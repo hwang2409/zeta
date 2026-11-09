@@ -16,7 +16,6 @@ from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..project_errors import ProjectRegistryBusyError
 from . import (
-    abort_scope,
     accounts,
     login,
     model_selection,
@@ -25,19 +24,15 @@ from . import (
 from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
-from .handlers import lifecycle, session, settings, validation
+from .handlers import session, settings, validation
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
     project_request_error,
 )
 from .protocol import (
-    _ERGONOMICS_METHODS,
-    _LOGIN_METHODS,
-    _PROJECT_METHODS,
     FEATURES,
     MAX_FRAME_BYTES,
-    ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
     MethodDescriptor,
@@ -555,10 +550,7 @@ class _Client:
             raise ProtocolError(
                 ErrorDescriptor.PROTOCOL_MISMATCH, "hello must be the first request"
             )
-        assert self.server.connections is not None
-        return await self.server.connections.route_request(
-            self, request_id, method, params
-        )
+        return False, None
 
     async def _dispatch_session_grants(
         self, descriptor: MethodDescriptor, params: dict[str, Any]
@@ -578,104 +570,6 @@ class _Client:
 
     _descriptor_protocol_error = staticmethod(protocol_error)
     _descriptor_feature_error = staticmethod(feature_error)
-    async def _dispatch_descriptor(
-        self,
-        request_id: str | int,
-        descriptor: MethodDescriptor,
-        params: dict[str, Any],
-    ) -> object:
-        method = descriptor.wire
-        if descriptor in _LOGIN_METHODS:
-            return await self.logins.request(method, params)
-        if descriptor in _ERGONOMICS_METHODS:
-            return await self._ergonomics(descriptor, params)
-        if descriptor is MethodDescriptor.PING:
-            if "ping" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "ping requires the negotiated ping feature",
-                )
-            return {"pong": True}
-        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
-            contexts = self.server.turn_contexts
-            return contexts.set_request(self.features, self.server.runtime, params)
-        if descriptor in _PROJECT_METHODS:
-            assert self.projects is not None
-            return await asyncio.to_thread(
-                self.projects.dispatch,
-                request_id,
-                method,
-                params,
-                features=self.features,
-            )
-        if descriptor is MethodDescriptor.LIST_SESSIONS:
-            result, _page_ids = await self.connections.run_read(
-                self, lambda: lifecycle.list_sessions(self, request_id, params)
-            )
-            return result
-        if descriptor is MethodDescriptor.NEW_SESSION:
-            return await lifecycle.new_session(self, params)
-        if descriptor is MethodDescriptor.RESUME:
-            return await lifecycle.resume(self, params)
-        if descriptor in {
-            MethodDescriptor.SESSION_GRANTS,
-            MethodDescriptor.REVOKE_SESSION_GRANTS,
-        }:
-            return await self._dispatch_session_grants(descriptor, params)
-        if descriptor is MethodDescriptor.SEND:
-            return await self.server.control.deliveries.send(params, self.features)
-        if descriptor is MethodDescriptor.STEER:
-            return await self.server.control.deliveries.steer(params, self.features)
-        if descriptor is MethodDescriptor.DELIVERY_STATUS:
-            return self.server.control.deliveries.status(params, self.features)
-        if descriptor is MethodDescriptor.CLEAR_STEERING:
-            return abort_scope.clear_pending_steering(
-                self.features, self.server.runtime.loop
-            )
-        if descriptor in {MethodDescriptor.APPROVE, MethodDescriptor.DENY}:
-            scope = params.get("scope", "once")
-            if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope must be 'once' or 'always_tool'",
-                )
-            if scope == "always_tool" and descriptor is not MethodDescriptor.APPROVE:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope 'always_tool' requires approve",
-                )
-            decision = (
-                ApprovalDecision.APPROVE
-                if descriptor is MethodDescriptor.APPROVE
-                else ApprovalDecision.DENY
-            )
-            return await self.server.control.resolve_approval(
-                decision, validation.required_string(params, "request_id"), scope
-            )
-        if descriptor is MethodDescriptor.ABORT:
-            return await self.server.control.abort(
-                abort_scope.parse_abort_scope(params, self.features)
-            )
-        if descriptor is MethodDescriptor.STATUS:
-            assert self.server.connections is not None
-            session_id = (
-                self.server.runtime.session_id
-                if self.server.runtime.opened is not None
-                else None
-            )
-            return await self.server.connections.read_status(
-                self,
-                await lifecycle.status(
-                    self,
-                    include_connection_setup_counts=(
-                        params.get("include_connection_setup_counts") is True
-                    )
-                ),
-                session_id,
-            )
-        raise ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-        )
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:

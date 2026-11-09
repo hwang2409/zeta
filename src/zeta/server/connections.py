@@ -15,7 +15,6 @@ from .protocol import (
     EventDescriptor,
     FrameCodec,
     FrameWriteCancelled,
-    MethodDescriptor,
     ProtocolError,
     _Frame,
 )
@@ -837,76 +836,6 @@ class ConnectionRegistry:
         else:
             future.set_exception(error)
 
-    async def route_request(
-        self,
-        connection: Any,
-        request_id: str | int,
-        method: str,
-        params: dict[str, Any],
-    ) -> tuple[bool, object]:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            return False, None
-        descriptor = MethodDescriptor.for_wire(method)
-        if descriptor is None or descriptor.access.value != "read":
-            return False, None
-        if method == "list_sessions" and "project_id" in params:
-            raise ProtocolError(
-                ErrorDescriptor.OBSERVER_READ_ONLY,
-                "method is unavailable to read-only observers",
-                {"method": method},
-            )
-        if method not in {
-            "list_sessions",
-            "status",
-            "session_tree",
-            "session_history",
-            "model_catalog",
-            "session_settings",
-            "content_read",
-        }:
-            return False, None
-        if method in {"session_tree", "session_history"}:
-            return True, await self.read_session(connection, method, params)
-        if method == "content_read":
-            if "content_read" not in state.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            target = capture_read(connection, method, params)
-            return True, await self.run_read(
-                connection,
-                lambda: perform_read(method, target, params),
-                session_id=target[0],
-            )
-        if method == "list_sessions":
-            result, _ = await self.run_read(
-                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
-            )
-            return True, result
-        fallback_config = None
-        if method == "status" and connection.server.runtime.loop is None:
-            fallback_config = await self.run_blocking(
-                lambda: connection.server.runtime._config(None, None)
-            )
-        target = capture_read(
-            connection, method, params, fallback_config=fallback_config
-        )
-        result = await self.run_read(
-            connection,
-            lambda: perform_read(
-                method,
-                target,
-                params,
-                backward_enabled="session_history_backward" in state.features,
-                fidelity="session_history_fidelity" in state.features,
-                content_read="content_read" in state.features,
-                served_turn_end="served_turn_end" in state.features,
-            ),
-            session_id=target[0],
-        )
-        return True, result
 
     async def aclose(self) -> None:
         self._closed = True

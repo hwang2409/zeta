@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
@@ -334,48 +334,23 @@ class MethodDescriptor(Enum):
         return sorted(methods) if role == "observer" else methods
 
 
-Handler = Callable[[object, str | int, dict[str, object]], object]
-
-
-_LOGIN_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")
-)
-_ERGONOMICS_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in (
-        "RENAME_SESSION",
-        "DELETE_SESSION",
-        "REPAIR_TRANSCRIPT",
-        "SESSION_TREE",
-        "SESSION_HISTORY",
-        "CONTENT_READ",
-        "MODEL_CATALOG",
-        "SESSION_SETTINGS",
-        "SET_SETTINGS",
-        "SET_COMPACTION",
-        "SEND_IMAGES",
-        "SWITCH_BRANCH",
-        "FORK_MESSAGE",
-        "SLASH_LIST",
-        "SLASH_RUN",
-        "ACCOUNT_LIST",
-        "ACCOUNT_LOGOUT",
-        "ACCOUNT_REFRESH",
-        "ACCOUNT_SWITCH",
-    )
-)
-_PROJECT_METHODS = frozenset(
-    MethodDescriptor[name]
-    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
-)
-
 
 MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
 
+_LOGIN_METHODS = frozenset(MethodDescriptor[name] for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS"))
+_ERGONOMICS_METHODS = frozenset(MethodDescriptor[name] for name in ("RENAME_SESSION", "DELETE_SESSION", "REPAIR_TRANSCRIPT", "SESSION_TREE", "SESSION_HISTORY", "CONTENT_READ", "MODEL_CATALOG", "SESSION_SETTINGS", "SET_SETTINGS", "SET_COMPACTION", "SEND_IMAGES", "SWITCH_BRANCH", "FORK_MESSAGE", "SLASH_LIST", "SLASH_RUN", "ACCOUNT_LIST", "ACCOUNT_LOGOUT", "ACCOUNT_REFRESH", "ACCOUNT_SWITCH"))
+_PROJECT_METHODS = frozenset(MethodDescriptor[name] for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX"))
+
+
+async def _dispatch(
+    self, request_id: str | int, method: str, params: dict[str, Any]
+) -> object:
+    from .handlers.registry import dispatch
+
+    return await dispatch(self, request_id, method, params)
 
 def hello_result(
     protocol_version: str, capabilities: dict[str, object], warning: str | None
@@ -525,52 +500,6 @@ LOADED_SESSION_MUTATIONS = frozenset(
 )
 
 
-async def _dispatch(
-    self, request_id: str | int, method: str, params: dict[str, Any]
-) -> object:
-    handled, result = await self._route_request(request_id, method, params)
-    if handled:
-        return result
-    descriptor = MethodDescriptor.for_wire(method)
-    if self.role == "observer" and (
-        descriptor is None or descriptor.access is not Access.READ
-    ):
-        raise ProtocolError(
-            ErrorDescriptor.OBSERVER_READ_ONLY,
-            "method is unavailable to read-only observers",
-            {"method": method},
-        )
-    if descriptor is None:
-        raise ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-        )
-    if descriptor.access is Access.SESSION_MUTATION:
-        self.server.control._reject_if_unhealthy()
-    if descriptor.since is not None and tuple(
-        int(part) for part in self.protocol_version.split(".")
-    ) < tuple(int(part) for part in descriptor.since.split(".")):
-        raise self._descriptor_protocol_error(descriptor)
-    if descriptor.feature is not None and descriptor.feature not in self.features:
-        raise self._descriptor_feature_error(descriptor)
-    return await HANDLERS[descriptor](self, request_id, params)
-
-
-def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:
-    async def handle(
-        client: object, request_id: str | int, params: dict[str, Any]
-    ) -> object:
-        return await client._dispatch_descriptor(request_id, descriptor, params)  # type: ignore[attr-defined]
-
-    return handle
-
-
-HANDLERS: dict[MethodDescriptor, Handler] = {
-    descriptor: _descriptor_handler(descriptor) for descriptor in MethodDescriptor
-}
-if HANDLERS.keys() != set(MethodDescriptor):
-    raise RuntimeError("serve method handlers are not exhaustive")
-
-
 def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
     message = {
         **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
@@ -606,6 +535,8 @@ def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
         f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
     )
     return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
+
+
 
 
 class FrameCodec:
