@@ -883,134 +883,65 @@ class ConnectionRegistry(ReplayOutput):
         return result
 
     async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
-        return await self.read_session(connection, "session_tree", params)
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
+        return await self.run_read(
+            connection,
+            lambda: session.tree(_observer_runtime(store)),
+            session_id=runtime.session_id,
+        )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
-        return await self.read_session(connection, "session_history", params)
-
-    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
-        return await self.read_session(connection, "content_read", params)
-
-    async def read_catalog(self, connection: Any) -> object:
-        return await self.run_read(
-            connection,
-            lambda: settings.catalog(connection.server.runtime),
-        )
-
-    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
-        return await self.run_read(
-            connection,
-            lambda: settings.settings(connection.server.runtime),
-        )
-
-    async def read_session(
-        self, connection: Any, method: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        target = capture_read(connection, method, params)
-        features = history_features(self._connections[connection].features)
-        include_delivery_id = {
-            "delivery_id",
-            "user_message_event",
-            "user_message_delivery_id",
-        } <= features
-        return await self.run_read(
-            connection,
-            lambda: perform_read(
-                method,
-                target,
-                params,
-                include_delivery_id=include_delivery_id,
-                backward_enabled="session_history_backward" in features,
-                fidelity="session_history_fidelity" in features,
-                content_read="content_read" in features,
-                served_turn_end="served_turn_end" in features,
-            ),
-            session_id=target[0],
-        )
-
-    async def read_status(
-        self, connection: Any, status: dict[str, Any], session_id: str | None
-    ) -> object:
+        runtime = connection.server.runtime
+        store = validation.active(runtime, params)
         features = self._connections[connection].features
         return await self.run_read(
             connection,
-            lambda: project_status(
-                status, served_turn_end="served_turn_end" in features
-            ),
-            session_id=session_id,
-        )
-
-    async def route_request(
-        self,
-        connection: Any,
-        request_id: str | int,
-        method: str,
-        params: dict[str, Any],
-    ) -> tuple[bool, object]:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            return False, None
-        descriptor = MethodDescriptor.for_wire(method)
-        if descriptor is None or descriptor.access.value != "read":
-            return False, None
-        if descriptor is MethodDescriptor.LIST_SESSIONS and "project_id" in params:
-            raise ProtocolError(
-                ErrorDescriptor.OBSERVER_READ_ONLY,
-                "method is unavailable to read-only observers",
-                {"method": method},
-            )
-        if method not in {
-            MethodDescriptor.LIST_SESSIONS.wire,
-            MethodDescriptor.STATUS.wire,
-            MethodDescriptor.SESSION_TREE.wire,
-            MethodDescriptor.SESSION_HISTORY.wire,
-            MethodDescriptor.MODEL_CATALOG.wire,
-            MethodDescriptor.SESSION_SETTINGS.wire,
-            MethodDescriptor.CONTENT_READ.wire,
-        }:
-            return False, None
-        if method in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY}:
-            return True, await self.read_session(connection, descriptor, params)
-        if method is MethodDescriptor.CONTENT_READ:
-            if "content_read" not in state.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            target = capture_read(connection, descriptor, params)
-            return True, await self.run_read(
-                connection,
-                lambda: perform_read(descriptor, target, params),
-                session_id=target[0],
-            )
-        if descriptor is MethodDescriptor.LIST_SESSIONS:
-            result, _ = await self.run_read(
-                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
-            )
-            return True, result
-        fallback_config = None
-        if descriptor is MethodDescriptor.STATUS and connection.server.runtime.loop is None:
-            fallback_config = await self.run_blocking(
-                lambda: connection.server.runtime._config(None, None)
-            )
-        target = capture_read(
-            connection, method, params, fallback_config=fallback_config
-        )
-        features = history_features(state.features)
-        result = await self.run_read(
-            connection,
-            lambda: perform_read(
-                method,
-                target,
+            lambda: history.history(
+                _observer_runtime(store),
                 params,
+                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= history_features(features),
                 backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            session_id=target[0],
+            session_id=runtime.session_id,
         )
-        return True, result
+
+    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+        if set(params) - {"handle", "offset", "limit"}:
+            raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
+        runtime = connection.server.runtime
+        if runtime.opened is None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        return await self.run_read(
+            connection,
+            lambda: content.read(
+                runtime.opened.store,
+                params.get("handle"),
+                offset=params.get("offset", 0),
+                limit=params.get("limit", content.MAX_CONTENT_READ),
+            ),
+            session_id=runtime.session_id,
+        )
+
+    async def read_catalog(self, connection: Any) -> object:
+        return await self.run_read(connection, lambda: settings.catalog(connection.server.runtime))
+
+    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
+        return await self.run_read(connection, lambda: settings.settings(connection.server.runtime))
+
+    async def read_status(self, connection: Any, status: dict[str, Any], session_id: str | None) -> object:
+        features = self._connections[connection].features
+        return await self.run_read(
+            connection,
+            lambda: project_status(status, served_turn_end="served_turn_end" in features),
+            session_id=session_id,
+        )
+
+    async def route_request(self, connection: Any, request_id: str | int, method: str, params: dict[str, Any]) -> tuple[bool, object]:
+        return False, None
 
     async def aclose(self) -> None:
         self._closed = True
@@ -1103,37 +1034,6 @@ def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, obje
         )
     status.update(suffix)
     return session_id, status
-
-
-def capture_read(
-    client: Any,
-    method: MethodDescriptor,
-    params: dict[str, Any],
-    *,
-    fallback_config: Any = None,
-) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    if method is MethodDescriptor.CONTENT_READ:
-        if set(params) - {"handle", "offset", "limit"}:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_CONTENT_READ,
-                "invalid content read",
-            )
-        if runtime.opened is None:
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            )
-        return runtime.session_id, runtime.opened.store
-    if method in {MethodDescriptor.SESSION_TREE, MethodDescriptor.SESSION_HISTORY}:
-        store = validation.active(runtime, params)
-        return runtime.session_id, store
-    if method is MethodDescriptor.STATUS:
-        return _capture_status(client, fallback_config)
-    if method is MethodDescriptor.MODEL_CATALOG:
-        return None, settings.catalog(runtime)
-    if method is MethodDescriptor.SESSION_SETTINGS:
-        return runtime.session_id, settings.settings(runtime)
-    raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
