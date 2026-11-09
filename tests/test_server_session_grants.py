@@ -9,7 +9,7 @@ import json
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from rich.console import Console
@@ -42,7 +42,6 @@ from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
-from zeta.server.approval_settlement.owner import TaskOwner
 from zeta.server.protocol import EventDescriptor
 from zeta.tui.app import TUIApp
 
@@ -1329,48 +1328,102 @@ async def _first_child_bash_two_fact(
 
 def test_approval_task_creation_has_one_owner() -> None:
     root = Path(__file__).parents[1]
-    violations: list[tuple[str, str, int]] = []
+    violations: list[tuple[str, int]] = []
+    task_names = {"Task", "create_task", "ensure_future"}
     files = [
         root / "src/zeta/server/approval_lifecycle.py",
         *root.glob("src/zeta/server/approval_settlement/**/*.py"),
     ]
     for path in files:
         relative = str(path.relative_to(root))
-        tree = ast.parse((root / relative).read_text())
-        for parent in ast.walk(tree):
-            if not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in ast.walk(parent):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in {"create_task", "ensure_future"}
-                    and not (
-                        relative.endswith("/approval_settlement/owner.py")
-                        and parent.name == "start"
-                    )
-                ):
-                    violations.append((relative, parent.name, node.lineno))
+        tree = ast.parse(path.read_text())
+        imported_task_names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+                for alias in node.names:
+                    if alias.name in task_names:
+                        imported_task_names.add(alias.asname or alias.name)
+
+        class TaskCallVisitor(ast.NodeVisitor):
+            def __init__(self, relative: str, imported_task_names: set[str]) -> None:
+                self.classes: list[str] = []
+                self.functions: list[str] = []
+                self.relative = relative
+                self.imported_task_names = imported_task_names
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                self.classes.append(node.name)
+                self.generic_visit(node)
+                self.classes.pop()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node: ast.Call) -> None:
+                callee = node.func
+                name = (
+                    callee.id
+                    if isinstance(callee, ast.Name)
+                    else callee.attr
+                    if isinstance(callee, ast.Attribute)
+                    else None
+                )
+                is_task_call = name in task_names or name in self.imported_task_names
+                allowed = (
+                    self.relative.endswith("/approval_settlement/owner.py")
+                    and self.classes == ["TaskOwner"]
+                    and self.functions == ["start"]
+                )
+                if is_task_call and not allowed:
+                    violations.append((self.relative, node.lineno))
+                self.generic_visit(node)
+
+        TaskCallVisitor(relative, imported_task_names).visit(tree)
     assert not violations, f"unowned approval task creation: {violations!r}"
 
 
 @pytest.mark.asyncio
 async def test_terminal_watchdog_failure_is_retrieved(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    owner = TaskOwner()
+    lifecycle = approval_lifecycle.ApprovalLifecycle(
+        request_turn_failure=lambda: None,
+        policy=lambda: None,
+        session_id=lambda: "session-1",
+        parent_store=lambda: None,
+        offload=cast(Any, None),
+        is_closing=lambda: False,
+    )
+    request = approval_lifecycle.ApprovalRequest(
+        "call-1", ToolCall("call-1", "bash", {"command": "true"}), child_instance_id="child-1"
+    )
+    lifecycle.register_delegated(request, cast(Any, None), "child-1")
+    key = ("child-1", "call-1")
+    assert lifecycle.release_or_hold_terminal(key, "session-1", {})
 
-    async def fail_terminal() -> None:
+    async def fail_wait(*args: Any, **kwargs: Any) -> None:
+        args[0].close()
+        raise TimeoutError
+
+    def fail_release(record: Any) -> None:
         raise RuntimeError("terminal release failed")
 
-    owner.start("call-1", fail_terminal(), "terminal watchdog")
-    await owner.drain(0.1)
+    monkeypatch.setattr(approval_lifecycle.asyncio, "wait_for", fail_wait)
+    # test-contract: seam force the real terminal watchdog release to fail
+    monkeypatch.setattr(lifecycle, "_release_terminal", fail_release)
+    await lifecycle.wait_for_approval_settlement(0.1)
     assert any(
         record.message == "approval settlement task failed"
-        and record.approval_key == "call-1"
+        and record.approval_key == key
         and record.kind == "terminal watchdog"
         for record in caplog.records
     )
+    assert not lifecycle._settlement_tasks
 
 
 @pytest.mark.asyncio

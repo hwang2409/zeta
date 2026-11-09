@@ -1079,19 +1079,19 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
 def approval_settlement_tasks_do_not_leak(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    tasks: list[asyncio.Task[object]] = []
-    create_task = asyncio.create_task
+    from zeta.server.approval_settlement.owner import TaskOwner
 
-    def track_task(coro: object, *args: object, **kwargs: object) -> asyncio.Task[object]:
-        task = create_task(coro, *args, **kwargs)  # type: ignore[arg-type]
-        if getattr(coro, "__qualname__", "") in {
-            "ApprovalLifecycle._settle_record",
-            "ApprovalLifecycle._finish_external",
-        }:
-            tasks.append(task)
+    tasks: list[asyncio.Task[object]] = []
+    original_start = TaskOwner.start
+
+    def track_start(
+        owner: TaskOwner, key: object, operation: object, kind: str
+    ) -> asyncio.Task[object]:
+        task = original_start(owner, key, operation, kind)  # type: ignore[arg-type]
+        tasks.append(task)
         return task
 
-    monkeypatch.setattr(asyncio, "create_task", track_task)
+    monkeypatch.setattr(TaskOwner, "start", track_start)
     yield
     unfinished = [task for task in tasks if not task.done()]
     assert not unfinished, f"approval settlement tasks outlived the test: {unfinished!r}"
