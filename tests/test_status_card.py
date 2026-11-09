@@ -273,7 +273,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
     tmp_path, monkeypatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
-    attention = AttentionStore(store.session_dir)
+    attention = AttentionStore(store.session_dir, writer_epoch=5)
     decision = attention.request(
         session_id=store.session_id,
         project_id=None,

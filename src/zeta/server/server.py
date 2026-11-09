@@ -18,40 +18,29 @@ from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..project_errors import ProjectRegistryBusyError
 from ..storage_format import drain_releases, pending_releases
 from . import (
-    abort_scope,
     accounts,
     login,
-    model_selection,
-    slash_commands,
 )
-from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
-from .handlers import lifecycle, session, settings, validation
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
     project_request_error,
 )
+from .handlers.registry import dispatch as _dispatch_request
 from .protocol import (
-    _ERGONOMICS_METHODS,
-    _LOGIN_METHODS,
-    _PROJECT_METHODS,
     FEATURES,
     MAX_FRAME_BYTES,
-    ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
     FrameWriteOwner,
     MethodDescriptor,
     ProtocolError,
     _Frame,
-    feature_error,
     hello_result,
     negotiate_protocol_version,
-    protocol_error,
 )
-from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
@@ -590,127 +579,10 @@ class _Client:
             raise ProtocolError(
                 ErrorDescriptor.PROTOCOL_MISMATCH, "hello must be the first request"
             )
-        assert self.server.connections is not None
-        return await self.server.connections.route_request(
-            self, request_id, method, params
-        )
-
-    async def _dispatch_session_grants(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        session_grants.require_feature(self.features)
-        runtime = self.server.runtime
-        if descriptor is MethodDescriptor.SESSION_GRANTS:
-            return session_grants.read(runtime.policy, runtime.session_id, params)
-        result, change = session_grants.revoke(
-            runtime.policy, runtime.session_id, params
-        )
-        if change.changed:
-            await self.server.control.publish_session_grant_change(change)
-        return result
+        return False, None
 
     _dispatch = _dispatch_request
 
-    _descriptor_protocol_error = staticmethod(protocol_error)
-    _descriptor_feature_error = staticmethod(feature_error)
-    async def _dispatch_descriptor(
-        self,
-        request_id: str | int,
-        descriptor: MethodDescriptor,
-        params: dict[str, Any],
-    ) -> object:
-        method = descriptor.wire
-        if descriptor in _LOGIN_METHODS:
-            return await self.logins.request(method, params)
-        if descriptor in _ERGONOMICS_METHODS:
-            return await self._ergonomics(descriptor, params)
-        if descriptor is MethodDescriptor.PING:
-            if "ping" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "ping requires the negotiated ping feature",
-                )
-            return {"pong": True}
-        if descriptor is MethodDescriptor.SET_TURN_CONTEXT:
-            contexts = self.server.turn_contexts
-            return contexts.set_request(self.features, self.server.runtime, params)
-        if descriptor in _PROJECT_METHODS:
-            assert self.projects is not None
-            return await asyncio.to_thread(
-                self.projects.dispatch,
-                request_id,
-                method,
-                params,
-                features=self.features,
-            )
-        if descriptor is MethodDescriptor.LIST_SESSIONS:
-            result, _page_ids = await self.connections.run_read(
-                self, lambda: lifecycle.list_sessions(self, request_id, params)
-            )
-            return result
-        if descriptor is MethodDescriptor.NEW_SESSION:
-            return await lifecycle.new_session(self, params)
-        if descriptor is MethodDescriptor.RESUME:
-            return await lifecycle.resume(self, params)
-        if descriptor in {
-            MethodDescriptor.SESSION_GRANTS,
-            MethodDescriptor.REVOKE_SESSION_GRANTS,
-        }:
-            return await self._dispatch_session_grants(descriptor, params)
-        if descriptor is MethodDescriptor.SEND:
-            return await self.server.control.deliveries.send(params, self.features)
-        if descriptor is MethodDescriptor.STEER:
-            return await self.server.control.deliveries.steer(params, self.features)
-        if descriptor is MethodDescriptor.DELIVERY_STATUS:
-            return self.server.control.deliveries.status(params, self.features)
-        if descriptor is MethodDescriptor.CLEAR_STEERING:
-            return abort_scope.clear_pending_steering(
-                self.features, self.server.runtime.loop
-            )
-        if descriptor in {MethodDescriptor.APPROVE, MethodDescriptor.DENY}:
-            scope = params.get("scope", "once")
-            if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope must be 'once' or 'always_tool'",
-                )
-            if scope == "always_tool" and descriptor is not MethodDescriptor.APPROVE:
-                raise ProtocolError(
-                    ErrorDescriptor.INVALID_PARAMS,
-                    "scope 'always_tool' requires approve",
-                )
-            decision = (
-                ApprovalDecision.APPROVE
-                if descriptor is MethodDescriptor.APPROVE
-                else ApprovalDecision.DENY
-            )
-            return await self.server.control.resolve_approval(
-                decision, validation.required_string(params, "request_id"), scope
-            )
-        if descriptor is MethodDescriptor.ABORT:
-            return await self.server.control.abort(
-                abort_scope.parse_abort_scope(params, self.features)
-            )
-        if descriptor is MethodDescriptor.STATUS:
-            assert self.server.connections is not None
-            session_id = (
-                self.server.runtime.session_id
-                if self.server.runtime.opened is not None
-                else None
-            )
-            return await self.server.connections.read_status(
-                self,
-                await lifecycle.status(
-                    self,
-                    include_connection_setup_counts=(
-                        params.get("include_connection_setup_counts") is True
-                    )
-                ),
-                session_id,
-            )
-        raise ProtocolError(
-            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-        )
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
@@ -767,106 +639,11 @@ class _Client:
             notices.extend(self.server._account_warnings)
         return result
 
-    async def _ergonomics(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        if isinstance(descriptor, str):
-            descriptor = MethodDescriptor.for_wire(descriptor)
-            if descriptor is None:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND, "method not found"
-                )
-        runtime = self.server.runtime
-        method = descriptor.wire
-        if descriptor is MethodDescriptor.REPAIR_TRANSCRIPT:
-            return await session.repair_transcript(self, params)
-        if descriptor in {
-            MethodDescriptor.RENAME_SESSION,
-            MethodDescriptor.DELETE_SESSION,
-        }:
-
-            return await session.mutate_session(
-                runtime,
-                method,
-                validation.required_string(params, "session_id"),
-                params.get("name"),
-                self.server.control.require_idle,
-            )
-        if descriptor in {
-            MethodDescriptor.SESSION_TREE,
-            MethodDescriptor.SESSION_HISTORY,
-        }:
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.CONTENT_READ:
-            if "content_read" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.MODEL_CATALOG:
-            return settings.catalog(runtime)
-        store = validation.active(runtime, params)
-        if descriptor is MethodDescriptor.SEND_IMAGES:
-            return await self.server.control.deliveries.send_images(
-                params, self.features
-            )
-        if descriptor is MethodDescriptor.SESSION_SETTINGS:
-            return settings.settings(runtime, include_plan_mode=True)
-        if descriptor in {
-            MethodDescriptor.ACCOUNT_LIST,
-            MethodDescriptor.ACCOUNT_LOGOUT,
-            MethodDescriptor.ACCOUNT_REFRESH,
-            MethodDescriptor.ACCOUNT_SWITCH,
-            MethodDescriptor.SLASH_LIST,
-        }:
-            return await slash_commands.read_request(
-                method, runtime, self.server.control.require_idle, params, self
-            )
-        if descriptor is MethodDescriptor.SLASH_RUN:
-            text = validation.required_string(params, "text")
-            registry = await slash_commands.registry_for_request(runtime)
-            if self.server.control.turn_busy() and not slash_commands.can_run_while_busy(
-                registry, text
-            ):
-                await self.server.control.require_idle()
-            register = self.server.control.model_input_registrar(self.features)
-            return await slash_commands.run_command(
-                runtime,
-                text,
-                register_model_input=register,
-                approval_control=self.server.control,
-                slash_lock=self.server.control.slash_lock,
-                busy=self.server.control.turn_busy(),
-                registry=registry,
-            )
-        await self.server.control.require_idle()
-        validation.require_mutable(runtime, self.server.control.has_pending_approvals())
-        if descriptor is MethodDescriptor.SET_SETTINGS:
-            model = validation.required_string(params, "model")
-            mode = validation.required_string(params, "approval_mode")
-            model_selection.validate(model, mode)
-            await model_selection.apply_rpc(runtime, model, mode)
-            return settings.settings(runtime)
-        if descriptor is MethodDescriptor.SET_COMPACTION:
-            validation.required_string(params, "mode")
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "compaction mode selection was removed; eviction is always used",
-            )
-        if descriptor is MethodDescriptor.FORK_MESSAGE:
-            store.append_message_fork(validation.required_string(params, "message_id"))
-        elif descriptor is MethodDescriptor.SWITCH_BRANCH:
-            head = validation.required_string(params, "head_id")
-            current = store.replay()
-            if not current or current[-1].id != head:
-                store.switch_to_branch(head)
-        return session.tree(runtime)
-
     async def _write(self, payload: _Frame) -> bool:
-        written = await self.connections.send(self, payload)
+        try:
+            written = await self.connections.send(self, payload)
+        except OSError:
+            written = False
         if not written:
             self._transport_failed = True
         return written

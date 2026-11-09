@@ -42,7 +42,7 @@ from zeta.protocol.types import (
     ToolUseContent,
 )
 from zeta.server import ZetaServer
-from zeta.server.handlers import lifecycle
+from zeta.server.handlers import lifecycle, registry
 from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -492,10 +492,10 @@ async def test_same_tick_approval_reservation_winner(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_before_durable_commit_retries_abort(
+async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Cancellation with no committed decision resets to pending; abort retries."""
+    """Handler cancellation does not transfer into the settlement owner."""
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         await server.control._event(_start_event(call))
@@ -516,12 +516,8 @@ async def test_cancelled_before_durable_commit_retries_abort(
             store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement before commit")
-        assert store.approval_resolution_data(call.id) is None
-        retry = server.control._terminate_pending_approvals()
-        assert retry is not None
-        async with asyncio.timeout(10):
-            await retry
-        assert store.approval_resolution_data(call.id)["decision"] == "abort"
+        await server.control.wait_for_approval_settlement()
+        assert store.approval_resolution_data(call.id)["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
     finally:
         await close_serve(server, writer)
@@ -557,6 +553,7 @@ async def test_cancelled_after_durable_commit_keeps_decision(
         gate.release.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement after commit")
+        await server.control.wait_for_approval_settlement()
         resolution = store.approval_resolution_data(call.id)
         assert resolution is not None and resolution["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
@@ -1588,7 +1585,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
 
 
 @pytest.mark.asyncio
-async def test_slash_and_ergonomics_read_serve_control_not_store(
+async def test_slash_and_named_settings_read_serve_control_not_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
@@ -1606,8 +1603,9 @@ async def test_slash_and_ergonomics_read_serve_control_not_store(
         status = session.slash_status()
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
-            await server._client._ergonomics(
-                "set_settings",
+            await registry.set_settings(
+                server._client,
+                "set-settings",
                 {
                     "session_id": server.runtime.session_id,
                     "model": server.runtime.metadata.model,

@@ -122,6 +122,7 @@ from zeta.server.event_contract import (
     STREAM_EVENT_WIRE_EVENTS,
     tool_end,
 )
+from zeta.server.handlers import registry
 from zeta.server.protocol import (
     MAX_FRAME_BYTES,
     MAX_REQUEST_ID_BYTES,
@@ -5279,8 +5280,13 @@ async def _ready_extensions(server):
 
 @pytest.mark.asyncio
 async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
-    from zeta.server.handlers.history import EXTENSION_REQUESTS
+    from zeta.server.protocol import MethodDescriptor
 
+    extension_requests = tuple(
+        descriptor.wire
+        for descriptor in MethodDescriptor
+        if descriptor.since is not None
+    )
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
@@ -5288,8 +5294,8 @@ async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.0"
-        assert not set(EXTENSION_REQUESTS) & set(hello["capabilities"]["requests"])
-        for method in EXTENSION_REQUESTS:
+        assert not set(extension_requests) & set(hello["capabilities"]["requests"])
+        for method in extension_requests:
             assert (await _request(reader, writer, method, method))[-1]["error"][
                 "code"
             ] == -32601
@@ -8608,7 +8614,7 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert registry is not None
         project_record = registry.create_project("serve attention", "test")
         project_id = project_record.project_id
-        store = AttentionStore(opened.store.session_dir)
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         decision = store.request(
             session_id=session_id,
             project_id=project_id,
@@ -8767,7 +8773,7 @@ async def test_serve_request_attention_kind_is_in_tool_end_result(
 
         assert AttentionStore(
             server.runtime.opened.store.session_dir  # type: ignore[union-attr]
-        ).list()[0].kind == "answer"
+        , writer_epoch=5).list()[0].kind == "answer"
     finally:
         await close_serve(server, writer)
 
@@ -11434,17 +11440,33 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize(("home_epoch", "writer_epoch"), [(4, 5), (5, 6)])
 @pytest.mark.asyncio
 async def test_serve_current_session_repair_updates_live_memory_owner(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close_direct_test_runtime_owners: None,
+    home_epoch: int,
+    writer_epoch: int,
 ) -> None:
+    import zeta.core.store._log as store_log
+    import zeta.memory.auto as memory_auto
     from tests.support.owned import await_or_fail
-    from zeta.project_registry import ProjectRegistry
+    from zeta import project_registry, storage_format
+    from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 
     workspace = tmp_path / "repo"
     workspace.mkdir()
-    registry = ProjectRegistry(tmp_path / "projects")
-    project = registry.create_project("recovery", "test", workspace)
+    registry = await asyncio.to_thread(ProjectRegistry, tmp_path / "projects")
+    project = await asyncio.to_thread(
+        registry.create_project, "recovery", "test", workspace
+    )
+    (tmp_path / "storage-format.json").write_text(
+        json.dumps({"writer_epoch": home_epoch}) + "\n"
+    )
+    for module in (storage_format, store_log, memory_auto, project_registry):
+        monkeypatch.setattr(module, "WRITER_EPOCH", writer_epoch, raising=False)
+    bootstrap_lease = await asyncio.to_thread(storage_format.open_writer, tmp_path)
     server = ZetaServer(
         home=tmp_path,
         cwd=workspace,
@@ -11465,19 +11487,27 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
             MessageOrigin.USER,
         )
     )
-    registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=registry.memory_digest(project.project_id),
-        updates={"state.md": "automatic\n"},
-        provenance={
-            "session_id": session_id,
-            "seq_start": 1,
-            "seq_end": 2,
-            "model": "offline",
-        },
+    memory_write_error: ProjectRegistryError | None = None
+    try:
+        registry.compare_and_swap_memory(
+            project.project_id,
+            expected_digest=registry.memory_digest(project.project_id),
+            updates={"state.md": "automatic\n"},
+            provenance={
+                "session_id": session_id,
+                "seq_start": 1,
+                "seq_end": 2,
+                "model": "offline",
+            },
+        )
+    except ProjectRegistryError as exc:
+        memory_write_error = exc
+    assert memory_write_error is None, (
+        f"epoch-{home_epoch} project writes were disabled: {memory_write_error}"
     )
     transcript = root.path
     transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
+    damaged = transcript.read_bytes()
     try:
         repaired = (
             await _request(
@@ -11490,6 +11520,17 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
         )[-1]["result"]
         quarantine_id = repaired["quarantine_id"]
         assert repaired["memory_review_required"] is True
+        assert transcript.with_name(
+            f"conversation.quarantine.{quarantine_id}.jsonl"
+        ).read_bytes() == damaged
+        recovery_evidence = transcript.with_name(
+            f"conversation.recovery.{quarantine_id}.json"
+        )
+        assert json.loads(recovery_evidence.read_text())["state"] == "committed"
+        resumed = (
+            await _request(reader, writer, 4, "resume", {"session_id": session_id})
+        )[-1]
+        assert resumed["result"]["session"]["session_id"] == session_id
 
         await await_or_fail(
             asyncio.to_thread(
@@ -11514,6 +11555,7 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
         assert memory_state["recovery_paused"] is True
     finally:
         await close_serve(server, writer)
+        bootstrap_lease.close()
 
 
 @pytest.mark.asyncio
@@ -11956,8 +11998,9 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             def start_rename() -> None:
                 rename_tasks.append(
                     asyncio.create_task(
-                        second_client._ergonomics(
-                            "rename_session",
+                        registry.rename_session(
+                            second_client,
+                            "rename-session",
                             {"session_id": sid, "name": "renamed during switch"},
                         )
                     )
@@ -12984,8 +13027,13 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
-                with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(settlement, timeout=10)
+                await asyncio.wait_for(settlement, timeout=10)
+                status_frames = await _request(reader, writer, 5, "status")
+                frames.extend(status_frames)
+                assert status_frames[-1].get("result", {}).get("state") in {
+                    "idle",
+                    "running",
+                }
             else:
                 frames += await read_until(
                     reader,

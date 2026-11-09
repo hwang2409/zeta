@@ -52,7 +52,7 @@ from .child_context import (
     consume_run,
     resolve_child_backend,
 )
-from .conversation_channel import has_follow_up_loop
+from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
@@ -111,6 +111,7 @@ async def consume_child(
     child_store: ConversationStore | None = None,
     background: bool = False,
     finish_turn_limit: Callable[[str], dict[str, object]] | None = None,
+    hold_wake: HoldWake = NO_HOLD_WAKE,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
     final_message: Message | None = None
@@ -146,10 +147,7 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
                 publish(status)
-            elif (
-                event.type is StreamEventType.RETRY
-                and event.data.get("kind") == "provider_rate_limit_hold"
-            ):
+            elif await hold_wake.observe(event):
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
@@ -1015,6 +1013,10 @@ async def run_agent_tool(
             **run_kwargs,
             child_path=child_path,
             publish=publish,
+            hold_wake=HoldWake(
+                loop._background_owner.conversation_channel,
+                child_instance_id, child_path, description, selected_accounts,
+            ) if background else NO_HOLD_WAKE,
             child_turns=child_turns,
             update_turns=update_turns,
             record_tool_call=record_tool_call,
