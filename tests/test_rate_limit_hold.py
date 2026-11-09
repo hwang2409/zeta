@@ -103,6 +103,7 @@ async def test_account_switch_ends_hold_and_probes_with_new_account(
             what="held turn",
         )
     finally:
+        await loop.close()
         await client.aclose()
         opened.store.close()
 
