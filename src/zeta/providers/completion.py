@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import random
+import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
