@@ -109,6 +109,24 @@ def _append_index_process(
         results.put((child_index, "ok", None))
 
 
+def _open_project_index_process(
+    child_index: int,
+    projects_root: str,
+    project_id: str,
+    start,
+    results,
+) -> None:
+    results.put((child_index, "ready", None))
+    try:
+        assert start.wait(60), "timed out waiting 60s for the parent start signal"
+        registry = ProjectRegistry(Path(projects_root))
+        index_module.open_project_index(registry, project_id)
+    except BaseException:  # noqa: BLE001 - child must report every failure
+        results.put((child_index, "error", traceback.format_exc()))
+    else:
+        results.put((child_index, "ok", None))
+
+
 def _await_phase(children, results, phase: str, deadline: float) -> dict[int, tuple[str, object]]:
     messages: dict[int, tuple[str, object]] = {}
     while len(messages) < len(children):
@@ -842,6 +860,163 @@ def test_database_size_is_bounded_against_indexed_text(tmp_path: Path) -> None:
     )
 
 
+def test_first_version_backfill_reports_building_and_keeps_concurrent_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects_root = tmp_path / "projects"
+    registry = ProjectRegistry(projects_root)
+    project = registry.create_project("demo", "demo", str(tmp_path))
+    historical = _source(
+        tmp_path / "sessions",
+        "historical",
+        [
+            _row(1, "user", "historical build canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    (historical.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": project.project_id}), encoding="utf-8"
+    )
+    registry.record_session(
+        project.project_id,
+        session_id=historical.session_id,
+        transcript_path=str(historical.session_dir),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original = index_module.render_transcript_units
+    calls = 0
+
+    def controlled(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(10), "test did not release version backfill"
+        return original(*args)
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    errors: list[BaseException] = []
+
+    def backfill() -> None:
+        try:
+            index_module.open_project_index(registry, project.project_id)
+        except BaseException as exc:  # noqa: BLE001 - assert thread failure
+            errors.append(exc)
+
+    backfill_thread = threading.Thread(target=backfill)
+    backfill_thread.start()
+    append_thread: threading.Thread | None = None
+    try:
+        assert entered.wait(10), "version backfill did not start"
+        building = index_module.open_project_index(registry, project.project_id)
+        status = building.status()
+        assert not status.ready
+        assert status.detail == "index building"
+        with pytest.raises(TranscriptIndexUnavailable, match="index building"):
+            building.search("historical")
+
+        active = _source(
+            tmp_path / "sessions",
+            "active",
+            [
+                _row(1, "user", "concurrent append canary"),
+                _row(2, "assistant", "answer", state="completed"),
+            ],
+        )
+        (active.session_dir / "meta.json").write_text(
+            json.dumps({"project_id": project.project_id}), encoding="utf-8"
+        )
+        registry.record_session(
+            project.project_id,
+            session_id=active.session_id,
+            transcript_path=str(active.session_dir),
+        )
+
+        def append() -> None:
+            try:
+                refresh_module._refresh_sources(
+                    registry, project.project_id, (active,)
+                )
+            except BaseException as exc:  # noqa: BLE001 - assert thread failure
+                errors.append(exc)
+
+        append_thread = threading.Thread(target=append)
+        append_thread.start()
+    finally:
+        release.set()
+        backfill_thread.join(10)
+        if append_thread is not None:
+            append_thread.join(10)
+
+    assert not backfill_thread.is_alive()
+    assert append_thread is not None and not append_thread.is_alive()
+    assert not errors
+    complete = index_module.open_project_index(registry, project.project_id)
+    assert complete.search("historical build canary")
+    assert complete.search("concurrent append canary")
+
+
+def test_concurrent_processes_backfill_the_version_once(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    registry = ProjectRegistry(projects_root)
+    project = registry.create_project("demo", "demo", str(tmp_path))
+    for number in range(4):
+        source = _source(
+            tmp_path / "sessions",
+            f"session-{number}",
+            [
+                _row(1, "user", f"backfill canary {number}"),
+                _row(2, "assistant", "answer", state="completed"),
+            ],
+        )
+        (source.session_dir / "meta.json").write_text(
+            json.dumps({"project_id": project.project_id}), encoding="utf-8"
+        )
+        registry.record_session(
+            project.project_id,
+            session_id=source.session_id,
+            transcript_path=str(source.session_dir),
+        )
+
+    errors = _run_index_processes(
+        _open_project_index_process,
+        [(str(projects_root), project.project_id) for _ in range(8)],
+    )
+
+    assert errors == [None] * 8
+    index = index_module.open_project_index(registry, project.project_id)
+    status = index.status()
+    assert status.ready
+    assert status.session_count == 4
+    # generation increments once per build; a value of 1 proves exactly one of the
+    # eight racing processes built the version and the rest deferred.
+    assert status.generation == 1
+    assert all(index.search(f"backfill canary {number}") for number in range(4))
+
+
+def test_stale_building_marker_from_crashed_backfill_is_recovered(
+    tmp_path: Path,
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "stale marker canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    assert index.search("stale marker canary")
+    # a backfill killed mid-run leaves the marker behind with no live write lock.
+    index.building_path.touch()
+    assert index.status().ready
+    assert index.status().detail != "index building"
+    assert index.search("stale marker canary")
+    assert not index.building_path.exists()
+
+
 def test_out_of_order_unit_commit_never_regresses(tmp_path: Path) -> None:
     source = _source(
         tmp_path / "sessions",
@@ -1063,10 +1238,92 @@ def test_operator_cli_rebuild_status_and_search(
     assert '"generation": 1' in output
 
 
+def test_first_v5_search_backfills_linked_sessions_from_v4_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "demo", str(tmp_path))
+    source = _source(
+        home / "sessions",
+        "historical",
+        [
+            _row(1, "user", "historical backfill canary"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    (source.session_dir / "meta.json").write_text(
+        json.dumps({"project_id": project.project_id}), encoding="utf-8"
+    )
+    registry.record_session(
+        project.project_id,
+        session_id=source.session_id,
+        transcript_path=str(source.session_dir),
+    )
+    base_checkout = tmp_path / "base"
+    archive = subprocess.run(
+        ["git", "archive", V4_REVISION, "src/zeta"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(base_checkout, filter="data")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(base_checkout / "src")
+    built = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from pathlib import Path
+from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
+index = TranscriptIndex(Path(sys.argv[1]), sys.argv[2])
+index.append(TranscriptSource('historical', Path(sys.argv[3])))
+assert index.search('historical backfill canary')
+print(index.path.name)
+""",
+            str(registry.root / project.project_id),
+            project.project_id,
+            str(source.session_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert built.stdout.strip() == "transcript-index.sqlite3"
+
+    search_args = build_parser().parse_args(
+        ["project", "index", "demo", "search", "historical", "backfill"]
+    )
+    assert run_project(search_args) == 0
+    first_search = json.loads(capsys.readouterr().out)
+    assert first_search, "first v5 search returned [] instead of linked v4 results"
+
+    assert run_project(search_args) == 0
+    second_search = json.loads(capsys.readouterr().out)
+    assert second_search == first_search
+    assert run_project(
+        build_parser().parse_args(["project", "index", "demo", "status"])
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["generation"] == 1
+
+    assert run_project(
+        build_parser().parse_args(["project", "index", "demo", "rebuild"])
+    ) == 0
+    capsys.readouterr()
+    assert run_project(search_args) == 0
+    rebuilt_search = json.loads(capsys.readouterr().out)
+    assert rebuilt_search == first_search
+
+
 @pytest.mark.asyncio
 async def test_refreshes_coalesce_per_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1091,7 +1348,7 @@ async def test_refreshes_coalesce_per_project(
         asyncio.gather(
             *(
                 refresh_transcript_index(
-                    tmp_path / "projects",
+                    registry,
                     PROJECT_A,
                     source.session_id,
                     source.session_dir,
@@ -1116,7 +1373,7 @@ async def test_refresh_sqlite_failure_is_reported(
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
-            tmp_path / "projects", PROJECT_A, "one", tmp_path / "missing"
+            ProjectRegistry(tmp_path / "projects"), PROJECT_A, "one", tmp_path / "missing"
         )
     assert "could not refresh transcript index" in caplog.text
 
@@ -1125,6 +1382,7 @@ async def test_refresh_sqlite_failure_is_reported(
 async def test_transient_refresh_failure_retries_pending_session_on_next_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     first = _source(
         tmp_path / "sessions",
         "one",
@@ -1159,10 +1417,10 @@ async def test_transient_refresh_failure_retries_pending_session_on_next_refresh
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="database is locked"):
         await refresh_transcript_index(
-            tmp_path / "projects", PROJECT_A, first.session_id, first.session_dir
+            registry, PROJECT_A, first.session_id, first.session_dir
         )
     await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, second.session_id, second.session_dir
+        registry, PROJECT_A, second.session_id, second.session_dir
     )
 
     index = TranscriptIndex(tmp_path / "projects" / PROJECT_A, PROJECT_A)
@@ -1192,7 +1450,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     store.append_message(message(MessageRole.USER, "first indexed question"))
     store.append_message(message(MessageRole.ASSISTANT, "first indexed answer"))
     await refresh_transcript_index(
-        projects_root,
+        ProjectRegistry(projects_root),
         PROJECT_A,
         store.session_id,
         store.session_dir,
@@ -1218,7 +1476,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     monkeypatch.setattr(refresh_module, "_refresh_sources", fail_once)
     with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
         await refresh_transcript_index(
-            projects_root,
+            ProjectRegistry(projects_root),
             PROJECT_A,
             store.session_id,
             store.session_dir,
@@ -1241,7 +1499,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     )
 
     await refresh_transcript_index(
-        projects_root,
+        ProjectRegistry(projects_root),
         PROJECT_A,
         store.session_id,
         store.session_dir,
@@ -1263,6 +1521,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
     from zeta.core.store._log import MAX_PENDING_APPEND_RECEIPTS
 
     projects_root = tmp_path / "projects"
+    registry = ProjectRegistry(projects_root)
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1295,7 +1554,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
         )
         with pytest.raises(index_module.TranscriptIndexError, match="disk full"):
             await refresh_transcript_index(
-                projects_root,
+                registry,
                 PROJECT_A,
                 source.session_id,
                 source.session_dir,
@@ -1309,7 +1568,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
     # test-contract: seam inject the refresh worker boundary
     monkeypatch.setattr(refresh_module, "_refresh_sources", original_refresh)
     await refresh_transcript_index(
-        projects_root,
+        registry,
         PROJECT_A,
         source.session_id,
         source.session_dir,
@@ -1324,6 +1583,7 @@ async def test_failed_refresh_receipts_fall_back_to_bounded_full_read(
 async def test_append_runs_off_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
     source = _source(
         tmp_path / "sessions",
         "one",
@@ -1343,7 +1603,7 @@ async def test_append_runs_off_event_loop(
     # test-contract: seam inject the refresh worker boundary
     monkeypatch.setattr(refresh_module, "_refresh_sources", observed_refresh)
     await refresh_transcript_index(
-        tmp_path / "projects", PROJECT_A, source.session_id, source.session_dir
+        registry, PROJECT_A, source.session_id, source.session_dir
     )
 
     assert refresh_threads

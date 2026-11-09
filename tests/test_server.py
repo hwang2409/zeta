@@ -31,6 +31,7 @@ from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.core.slash as core_slash
 import zeta.server.handlers.history as history_module
 import zeta.server.protocol as protocol_module
 from tests.support.completion import completion_control
@@ -76,6 +77,7 @@ from zeta.attention_records import AttentionStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
+from zeta.core.slash import compaction_history as original_history
 from zeta.core.store import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -112,7 +114,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
-from zeta.server.connections import Admission, ConnectionRegistry
+from zeta.server.connections import Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     NOTIFICATION_WIRE_EVENTS,
@@ -4027,7 +4029,9 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
 
 
 @pytest.mark.asyncio
-async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) -> None:
+async def test_late_approval_after_disconnect_abort_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
     server = ZetaServer(
@@ -4037,18 +4041,34 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
-    # test-contract: latency reconnect must tolerate asynchronous disconnect cleanup
-    await asyncio.sleep(0.05)
-    second_reader, second_writer = await asyncio.open_unix_connection(
-        str(server.socket_path)
-    )
+    assert server.connections is not None
+    controller = server.connections.controller_metadata()
+    assert controller is not None
+    first_client_released = asyncio.Event()
+    release = server.connections.release
+
+    def record_release(connection: object) -> None:
+        release(connection)
+        if connection is controller.connection:
+            first_client_released.set()
+
+    monkeypatch.setattr(server.connections, "release", record_release)
+    second_writer = None
     try:
+        await _request(reader, writer, 3, "send", {"text": "read it"})
+        await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(first_client_released.wait(), 10)
+        second_reader, second_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
+        )
         await _request(
-            second_reader, second_writer, 1, "hello", {"protocol_version": "1.0"}
+            second_reader,
+            second_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.0"},
         )
         error = (
             await _request(
@@ -4061,9 +4081,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(tmp_path: Path) 
         )[-1]
         assert error["error"]["code"] == -32006
     finally:
-        await close_serve(
-            server, writer, second_writer
-        )
+        await close_serve(server, writer, second_writer)
 
 
 @pytest.mark.asyncio
@@ -9239,7 +9257,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         try:
             return call_soon_threadsafe(callback, *args)
         finally:
-            if callback is ConnectionRegistry._read_done:
+            if type(callback).__qualname__ == "_Handoff":
                 worker_completed.set()
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", track_read_completion)
@@ -9278,7 +9296,9 @@ async def test_slash_status_transcript_work_does_not_block_serve(
 
         # test-contract: seam hold the real synchronous transcript projection
         monkeypatch.setattr(
-            server.runtime.loop.context_assembler, "token_counter", blocked_counter
+            core_slash,
+            "compaction_history",
+            lambda entries, _counter: original_history(entries, blocked_counter),
         )
         probe_ready = threading.Event()
         probe_frames: list[dict[str, Any]] = []
@@ -9367,9 +9387,11 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             )
         )
         request_task.cancel()
+        # A cancelled /status waits for its started worker before it re-raises,
+        # so release the worker before awaiting the cancelled request.
+        release.set()
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(request_task, 10)
-        release.set()
         assert await asyncio.to_thread(worker_completed.wait, 10)
         assert not worker_errors
         frames = await _frames_until_eof(reader)
@@ -9388,27 +9410,33 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         await close_serve(server, observer_writer)
 
 
-@pytest.mark.asyncio
-async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("read_state", ["running", "queued"])
+async def test_serve_close_settles_slash_status_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_state: str
 ) -> None:
+    """A slash /status read that is running or queued ends when serve closes."""
+
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     _reader, writer, sid = await _ready_extensions(server)
-    entered = threading.Event()
     release = threading.Event()
-    worker_completed = asyncio.Event()
+    held: list[threading.Event] = []
+    workers: list[threading.Thread] = []
     worker_errors: list[BaseException] = []
-    shutdown_started = asyncio.Event()
-    closing: asyncio.Task[None] | None = None
+    status_entered = threading.Event()
+    slash_read_queued = asyncio.Event()
+    occupiers: list[asyncio.Task[object]] = []
     request_task: asyncio.Task[None] | None = None
-    loop_closed = False
-    status_worker: threading.Thread | None = None
+    closed = False
+    monkeypatch.setattr(
+        threading, "excepthook", lambda args: worker_errors.append(args.exc_value)
+    )
 
-    def capture_worker_error(args: threading.ExceptHookArgs) -> None:
-        worker_errors.append(args.exc_value)
-        call_soon_threadsafe(worker_completed.set)
+    def hold_worker(entered: threading.Event) -> object:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(30), "read worker was not released"
+        return None
 
-    monkeypatch.setattr(threading, "excepthook", capture_worker_error)
     assert server.runtime.loop is not None
     store = server.runtime.loop.store
     source = store.append_message(
@@ -9418,53 +9446,39 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
     original_counter = server.runtime.loop.context_assembler.token_counter
 
     def blocked_counter(message: Message) -> int:
-        nonlocal status_worker
-        status_worker = threading.current_thread()
-        entered.set()
-        assert release.wait(30), "status transcript worker was not released"
+        if not status_entered.is_set():
+            hold_worker(status_entered)
         return original_counter(message)
 
     # test-contract: seam hold the real synchronous transcript projection
     monkeypatch.setattr(
-        server.runtime.loop.context_assembler, "token_counter", blocked_counter
+        core_slash,
+        "compaction_history",
+        lambda entries, _counter: original_history(entries, blocked_counter),
     )
-    assert server.connections is not None
-    loop = server.connections.loop
-    call_soon_threadsafe = loop.call_soon_threadsafe
-    is_closed = loop.is_closed
+    registry = server.connections
+    assert registry is not None
+    run_blocking = registry.run_blocking
 
-    def close_aware_call_soon_threadsafe(
-        callback: Callable[..., object], *args: object
-    ) -> asyncio.Handle:
-        if loop_closed:
-            raise RuntimeError("Event loop is closed")
-        return call_soon_threadsafe(callback, *args)
+    async def track_slash_read(job: Callable[[], object]) -> object:
+        # Waiters run only after this task yields, which is after the enqueue.
+        slash_read_queued.set()
+        return await run_blocking(job)
 
-    def track_closed_status_worker() -> bool:
-        closed = loop_closed or is_closed()
-        if closed and threading.current_thread() is status_worker:
-            call_soon_threadsafe(worker_completed.set)
-        return closed
-
-    monkeypatch.setattr(loop, "call_soon_threadsafe", close_aware_call_soon_threadsafe)
-    monkeypatch.setattr(loop, "is_closed", track_closed_status_worker)
-    close_control = server.control.close
-
-    async def track_shutdown() -> None:
-        shutdown_started.set()
-        await close_control()
-
-    monkeypatch.setattr(server.control, "close", track_shutdown)
-    writer_wait_closed = writer.wait_closed
-
-    async def wait_closed_after_server_shutdown() -> None:
-        assert shutdown_started.is_set(), (
-            "server shutdown must start before the test waits for the peer close"
-        )
-        await asyncio.wait_for(writer_wait_closed(), 10)
-
-    monkeypatch.setattr(writer, "wait_closed", wait_closed_after_server_shutdown)
     try:
+        if read_state == "queued":
+            # Occupy both serve read workers so the /status read stays queued.
+            for _ in range(2):
+                entered = threading.Event()
+                held.append(entered)
+                occupiers.append(
+                    asyncio.create_task(
+                        run_blocking(lambda entered=entered: hold_worker(entered))
+                    )
+                )
+            for entered in held:
+                assert await asyncio.to_thread(entered.wait, 10)
+        monkeypatch.setattr(registry, "run_blocking", track_slash_read)
         writer.write(
             json.dumps(
                 {
@@ -9477,9 +9491,9 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             + b"\n"
         )
         await writer.drain()
-        assert await asyncio.to_thread(entered.wait, 10), (
-            "status transcript worker did not start"
-        )
+        await await_or_fail(slash_read_queued.wait(), what="/status read submission")
+        if read_state == "running":
+            assert await asyncio.to_thread(status_entered.wait, 10)
         client = server._client
         assert client is not None
         request_task = next(
@@ -9491,29 +9505,33 @@ async def test_slash_status_worker_ignores_completion_after_serve_loop_closes(
             )
         )
 
-        writer.close()
-        closing = asyncio.create_task(server.close())
-        await asyncio.wait_for(shutdown_started.wait(), 10)
-        loop_closed = True
+        await await_or_fail(server.close(), what="server close")
+        # The workers are still held: only the registry close can end these.
+        await await_or_fail(
+            asyncio.gather(request_task, *occupiers, return_exceptions=True),
+            what=f"{read_state} /status request after server close",
+        )
+        assert request_task.cancelled()
+        assert all(task.cancelled() for task in occupiers)
+        assert server.connections is None
+        closed = True
+
         release.set()
-        await asyncio.wait_for(worker_completed.wait(), 10)
+        for worker in workers:
+            await asyncio.to_thread(worker.join, 10)
+            assert not worker.is_alive(), f"{worker.name} did not exit"
         assert not worker_errors
-        loop_closed = False
-        await asyncio.wait_for(asyncio.shield(closing), 10)
-        request_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(request_task), 10)
-        assert request_task.done(), "serve request task remained after cancellation"
+        # A queued read that close dropped never starts after the release.
+        assert status_entered.is_set() == (read_state == "running")
     finally:
-        loop_closed = False
         release.set()
-        if request_task is not None and not request_task.done():
-            request_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await asyncio.wait_for(asyncio.shield(request_task), 10)
-        if closing is None:
-            closing = asyncio.create_task(server.close())
-        await asyncio.wait_for(asyncio.shield(closing), 10)
+        for task in (request_task, *occupiers):
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 10)
+        if not closed:
+            await asyncio.wait_for(server.close(), 10)
         writer.close()
         with suppress(Exception):
             await asyncio.wait_for(writer.wait_closed(), 10)
