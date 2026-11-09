@@ -11719,9 +11719,10 @@ async def test_account_switch_does_not_block_loop_while_registry_lock_held(
 
     async def ticker() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
 
     ticker_task = asyncio.create_task(ticker())
     request_task = asyncio.create_task(

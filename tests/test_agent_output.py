@@ -502,11 +502,12 @@ async def test_agent_output_read_does_not_block_event_loop(
 
     async def heartbeat() -> None:
         nonlocal ticks
-        while not release.is_set():
-            ticks += 1
-            if started.is_set():
-                ticked_after_start.set()
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not release.is_set():
+                ticks += 1
+                if started.is_set():
+                    ticked_after_start.set()
+                await asyncio.sleep(0)
 
     def release_after_heartbeat() -> None:
         assert started.wait(10)
@@ -1042,8 +1043,9 @@ async def test_full_child_runs_never_read_lifecycle_on_event_loop(
             _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         )
         if case == "cancel":
-            while len(loop.backend.calls) < 2:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while len(loop.backend.calls) < 2:
+                    await asyncio.sleep(0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)
