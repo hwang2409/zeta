@@ -21,7 +21,7 @@ from .attention_records import (
     broken_record_refusal,
     observed_epoch_for_session,
 )
-from .project_inbox import ProjectInbox
+from .project_inbox import ProjectInbox, USER_ORIGIN
 from .runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
@@ -71,6 +71,7 @@ class AttentionReplies:
         *,
         registry_state: ProjectRegistryState | None = None,
         on_inbox_visible: Callable[[], None] | None = None,
+        origin: str = USER_ORIGIN,
     ) -> None:
         self.home = Path(home)
         self.source_session_id = source_session_id
@@ -79,6 +80,7 @@ class AttentionReplies:
         self.staged_dir = self.attention_dir / "staged"
         self.registry_state = registry_state
         self.on_inbox_visible = on_inbox_visible
+        self.origin = origin
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
@@ -615,10 +617,11 @@ class AttentionReplies:
             title=f"{label}: {first.title}"
             if len(records) == 1
             else f"{label} batch ({len(records)})",
-            body=f"User relayed from session {sender}. Check whether the situation has changed before acting.\n\n"
+            body=f"Attention decision relayed from session {sender}. Check whether the situation has changed before acting.\n\n"
             + "\n\n".join(sections),
             message_id=self._message_id(pairs),
             on_visible=self.on_inbox_visible,
+            _origin=self.origin,
         )
         for record, (_, reply) in zip(records, pairs):
             current = self._record(record.id)
