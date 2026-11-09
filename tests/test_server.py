@@ -9159,7 +9159,6 @@ async def test_slash_status_transcript_work_does_not_block_serve(
     assert server.connections is not None
     loop = server.connections.loop
     call_soon_threadsafe = loop.call_soon_threadsafe
-    read_done = server.connections._reads._done
 
     def track_read_completion(
         callback: Callable[..., object], *args: object
@@ -9167,7 +9166,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         try:
             return call_soon_threadsafe(callback, *args)
         finally:
-            if callback == read_done:
+            if getattr(callback, "__qualname__", "") == "_OwnedCall._deliver":
                 worker_completed.set()
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", track_read_completion)
