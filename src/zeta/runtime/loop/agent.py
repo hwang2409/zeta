@@ -75,6 +75,7 @@ from ...providers.completion import (
     CompletionControl,
     CompletionRetryBudget,
     CompletionRun,
+    ProviderAccountSwitched,
     ResetPolicy,
 )
 from ...runtime.tool_setup import select_tool_registry
@@ -88,6 +89,7 @@ from ..prompt import RuntimePrompt
 from ._completion import (
     _error_info,
     _sanitize_account_message,
+    account_generation,
     can_retry_context,
     ensure_context_reduced,
     observed_completion,
@@ -931,6 +933,7 @@ class AgentLoop(
                         ),
                         budget=provider_retry_budget,
                         task_deadline=task_deadline,
+                        account_generation=account_generation(self),
                     ),
                 )
                 has_active_delivery = prepared_delivery.has_active_delivery
@@ -1009,6 +1012,10 @@ class AgentLoop(
                     await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
+            except ProviderAccountSwitched:  # redispatch through the new account's backend
+                await completion.aclose()  # type: ignore[union-attr]
+                self._dispatch_progress.reset()
+                continue
             except Exception as exc:
                 if completion is not None:
                     await completion.aclose()

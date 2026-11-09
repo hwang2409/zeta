@@ -20,7 +20,7 @@ from tests.test_server import _connect, _request
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer, slash_commands
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.server.slash_commands import run_command
 

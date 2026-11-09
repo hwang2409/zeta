@@ -15,6 +15,7 @@ from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.codex import CodexLoginRequiredError
 from zeta.config.settings import load_settings, resolve
+from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
 from zeta.core.slash import create_slash_registry
@@ -189,7 +190,8 @@ idle_minutes = 2
 def test_memory_slash_command_dispatches_log_and_undo() -> None:
     calls: list[str] = []
     session = SimpleNamespace(
-        slash_memory=lambda args: calls.append(args) or f"memory:{args}"
+        slash_memory=lambda args: calls.append(args) or f"memory:{args}",
+        slash_lock=SlashLock(),
     )
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 

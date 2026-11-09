@@ -849,6 +849,11 @@ Clients use `turn_id` to correlate this durable outcome with a negotiated
 {"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
 ```
 
+While a slash command runs, `status` also carries
+`slash_command: {"name": "/status", "state": "running"}`. `state` is `waiting`
+after the command was cancelled and is finishing work it already started. The
+field is omitted when no slash command runs.
+
 ### `ping`
 
 Requires the `ping` feature; otherwise `-32601`. Params: none. The result is
@@ -1214,9 +1219,29 @@ Event fields are:
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
-The `retry` data can contain `retry: integer`, `delay: number`, `text: string`,
-and `is_stall: boolean`. It is an informational notice that a retry is
-scheduled. Unknown provider keys remain allowed inside `data`.
+The `retry` data can contain `retry: integer`, `delay: number` (seconds),
+`text: string`, and `is_stall: boolean`. It is an informational notice that a
+retry is scheduled. A provider retry can also include `kind: "provider_retry"`,
+`attempt: integer`, and `reason: string`.
+
+For a long provider rate limit, the retry data uses
+`kind: "provider_rate_limit_hold"`. This means the turn is held and will
+re-probe the provider rate limit; it is not an error. The hold ends when the
+provider succeeds, the turn is canceled, its deadline expires, or the
+credential/account changes. This kind can include these fields:
+
+| field | type and unit | meaning |
+| --- | --- | --- |
+| `delay` | number, seconds | delay before the next probe |
+| `retry_after` | number, seconds | provider-requested rate-limit duration |
+| `provider` | string | provider name |
+| `attempt` | integer | provider attempt number |
+| `reason` | string | reason for the hold |
+| `until` | number, Unix timestamp in seconds | wall-clock time when the provider-requested hold ends, emitted as the numeric epoch value from `time.time()` |
+| `text` | string | human-readable hold status |
+
+These fields are additive. Older clients can ignore them. Unknown provider
+keys remain allowed inside `data`.
 
 `assistant_reset` is emitted only when the client negotiated the
 `assistant_reset` feature and a scheduled retry will actually start. It follows
@@ -1502,9 +1527,19 @@ implementation for the frontend client. Two RPCs cover the surface.
   `client_only: true` and the stable machine-readable reason
   `unavailable: "requires_tui"`. Invalid `include_unavailable` values return
   `-32602`.
+  Each entry also has `runs_while_busy`, read from the same policy that the
+  busy gate of `slash_run` uses:
+  - `always`: every form runs while a turn is running. Client-only entries
+    have this value, because `slash_run` answers them with `client_only`.
+  - `never`: every form returns `-32004` while a turn is running (for
+    example `/plan`, `/compact`, skills, and prompt macros).
+  - `read_forms`: only the read forms run while a turn is running (for
+    example bare `/status` or bare `/memory`); other forms return `-32004`.
+  A missing field means unknown: older servers do not send it, so a client
+  must send the command and handle `-32004`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
-  starting with `/`). Rejects the request when a turn is running with
-  `-32004`. Returns a `kind` discriminator:
+  starting with `/`). When a turn is running, it rejects the forms that
+  `runs_while_busy` does not allow with `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt. For
     `/status`, this is the same operational view as the TUI, including configured
     hooks, recent cache-hit history, and model-attributed estimated cost. The

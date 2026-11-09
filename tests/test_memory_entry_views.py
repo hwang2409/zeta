@@ -25,7 +25,7 @@ from zeta.project_errors import ProjectRegistryError
 from zeta.project_memory_commands import run_memory_command
 from zeta.project_memory_history import _MEMORY_MIRROR_HEADER
 from zeta.project_registry import ProjectRegistry
-from zeta.server.project_requests import ProjectRequests
+from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.protocol import FrameCodec
 from zeta.tools._validation import validate_tool_result
 from zeta.tools.project import _inspect_project
