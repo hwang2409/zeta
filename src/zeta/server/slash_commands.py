@@ -545,7 +545,7 @@ async def registry_for_request(runtime: ServerRuntime) -> SlashCommandRegistry:
     """Refresh live skills and build one registry for a serve request."""
 
     if runtime.loop is not None:
-        await runtime.loop.refresh_skills()
+        await runtime.loop.refresh_live_config()
     return await asyncio.to_thread(build_registry, runtime)
 
 

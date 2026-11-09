@@ -1001,6 +1001,9 @@ class ApprovalLifecycle:
         history_outcome: OSError | asyncio.CancelledError | None = None
         try:
             history_outcome = await self._append_delegated_history(record, payload)
+            current = self._state.records.get(record.target.key)
+            if current is not None and current.token == record.token:
+                record = current
             if payload is not None and record.published:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal
