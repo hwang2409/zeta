@@ -1,6 +1,6 @@
 """Skill discovery and loading."""
 
-from .loader import (
+from .catalog import (
     SkillCatalog,
     SkillMeta,
     discover_packaged_skills,

@@ -13,6 +13,8 @@ RATE_LIMIT_PROBE_SECONDS = 300.0
 RATE_LIMIT_CREDENTIAL_POLL_SECONDS = 5.0
 # floor for a subscription-limit probe, so a reset that already passed cannot spin.
 SUBSCRIPTION_LIMIT_MIN_PROBE_SECONDS = 60.0
+# a background child held longer than this wakes its parent once per hold.
+LONG_HOLD_WAKE_SECONDS = 15 * 60.0
 
 
 def retry_after_seconds(
