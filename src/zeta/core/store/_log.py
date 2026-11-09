@@ -34,6 +34,7 @@ from ..checkpoints import (
 from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
+    TranscriptLoadError,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
