@@ -25,6 +25,7 @@ from tests.test_server import (
     TIMEOUT,
     _connect,
     _frames_until_event,
+    _named_events,
     _read_raw,
     _request,
 )
@@ -37,6 +38,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
 )
 from zeta.server import ZetaServer
@@ -121,6 +123,103 @@ def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> 
     assert not violations, (
         "approval state writes outside lifecycle swap seam: " + ", ".join(violations)
     )
+
+
+@pytest.mark.asyncio
+async def test_delegated_tool_end_survives_approval_history_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, _foreground = await _approval_server(tmp_path)
+    child_store = ConversationStore(tmp_path / "child")
+    call = ToolCall("child-call", "read", {"path": "/tmp/input"})
+    child_store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
+    policy = server.runtime.policy
+    assert policy is not None
+    request = ApprovalRequest(call.id, call, child_instance_id="child")
+    policy.register_delegated(request, child_store, child_instance_id="child")
+    history_started = asyncio.Event()
+    release_history = asyncio.Event()
+    resolving: asyncio.Task[dict[str, object]] | None = None
+    try:
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_APPROVAL_START,
+                    tool_call=call,
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="delegated approval start",
+        )
+        await await_or_fail(
+            _frames_until_event(reader, "approval_request"), what="approval request"
+        )
+        wire_id = server.control._approvals.wire_id(request.key)
+        original_append = server.control._approvals._append_delegated_history
+
+        async def hold_history(
+            record: object, payload: dict[str, object] | None
+        ) -> object:
+            history_started.set()
+            await await_or_fail(
+                release_history.wait(), what="release approval history"
+            )
+            return await original_append(record, payload)
+
+        monkeypatch.setattr(
+            server.control._approvals, "_append_delegated_history", hold_history
+        )
+        resolving = asyncio.create_task(
+            server.control.resolve_approval("deny", wire_id)
+        )
+        await await_or_fail(history_started.wait(), what="approval history start")
+        await await_or_fail(
+            server.control._event(
+                StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=call,
+                    tool_result=ToolResult(call.id, "child result"),
+                    data={"agent_instance_id": "child"},
+                ),
+                session_id="parent",
+                background=True,
+            ),
+            what="child tool end",
+        )
+        release_history.set()
+        await await_or_fail(resolving, what="approval resolution")
+
+        async def read_until_tool_end() -> list[dict[str, object]]:
+            frames: list[dict[str, object]] = []
+            while True:
+                try:
+                    raw = await asyncio.wait_for(_read_raw(reader), 10)
+                except TimeoutError:
+                    return frames
+                frame = json.loads(raw)
+                frames.append(frame)
+                if frame.get("params", {}).get("event") == "tool_end":
+                    return frames
+
+        frames = await await_or_fail(
+            read_until_tool_end(), timeout=20, what="child tool_end publication"
+        )
+        assert len(_named_events(frames, "tool_end")) == 1
+    finally:
+        release_history.set()
+        if resolving is not None and not resolving.done():
+            resolving.cancel()
+        if resolving is not None:
+            await await_or_fail(
+                asyncio.gather(resolving, return_exceptions=True),
+                what="approval resolution cleanup",
+            )
+        await close_serve(server, writer)
+        child_store.close()
 
 
 @pytest.mark.asyncio
