@@ -1704,6 +1704,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
+| `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
