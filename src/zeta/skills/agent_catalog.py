@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..agent.budget import HARD_MAX_AGENT_DEPTH
-from ..agent.presets import AGENT_PRESETS, AgentPreset
+from ..agent.presets import AGENT_PRESETS, AgentPreset, valid_max_turns
 from ..models.catalog import known_model_names
 from .discovery import (
     MarkdownDocument,
@@ -122,7 +122,7 @@ class AgentCatalog:
                 or type(allow_delegation) is not bool
                 or type(accepts_follow_ups) is not bool
                 or type(explicit_finish) is not bool
-                or (max_turns is not None and (type(max_turns) is not int or max_turns < 1))
+                or (max_turns is not None and not valid_max_turns(max_turns))
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
                 or (agents_root is not None and type(agents_root) is not str)
@@ -201,7 +201,7 @@ def _build_agent(
             f"agent {document.path} frontmatter explicit_finish must be a boolean"
         )
     max_turns = metadata.get("max_turns")
-    if max_turns is not None and (type(max_turns) is not int or max_turns < 1):
+    if max_turns is not None and not valid_max_turns(max_turns):
         raise ValueError(
             f"agent {document.path} frontmatter max_turns must be a positive integer"
         )

@@ -11,6 +11,11 @@ from ..protocol.types import Message, MessageRole, TextContent
 AgentType = Literal["general", "explore", "plan", "run"]
 
 
+def valid_max_turns(value: object) -> bool:
+    """The one rule for a child turn limit: a positive integer, never a bool."""
+    return type(value) is int and value >= 1
+
+
 @dataclass(frozen=True, slots=True)
 class AgentPreset:
     """Define the child prompt and tools for one agent type."""

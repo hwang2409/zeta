@@ -58,6 +58,7 @@ from .presets import (
     RUN_PRESET,
     AgentPreset,
     resolve_child_profile_tools,
+    valid_max_turns,
 )
 from .receipt import (
     MAX_AGENT_RESULT_BYTES,
@@ -74,7 +75,6 @@ from .turn_limit import (
     make_finish_limited_child_turn,
     make_publish_child_lifecycle,
     turn_control_for,
-    valid_max_turns,
 )
 
 logger = logging.getLogger(__name__)

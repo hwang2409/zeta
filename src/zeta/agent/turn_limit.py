@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from ..core.checkpoints import _now
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
 from ..protocol.types import Message, harness_notice
+from .presets import valid_max_turns
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
 
 HANDOFF_NAME = "turn-limit-handoff.md"
@@ -77,10 +78,6 @@ class ChildTurnControl:
     @property
     def reserved(self) -> bool:
         return self._reserved
-
-
-def valid_max_turns(value: object) -> bool:
-    return type(value) is int and value >= 1
 
 
 def turn_control_for(
