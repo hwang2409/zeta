@@ -122,7 +122,7 @@ class StoreWriteMixin:
         self._create_task(
             _observe_refresh(
                 refresh_transcript_index(
-                    registry.root,
+                    registry,
                     self.root_project_id,
                     self.store.session_id,
                     self.store.session_dir,

@@ -511,16 +511,6 @@ class AnthropicBackend(CompletionBackend):
             map_error,
         )
 
-    def rate_limit_state(self) -> tuple[int, int] | None:
-        path = getattr(self.token_store, "path", None)
-        if not isinstance(path, Path):
-            return None
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
-
     @property
     def connection_setup_count(self) -> int:
         return self._lease.connection_setup_count

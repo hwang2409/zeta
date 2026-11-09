@@ -67,7 +67,7 @@ def _fixture(home: Path, count: int = 3) -> ReplyFixture:
         project_id=project.project_id,
         auto_project=False,
     )
-    store = AttentionStore(session.store.session_dir)
+    store = AttentionStore(session.store.session_dir, writer_epoch=5)
     records = [
         store.request(
             session_id=session.store.session_id,
@@ -97,7 +97,7 @@ def test_invalid_attention_name_is_listed_without_reading_bytes(tmp_path: Path) 
     long_path = fixture.attention_dir / ("x" * 200 + ".json")
     long_path.write_bytes(b"also must not be read")
 
-    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id).list()
+    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id, writer_epoch=5).list()
 
     broken = next(item for item in listed if isinstance(item, Broken))
     assert broken.id == "junk.json"
@@ -132,7 +132,7 @@ def test_broken_attention_is_listed_and_cannot_be_replied_or_deleted(
     original = path.read_bytes()
     path.write_bytes(b"{")
 
-    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id).list()
+    listed = AttentionStore(tmp_path / "sessions" / fixture.session_id, writer_epoch=5).list()
     assert len(listed) == 1
     broken = listed[0]
     assert isinstance(broken, Broken)
@@ -211,7 +211,7 @@ async def test_broken_sealed_journal_does_not_discard_loaded_session(
         finally:
             await server.close()
 
-    listed = AttentionStore(fixture.home / "sessions" / fixture.session_id).list()
+    listed = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5).list()
     assert any(
         isinstance(record, Broken) and record.id == fixture.records[0].id
         for record in listed
@@ -236,7 +236,7 @@ def _stage_all(fixture: ReplyFixture, replies: list[str] | None = None) -> list[
 
 
 def _assert_resolved(fixture: ReplyFixture, replies: list[str]) -> None:
-    store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+    store = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
     assert [store.get(record.id).decision for record in fixture.records] == replies
     assert all(store.get(record.id).status == "resolved" for record in fixture.records)
 
@@ -670,7 +670,7 @@ def test_attention_replies_public_table(
         assert restarted.recover().staged == ()
         assert fixture.inbox_messages() == []
         assert (
-            AttentionStore(fixture.home / "sessions" / fixture.session_id)
+            AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
             .get(fixture.records[0].id)
             .status
             == "open"
@@ -870,7 +870,7 @@ def test_attention_replies_public_table(
         assert after == before
         assert replies.recover().staged == ((popup.id, "typed popup text"),)
         assert (
-            AttentionStore(fixture.home / "sessions" / fixture.session_id)
+            AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
             .get(popup.id)
             .status
             == "open"
@@ -912,7 +912,7 @@ def test_attention_replies_public_table(
             if path.is_file()
         } == retained_bytes
         assert (
-            AttentionStore(fixture.home / "sessions" / fixture.session_id)
+            AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
             .get(unrelated.id)
             .decision
             == "unrelated answer"
@@ -988,7 +988,7 @@ def test_attention_replies_public_table(
         assert {message["id"] for message in fixture.inbox_messages()} == set(
             journal_ids
         )
-        store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+        store = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
         assert store.get(fixture.records[0].id).decision == "first"
         assert store.get(fixture.records[1].id).decision == "second"
         _assert_no_live_journal(fixture)
@@ -1001,7 +1001,7 @@ def test_attention_replies_public_table(
     second = replies.dismiss(record.id)
     assert first.items[0].status == "applied"
     assert second.already_resolved
-    resolved = AttentionStore(fixture.home / "sessions" / fixture.session_id).get(
+    resolved = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5).get(
         record.id
     )
     assert resolved.status == "resolved" and resolved.decision is None
@@ -1083,7 +1083,7 @@ def test_flush_sends_good_staged_reply_and_keeps_broken_one(tmp_path: Path) -> N
         + "\n\n"
         + _section(good, "good answer")
     )
-    store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+    store = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
     assert store.get(good.id).status == "resolved"
     assert bad_path.read_bytes() == b"{"
     assert (fixture.attention_dir / "staged" / bad.id).read_text() == "bad answer"
@@ -1147,7 +1147,7 @@ def test_record_broken_at_call_time_never_blocks_good_items(
         refusal = exc
 
     assert bad_path.read_bytes() == b"{"
-    store = AttentionStore(fixture.home / "sessions" / fixture.session_id)
+    store = AttentionStore(fixture.home / "sessions" / fixture.session_id, writer_epoch=5)
     if operation in {"stage", "reply", "dismiss", "resolve_local"}:
         assert refusal is not None and "invalid_json" in str(refusal)
         assert _attention_files(fixture) == before, "refusal left a partial write"
