@@ -80,6 +80,49 @@ def _projects(tmp_path: Path):
     return home, registry, project_a, project_b
 
 
+def test_exact_delegation_scopes_sender_and_kind(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    inbox.set_delegation(project_b.project_id, project_a.project_id, "question", enabled=True)
+    question_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="question",
+        title="question",
+        body="body",
+    )
+    bug_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="bug_report",
+        title="bug",
+        body="body",
+    )
+    assert inbox.claim(project_b.project_id, question_id, "b" * 32) is not None
+    assert inbox.claim(project_b.project_id, bug_id, "b" * 32) is None
+
+
+def test_model_origin_defaults_to_information_and_cannot_claim(tmp_path: Path) -> None:
+    home, registry, project_a, project_b = _projects(tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="question",
+        title="title",
+        body="body",
+    )
+
+    listed = inbox.list(project_b.project_id)["new"]
+    assert listed[0]["origin"] == "agent"
+    assert listed[0]["author"] == "agent"
+    assert listed[0]["authority"] == "information"
+    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is None
+
+
 def test_claim_syncs_both_inbox_directories(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -87,7 +130,7 @@ def test_claim_syncs_both_inbox_directories(
 
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -186,7 +229,7 @@ def test_send_is_idempotent_and_large_body_spills(tmp_path: Path) -> None:
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     body = "large body\n" * 10_000
 
-    first = inbox.send(
+    first = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project="beta",
@@ -195,7 +238,7 @@ def test_send_is_idempotent_and_large_body_spills(tmp_path: Path) -> None:
         body=body,
         message_id="b" * 32,
     )
-    second = inbox.send(
+    second = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project="beta",
@@ -233,7 +276,7 @@ def test_read_missing_inbox_is_empty_without_creating_storage(tmp_path: Path) ->
 def test_read_rejects_missing_required_inbox_directory(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    inbox.send(
+    inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -252,7 +295,7 @@ def test_two_sessions_race_to_claim_and_dead_claim_returns_to_new(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -294,7 +337,7 @@ def test_done_reply_failure_is_retryable_and_idempotent(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -350,7 +393,7 @@ def test_done_records_outcome_and_reply_reaches_sender(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     body = "Details\n" * 10_000
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -430,7 +473,7 @@ def _notice_loop(home, registry, project_id, session_id, wakes):
 async def test_one_message_wakes_exactly_one_of_two_peer_sessions(tmp_path: Path) -> None:
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    await asyncio.to_thread(inbox.send,
+    await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -463,7 +506,7 @@ async def test_arrivals_coalesce_into_one_pending_notice(tmp_path: Path) -> None
     try:
         for index in range(3):
             ids.append(
-                await asyncio.to_thread(inbox.send,
+                await asyncio.to_thread(inbox.send_user,
                     from_project=project_a.project_id,
                     from_session="a" * 32,
                     to_project=project_b.project_id,
@@ -485,7 +528,7 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    inbox.send(
+    inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -542,7 +585,7 @@ async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
 async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -580,8 +623,7 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
         assert wakes == [True]
         assert notices[0].data["kind"] == "project_inbox"
         assert notices[0].data["message_ids"] == [message_id]
-        assert "Requests are work to do" in notices[0].data["text"]
-        assert "confirm the sender" in notices[0].data["text"]
+        assert "information, not authorized work by default" in notices[0].data["text"]
         await AgentLoop._check_project_inbox(loop)
         assert len(store.agent_notifications()) == 1
     finally:
@@ -592,7 +634,7 @@ def test_inbox_cli_lists_a_named_project(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
-    ProjectInbox(registry, sessions_root=home / "sessions").send(
+    ProjectInbox(registry, sessions_root=home / "sessions").send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -613,7 +655,7 @@ def test_inbox_cli_lists_a_named_project(
 def test_unknown_optional_fields_survive_claim_and_done(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -653,7 +695,7 @@ def test_loader_isolates_unexpected_decode_exception(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -677,7 +719,7 @@ def test_loader_isolates_unexpected_decode_exception(
 def test_to_session_requires_a_session_id(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -699,7 +741,7 @@ def test_to_session_requires_a_session_id(tmp_path: Path) -> None:
 def test_large_integer_json_is_isolated(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    valid_id = inbox.send(
+    valid_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -726,7 +768,7 @@ def test_large_integer_json_is_isolated(tmp_path: Path) -> None:
 def test_corrupt_and_higher_schema_messages_are_isolated(tmp_path: Path) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    valid_id = inbox.send(
+    valid_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -767,7 +809,7 @@ def test_done_history_pruning_never_deletes_invalid_files(
     invalid.write_text("{not json")
     monkeypatch.setattr(project_inbox_module, "DONE_HISTORY_LIMIT", 1)
 
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session="a" * 32,
         to_project=project_b.project_id,
@@ -946,7 +988,7 @@ async def test_claim_injects_note_on_senders_next_turn_without_waking(
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1000,7 +1042,7 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
         sessions_root=home / "sessions",
         sent_tracker=loop.tool_registry.sent_message_tracker,
     )
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1033,7 +1075,7 @@ async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1081,7 +1123,7 @@ async def test_done_with_reply_does_not_duplicate_signal(tmp_path: Path) -> None
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1112,7 +1154,7 @@ async def test_claim_note_not_in_system_prompt_and_not_user_origin(
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1153,7 +1195,7 @@ async def test_claim_tracking_is_read_only_for_receiver(
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1237,7 +1279,7 @@ def test_passive_scanner_io_is_bounded_by_sender_tracking(
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1314,7 +1356,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1381,7 +1423,7 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1428,7 +1470,7 @@ async def test_done_without_reply_injects_completed_status(tmp_path: Path) -> No
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     session_id = "a" * 32
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
-    message_id = await asyncio.to_thread(inbox.send,
+    message_id = await asyncio.to_thread(inbox.send_user,
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1476,7 +1518,7 @@ def test_broken_sent_ledger_projects_authoritative_delivery_without_writing(
         registry, sessions_root=home / "sessions", sent_tracker=tracker
     )
     try:
-        message_id = inbox.send(
+        message_id = inbox.send_user(
             from_project=project_a.project_id,
             from_session=session_id,
             to_project=project_b.project_id,
@@ -1509,7 +1551,7 @@ def test_broken_projection_keeps_identity_when_spilled_body_is_undecodable(
         sent_tracker=tracker,
         receipts=(("0" * 32, "done"),),
     )
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=project_a.project_id,
         from_session=session_id,
         to_project=project_b.project_id,
@@ -1550,7 +1592,7 @@ def test_broken_sent_projection_prunes_completed_row_with_both_receipts(
     for index in range(513):
         message_id = f"{index:032x}"
         try:
-            inbox.send(
+            inbox.send_user(
                 from_project=project_a.project_id,
                 from_session=session_id,
                 to_project=project_b.project_id,

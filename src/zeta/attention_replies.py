@@ -21,7 +21,7 @@ from .attention_records import (
     broken_record_refusal,
     observed_epoch_for_session,
 )
-from .project_inbox import ProjectInbox, USER_ORIGIN
+from .project_inbox import USER_ORIGIN, ProjectInbox
 from .runtime.project_registry_state import (
     ProjectRegistryState,
     available_project_registry,
