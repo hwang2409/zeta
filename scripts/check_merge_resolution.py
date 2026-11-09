@@ -286,7 +286,10 @@ def _owners_by_line(tree: ast.Module, count: int) -> list[str]:
 
 
 def _diff_blocks(base: list[str], side: list[str]) -> list[tuple[int, int, int, int]]:
-    matcher = difflib.SequenceMatcher(None, base, side, autojunk=False)
+    # Repeated source lines make the exact matcher superlinear on large files.
+    matcher = difflib.SequenceMatcher(
+        None, base, side, autojunk=len(base) + len(side) > 1000
+    )
     return [
         (old_start, old_end, new_start, new_end)
         for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()

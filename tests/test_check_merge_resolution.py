@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.check_merge_resolution as merge_resolution
 from scripts.check_merge_resolution import Item, _item_in, item_key
 
 SCRIPT = Path(
@@ -964,6 +965,19 @@ def test_pr_side_line_table(tmp_path: Path, case: str) -> None:
     if case == "lost line":
         assert "pr-line" in result.stdout
 
+
+
+def test_large_repeated_diff_uses_bounded_matching(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[bool] = []
+    original = merge_resolution.difflib.SequenceMatcher
+
+    def matcher(*args, **kwargs):
+        calls.append(kwargs["autojunk"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(merge_resolution.difflib, "SequenceMatcher", matcher)
+    merge_resolution._diff_blocks(["same"] * 600, ["same"] * 600 + ["new"])
+    assert calls == [True]
 
 
 def test_pr_line_count_subtracts_base_and_main_copies(tmp_path: Path) -> None:
