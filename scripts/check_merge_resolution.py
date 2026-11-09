@@ -14,18 +14,6 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 
-_AST_CACHE: dict[str, ast.Module] = {}
-_PARSE_ITEMS_CACHE: dict[tuple[int, str, tuple[tuple[str, str], ...]], tuple[list[Item], set[tuple[str, str]]]] = {}
-
-
-def _parse_tree(text: str, path: str) -> ast.Module:
-    key = hashlib.sha256(text.encode()).hexdigest()
-    tree = _AST_CACHE.get(key)
-    if tree is None:
-        tree = ast.parse(text, filename=path)
-        _AST_CACHE[key] = tree
-    return tree
-
 ROOTS = ("src/", "scripts/", "tests/")
 
 
@@ -128,22 +116,6 @@ def _collection_elements(value: ast.expr) -> list[ast.expr] | None:
 def parse_items(
     path: str, tree: ast.Module, collection_lookup: dict[str, list[ast.expr]]
 ) -> tuple[list[Item], set[tuple[str, str]]]:
-    cache_key = (
-        id(tree),
-        path,
-        tuple(
-            sorted(
-                (
-                    name,
-                    tuple(ast.dump(element, include_attributes=False) for element in elements),
-                )
-                for name, elements in collection_lookup.items()
-            )
-        ),
-    )
-    cached = _PARSE_ITEMS_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
     result: list[Item] = []
     unresolved: set[tuple[str, str]] = set()
 
@@ -274,7 +246,6 @@ def parse_items(
             add_dispatch_comparisons(node, scope)
 
     visit_body(tree.body)
-    _PARSE_ITEMS_CACHE[cache_key] = (result, unresolved)
     return result, unresolved
 
 
@@ -359,7 +330,7 @@ def _owner_translation(source: dict, target: dict) -> dict[str, str]:
 
 def _line_items(path: str, text: str, owners: dict[str, str]) -> list[Item]:
     try:
-        tree = _parse_tree(text, path)
+        tree = ast.parse(text, filename=path)
     except SyntaxError:
         return []
     lines = text.splitlines()
@@ -674,7 +645,7 @@ def _revision_index(
         text = sources[(revision, path)]
         if text is None:
             continue
-        tree = _parse_tree(text, path)
+        tree = ast.parse(text, filename=path)
         trees[path] = tree
         _index_collections(tree, _module_name(path), collections)
     return trees, collections
