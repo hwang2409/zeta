@@ -244,10 +244,14 @@ class ContextAssembler(ContextMarkerMixin):
         self,
         backend: CompletionBackend,
         request: AdmittedSessionRequest,
-    ):
+        *,
+        control: Any,
+    ) -> Any:
         """Dispatch a request previously admitted for the current session."""
 
-        return self._request_admission.dispatch(backend, request)
+        return self._request_admission.dispatch(
+            backend, request, control=control
+        )
 
     @property
     def provider_attempt_estimate(self) -> int | None:

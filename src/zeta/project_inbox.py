@@ -13,7 +13,7 @@ import stat
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -223,6 +223,7 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        on_visible: Callable[[], None] | None = None,
     ) -> str:
         message_id, _outcome = self.send_with_outcome(
             from_project=from_project,
@@ -234,6 +235,7 @@ class ProjectInbox:
             in_reply_to=in_reply_to,
             message_id=message_id,
             to_session=to_session,
+            on_visible=on_visible,
         )
         return message_id
 
@@ -249,6 +251,7 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
+        on_visible: Callable[[], None] | None = None,
     ) -> tuple[str, SentLedgerOutcome[None]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
@@ -278,6 +281,12 @@ class ProjectInbox:
             "created_at": _now(),
         }
         self._publish_outgoing(target.project_id, message_id, body, record)
+        if on_visible is not None:
+            try:
+                on_visible()
+            except Exception:  # noqa: BLE001,S110
+                # The durable record remains authoritative if its wake cannot run.
+                pass
         tracker = (
             self.sent_tracker
             if self.sent_tracker is not None and self.sent_tracker.session_id == session
@@ -310,34 +319,34 @@ class ProjectInbox:
                 break
             if existing is None:
                 self._publish_record(new_fd, name, record)
-                return
-            immutable_fields = {
-                "schema_version",
-                "id",
-                "origin",
-                "from",
-                "to_project",
-                "to_session",
-                "kind",
-                "title",
-                "body",
-                "in_reply_to",
-            }
-            comparable = {
-                key: (
-                    existing.get(key, LOCAL_ORIGIN)
-                    if key == "origin"
-                    else existing.get(key)
-                    if key == "to_session"
-                    else existing[key]
-                )
-                for key in immutable_fields
-            }
-            expected = {key: record[key] for key in immutable_fields}
-            # Decoding resolves spilled bodies, so compare against the caller body.
-            expected["body"] = body
-            if comparable != expected:
-                raise InboxError("message id already exists with different content")
+            else:
+                immutable_fields = {
+                    "schema_version",
+                    "id",
+                    "origin",
+                    "from",
+                    "to_project",
+                    "to_session",
+                    "kind",
+                    "title",
+                    "body",
+                    "in_reply_to",
+                }
+                comparable = {
+                    key: (
+                        existing.get(key, LOCAL_ORIGIN)
+                        if key == "origin"
+                        else existing.get(key)
+                        if key == "to_session"
+                        else existing[key]
+                    )
+                    for key in immutable_fields
+                }
+                expected = {key: record[key] for key in immutable_fields}
+                # Decoding resolves spilled bodies, so compare against the caller body.
+                expected["body"] = body
+                if comparable != expected:
+                    raise InboxError("message id already exists with different content")
 
     def list(
         self, project: str, *, session_id: str | None = None

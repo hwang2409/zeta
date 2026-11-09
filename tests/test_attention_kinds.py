@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from tests.test_attention import _session
-from zeta import storage_format
+from zeta import attention_records
 from zeta.attention_decisions import open_decisions
-from zeta.attention_records import AttentionStore
+from zeta.attention_records import ATTENTION_KIND_EPOCH, AttentionStore
 from zeta.skills import SkillCatalog
 from zeta.storage_format import (
     StorageFormatError,
@@ -70,14 +70,36 @@ def test_attention_kinds_sort_decisions_first(tmp_path: Path) -> None:
     opened.store.close()
 
 
+def test_attention_kind_epoch_is_independent_of_writer_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
+    opened = _session(tmp_path)
+    try:
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
+        try:
+            record = _record(store, kind="answer", session_id=opened.store.session_id)
+            refusal = None
+        except ValueError as exc:
+            record, refusal = None, str(exc)
+        assert refusal is None and record is not None and record.kind == "answer"
+    finally:
+        opened.store.close()
+
+
 def test_information_item_dismisses_without_reply(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     record = _record(store, kind="answer", session_id=opened.store.session_id)
-    dismissed, already = store.dismiss(record.id, session_id=opened.store.session_id)
-    assert not already
+    from zeta.attention_replies import AttentionReplies
+
+    replies = AttentionReplies(tmp_path, opened.store.session_id)
+    first = replies.dismiss(record.id)
+    second = replies.dismiss(record.id)
+    assert first.items[0].status == "applied"
+    assert second.already_resolved
+    dismissed = store.get(record.id)
     assert dismissed.status == "resolved" and dismissed.decision is None
-    assert store.dismiss(record.id, session_id=opened.store.session_id)[1]
     opened.store.close()
 
 
@@ -85,8 +107,10 @@ def test_decision_cannot_be_dismissed(tmp_path: Path) -> None:
     opened = _session(tmp_path)
     store = AttentionStore(opened.store.session_dir)
     record = _record(store, session_id=opened.store.session_id)
+    from zeta.attention_replies import AttentionReplies
+
     with pytest.raises(ValueError, match="require a reply"):
-        store.dismiss(record.id, session_id=opened.store.session_id)
+        AttentionReplies(tmp_path, opened.store.session_id).dismiss(record.id)
     opened.store.close()
 
 
@@ -110,18 +134,21 @@ def test_request_attention_kind_rules_use_registered_handler(tmp_path: Path) -> 
     opened.store.close()
 
 
-def test_non_decision_creation_waits_for_shared_cutover(tmp_path: Path) -> None:
+def test_non_decision_creation_waits_for_shared_cutover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(attention_records, "WRITER_EPOCH", 6)
     advance(tmp_path, expected_epoch=0)
     session = _session(tmp_path)
     try:
-        store = AttentionStore(session.store.session_dir, writer_epoch=2)
+        store = AttentionStore(session.store.session_dir, writer_epoch=4)
     except TypeError:
         store = AttentionStore(session.store.session_dir)
     decision = _record(store, session_id=session.store.session_id)
     assert store.get(decision.id).kind == "decision"
     with pytest.raises(
         ValueError,
-        match=rf"zeta storage-format advance --expected-epoch 2 --target-epoch {storage_format.WRITER_EPOCH}",
+        match=rf"zeta storage-format advance --expected-epoch 4 --target-epoch {ATTENTION_KIND_EPOCH}",
     ):
         _record(store, kind="answer", session_id=session.store.session_id)
     session.store.close()

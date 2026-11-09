@@ -290,6 +290,37 @@ class _AbortSignal(Protocol):
     async def wait(self) -> None: ...
 
 
+async def _poll_approval_resolution(
+    abort_signal: _AbortSignal,
+    *,
+    current: Callable[[], tuple[bool, ApprovalDecision | None]],
+    abort_or_winner: Callable[[], Awaitable[ApprovalDecision | None]],
+) -> ApprovalDecision | None:
+    while True:
+        resolved, decision = current()
+        if resolved:
+            return decision
+        if abort_signal.is_set():
+            return await abort_or_winner()
+        abort_task = asyncio.create_task(abort_signal.wait())
+        poll_task = asyncio.create_task(asyncio.sleep(0.05))
+        try:
+            done, pending = await asyncio.wait(
+                {abort_task, poll_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            abort_task.cancel()
+            poll_task.cancel()
+            await asyncio.gather(abort_task, poll_task, return_exceptions=True)
+            raise
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if abort_task in done:
+            return await abort_or_winner()
+
+
 class ApprovalAbortPolicy(Protocol):
     """Resolve an abort against any decision that won concurrently."""
 
@@ -1002,44 +1033,22 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     None,
                 )
 
-        while True:
+        def current() -> tuple[bool, ApprovalDecision | None]:
             ephemeral = self._ephemeral.get(tool_call.id)
             if ephemeral is not None and ephemeral[1] is not None:
-                if ephemeral[1] == ApprovalDecision.ALLOW.value:
-                    return ApprovalDecision.ALLOW
-                if ephemeral[1] == ApprovalDecision.DENY.value:
-                    return ApprovalDecision.DENY
-                return None
+                return True, _resolved_decision(ephemeral[1])
             state = store.approval_states().get(tool_call.id)
             if state is not None and state[1] is not None:
-                if state[1] == ApprovalDecision.ALLOW.value:
-                    return ApprovalDecision.ALLOW
-                if state[1] == ApprovalDecision.DENY.value:
-                    return ApprovalDecision.DENY
-                return None
-            if abort_signal.is_set():
-                return await self._resolve_abort_or_winner(
-                    tool_call.id, capability=capability
-                )
-            abort_task = asyncio.create_task(abort_signal.wait())
-            poll_task = asyncio.create_task(asyncio.sleep(0.05))
-            try:
-                done, pending = await asyncio.wait(
-                    {abort_task, poll_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            except asyncio.CancelledError:
-                abort_task.cancel()
-                poll_task.cancel()
-                await asyncio.gather(abort_task, poll_task, return_exceptions=True)
-                raise
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if abort_task in done:
-                return await self._resolve_abort_or_winner(
-                    tool_call.id, capability=capability
-                )
+                return True, _resolved_decision(state[1])
+            return False, None
+
+        return await _poll_approval_resolution(
+            abort_signal,
+            current=current,
+            abort_or_winner=lambda: self._resolve_abort_or_winner(
+                tool_call.id, capability=capability
+            ),
+        )
 
     def forget_ephemeral(self, request_id: str) -> None:
         """Remove one non-durable approval after its owner finishes."""

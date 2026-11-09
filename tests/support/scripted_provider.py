@@ -36,6 +36,7 @@ from zeta.protocol.types import (
     ToolCall,
     ToolUseContent,
 )
+from zeta.providers.completion import owned_completion
 
 FAKE_SCRIPT_ENV = "ZETA_FAKE_SCRIPT"
 SCRIPT_VERSION = 1
@@ -295,6 +296,7 @@ class ScriptedFakeBackend(CompletionBackend):
         self.script = script
         self.model = model
 
+    @owned_completion
     async def complete(
         self, messages: Sequence[Message], tool_schemas: Sequence[dict[str, Any]]
     ) -> AsyncIterator[StreamEvent]:

@@ -14,6 +14,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
 )
+from zeta.providers.completion import owned_completion
 
 
 class FakeInteractiveBackend(CompletionBackend):
@@ -24,6 +25,7 @@ class FakeInteractiveBackend(CompletionBackend):
         self.model = model
         self.calls: list[list[Message]] = []
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
