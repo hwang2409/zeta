@@ -1050,7 +1050,7 @@ async def run_agent_tool(
             publish=publish,
             hold_wake=HoldWake(
                 loop._background_owner.conversation_channel,
-                child_instance_id, child_path, description, selected_accounts,
+                child_instance_id, child_path, description, child_account_pins,
             ) if background else NO_HOLD_WAKE,
             child_turns=child_turns,
             update_turns=update_turns,
