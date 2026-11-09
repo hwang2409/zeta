@@ -117,6 +117,8 @@ async def _approve_after_external_end(
 
 class _DelegatedBackend:
     def __init__(self) -> None:
+        self.child_one_ready = asyncio.Event()
+        self.release_child_one = asyncio.Event()
         self.child_two_ready = asyncio.Event()
         self.release_child_two = asyncio.Event()
 
@@ -160,7 +162,11 @@ class _DelegatedBackend:
             )
         elif last_user in {"child 1", "child 2"} and not has_tool_result:
             number = last_user[-1]
-            if number == "2":
+            if number == "1":
+                self.child_one_ready.set()
+                # test-contract: seam the owning journey supplies the one deadline.
+                await self.release_child_one.wait()
+            elif number == "2":
                 self.child_two_ready.set()
                 # test-contract: seam the owning journey supplies the one deadline.
                 await self.release_child_two.wait()
@@ -1365,17 +1371,22 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             if (
                 event is EventDescriptor.APPROVAL_REQUEST
                 and fields.get("delegated") is True
+                and fields.get("tool_call", {}).get("id") == "child-bash-2"
             ):
                 publication_attempted.set()
             return result
 
         server.control._approvals._admit = observe_publication
+        await await_or_fail(
+            backend.child_one_ready.wait(), what="child 1 post-revoke ordering gate"
+        )
 
         async def second_delegate_journey() -> None:
             await _request(
                 reader, writer, 6, "revoke_session_grants", {"grant": "bash"}
             )
             await _event(reader, "session_grants_changed")
+            backend.release_child_one.set()
             second_send = await _request(
                 reader, writer, 7, "send", {"text": "second delegate"}
             )
@@ -1437,6 +1448,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
             what="second delegated approval journey",
         )
     finally:
+        backend.release_child_one.set()
         backend.release_child_two.set()
         await close_serve(server, writer)
 
