@@ -8140,31 +8140,40 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
 
 @pytest.mark.asyncio
 async def test_typed_child_type_survives_cancellation_and_reopen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    backend = FakeBackend(
+    child_started = asyncio.Event()
+
+    class StartedBackend(FakeBackend):
+        @owned_completion
+        async def complete(
+            self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+        ) -> AsyncIterator[StreamEvent]:
+            async for event in FakeBackend.complete.__wrapped__(
+                self, messages, tool_schemas
+            ):
+                if (
+                    len(self.calls) == 2
+                    and event.type is StreamEventType.MESSAGE_UPDATE
+                ):
+                    child_started.set()
+                yield event
+
+    backend = StartedBackend(
         [
             ScriptedTurn(tool_calls=[_agent_call(agent_type="explore")]),
             ScriptedTurn([TextContent("slow")], delay=5),
         ]
     )
-    lifecycle_started = threading.Event()
-    original_start = ConversationStore.start_agent_lifecycle
-
-    def observed_start(self, *args, **kwargs) -> None:
-        original_start(self, *args, **kwargs)
-        lifecycle_started.set()
-
-    monkeypatch.setattr(ConversationStore, "start_agent_lifecycle", observed_start)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    assert await asyncio.to_thread(lifecycle_started.wait, 10)
+    await asyncio.wait_for(child_started.wait(), timeout=10)
     loop.abort()
 
-    await task
+    await await_or_fail(task, what="canceled typed child turn")
 
     result = next(
         message.tool_result for message in store.messages() if message.tool_result
@@ -12870,6 +12879,8 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
             "heredoc-secret",
         ),
     ],
+    # Stable ids: the commands embed sys.executable, which differs per machine.
+    ids=["bearer-arg", "env-token", "password-flag", "stdin-path", "fd-url", "heredoc"],
 )
 async def test_killed_task_receipt_never_contains_command_secrets(
     tmp_path: Path,
