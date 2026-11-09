@@ -176,6 +176,8 @@ class PerActorFakeBackend:
         gated_child_call: int = 1,
         gated_child_prompts: Collection[str] | None = None,
         parent_waits_for_children: bool = True,
+        parent_second_started: asyncio.Event | None = None,
+        release_parent_second: asyncio.Event | None = None,
     ) -> None:
         self.parent_prompts = (
             {parent_prompt} if isinstance(parent_prompt, str) else set(parent_prompt)
@@ -189,6 +191,8 @@ class PerActorFakeBackend:
         self.release_children = asyncio.Event()
         self.gated_child_call = gated_child_call
         self.parent_waits_for_children = parent_waits_for_children
+        self.parent_second_started = parent_second_started
+        self.release_parent_second = release_parent_second
         self.gated_child_prompts = (
             set(self.children)
             if gated_child_prompts is None
@@ -231,7 +235,16 @@ class PerActorFakeBackend:
                     )
                 except TimeoutError as error:
                     raise AssertionError("child did not start") from error
-                yield await anext(stream)
+                first = await anext(stream)
+                if self.parent_second_started is not None:
+                    self.release_children.set()
+                yield first
+                if self.parent_second_started is not None:
+                    self.parent_second_started.set()
+                    assert self.release_parent_second is not None
+                    await await_or_fail(
+                        self.release_parent_second.wait(), what="release parent second turn"
+                    )
             finally:
                 self.release_children.set()
         async for event in stream:

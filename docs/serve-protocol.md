@@ -1431,7 +1431,7 @@ error code and message. Provider status and origin remain internal.
   case the client sends a new join.
   The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
   globally, evicting the largest scope first; a scope holds at most two waiting
-  events (one `assistant_message`, one echo), counted in these limits. Older pages continue to use
+  events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
   `session_history` and do not change the live stream.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
@@ -1752,7 +1752,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

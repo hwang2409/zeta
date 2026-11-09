@@ -942,9 +942,6 @@ class ConnectionRegistry(ReplayOutput):
             session_id=session_id,
         )
 
-    async def route_request(self, connection: Any, request_id: str | int, method: str, params: dict[str, Any]) -> tuple[bool, object]:
-        return False, None
-
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())

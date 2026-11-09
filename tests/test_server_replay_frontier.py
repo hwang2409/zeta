@@ -344,7 +344,12 @@ def _foreground_tool_backend(tmp_path: Path) -> FakeBackend:
     )
 
 
-def _background_backend(tmp_path: Path) -> PerActorFakeBackend:
+def _background_backend(
+    tmp_path: Path,
+    *,
+    parent_second_started: asyncio.Event | None = None,
+    release_parent_second: asyncio.Event | None = None,
+) -> PerActorFakeBackend:
     agent = ToolCall(
         "agent-bg", "agent", {"prompt": "child-work", "description": "child", "background": True}
     )
@@ -361,12 +366,16 @@ def _background_backend(tmp_path: Path) -> PerActorFakeBackend:
             ]
         },
         parent_prompt="delegate",
+        parent_second_started=parent_second_started,
+        release_parent_second=release_parent_second,
     )
 
 
 async def _background(serve: Serve) -> None:
     await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
     request = await _wait_event(serve.observer, "approval_request", delegated=True)
+    # The parent is idle before approval, so its completion cannot be folded into its turn.
+    await _wait_event(serve.observer, "agent_end")
     await serve.approve(request["request_id"])
     terminal = await _wait_event(serve.observer, "tool_end", **{"tool_call.id": "agent-bg"})
     while "notification_id" not in terminal["data"]:
@@ -527,6 +536,48 @@ async def _run_scenario(tmp_path: Path, transport: Transport, name: str) -> tupl
         await _close(serve)
         raise
     return serve, history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_background_child_completion_can_arrive_during_parent_turn(
+    tmp_path: Path, transport: Transport
+) -> None:
+    """A child completion is still published while the parent model turn is held."""
+    parent_second_started = asyncio.Event()
+    release_parent_second = asyncio.Event()
+    backend = _background_backend(
+        tmp_path,
+        parent_second_started=parent_second_started,
+        release_parent_second=release_parent_second,
+    )
+    serve = await _serve(tmp_path, transport, backend)
+    try:
+        await serve.join(serve.observer)
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        request = await _wait_event(serve.observer, "approval_request", delegated=True)
+        await await_or_fail(parent_second_started.wait(), what="parent second turn started")
+        await serve.approve(request["request_id"])
+        approval_end = await _wait_event(serve.observer, "approval_end", request_id=request["request_id"])
+        assert approval_end["request_id"] == request["request_id"]
+        terminal_frames = [
+            await _wait_event(serve.observer, "tool_end", **{"tool_call.id": "agent-bg"})
+        ]
+        while "notification_id" not in terminal_frames[-1]["data"]:
+            terminal_frames.append(
+                await _wait_event(serve.observer, "tool_end", **{"tool_call.id": "agent-bg"})
+            )
+        terminal = terminal_frames[-1]
+        assert "notification_id" not in terminal_frames[0]["data"]
+        receipt = await _wait_event(
+            serve.observer, "sub_agent_receipt", **{"data.notification_id": terminal["data"]["notification_id"]}
+        )
+        assert receipt["data"]["notification_id"] == terminal["data"]["notification_id"]
+        release_parent_second.set()
+        await _wait_event(serve.observer, "agent_end")
+    finally:
+        release_parent_second.set()
+        await _close(serve)
 
 
 @pytest.mark.asyncio
