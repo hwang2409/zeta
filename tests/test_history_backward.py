@@ -126,6 +126,29 @@ async def _history_request(reader: object, writer: object, request_id: int, sess
 
 
 @pytest.mark.asyncio
+async def test_real_store_history_uses_index_not_full_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_full_projection(*args: object, **kwargs: object) -> object:
+        raise AssertionError("real store history used the full projection")
+
+    monkeypatch.setattr(history, "history_projection", reject_full_projection)
+    async with _real_history_server(tmp_path, count=3) as (
+        reader,
+        writer,
+        session_id,
+        _server,
+    ):
+        result = await _history_request(reader, writer, 3, session_id, {"offset": 0})
+
+    assert [row["content"][0]["text"][:9] for row in result["messages"]] == [
+        "message-0",
+        "message-1",
+        "message-2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path) as (reader, writer, session_id, _server):
@@ -208,7 +231,9 @@ async def test_real_socket_branch_during_read_is_stale_and_not_cached(
         assert response["error"]["code"] == -32009
         assert response["error"]["data"] == {"code": "stale_history_snapshot"}
         fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
-        assert fresh["messages"] == old_first["messages"]
+        assert [row["id"] for row in fresh["messages"]] == [
+            old_first["messages"][0]["id"]
+        ]
 
 
 @pytest.mark.asyncio

@@ -54,7 +54,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -226,19 +226,16 @@ class HistoryIndex:
             self._remove_file()
             connection = self._connection(write=True)
             self._create_schema(connection)
-            group = -1
+            group = 0
             with connection:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
-                    if self._belongs_in_history(entry_type, data):
-                        if group < 0:
-                            group = 0
-                        elif self._starts_next_group(entry_type, data):
-                            group += 1
-                        history_group = group
-                    else:
-                        history_group = None
+                    history_group = (
+                        group if self._belongs_in_history(entry_type, data) else None
+                    )
+                    if self._starts_next_group(entry_type, data):
+                        group += 1
                     connection.execute(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
@@ -255,7 +252,7 @@ class HistoryIndex:
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
                         )
-                self._set_meta(connection, source_facts, total=group + 1)
+                self._set_meta(connection, source_facts, total=group)
             self._available = True
         finally:
             if connection is not None:
@@ -309,23 +306,15 @@ class HistoryIndex:
                 )
                 if expected != entries[0].seq:
                     raise HistoryIndexUnavailableError("history index delta is not contiguous")
-                current_group = int(
-                    connection.execute(
-                        "SELECT COALESCE(MAX(history_group),-1) FROM entries"
-                    ).fetchone()[0]
-                )
+                stored = self._stored_facts(connection) or {}
+                total = int(stored.get("history_groups", 0))
                 projected: list[tuple[object, int | None]] = []
                 for entry in entries:
                     data = dict(entry.data)
-                    if self._belongs_in_history(entry.type, data):
-                        if current_group < 0:
-                            current_group = 0
-                        elif self._starts_next_group(entry.type, data):
-                            current_group += 1
-                        group = current_group
-                    else:
-                        group = None
+                    group = total if self._belongs_in_history(entry.type, data) else None
                     projected.append((entry, group))
+                    if self._starts_next_group(entry.type, data):
+                        total += 1
                 with connection:
                     connection.executemany(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
@@ -346,7 +335,7 @@ class HistoryIndex:
                                 "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                                 (data["delivery_id"], self._value(accepted)),
                             )
-                    self._set_meta(connection, facts, total=current_group + 1)
+                    self._set_meta(connection, facts, total=total)
                 self._available = True
             except HistoryIndexError:
                 raise

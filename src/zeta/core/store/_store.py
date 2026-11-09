@@ -24,6 +24,7 @@ from contextlib import (  # noqa: F401 - re-exported by the store facade
     contextmanager,
     nullcontext,
 )
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
@@ -76,7 +77,13 @@ from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
-from ._history_index import HistoryIndex, HistoryIndexError
+from ._history_index import (
+    HistoryIndex,
+    HistoryIndexError,
+    HistoryIndexUnavailableError,
+    IndexedHistoryPage,
+    StaleHistorySnapshot,
+)
 from ._incremental_validation import (
     IncrementalValidationMixin,
     validate_approval_reason,
@@ -281,7 +288,7 @@ class ConversationStore(
             self._history_index._mark_unavailable()
             return
         try:
-            self._sync_history_index(self._entries)
+            self._sync_history_index(self.active_branch_snapshot())
         except (OSError, HistoryIndexError):
             self._history_index._mark_unavailable()
 
@@ -298,14 +305,24 @@ class ConversationStore(
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
             "prefix_digest": self._entry_prefix_digest.hex(),
+            "reset_generation": self._reset_generation,
         }
 
     def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:
-        if self._history_index is not None:
+        if self._history_index is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
             self._history_index.sync_validated(self._history_index_facts(), entries)
+        else:
+            self._history_index._mark_unavailable()
 
     def _apply_history_index_entries(
-        self, entries: tuple[ConversationEntry, ...]
+        self,
+        entries: tuple[ConversationEntry, ...],
+        *,
+        leave_stale_on_loop: bool = False,
     ) -> None:
         if self._history_index is None or not entries:
             return
@@ -314,12 +331,15 @@ class ConversationStore(
         except RuntimeError:
             pass
         else:
-            self._history_index._mark_unavailable()
+            if not leave_stale_on_loop:
+                self._history_index._mark_unavailable()
             return
+        if not self._history_index.available:
+            self._sync_history_index(self.active_branch_snapshot())
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(
-                digest, self._encoded_entry_line(entry)
+                digest, encode_json(entry.to_dict()) + b"\n"
             )
         facts = self._history_index_facts()
         last = entries[-1]
@@ -333,6 +353,51 @@ class ConversationStore(
             self._history_index.apply_committed(facts, entries)
         except Exception:  # noqa: BLE001 -- derived state cannot fail authority
             self._history_index._mark_unavailable()
+
+    def history_index_page(
+        self, request: Mapping[str, object]
+    ) -> IndexedHistoryPage | None:
+        """Read one stable derived page, or defer when no sidecar exists."""
+        index = self._history_index
+        if index is None or (self._read_only and not index.available):
+            return None
+        for attempt in range(2):
+            if not index.available:
+                writer = self._new_persistent_durable_writer()
+                try:
+                    writer._sync_history_index(writer.active_branch_snapshot())
+                finally:
+                    writer.close()
+            facts = self._history_index_facts()
+            try:
+                page = index.page(request, facts)
+            except StaleHistorySnapshot:
+                if "end" in request or attempt:
+                    raise
+                index._mark_unavailable()
+                continue
+            except HistoryIndexUnavailableError as exc:
+                if self._history_index_facts() != facts:
+                    raise StaleHistorySnapshot from exc
+                if self._read_only or attempt:
+                    raise
+                index._mark_unavailable()
+                continue
+            if self._history_index_facts() != facts:
+                index._mark_unavailable()
+                raise StaleHistorySnapshot
+            groups = tuple(
+                tuple(
+                    self._entries[entry.seq - 1]
+                    if entry.seq <= len(self._entries)
+                    and self._entries[entry.seq - 1].id == entry.id
+                    else entry
+                    for entry in group
+                )
+                for group in page.groups
+            )
+            return replace(page, groups=groups)
+        raise HistoryIndexUnavailableError("history index is unavailable")
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -749,6 +814,9 @@ class ConversationStore(
         finally:
             self._write_deadline = previous_deadline
         linear = not self._entries or entry.parent_id == self._entries[-1].id
+        self._apply_history_index_entries(
+            (entry,), leave_stale_on_loop=not linear
+        )
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -759,6 +827,7 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
+            self._sync_history_index(self.active_branch_snapshot())
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
