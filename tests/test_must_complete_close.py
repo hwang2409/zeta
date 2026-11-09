@@ -46,6 +46,9 @@ ATTEMPT_SEAMS = ("producer-drain", "source-close")
 LEASE_SEAMS = ("drain-wait", "client-close")
 ATTEMPT_BOUND_FAILURE = "provider attempt close did not finish within 20 s"
 LEASE_BOUND_FAILURE = "http client close did not finish within 30 s"
+# the test's gates time out later than the 10 s hang guards, so a guard
+# reports a hung close (and its teardown releases the gates) first.
+GATE_TIMEOUT = 30
 
 
 def _codex_token() -> str:
@@ -116,7 +119,7 @@ class _Body(httpx.AsyncByteStream):
         if self.read_error is not None:
             raise self.read_error
         self.read_parked.set()
-        await asyncio.wait_for(self.release.wait(), 10)
+        await asyncio.wait_for(self.release.wait(), GATE_TIMEOUT)
 
     async def aclose(self) -> None:
         self.close_calls += 1
@@ -124,7 +127,7 @@ class _Body(httpx.AsyncByteStream):
         cancels = 0
         while self.hold_close and not self.release.is_set():
             try:
-                await asyncio.wait_for(self.release.wait(), 10)
+                await asyncio.wait_for(self.release.wait(), GATE_TIMEOUT)
             except asyncio.CancelledError:
                 self.cancel_seen[cancels].set()
                 cancels += 1
@@ -150,7 +153,7 @@ class _GatedQueue(asyncio.Queue):
     async def put(self, item: object) -> None:
         if isinstance(item, BaseException):
             self.error_put.set()
-            await asyncio.wait_for(self.release.wait(), 10)
+            await asyncio.wait_for(self.release.wait(), GATE_TIMEOUT)
         await super().put(item)
 
 
@@ -164,7 +167,7 @@ class _WatchedEvent(asyncio.Event):
 
     async def wait(self) -> bool:
         self.waited.set()
-        return await asyncio.wait_for(super().wait(), 10)
+        return await asyncio.wait_for(super().wait(), GATE_TIMEOUT)
 
 
 @dataclass
@@ -173,12 +176,16 @@ class _Site:
     backend: Any
     body: _Body
     clients: list[httpx.AsyncClient] = field(default_factory=list)
+    attempts: list[Any] = field(default_factory=list)
 
     def attempt(self) -> Any:
         if self.name == "ollama":
-            return self.backend.create_attempt([], [])
-        token = _codex_token() if self.name == "codex" else "token-test"
-        return self.backend.create_attempt([], [], token)
+            attempt = self.backend.create_attempt([], [])
+        else:
+            token = _codex_token() if self.name == "codex" else "token-test"
+            attempt = self.backend.create_attempt([], [], token)
+        self.attempts.append(attempt)
+        return attempt
 
     @property
     def borrows(self) -> int:
@@ -209,7 +216,7 @@ class _ClosingClient(httpx.AsyncClient):
         self.close_entered.set()
         while self.hold and not self.release.is_set():
             try:
-                await asyncio.wait_for(self.release.wait(), 10)
+                await asyncio.wait_for(self.release.wait(), GATE_TIMEOUT)
             except asyncio.CancelledError:
                 self.close_cancelled.set()
                 if not self.swallow:
@@ -272,14 +279,37 @@ async def _settle(task: asyncio.Task[Any]) -> BaseException | None:
     return done[0] if isinstance(done[0], BaseException) else None
 
 
+async def _drain_left() -> None:
+    """Wait for every other task on this test's loop to end."""
+    left = asyncio.all_tasks() - {asyncio.current_task()}
+    await await_or_fail(
+        asyncio.gather(*left, return_exceptions=True), what="tasks the row left"
+    )
+
+
+async def _ended_or_drained(task: asyncio.Task[Any]) -> bool:
+    """Wait for a close the row expects to end; return whether it ended.
+
+    On the 10 s hang guard the task is cancelled and drained first, so the
+    row's behavior assertion is the reported failure and no close task
+    outlives it.
+    """
+    done, _ = await asyncio.wait({task}, timeout=10)
+    if task in done:
+        return True
+    task.cancel()
+    await _settle(task)
+    return False
+
+
 async def _returned_at_bound(task: asyncio.Task[Any], what: str) -> Any:
     """Return the outcome of a close the production bound must have ended.
 
     The 10 s wait is a hang guard, not the proof: the clock already passed
     the bound, so a close that still runs waits forever.
     """
-    done, _ = await asyncio.wait({task}, timeout=10)
-    assert task in done, f"the bound expired but the {what} still waits"
+    ended = await _ended_or_drained(task)
+    assert ended, f"the bound expired but the {what} still waits"
     return task.exception() or task.result()
 
 
@@ -412,12 +442,9 @@ async def _owner_returns(attempt: Any) -> BaseException | None:
     # a later close waits on the same owner task: it returns only once the
     # owner task has ended. the 10 s wait is a hang guard, not the proof.
     later = asyncio.create_task(attempt.aclose())
-    try:
-        done, _ = await asyncio.wait({later}, timeout=10)
-        assert later in done, "the attempt close owner task is still live"
-        return later.exception()
-    finally:
-        later.cancel()
+    ended = await _ended_or_drained(later)
+    assert ended, "the attempt close owner task is still live"
+    return later.exception()
 
 
 async def _attempt_caller_cancelled_at_paused_producer(
@@ -748,6 +775,7 @@ async def _lease_late_failure_after_bound(
     finally:
         site.clients[0].release.set()
         await _settle(closing)
+        await _drain_left()  # a late report lands here, not in a later row
         loop.set_exception_handler(previous)
 
 
@@ -812,5 +840,16 @@ async def test_close_site_releases_its_borrow_and_returns(
         await row(site, clock)
     finally:
         site.body.release.set()
+        for client in site.clients:
+            if isinstance(client, _ClosingClient):
+                client.release.set()
+        # a failed row can leave attempts, close owners, cleanups, and readers
+        # running: with the gates open they end, and are drained here.
+        for attempt in site.attempts:
+            await await_or_fail(
+                asyncio.gather(attempt.aclose(), return_exceptions=True),
+                what="attempt close",
+            )
+        await _drain_left()
         for client in site.clients:
             await await_or_fail(_REAL_CLIENT.aclose(client), what="client close")
