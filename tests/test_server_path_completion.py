@@ -65,6 +65,7 @@ async def test_path_complete_uses_tui_projection_over_real_unix_transport(
     (workspace / "😀folder").mkdir()
     (workspace / "😀file name.txt").touch()
     (workspace / ".hidden").touch()
+    (workspace / ".zeta").mkdir()
     for index in range(51):
         (workspace / f"many-{index:02}.txt").touch()
 
