@@ -1386,15 +1386,50 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 monkeypatch.setattr(GrantPublication, "publish", gated_publish)
             elif case == "cancel_history":
                 original_history = ConversationStore.append_approval_history_async
+                original_persist = approval_lifecycle.persist_durably
+                original_finish = server.control._approvals._finish_record
+                committed = asyncio.Event()
+                release_persist = asyncio.Event()
+                competing_entered = asyncio.Event()
+                release_competing = asyncio.Event()
+
+                async def gated_persist(*args: object, **kwargs: object) -> object:
+                    result = await original_persist(*args, **kwargs)
+                    committed.set()
+                    await await_or_fail(
+                        release_persist.wait(), what="approval settlement commit"
+                    )
+                    return result
+
+                async def gated_finish(
+                    record: Any, resolution: dict[str, str]
+                ) -> None:
+                    if record.target.key == "call-1":
+                        owner = asyncio.current_task()
+                        current = server.control._approvals.state.records["call-1"]
+                        if current.settlement is not owner:
+                            competing_entered.set()
+                            await await_or_fail(
+                                release_competing.wait(),
+                                what="competing approval publication",
+                            )
+                    await original_finish(record, resolution)
 
                 async def gated_history(
                     store: ConversationStore, payload: dict[str, object]
                 ) -> object:
-                    # test-contract: hold the settlement before its history await
+                    record = server.control._approvals.state.records["call-1"]
+                    assert asyncio.current_task() is record.settlement
                     entered.set()
-                    await await_or_fail(release.wait(), what="approval history")
+                    try:
+                        await await_or_fail(release.wait(), what="approval history")
+                    except asyncio.CancelledError:
+                        await original_history(store, payload)
+                        raise
                     return await original_history(store, payload)
 
+                monkeypatch.setattr(approval_lifecycle, "persist_durably", gated_persist)
+                monkeypatch.setattr(server.control._approvals, "_finish_record", gated_finish)
                 monkeypatch.setattr(
                     ConversationStore,
                     "append_approval_history_async",
@@ -1446,6 +1481,19 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     {"request_id": "call-1", "scope": "always_tool"},
                 )
             )
+            competing: asyncio.Task[object] | None = None
+            if case == "cancel_history":
+                await await_or_fail(committed.wait(), what="approval settlement commit")
+                record = server.control._approvals.state.records["call-1"]
+                resolution = record.target.store.approval_resolution_data("call-1")
+                assert resolution is not None
+                competing = asyncio.create_task(
+                    server.control._approvals._finish_record(record, resolution)
+                )
+                await await_or_fail(
+                    competing_entered.wait(), what="competing approval publication"
+                )
+                release_persist.set()
             if case == "external_end":
                 await await_or_fail(entered.wait(), what="durable settlement")
                 external_end = asyncio.create_task(
@@ -1467,8 +1515,12 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                     assert not settlement.done()
                 cancel_target.cancel()
                 release.set()
+                if case == "cancel_history":
+                    release_competing.set()
                 with pytest.raises((asyncio.CancelledError, AssertionError)):
                     await await_or_fail(approve, what="canceled approve")
+                if competing is not None:
+                    await await_or_fail(competing, what="competing approval publication")
             else:
                 frames = await await_or_fail(approve, what="approve response")
                 assert frames[-1]["result"]["decision"] == "approve"
@@ -1486,6 +1538,15 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
                 assert not server.control._approvals.state.records, (
                     f"{case} left an approval record after grant settlement"
                 )
+                if case == "cancel_history":
+                    assert server.runtime.opened is not None
+                    history = [
+                        entry.data
+                        for entry in server.runtime.opened.store.entries
+                        if entry.type == "approval_history"
+                    ]
+                    assert [row["event"] for row in history] == ["approval_end"]
+                    assert history[0]["request_id"] == "call-1"
                 original_frames = list(_buffer(reader))
                 _buffer(reader).clear()
                 await await_or_fail(
@@ -1659,6 +1720,10 @@ async def test_session_grant_lifecycle_table_over_unix_protocol(
             assert not server.control._approvals.state.records
     finally:
         release.set() if "release" in locals() else None
+        if "release_competing" in locals():
+            release_competing.set()
+        if "competing" in locals() and competing is not None and not competing.done():
+            await await_or_fail(competing, what="competing approval cleanup")
         await close_serve(
             server,
             writer,
