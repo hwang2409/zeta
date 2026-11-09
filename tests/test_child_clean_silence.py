@@ -247,6 +247,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
     idle_count = 0
     initial_idle = asyncio.Event()
     silence_idle = asyncio.Event()
+    silence_done = asyncio.Event()
     child_ended = asyncio.Event()
     def observe(event: StreamEvent) -> None:
         nonlocal idle_count
@@ -255,13 +256,18 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             and event.data.get("kind") == "child_idle"
         ):
             idle_count += 1
-            (initial_idle if idle_count == 1 else silence_idle).set()
+            if idle_count == 1:
+                initial_idle.set()
+            else:
+                silence_idle.set()
+                silence_done.set()
         if (
             event.type is StreamEventType.TOOL_EXECUTION_END
             and event.tool_call
             and event.tool_call.id == "child"
         ):
             child_ended.set()
+            silence_done.set()
 
     loop.set_background_event_sink(observe)
     first, second = grandchildren
@@ -310,7 +316,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             )
             await await_or_fail(child_ended.wait(), what="plain child failure")
         else:
-            await await_or_fail(silence_idle.wait(), what="clean silence idle")
+            await await_or_fail(silence_done.wait(), what="clean silence result")
             if ending == "thinking_only":
                 assert child_backend.notification_called.is_set()
             else:
