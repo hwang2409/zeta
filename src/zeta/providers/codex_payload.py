@@ -30,6 +30,7 @@ from .payload_common import (
     HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER,
     images_before_prompt,
     is_harness_notification,
+    provider_messages,
 )
 
 
@@ -128,7 +129,7 @@ def build_responses_payload(
     Codex receives tool images as a following user image input. The function
     output remains a text receipt because it cannot carry image content here.
     """
-    messages = without_incomplete_tool_batches(messages)
+    messages = provider_messages(without_incomplete_tool_batches(messages))
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     system_at_head = True

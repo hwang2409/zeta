@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..core.project_context import (
     ProjectContext,
@@ -13,9 +13,18 @@ from ..core.project_context import (
     resolve_project_context_from_projects,
 )
 from ..core.session import env_home
+from ..core.slash import effective_budget_for_model
+from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
 from ..project_context.projection import ProjectContextProjection
-from ..protocol.types import Message, MessageRole, TextContent
+from ..protocol.types import (
+    CompletionBackend,
+    Message,
+    MessageRole,
+    TextContent,
+    is_owned_completion_backend,
+)
+from ..providers.factory import build_backend, credential_store
 from ..runtime.prompt import (
     PromptFragment,
     RuntimePrompt,
@@ -24,9 +33,71 @@ from ..runtime.prompt import (
 )
 from ..tools import ToolRegistry
 from .presets import AgentPreset, compose_system_prompt
+from .receipt import MAX_AGENT_RESULT_BYTES
+from .run_consumer import consume_run as consume_follow_up_run
 
 if TYPE_CHECKING:
+    from ..core.store import ConversationStore
     from ..runtime.loop import AgentLoop
+
+
+async def consume_run(
+    child_loop: AgentLoop,
+    prompt: str,
+    *,
+    child_store: ConversationStore,
+    tool_call_id: str = "",
+    max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
+    receipt_components: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> dict[str, object]:
+    """Consume one child run through its follow-up and idle lifecycle."""
+    from .runner import consume_child
+
+    return await consume_follow_up_run(
+        consume_child,
+        child_loop,
+        prompt,
+        child_store=child_store,
+        tool_call_id=tool_call_id,
+        max_receipt_bytes=max_receipt_bytes,
+        receipt_components=receipt_components,
+        **kwargs,
+    )
+
+
+def resolve_child_backend(
+    loop: AgentLoop, model: object
+) -> tuple[CompletionBackend | None, str | None]:
+    """Give composed child loops a distinct backend owner."""
+    if model is None:
+        if not is_owned_completion_backend(loop.backend):
+            return loop.backend, None
+        model = loop.backend.model
+    if type(model) is not str or not model.strip():
+        return None, "agent error: model must be a nonempty string"
+    try:
+        provider = provider_for_model(model)
+    except ValueError as exc:
+        return None, f"agent error: {exc}"
+    context = getattr(loop, "account_context", None)
+    account_kwargs = context.backend_kwargs(provider) if context is not None else {}
+    store = credential_store(provider, **account_kwargs)
+    if store is not None:
+        tokens = store.read() or store.bootstrap()
+        if tokens is None:
+            message = f"agent error: not logged in to {provider}; "
+            return None, message + f"run zeta login --provider {provider}"
+    try:
+        child_budget = effective_budget_for_model(
+            provider, model, loop.context_assembler.token_budget
+        )
+        backend, _ = build_backend(
+            provider, model, token_budget=child_budget, **account_kwargs
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, f"agent error: could not start {provider} backend: {exc}"
+    return backend, None
 
 
 def _load_child_project_context(
@@ -173,6 +244,44 @@ def _compose_child_project_context(
             context.memory_offset + shift if context.memory_offset is not None else None
         ),
         prompt_components=components,
+    )
+
+
+def _child_model_and_budget(
+    loop: AgentLoop, child_backend: object, child_provider: object, model: object
+) -> tuple[str, int]:
+    child_model = getattr(child_backend, "model", None)
+    if type(child_model) is not str or not child_model:
+        child_model = model if type(model) is str and model else "unknown"
+    backend_budget = getattr(child_backend, "token_budget", None)
+    child_budget = loop.context_assembler.token_budget
+    if type(backend_budget) is int and backend_budget > 0:
+        child_budget = backend_budget
+    elif isinstance(child_provider, str):
+        child_budget = effective_budget_for_model(
+            child_provider, child_model, child_budget
+        )
+    return child_model, child_budget
+
+
+def _prepare_child_project_context(
+    loop: AgentLoop,
+    cwd_override: Path | None,
+    child_registry: ToolRegistry,
+    preset: AgentPreset,
+    explicit_finish: bool,
+    projection: ProjectContextProjection,
+) -> ProjectContext:
+    context = _load_child_project_context(
+        loop,
+        cwd_override,
+        child_registry,
+        projection=projection,
+    )
+    return _compose_child_project_context(
+        context,
+        preset,
+        explicit_finish=explicit_finish,
     )
 
 

@@ -235,12 +235,13 @@ _EXPECTED_PROVIDER_TOOL_CONTRACTS = {
         "agent": (
             (
                 "agent_type=string background=boolean cwd=string description=string "
-                "model=string preset=string prompt=string"
+                "max_turns=integer model=string preset=string prompt=string"
             ),
             "description prompt",
             {
                 "agent_type.enum": ["general", "explore", "plan", "run"],
                 "preset.enum": ["general", "explore", "plan", "run"],
+                "max_turns.minimum": 1,
                 "model.enum": [
                     "claude-fable-5",
                     "claude-haiku-4-5",

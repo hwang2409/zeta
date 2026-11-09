@@ -13,6 +13,7 @@ from typing import Any
 
 from rich.console import RenderableType
 
+from ..agent.turn_limit import project_notification_data
 from ..core.checkpoints import BranchInfo, ConversationIntegrityError, load_session_json
 from ..core.checkpoints.workspace import (
     SIZE_NOTICE_THRESHOLD_BYTES,
@@ -691,7 +692,10 @@ class CheckpointTranscriptMixin:
                     and entry.id not in acknowledged_notifications
                     and entry.id not in presented_notifications
                 ):
-                    data = {"notification_id": entry.id, **entry.data}
+                    data = {
+                        "notification_id": entry.id,
+                        **project_notification_data(entry.data),
+                    }
                     rendered = self._presenter.render_event(
                         StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
                     )
