@@ -85,8 +85,8 @@ class MemoryTransactions:
                     return HealthyMemoryProjection(
                         project_id, 2, snapshot.version, snapshot.digest, snapshot, memory
                     )
-                contents = dict(registry._legacy_contents(directory_fd))
-                snapshot = MemorySnapshot(contents, registry._memory_digest_value(contents))
+                snapshot = registry._snapshot_locked(directory_fd)
+                contents = snapshot.contents
                 memory = tuple(
                     MemoryContextEntry(name, content, False)
                     for name, content in contents.items()
