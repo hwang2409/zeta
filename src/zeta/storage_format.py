@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import copy
 import fcntl
 import hashlib
@@ -10,14 +11,17 @@ import json
 import os
 import secrets
 import stat
+import sys
 import threading
+import weakref
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 4
+WRITER_EPOCH: Final = 5
 
 # These are the authoritative stored roots. An empty sessions/ directory is safe:
 # startup can create it before a session exists. The lock, logs, caches, and other
@@ -98,7 +102,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     'tool_result_resource': frozenset({'annotations', 'resource', 'type'}),
     'tool_result_resource_contents': frozenset({'blob', 'mimeType', 'text', 'uri'}),
     'tool_result_annotations': frozenset({'audience', 'lastModified', 'priority'}),
-    'attention_record': frozenset({'created_at', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
+    'attention_record': frozenset({'created_at', 'kind', 'decision', 'entry_id', 'entry_seq', 'fork_session_id', 'id', 'lane', 'options', 'project_id', 'recommendation', 'resolved_at', 'session_id', 'status', 'title', 'why'}),
     'attention_fork_meta': frozenset({'attention_id', 'forked_at_entry', 'forked_from_session'}),
     "transcript_recovery.evidence": frozenset(
         {
@@ -141,6 +145,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
     "conversation.entry_type": frozenset(
@@ -314,6 +319,100 @@ type Mutation = SetValue | DeleteValue | ReplaceSubtree | PatchRecords
 PublishBytes = Callable[[int, str, bytes], None]
 
 
+# Lease release that is safe to start from a garbage-collector finalizer.
+# The collector can run a finalizer at any allocation on any thread, including
+# while some thread holds a lease registry lock, so a finalizer that took that
+# lock could deadlock. A finalizer only queues the release with release_later
+# and never runs it. Normal code runs the queue at safe points with
+# drain_releases: after the last registry lock in the process is released,
+# before a lease is acquired, after an explicit close, and at exit. An explicit
+# close releases its own leases with release_now, never through the queue, so
+# its locks are free when it returns even if another thread is draining.
+# Release callbacks may take only RegistryLock locks.
+
+
+class _ThreadState(threading.local):
+    held = 0
+    draining = False
+
+
+_STATE = _ThreadState()
+_PENDING: deque[tuple[Callable[..., None], tuple[Any, ...]]] = deque()
+# Only normal code touches the process-wide count; finalizers never read it.
+_HELD_LOCK = threading.Lock()
+_held = 0
+
+
+def release_later(close: Callable[..., None], *args: Any) -> None:
+    """Finalizer callback: queue ``close(*args)`` for the next safe point. Takes no lock."""
+
+    _PENDING.append((close, args))
+
+
+def pending_releases() -> bool:
+    """Whether a release is queued. Takes no lock; a later append is seen next call."""
+
+    return bool(_PENDING)
+
+
+def drain_releases() -> None:
+    """Run queued releases; a no-op on a thread that holds a registry lock or is draining."""
+
+    if _STATE.held or _STATE.draining:
+        return
+    _STATE.draining = True
+    try:
+        # A collection inside a close only appends; this loop picks it up.
+        while True:
+            try:
+                close, args = _PENDING.popleft()
+            except IndexError:
+                return
+            try:
+                close(*args)
+            except Exception:  # noqa: BLE001 - a failed release must not fail the unrelated caller
+                sys.excepthook(*sys.exc_info())
+    finally:
+        _STATE.draining = False
+
+
+def release_now(finalizer: weakref.finalize) -> None:
+    """Explicit close: run the owner's own release here, at most once, then drain the queue."""
+
+    detached = finalizer.detach()  # the finalizer can no longer queue it too
+    if detached is not None:
+        _owner, _release_later, (close, *args), _kwargs = detached
+        close(*args)
+    drain_releases()
+
+
+atexit.register(drain_releases)
+
+
+class RegistryLock:
+    """A non-reentrant lock; the last holder in the process drains releases after it lets go."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> None:
+        global _held
+        self._lock.acquire()
+        with _HELD_LOCK:
+            _held += 1
+        _STATE.held += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        global _held
+        _STATE.held -= 1
+        with _HELD_LOCK:
+            _held -= 1
+            last = not _held
+        self._lock.release()
+        if last and _PENDING:
+            drain_releases()
+
+
 @dataclass(slots=True)
 class _RegistryEntry:
     fd: int
@@ -323,7 +422,7 @@ class _RegistryEntry:
 
 
 _REGISTRY: dict[Path, _RegistryEntry] = {}
-_REGISTRY_LOCK = threading.RLock()
+_REGISTRY_LOCK = RegistryLock()
 
 
 @contextmanager
@@ -466,6 +565,7 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
 def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
 
+    drain_releases()
     canonical = _canonical_home(home)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(canonical)
@@ -761,6 +861,8 @@ class WriterLease:
         publish: PublishBytes,
         path: tuple[str, ...] = (),
         initial: object | None = None,
+        validate: Callable[[object], None] | None = None,
+        on_invalid_json: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Patch and explicitly delete object records by identity."""
 
@@ -771,12 +873,20 @@ class WriterLease:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
                 raw: object = ([] if not path else {}) if initial is None else initial
+                exists = False
             else:
+                exists = True
                 try:
                     with os.fdopen(fd, "rb") as stream:
                         raw = json.load(stream)
-                except (OSError, ValueError) as exc:
+                except (ValueError, RecursionError) as exc:
+                    if on_invalid_json is not None:
+                        on_invalid_json()
                     raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+                except OSError as exc:
+                    raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
+            if validate is not None and exists:
+                validate(raw)
             records = raw
             if path:
                 if type(raw) is not dict:

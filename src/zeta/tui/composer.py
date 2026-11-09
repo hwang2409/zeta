@@ -431,6 +431,7 @@ class ComposerAttachmentMixin:
             signal = getattr(self, "_standalone_abort_signal", None)
             if signal is not None:
                 signal.abort()
+            self.loop.abort(foreground_only=True)
             for request in self.pending_approvals:
                 if self._approval_policy is not None:
                     self._approval_policy.abort(request.key)
@@ -510,11 +511,6 @@ class ComposerAttachmentMixin:
         session = self._active_session
         buffer = session.app.current_buffer if session is not None else None
         return await self._paste_runtime.paste(buffer)
-
-    async def paste_from_clipboard(self) -> str:
-        """Stage and register one clipboard image through the ordered paste module."""
-
-        return await self._paste_runtime.paste()
 
     def _paste_from_keybinding(self, event: Any | None = None) -> None:
         if self._reject_during_startup_replay("paste"):

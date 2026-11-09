@@ -28,7 +28,7 @@ from .agent_sync import (
     AgentTranscriptTreeSnapshot,
 )
 from .base import compact_tool_card
-from .shared import wrap_by_cells
+from .shared import hard_wrap_by_cells
 
 if TYPE_CHECKING:
     from .agent_message import AgentIdentityIndex
@@ -63,7 +63,7 @@ class _BoundedTail:
         projected: list[str] = []
         for line in self._lines:
             projected.extend(
-                wrap_by_cells(str(line), options.max_width) if line.wrap else (str(line),)
+                hard_wrap_by_cells(str(line), options.max_width) if line.wrap else (str(line),)
             )
         omitted = (
             len(projected) - MAX_TAIL_LINES + 1

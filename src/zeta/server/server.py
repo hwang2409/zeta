@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import socket
 import stat
@@ -14,8 +15,12 @@ from typing import Any
 from ..core.session import SessionError, SessionNotFoundError
 from ..core.session_execution import SessionOwnedError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
-from ..core.transcript_recovery.runtime import repair_transcript_for_runtime
+from ..core.transcript_recovery.runtime import (
+    TranscriptRepairRequiresUpgrade,
+    repair_transcript_for_runtime,
+)
 from ..project_errors import ProjectRegistryBusyError
+from ..storage_format import drain_releases, pending_releases
 from . import (
     abort_scope,
     accounts,
@@ -38,9 +43,7 @@ from .protocol import (
     _LOGIN_METHODS,
     _PROJECT_METHODS,
     FEATURES,
-    HANDLERS,
     MAX_FRAME_BYTES,
-    Access,
     ApprovalDecision,
     ErrorDescriptor,
     FrameCodec,
@@ -53,31 +56,28 @@ from .protocol import (
     negotiate_protocol_version,
     protocol_error,
 )
+from .protocol import _dispatch as _dispatch_request
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
-LOADED_SESSION_MUTATIONS = frozenset(
-    {
-        "abort",
-        "approve",
-        "clear_steering",
-        "deny",
-        "fork_message",
-        "rename_session",
-        "repair_transcript",
-        "revoke_session_grants",
-        "send",
-        "send_images",
-        "set_compaction",
-        "set_settings",
-        "set_turn_context",
-        "slash_run",
-        "steer",
-        "switch_branch",
-    }
-)
+logger = logging.getLogger(__name__)
 
+# A GC finalizer only queues a lease release; an idle serve must still run it,
+# or another process stays refused the session until serve's next lease call.
+IDLE_DRAIN_INTERVAL = 1.0
+
+
+async def _drain_released_leases() -> None:
+    while True:
+        await asyncio.sleep(IDLE_DRAIN_INTERVAL)
+        if not pending_releases():
+            continue
+        try:
+            # a release may wait on a registry lock another thread holds
+            await asyncio.to_thread(drain_releases)
+        except Exception:  # a failed drain must not stop serve
+            logger.exception("draining released leases failed")
 
 
 class _UnixSocketListener:
@@ -249,6 +249,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
@@ -285,6 +286,7 @@ class ZetaServer:
             except BaseException:
                 await self.close()
                 raise
+        self._idle_drain = asyncio.create_task(_drain_released_leases())
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -294,6 +296,10 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
+        if self._idle_drain is not None:
+            self._idle_drain.cancel()
+            await asyncio.wait([self._idle_drain])
+            self._idle_drain = None
         try:
             if self._client is not None:
                 await self._client.close(graceful=True)
@@ -427,6 +433,18 @@ class _Client:
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
                             str(exc),
                             {"retryable": exc.retryable},
+                        )
+                    )
+                except TranscriptRepairRequiresUpgrade as exc:
+                    await self._write(
+                        self.codec.error_response(
+                            request_id,
+                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                            str(exc),
+                            {
+                                "home_epoch": exc.home_epoch,
+                                "required_epoch": exc.required_epoch,
+                            },
                         )
                     )
                 except TranscriptLoadError as exc:
@@ -587,34 +605,7 @@ class _Client:
             await self.server.control.publish_session_grant_change(change)
         return result
 
-    async def _dispatch(
-        self, request_id: str | int, method: str, params: dict[str, Any]
-    ) -> object:
-        handled, result = await self._route_request(request_id, method, params)
-        if handled:
-            return result
-        descriptor = MethodDescriptor.for_wire(method)
-        if self.role == "observer" and (
-            descriptor is None or descriptor.access is not Access.READ
-        ):
-            raise ProtocolError(
-                ErrorDescriptor.OBSERVER_READ_ONLY,
-                "method is unavailable to read-only observers",
-                {"method": method},
-            )
-        if descriptor is None:
-            raise ProtocolError(
-                ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
-            )
-        if descriptor.access is Access.SESSION_MUTATION:
-            self.server.control._reject_if_unhealthy()
-        if descriptor.since is not None and tuple(
-            int(part) for part in self.protocol_version.split(".")
-        ) < tuple(int(part) for part in descriptor.since.split(".")):
-            raise self._descriptor_protocol_error(descriptor)
-        if descriptor.feature is not None and descriptor.feature not in self.features:
-            raise self._descriptor_feature_error(descriptor)
-        return await HANDLERS[descriptor](self, request_id, params)
+    _dispatch = _dispatch_request
 
     _descriptor_protocol_error = staticmethod(protocol_error)
     _descriptor_feature_error = staticmethod(feature_error)
@@ -901,6 +892,8 @@ class _Client:
                     else None
                 ),
             )
+        except TranscriptRepairRequiresUpgrade:
+            raise
         except (ValueError, SessionError) as exc:
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
         return {

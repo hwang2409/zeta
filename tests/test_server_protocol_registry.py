@@ -727,10 +727,22 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session grant not found","data":{"code":"session_grant_not_found","grant":"bash"}}}\n',
     ),
     (
+        ErrorDescriptor.SESSION_MISMATCH,
+        "session is not active",
+        {"attached_session_id": "s1", "session_id": "s2"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32003,"message":"session is not active","data":{"code":"session_mismatch","attached_session_id":"s1","session_id":"s2"}}}\n',
+    ),
+    (
         ErrorDescriptor.SESSION_NOT_FOUND,
         "session missing",
         {"session_id": "s1"},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session missing","data":{"code":"session_not_found","session_id":"s1"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+        "transcript repair needs the stored-format upgrade (home epoch 2, needs 4)",
+        {"home_epoch": 2, "required_epoch": 4},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
     ),
 )
 

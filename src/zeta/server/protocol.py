@@ -64,6 +64,11 @@ class ErrorDescriptor(Enum):
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
+        -32013,
+        "transcript_repair_requires_upgrade",
+        "transcript repair requires the stored-format upgrade",
+    )
     CORRUPT_TRANSCRIPT = (
         -32000,
         "corrupt_transcript",
@@ -125,6 +130,11 @@ class ErrorDescriptor(Enum):
         -32602,
         "session_not_found",
         "the requested session does not exist",
+    )
+    SESSION_MISMATCH = (
+        -32003,
+        "session_mismatch",
+        "the requested session is not the attached session",
     )
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
@@ -230,6 +240,7 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "delivery_session_guard",
 )
 
 
@@ -496,6 +507,79 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     if requested == "1.0" and advertised in SUPPORTED_PROTOCOL_VERSIONS[1:]:
         return advertised
     return requested
+
+
+LOADED_SESSION_MUTATIONS = frozenset(
+    {
+        "abort",
+        "approve",
+        "clear_steering",
+        "deny",
+        "fork_message",
+        "rename_session",
+        "repair_transcript",
+        "revoke_session_grants",
+        "send",
+        "send_images",
+        "set_compaction",
+        "set_settings",
+        "set_turn_context",
+        "slash_run",
+        "steer",
+        "switch_branch",
+    }
+)
+
+
+async def _dispatch(
+    self, request_id: str | int, method: str, params: dict[str, Any]
+) -> object:
+    handled, result = await self._route_request(request_id, method, params)
+    if handled:
+        return result
+    descriptor = MethodDescriptor.for_wire(method)
+    if self.role == "observer" and (
+        descriptor is None or descriptor.access is not Access.READ
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.OBSERVER_READ_ONLY,
+            "method is unavailable to read-only observers",
+            {"method": method},
+        )
+    if descriptor is None:
+        raise ProtocolError(
+            ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
+        )
+    if descriptor.access is Access.SESSION_MUTATION:
+        self.server.control._reject_if_unhealthy()
+    if descriptor.since is not None and tuple(
+        int(part) for part in self.protocol_version.split(".")
+    ) < tuple(int(part) for part in descriptor.since.split(".")):
+        raise self._descriptor_protocol_error(descriptor)
+    if descriptor.feature is not None and descriptor.feature not in self.features:
+        raise self._descriptor_feature_error(descriptor)
+    if descriptor.access is Access.DELIVERY:
+        _require_attached_session(self.server.runtime, params)
+    return await HANDLERS[descriptor](self, request_id, params)
+
+
+def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
+    """Reject a delivery aimed at another session before any delivery effect."""
+
+    if "session_id" not in params:
+        return
+    session_id = params["session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+        )
+    attached = runtime.session_id if runtime.opened is not None else None
+    if attached is not None and session_id != attached:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_MISMATCH,
+            "session is not active",
+            {"attached_session_id": attached, "session_id": session_id},
+        )
 
 
 def _descriptor_handler(descriptor: MethodDescriptor) -> Handler:

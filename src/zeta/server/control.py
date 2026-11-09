@@ -140,6 +140,7 @@ class ServeControl:
             ),
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
+            grant_published=self._publish_session_grant,
         )
 
     def start_turn(
@@ -149,6 +150,7 @@ class ServeControl:
         *,
         origin: MessageOrigin = MessageOrigin.USER,
         persist_user_message: bool = True,
+        allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
         self._turn_task = asyncio.create_task(
@@ -159,6 +161,7 @@ class ServeControl:
                 persist_user_message=persist_user_message,
                 host_commands=host_commands,
                 turn_id=uuid.uuid4().hex,
+                allow_assistant_reset=allow_assistant_reset,
             )
         )
 
@@ -433,16 +436,10 @@ class ServeControl:
         policy = self.server.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
-        grants_before = policy.session_allow
         result, core_key = await self._approvals.transition(
             Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
-        added = tuple(sorted(map(str, policy.session_allow - grants_before)))
-        if added:
-            await self.publish_session_grant_change(
-                session_grant_change(policy, "grant", added)
-            )
         if (
             not self.turn_busy()
             and isinstance(core_key, str)
@@ -455,6 +452,13 @@ class ServeControl:
                 self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
         return result
+
+    async def _publish_session_grant(self, tool: str) -> None:
+        policy = self.server.runtime.policy
+        if policy is not None:
+            await self.publish_session_grant_change(
+                session_grant_change(policy, "grant", (tool,))
+            )
 
     async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
         connections = self.server.connections
@@ -480,9 +484,7 @@ class ServeControl:
         reason: str = "turn_canceled",
     ) -> Awaitable[object]:
         return asyncio.create_task(
-            self._approvals.transition(
-                Cancel(request_id, child_instance_id, reason)
-            )
+            self._approvals.transition(Cancel(request_id, child_instance_id, reason))
         )
 
     def request_approval_abort_gate(
@@ -543,6 +545,7 @@ class ServeControl:
         persist_user_message: bool = True,
         host_commands: SessionHostCommands | None = None,
         turn_id: str,
+        allow_assistant_reset: bool = True,
     ) -> None:
         loop = self.server.runtime.loop
         state = self.server.runtime.state
@@ -567,6 +570,7 @@ class ServeControl:
                 host_instruction=""
                 if host_commands is None
                 else host_commands.instruction,
+                allow_assistant_reset=allow_assistant_reset,
             ):
                 if pending_turn_end is not None:
                     if event.type is StreamEventType.AGENT_END:
@@ -883,9 +887,7 @@ class ServeControl:
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
-                await self._notify(
-                    wire_event, session_id, _admitted=True, **fields
-                )
+                await self._notify(wire_event, session_id, _admitted=True, **fields)
                 return
             await self._notify(wire_event, session_id, **fields)
             return

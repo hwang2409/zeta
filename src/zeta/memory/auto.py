@@ -31,7 +31,7 @@ from ..protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     MessageOrigin,
 )
-from ..providers.retry_policy import ProviderRetryBudget, use_retry_budget
+from ..providers.completion import CompletionRetryBudget
 from ..storage_format import WRITER_EPOCH, WriterLease, open_writer
 from .entry_reconciler import EntryReconciliationFailure, reconcile_entry_range
 from .profiles import early_update_debounce_seconds, early_update_max_wait_seconds
@@ -54,7 +54,9 @@ from .reconciliation_state import (
 )
 
 InvokeResult = str | ReconciliationResponse
-Invoke = Callable[[str], InvokeResult | Awaitable[InvokeResult]]
+Invoke = Callable[
+    [str, CompletionRetryBudget], InvokeResult | Awaitable[InvokeResult]
+]
 Notice = Callable[[str], None]
 Clock = Callable[[], float]
 IdleWait = Callable[[asyncio.Event, float], Awaitable[None]]
@@ -231,6 +233,9 @@ class AutoMemoryReconciler:
 
     @property
     def automatic_memory_status(self) -> str | None:
+        broken = self.state.broken
+        if broken is not None:
+            return broken.status_line()
         scanner_failure = self.scanner_failure
         if scanner_failure is not None:
             seq, cause = scanner_failure
@@ -256,7 +261,11 @@ class AutoMemoryReconciler:
 
     def retry_terminal(self, key: str) -> bool:
         """Re-queue one terminal receipt for this session."""
-        if self._paused_for_login or self.scanner_failure is not None:
+        if (
+            self._paused_for_login
+            or self.state.broken is not None
+            or self.scanner_failure is not None
+        ):
             return False
         queued = self.state.retry_terminal(key, now=self._retry_clock())
         if queued and not self._closing:
@@ -337,6 +346,7 @@ class AutoMemoryReconciler:
             or self._closing
             or self._paused_for_login
             or self._paused_for_recovery
+            or self.state.broken is not None
             or (seq is not None and self._recovery_cutoff is not None and seq <= self._recovery_cutoff)
         ):
             return
@@ -354,6 +364,7 @@ class AutoMemoryReconciler:
             not self.config.enabled
             or self._closing
             or self._paused_for_login
+            or self.state.broken is not None
             or seq_end < seq_start
         ):
             return
@@ -365,7 +376,11 @@ class AutoMemoryReconciler:
 
     async def drain(self) -> None:
         """Wait until all work currently caused by activity has settled."""
-        if not self.config.enabled or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._paused_for_login
+            or self.state.broken is not None
+        ):
             return
         self._begin_work_cycle()
         self._ensure_worker()
@@ -400,7 +415,12 @@ class AutoMemoryReconciler:
 
     def catch_up(self) -> None:
         """Queue durable transcript content left behind by an earlier shutdown."""
-        if not self.config.enabled or self._closing or self._paused_for_login:
+        if (
+            not self.config.enabled
+            or self._closing
+            or self._paused_for_login
+            or self.state.broken is not None
+        ):
             return
         self._begin_work_cycle()
         self._resume_catch_up = True
@@ -412,7 +432,7 @@ class AutoMemoryReconciler:
             self._retry_attempts_in_cycle.clear()
 
     def _ready_retries(self) -> tuple[ReconciliationWork, ...]:
-        if self.scanner_failure is not None:
+        if self.state.broken is not None or self.scanner_failure is not None:
             return ()
         return tuple(
             work
@@ -421,11 +441,13 @@ class AutoMemoryReconciler:
         )
 
     def _ensure_worker(self) -> None:
+        if self.state.broken is not None:
+            return
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._worker())
 
     def _add_pending(self, start: int, end: int, *reasons: str) -> None:
-        if self.state.scanner_failure is not None:
+        if self.state.broken is not None or self.state.scanner_failure is not None:
             return
         for uncovered_start, uncovered_end in self.state.uncovered_ranges(start, end):
             merged = _PendingRange(uncovered_start, uncovered_end, set(reasons))
@@ -443,7 +465,7 @@ class AutoMemoryReconciler:
             self._pending = sorted(remaining, key=lambda item: item.start)
 
     def _queue_ready_retries(self) -> None:
-        if self.scanner_failure is not None:
+        if self.state.broken is not None or self.scanner_failure is not None:
             return
         queued = {item.key for item in self._pending if item.key is not None}
         for work in self._ready_retries():
@@ -737,7 +759,7 @@ class AutoMemoryReconciler:
                         return
                     selected_start = int(request.transcript.rows[0]["seq"])
                     selected_end = int(request.transcript.rows[-1]["seq"])
-                    budget = ProviderRetryBudget()
+                    budget = CompletionRetryBudget()
                     try:
                         raw_text, first_usage = await self._invoke_request(
                             request.prompt, budget
@@ -876,14 +898,19 @@ class AutoMemoryReconciler:
                 self._publish_failure_notice()
 
     async def _invoke_request(
-        self, prompt: str, budget: ProviderRetryBudget
+        self, prompt: str, budget: CompletionRetryBudget
     ) -> tuple[str, dict[str, int]]:
         if self._closing:
             raise asyncio.CancelledError
-        with use_retry_budget(budget):
-            raw = self.invoke(prompt)
-            if inspect.isawaitable(raw):
-                raw = await raw
+        try:
+            inspect.signature(self.invoke).bind(prompt, budget)
+        except TypeError:
+            raw = self.invoke(prompt)  # type: ignore[call-arg]
+        else:
+            raw = self.invoke(prompt, budget)
+        if inspect.isawaitable(raw):
+            # test-contract: seam provider completion owns its request deadlines
+            raw = await raw
         if isinstance(raw, ReconciliationResponse):
             return raw.text, dict(raw.usage)
         return raw, {}

@@ -23,7 +23,6 @@ from ..skills import (
     SkillCatalog,
 )
 from .commands.custom_commands import (
-    COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
     load_custom_commands,
 )
@@ -126,7 +125,6 @@ class UsageTracker:
                     estimated_cost_usd=_snapshot_cost(self.provider, snapshot),
                 )
             self._accumulate_cost(snapshot)
-
     def _accumulate_cost(self, snapshot: UsageSnapshot) -> None:
         if snapshot.model is None:
             return
@@ -153,7 +151,6 @@ class UsageTracker:
                 else None
             ),
         )
-
     def _counters(self) -> dict[str, int]:
         return {
             "input_tokens": self.source.uncached_input_tokens_this_session,
@@ -170,7 +167,6 @@ class CompactionSummary:
     turn: int
     entries_folded: int
     tokens_saved: int
-
 
 @dataclass(frozen=True, slots=True)
 class ModelPricing:
@@ -969,6 +965,10 @@ def _mcp_mutates(args: str) -> bool:
     }
 
 
+def _decisions_mutates(args: str) -> bool:
+    return args.strip().partition(" ")[0] in {"dismiss", "reply"}
+
+
 def create_slash_registry(
     *,
     zeta_home: str | Path | None = None,
@@ -1140,7 +1140,12 @@ def create_slash_registry(
     registry.register(SlashCommand("runs", _run_runs, "list live agent runs"))
     registry.register(SlashCommand("tasks", _run_tasks, "inspect background processes"))
     registry.register(
-        SlashCommand("decisions", _run_decisions, "answer or discuss open decisions")
+        SlashCommand(
+            "decisions",
+            _run_decisions,
+            "read, reply, dismiss, or batch-reply to attention items",
+            ServeSlash(mutates=_decisions_mutates),
+        )
     )
     registry.register(
         SlashCommand(

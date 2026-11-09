@@ -16,7 +16,10 @@ import pytest
 
 import zeta.core.session as session_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
+from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
@@ -38,6 +41,7 @@ from zeta.protocol.types import (
     TextContent,
     ToolSchema,
 )
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
@@ -54,6 +58,7 @@ class _GatedBackend(CompletionBackend):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -77,6 +82,7 @@ class _PostTurnBackend(CompletionBackend):
         self.woke = asyncio.Event()
         self.later_woke = asyncio.Event()
 
+    @owned_completion
     async def complete(
         self,
         messages: Sequence[Message],
@@ -84,9 +90,13 @@ class _PostTurnBackend(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         self.calls += 1
         if self.calls == 1:
-            yield StreamEvent(StreamEventType.MESSAGE_END)
-            self.finalization_entered.set()
-            await self.release_finalization.wait()
+            # the completion owner closes the stream at MESSAGE_END; hold
+            # turn finalization inside that close.
+            try:
+                yield StreamEvent(StreamEventType.MESSAGE_END)
+            finally:
+                self.finalization_entered.set()
+                await await_or_fail(self.release_finalization.wait(), what="self.release_finalization.wait()")
             return
         if self.calls == 2:
             self.woke.set()
@@ -104,9 +114,7 @@ class _ControllerConnection:
             "Server",
             (),
             {
-                "runtime": type(
-                    "Runtime", (), {"set_post_stream_provider_retry": lambda *_: None}
-                )()
+                "runtime": type("Runtime", (), {})()
             },
         )()
 
@@ -527,45 +535,21 @@ async def _capture_direct_raw_stream(
     reader, writer = await _connect(server)
     frames: list[bytes] = []
 
-    async def send(request_id: int, method: str, params: dict[str, object]) -> None:
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode()
+    async def call(request_id: int, method: str, params: dict[str, object]) -> bytes:
+        await send(reader, writer, request_id, method, params)
+        replies = await read_until(
+            reader, lambda frame: frame.get("id") == request_id, what=method
         )
-        await writer.drain()
-
-    async def read_until(request_id: int, *, record: bool = True) -> None:
-        while True:
-            frame = await _read_raw(reader)
-            if record:
-                frames.append(frame)
-            if json.loads(frame).get("id") == request_id:
-                return
+        return b"".join(frame.raw for frame in replies)
 
     try:
-        await send(1, "hello", {"protocol_version": "1.2"})
-        await read_until(1)
-        await send(2, "status", {})
-        await read_until(2)
-        await send(3, "missing_method", {})
-        await read_until(3)
-        await send(4, "new_session", {"provider": "codex"})
-        await read_until(4, record=False)
-        await send(5, "send", {"text": "wait"})
-        await read_until(5)
-        await backend.entered.wait()
-        await send(6, "abort", {})
-        await read_until(6)
+        frames.append(await call(1, "hello", {"protocol_version": "1.2"}))
+        frames.append(await call(2, "status", {}))
+        frames.append(await call(3, "missing_method", {}))
+        await call(4, "new_session", {"provider": "codex"})
+        frames.append(await call(5, "send", {"text": "wait"}))
+        await asyncio.wait_for(backend.entered.wait(), 10)
+        frames.append(await call(6, "abort", {}))
         writer.close()
         await writer.wait_closed()
         assert await reader.read() == b""
@@ -611,9 +595,18 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
     expected = (
         Path(__file__).parent / "fixtures" / "serve_control_detach_origin_main.jsonl"
     ).read_bytes()
-    actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
-    actual += await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
-    assert actual == expected
+    expected_frames = expected.splitlines(keepends=True)
+    split = next(
+        index for index, frame in enumerate(expected_frames) if b'"id":1' in frame
+    )
+    actual_controller = await _controller_event_stream(
+        tmp_path, monkeypatch, observer=False
+    )
+    actual_direct = await _capture_direct_raw_stream(tmp_path / "direct", monkeypatch)
+    assert_raw_frames_preserved(
+        actual_controller, b"".join(expected_frames[:split])
+    )
+    assert_raw_frames_preserved(actual_direct, b"".join(expected_frames[split:]))
 
     server = ZetaServer(home=tmp_path / "owner", port=0, provider="codex")
     await server.start()
@@ -624,6 +617,46 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
         assert server.runtime._background_wake_sink is not None
     finally:
         await server.close()
+
+
+def _controller_fixture_frames() -> bytes:
+    expected = (
+        Path(__file__).parent / "fixtures" / "serve_control_detach_origin_main.jsonl"
+    ).read_bytes()
+    frames = expected.splitlines(keepends=True)
+    split = next(index for index, frame in enumerate(frames) if b'"id":1' in frame)
+    return b"".join(frames[:split])
+
+
+@pytest.mark.asyncio
+async def test_controller_stream_reads_deny_response_written_after_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CI run 42502453427: the id-4 deny response reached the socket after turn_end.
+    turn_end_written = asyncio.Event()
+    write = _Client._write
+    write_physical = _Client._write_physical
+
+    async def response_after_turn_end(self: _Client, payload: bytes) -> bool:
+        if json.loads(payload).get("id") == 4:
+            await asyncio.wait_for(turn_end_written.wait(), 10)
+        return await write(self, payload)
+
+    async def mark_turn_end(self: _Client, payload: bytes) -> bool:
+        written = await write_physical(self, payload)
+        if b'"event":"turn_end"' in payload:
+            turn_end_written.set()
+        return written
+
+    # test-contract: seam no public hook orders one response after a later event
+    monkeypatch.setattr(_Client, "_write", response_after_turn_end)
+    # test-contract: seam no public event says a frame reached the socket
+    monkeypatch.setattr(_Client, "_write_physical", mark_turn_end)
+    try:
+        actual = await _controller_event_stream(tmp_path, monkeypatch, observer=False)
+    finally:
+        turn_end_written.set()  # never leave the id-4 write parked at teardown
+    assert_raw_frames_preserved(actual, _controller_fixture_frames())
 
 
 @pytest.mark.parametrize("child_instance_id", ["root:1", "root:1:1"])

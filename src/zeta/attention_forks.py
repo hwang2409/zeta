@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -26,7 +25,6 @@ from .core.session_files import (
     write_session_file,
 )
 from .core.store.prompt_composition import clone_prompt_composition
-from .project_inbox import ProjectInbox
 from .protocol.types import Message, MessageRole, TextContent, ToolUseContent
 from .runtime.project_registry_state import (
     ProjectRegistryState,
@@ -118,61 +116,6 @@ def validate_attention_fork(
     return ValidatedAttentionFork(fork, record)
 
 
-def attention_decision_message_id(attention_id: str) -> str:
-    """Return the stable inbox identity for one attention decision."""
-    return hashlib.sha256(f"attention-decision:{attention_id}".encode()).hexdigest()[
-        :32
-    ]
-
-
-def deliver_attention_decision(
-    home: Path,
-    record: AttentionRecord,
-    decision: str,
-    *,
-    from_session: str,
-    registry_state: ProjectRegistryState | None = None,
-) -> tuple[str, AttentionRecord, bool]:
-    """Deliver and resolve one decision through the shared resolution seam."""
-    decision = decision.strip()
-    if not decision:
-        raise ValueError("decision must be nonempty")
-    message_id = attention_decision_message_id(record.id)
-    store = AttentionStore(Path(home) / "sessions" / record.session_id)
-    state = registry_state or available_project_registry(Path(home) / "projects")
-    registry = state.registry
-    if registry is None:
-        raise ValueError("project registry is unavailable")
-    inbox = ProjectInbox(registry, sessions_root=Path(home) / "sessions")
-
-    def send(current: AttentionRecord) -> None:
-        if current.project_id is None:
-            raise ValueError("attention record has no project")
-        body = (
-            f"User decision relayed from session {from_session}. "
-            f"The question was asked at {current.created_at}; check whether the "
-            f"situation has changed before acting.\n\nDecision: {decision}"
-        )
-        inbox.send(
-            from_project=current.project_id,
-            from_session=from_session,
-            to_project=current.project_id,
-            to_session=current.session_id,
-            kind="reply",
-            title=f"Decision: {current.title}",
-            body=body,
-            message_id=message_id,
-        )
-
-    resolved, already_resolved = store.resolve(
-        record.id,
-        session_id=record.session_id,
-        decision=decision,
-        before_commit=send,
-    )
-    return message_id, resolved, already_resolved
-
-
 def release_discussion_fork(
     home: Path,
     fork_session_id: str,
@@ -203,7 +146,6 @@ def release_discussion_fork(
     ):
         store.replace(replace(record, fork_session_id=None))
     return fork.forked_from_session
-
 
 
 @contextmanager
@@ -382,9 +324,13 @@ def create_discussion_fork(
         with _fork_allocation_lock(attention_store):
             record = attention_store.get(attention_id)
             if record.session_id != source_session_id:
-                raise ValueError("attention record does not belong to the source session")
+                raise ValueError(
+                    "attention record does not belong to the source session"
+                )
             if record.project_id != source.metadata.project_id:
-                raise ValueError("attention record does not belong to the source project")
+                raise ValueError(
+                    "attention record does not belong to the source project"
+                )
             if record.fork_session_id:
                 return record.fork_session_id
             branch = source.store.replay()

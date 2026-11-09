@@ -176,10 +176,6 @@ class ConnectionRegistry:
                 "another client is already connected",
             ) from exc
         connection.role = role
-        if role == "controller":
-            connection.server.runtime.set_post_stream_provider_retry(
-                "assistant_reset" in features
-            )
         return role
 
     def _claim(
@@ -798,14 +794,6 @@ class ConnectionRegistry:
             ),
             session_id=session_id,
         )
-
-    async def run_observer_read(
-        self, connection: Any, callable: Callable[[], Any]
-    ) -> Any:
-        state = self._connections.get(connection)
-        if state is None or state.role != "observer":
-            raise RuntimeError("observer is not connected")
-        return await self.run_blocking(callable)
 
     def _read_worker(self) -> None:
         while True:
