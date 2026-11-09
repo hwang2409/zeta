@@ -692,8 +692,32 @@ async def _controller_event_stream(
             reader, is_event("sub_agent_receipt"), what="sub_agent_receipt"
         )
         await send(reader, writer, 4, "deny", {"request_id": "call-1"})
-        frames += await read_until(reader, is_event("turn_end"), what="turn_end")
-        raw = b"".join(frame.raw for frame in frames)
+        frames += await read_until(
+            reader,
+            lambda frame: (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            ),
+            what="turn_end",
+        )
+        deny_response = next(frame for frame in frames if frame.get("id") == 4)
+        assert deny_response["result"] == {
+            "accepted": True,
+            "request_id": "call-1",
+            "decision": "deny",
+        }
+        turn_one_end = next(
+            index
+            for index, frame in enumerate(frames)
+            if (
+                is_event("turn_end")(frame)
+                and frame.get("params", {}).get("data", {}).get("turn") == 1
+            )
+        )
+        bounded_frames = frames[: turn_one_end + 1]
+        if deny_response not in bounded_frames:
+            bounded_frames.append(deny_response)
+        raw = b"".join(frame.raw for frame in bounded_frames)
         assert session_id.encode() in raw
         return raw
     finally:
