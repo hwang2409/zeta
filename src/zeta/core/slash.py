@@ -23,7 +23,6 @@ from ..skills import (
     SkillCatalog,
 )
 from .commands.custom_commands import (
-    COMMAND_FILE_SIZE_LIMIT,  # noqa: F401 - public compatibility export
     CustomCommand,
     load_custom_commands,
 )

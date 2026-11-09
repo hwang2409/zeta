@@ -508,10 +508,20 @@ async def _handle_pending_notification(
             child_loop.agent_instance_id or "", flow.pending_ids()
         )
         if episode is None:
+            from ..runtime.loop.empty_turn import not_delivered_text
+
+            channel = child_loop._background_owner.conversation_channel
             flow.suppress_pending(exhausted_ids)
-            child_loop._background_owner.conversation_channel.clear_wake(
-                child_loop.agent_instance_id or ""
-            )
+            channel.clear_wake(child_loop.agent_instance_id or "")
+            if exhausted_ids:
+                await channel.publish_not_delivered(
+                    child_loop,
+                    not_delivered_text(
+                        f"the budget of {POST_CAP_CAUSAL_TURNS} automatic turns "
+                        "after the finish gate is used up",
+                        waits_for_input=child_loop.explicit_finish,
+                    ),
+                )
             return await state.wait_transition(child_loop, tasks_running=tasks_running)
     return await state.run_model_turn(
         child_loop,

@@ -35,14 +35,6 @@ def exists(directory_fd: int, name: str) -> bool:
     return True
 
 
-def file_mtime_ns(directory_fd: int, name: str) -> int:
-    fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    try:
-        return os.fstat(fd).st_mtime_ns
-    finally:
-        os.close(fd)
-
-
 @contextmanager
 def owned_fd(fd: int) -> Iterator[int]:
     try:
