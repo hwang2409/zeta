@@ -310,6 +310,7 @@ def compose_runtime(
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish
+        loop.project_discovery = project_discovery
 
         def prepare_project_context(projection: Any) -> ProjectContext:
             cwd_project = (

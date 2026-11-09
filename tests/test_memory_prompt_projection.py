@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import zeta.agent.child_context as child_context_module
 from zeta.agent.runner import _child_base_system_prompt
-from zeta.core.project_context import load_project_context
+from zeta.core.project_context import discover_project, load_project_context
 from zeta.core.session import SessionManager
 from zeta.memory.entry_store import (
     AddOperation,
@@ -21,6 +23,7 @@ from zeta.memory.entry_store import (
 )
 from zeta.memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from zeta.project_registry import ProjectRegistry
+from zeta.runtime.prompt import RuntimePrompt
 from zeta.server.runtime import ServerRuntime
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
@@ -332,6 +335,236 @@ def test_same_cwd_child_inherits_parent_memory_snapshot(tmp_path: Path) -> None:
         _child_base_system_prompt(loop, str(symlink_cwd)).system_prompt is parent_prompt
     )
     assert "new memory" not in parent_prompt
+
+
+def test_same_cwd_child_reuses_parent_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+    calls = 0
+    real_discover = child_context_module.discover_project
+
+    def tracked_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(child_context_module, "discover_project", tracked_discovery)
+    child = _child_base_system_prompt(loop, str(workspace))
+
+    assert calls == 0
+    assert child.system_prompt == context.system_prompt
+
+
+def test_same_cwd_child_refreshes_after_agents_marker_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    (workspace / "AGENTS.md").write_text("new child instruction", encoding="utf-8")
+    calls = 0
+    real_discover = child_context_module.discover_project
+
+    def tracked_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+    monkeypatch.setattr(child_context_module, "discover_project", tracked_discovery)
+
+    child = _child_base_system_prompt(loop, str(workspace))
+
+    assert calls == 1
+    assert "new child instruction" in child.system_prompt
+
+
+def test_same_cwd_child_refreshes_after_git_marker_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    (workspace / ".git").mkdir()
+    calls = 0
+    real_discover = child_context_module.discover_project
+
+    def tracked_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+    monkeypatch.setattr(child_context_module, "discover_project", tracked_discovery)
+
+    _child_base_system_prompt(loop, str(workspace))
+
+    assert calls == 1
+
+
+def test_different_physical_child_cwd_discovers_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace, registry, project_id = _entry_project(tmp_path)
+    _add(registry, project_id, (AddOperation("state", "current memory", _source(1)),))
+    context = load_project_context(
+        cwd=workspace,
+        repo_root=workspace,
+        zeta_home=home,
+        catalog=SkillCatalog.empty(),
+        **_context_projects(registry, project_id),
+    )
+    discovery = discover_project(workspace, user_home=home.parent)
+    other = tmp_path / "other"
+    other.mkdir()
+    other_link = tmp_path / "other-link"
+    other_link.symlink_to(other, target_is_directory=True)
+    calls = 0
+    real_discover = child_context_module.discover_project
+
+    def tracked_discovery(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    loop = SimpleNamespace(
+        context_assembler=SimpleNamespace(system_prompt=context.system_prompt),
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project_id,
+        project_registry=registry,
+        project_discovery=discovery,
+        _skill_prompt_base=lambda: RuntimePrompt(
+            context.system_prompt, context.prompt_components
+        ),
+    )
+    monkeypatch.setattr(child_context_module, "discover_project", tracked_discovery)
+
+    _child_base_system_prompt(loop, str(other_link))
+
+    assert calls == 1
+
+
+def test_same_cwd_child_sees_project_created_after_discovery(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    discovery = discover_project(workspace, user_home=home.parent)
+    project = registry.create_project("created", "test", workspace)
+    (home / "projects" / project.project_id / "AGENTS.md").write_text(
+        "created project instructions", encoding="utf-8"
+    )
+    loop = SimpleNamespace(
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=None,
+        project_registry=registry,
+    )
+
+    child = child_context_module._load_child_project_context(
+        loop,
+        None,
+        None,
+        projection=registry.project_context_projection(None),
+        discovery=discovery,
+    )
+
+    assert "created project instructions" in child.system_prompt
+
+
+def test_same_cwd_child_sees_renamed_project_after_discovery(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("before", "test", workspace)
+    agents = home / "projects" / project.project_id / "AGENTS.md"
+    agents.write_text("before project instructions", encoding="utf-8")
+    discovery = discover_project(workspace, user_home=home.parent)
+    record = home / "projects" / project.project_id / "project.json"
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload["name"] = "after"
+    record.write_text(json.dumps(payload), encoding="utf-8")
+    agents.write_text("after project instructions", encoding="utf-8")
+    loop = SimpleNamespace(
+        store=SimpleNamespace(cwd=str(workspace)),
+        active_home=str(home),
+        tool_registry=SimpleNamespace(skill_catalog=SkillCatalog.empty()),
+        root_project_id=project.project_id,
+        project_registry=registry,
+    )
+
+    child = child_context_module._load_child_project_context(
+        loop,
+        None,
+        None,
+        projection=registry.project_context_projection(project.project_id),
+        discovery=discovery,
+    )
+
+    assert "after project instructions" in child.system_prompt
+    assert "before project instructions" not in child.system_prompt
 
 
 def test_fresh_cwd_child_loads_current_memory(

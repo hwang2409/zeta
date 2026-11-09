@@ -121,6 +121,43 @@ class ProjectDiscovery:
     filesystem_root: Path
     eligible: bool
     project: Project | None = None
+    marker_signature: tuple[
+        tuple[str, tuple[int, int, int, int, int] | None], ...
+    ] = ()
+
+
+def _marker_signature(directory: Path) -> tuple[
+    tuple[str, tuple[int, int, int, int, int] | None], ...
+]:
+    """Capture markers that can change project context without a Git probe."""
+    markers: list[tuple[str, tuple[int, int, int, int, int] | None]] = []
+    current = directory
+    while True:
+        for name in (".git", AGENTS_FILENAME):
+            marker = current / name
+            try:
+                stat = marker.stat()
+                value = (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_mode,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                )
+            except OSError:
+                value = None
+            markers.append((str(marker), value))
+        if current.parent == current:
+            return tuple(markers)
+        current = current.parent
+
+
+def project_discovery_is_current(
+    discovery: ProjectDiscovery, cwd: str | Path
+) -> bool:
+    """Return whether captured project markers still match the cwd."""
+    resolved = Path(cwd).expanduser().resolve()
+    return resolved == discovery.cwd and _marker_signature(resolved) == discovery.marker_signature
 
 
 def _run_discovery_git(
@@ -194,7 +231,16 @@ def discover_project(
                 "git project discovery failed for %s: incomplete repository geometry",
                 directory,
             )
-        return ProjectDiscovery(directory, directory, None, None, home, root, eligible)
+        return ProjectDiscovery(
+            directory,
+            directory,
+            None,
+            None,
+            home,
+            root,
+            eligible,
+            marker_signature=_marker_signature(directory),
+        )
     repo_root, git_dir, common_dir = (
         Path(line).expanduser().resolve() for line in lines
     )
@@ -221,7 +267,14 @@ def discover_project(
                 directory,
             )
             return ProjectDiscovery(
-                directory, repo_root, common_dir, None, home, root, False
+                directory,
+                repo_root,
+                common_dir,
+                None,
+                home,
+                root,
+                False,
+                marker_signature=_marker_signature(directory),
             )
         primary = Path(first.removeprefix("worktree ")).expanduser().resolve()
         # A separate Git directory can be reported instead of its checkout.
@@ -229,7 +282,14 @@ def discover_project(
             primary = repo_root
     eligible = primary not in {home, root}
     return ProjectDiscovery(
-        directory, repo_root, common_dir, primary, home, root, eligible
+        directory,
+        repo_root,
+        common_dir,
+        primary,
+        home,
+        root,
+        eligible,
+        marker_signature=_marker_signature(directory),
     )
 
 

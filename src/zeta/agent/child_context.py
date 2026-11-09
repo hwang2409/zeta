@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING, cast
 
 from ..core.project_context import (
     ProjectContext,
+    ProjectDiscovery,
     discover_project,
     load_project_context,
+    project_discovery_is_current,
     resolve_project_context_from_projects,
 )
 from ..core.session import env_home
@@ -35,6 +37,7 @@ def _load_child_project_context(
     child_registry: ToolRegistry | None,
     *,
     projection: ProjectContextProjection | None = None,
+    discovery: ProjectDiscovery | None = None,
 ) -> ProjectContext:
     """Compose one child's project context through the tolerant projection."""
 
@@ -46,7 +49,12 @@ def _load_child_project_context(
     )
     home_hint = loop.active_home
     zeta_home = Path(home_hint) if home_hint else env_home()
-    discovery = discover_project(child_cwd, user_home=zeta_home.parent)
+    if (
+        discovery is None
+        or not same_physical_path(child_cwd, loop.store.cwd)
+        or not project_discovery_is_current(discovery, child_cwd)
+    ):
+        discovery = discover_project(child_cwd, user_home=zeta_home.parent)
     registry = loop.project_registry
     if projection is None and registry is not None:
         projection = registry.project_context_projection(loop.root_project_id)
@@ -84,6 +92,16 @@ def _child_base_system_prompt(
         cwd_override, loop.store.cwd
     ):
         return _load_child_project_context(loop, cwd_override, child_registry)
+    child_cwd = Path(cwd_override or loop.store.cwd)
+    discovery = getattr(loop, "project_discovery", None)
+    if (
+        discovery is not None
+        and same_physical_path(child_cwd, loop.store.cwd)
+        and not project_discovery_is_current(discovery, child_cwd)
+    ):
+        return _load_child_project_context(
+            loop, cwd_override, child_registry, projection=None, discovery=None
+        )
     registry = getattr(loop, "project_registry", None)
     projection = (
         registry.project_context_projection(loop.root_project_id)
@@ -102,7 +120,11 @@ def _child_base_system_prompt(
         and "project_memory" in runtime_prompt.prompt_components
     ):
         projected = _load_child_project_context(
-            loop, cwd_override, child_registry, projection=projection
+            loop,
+            cwd_override,
+            child_registry,
+            projection=projection,
+            discovery=getattr(loop, "project_discovery", None),
         )
         projected_prompt = RuntimePrompt(
             projected.system_prompt, projected.prompt_components
