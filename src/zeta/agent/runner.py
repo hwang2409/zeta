@@ -43,7 +43,8 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
 from . import child_context as _child_context
-from .background import CancellationRequest, finish_background_child
+from .background_lifecycle import finish_background_child
+from .background_owner import CancellationRequest
 from .child_context import (
     _child_base_system_prompt,
     _child_model_and_budget,

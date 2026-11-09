@@ -329,16 +329,16 @@ async def test_resume_recovery_cancel_during_setup_is_safe(tmp_path: Path) -> No
     entered = threading.Event()
     release = threading.Event()
 
-    from zeta.agent import background
+    from zeta.agent import background_lifecycle
 
-    original_recover = background.recover_agent_children
+    original_recover = background_lifecycle.recover_agent_children
 
     def gated_recover(loop):
         entered.set()
         assert release.wait(2)
         return original_recover(loop)
 
-    with patch.object(background, "recover_agent_children", gated_recover):
+    with patch.object(background_lifecycle, "recover_agent_children", gated_recover):
         resume = asyncio.create_task(runtime.resume_session(session_id))
         assert await asyncio.to_thread(entered.wait, 2)
         resume.cancel()

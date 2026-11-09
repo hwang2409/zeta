@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from ...agent import recovery_lease
-from ...agent.background import BackgroundAgentOwner
+from ...agent.background_owner import BackgroundAgentOwner
 from ...agent.budget import (
     DEFAULT_MAX_AGENT_DEPTH,
     HARD_MAX_AGENT_DEPTH,

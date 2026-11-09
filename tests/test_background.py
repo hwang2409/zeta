@@ -35,7 +35,7 @@ from tests.support.processes import (
     wait_for_path_command,
     wait_pid_exited,
 )
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background_owner import BackgroundAgentOwner
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
