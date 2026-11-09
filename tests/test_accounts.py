@@ -464,13 +464,15 @@ async def test_credential_store_while_async_guard_holds_lifecycle_lock_does_not_
             lock_waiting.set()
         return original_bounded_guard(guard, timeout)
 
+    # test-contract: seam observes the existing worker-thread lock boundary.
     monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
 
     async def ticker() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not stop.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
 
     ticker_task = asyncio.create_task(ticker())
     try:
