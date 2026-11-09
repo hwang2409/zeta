@@ -423,6 +423,7 @@ async def test_unknown_skill_tool_refreshes_during_same_turn(tmp_path: Path) -> 
 
     assert loaded["isError"] is False
     assert loaded["content"][0]["text"] == "same turn body"
+    loop.store.close()
     await loop.close()
 
 
@@ -606,6 +607,7 @@ async def test_newer_live_config_generation_wins(
             )
         finally:
             try:
+                loop.store.close()
                 await asyncio.wait_for(loop.close(), 10)
             finally:
                 loop.store.close()

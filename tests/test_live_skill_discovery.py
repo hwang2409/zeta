@@ -168,8 +168,8 @@ async def test_live_live_config_ignores_user_skill_marker_and_replaces_owned_ind
             if isinstance(block, TextContent)
         )
     finally:
-        await loop.close()
         loop.store.close()
+        await loop.close()
 
     assert user_block in text
     assert "live description" in text
@@ -235,6 +235,7 @@ async def test_live_live_config_discards_stale_plan_prompt(
             await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), 10)
         finally:
             try:
+                loop.store.close()
                 await asyncio.wait_for(loop.close(), 10)
             finally:
                 loop.store.close()
@@ -321,6 +322,7 @@ async def test_live_live_config_discards_stale_memory_prompt(
             await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), 10)
         finally:
             try:
+                loop.store.close()
                 await asyncio.wait_for(loop.close(), 10)
             finally:
                 loop.store.close()
@@ -397,6 +399,7 @@ async def test_tui_submit_discovers_new_skill_slash_before_parse(
     assert "live body" in user_text
     assert "request" in user_text
     await app._submissions.close()
+    loop.store.close()
     await loop.close()
 
 
@@ -486,8 +489,8 @@ async def test_locked_metadata_does_not_block_skill_commit_or_next_turn(
     finally:
         release.set()
         holder.join(1)
-        await loop.close()
         loop.store.close()
+        await loop.close()
 
 
 @pytest.mark.asyncio
@@ -528,8 +531,8 @@ async def test_touch_adopts_metadata_without_reverting_live_prompt(
     saved = manager.read_metadata(loop.session_metadata.session_id)
     assert saved.system_prompt == original_prompt
     assert saved.skill_catalog == original_catalog
-    await loop.close()
     loop.store.close()
+    await loop.close()
 
 
 @pytest.mark.asyncio
@@ -562,8 +565,8 @@ async def test_runtime_prompt_does_not_read_session_prompt_components(
         await loop.refresh_live_config()
         loop.set_plan_mode(False)
     finally:
-        await loop.close()
         loop.store.close()
+        await loop.close()
 
     assert "live description" in loop.context_assembler.system_prompt.content[0].text
 
@@ -669,6 +672,7 @@ async def test_concurrent_resume_keeps_live_prompt_components_with_live_config(
         assert system_text[offset : offset + length] == memory
         assert component["digest"] == hashlib.sha256(memory.encode()).hexdigest()
     finally:
+        runtime.loop.store.close()
         await runtime.loop.close()
         first.store.close()
 
@@ -735,6 +739,7 @@ async def test_resume_replaces_live_skill_index_and_refreshes_memory(
     await loop.refresh_live_config()
     assert "live description" in loop.context_assembler.system_prompt.content[0].text
     assert manager.read_metadata(opened.metadata.session_id).system_prompt == prompt
+    loop.store.close()
     await loop.close()
     opened.store.close()
 

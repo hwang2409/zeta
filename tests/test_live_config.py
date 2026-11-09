@@ -114,6 +114,7 @@ async def test_live_refresh_removes_pathless_injected_profile_for_new_spawn(
 
         assert "injected" not in loop.tool_registry.agent_catalog.names()
     finally:
+        loop.store.close()
         await loop.close()
 
 
@@ -163,6 +164,7 @@ async def test_live_config_adds_profile_to_next_agent_schema_and_spawn(
         isinstance(block, TextContent) and "committed specialist body" in block.text
         for block in child_prompt.content
     )
+    loop.store.close()
     await loop.close()
 
 
@@ -199,6 +201,7 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
     )
     assert result.is_error
     assert result.content.startswith("agent error: maximum agent nesting depth is 0")
+    loop.store.close()
     await loop.close()
 
 
@@ -260,7 +263,9 @@ async def test_running_child_refreshes_delegation_catalog_without_changing_selec
     )
     assert "delegate" in _agent_enums(backend.calls[0][1])[0]
     assert len(backend.calls) >= 2, "running child rejected the new delegate profile"
+    child_store.close()
     await child.close()
+    loop.store.close()
     await loop.close()
 
 
@@ -291,6 +296,7 @@ async def test_live_config_invalid_profile_keeps_last_good_and_commits_independe
     assert len(events) == 1
     assert events[0].type.value == "config_changed"
     assert events[0].data["diagnostics"], "profile failure was not visible"
+    loop.store.close()
     await loop.close()
 
 
@@ -315,6 +321,7 @@ async def test_agent_semantic_edit_emits_one_config_change(tmp_path: Path) -> No
         for schema in loop.tool_registry.schemas
         if schema["name"] == "agent"
     )
+    loop.store.close()
     await loop.close()
 
 
@@ -371,6 +378,7 @@ async def test_profile_semantic_edit_then_touch_is_noop(tmp_path: Path) -> None:
     )
     assert json.dumps(loop.tool_schemas, sort_keys=True).encode() == before
     assert events == []
+    loop.store.close()
     await loop.close()
 
 
@@ -426,6 +434,7 @@ async def test_live_config_rejects_candidate_when_prompt_changes_in_flight(
         try:
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         finally:
+            loop.store.close()
             await asyncio.wait_for(loop.close(), 10)
 
 
@@ -469,6 +478,7 @@ async def test_equal_mcp_schema_refresh_keeps_prepared_live_candidate(
         try:
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         finally:
+            loop.store.close()
             await asyncio.wait_for(loop.close(), 10)
 
 
@@ -493,6 +503,7 @@ async def test_live_config_initial_manifest_is_not_read_during_loop_construction
     assert observed == [], "loop construction read the live-config filesystem"
     await loop.refresh_live_config(force=True)
     assert observed and all(thread != event_thread for thread in observed)
+    loop.store.close()
     await loop.close()
 
 
@@ -529,6 +540,7 @@ async def test_live_slash_projection_is_prepared_off_loop(tmp_path: Path) -> Non
     assert prepared_on and prepared_on[0] != event_thread
     assert committed_on == [event_thread]
     assert [skill.name for skill in registry.skill_entries] == ["new-skill"]
+    loop.store.close()
     await loop.close()
 
 
@@ -565,6 +577,7 @@ async def test_live_config_prepares_schema_and_prompt_off_loop(
     assert "specialist" in loop.tool_registry.agent_catalog.names(), (
         "off-loop preparation omitted the agent catalog"
     )
+    loop.store.close()
     await loop.close()
 
 
@@ -586,6 +599,7 @@ async def test_config_changed_event_renders_through_real_render_event(
     assert isinstance(rendered, Text)
     assert rendered.style == theme.NOTICE
     assert console.export_text().strip() == "agent profiles changed: added specialist"
+    loop.store.close()
     await loop.close()
 
 
@@ -660,6 +674,7 @@ async def test_many_live_changes_stay_bounded_on_tui_and_serve_paths(
     assert len(encoded) < MAX_FRAME_BYTES
     assert frame["params"]["event"] == "config_changed"
     assert frame["params"]["data"] == payload
+    loop.store.close()
     await loop.close()
 
 
@@ -677,6 +692,7 @@ async def test_added_profile_is_detected_with_unchanged_parent_stat(
     await _refresh(loop)
 
     assert "specialist" in _agent_enums(tuple(loop.tool_registry.schemas))[0]
+    loop.store.close()
     await loop.close()
 
 
@@ -708,4 +724,5 @@ async def test_config_changed_projection_is_byte_exact(tmp_path: Path) -> None:
         + "}}\n"
     ).encode()
     assert encoded == expected
+    loop.store.close()
     await loop.close()
