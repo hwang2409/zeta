@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from .. import ergonomics
+from ..handlers import validation
+from ..handlers.history import replay_history
 from ..protocol import EventDescriptor, FrameCodec, _Frame
 from . import (
     DROP,
@@ -190,7 +191,7 @@ class ReplayOutput:
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        store = ergonomics.active(connection.server.runtime, {"session_id": scope.value})
+        store = validation.active(connection.server.runtime, {"session_id": scope.value})
         self.replay.begin_join(connection, scope, store.reset_generation())
 
     def finish_replay_join(
@@ -425,12 +426,12 @@ class ReplayOutput:
 
         Also return the seq of the newest row that page's history includes.
         """
-        store = ergonomics.active(connection.server.runtime, {"session_id": session_id})
+        store = validation.active(connection.server.runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
         features = history_features(self._connections[connection].features)
         result = await self.run_read(
             connection,
-            lambda: ergonomics.replay_history(
+            lambda: replay_history(
                 pinned,
                 include_delivery_id={
                     "delivery_id", "user_message_event", "user_message_delivery_id"

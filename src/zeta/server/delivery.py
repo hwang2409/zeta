@@ -24,6 +24,7 @@ from ..protocol.types import (
     with_message_origin,
 )
 from . import event_contract
+from .handlers import validation
 from .protocol import ErrorDescriptor, ProtocolError
 from .session_replay.rows import RowFacts
 
@@ -125,7 +126,7 @@ class DeliveryRequests:
     async def send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        from . import ergonomics, image_delivery
+        from .handlers import send_images
 
         control = self._control
         runtime = control.server.runtime
@@ -140,9 +141,9 @@ class DeliveryRequests:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
-        ergonomics.require_mutable(runtime, control.has_pending_approvals())
+        validation.require_mutable(runtime, control.has_pending_approvals())
         worker = asyncio.create_task(
-            asyncio.to_thread(image_delivery.prepare_image_delivery, runtime, params)
+            asyncio.to_thread(send_images.prepare_image_delivery, runtime, params)
         )
         try:
             # test-contract: seam request cancellation owns and cleans up this worker
@@ -156,12 +157,12 @@ class DeliveryRequests:
             )
         except ProtocolError:
             await asyncio.to_thread(
-                image_delivery.cleanup_image_delivery, runtime, prepared
+                send_images.cleanup_image_delivery, runtime, prepared
             )
             raise
         if duplicate is not None:
             await asyncio.to_thread(
-                image_delivery.cleanup_image_delivery, runtime, prepared
+                send_images.cleanup_image_delivery, runtime, prepared
             )
             return duplicate
         message = prepared.message
@@ -172,7 +173,7 @@ class DeliveryRequests:
                 await control.user_message(text, "send", features, prepared.attachments)
             except asyncio.CancelledError:
                 await asyncio.to_thread(
-                    image_delivery.cleanup_image_delivery, runtime, prepared
+                    send_images.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             control.start_turn(
@@ -197,7 +198,7 @@ class DeliveryRequests:
         except asyncio.CancelledError:
             if runtime.opened.store.client_delivery(delivery_id) is None:
                 await asyncio.to_thread(
-                    image_delivery.cleanup_image_delivery, runtime, prepared
+                    send_images.cleanup_image_delivery, runtime, prepared
                 )
                 raise
             canceled_after_commit = True
@@ -235,7 +236,7 @@ class DeliveryRequests:
         control._reject_if_unhealthy()
         if not control.turn_busy():
             raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running")
-        text = _required_string(params, "text")
+        text = validation.required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
         )
@@ -414,7 +415,7 @@ class DeliveryRequests:
 async def _cleanup_canceled_image_delivery(
     worker: asyncio.Task[Any], runtime: Any
 ) -> None:
-    from . import image_delivery
+    from .handlers import send_images
 
     settled = asyncio.Event()
     worker.add_done_callback(lambda _: settled.set())
@@ -427,7 +428,7 @@ async def _cleanup_canceled_image_delivery(
         return
     cleanup = asyncio.create_task(
         asyncio.to_thread(
-            image_delivery.cleanup_image_delivery, runtime, worker.result()
+            send_images.cleanup_image_delivery, runtime, worker.result()
         )
     )
     while not cleanup.done():
@@ -479,15 +480,6 @@ def _require_feature(features: frozenset[str], feature: str, param: str) -> None
             ErrorDescriptor.INVALID_PARAMS,
             f"{param} requires negotiated feature '{feature}'",
         )
-
-
-def _required_string(params: dict[str, Any], name: str) -> str:
-    value = params.get(name)
-    if not isinstance(value, str) or not value:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, f"{name} must be a nonempty string"
-        )
-    return value
 
 
 def _required_delivery_id(params: dict[str, Any]) -> str:

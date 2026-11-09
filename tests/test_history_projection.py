@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.core.store import ConversationStore
-from zeta.server import ergonomics
 from zeta.server.connections import ConnectionRegistry
+from zeta.server.handlers import history, history_projection
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
 
 
@@ -42,7 +42,7 @@ class _HistoryStore:
 
 
 def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
-    return ergonomics.history(_runtime(store), params, backward_enabled=True)
+    return history.history(_runtime(store), params, backward_enabled=True)
 
 
 def test_session_history_full_paging_visits_each_entry_once() -> None:
@@ -66,7 +66,7 @@ def test_session_history_full_paging_visits_each_entry_once() -> None:
     runtime = _runtime(Store())
     offset = 0
     while True:
-        result = ergonomics.history(runtime, {"offset": offset})
+        result = history.history(runtime, {"offset": offset})
         if result["next_offset"] is None:
             break
         offset = result["next_offset"]
@@ -84,8 +84,8 @@ def test_session_history_first_page_is_entry_capped() -> None:
             return entries
 
     runtime = _runtime(Store())
-    first = ergonomics.history(runtime, {"offset": 0})
-    second = ergonomics.history(runtime, {"offset": first["next_offset"]})
+    first = history.history(runtime, {"offset": 0})
+    second = history.history(runtime, {"offset": first["next_offset"]})
 
     assert len(first["messages"]) <= 128
     assert len(second["messages"]) > len(first["messages"])
@@ -108,7 +108,7 @@ def test_session_history_oversized_store_row_returns_truncated_page(tmp_path) ->
         }
     )
     try:
-        result = ergonomics.history(_runtime(store), {})
+        result = history.history(_runtime(store), {})
         response = json.loads(FrameCodec().response("request-1", result))
     finally:
         store.close()
@@ -163,7 +163,7 @@ def test_session_history_keeps_frame_fitting_approval_and_notification_bytes() -
         def active_branch_snapshot(self):
             return entries
 
-    result = ergonomics.history(_runtime(Store()), {})
+    result = history.history(_runtime(Store()), {})
     messages = result["messages"]
     approval = next(row for row in messages if row.get("event") == "approval_request")
     notification = next(row for row in messages if row.get("notification") is not None)
@@ -187,14 +187,14 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
         }
     )
     try:
-        result = ergonomics.history(_runtime(store), {})
+        result = history.history(_runtime(store), {})
         response = json.loads(FrameCodec().response("request-1", result))
     finally:
         store.close()
 
     assert "error" not in response
     assert response["result"]["messages"][0]["content"][0]["text"] == (
-        ergonomics.HISTORY_GROUP_TRUNCATED
+        history_projection.HISTORY_GROUP_TRUNCATED
     )
 
 
@@ -314,7 +314,7 @@ def test_session_history_marks_every_large_projected_field(
         def active_branch_snapshot(self):
             return entries
 
-    result = ergonomics.history(_runtime(Store()), {})
+    result = history.history(_runtime(Store()), {})
     response = json.loads(FrameCodec().response("request-1", result))
 
     assert "error" not in response
@@ -347,7 +347,7 @@ def test_session_history_page_construction_is_linear(
         def active_branch_snapshot(self):
             return entries
 
-    result = ergonomics.history(_runtime(Store()), {})
+    result = history.history(_runtime(Store()), {})
     assert len(result["messages"]) == len(entries)
     assert serialized_rows <= len(entries)
 
@@ -377,7 +377,7 @@ def test_session_history_sizes_each_group_once_per_generation(
     runtime = _runtime(Store())
     offset = 0
     while True:
-        result = ergonomics.history(runtime, {"offset": offset})
+        result = history.history(runtime, {"offset": offset})
         if result["next_offset"] is None:
             break
         offset = result["next_offset"]
@@ -406,7 +406,7 @@ def test_session_history_exact_size_and_real_frame_bound(
         ),
     )
     frame_size = getattr(
-        ergonomics,
+        history_projection,
         "_history_frame_size",
         lambda codec, request_id, *, messages_body_size, next_offset: response_size(
             request_id, {"messages": [], "next_offset": next_offset}
@@ -457,7 +457,7 @@ def test_session_history_exact_size_and_real_frame_bound(
     offset = 0
     runtime = _runtime(Store())
     while True:
-        result = ergonomics.history(runtime, {"offset": offset})
+        result = history.history(runtime, {"offset": offset})
         encoded_size = response_size(request_id, result)
         assert encoded_size <= MAX_FRAME_BYTES
         if result["next_offset"] is None:
@@ -483,14 +483,14 @@ def test_session_history_applies_entry_cap_only_at_offset_zero(
 
     runtime = _runtime(Store())
     target = 8
-    monkeypatch.setattr(ergonomics, "HISTORY_FIRST_PAGE_ENTRIES", target)
+    monkeypatch.setattr(history, "HISTORY_FIRST_PAGE_ENTRIES", target)
     for offset in range(len(entries) + 1):
-        result = ergonomics.history(runtime, {"offset": offset})
+        result = history.history(runtime, {"offset": offset})
         stop = min(target, len(entries)) if offset == 0 else len(entries)
         expected_rows = [
             row
             for entry in entries[offset:stop]
-            for row in ergonomics._history_entry_rows(entry, {})
+            for row in history_projection._history_entry_rows(entry, {})
         ]
         expected = {
             "messages": expected_rows,
@@ -518,7 +518,7 @@ async def test_session_history_projection_constructed_once_off_event_loop() -> N
         offset = 0
         while True:
             result = await registry.run_blocking(
-                lambda offset=offset: ergonomics.history(runtime, {"offset": offset})
+                lambda offset=offset: history.history(runtime, {"offset": offset})
             )
             if result["next_offset"] is None:
                 break

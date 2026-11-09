@@ -24,8 +24,9 @@ from zeta.protocol.types import (
     TextContent,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer
 from zeta.server import connections as connection_module
+from zeta.server.handlers import history_projection as history_projection_module
 from zeta.server.protocol import FEATURES, EventDescriptor
 from zeta.server.server import _Client
 
@@ -1128,7 +1129,7 @@ async def _observer_controller_absent(
 async def _replay_only_backward_page(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ergonomics, "MAX_FRAME_BYTES", 4_000)
+    monkeypatch.setattr(history_projection_module, "MAX_FRAME_BYTES", 4_000)
     server, client, session_id = await _started(tmp_path, transport)
     try:
         for number in range(60):

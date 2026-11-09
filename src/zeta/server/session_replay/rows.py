@@ -201,7 +201,7 @@ ROUTES: dict[tuple[EventDescriptor, str], Source] = {
     ),
     # known gap G1, deferred to slice S3 (not settled): the queued steer row is not
     # in history, but its delivered/dropped client_delivery row is, with the steer
-    # text (ergonomics.py `_history_entry_rows`), and has no live event. A
+    # text (history_projection.py `_history_entry_rows`), and has no live event. A
     # join whose history read spans the delivery sees the steer twice.
     (EventDescriptor.USER_MESSAGE, "steer"): LIVE,
     (EventDescriptor.USER_MESSAGE, "undelivered"): PublishFirst(_user_turn),
