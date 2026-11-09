@@ -848,6 +848,11 @@ Clients use `turn_id` to correlate this durable outcome with a negotiated
 {"jsonrpc":"2.0","id":9,"result":{"session":null,"state":"idle","explicit_finish":false,"pending_approvals":[],"usage":{},"compaction_markers":0}}
 ```
 
+While a slash command runs, `status` also carries
+`slash_command: {"name": "/status", "state": "running"}`. `state` is `waiting`
+after the command was cancelled and is finishing work it already started. The
+field is omitted when no slash command runs.
+
 ### `ping`
 
 Requires the `ping` feature; otherwise `-32601`. Params: none. The result is
@@ -1527,9 +1532,19 @@ implementation for the frontend client. Two RPCs cover the surface.
   `client_only: true` and the stable machine-readable reason
   `unavailable: "requires_tui"`. Invalid `include_unavailable` values return
   `-32602`.
+  Each entry also has `runs_while_busy`, read from the same policy that the
+  busy gate of `slash_run` uses:
+  - `always`: every form runs while a turn is running. Client-only entries
+    have this value, because `slash_run` answers them with `client_only`.
+  - `never`: every form returns `-32004` while a turn is running (for
+    example `/plan`, `/compact`, skills, and prompt macros).
+  - `read_forms`: only the read forms run while a turn is running (for
+    example bare `/status` or bare `/memory`); other forms return `-32004`.
+  A missing field means unknown: older servers do not send it, so a client
+  must send the command and handle `-32004`.
 - `slash_run`: params `session_id` and `text` (the raw composer value
-  starting with `/`). Rejects the request when a turn is running with
-  `-32004`. Returns a `kind` discriminator:
+  starting with `/`). When a turn is running, it rejects the forms that
+  `runs_while_busy` does not allow with `-32004`. Returns a `kind` discriminator:
   - `output`: `text` is the composed notice to render as a quiet receipt. For
     `/status`, this is the same operational view as the TUI, including configured
     hooks, recent cache-hit history, and model-attributed estimated cost. The

@@ -1,9 +1,9 @@
 # Transcript search
 
 Zeta keeps a disposable SQLite FTS5 index for each project at
-`~/.zeta/projects/<project-id>/transcript-index-v<schema-version>.sqlite3`.
-Project memory remains small and describes project state and decisions. The index
-stores sanitized evidence for other history.
+`~/.zeta/projects/<project-id>/transcript-index.sqlite3`. Project memory remains
+small and describes project state and decisions. The transcript index stores
+sanitized evidence for other history.
 
 The index contains completed parent-session turns and parent-visible child-agent
 completion reports. A turn joins input, agent reply text, and bounded tool
