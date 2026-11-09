@@ -177,10 +177,9 @@ class _OrderedFileWriter:
             self._waiters.append((watermark, loop, future))
         try:
             await asyncio.wait_for(asyncio.shield(future), timeout)
-        except TimeoutError as exc:
+        except TimeoutError:
             with self._lock:
                 self._waiters = [waiter for waiter in self._waiters if waiter[2] is not future]
-            self._report_failure(exc)
             raise
 
     async def shutdown(

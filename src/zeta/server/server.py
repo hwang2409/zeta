@@ -282,7 +282,7 @@ class ZetaServer:
         async with self._server:
             await self._server.serve_forever()
 
-    async def close(self) -> None:
+    async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
         if self._idle_drain is not None:
             self._idle_drain.cancel()
             await asyncio.wait([self._idle_drain])
@@ -298,7 +298,9 @@ class ZetaServer:
                 try:
                     await self.runtime.close()
                 finally:
-                    await self.control.wait_for_approval_settlement()
+                    await self.control.wait_for_approval_settlement(
+                        approval_settlement_timeout
+                    )
             finally:
                 if self.connections is not None:
                     await self.connections.aclose()
