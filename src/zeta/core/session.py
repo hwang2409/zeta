@@ -31,6 +31,7 @@ from .transcript_recovery import (
     recovery_status,
     set_memory_review_required,
 )
+from .transcript_recovery.runtime import format_repair_transcript_command
 from .store._child_runs import child_run_segments
 from .session_execution import (
     OwnerHint,
@@ -892,9 +893,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     _must_exist=True,
                 ).close()
             except TranscriptLoadError as diagnosis:
+                repair_hint = (
+                    f"; run {format_repair_transcript_command(full_id)}"
+                    if diagnosis.repair_available
+                    else ""
+                )
                 raise SessionError(
-                    f"session {full_id} could not be exported: {diagnosis}; "
-                    f"run /repair-transcript {full_id} confirm"
+                    f"session {full_id} could not be exported: {diagnosis}{repair_hint}"
                 ) from exc
             except (ConversationIntegrityError, OSError):
                 pass

@@ -506,3 +506,27 @@ def test_export_rejects_corrupt_rows_cleanly(
     assert out.getvalue() == ""
     assert not destination.exists()
     assert opened.store.path.read_bytes() == before
+
+
+def test_export_cli_explains_unavailable_transcript_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from zeta.cli.main import main
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="offline")
+    opened.store.path.write_bytes(b"broken\n")
+    before = opened.store.path.read_bytes()
+    opened.store.close()
+
+    assert main(["session", "export", opened.metadata.session_id]) == 1
+
+    err = capsys.readouterr().err
+    assert (
+        f"zeta: session {opened.metadata.session_id} could not be exported: "
+        f"transcript unrecoverable header at row 1 "
+        f"(session {opened.metadata.session_id})\n"
+    ) == err
+    assert "/repair-transcript" not in err
+    assert opened.store.path.read_bytes() == before
