@@ -31,7 +31,7 @@ from websockets.asyncio.client import connect
 
 import zeta.accounts.session as account_session_module
 import zeta.agent.pending_delivery as pending_delivery_module
-import zeta.server.ergonomics as ergonomics_module
+import zeta.server.handlers.history as history_module
 import zeta.server.protocol as protocol_module
 from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
@@ -1555,7 +1555,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
             raise AssertionError("session_history must not read store.messages()")
 
     runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
-    result = ergonomics_module.history(runtime, {}, include_delivery_id=False)
+    result = history_module.history(runtime, {}, include_delivery_id=False)
 
     assert [row["id"] for row in result["messages"]] == ["message-1", "message-2"]
     assert calls == 1
@@ -1566,7 +1566,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
 async def test_session_history_keeps_main_durable_entry_cursor_space(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(history_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     target = tmp_path / "input.txt"
     target.write_text("approved")
     call = ToolCall("call-1", "read", {"path": str(target)})
@@ -1702,7 +1702,7 @@ async def test_session_history_never_splits_approval_anchor_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, page_limit: int
 ) -> None:
     monkeypatch.setattr(
-        ergonomics_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
+        history_module, "HISTORY_PAGE_ENTRIES", page_limit, raising=False
     )
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend(
@@ -4887,7 +4887,7 @@ async def _ready_extensions(server):
 
 @pytest.mark.asyncio
 async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
-    from zeta.server.ergonomics import EXTENSION_REQUESTS
+    from zeta.server.handlers.history import EXTENSION_REQUESTS
 
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
@@ -5138,7 +5138,7 @@ async def test_session_history_shows_zeta_notice_as_system_message(
 ) -> None:
     from zeta.runtime.loop.empty_turn import build_nudge_message
 
-    monkeypatch.setattr(ergonomics_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
+    monkeypatch.setattr(history_module, "HISTORY_FIRST_PAGE_ENTRIES", 8)
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
@@ -5846,7 +5846,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
     import base64
 
     from zeta.protocol.types import ImageContent
-    from zeta.server.image_delivery import MAX_IMAGE_BYTES
+    from zeta.server.handlers.send_images import MAX_IMAGE_BYTES
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("seen")])])
     server = ZetaServer(
@@ -6091,7 +6091,10 @@ async def test_image_names_match_verified_types(tmp_path):
 
     from PIL import Image
 
-    from zeta.server.image_delivery import DIRECTION_CONTROLS, prepare_image_delivery
+    from zeta.server.handlers.send_images import (
+        DIRECTION_CONTROLS,
+        prepare_image_delivery,
+    )
     from zeta.server.protocol import ProtocolError
     from zeta.server.runtime import ServerRuntime
 
@@ -6164,7 +6167,7 @@ async def test_attachment_failure_removes_entire_batch(
 
     from PIL import Image
 
-    from zeta.server import image_delivery
+    from zeta.server.handlers import send_images
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path, provider="codex")
@@ -6180,11 +6183,11 @@ async def test_attachment_failure_removes_entire_batch(
     attachments = runtime.opened.store.session_dir / "attachments"
     if existing:
         await asyncio.to_thread(
-            image_delivery.prepare_image_delivery, runtime, {"images": [item]}
+            send_images.prepare_image_delivery, runtime, {"images": [item]}
         )
     before = set(attachments.rglob("*"))
     original_open = os.fdopen
-    original_replace = image_delivery.os.replace
+    original_replace = send_images.os.replace
     writes = 0
     replacements = 0
 
@@ -6228,10 +6231,10 @@ async def test_attachment_failure_removes_entire_batch(
     try:
         with monkeypatch.context() as patch:
             patch.setattr(os, "fdopen", failing_open)
-            patch.setattr(image_delivery.os, "replace", failing_replace)
+            patch.setattr(send_images.os, "replace", failing_replace)
             with pytest.raises(OSError):
                 await asyncio.to_thread(
-                    image_delivery.prepare_image_delivery,
+                    send_images.prepare_image_delivery,
                     runtime,
                     {"images": [item, item]},
                 )
@@ -7979,7 +7982,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
 async def test_attachment_symlink_cannot_write_outside_session(tmp_path):
     import base64
 
-    from zeta.server.image_delivery import prepare_image_delivery
+    from zeta.server.handlers.send_images import prepare_image_delivery
     from zeta.server.runtime import ServerRuntime
 
     runtime = ServerRuntime(tmp_path / "home", cwd=tmp_path, provider="codex")

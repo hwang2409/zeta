@@ -28,7 +28,8 @@ from zeta.protocol.types import (
     ToolCall,
     with_message_origin,
 )
-from zeta.server import ZetaServer, ergonomics
+from zeta.server import ZetaServer
+from zeta.server.handlers import history as history_module
 from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -480,7 +481,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
     observer_reader, observer_writer = await _observer(server, 3)
     entered = threading.Event()
     release = threading.Event()
-    original_history = ergonomics.history
+    original_history = history_module.history
 
     def gated_history(
         runtime: Any, params: dict[str, Any], **kwargs: Any
@@ -489,7 +490,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
         assert release.wait(TIMEOUT)
         return original_history(runtime, params)
 
-    monkeypatch.setattr(ergonomics, "history", gated_history)
+    monkeypatch.setattr(history_module, "history", gated_history)
     try:
         request = asyncio.create_task(
             _request(

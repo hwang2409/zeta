@@ -8,7 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from . import content, ergonomics
+from . import content
+from .handlers import history, lifecycle, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -873,7 +874,7 @@ class ConnectionRegistry:
             )
         if method == "list_sessions":
             result, _ = await self.run_read(
-                connection, lambda: connection._list_sessions(request_id, params)
+                connection, lambda: lifecycle.list_sessions(connection, request_id, params)
             )
             return True, result
         fallback_config = None
@@ -935,7 +936,7 @@ def _active_status_parts(
         else None
     )
     status = {
-        "session": client._session_snapshot(),
+        "session": lifecycle.session_snapshot(client),
         "state": (
             "idle"
             if client.server.control.unhealthy() or runtime.state is None
@@ -1011,14 +1012,14 @@ def capture_read(
             )
         return runtime.session_id, runtime.opened.store
     if method in {"session_tree", "session_history"}:
-        store = ergonomics.active(runtime, params)
+        store = validation.active(runtime, params)
         return runtime.session_id, store
     if method == "status":
         return _capture_status(client, fallback_config)
     if method == "model_catalog":
-        return None, ergonomics.catalog(runtime)
+        return None, settings.catalog(runtime)
     if method == "session_settings":
-        return runtime.session_id, ergonomics.settings(runtime)
+        return runtime.session_id, settings.settings(runtime)
     raise ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, "method not found")
 
 
@@ -1061,9 +1062,9 @@ def perform_read(
         "ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()}
     )()
     if method == "session_tree":
-        return ergonomics.tree(runtime)
+        return session.tree(runtime)
     if method == "session_history":
-        return ergonomics.history(
+        return history.history(
             runtime,
             params,
             include_delivery_id=include_delivery_id,
