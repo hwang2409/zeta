@@ -29,17 +29,20 @@ def _writer_epoch_tokens(path: Path, source: str) -> list[str]:
 
 
 def test_writer_epoch_token_only_in_storage_format() -> None:
-    source_root = Path.cwd() / "src" / "zeta"
+    source_root = Path(__file__).resolve().parents[1] / "src" / "zeta"
+    scanned = sorted(source_root.rglob("*.py"))
+    assert scanned, f"no python files found under {source_root}"
     violations = [
         hit
-        for path in sorted(source_root.rglob("*.py"))
-        if path.name != "storage_format.py"
+        for path in scanned
+        if path != source_root / "storage_format.py"
         for hit in _writer_epoch_tokens(path, path.read_text())
     ]
     assert not violations, (
         "WRITER_EPOCH must stay inside src/zeta/storage_format.py. for a feature "
         "gate, compare against FEATURE_EPOCHS[...] / feature_enabled(); for the "
-        "writer's own epoch, call writer_epoch(). offenders: " + ", ".join(violations)
+        "writer's own epoch, call storage_format.writer_epoch(). offenders: "
+        + ", ".join(violations)
     )
 
 
