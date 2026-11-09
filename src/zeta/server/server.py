@@ -18,13 +18,9 @@ from ..project_errors import ProjectRegistryBusyError
 from . import (
     accounts,
     login,
-    model_selection,
-    slash_commands,
 )
-from . import control as session_grants
 from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
-from .handlers import session, settings, validation
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
@@ -552,20 +548,6 @@ class _Client:
             )
         return False, None
 
-    async def _dispatch_session_grants(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        session_grants.require_feature(self.features)
-        runtime = self.server.runtime
-        if descriptor is MethodDescriptor.SESSION_GRANTS:
-            return session_grants.read(runtime.policy, runtime.session_id, params)
-        result, change = session_grants.revoke(
-            runtime.policy, runtime.session_id, params
-        )
-        if change.changed:
-            await self.server.control.publish_session_grant_change(change)
-        return result
-
     _dispatch = _dispatch_request
 
     _descriptor_protocol_error = staticmethod(protocol_error)
@@ -625,103 +607,6 @@ class _Client:
             assert isinstance(notices, list)
             notices.extend(self.server._account_warnings)
         return result
-
-    async def _ergonomics(
-        self, descriptor: MethodDescriptor, params: dict[str, Any]
-    ) -> object:
-        if isinstance(descriptor, str):
-            descriptor = MethodDescriptor.for_wire(descriptor)
-            if descriptor is None:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND, "method not found"
-                )
-        runtime = self.server.runtime
-        method = descriptor.wire
-        if descriptor is MethodDescriptor.REPAIR_TRANSCRIPT:
-            return await session.repair_transcript(self, params)
-        if descriptor in {
-            MethodDescriptor.RENAME_SESSION,
-            MethodDescriptor.DELETE_SESSION,
-        }:
-
-            return await session.mutate_session(
-                runtime,
-                method,
-                validation.required_string(params, "session_id"),
-                params.get("name"),
-                self.server.control.require_idle,
-            )
-        if descriptor in {
-            MethodDescriptor.SESSION_TREE,
-            MethodDescriptor.SESSION_HISTORY,
-        }:
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.CONTENT_READ:
-            if "content_read" not in self.features:
-                raise ProtocolError(
-                    ErrorDescriptor.METHOD_NOT_FOUND,
-                    "content_read requires the negotiated content_read feature",
-                )
-            assert self.server.connections is not None
-            return await self.server.connections.read_session(self, method, params)
-        if descriptor is MethodDescriptor.MODEL_CATALOG:
-            return settings.catalog(runtime)
-        store = validation.active(runtime, params)
-        if descriptor is MethodDescriptor.SEND_IMAGES:
-            return await self.server.control.deliveries.send_images(
-                params, self.features
-            )
-        if descriptor is MethodDescriptor.SESSION_SETTINGS:
-            return settings.settings(runtime, include_plan_mode=True)
-        if descriptor in {
-            MethodDescriptor.ACCOUNT_LIST,
-            MethodDescriptor.ACCOUNT_LOGOUT,
-            MethodDescriptor.ACCOUNT_REFRESH,
-            MethodDescriptor.ACCOUNT_SWITCH,
-            MethodDescriptor.SLASH_LIST,
-        }:
-            return await slash_commands.read_request(
-                method, runtime, self.server.control.require_idle, params, self
-            )
-        if descriptor is MethodDescriptor.SLASH_RUN:
-            text = validation.required_string(params, "text")
-            if (
-                self.server.control.turn_busy()
-                and not await slash_commands.can_run_while_busy(runtime, text)
-            ):
-                await self.server.control.require_idle()
-            register = self.server.control.model_input_registrar(self.features)
-            return await slash_commands.run_command(
-                runtime,
-                text,
-                register_model_input=register,
-                approval_control=self.server.control,
-                run_blocking=self.server.control._run_blocking,
-                busy=self.server.control.turn_busy(),
-            )
-        await self.server.control.require_idle()
-        validation.require_mutable(runtime, self.server.control.has_pending_approvals())
-        if descriptor is MethodDescriptor.SET_SETTINGS:
-            model = validation.required_string(params, "model")
-            mode = validation.required_string(params, "approval_mode")
-            model_selection.validate(model, mode)
-            await model_selection.apply_rpc(runtime, model, mode)
-            return settings.settings(runtime)
-        if descriptor is MethodDescriptor.SET_COMPACTION:
-            validation.required_string(params, "mode")
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS,
-                "compaction mode selection was removed; eviction is always used",
-            )
-        if descriptor is MethodDescriptor.FORK_MESSAGE:
-            store.append_message_fork(validation.required_string(params, "message_id"))
-        elif descriptor is MethodDescriptor.SWITCH_BRANCH:
-            head = validation.required_string(params, "head_id")
-            current = store.replay()
-            if not current or current[-1].id != head:
-                store.switch_to_branch(head)
-        return session.tree(runtime)
 
     async def _write(self, payload: _Frame) -> bool:
         written = await self.connections.send(self, payload)
