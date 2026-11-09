@@ -87,6 +87,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    assistant_text,
     with_message_origin,
 )
 from zeta.providers.codex import CodexStreamError
@@ -9416,6 +9417,55 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     backend, error = resolve_child_backend(loop, 7)
     assert backend is None
     assert error is not None and "nonempty string" in error
+
+
+@pytest.mark.asyncio
+async def test_child_turn_retries_after_credential_lock_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent.child_context import resolve_child_backend
+
+    class LockedCredentials(_FakeCredentials):
+        def read(self) -> object | None:
+            raise AccountCredentialLockTimeoutError()
+
+    child = FakeBackend([ScriptedTurn([TextContent("done")])])
+    parent = FakeBackend([])
+    loop = AgentLoop(
+        parent, ConversationStore(tmp_path / "parent"), skill_catalog=SkillCatalog.empty()
+    )
+    monkeypatch.setattr(
+        "zeta.agent.child_context.credential_store",
+        lambda provider, **kwargs: LockedCredentials(None),
+    )
+    monkeypatch.setattr(
+        "zeta.agent.child_context.build_backend",
+        lambda provider, model, **kwargs: (child, model),
+    )
+
+    try:
+        backend, error = resolve_child_backend(loop, "gpt-5.6-luna")
+    except AccountCredentialLockTimeoutError as exc:
+        backend, error = None, str(exc)
+    assert error is None, "child setup died instead of entering the turn retry loop"
+    assert backend is child
+
+    store = ConversationStore(tmp_path / "child")
+    child_loop = AgentLoop(
+        child, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        await _collect(child_loop.run_turn("finish", origin=MessageOrigin.USER))
+        assert [
+            assistant_text(message)
+            for message in store.messages()
+            if message.role is MessageRole.ASSISTANT
+        ] == ["done"]
+    finally:
+        await child_loop.close()
+        await loop.close()
+        store.close()
+        loop.store.close()
 
 
 def test_resolve_child_backend_accepts_bootstrapped_login(
