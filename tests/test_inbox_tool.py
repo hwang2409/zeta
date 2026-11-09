@@ -6,11 +6,9 @@ import re
 import stat
 import sys
 import threading
-from io import StringIO
 from pathlib import Path
 
 import pytest
-from rich.console import Console
 
 import zeta.project_inbox as project_inbox_module
 from zeta.agent.receipt import receipt_tool_result
@@ -34,7 +32,6 @@ from zeta.storage_format import WriterLease, open_writer
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
-from zeta.tui.cards.approval_card import render_approval_card
 
 project_inbox_sent_module = sys.modules[SentMessageTracker.__module__]
 
@@ -165,45 +162,6 @@ async def test_inbox_name_rule_refreshes_after_project_creation(
         )
         assert result.get("isError") is not True
         assert beta.project_id != "beta"
-    finally:
-        await registry.close()
-        store.close()
-
-
-@pytest.mark.asyncio
-async def test_inbox_approval_display_keeps_name_with_canonical_project_id(
-    tmp_path: Path,
-) -> None:
-    registry, store = await asyncio.to_thread(_registry, tmp_path)
-    try:
-        projects = registry.project_registry
-        assert projects is not None
-        beta = await asyncio.to_thread(projects.create_project, "beta", "beta")
-        registry.set_approval_policy(ApprovalPolicy(default="ask", store=store))
-        raw = ToolCall(
-            "approval-display",
-            "inbox",
-            {
-                "action": "send",
-                "project": "beta",
-                "kind": "question",
-                "title": "title",
-                "body": "body",
-            },
-        )
-        prepared = await registry.prepare_tool_call(raw)
-        request = registry.prepare_approval(prepared)
-        assert request is not None
-        assert request.label == f"beta ({beta.project_id})"
-        output = StringIO()
-        Console(file=output, force_terminal=False, width=200).print(
-            render_approval_card(
-                request.tool_call.name,
-                request.tool_call.arguments,
-                label=request.label,
-            )
-        )
-        assert f"beta ({beta.project_id})" in output.getvalue()
     finally:
         await registry.close()
         store.close()

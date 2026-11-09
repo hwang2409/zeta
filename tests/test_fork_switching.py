@@ -684,6 +684,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app.stop_decisions_poll = lambda: cleaned.append("poll")
     app._stop_decisions_refresh = lambda: cleaned.append("refresh")
     app._close_finder_workers = fail_finder
+    app._close_approval_labels = lambda: async_cleanup("approval labels")
     async def close_navigation() -> None:
         cleaned.append("navigation close")
 
@@ -707,5 +708,6 @@ def test_tui_close_failure_still_runs_later_cleanup(
     assert "session" in cleaned
     assert cleaned.index("recency") < cleaned.index("session")
     assert "task sink" in cleaned
+    assert "approval labels" in cleaned
     assert cleaned.index("navigation close") < cleaned.index("navigation unbind")
     assert cleaned.index("navigation unbind") < cleaned.index("wizard")
