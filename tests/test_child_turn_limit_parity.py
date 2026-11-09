@@ -20,7 +20,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
-from zeta.server.ergonomics import _history_entry_rows
+from zeta.server.handlers.history_projection import _history_entry_rows
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools import ToolRegistry

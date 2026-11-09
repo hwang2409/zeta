@@ -40,7 +40,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
-from zeta.server.ergonomics import _history_entry_rows
+from zeta.server.handlers.history_projection import _history_entry_rows
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
 from zeta.tools import ToolRegistry
