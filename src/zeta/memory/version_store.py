@@ -14,8 +14,8 @@ from zeta.core.session_files import atomic_publish_file
 from zeta.project_errors import ProjectRegistryError, UnsupportedMemoryFormatError
 from zeta.storage_format import (
     ReplaceSubtree,
+    WriterLease,
     mapping_mutations,
-    open_writer,
     require_closed_variant,
 )
 
@@ -154,7 +154,7 @@ def publish_version[T](
     manifest_reader: Callable[[int, str], dict[str, object]],
     transaction_step: Callable[[str], None],
     prune_versions: Callable[[int, int, set[str], set[str]], None],
-    home: os.PathLike[str] | str,
+    storage_lease: WriterLease,
 ) -> PublishedVersion[T]:
     """Publish one immutable version through the format-independent protocol."""
     root_fd, blobs_fd, versions_fd = version_handles(directory_fd, True)
@@ -191,25 +191,24 @@ def publish_version[T](
             "snapshot": snapshot,
             "before_snapshot": before_snapshot,
         }
-        with open_writer(home) as lease:
-            lease.publish_json(
-                versions_fd,
-                f"{version}.json",
-                mapping_mutations(manifest),
-                _publish_legacy_json,
-            )
-            transaction_step("manifest")
-            lease.publish_json(
-                directory_fd,
-                CURRENT_POINTER,
-                (
-                    *mapping_mutations({"current": version}),
-                    ReplaceSubtree(("history",), retained),
-                ),
-                lambda fd, name, data: _publish_legacy_json(
-                    fd, name, data, sync_directory=True
-                ),
-            )
+        storage_lease.publish_json(
+            versions_fd,
+            f"{version}.json",
+            mapping_mutations(manifest),
+            _publish_legacy_json,
+        )
+        transaction_step("manifest")
+        storage_lease.publish_json(
+            directory_fd,
+            CURRENT_POINTER,
+            (
+                *mapping_mutations({"current": version}),
+                ReplaceSubtree(("history",), retained),
+            ),
+            lambda fd, name, data: _publish_legacy_json(
+                fd, name, data, sync_directory=True
+            ),
+        )
         transaction_step("publish")
         prune_versions(blobs_fd, versions_fd, set(retained), set(dropped))
         return PublishedVersion(prepared.value, snapshot, version)

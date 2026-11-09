@@ -41,6 +41,7 @@ from .completion import (
     is_completion_sentinel,
     report_provider_record,
 )
+from .codex_arguments import _parse_complete_object, _parse_partial_object
 from .must_complete_close import task_is_cancelling
 from .codex_payload import (
     _cache_affinity_json,
@@ -1027,7 +1028,16 @@ def _decode_terminal_response(
                 f"Codex completed {invalid_item.kind} status "
                 f"{_format_provider_status(invalid_item.completion_status)} is invalid"
             )
-        stop_reason = "end_turn"
+        stop_reason = (
+            "refusal"
+            if any(
+                block.kind == "refusal"
+                for item in items.values()
+                for key in item.blocks
+                if (block := blocks.get(key)) is not None
+            )
+            else "end_turn"
+        )
 
     if isinstance(response, Mapping):
         response_data.update(
@@ -1219,20 +1229,3 @@ def _complete_item(item: _ItemState) -> list[ContentBlock]:
     arguments = _parse_complete_object(item.arguments)
     return [ToolUseContent(ToolCall(item.call_id, item.name, arguments))]
 
-
-def _parse_partial_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _parse_complete_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value or "{}")
-    except json.JSONDecodeError as exc:
-        raise CodexStreamError("Codex tool arguments are invalid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise CodexStreamError("Codex tool arguments are not an object")
-    return parsed

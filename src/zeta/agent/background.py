@@ -31,10 +31,16 @@ from .receipt import (
     build_agent_receipt,
     build_explicit_finish_receipt,
     child_cleanup_details,
+    lifecycle_tool_result,
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
 from .terminal_fence import TerminalTransitionFence
+from .turn_limit import (
+    background_turn_limit_state,
+    project_payload,
+    write_background_turn_limit,
+)
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
 
@@ -253,6 +259,13 @@ class BackgroundAgentOwner:
 
         self._stores.append(store)
 
+    def finish_store(self, instance_id: str, store: ConversationStore) -> None:
+        """Schedule a finished child store while its watcher remains owned."""
+
+        self._active_stores.pop(instance_id, None)
+        self.mark_store_finished(store)
+        self.release_unused_stores()
+
     def mark_store_finished(self, store: ConversationStore) -> None:
         self._pending_stores.add(store)
 
@@ -337,7 +350,7 @@ class BackgroundAgentOwner:
         if instance_id in self._watchers:
             self._parent_stores[instance_id] = parent_store
             self._parent_ids[instance_id] = parent_instance_id
-
+    def controls_child(self, parent: ConversationStore, child: str) -> bool: watcher = self._watchers.get(child); return bool(watcher and not watcher.done() and self._parent_stores.get(child) is parent)
     def parent_edge(
         self,
         instance_id: str,
@@ -387,7 +400,9 @@ class BackgroundAgentOwner:
         while self._store_close_tasks:
             close_tasks = tuple(self._store_close_tasks)
             try:
-                await asyncio.gather(*close_tasks, return_exceptions=False)
+                # Shield: close tasks are shared, so one canceled waiter must not
+                # cancel the release that other waiters are gathering.
+                await asyncio.gather(*map(asyncio.shield, close_tasks))
             except Exception:
                 self._observed_close_failures.update(
                     task
@@ -440,54 +455,6 @@ def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
         structured_content=structured_content,
     )
     return receipt_tool_result(ToolCall.from_dict(marker["tool_call"]).id, result)
-
-
-def _lifecycle_tool_result(
-    tool_call: ToolCall, child_store: ConversationStore, child_path: Path
-) -> ToolResult | None:
-    lifecycle = child_store.agent_lifecycle()
-    if lifecycle is None or lifecycle.get("finished_at") is None:
-        return None
-    state = lifecycle.get("state")
-    final_result = lifecycle.get("final_result")
-    if type(state) is not str or type(final_result) is not str or not final_result:
-        return None
-    structured: dict[str, object] = {
-        "turns_used": lifecycle.get("turns_used", 0),
-        "child_session_path": str(child_path),
-        "status": state,
-    }
-    for key in ("agent_type", "handle", "depth"):
-        if key in lifecycle:
-            structured["child_instance_id" if key == "handle" else key] = lifecycle[key]
-    state_value: TerminalState = (
-        "completed"
-        if state == "completed"
-        else "canceled"
-        if state == "canceled"
-        else "failed"
-    )
-    if lifecycle.get("final_result_is_receipt") is True:
-        return ToolResult(
-            tool_call.id,
-            final_result,
-            is_error=state_value == "failed",
-            structured_content=structured,
-            is_canceled=state_value == "canceled",
-        )
-    result = build_agent_receipt(
-        state_value,
-        final_result,
-        agent_stats(
-            lifecycle,
-            status=state_value,
-            turns_used=structured["turns_used"]
-            if type(structured["turns_used"]) is int
-            else 0,
-        ),
-        structured_content=structured,
-    )
-    return receipt_tool_result(tool_call.id, result)
 
 
 def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
@@ -557,6 +524,12 @@ def _background_terminal(
         if report is not None
         else build_agent_receipt(state, text, stats)
     )
+    if (
+        report is None
+        and lifecycle is not None
+        and lifecycle.get("final_result_is_receipt") is True
+    ):
+        payload["content"][0]["text"] = text
     return _BackgroundTerminal(
         status=status,
         text=payload["content"][0]["text"],
@@ -700,7 +673,7 @@ def _recover_nested_children(
                         notification_stats = existing_stats
             elif not existing_result:
                 lifecycle_result = (
-                    _lifecycle_tool_result(tool_call, child_store, child_path)
+                    lifecycle_tool_result(tool_call, child_store, child_path)
                     if child_store is not None
                     else None
                 )
@@ -887,7 +860,7 @@ def _recover_agent_children(
                 continue
             existing_result = loop._existing_tool_result(tool_call.id)
             recovered_result = (
-                _lifecycle_tool_result(tool_call, child_store, child_path)
+                lifecycle_tool_result(tool_call, child_store, child_path)
                 if child_store is not None
                 else None
             )
@@ -1011,8 +984,15 @@ async def finish_background_child(
                     if explicit_finish_report["status"] == "failed"
                     else "completed"
                 )
-        result_structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
-        turns_used = max(child_turns(), int(result_structured.get("turns_used", 0)))
+        turn_limited, turns_used, turn_limit_handoff = background_turn_limit_state(
+            result=result,
+            child_turns=child_turns,
+            child_loop=child_loop,
+            child_instance_id=child_instance_id,
+            child_session_path=child_path,
+            final_text=notification_text,
+            background_owner=background_owner,
+        )
         if (
             child_loop is not None
             and status != "canceled"
@@ -1115,11 +1095,22 @@ async def finish_background_child(
                 if key in payload_structured:
                     notification_report[key] = payload_structured[key]
 
+        if turn_limited:
+            terminal_payload = project_payload(terminal_payload, child_path)
+
         async def commit_adopt_publish() -> ConversationEntry:
+            persisted_text = notification_text
+            if turn_limit_handoff is not None:
+                persisted_text = await write_background_turn_limit(
+                    child_store,
+                    turn_limit_handoff,
+                    notification_text,
+                    child_path,
+                )
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
                 terminal_state=lifecycle_state,
-                final_result=notification_text,
+                final_result=persisted_text,
                 turns_used=turns_used,
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
@@ -1144,7 +1135,7 @@ async def finish_background_child(
                 child_session_path=child_path,
                 description=description,
                 status=status,
-                text=notification_text,
+                text=persisted_text,
                 stats=terminal_stats,
                 killed_task_ids=killed_task_metadata or None,
                 killed_task_count=killed_task_count or None,
@@ -1186,3 +1177,5 @@ async def finish_background_child(
             cleanup_result = cleanup()
             if inspect.isawaitable(cleanup_result):
                 await cleanup_result
+            # Do not let the watcher finish before its child store lease closes.
+            await background_owner.wait_for_store_closes()
