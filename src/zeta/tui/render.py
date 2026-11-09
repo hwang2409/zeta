@@ -756,6 +756,7 @@ def format_status(
     plan_state: str | None = None,
     background_count: int = 0,
     decisions_count: int = 0,
+    decisions_staged: int = 0,
     main_active: bool = False,
     undo_available: bool = False,
     transcript_search: str | None = None,
@@ -780,6 +781,13 @@ def format_status(
     else:
         value = str(context_tokens)
     context_text = f"{value} ({percent}%)"
+    decisions_marker = None
+    if decisions_staged > 0:
+        open_count = decisions_count - decisions_staged
+        decisions_marker = f"● {open_count} open, {decisions_staged} staged"
+    elif decisions_count > 0:
+        noun = "attention item" if decisions_count == 1 else "attention items"
+        decisions_marker = f"● {decisions_count} {noun}"
 
     state = (
         loop_state
@@ -836,9 +844,8 @@ def format_status(
         segments.append(state_segment)
         if background_count > 0:
             segments.append(f"bg {background_count}")
-        if decisions_count > 0:
-            noun = "attention item" if decisions_count == 1 else "attention items"
-            segments.append(f"● {decisions_count} {noun}")
+        if decisions_marker:
+            segments.append(decisions_marker)
         if main_active:
             segments.append("◆ main")
         if transcript_position:
@@ -965,9 +972,8 @@ def format_status(
             value = fitted.plain.rstrip(" ·")
     rendered = Text(value, style=theme.CHROME)
     offset = 0
-    if decisions_count > 0:
-        noun = "attention item" if decisions_count == 1 else "attention items"
-        marker = f"● {decisions_count} {noun}"
+    if decisions_marker:
+        marker = decisions_marker
         marker_start = value.find(marker)
         if marker_start >= 0:
             rendered.stylize(
