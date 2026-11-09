@@ -1114,11 +1114,10 @@ async def run_agent_tool(
             loop._background_owner.project_context_loops.pop(
                 child_store.session_id, None
             )
+            loop._background_owner.finish_store(child_instance_id, child_store)
             loop._background_owner.unregister(child_instance_id)
             if child_policy is not None:
                 await child_policy.cleanup()
-            loop._background_owner.mark_store_finished(child_store)
-            loop._background_owner.release_unused_stores()
 
         async def close_background_child(cause: str) -> tuple[str, ...]:
             return tuple(
