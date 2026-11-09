@@ -74,9 +74,9 @@ def _tasks_detail_lines() -> list[overlay.FragmentLine]:
 
 
 def _mcp_lines(tmp_path) -> list[overlay.FragmentLine]:
-    service = MCPManagementService(
-        home=tmp_path / "home", project_dir=tmp_path / "repo"
-    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    service = MCPManagementService(home=tmp_path / "home", project_dir=project)
     asyncio.run(service.add("alpha", scope="user", command="python"))
     asyncio.run(
         service.add("beta", scope="project", url="https://example.test", enabled=False)
