@@ -12,8 +12,13 @@ from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
-from ..locking import shape_lock
-from ..storage_format import drain_releases
+from ..locking import RETENTION_HOME_ID, domain_authority, shape_lock
+from ..storage_format import (
+    StorageFeature,
+    WriterLease,
+    drain_releases,
+    feature_enabled,
+)
 
 
 class SessionError(ValueError):
@@ -30,6 +35,90 @@ class SessionFileReplaced(SessionError):
 
 class SessionInUseError(SessionError):
     """Raised when an open store or metadata operation prevents deletion."""
+
+
+class SessionReferenceUnavailable(SessionError):
+    """Raised when retention is removing a referenced session."""
+
+
+_READ_RETRIES = 3
+_SESSION_REFERENCE_GENERATION = "session-reference-generation"
+
+
+class SessionReferenceGate:
+    """Coordinate all durable session references with retention."""
+
+    def __init__(self, home: Path, lease: WriterLease) -> None:
+        self.home = Path(home)
+        self.lease = lease
+
+    def _enabled(self) -> bool:
+        return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
+
+    @contextmanager
+    def _locked(self, *, exclusive: bool):
+        require_off_loop_lock("session reference authority", SessionError)
+        if not self._enabled():
+            yield self
+            return
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with domain_authority(
+            self.home, RETENTION_HOME_ID, "references", exclusive=exclusive
+        ):
+            yield self
+
+    def shared(
+        self,
+        *,
+        installed_ids: tuple[str, ...] = (),
+        referenced_ids: tuple[str, ...] = (),
+    ):
+        @contextmanager
+        def operation():
+            with self._locked(exclusive=False):
+                self.validate((*installed_ids, *referenced_ids))
+                self.bump_generation()
+                yield self
+        return operation()
+
+    def exclusive(self):
+        return self._locked(exclusive=True)
+
+    def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
+        if not self._enabled():
+            return
+        for session_id in session_ids:
+            _component(session_id)
+            reservation = self.home / "session-trash" / "reservations" / f"{session_id}.json"
+            quarantined = self.home / "session-trash" / session_id
+            if reservation.exists() or quarantined.exists():
+                raise SessionReferenceUnavailable(
+                    f"session reference unavailable: {session_id} is being deleted"
+                )
+
+    def bump_generation(self) -> int:
+        if not self._enabled():
+            return 0
+        path = self.home / _SESSION_REFERENCE_GENERATION
+        try:
+            value = int(path.read_text(encoding="ascii"))
+        except (FileNotFoundError, ValueError):
+            value = 0
+        value += 1
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, f"{value}\n".encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        directory_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return value
 
 
 _READ_RETRIES = 3

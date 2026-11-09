@@ -20,6 +20,7 @@ from typing import Any
 
 from .core.session_files import (
     SessionError,
+    SessionReferenceGate,
     atomic_publish_file,
     child_directory,
     open_session_file,
@@ -239,6 +240,37 @@ class ProjectInbox:
         return message_id
 
     def send_with_outcome(
+        self,
+        *,
+        from_project: str,
+        from_session: str,
+        to_project: str,
+        kind: str,
+        title: str,
+        body: str,
+        in_reply_to: str | None = None,
+        message_id: str | None = None,
+        to_session: str | None = None,
+        on_visible: Callable[[], None] | None = None,
+    ) -> tuple[str, SentLedgerOutcome[None]]:
+        ids = tuple(item for item in (from_session, to_session) if item is not None)
+        with SessionReferenceGate(
+            self.registry.root.parent, self.registry._storage_lease
+        ).shared(referenced_ids=ids):
+            return self._send_with_outcome(
+                from_project=from_project,
+                from_session=from_session,
+                to_project=to_project,
+                kind=kind,
+                title=title,
+                body=body,
+                in_reply_to=in_reply_to,
+                message_id=message_id,
+                to_session=to_session,
+                on_visible=on_visible,
+            )
+
+    def _send_with_outcome(
         self,
         *,
         from_project: str,

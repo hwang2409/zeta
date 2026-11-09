@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from enum import IntEnum
+from pathlib import Path
+
+# sorts before every valid project id, so retention authorities are acquired
+# with project domains in one global order.
+RETENTION_HOME_ID = "\x00zeta-retention"
 
 
 class _Rank(IntEnum):
@@ -75,3 +82,24 @@ def domain_lock(project_id: str, domain: str) -> AbstractContextManager[None]:
 
 def shape_lock() -> AbstractContextManager[None]:
     return ranked_lock(_Rank.SHAPE)
+
+
+@contextmanager
+def domain_authority(
+    home: Path, project_id: str, domain: str, *, exclusive: bool
+) -> Iterator[None]:
+    """Hold one ranked domain authority and its process-shared lock file."""
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_dir = home / ".domain-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    lock_name = f"{project_id.encode('utf-8').hex()}-{domain.encode('utf-8').hex()}.lock"
+    fd = os.open(lock_dir / lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        with domain_lock(project_id, domain):
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)

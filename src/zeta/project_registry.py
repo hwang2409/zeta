@@ -26,6 +26,7 @@ from pathlib import Path
 from . import project_schema
 from .core.session_files import (
     SessionError,
+    SessionReferenceGate,
     atomic_publish_file,
     open_session_file,
 )
@@ -904,7 +905,15 @@ class ProjectRegistry(
         prepared = self._prepare_session_records(project_id, records)
         if not prepared:
             return
-        with self._project_lock(
+        ids = tuple(
+            session_id
+            for record in prepared
+            for session_id in (record["session_id"], record.get("parent_session_id"))
+            if isinstance(session_id, str)
+        )
+        with SessionReferenceGate(self.root.parent, self._storage_lease).shared(
+            referenced_ids=ids
+        ), self._project_lock(
             project_id, "sessions", exclusive=True
         ) as project_fd:
             self._update_sessions_locked(project_fd, set(), prepared)

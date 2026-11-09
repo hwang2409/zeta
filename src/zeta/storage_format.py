@@ -24,7 +24,8 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 6
+WRITER_EPOCH: Final = 7
+SESSION_RETENTION_FEATURE_EPOCH: Final = 7
 
 
 class StorageFeature(StrEnum):
@@ -33,6 +34,7 @@ class StorageFeature(StrEnum):
     PROJECT_WRITES = "project_writes"
     ATTENTION_KINDS = "attention_kinds"
     PROJECT_LOCKS = "project_locks"
+    SESSION_RETENTION = "session_retention"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -40,7 +42,8 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.TRANSCRIPT_REPAIR: 4,
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
-    StorageFeature.PROJECT_LOCKS: WRITER_EPOCH,
+    StorageFeature.PROJECT_LOCKS: 6,
+    StorageFeature.SESSION_RETENTION: SESSION_RETENTION_FEATURE_EPOCH,
 }
 
 
@@ -169,6 +172,18 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
         }
     ),
     "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
+    "session_reference_generation": frozenset({"generation"}),
+    "retention_arm": frozenset({
+        "schema_version", "gate_version", "armed_by_zeta_version", "armed_at", "preview_id"
+    }),
+    "retention_state": frozenset({
+        "root_id", "device", "inode", "cutoff", "walk_started_at", "lease_epoch",
+        "frontier", "completed_directories", "max_activity", "bytes", "descendant_ids",
+        "entry_count", "reference_cursor", "start_generation", "references", "phase", "preview"
+    }),
+    "retention_preview": frozenset({"preview_id", "days", "cutoff", "root_ids", "count", "bytes", "created_at"}),
+    "retention_reservation": frozenset({"schema_version", "session_id", "transaction_id", "source_path", "trash_path", "device", "inode"}),
+    "retention_manifest": frozenset({"schema_version", "session_id", "transaction_id", "device", "inode", "descendants", "bytes", "stage", "generation"}),
 }
 
 
