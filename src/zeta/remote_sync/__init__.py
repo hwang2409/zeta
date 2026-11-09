@@ -24,7 +24,12 @@ from typing import Protocol
 
 from ..core.session import SessionManager
 from ..core.session_execution import RUNTIME_LEASE_NAME
-from ..core.session_files import SessionError, SessionInUseError, session_directory
+from ..core.session_files import (
+    SessionError,
+    SessionInUseError,
+    SessionReferenceGate,
+    session_directory,
+)
 from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
@@ -96,8 +101,12 @@ class LocalTransport:
         return _machine_id(self.home)
 
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
-        with open_writer(self.home):
-            return self._publish_session(snapshot, force=force)
+        with open_writer(self.home) as lease:
+            manifest = _read_manifest(snapshot)
+            with SessionReferenceGate(self.home, lease).shared(
+                installed_ids=(manifest["session_id"],)
+            ):
+                return self._publish_session(snapshot, force=force)
 
     def _publish_session(self, snapshot: Path, *, force: bool) -> Path:
         manifest = _read_manifest(snapshot)
