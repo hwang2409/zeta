@@ -13314,6 +13314,50 @@ async def test_background_cleanup_keeps_store_close_visible_to_owner(
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_child_store_open_closes_the_opened_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    open_entered = threading.Event()
+    release_open = threading.Event()
+    opened: list[ConversationStore] = []
+
+    class BlockingChildStore(ConversationStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+            open_entered.set()
+            assert release_open.wait(10)
+
+    # test-contract: seam hold the child store open inside its worker thread
+    monkeypatch.setattr(agent_runner_module, "ConversationStore", BlockingChildStore)
+    backend = FakeBackend([ScriptedTurn(tool_calls=[_agent_call()])])
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    run = asyncio.create_task(_collect(loop.run_turn("start", origin=MessageOrigin.USER)))
+    try:
+        assert await await_or_fail(
+            asyncio.to_thread(open_entered.wait, 10), what="child store open"
+        )
+        run.cancel()
+        release_open.set()
+        await await_or_fail(
+            asyncio.gather(run, return_exceptions=True), what="canceled parent turn"
+        )
+        assert len(opened) == 1
+        assert opened[0]._closed, "child store opened during cancellation leaked"
+    finally:
+        release_open.set()
+        run.cancel()
+        await await_or_fail(
+            asyncio.gather(run, return_exceptions=True), what="parent turn cleanup"
+        )
+        await loop.close()
+        for child_store in opened:
+            child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_foreground_child_close_finishes_before_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -701,15 +701,26 @@ async def run_agent_tool(
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
     agents_root = loop.store.session_dir / "agents"
-    child_store = await loop.store._to_thread_store(
-        lambda: ConversationStore(
+    opened: list[ConversationStore] = []
+
+    def open_child_store() -> ConversationStore:
+        store = ConversationStore(
             agents_root,
             session_id=str(child_number),
             cwd=child_cwd,
             _storage_lease=loop.store._storage_lease,
             _owner_surface="child",
         )
-    )
+        opened.append(store)
+        return store
+
+    try:
+        child_store = await loop.store._to_thread_store(open_child_store)
+    except asyncio.CancelledError:
+        # _to_thread_store finishes the worker before it raises, so close its store.
+        for store in opened:
+            await store._to_thread_store(store.close)
+        raise
     try:
         await child_store._to_thread_store(child_store.activate_runtime_lease)
     except BaseException:
