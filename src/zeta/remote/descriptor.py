@@ -1,6 +1,7 @@
 """Secure descriptors for hosted read-only observer sockets."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -67,6 +68,8 @@ class Descriptor:
             raise DescriptorError("unknown observer descriptor field")
         if not all(isinstance(value.get(key), str) for key in ("socket", "session_id")):
             raise DescriptorError("invalid observer descriptor")
+        if any(key in value and (not isinstance(value[key], str) or len(value[key].encode()) > MAX_DISPLAY_BYTES) for key in ("name", "cwd", "provider", "model")):
+            raise DescriptorError("invalid observer descriptor")
         if not isinstance(value.get("pid"), int) or isinstance(value["pid"], bool):
             raise DescriptorError("invalid observer descriptor")
         return cls(
@@ -103,12 +106,17 @@ def remove(home: Path, session_id: str) -> None:
 
 def validate(path: Path, *, expected_session_id: str | None = None) -> Descriptor:
     try:
-        info = path.lstat()
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or not stat.S_ISREG(info.st_mode):
+            raise DescriptorError("observer descriptor has unsafe ownership or mode")
+        raw = os.read(fd, MAX_DESCRIPTOR_BYTES + 1)
     except OSError as exc:
         raise DescriptorError("observer descriptor is unavailable") from exc
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or not stat.S_ISREG(info.st_mode):
-        raise DescriptorError("observer descriptor has unsafe ownership or mode")
-    descriptor = Descriptor.decode(path.read_bytes())
+    finally:
+        with contextlib.suppress(UnboundLocalError, OSError):
+            os.close(fd)
+    descriptor = Descriptor.decode(raw)
     if expected_session_id is not None and descriptor.session_id != expected_session_id:
         raise DescriptorError("observer session does not match descriptor")
     socket = Path(descriptor.socket)

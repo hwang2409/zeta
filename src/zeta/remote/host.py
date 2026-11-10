@@ -40,8 +40,11 @@ class ObserverHost:
         self.cwd = self.cwd[:256]
         self.socket = socket_path(home, session_id)
         self._server: ZetaServer | None = None
+        self._started = False
 
     async def start(self) -> None:
+        if self._started:
+            return
         if self.runtime is None:
             opened, loop, policy, project_dir, repo_root = self._runtime_args
             if not all(value is not None for value in (opened, loop, policy, project_dir, repo_root)):
@@ -67,10 +70,12 @@ class ObserverHost:
             await server.close()
             raise
         self._server = server
-        publish(self.home, Descriptor(str(self.socket), self.session_id, os.getpid(), self.name, self.cwd, self.provider, self.model))
+        self._started = True
+        await asyncio.to_thread(publish, self.home, Descriptor(str(self.socket), self.session_id, os.getpid(), self.name, self.cwd, self.provider, self.model))
 
     async def close(self) -> None:
         server, self._server = self._server, None
+        self._started = False
         if server is not None:
             await server.close()
         await asyncio.to_thread(remove, self.home, self.session_id)

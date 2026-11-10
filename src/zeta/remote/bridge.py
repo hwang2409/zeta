@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import socket
+import stat
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -19,7 +20,12 @@ MAX_ROW_BYTES = 8192
 def _machine_id(home: Path) -> str:
     path = descriptor_dir(home) / ".machine-id"
     try:
-        value = path.read_text(encoding="ascii").strip()
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or not stat.S_ISREG(info.st_mode):
+            raise OSError("unsafe machine id")
+        value = os.read(fd, 257).decode("ascii").strip()
+        os.close(fd)
     except OSError:
         value = ""
     if not value:
@@ -64,12 +70,12 @@ def _probe_state(descriptor) -> str | None:
         data = b""
         while b"\\n" not in data and len(data) <= MAX_INPUT_BYTES:
             data += sock.recv(4096)
+        data = data.split(b"\\n", 1)[1]
         sock.sendall(b'{"id":2,"method":"status","params":{}}\\n')
-        while b"\\n" not in data:
+        while b"\\n" not in data and len(data) <= MAX_INPUT_BYTES:
             data += sock.recv(4096)
-        response = json.loads(data.split(b"\\n", 1)[-1])
-        session = response.get("result", {}).get("session", {})
-        state = session.get("status") or session.get("state")
+        response = json.loads(data.split(b"\\n", 1)[0])
+        state = response.get("result", {}).get("state")
         return state if state in {"idle", "running", "approval"} else None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -108,28 +114,41 @@ async def attach(home: Path, session_id: str) -> int:
         print(f"zeta remote bridge: {exc}", file=sys.stderr)
         return 2
 
+    loop = asyncio.get_running_loop()
+    stdin_reader = asyncio.StreamReader(limit=MAX_INPUT_BYTES + 1)
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin_reader), sys.stdin)
+
     async def stdin_to_socket() -> None:
         while True:
-            chunk = await asyncio.to_thread(sys.stdin.buffer.readline)
+            try:
+                chunk = await stdin_reader.readuntil(b"\\n")
+            except asyncio.IncompleteReadError as exc:
+                chunk = exc.partial
+            except asyncio.LimitOverrunError as exc:
+                raise ValueError("bridge input is too large") from exc
             if not chunk:
-                with contextlib.suppress(NotImplementedError):
-                    writer.write_eof()
                 return
-            if len(chunk) > MAX_INPUT_BYTES:
-                raise ValueError("bridge input is too large")
             writer.write(chunk)
             await writer.drain()
+            if not chunk.endswith(b"\\n"):
+                return
 
     async def socket_to_stdout() -> None:
         while True:
-            chunk = await reader.read(65536)
+            chunk = await reader.read(MAX_INPUT_BYTES)
             if not chunk:
                 return
-            sys.stdout.buffer.write(chunk)
+            await asyncio.to_thread(sys.stdout.buffer.write, chunk)
             await asyncio.to_thread(sys.stdout.buffer.flush)
 
     try:
-        await asyncio.gather(stdin_to_socket(), socket_to_stdout())
+        tasks = [asyncio.create_task(stdin_to_socket()), asyncio.create_task(socket_to_stdout())]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
     except (BrokenPipeError, ConnectionError, ValueError) as exc:
         print(f"zeta remote bridge: {exc}", file=sys.stderr)
         return 2
