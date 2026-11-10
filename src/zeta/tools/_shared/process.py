@@ -134,6 +134,15 @@ class BackgroundTaskRegistry:
     def running_count(self) -> int:
         return sum(record.running for record in self._records.values())
 
+    def pending_exit_tasks(self) -> tuple[tuple[str, str], ...]:
+        """Return tasks whose exit evidence is still being admitted."""
+
+        return tuple(
+            (owner.record.task_id, owner.record.command)
+            for owner in self._owners.values()
+            if owner.evidence_pending
+        )
+
     @property
     def task_start_generation(self) -> int:
         """Return the monotonic count of tasks that reached running state."""
