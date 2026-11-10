@@ -619,11 +619,15 @@ async def _background_event_transcript_count(
         )
     elif event == "task_kill":
         assert task_id is not None
-        needle = f"background task {task_id} exited"
+        needle = (
+            f"background task {task_id} killed by this call"
+            if owner == "run_background"
+            else "⏺ /matrix · canceled"
+        )
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"⏺ task {task_id} exited"
+            f"background tasks killed on session exit: {task_id}"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
@@ -13501,7 +13505,8 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
     try:
         with patch_stdout(raw=True):
             await app._run_full_screen(session)
-        assert any("background failed" in line for line in app._transcript_lines)
+        assert not any("background failed" in line for line in app._transcript_lines)
+        assert any("RuntimeError" in line for line in app._transcript_lines)
         assert not log_path.exists()
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -13515,55 +13520,58 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
 
 
 @pytest.mark.asyncio
-async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
+async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
-    terminal_calls: list[str] = []
-    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-    monkeypatch.setattr(
-        "prompt_toolkit.application.run_in_terminal",
-        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-    )
-    monkeypatch.setattr(
-        "prompt_toolkit.application.in_terminal",
-        lambda: terminal_calls.append("in_terminal"),
-    )
-    monkeypatch.setattr(
-        "prompt_toolkit.patch_stdout.run_in_terminal",
-        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-    )
-
-    async def run_async(**_kwargs: object) -> None:
-        async def fail() -> None:
-            raise RuntimeError("background failed")
-
-        asyncio.create_task(fail())
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(session.app, "run_async", run_async)
-    with patch_stdout(raw=True):
-        await app._run_full_screen(session)
-
-    assert any("background failed" in line for line in app._transcript_lines)
-    # The log path wraps inside the card on long tmp paths (macOS); compare
-    # the text without ANSI codes, card borders, and line breaks.
-    flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
-    assert "tui-errors.jsonl" in flat
-    assert terminal_calls == []
-    log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
-    deadline = time.monotonic() + 1
-    records: list[str] = []
-    while time.monotonic() < deadline:
-        if log_path.exists():
-            records = log_path.read_text().splitlines()
-            if records:
-                break
-        await asyncio.sleep(0.01)
-    assert len(records) == 1
-    assert "background failed" in json.loads(records[0])["traceback"]
-
+    async with owned_app(app):
+        terminal_calls: list[str] = []
+        monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+        monkeypatch.setattr(
+            "prompt_toolkit.application.run_in_terminal",
+            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+        )
+        monkeypatch.setattr(
+            "prompt_toolkit.application.in_terminal",
+            lambda: terminal_calls.append("in_terminal"),
+        )
+        monkeypatch.setattr(
+            "prompt_toolkit.patch_stdout.run_in_terminal",
+            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+        )
+    
+        async def run_async(**_kwargs: object) -> None:
+            async def fail() -> None:
+                raise RuntimeError("sk-test-SECRET123")
+    
+            asyncio.create_task(fail())
+            await asyncio.sleep(0)
+    
+        monkeypatch.setattr(session.app, "run_async", run_async)
+        with patch_stdout(raw=True):
+            await app._run_full_screen(session)
+    
+        assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
+        assert any("RuntimeError" in line for line in app._transcript_lines)
+        # The log path wraps inside the card on long tmp paths (macOS); compare
+        # the text without ANSI codes, card borders, and line breaks.
+        flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
+        assert "tui-errors.jsonl" in flat
+        assert terminal_calls == []
+        log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
+        deadline = time.monotonic() + 1
+        records: list[str] = []
+        while time.monotonic() < deadline:
+            if log_path.exists():
+                records = log_path.read_text().splitlines()
+                if records:
+                    break
+            await asyncio.sleep(0.01)
+        assert len(records) == 1
+        assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
+        assert os.stat(log_path).st_mode & 0o777 == 0o600
+        assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
 
 def test_tui_diagnostic_record_is_not_visible_before_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -13603,6 +13611,42 @@ def test_tui_diagnostic_write_ignores_fd_exhaustion(
     tui_stalls_module.write_tui_diagnostic(
         tmp_path / "logs" / "tui-errors.jsonl", {"traceback": "failure"}
     )
+
+
+@pytest.mark.asyncio
+async def test_slow_successful_draft_flush_does_not_report_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notices: list[str] = []
+    write_started = threading.Event()
+    release_write = threading.Event()
+    persistence = DraftPersistence(
+        tmp_path / "draft",
+        delay=0,
+        notice_sink=notices.append,
+    )
+    original_write = persistence_module.write_json_file
+
+    def slow_write(*args: object, **kwargs: object) -> None:
+        write_started.set()
+        assert release_write.wait(10)
+        original_write(*args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "write_json_file", slow_write)
+    monkeypatch.setattr(persistence_module, "PERSISTENCE_FLUSH_TIMEOUT", 0.01)
+    persistence.schedule("slow draft")
+    flush = asyncio.create_task(persistence.flush_pending())
+    try:
+        assert await asyncio.to_thread(write_started.wait, 10)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(flush, 10)
+        assert notices == []
+    finally:
+        release_write.set()
+    await persistence._writer.flush(timeout=10)
+    await asyncio.sleep(0)
+    assert persistence.load() == "slow draft"
 
 
 @pytest.mark.asyncio

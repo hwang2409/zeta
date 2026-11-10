@@ -412,7 +412,12 @@ the runtime.
 If the session does not exist, `resume` returns `-32602` with structured error
 data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
-recovery.
+recovery. A session id prefix must contain at least 4 characters.
+
+If the prefix matches more than one session, `resume` returns `-32602` with
+`data` shaped as `{"code":"session_id_ambiguous","session_id":"<requested id>","candidates":["<short id>", ...]}`.
+`candidates` contains the same bounded list of at most 8 short ids shown in the
+unchanged human-readable message.
 
 If the transcript is corrupt or uses a newer conversation format, `resume`
 returns `-32000` with bounded data:
@@ -1120,6 +1125,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
