@@ -49,6 +49,7 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
@@ -215,9 +216,13 @@ class TUIApp(
         project_eligible: bool | None = None,
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
+        self.foreground_event_publisher = (
+            foreground_event_publisher or ForegroundEventPublisher()
+        )
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
