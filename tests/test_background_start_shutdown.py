@@ -249,6 +249,7 @@ async def test_cancelled_terminal_commit_notifies_exit_once(
             return set(), set(fs)
         return await original_wait(fs, timeout=timeout, **kwargs)
 
+    # test-contract: seam persistence is intentionally patched to force the race
     monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
     monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
     killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
@@ -307,6 +308,7 @@ async def test_failed_registry_close_can_retry(monkeypatch: pytest.MonkeyPatch) 
             raise OSError("close failed")
         original_persist(rows)
 
+    # test-contract: seam persistence failure is intentionally injected
     monkeypatch.setattr(registry, "_persist", flaky_persist)
 
     with pytest.raises(OSError, match="close failed"):

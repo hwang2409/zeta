@@ -258,12 +258,13 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
     )
     loop.explicit_finish = True
     idle_count = 0
+    status_at_clean_silence: dict[str, object] | None = None
     initial_idle = asyncio.Event()
     silence_idle = asyncio.Event()
     silence_done = asyncio.Event()
     child_ended = asyncio.Event()
     def observe(event: StreamEvent) -> None:
-        nonlocal idle_count
+        nonlocal idle_count, status_at_clean_silence
         if (
             event.type is StreamEventType.AGENT_NOTIFICATION
             and event.data.get("kind") == "child_idle"
@@ -272,6 +273,11 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             if idle_count == 1:
                 initial_idle.set()
             else:
+                status_at_clean_silence = _read_agent_status(
+                    store,
+                    requested_handle=str(event.data["child_instance_id"]),
+                    running_handles=loop._background_owner.active_instance_ids,
+                )[0]
                 silence_idle.set()
                 silence_done.set()
         if (
@@ -320,7 +326,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                     child_backend.notification_ready.wait(),
                     what="thinking-only notification response",
                 )
-            if ending in {"thinking_only", "non_explicit"}:
+            if ending == "non_explicit":
                 await await_or_fail(
                     registry.background_tasks.input(
                         running[1].task_id, "done\n", eof=True
@@ -350,12 +356,16 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             else:
                 assert flow is not None
                 assert flow._low_capacity_notifications is True
-        rows = _read_agent_status(
-            store,
-            requested_handle=handle,
-            running_handles=loop._background_owner.active_instance_ids,
-        )
-        assert rows[0]["state"] == expected_state
+        if ending == "non_explicit":
+            rows = _read_agent_status(
+                store,
+                requested_handle=handle,
+                running_handles=loop._background_owner.active_instance_ids,
+            )
+            assert rows[0]["state"] == expected_state
+        else:
+            assert status_at_clean_silence is not None
+            assert status_at_clean_silence["state"] == expected_state
     finally:
         child_backend.release_initial.set()
         child_backend.release_notification.set()
