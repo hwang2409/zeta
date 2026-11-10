@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 from ...protocol.types import is_passive_harness_message, is_visible_harness_notice
 from ..checkpoints import ConversationEntry
 
+_HISTORY_PAGE_ATTEMPTS = 16
+
 if TYPE_CHECKING:
     from ._store import ConversationStore
 
@@ -441,7 +443,7 @@ class HistoryPageStoreMixin:
             return None
         if index is None or (self._read_only and not index.available):
             return None
-        for attempt in range(4):
+        for attempt in range(_HISTORY_PAGE_ATTEMPTS):
             if not index.available:
                 writer = self._new_persistent_durable_writer()
                 try:
@@ -453,19 +455,19 @@ class HistoryPageStoreMixin:
             try:
                 page = index.page(request, facts)
             except StaleHistorySnapshot:
-                if "end" in request or attempt == 3:
+                if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
                     raise
                 index._mark_unavailable()
                 continue
             except HistoryIndexUnavailableError as exc:
                 if self._history_index_facts() != facts:
                     raise StaleHistorySnapshot from exc
-                if self._read_only or attempt == 3:
+                if self._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
                     raise
                 index._mark_unavailable()
                 continue
             if self._history_index_facts() != facts:
-                if "end" in request or attempt == 3:
+                if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
                     raise StaleHistorySnapshot
                 continue
 
