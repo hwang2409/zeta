@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.child_runs import project_child_run_row, read_child_lifecycle
+from ...core.store._child_runs import child_run_segments
 
 BASELINE_ROW_RESERVE = 4_096
 
@@ -61,11 +62,18 @@ def ended_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any | None:
     marker = store.agent_children().get(run_id) or {}
     path = marker.get("child_session_path")
     if type(path) is not str:
-        return None
+        try:
+            path = store.session_dir.joinpath(
+                *(component for segment in child_run_segments(store.session_id, run_id) for component in ("agents", str(segment)))
+            )
+        except (OSError, ValueError):
+            return None
     try:
         lifecycle, _ = read_child_lifecycle(store, Path(path))
     except (OSError, ValueError):
         return None
+    if not isinstance(lifecycle, dict):
+        lifecycle = getattr(lifecycle, "value", None)
     if not isinstance(lifecycle, dict) or lifecycle.get("finished_at") is None:
         return None
     row = project_child_run_row(
