@@ -200,6 +200,7 @@ class EventDescriptor(StrEnum):
     CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
     PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"
+    PROJECT_INBOX_HEALTH = "project_inbox_health"
     CHILD_QUESTION = "child_question"
     CHILD_QUESTION_WITHDRAWN = "child_question_withdrawn"
     CHILD_MESSAGE_DELIVERED = "child_message_delivered"

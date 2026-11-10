@@ -97,6 +97,7 @@ NOTIFICATION_WIRE_EVENTS = {
     "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
+    "project_inbox_health": EventDescriptor.PROJECT_INBOX_HEALTH,
     "child_question": EventDescriptor.CHILD_QUESTION,
     "child_question_withdrawn": EventDescriptor.CHILD_QUESTION_WITHDRAWN,
 }
