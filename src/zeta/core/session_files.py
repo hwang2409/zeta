@@ -67,6 +67,13 @@ class SessionReferenceAuthority:
     def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
         self.gate.validate(session_ids)
 
+    def validate_project_domains(
+        self, project_domains: tuple[tuple[str, str], ...]
+    ) -> None:
+        declared = set(self.project_domains)
+        if not set(project_domains).issubset(declared):
+            raise AssertionError("project domain was not declared for reference admission")
+
 
 class SessionReferenceGate:
     """Coordinate all durable session references with retention."""

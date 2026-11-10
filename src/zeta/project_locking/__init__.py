@@ -220,8 +220,11 @@ class ProjectLockingMixin:
         domains: tuple[tuple[str, str], ...],
         *,
         exclusive: bool,
+        authority=None,
     ) -> Iterator[tuple[int, ...]]:
         require_off_loop_lock("project domain authority", ProjectRegistryError)
+        if authority is not None:
+            authority.validate_project_domains(domains)
         if domains != tuple(sorted(set(domains))):
             raise AssertionError("project domains must be unique and sorted")
         lease = self._storage_lease

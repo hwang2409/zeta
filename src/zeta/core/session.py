@@ -77,7 +77,7 @@ from .session_metadata import META_VERSION, OpenedSession, SessionMetadata
 from .session_links import (
     _PROJECT_ROLES,
     associate_project as associate_project_link,
-    persist_pending_root_link,
+    _persist_pending_root_link,
     project_links_lock,
     reconcile_child_links,
     valid_pending_link,
@@ -282,60 +282,18 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     try:
                         with execution_authority, publication as authority:
                             assert authority is not None
-                            authority.validate((session_id, *referenced_ids))
-                            with child_directory(
-                                root_fd, session_id
-                            ) as destination_fd, session_directory(
-                                staged.sessions_dir, session_id
-                            ) as (_, source_fd):
-                                for filename in sorted(
-                                    (name for name in os.listdir(source_fd) if name != RUNTIME_LEASE_NAME),
-                                    key=lambda item: item == "meta.json",
-                                ):
-                                    os.replace(
-                                        filename,
-                                        filename,
-                                        src_dir_fd=source_fd,
-                                        dst_dir_fd=destination_fd,
-                                    )
-                                os.fsync(destination_fd)
-                                os.fsync(root_fd)
-                            store = ConversationStore(
-                                self.sessions_dir,
+                            return self._publish_created_session(
+                                root_fd=root_fd,
+                                staged=staged,
+                                metadata=metadata,
                                 session_id=session_id,
-                                _must_exist=True,
-                                _storage_lease=self._storage_lease,
-                                _execution_lease=execution_lease,
-                                _owner_surface=self._owner_surface,
-                                _initialization_execution_ranked=False,
+                                parent_session_id=parent_session_id,
+                                project_id=project_id,
+                                project_role=project_role,
+                                execution_lease=execution_lease,
+                                authority=authority,
+                                before_reference_publication=_before_reference_publication,
                             )
-                            metadata._execution_lease = store.execution_lease
-                            if _before_reference_publication is not None:
-                                _before_reference_publication(
-                                    OpenedSession(metadata, store)
-                                )
-                            store._rank_execution = True
-                            store.activate_runtime_lease()
-                            if project_id is not None:
-                                try:
-                                    persist_pending_root_link(
-                                        self.sessions_dir,
-                                        session_id,
-                                        project_id,
-                                        project_role or "session",
-                                        parent_session_id,
-                                        self._storage_lease,
-                                        _reference_authority=authority,
-                                    )
-                                except (SessionError, OSError) as exc:
-                                    logger.warning(
-                                        "could not persist project linkage intent: %s",
-                                        exc,
-                                    )
-                                self._reconcile_project_link(
-                                    session_id, _reference_authority=authority
-                                )
-                            return OpenedSession(metadata, store)
                     except BaseException:
                         if store is not None:
                             store.close()
@@ -343,6 +301,62 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     finally:
                         execution_lease.close()
         raise SessionError("could not allocate a unique session id")
+
+    def _publish_created_session(
+        self,
+        *,
+        root_fd: int,
+        staged: SessionManager,
+        metadata: SessionMetadata,
+        session_id: str,
+        parent_session_id: str | None,
+        project_id: str | None,
+        project_role: str | None,
+        execution_lease: SessionExecutionLease,
+        authority: SessionReferenceAuthority,
+        before_reference_publication: Callable[[OpenedSession], None] | None,
+    ) -> OpenedSession:
+        authority.validate((session_id, *((parent_session_id,) if parent_session_id else ())))
+        with child_directory(root_fd, session_id) as destination_fd, session_directory(
+            staged.sessions_dir, session_id
+        ) as (_, source_fd):
+            for filename in sorted(
+                (name for name in os.listdir(source_fd) if name != RUNTIME_LEASE_NAME),
+                key=lambda item: item == "meta.json",
+            ):
+                os.replace(
+                    filename,
+                    filename,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd,
+                )
+            os.fsync(destination_fd)
+            os.fsync(root_fd)
+        store = ConversationStore(
+            self.sessions_dir,
+            session_id=session_id,
+            _must_exist=True,
+            _storage_lease=self._storage_lease,
+            _execution_lease=execution_lease,
+            _owner_surface=self._owner_surface,
+            _initialization_execution_ranked=False,
+        )
+        metadata._execution_lease = store.execution_lease
+        if before_reference_publication is not None:
+            before_reference_publication(OpenedSession(metadata, store))
+        store._rank_execution = True
+        store.activate_runtime_lease()
+        if project_id is not None:
+            try:
+                _persist_pending_root_link(
+                    self.sessions_dir, session_id, project_id,
+                    project_role or "session", parent_session_id,
+                    self._storage_lease, authority=authority,
+                )
+            except (SessionError, OSError) as exc:
+                logger.warning("could not persist project linkage intent: %s", exc)
+            self._reconcile_project_link(session_id, _reference_authority=authority)
+        return OpenedSession(metadata, store)
 
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
         return associate_project_link(self, metadata, project_id)
@@ -390,7 +404,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 )
             return OpenedSession(metadata, store)
 
-        self.read_metadata(session_id)
+        existing_metadata = self.read_metadata(session_id)
         with session_root(self.sessions_dir) as root_fd, child_directory(
             root_fd, session_id
         ) as directory_fd:
@@ -408,6 +422,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 self.home,
                 self._storage_lease,
                 referenced_ids=(session_id,),
+                project_domains=(
+                    ((existing_metadata.project_id, "sessions"),)
+                    if existing_metadata.project_id is not None
+                    else ()
+                ),
             ) as authority:
                 reference_authority = authority
                 yield authority
@@ -415,7 +434,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         def initialize(store: ConversationStore) -> None:
             nonlocal opened_metadata
             assert reference_authority is not None
-            metadata = self.read_metadata(session_id)
+            metadata = existing_metadata
             if store.cwd != metadata.cwd:
                 raise SessionError(
                     f"session {session_id} cwd does not match its metadata"
@@ -660,7 +679,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     (value, "sessions") for value in sorted(project_ids)
                 )
                 with registry._project_locks(
-                    domains, exclusive=True
+                    domains, exclusive=True, authority=authority
                 ) as project_fds, session_directory(
                     self.sessions_dir, session_id
                 ) as (_, directory_fd), project_links_lock(directory_fd):

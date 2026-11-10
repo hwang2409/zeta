@@ -22,7 +22,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -150,7 +150,30 @@ def persist_pending_root_link(
     lease: WriterLease,
     *,
     previous_project_id: str | None = None,
-    _reference_authority: SessionReferenceAuthority | None = None,
+) -> None:
+    with reference_publication(
+        Path(sessions_dir).parent,
+        lease,
+        installed_ids=(session_id,),
+        referenced_ids=(parent_session_id,) if parent_session_id else (),
+        project_domains=((project_id, "sessions"),),
+    ) as authority:
+        _persist_pending_root_link(
+            sessions_dir, session_id, project_id, role, parent_session_id, lease,
+            previous_project_id=previous_project_id, authority=authority,
+        )
+
+
+def _persist_pending_root_link(
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    project_id: str,
+    role: str,
+    parent_session_id: str | None,
+    lease: WriterLease,
+    *,
+    previous_project_id: str | None = None,
+    authority: SessionReferenceAuthority,
 ) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
@@ -162,19 +185,7 @@ def persist_pending_root_link(
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
     referenced_ids = (parent_session_id,) if parent_session_id is not None else ()
-    publication = (
-        nullcontext(_reference_authority)
-        if _reference_authority is not None
-        else reference_publication(
-            Path(sessions_dir).parent,
-            lease,
-            installed_ids=(session_id,),
-            referenced_ids=referenced_ids,
-            project_domains=((project_id, "sessions"),),
-        )
-    )
     with (
-        publication as authority,
         session_directory(sessions_dir, session_id) as (_, directory_fd),
         project_links_lock(directory_fd),
     ):
@@ -190,11 +201,26 @@ def persist_pending_root_link(
 
 
 def persist_pending_child_link(
+    root_session_dir: os.PathLike[str] | str,
+    link: dict[str, object],
+    lease: WriterLease,
+) -> None:
+    root = Path(root_session_dir)
+    with reference_publication(
+        root.parent.parent, lease,
+        installed_ids=(str(link["session_id"]),),
+        referenced_ids=tuple(value for value in (link.get("parent_session_id"), root.name) if isinstance(value, str)),
+        project_domains=(((str(link["project_id"]), "sessions"),) if isinstance(link.get("project_id"), str) else ()),
+    ) as authority:
+        _persist_pending_child_link(root_session_dir, link, lease, authority=authority)
+
+
+def _persist_pending_child_link(
     root_session_dir: os.PathLike[str],
     link: dict[str, object],
     lease: WriterLease,
     *,
-    _reference_authority: SessionReferenceAuthority | None = None,
+    authority: SessionReferenceAuthority,
 ) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 
@@ -212,23 +238,7 @@ def persist_pending_child_link(
         for session_id in (link.get("parent_session_id"), root.name)
         if isinstance(session_id, str)
     )
-    project_id = link.get("project_id")
-    project_domains = (
-        ((project_id, "sessions"),) if isinstance(project_id, str) else ()
-    )
-    publication = (
-        nullcontext(_reference_authority)
-        if _reference_authority is not None
-        else reference_publication(
-            root.parent.parent,
-            lease,
-            installed_ids=installed_ids,
-            referenced_ids=referenced_ids,
-            project_domains=project_domains,
-        )
-    )
     with (
-        publication as authority,
         session_directory(root.parent, root.name) as (_, root_fd),
         project_links_lock(root_fd),
         child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
@@ -289,11 +299,11 @@ class ChildLineagePublisher:
     def _publish_admitted(
         self, value: dict[str, object], authority: SessionReferenceAuthority
     ) -> None:
-        persist_pending_child_link(
+        _persist_pending_child_link(
             self._root_session_dir,
             value,
             self._storage_lease,
-            _reference_authority=authority,
+            authority=authority,
         )
         with self._mutex:
             self._generation += 1
@@ -314,7 +324,7 @@ class ChildLineagePublisher:
                     self._root_session_dir.parent,
                     self._root_session_dir.name,
                     ready_collection_started=ready_collection_started,
-                    _reference_authority=authority,
+                    authority=authority,
                 )
                 if outcome == "failed":
                     raise ProjectRegistryError("child project lineage remains pending")
@@ -351,12 +361,35 @@ def reconcile_child_links(
     crash, a failed append, or a bounded pass is recovered on the next open
     without ever double-recording a link.
     """
-    outcome = _reconcile_child_links_pass(
-        project_registry,
-        sessions_dir,
-        session_id,
-        _reference_authority=_reference_authority,
-    )
+    if _reference_authority is None:
+        project_ids: set[str] = set()
+        try:
+            with (
+                session_directory(sessions_dir, session_id) as (_, session_fd),
+                child_directory(
+                    session_fd, PENDING_CHILD_LINKS_DIRNAME
+                ) as pending_fd,
+            ):
+                    for _name, link in _collect_pending_intents(pending_fd, session_fd)[0]:
+                        if isinstance(link.get("project_id"), str):
+                            project_ids.add(link["project_id"])
+        except (FileNotFoundError, OSError, SessionError):
+            pass
+        with reference_publication(
+            Path(sessions_dir).parent,
+            project_registry._storage_lease,
+            referenced_ids=(session_id,),
+            project_domains=tuple((value, "sessions") for value in sorted(project_ids)),
+        ) as authority:
+            outcome = _reconcile_child_links_pass(
+                project_registry, sessions_dir, session_id,
+                ready_collection_started=None, authority=authority,
+            )
+    else:
+        outcome = _reconcile_child_links_pass(
+            project_registry, sessions_dir, session_id,
+            ready_collection_started=None, authority=_reference_authority,
+        )
     if outcome == "failed":
         logger.warning("child project linkage reconciliation failed for %s", session_id)
 
@@ -367,27 +400,15 @@ def _reconcile_child_links_pass(
     session_id: str,
     *,
     ready_collection_started: Callable[[], None] | None = None,
-    _reference_authority: SessionReferenceAuthority | None = None,
+    authority: SessionReferenceAuthority,
 ) -> _ReconcileOutcome:
-    publication = (
-        nullcontext(_reference_authority)
-        if _reference_authority is not None
-        else reference_publication(
-            Path(sessions_dir).parent,
-            project_registry._storage_lease,
-            referenced_ids=(session_id,),
-        )
+    return _reconcile_child_links_pass_admitted(
+        project_registry,
+        sessions_dir,
+        session_id,
+        authority=authority,
+        ready_collection_started=ready_collection_started,
     )
-    with publication as authority:
-        assert authority is not None
-        return _reconcile_child_links_pass_admitted(
-            project_registry,
-            sessions_dir,
-            session_id,
-            authority=authority,
-            ready_collection_started=ready_collection_started,
-        )
-
 
 def _reconcile_child_links_pass_admitted(
     project_registry: ProjectRegistry,
@@ -443,7 +464,7 @@ def _reconcile_child_links_pass_admitted(
         }
         domains = tuple((project_id, "sessions") for project_id in sorted(project_ids))
         with project_registry._project_locks(
-            domains, exclusive=True
+            domains, exclusive=True, authority=authority
         ) as project_fds, session_directory(
             sessions_dir, session_id
         ) as (_, session_fd), project_links_lock(session_fd):
@@ -776,7 +797,7 @@ def publish_project_association(
 ) -> None:
     """Finish the metadata-to-registry handoff under reference authority."""
     try:
-        persist_pending_root_link(
+        _persist_pending_root_link(
             manager.sessions_dir,
             current.session_id,
             project_id,
@@ -784,7 +805,7 @@ def publish_project_association(
             current.parent_session_id,
             manager._storage_lease,
             previous_project_id=previous_project_id,
-            _reference_authority=authority,
+            authority=authority,
         )
     except (SessionError, OSError) as exc:
         logger.warning("could not persist project linkage intent: %s", exc)
