@@ -33,8 +33,7 @@ from .transcript_recovery import (
 from .transcript_recovery.runtime import format_repair_transcript_command
 from .store._child_runs import child_run_segments
 from .session_execution import (
-    RUNTIME_LEASE_NAME, OwnerHint,
-    OwnerSurface,
+    RUNTIME_LEASE_NAME, OwnerHint, OwnerSurface,
     SessionExecutionLease,
     SessionOwnedError,
     session_owner_status,
