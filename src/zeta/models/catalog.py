@@ -73,10 +73,23 @@ def default_model(provider: str) -> str | None:
     return DEFAULT_MODELS.get(provider)
 
 
-def known_model_names() -> list[str]:
-    """Return every model name the built-in catalogs serve, sorted."""
+_LIVE_MODELS: dict[str, frozenset[str]] = {}
 
-    return sorted(model for models in PROVIDER_MODELS.values() for model in models)
+
+def update_live_catalog(provider: str, models: frozenset[str]) -> None:
+    """Publish a successful live catalog for other model consumers."""
+
+    _LIVE_MODELS[provider] = models
+
+
+def known_model_names() -> list[str]:
+    """Return every known static or successfully loaded live model, sorted."""
+
+    return sorted(
+        model
+        for models in (*PROVIDER_MODELS.values(), *_LIVE_MODELS.values())
+        for model in models
+    )
 
 
 def provider_for_model(model: str) -> str:
@@ -88,8 +101,14 @@ def provider_for_model(model: str) -> str:
     """
 
     for provider, models in PROVIDER_MODELS.items():
-        if model in models:
+        if model in models or model in _LIVE_MODELS.get(provider, ()):
             return provider
+    if model.startswith("claude-"):
+        return "claude"
+    if model.startswith(("gpt-", "o1", "o3", "o4")):
+        return "codex"
+    if ":" in model:
+        return "ollama"
     choices = ", ".join(known_model_names())
     raise ValueError(f"unknown model {model!r}; choose one of: {choices}")
 
@@ -102,5 +121,6 @@ __all__ = [
     "default_model",
     "known_model_names",
     "provider_for_model",
+    "update_live_catalog",
     "validate_provider",
 ]

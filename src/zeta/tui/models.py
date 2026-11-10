@@ -12,13 +12,11 @@ import httpx
 
 from ..accounts import SessionAccountContext
 from ..core.session import env_home
-from ..models.catalog import PROVIDER_MODELS
+from ..models.catalog import PROVIDER_MODELS, update_live_catalog
 from ..providers.factory import credential_store
 
 
-MODEL_CATALOGS = {
-    "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
-}
+MODEL_CATALOGS: dict[str, frozenset[str]] = {}
 _MODEL_CATALOG_TIMEOUT = 2.0
 _WRONG_PROVIDER_PREFIXES = {
     "claude": ("gpt-", "o1", "o3", "o4", "gemini-", "llama-"),
@@ -108,7 +106,23 @@ def load_model_catalog(
     """Load a provider catalog, returning None when it cannot be obtained."""
 
     if provider == "codex":
-        return _load_codex_model_catalog()
+        catalog = _load_codex_model_catalog()
+        if catalog is not None:
+            update_live_catalog(provider, catalog)
+        return catalog
+    if provider == "ollama":
+        try:
+            response = httpx.get(
+                os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/") + "/api/tags",
+                timeout=1.0,
+            )
+            response.raise_for_status()
+            catalog = _model_names_from_payload(response.json())
+            if catalog is not None:
+                update_live_catalog(provider, catalog)
+            return catalog
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, httpx.HTTPError):
+            return None
     if provider != "claude":
         return None
 
@@ -137,7 +151,10 @@ def load_model_catalog(
             timeout=_MODEL_CATALOG_TIMEOUT,
         )
         response.raise_for_status()
-        return _model_names_from_payload(response.json())
+        catalog = _model_names_from_payload(response.json())
+        if catalog is not None:
+            update_live_catalog(provider, catalog)
+        return catalog
     except (
         OSError,
         RuntimeError,
