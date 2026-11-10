@@ -58,11 +58,23 @@ def history_events(result: Mapping[str, object]) -> tuple[StreamEvent, ...]:
 
 def decode_event(raw: bytes | str) -> StreamEvent:
     name, params = decode_frame(raw)
+    aliases = {
+        "assistant_delta": StreamEventType.MESSAGE_UPDATE,
+        "assistant_message": StreamEventType.MESSAGE_END,
+        "tool_start": StreamEventType.TOOL_EXECUTION_START,
+        "tool_output": StreamEventType.TOOL_EXECUTION_UPDATE,
+        "tool_end": StreamEventType.TOOL_EXECUTION_END,
+        "approval_request": StreamEventType.TOOL_APPROVAL_START,
+        "approval_end": StreamEventType.TOOL_APPROVAL_END,
+        "sub_agent_receipt": StreamEventType.AGENT_NOTIFICATION,
+        "usage": StreamEventType.AGENT_NOTIFICATION,
+        "served_turn_end": StreamEventType.TURN_END,
+    }
     try:
-        kind = StreamEventType(name)
+        kind = aliases[name] if name in aliases else StreamEventType(name)
     except ValueError as exc:
         raise RemoteWireError("unknown remote event") from exc
-    allowed = {"event", "type", "session_id", "data", "delta", "kind", "message", "content", "tool_call", "tool_result", "error", "row_seq"}
+    allowed = {"event", "type", "session_id", "data", "delta", "kind", "message", "content", "tool_call", "tool_result", "error", "row_seq", "usage", "stream_id", "seq"}
     if set(params) - allowed:
         raise RemoteWireError("unknown remote event field")
     value = {key: item for key, item in params.items() if key != "session_id"}

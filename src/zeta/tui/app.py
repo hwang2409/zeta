@@ -595,7 +595,7 @@ class TUIApp(
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " › ")],
-            placeholder=[("class:placeholder", "type a message...")],
+            placeholder=lambda: [("class:placeholder", self._composer_placeholder())],
             history=None,
             key_bindings=bindings,
             completer=ComposerCompleter(
