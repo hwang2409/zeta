@@ -749,13 +749,22 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pending_join", (False, True), ids=("live", "pending-join"))
-@pytest.mark.parametrize("renumber", (False, True), ids=("over-count", "renumber"))
+@pytest.mark.parametrize(
+    ("pending_join", "renumber", "empty_frontier"),
+    (
+        pytest.param(False, False, False, id="live-over-count"),
+        pytest.param(True, False, False, id="pending-join-over-count"),
+        pytest.param(False, True, False, id="live-renumber"),
+        pytest.param(True, True, False, id="pending-join-renumber"),
+        pytest.param(False, False, True, id="live-empty-frontier-over-count"),
+    ),
+)
 @pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_replay_frontier_table(
     tmp_path: Path,
     pending_join: bool,
     renumber: bool,
+    empty_frontier: bool,
     transport: Transport,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -778,7 +787,7 @@ async def test_replay_frontier_table(
         assert write_release.wait(10)
 
     try:
-        for index in range(6):
+        for index in range(0 if empty_frontier else 6):
             serve.store.append_task_notification(task_id=f"before-{index}", command="true", exit_code=0)
         if pending_join:
             connections.run_read = held_read  # type: ignore[method-assign]

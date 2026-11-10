@@ -133,7 +133,12 @@ class _ChildBackend(CompletionBackend):
                 await await_or_fail(
                     self.release_initial.wait(), what="plain child initial response"
                 )
-            blocks = [TextContent("working")]
+            if self.ending == "empty_turn":
+                blocks = [ThinkingContent("still thinking")]
+            else:
+                blocks = [TextContent("working")]
+        elif self.calls >= 3 and self.ending == "empty_turn":
+            blocks = [ThinkingContent("still thinking")]
         else:
             self.notification_called.set()
             thinking = ThinkingContent("still working")
@@ -211,6 +216,7 @@ def _catalog() -> AgentCatalog:
     [
         ("thinking_only", "explicit-test", "idle"),
         ("low_capacity", "explicit-test", "idle"),
+        ("empty_turn", "explicit-test", "idle"),
         ("non_explicit", "plain-test", "failed"),
     ],
 )
@@ -263,6 +269,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
     silence_idle = asyncio.Event()
     silence_done = asyncio.Event()
     child_ended = asyncio.Event()
+    terminal_done = asyncio.Event()
     def observe(event: StreamEvent) -> None:
         nonlocal idle_count, status_at_clean_silence
         if (
@@ -272,6 +279,14 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             idle_count += 1
             if idle_count == 1:
                 initial_idle.set()
+                if ending == "empty_turn":
+                    status_at_clean_silence = _read_agent_status(
+                        store,
+                        requested_handle=str(event.data["child_instance_id"]),
+                        running_handles=loop._background_owner.active_instance_ids,
+                    )[0]
+                    silence_done.set()
+                    terminal_done.set()
             else:
                 status_at_clean_silence = _read_agent_status(
                     store,
@@ -287,6 +302,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
         ):
             child_ended.set()
             silence_done.set()
+            terminal_done.set()
 
     loop.set_background_event_sink(observe)
     first, second = grandchildren
@@ -302,7 +318,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             else None
         )
         await await_or_fail(child_backend.work_started.wait(), what="live child work")
-        if ending != "non_explicit":
+        if ending not in {"non_explicit", "empty_turn"}:
             await await_or_fail(initial_idle.wait(), what="child initial idle")
         if ending == "low_capacity":
             await await_or_fail(first.started.wait(), what="first grandchild starts")
@@ -349,6 +365,15 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             child_backend.release_notification.set()
         if ending == "non_explicit":
             await await_or_fail(child_ended.wait(), what="plain child failure")
+        elif ending == "empty_turn":
+            await await_or_fail(terminal_done.wait(), what="empty-turn child terminal")
+            if status_at_clean_silence is None:
+                status_at_clean_silence = _read_agent_status(
+                    store,
+                    requested_handle=handle,
+                    running_handles=loop._background_owner.active_instance_ids,
+                )[0]
+            assert status_at_clean_silence["state"] == expected_state
         else:
             await await_or_fail(silence_done.wait(), what="clean silence result")
             if ending == "thinking_only":
@@ -363,7 +388,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                 running_handles=loop._background_owner.active_instance_ids,
             )
             assert rows[0]["state"] == expected_state
-        else:
+        elif ending != "empty_turn":
             assert status_at_clean_silence is not None
             assert status_at_clean_silence["state"] == expected_state
     finally:

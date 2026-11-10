@@ -336,6 +336,8 @@ async def consume_child(
             "no_progress_loop",
         }:
             return recoverable_error_result(terminal_result, failure_message, *failure_error)
+        if failure_error is not None and failure_error[0] == "empty_turn":
+            return clean_no_output(f"agent error: {failure_message}")
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         return clean_no_output("agent error: child ended without a final response")
