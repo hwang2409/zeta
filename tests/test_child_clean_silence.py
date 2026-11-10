@@ -342,22 +342,21 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                     child_backend.notification_ready.wait(),
                     what="thinking-only notification response",
                 )
-            if ending in {"non_explicit", "empty_turn"}:
+            if ending == "non_explicit":
                 await await_or_fail(
                     registry.background_tasks.input(
                         running[1].task_id, "done\n", eof=True
                     ),
                     what="second background task exit",
                 )
-            if ending in {"non_explicit", "empty_turn"}:
+            if ending == "non_explicit":
                 await await_or_fail(
                     asyncio.gather(
                         *(record.process.wait() for record in registry.background_tasks.records)
                     ),
                     what="background tasks finish",
                 )
-                if ending == "non_explicit":
-                    child_backend.release_initial.set()
+                child_backend.release_initial.set()
         if ending == "non_explicit":
             await await_or_fail(
                 child_backend.notification_ready.wait(), what="plain notification turn"
