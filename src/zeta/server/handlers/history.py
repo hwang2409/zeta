@@ -29,22 +29,25 @@ _MISSING_VALIDATOR = object()
 
 
 def history_validator(
+    expected: tuple[int, str | None, str | None] | None = None,
     *,
-    end: int,
-    entry_id: str | None,
-    repair_generation: str | None,
     supplied: object = _MISSING_VALIDATOR,
 ) -> dict[str, object]:
-    expected: dict[str, object] = {
-        "end": end,
-        "entry_id": entry_id,
-        "repair_generation": repair_generation,
-    }
+    emitted = (
+        {
+            "end": expected[0],
+            "entry_id": expected[1],
+            "repair_generation": expected[2],
+        }
+        if expected is not None
+        else None
+    )
     if supplied is _MISSING_VALIDATOR:
-        return expected
+        assert emitted is not None
+        return emitted
     if not isinstance(supplied, dict) or set(supplied) not in (
         {"end", "entry_id"},
-        set(expected),
+        {"end", "entry_id", "repair_generation"},
     ):
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
@@ -65,12 +68,14 @@ def history_validator(
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
         )
-    if supplied != expected:
+    if emitted is None:
+        return dict(supplied)
+    if supplied != emitted:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
             "session history changed; restart from the newest page",
         )
-    return expected
+    return emitted
 
 
 def _fit_history_groups(
@@ -324,9 +329,7 @@ def _backward_history_page(
     )
     end = len(projection.entry_groups) - 1
     validator = history_validator(
-        end=end,
-        entry_id=_history_endpoint(projection, end),
-        repair_generation=store.repair_generation,
+        (end, _history_endpoint(projection, end), store.repair_generation),
         supplied=(
             supplied_validator
             if supplied_validator is not _MISSING_VALIDATOR
@@ -448,9 +451,7 @@ def _projected_backward_history_request(
     before = params["before"]
     end = len(projection.entry_groups) - 1
     validator = history_validator(
-        end=end,
-        entry_id=_history_endpoint(projection, end),
-        repair_generation=store.repair_generation,
+        (end, _history_endpoint(projection, end), store.repair_generation),
         supplied=params.get("history_validator", _MISSING_VALIDATOR),
     )
     if before is None:
@@ -524,9 +525,7 @@ def _backward_history_request(
             served_turn_end=served_turn_end,
         )
     validator = history_validator(
-        end=page.total,
-        entry_id=page.endpoint,
-        repair_generation=page.repair_generation,
+        (page.total, page.endpoint, page.repair_generation),
         supplied=(
             _MISSING_VALIDATOR if before is None else params["history_validator"]
         ),
@@ -618,10 +617,8 @@ def _validate_history_params(params: dict) -> None:
             ErrorDescriptor.INVALID_PARAMS,
             "history_validator is only valid for continuations",
         )
-    if before is not None and validator is None:
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
-        )
+    if before is not None:
+        history_validator(supplied=validator)
 
 
 def history(
