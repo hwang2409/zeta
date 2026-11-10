@@ -42,6 +42,12 @@ _LOGGER = logging.getLogger(__name__)
 _SIGNATURE_TERMINAL_STATES = frozenset({"completed", "failed", "canceled"})
 
 
+def event_loop_running() -> bool:
+    try: asyncio.get_running_loop()
+    except RuntimeError: return False
+    return True
+
+
 class AgentSignatureRefreshMixin:
     def _agent_tree_signature(self) -> tuple[object, ...]:
         running = tuple(
@@ -49,7 +55,7 @@ class AgentSignatureRefreshMixin:
             if entry.state not in _SIGNATURE_TERMINAL_STATES
             and (entry.path != self.root_path or self.child_view_active)
         )
-        return agent_tree_signature(self.current_path, self.selected_index, running, self._path_signature)
+        return self._agent_tree_signature_function(self.current_path, self.selected_index, running, self._path_signature)
 
     def _request_agent_tree_signature(self, force: bool) -> None:
         if self._invalidate is None:
@@ -66,7 +72,7 @@ class AgentSignatureRefreshMixin:
             and (entry.path != self.root_path or self.child_view_active)
         )
         task = asyncio.create_task(asyncio.to_thread(
-            agent_tree_signature, self.current_path, self.selected_index,
+            self._agent_tree_signature_function, self.current_path, self.selected_index,
             running, self._path_signature
         ))
         self._signature_task = task

@@ -47,7 +47,9 @@ from .cards.agent_sync import (
     AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
+    agent_tree_signature,
     candidate_paths,
+    event_loop_running,
     registered_child_markers,
 )
 from .cards.shared import (
@@ -772,6 +774,9 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
 
 
 class AgentNavigation(AgentSignatureRefreshMixin):
+    @staticmethod
+    def _agent_tree_signature_function(*args: object) -> tuple[object, ...]:
+        return agent_tree_signature(*args)
     """Own the current session path, list selection, and child transcript."""
 
     def __init__(self, store: ConversationStore) -> None:
@@ -996,7 +1001,7 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             if self.child_view_active
             else False
         )
-        if self._invalidate is None or not asyncio.get_event_loop().is_running():
+        if self._invalidate is None or not event_loop_running():
             signature = self._agent_tree_signature()
             return transcript_changed or todo_changed or self._refresh_with_signature(
                 signature, force
