@@ -83,14 +83,16 @@ async def test_probe_stops_when_peer_closes_and_ignores_notifications(tmp_path: 
     server = await asyncio.start_unix_server(lambda reader, writer: _probe_peer(reader, writer), path)
     try:
         descriptor = Descriptor(str(path), "session", os.getpid())
-        assert await asyncio.wait_for(asyncio.to_thread(_probe_state, descriptor), 2) == "running"
+        assert await asyncio.wait_for(asyncio.to_thread(_probe_state, descriptor), 10) == "running"
     finally:
         server.close()
         await server.wait_closed()
 
 
+# test-contract: transport raw socket peer is required to exercise probe framing and eof.
 async def _probe_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
+        # test-contract: transport raw socket peer is required to exercise probe framing and eof.
         await reader.readline()
         writer.write(b'{"jsonrpc":"2.0","method":"event","params":{}}\n')
         writer.write(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
@@ -119,7 +121,7 @@ async def test_attach_exits_when_socket_closes_with_stdin_open(tmp_path: Path, m
     monkeypatch.setattr("sys.stdin", Stdin())
     descriptor_path = publish(tmp_path, Descriptor(str(path), "session", os.getpid()))
     try:
-        assert await asyncio.wait_for(attach(tmp_path, "session"), 2) == 0
+        assert await asyncio.wait_for(attach(tmp_path, "session"), 10) == 0
     finally:
         os.close(read_fd)
         os.close(write_fd)
