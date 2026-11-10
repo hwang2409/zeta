@@ -42,11 +42,11 @@ from .cards.agent_list import (
 )
 from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
+    AgentSignatureRefreshMixin,
     AgentTodoControl,
     AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
-    agent_tree_signature,
     candidate_paths,
     registered_child_markers,
 )
@@ -771,7 +771,7 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         return self.transcript.mouse_handler(mouse_event)
 
 
-class AgentNavigation:
+class AgentNavigation(AgentSignatureRefreshMixin):
     """Own the current session path, list selection, and child transcript."""
 
     def __init__(self, store: ConversationStore) -> None:
@@ -945,53 +945,6 @@ class AgentNavigation:
 
     _path_signature = staticmethod(agent_path_signature)
 
-    def _agent_tree_signature(self) -> tuple[object, ...]:
-        running = tuple(
-            entry.path for entry in self.entries
-            if entry.state not in _TERMINAL_AGENT_STATES
-            and (entry.path != self.root_path or self.child_view_active)
-        )
-        return agent_tree_signature(self.current_path, self.selected_index, running, self._path_signature)
-
-    def _request_agent_tree_signature(self, force: bool) -> None:
-        if self._invalidate is None:
-            return
-        self._signature_generation += 1
-        generation = self._signature_generation
-        self._signature_force |= force
-        if self._signature_task is not None:
-            self._signature_dirty = True
-            return
-        running = tuple(
-            entry.path for entry in self.entries
-            if entry.state not in _TERMINAL_AGENT_STATES
-            and (entry.path != self.root_path or self.child_view_active)
-        )
-        task = asyncio.create_task(asyncio.to_thread(
-            agent_tree_signature, self.current_path, self.selected_index,
-            running, self._path_signature
-        ))
-        self._signature_task = task
-        task.add_done_callback(lambda completed: self._agent_tree_signature_done(generation, force, completed))
-    def _agent_tree_signature_done(
-        self,
-        generation: int,
-        force: bool,
-        task: asyncio.Task[tuple[object, ...]],
-    ) -> None:
-        if self._signature_task is task:
-            self._signature_task = None
-        if task.cancelled(): return
-        if generation != self._signature_generation or self._signature_dirty:
-            self._signature_dirty = False
-            pending_force = self._signature_force
-            self._signature_force = False
-            self._request_agent_tree_signature(pending_force)
-            return
-        self._signature_force = False
-        try: signature = task.result()
-        except (OSError, ValueError): return
-        if self._invalidate is not None and self._refresh_with_signature(signature, force): self._invalidate()
     def _schedule_refresh(self, delay: float) -> None:
         if self._invalidate is None or self._refresh_handle is not None:
             return

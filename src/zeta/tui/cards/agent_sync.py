@@ -39,6 +39,55 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
+_SIGNATURE_TERMINAL_STATES = frozenset({"completed", "failed", "canceled"})
+
+
+class AgentSignatureRefreshMixin:
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        running = tuple(
+            entry.path for entry in self.entries
+            if entry.state not in _SIGNATURE_TERMINAL_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        return agent_tree_signature(self.current_path, self.selected_index, running, self._path_signature)
+
+    def _request_agent_tree_signature(self, force: bool) -> None:
+        if self._invalidate is None:
+            return
+        self._signature_generation += 1
+        generation = self._signature_generation
+        self._signature_force |= force
+        if self._signature_task is not None:
+            self._signature_dirty = True
+            return
+        running = tuple(
+            entry.path for entry in self.entries
+            if entry.state not in _SIGNATURE_TERMINAL_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        task = asyncio.create_task(asyncio.to_thread(
+            agent_tree_signature, self.current_path, self.selected_index,
+            running, self._path_signature
+        ))
+        self._signature_task = task
+        task.add_done_callback(lambda completed: self._agent_tree_signature_done(generation, force, completed))
+
+    def _agent_tree_signature_done(
+        self, generation: int, force: bool, task: asyncio.Task[tuple[object, ...]]
+    ) -> None:
+        if self._signature_task is task:
+            self._signature_task = None
+        if task.cancelled(): return
+        if generation != self._signature_generation or self._signature_dirty:
+            self._signature_dirty = False
+            pending_force = self._signature_force
+            self._signature_force = False
+            self._request_agent_tree_signature(pending_force)
+            return
+        self._signature_force = False
+        try: signature = task.result()
+        except (OSError, ValueError): return
+        if self._invalidate is not None and self._refresh_with_signature(signature, force): self._invalidate()
 
 
 def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
