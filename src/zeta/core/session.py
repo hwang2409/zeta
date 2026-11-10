@@ -33,6 +33,7 @@ from .transcript_recovery import (
 from .transcript_recovery.runtime import format_repair_transcript_command
 from .store._child_runs import child_run_segments
 from .session_execution import (
+    RUNTIME_LEASE_NAME,
     OwnerHint,
     OwnerSurface,
     SessionExecutionLease,
@@ -291,7 +292,15 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             ) as destination_fd, session_directory(
                                 staged.sessions_dir, session_id
                             ) as (_, source_fd):
-                                for filename in os.listdir(source_fd):
+                                names = [
+                                    filename
+                                    for filename in os.listdir(source_fd)
+                                    if filename != RUNTIME_LEASE_NAME
+                                ]
+                                # Publish metadata last so discovery skips incomplete sessions.
+                                for filename in sorted(
+                                    names, key=lambda item: item == "meta.json"
+                                ):
                                     os.replace(
                                         filename,
                                         filename,
