@@ -39,66 +39,6 @@ _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
 _LOGGER = logging.getLogger(__name__)
-_SIGNATURE_TERMINAL_STATES = frozenset({"completed", "failed", "canceled"})
-
-
-def event_loop_running() -> bool:
-    try: asyncio.get_running_loop()
-    except RuntimeError: return False
-    return True
-
-
-class AgentSignatureRefreshMixin:
-    def _agent_tree_signature(self) -> tuple[object, ...]:
-        running = tuple(
-            entry.path for entry in self.entries
-            if entry.state not in _SIGNATURE_TERMINAL_STATES
-            and (entry.path != self.root_path or self.child_view_active)
-        )
-        return self._agent_tree_signature_function(self.current_path, self.selected_index, running, self._path_signature)
-
-    def _request_agent_tree_signature(self, force: bool) -> bool:
-        if self._invalidate is None:
-            return False
-        self._signature_generation += 1
-        generation = self._signature_generation
-        self._signature_force |= force
-        if self._signature_task is not None:
-            self._signature_dirty = True
-            return True
-        running = tuple(
-            entry.path for entry in self.entries
-            if entry.state not in _SIGNATURE_TERMINAL_STATES
-            and (entry.path != self.root_path or self.child_view_active)
-        )
-        try:
-            task = asyncio.create_task(asyncio.to_thread(
-                self._agent_tree_signature_function, self.current_path, self.selected_index,
-                running, self._path_signature
-            ))
-        except RuntimeError:
-            return False
-        self._signature_task = task
-        task.add_done_callback(lambda completed: self._agent_tree_signature_done(generation, force, completed))
-        return True
-
-    def _agent_tree_signature_done(
-        self, generation: int, force: bool, task: asyncio.Task[tuple[object, ...]]
-    ) -> None:
-        if self._signature_task is task:
-            self._signature_task = None
-        if task.cancelled(): return
-        if generation != self._signature_generation or self._signature_dirty:
-            self._signature_dirty = False
-            pending_force = self._signature_force
-            self._signature_force = False
-            self._request_agent_tree_signature(pending_force)
-            return
-        self._signature_force = False
-        try: signature = task.result()
-        except (OSError, ValueError): return
-        if self.refresh(force=force, _signature=signature) and self._invalidate is not None:
-            self._invalidate()
 
 
 def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:

@@ -5308,11 +5308,10 @@ async def test_agent_signature_drops_stale_result_and_coalesces_refresh(
 
     monkeypatch.setattr(agent_card_module, "agent_tree_signature", signature)
     navigation._invalidate = lambda: invalidations.append(None)
-    navigation._layout = object()
     try:
-        navigation.refresh(force=True)
+        navigation._refresh_after_debounce()
         await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
-        navigation.refresh(force=True)
+        navigation._refresh_after_debounce()
         release.set()
         await asyncio.wait_for(asyncio.to_thread(second_started.wait), 10)
         await asyncio.sleep(0)

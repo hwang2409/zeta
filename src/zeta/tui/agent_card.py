@@ -42,14 +42,12 @@ from .cards.agent_list import (
 )
 from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
-    AgentSignatureRefreshMixin,
     AgentTodoControl,
     AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
     agent_tree_signature,
     candidate_paths,
-    event_loop_running,
     registered_child_markers,
 )
 from .cards.shared import (
@@ -773,10 +771,7 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         return self.transcript.mouse_handler(mouse_event)
 
 
-class AgentNavigation(AgentSignatureRefreshMixin):
-    @staticmethod
-    def _agent_tree_signature_function(*args: object) -> tuple[object, ...]:
-        return agent_tree_signature(*args)
+class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
     def __init__(self, store: ConversationStore) -> None:
@@ -868,9 +863,6 @@ class AgentNavigation(AgentSignatureRefreshMixin):
         return self._todo_control.snapshot(self.current_path)
 
     async def close(self) -> None:
-        if self._signature_task is not None:
-            self._signature_task.cancel()
-            self._signature_task = None
         await close_agent_owners(self.transcript_control.close, self._todo_control.close)
 
     def child_view_focused(self) -> bool:
@@ -915,9 +907,6 @@ class AgentNavigation(AgentSignatureRefreshMixin):
         if self._refresh_handle is not None:
             self._refresh_handle.cancel()
             self._refresh_handle = None
-        if self._signature_task is not None:
-            self._signature_task.cancel()
-            self._signature_task = None
         self._invalidate = None
         self._layout = None
         self._composer_buffer = None
@@ -950,6 +939,16 @@ class AgentNavigation(AgentSignatureRefreshMixin):
 
     _path_signature = staticmethod(agent_path_signature)
 
+    def _agent_tree_signature(self) -> tuple[object, ...]:
+        running = (
+            entry.path for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        return agent_tree_signature(
+            self.current_path, self.selected_index, running, self._path_signature
+        )
+
     def _schedule_refresh(self, delay: float) -> None:
         if self._invalidate is None or self._refresh_handle is not None:
             return
@@ -966,12 +965,30 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             self._refresh_handle.cancel()
             self._refresh_handle = None
         self._schedule_refresh(0)
+
     def _refresh_after_debounce(self) -> None:
         self._refresh_handle = None
         if self._invalidate is None:
             return
-        if self.refresh():
-            self._invalidate()
+        if self._signature_task is not None:
+            self._signature_dirty = True
+            return
+        self._signature_generation += 1
+        generation = self._signature_generation
+        self._signature_force = False
+        running = tuple(
+            entry.path for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        task = asyncio.create_task(asyncio.to_thread(
+            agent_tree_signature, self.current_path, self.selected_index,
+            running, self._path_signature
+        ))
+        self._signature_task = task
+        task.add_done_callback(
+            lambda completed: self._debounced_signature_done(generation, completed)
+        )
         delay = (
             _AGENT_REFRESH_INTERVAL_SECONDS
             if any(
@@ -981,11 +998,33 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             else _AGENT_IDLE_REFRESH_INTERVAL_SECONDS
         )
         self._schedule_refresh(delay)
+
+    def _debounced_signature_done(
+        self, generation: int, task: asyncio.Task[tuple[object, ...]]
+    ) -> None:
+        if self._signature_task is task:
+            self._signature_task = None
+        if task.cancelled():
+            return
+        if generation != self._signature_generation or self._signature_dirty:
+            if self._signature_dirty:
+                self._signature_dirty = False
+                self._refresh_after_debounce()
+            return
+        try:
+            signature = task.result()
+        except (OSError, ValueError):
+            return
+        if self.refresh(_signature=signature) and self._invalidate is not None:
+            self._invalidate()
+
     def refresh(
         self, *, force: bool = False, _signature: tuple[object, ...] | None = None
     ) -> bool:
         """Refresh at most once per second unless fresh state is required."""
 
+        if _signature is None:
+            self._signature_generation += 1
         now = _monotonic()
         elapsed = now - self._last_refresh_at
         if not force and elapsed < _AGENT_REFRESH_INTERVAL_SECONDS:
@@ -1003,21 +1042,9 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             if self.child_view_active
             else False
         )
-        if (
-            _signature is None
-            and self._layout is not None
-            and event_loop_running()
-            and self._request_agent_tree_signature(force)
-        ):
-            return transcript_changed or todo_changed
         signature = _signature or self._agent_tree_signature()
-        return transcript_changed or todo_changed or self._refresh_with_signature(signature, force)
-
-    def _refresh_with_signature(
-        self, signature: tuple[object, ...], force: bool
-    ) -> bool:
         if not force and signature == self._refresh_signature:
-            return False
+            return transcript_changed or todo_changed
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
