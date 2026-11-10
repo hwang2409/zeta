@@ -768,9 +768,9 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
-            self._close_deferred_replay(session_id)
             self._notification_turn_started = False
             if started:
+                self._close_deferred_replay(session_id)
                 await self.deliveries.finalize_turn(
                     session_id,
                     state,
