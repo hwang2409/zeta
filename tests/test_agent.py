@@ -4079,6 +4079,8 @@ async def _run_post_cap_tool_cycle(
         await await_or_fail(owner.wait(), what="background owner completion")
         return backend
     finally:
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         await await_or_fail(loop.close(), what="agent loop close")
         store.close()
@@ -4196,6 +4198,8 @@ async def test_causal_budget_stop_shows_held_input_as_not_delivered(
         ]
         assert len(held) == 1
     finally:
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         owner.cancel_all()
         await await_or_fail(owner.wait(), what="background owner completion")
@@ -4544,6 +4548,8 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             assert published[0][1].startswith("Handed off running background work.")
     finally:
         backend.on_fresh_call = lambda: False
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         # a child that keeps re-waking must not hide the assertion above.
         owner.cancel_all()
