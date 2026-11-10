@@ -125,7 +125,11 @@ class ProjectInboxNotificationMixin:
                 poll = getattr(self, "_pending_project_inbox_poll", None)
                 if poll is None:
                     worker = asyncio.create_task(asyncio.to_thread(scanner.poll))
-                    result = await worker
+                    try:
+                        result = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(worker)
+                        raise
                     poll = _PollResult(
                         tuple(result[0] or ()), tuple(result[1]), tuple(result[2])
                     )
