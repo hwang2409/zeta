@@ -360,15 +360,19 @@ def project_child_run_row(
         "run_id": str(item["handle"]),
         "session_id": session_id,
         "parent_run_id": parent_run_id,
-        "description": item["description"],
-        "agent_type": item["agent_type"],
-        "status": item["state"],
+        "description": _bounded_text(item["description"], 3_998),
+        "agent_type": _bounded_text(item["agent_type"], 3_998),
+        "status": _bounded_text(item["state"], 3_998),
         "accepts_follow_ups": accepts_follow_ups,
         "turns_used": item["turns_used"],
         "tool_count": item["tool_calls"],
-        "current_step": item["current_step"],
-        "started_at": item["started_at"],
-        "finished_at": item["finished_at"],
+        "current_step": _bounded_text(item["current_step"], 3_998),
+        "started_at": _bounded_text(item["started_at"], 3_998),
+        "finished_at": (
+            _bounded_text(item["finished_at"], 3_998)
+            if item["finished_at"] is not None
+            else None
+        ),
         "elapsed_seconds": item["elapsed"],
     }
 
