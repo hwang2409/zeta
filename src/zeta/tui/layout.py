@@ -627,7 +627,7 @@ def full_screen_content(
         ),
         Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
     )
-    bottom_rows = [*overlay_field_windows, spacer, todo_panel, queued_rows, *padded_composer_rows]
+    bottom_rows = [spacer, todo_panel, queued_rows, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)
@@ -647,6 +647,7 @@ def full_screen_content(
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
     floats = [command_menu_float(composer.menu_top)]
+    floats.extend(Float(window, top=0, left=0, width=0, height=0, z_index=-100) for window in overlay_field_windows)
     if status_window is not None and status_active is not None:
         floats.append(status_card_float(status_window, status_active))
     if tasks_window is not None and tasks_active is not None:

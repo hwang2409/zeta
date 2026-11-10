@@ -483,7 +483,10 @@ class DecisionsMixin:
             self._decisions_answer_field.reset()
             session = self._active_session
             if isinstance(session, FullScreenPromptSession):
-                session.layout.focus(self._decisions_answer_field.window)
+                try:
+                    session.layout.focus(self._decisions_answer_field.window)
+                except ValueError:
+                    pass
                 if get_app().editing_mode.name == "VI":
                     get_app().vi_state.input_mode = InputMode.INSERT
         elif key == "enter":
