@@ -1374,7 +1374,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
     calls_by_thread: dict[int, int] = {}
     event_loop_thread_id = threading.get_ident()
     owner_thread_id: int | None = None
-    real_persist = session_links.persist_pending_child_link
+    real_persist = session_links._persist_pending_child_link
 
     def observe_admission(*args: object, **kwargs: object) -> None:
         nonlocal owner_thread_id
@@ -1396,7 +1396,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             assert release_owner.wait(120), "owner release was not signalled"
         return real_session_directory(*args, **kwargs)
 
-    monkeypatch.setattr(session_links, "persist_pending_child_link", observe_admission)
+    monkeypatch.setattr(session_links, "_persist_pending_child_link", observe_admission)
     monkeypatch.setattr(session_links, "session_directory", gate_before_collection)
     real_read = registry._read_session_records
     registry_reads = 0
@@ -1505,7 +1505,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
     release_first_batch = threading.Event()
     all_admissions_ready = threading.Event()
     admission_lock = threading.Lock()
-    real_persist = session_links.persist_pending_child_link
+    real_persist = session_links._persist_pending_child_link
     admission_count = 0
 
     def count_admission(*args: object, **kwargs: object) -> None:
@@ -1517,7 +1517,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
                 all_admissions_ready.set()
 
     # test-contract: count real admissions before the second bounded pass
-    monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+    monkeypatch.setattr(session_links, "_persist_pending_child_link", count_admission)
     real_reconcile = session_links._reconcile_child_links_pass
     reconcile_calls = 0
 
@@ -1697,7 +1697,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         first_batch_ready = threading.Event()
         all_admissions_ready = threading.Event()
         admission_lock = threading.Lock()
-        real_persist = session_links.persist_pending_child_link
+        real_persist = session_links._persist_pending_child_link
         admission_count = 0
 
         def count_admission(*args: object, **kwargs: object) -> None:
@@ -1709,7 +1709,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
                     all_admissions_ready.set()
 
         # test-contract: count real admissions before the second bounded pass
-        monkeypatch.setattr(session_links, "persist_pending_child_link", count_admission)
+        monkeypatch.setattr(session_links, "_persist_pending_child_link", count_admission)
         real_reconcile = session_links._reconcile_child_links_pass
         reconcile_calls = 0
 
@@ -1868,7 +1868,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
     first_phase = threading.Event()
     release_worker = threading.Event()
     order: list[str] = []
-    real_persist = session_links.persist_pending_child_link
+    real_persist = session_links._persist_pending_child_link
 
     def gated_persist(*args: object, **kwargs: object) -> None:
         if threading.get_ident() != event_loop_thread:
@@ -1879,7 +1879,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
         order.append("storage_return")
         first_phase.set()
 
-    monkeypatch.setattr(session_links, "persist_pending_child_link", gated_persist)
+    monkeypatch.setattr(session_links, "_persist_pending_child_link", gated_persist)
     call = ToolCall(
         "child-cancel",
         "agent",
