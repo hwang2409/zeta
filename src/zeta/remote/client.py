@@ -74,7 +74,7 @@ class RemoteSessionClient:
         self.detach()
         transport = self._transport_factory(host, ssh=self.ssh)
         transport.start(remote_bridge_command("attach", session_id))
-        transport.send((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["session_replay_seq"]}}, separators=(",", ":")) + "\n").encode())
+        transport.send((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.1", "role": "observer", "features": ["session_replay_seq", "serve_observers"]}}, separators=(",", ":")) + "\n").encode())
         transport.send((json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session_history_and_subscribe", "params": {"session_id": session_id}}, separators=(",", ":")) + "\n").encode())
         self.transport = transport
         self.view = RemoteView(host, session_id, session.name if isinstance(session, RemoteSession) else session_id, replay_seq)
