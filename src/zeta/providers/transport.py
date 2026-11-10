@@ -6,79 +6,45 @@ import asyncio
 import contextlib
 import json
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from .completion import is_control_exception, merge_exception, report_transport_activity
+from ..runtime._async_close import (
+    CloseFailureReporter,
+    CloseOutcome,  # noqa: F401 - preserve the provider transport import
+    close_resource,  # noqa: F401 - anthropic imports it from transport
+    close_transport_resources,
+    is_control_exception,
+    merge_exception,
+)
+from ..runtime._async_close import (
+    cleanup_failure_context as _cleanup_failure_context,
+)
+from ..runtime._async_close import (
+    report_loop_cleanup_failure as _report_loop_cleanup_failure,
+)
+from ..runtime._async_close import (
+    retain_background_closes as _retain_background_closes,
+)
+from .completion import report_transport_activity
+from .must_complete_close import MustCompleteClose, task_is_cancelling
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
-_BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
+DEFAULT_STREAM_STALL_SECONDS = 90.0  # Transport idle, including missing keepalives.
+# Long hidden reasoning is normal; diagnostics will let us safely tighten this later.
+MODEL_PROGRESS_STALL_SECONDS = 15 * 60.0
+DEFAULT_STREAM_STALL_RETRIES = 2
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
 _dropped_cleanup_reports = 0
-CloseFailureReporter = Callable[[int, BaseException], None]
-
-
-@dataclass(frozen=True, slots=True)
-class CloseFailure:
-    index: int
-    error: BaseException
-
-
-@dataclass(frozen=True, slots=True)
-class CloseOutcome:
-    """Failures from one aggregate close; an empty tuple means success."""
-
-    failures: tuple[CloseFailure, ...]
-
-
-def _exception_type_name(error: BaseException) -> str:
-    name = f"{type(error).__module__}.{type(error).__qualname__}"
-    return name.encode()[:128].decode(errors="ignore")
-
-
-def _primary_outcome(primary_exception: BaseException | None) -> str:
-    if isinstance(primary_exception, asyncio.CancelledError):
-        return "cancelled"
-    return "error" if primary_exception is not None else "success"
-
-
-def _cleanup_failure_context(
-    error: BaseException,
-    *,
-    stage: str,
-    index: int,
-    primary_exception: BaseException | None = None,
-) -> dict[str, object]:
-    return {
-        "exception_type": _exception_type_name(error),
-        "stage": stage,
-        "index": index,
-        "primary_outcome": _primary_outcome(primary_exception),
-    }
-
-
-def _report_loop_cleanup_failure(
-    error: BaseException,
-    *,
-    stage: str,
-    index: int,
-    primary_exception: BaseException | None = None,
-) -> None:
-    asyncio.get_running_loop().call_exception_handler(
-        _cleanup_failure_context(
-            error,
-            stage=stage,
-            index=index,
-            primary_exception=primary_exception,
-        )
-    )
+# how long a lease close waits for open borrows before it closes the client anyway
+LEASE_DRAIN_BOUND = 30.0
 
 
 async def _report_cleanup_failure(
@@ -121,37 +87,6 @@ async def _report_cleanup_failure(
             stage=f"{stage}_diagnostic",
             index=index,
             primary_exception=primary_exception,
-        )
-
-
-def _release_background_close(
-    task: asyncio.Task[object],
-    index: int,
-    report_failure: CloseFailureReporter | None,
-) -> None:
-    _BACKGROUND_CLOSE_TASKS.discard(task)
-    if task.cancelled():
-        return
-    error = task.exception()
-    if error is None or is_control_exception(error):
-        return
-    if report_failure is None:
-        _report_loop_cleanup_failure(error, stage="background_close", index=index)
-    else:
-        with contextlib.suppress(BaseException):
-            report_failure(index, error)
-
-
-def _retain_background_closes(
-    tasks: tuple[asyncio.Task[object], ...],
-    report_failure: CloseFailureReporter | None,
-) -> None:
-    for index, task in enumerate(tasks):
-        _BACKGROUND_CLOSE_TASKS.add(task)
-        task.add_done_callback(
-            lambda done, index=index: _release_background_close(
-                done, index, report_failure
-            )
         )
 
 
@@ -260,9 +195,9 @@ class HTTPClientLease:
     """Own one completion client and drain active borrows before closing it."""
 
     __slots__ = (
-        "_active_borrows",
         "_background_reporter_registered",
-        "_close_task",
+        "_borrowers",
+        "_close",
         "_drained",
         "_retired",
         "client",
@@ -276,57 +211,71 @@ class HTTPClientLease:
         self.owned = configured is None
         self.client = configured or httpx.AsyncClient(timeout=timeout)
         self.connection_setup_count = int(self.owned)
-        self._active_borrows = 0
+        self._borrowers: Counter[str] = Counter()
         self._background_reporter_registered = False
-        self._close_task: asyncio.Task[None] | None = None
+        self._close = MustCompleteClose(
+            "http client", LEASE_DRAIN_BOUND, self._open_borrows
+        )
         self._drained = asyncio.Event()
         self._drained.set()
         self._retired = False
 
+    @property
+    def _active_borrows(self) -> int:
+        return self._borrowers.total()
+
     @contextlib.asynccontextmanager
-    async def borrow(self) -> AsyncIterator[httpx.AsyncClient]:
+    async def borrow(self, borrower: str) -> AsyncIterator[httpx.AsyncClient]:
         if self._retired:
             raise RuntimeError("completion backend is retired")
-        self._active_borrows += 1
+        self._borrowers[borrower] += 1
         self._drained.clear()
         try:
             yield self.client
         finally:
-            self._active_borrows -= 1
-            if self._active_borrows == 0:
+            self._borrowers[borrower] -= 1
+            if not +self._borrowers:
+                self._borrowers.clear()
                 self._drained.set()
 
     def retire(self) -> None:
         self._retired = True
 
+    def _open_borrows(self) -> str:
+        names = ", ".join(sorted(+self._borrowers))
+        return f"borrows still open: {names}" if names else ""
+
     async def _close_owned(self) -> None:
-        await self._drained.wait()
-        if self.owned:
-            await self.client.aclose()
+        try:
+            # test-contract: seam the close owner bounds this drain
+            await self._drained.wait()
+        finally:
+            # the drain ended or the owner's bound cancelled it: close the
+            # client either way (the owner names any borrow that never ended).
+            if self.owned:
+                await self.client.aclose()
 
     def start_close(self) -> None:
         self.retire()
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_owned())
+        self._close.start(self._close_owned)
 
     async def aclose(
         self, report_failure: CloseFailureReporter | None = None
     ) -> None:
         self.start_close()
-        assert self._close_task is not None
-        task = self._close_task
+        assert self._close.task is not None
         try:
-            await asyncio.shield(task)
+            await self._close.wait()
         except asyncio.CancelledError:
             if report_failure is not None and not self._background_reporter_registered:
                 self._background_reporter_registered = True
-                _retain_background_closes((task,), report_failure)
+                _retain_background_closes((self._close.task,), report_failure)
             raise
 
     async def refresh(
         self, refresh_token: Callable[[httpx.AsyncClient], Awaitable[str]]
     ) -> str:
-        async with self.borrow() as client:
+        async with self.borrow("token refresh") as client:
             return await refresh_token(client)
 
 
@@ -383,11 +332,6 @@ async def sse_lines(response: httpx.Response) -> AsyncIterator[str]:
 
 
 
-def task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
 def request_error[ErrorT: RuntimeError](
     cause: httpx.HTTPError, error_type: type[ErrorT]
 ) -> ErrorT:
@@ -395,59 +339,6 @@ def request_error[ErrorT: RuntimeError](
     error.__cause__ = cause
     return error
 
-
-async def close_transport_resources(
-    *closes: Awaitable[object],
-    report_failure: CloseFailureReporter | None = None,
-) -> CloseOutcome:
-    """Close every owned resource and return each ordinary failure."""
-
-    created: list[asyncio.Task[object]] = []
-    try:
-        for close in closes:
-            created.append(asyncio.create_task(close))
-        tasks = tuple(created)
-        if task_is_cancelling():
-            await asyncio.sleep(0)
-            for task in tasks:
-                task.cancel()
-        results = tuple(await asyncio.gather(*tasks, return_exceptions=True))
-        cancellation = next(
-            (result for result in results if isinstance(result, asyncio.CancelledError)),
-            None,
-        )
-        if cancellation is not None:
-            raise cancellation
-        return CloseOutcome(
-            tuple(
-                CloseFailure(index, result)
-                for index, result in enumerate(results)
-                if isinstance(result, BaseException)
-            )
-        )
-    finally:
-        tasks = tuple(created)
-        pending = tuple(task for task in tasks if not task.done())
-        for task in pending:
-            task.cancel()
-        if task_is_cancelling():
-            _retain_background_closes(tasks, report_failure)
-        elif pending:
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except asyncio.CancelledError:
-                _retain_background_closes(tasks, report_failure)
-                raise
-
-
-async def close_resource(resource: object) -> None:
-    """Close one async resource through the shared cancellation-safe owner."""
-
-    outcome = await close_transport_resources(
-        resource.aclose()  # type: ignore[attr-defined]
-    )
-    if outcome.failures:
-        raise outcome.failures[0].error
 
 
 async def cleanup_transport[ErrorT: RuntimeError](
