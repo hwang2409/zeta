@@ -21,6 +21,7 @@ import zeta.project_inbox as project_inbox_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import (
     SENT_PAGE_LIMIT,
@@ -617,6 +618,83 @@ async def test_active_turn_skips_periodic_inbox_scan(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_targeted_inbox_notification_stays_with_target_session(
+    tmp_path: Path,
+) -> None:
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
+    manager = SessionManager(home)
+    session_a, session_b = await asyncio.to_thread(
+        lambda: (
+            manager.create(
+                provider="codex",
+                model="fake",
+                cwd=home,
+                project_id=project_b.project_id,
+                auto_project=False,
+            ),
+            manager.create(
+                provider="codex",
+                model="fake",
+                cwd=home,
+                project_id=project_b.project_id,
+                auto_project=False,
+            ),
+        )
+    )
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        to_session=session_a.store.session_id,
+        kind="info",
+        title="only for a",
+        body="private body for session a",
+    )
+    other_id = await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        to_session=session_b.store.session_id,
+        kind="info",
+        title="only for b",
+        body="private body for session b",
+    )
+    loop_a = AgentLoop(
+        FakeBackend([]),
+        session_a.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project_b.project_id,
+        project_registry=registry,
+    )
+    loop_b = AgentLoop(
+        FakeBackend([]),
+        session_b.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project_b.project_id,
+        project_registry=registry,
+    )
+    try:
+        await loop_a.activate()
+        await loop_b.activate()
+        notices_a = session_a.store.agent_notifications()
+        notices_b = session_b.store.agent_notifications()
+        assert notices_a and notices_a[0].data["message_ids"] == [message_id]
+        assert "private body for session a" in str(notices_a[0].data["messages"])
+        assert "private body for session b" not in str(notices_a[0].data["messages"])
+        assert notices_b and notices_b[0].data["message_ids"] == [other_id]
+        assert "private body for session a" not in str(notices_b[0].data["messages"])
+        assert "private body for session b" in str(notices_b[0].data["messages"])
+    finally:
+        await loop_a.close()
+        await loop_b.close()
+        session_a.store.close()
+        session_b.store.close()
+
+
 async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Path) -> None:
     home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")

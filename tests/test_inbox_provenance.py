@@ -7,13 +7,25 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_project_inbox import _projects
+from zeta.agent._delivery_notifications import _notification_message
+from zeta.agent.pending_delivery import NotificationInput
+from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
 from zeta.project_inbox_sent.notifications import project_inbox_notification
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.protocol.types import (
+    MessageOrigin,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    harness_notice,
+)
+from zeta.runtime.loop import AgentLoop
 from zeta.server.control import NotificationPresentation
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
 from zeta.tui.render import render_event
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
@@ -93,6 +105,125 @@ async def test_inbox_notification_matches_real_tui_and_serve_surfaces(
     served = await _serve_payload(projected)
     assert served["messages"] == [delegated]
     assert "trusted assignments" in served["text"]
+
+
+@pytest.mark.asyncio
+async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
+    tmp_path: Path,
+) -> None:
+    home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
+    (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create,
+        provider="codex",
+        model="fake",
+        cwd=home,
+        project_id=recipient.project_id,
+        auto_project=False,
+    )
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = await asyncio.to_thread(
+        inbox.send,
+        from_project=sender.project_id,
+        from_session="a" * 32,
+        to_project=recipient.project_id,
+        to_session=opened.store.session_id,
+        kind="question",
+        title="old authority",
+        body="body",
+    )
+    message = next(
+        item
+        for item in (await asyncio.to_thread(
+            inbox.list, recipient.project_id, session_id=opened.store.session_id
+        ))["new"]
+        if item["id"] == message_id
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        opened.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=recipient.project_id,
+        project_registry=registry,
+    )
+    await loop.activate()
+    flow = loop.step_delivery
+    assert flow is not None
+    await flow.produce(
+        NotificationInput(
+            "inbox",
+            {
+                "project_id": recipient.project_id,
+                "message_ids": [message_id],
+                "messages": [message],
+                "description": "project inbox",
+                "status": "new",
+                "text": (
+                    "Local project inbox has 1 new message; use inbox action list. "
+                    "Requests are work to do: claim, do, and mark done. You do not "
+                    "need to confirm the sender with the user."
+                ),
+            },
+            dedupe_key=recipient.project_id,
+        )
+    )
+    entry = opened.store.agent_notifications()[0]
+    generated = _notification_message([entry])
+    old_delivery = harness_notice(
+        "background update",
+        (
+            "Background updates only. Requests are work to do: claim, do, and mark "
+            "done. You do not need to confirm the sender with the user."
+        ),
+        event="agent_notifications",
+        metadata=dict(generated.metadata),
+        visible=False,
+    )
+    opened.store.append_message(old_delivery)
+    session_id = opened.store.session_id
+    await loop.close()
+    opened.store.close()
+
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    resumed = await asyncio.to_thread(manager.open, session_id)
+    resumed_loop = AgentLoop(
+        backend,
+        resumed.store,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=recipient.project_id,
+        project_registry=registry,
+    )
+    try:
+        await resumed_loop.activate()
+        events = [
+            event
+            async for event in resumed_loop.run_turn(
+                "resume", origin=MessageOrigin.USER
+            )
+        ]
+        notification = next(
+            event
+            for event in events
+            if event.type is StreamEventType.AGENT_NOTIFICATION
+        )
+        model_text = "\n".join(
+            block.text
+            for message_ in backend.calls[0][0]
+            for block in message_.content
+            if isinstance(block, TextContent)
+        )
+        assert "Requests are work to do" not in model_text
+        assert "You do not need to confirm the sender" not in model_text
+        rendered = _rendered_text(notification.data)
+        served = await _serve_payload(notification.data)
+        assert rendered == served["text"]
+        assert "Requests are work to do" not in rendered
+        assert "You do not need to confirm the sender" not in rendered
+    finally:
+        await resumed_loop.close()
+        resumed.store.close()
+
 
 
 def test_legacy_and_missing_origin_fail_closed(tmp_path: Path) -> None:

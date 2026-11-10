@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..core.checkpoints import ConversationEntry
@@ -146,9 +147,11 @@ def _reuse_persisted_notification_delivery(
     if not represented or not represented.issubset(pending_ids):
         return None
     selected = [entry for entry in pending if entry.id in represented]
-    projected = _notification_message(selected)
-    projected.metadata = dict(persisted.metadata)
-    projected.tool_result = persisted.tool_result
+    projected = replace(
+        _notification_message(selected),
+        metadata=dict(persisted.metadata),
+        tool_result=persisted.tool_result,
+    )
     if not _notification_fits(projected, notification_budget, token_counter):
         return None
     return selected, projected, True
