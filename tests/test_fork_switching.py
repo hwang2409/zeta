@@ -636,7 +636,8 @@ def test_tui_close_failure_still_runs_later_cleanup(
     cleaned: list[str] = []
 
     class ClosingApp(RuntimeCloseMixin):
-        pass
+        def _cancel_background_invalidation(self) -> None:
+            cleaned.append("background invalidation")
 
     class Loop:
         store = SimpleNamespace(agent_notifications=lambda: ())

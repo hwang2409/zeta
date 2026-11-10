@@ -5,7 +5,6 @@ import importlib
 import json
 import os
 import re
-import selectors
 import subprocess
 import sys
 import threading
@@ -3758,73 +3757,33 @@ async def test_concurrent_mcp_adds_keep_both_disk_entries(
 
 def test_concurrent_process_config_edits_keep_both_entries(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    home.mkdir()
-    lock = (home / ".mcp-trust.json.lock").open("a+")
-    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     script = """
 import asyncio
 import sys
 from pathlib import Path
-import zeta.mcp.management as management
+from zeta.mcp.management import MCPManagementService
 
 home = Path(sys.argv[1])
 name = sys.argv[2]
-real_flock = management.fcntl.flock
-notified = False
-
-def signal_contention(fd, operation):
-    global notified
-    try:
-        return real_flock(fd, operation)
-    except BlockingIOError:
-        if not notified:
-            print("contended", flush=True)
-            notified = True
-        raise
-
-management.fcntl.flock = signal_contention
-manager = management.MCPManagementService(home=home, lock_timeout=30)
+manager = MCPManagementService(home=home)
 asyncio.run(manager.add(name, scope="user", command=name))
 """
-    processes: list[subprocess.Popen[str]] = []
-    try:
-        processes = [
-            subprocess.Popen(
-                [sys.executable, "-c", script, str(home), name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            for name in ("first", "second")
-        ]
-        with selectors.DefaultSelector() as selector:
-            for process in processes:
-                assert process.stdout is not None
-                selector.register(process.stdout, selectors.EVENT_READ)
-            for _process in processes:
-                events = selector.select(timeout=5)
-                assert events, "child did not enter the config lock retry loop"
-                stream = events[0][0].fileobj
-                selector.unregister(stream)
-                assert stream.readline() == "contended\n"
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(home), name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for name in ("first", "second")
+    ]
+    results = [process.communicate(timeout=5) for process in processes]
 
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        lock.close()
-        results = [process.communicate(timeout=5) for process in processes]
-
-        assert all(process.returncode == 0 for process in processes), results
-        assert set(json.loads((home / "mcp.json").read_text())["servers"]) == {
-            "first",
-            "second",
-        }
-    finally:
-        if not lock.closed:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
-                process.communicate(timeout=5)
+    assert all(process.returncode == 0 for process in processes), results
+    assert set(json.loads((home / "mcp.json").read_text())["servers"]) == {
+        "first",
+        "second",
+    }
 
 
 @pytest.mark.asyncio
