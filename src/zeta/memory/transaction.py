@@ -13,6 +13,7 @@ from ..project_memory_history import (
     MemoryContextEntry,
     MemorySnapshot,
 )
+from ..project_schema import MAX_RECORD_SIZE
 from .entry_store import EntryMemorySnapshot
 from .entry_views import inspect_value, render_all_kinds
 
@@ -30,9 +31,21 @@ class HealthyMemoryProjection:
     memory: tuple[MemoryContextEntry, ...]
 
     def view(self, *, byte_cap: int | None = None) -> dict[str, object] | dict[str, str]:
+        if byte_cap is not None and (
+            type(byte_cap) is not int or byte_cap < 0 or byte_cap > MAX_RECORD_SIZE
+        ):
+            raise ProjectRegistryError("invalid memory byte cap")
         if self.format == 1:
             assert isinstance(self.snapshot, MemorySnapshot)
-            return dict(self.snapshot.contents)
+            remaining = byte_cap
+            result: dict[str, str] = {}
+            for name, content in self.snapshot.contents.items():
+                size = len(content.encode())
+                if remaining is None or size <= remaining:
+                    result[name] = content
+                    if remaining is not None:
+                        remaining -= size
+            return result
         assert isinstance(self.snapshot, EntryMemorySnapshot)
         value = {
             **inspect_value(
@@ -57,22 +70,13 @@ class HealthyMemoryProjection:
         return render_all_kinds(self.snapshot.state)
 
 
-@dataclass(frozen=True, slots=True)
-class BrokenMemoryProjection:
-    project_id: str
-    format: Literal[1, 2] | None
-    message: str
-
-MemoryProjection = HealthyMemoryProjection | BrokenMemoryProjection
-
-
 class MemoryTransactions:
     """Read project memory while holding p06's memory-domain capability."""
 
     def __init__(self, registry: ProjectRegistry):
         self._registry = weakref.proxy(registry)
 
-    def read(self, project_id: str, *, byte_cap: int = 64 * 1024) -> HealthyMemoryProjection:
+    def read(self, project_id: str) -> HealthyMemoryProjection:
         projection, _ = self._read(project_id, tolerate_malformed_files=False)
         return projection
 
@@ -152,4 +156,4 @@ class MemoryTransactions:
                 os.close(directory_fd)
 
 
-__all__ = ["BrokenMemoryProjection", "HealthyMemoryProjection", "MemoryProjection", "MemoryTransactions"]
+__all__ = ["HealthyMemoryProjection", "MemoryTransactions"]

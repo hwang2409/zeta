@@ -807,57 +807,24 @@ def test_resume_uses_project_snapshot_captured_before_execution(
     tmp_path: Path, recipe: str
 ) -> None:
     home, repository, manager, registry, project, session_id = _project_session(
-        tmp_path, recipe, "old memory"
+        tmp_path, recipe, "A_CAPTURED"
     )
-    before_update = registry.memory_snapshot(project.project_id)
-    registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=before_update.digest,
-        updates={"brief.md": "current memory"},
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
     )
-    projection = registry.project_context_projection(project.project_id)
-    expected = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-        registry=registry,
-        project_projection=projection,
-    )
-
-    resume_registry = registry if recipe == "custom" else _UnavailableRegistry(None)
-    resumed = manager.open(session_id)
-    result: ResumedPrompt | None = None
-    failure: BaseException | None = None
     try:
-        result = resume_prompt(
-            resumed.metadata,
-            manager=manager,
-            store=resumed.store,
-            home=home,
-            repo_root=repository,
-            inbox_enabled=True,
-            session_project=project,
-            cwd_project=project,
-            registry=resume_registry,
-            project_projection=projection,
-        )
-    except BaseException as exc:  # noqa: BLE001 - asserted below
-        failure = exc
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "B_LATER")
+        go.set()
+        resume.join(10)
     finally:
-        resumed.store.close()
+        go.set()
+        resume.join(10)
 
-    assert failure is None, f"{recipe} resume did not succeed: {failure}"
-    assert result is not None
-    assert "current memory" in result.context.system_prompt
-    assert "old memory" not in result.context.system_prompt
-    if recipe == "custom":
-        assert result.context.system_prompt.startswith("unknown-prefix\n")
-        assert result.context.system_prompt.endswith("\nunknown-suffix")
-    else:
-        assert result.context.system_prompt == expected.system_prompt
+    assert not resume.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], str), outcome
+    resumed_prompt = outcome[0]
+    assert "A_CAPTURED" in resumed_prompt and "B_LATER" not in resumed_prompt
 
 
 def _set_memory(registry: ProjectRegistry, project_id: str, text: str) -> None:

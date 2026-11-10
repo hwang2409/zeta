@@ -166,6 +166,10 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
         skill_catalog=SkillCatalog.empty(),
     )
     tools.project_registry_state = m.project_registry_state
+    for name in ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"):
+        m.project_registry.update_memory(
+            opened.metadata.project_id, {name: "x" * 20_000}
+        )
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
 
@@ -175,6 +179,8 @@ def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
         result["structuredContent"]["project"]["project_id"]
         == opened.metadata.project_id
     )
+    memory = result["structuredContent"]["memory"]
+    assert sum(len(content.encode()) for content in memory.values()) <= 64 * 1024
 
 
 async def test_project_slash_show_and_init(tmp_path: Path) -> None:

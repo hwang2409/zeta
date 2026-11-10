@@ -7,7 +7,6 @@ import json
 import re
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import IO, Any
 
 from ..core.session import env_home
@@ -22,17 +21,7 @@ _PROJECT_ID = re.compile(r"p_[0-9a-f]{32}\Z")
 
 
 def _memory_projection(registry: Any, project_id: str) -> Any:
-    transactions = getattr(registry, "memory_transactions", None)
-    if transactions is not None:
-        return transactions.read(project_id)
-    format_id = registry.memory_format(project_id)
-    if format_id == 2:
-        view = registry._entry_memory_view(project_id)
-        mirrors = registry._entry_memory_mirrors(project_id)
-    else:
-        view = {name: content for name, content in registry.load_memory(project_id)}
-        mirrors = view
-    return SimpleNamespace(format=format_id, view=lambda: view, mirror_files=lambda: mirrors)
+    return registry.memory_transactions.read(project_id)
 
 
 def add_subcommand(commands: argparse._SubParsersAction) -> None:

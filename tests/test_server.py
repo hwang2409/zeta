@@ -9245,6 +9245,9 @@ async def test_memory_command_parity_tui_and_serve() -> None:
     class Registry:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+            self.memory_transactions = SimpleNamespace(
+                read=lambda project_id: SimpleNamespace(format=1)
+            )
 
         def ensure_memory_supported(self, project_id: str) -> None:
             self.calls.append(("format", project_id))

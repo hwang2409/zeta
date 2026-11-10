@@ -601,10 +601,7 @@ def _validate_project_snapshot(snapshot: Path, project_id: str) -> None:
             path = snapshot / "memory" / name
             if path.is_file() and path.stat().st_size > MAX_MEMORY_MIRROR_FILE_SIZE:
                 raise ProjectRegistryError(f"memory file {name} is too large")
-        if registry.memory_transactions.read(project_id).format == 2:
-            registry.memory_transactions.read(project_id)
-        else:
-            registry.load_memory(project_id, byte_cap=MAX_RECORD_SIZE)
+        registry.memory_transactions.read(project_id).view(byte_cap=MAX_RECORD_SIZE)
     except UnsupportedMemoryFormatError:
         raise
     except ProjectRegistryError as exc:

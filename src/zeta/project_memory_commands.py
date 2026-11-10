@@ -106,12 +106,7 @@ def run_memory_command(
     action = args.strip()
     format_one_usage = "usage: /memory [log|retry [receipt]|undo [version-id]|accept <file>|recovery <session-id> <quarantine-id> resume]"
     try:
-        transactions = getattr(registry, "memory_transactions", None)
-        memory_format = (
-            transactions.read(project_id).format
-            if transactions is not None
-            else registry.memory_format(project_id)
-        )
+        memory_format = registry.memory_transactions.read(project_id).format
         usage = (
             format_one_usage
             if memory_format == 1

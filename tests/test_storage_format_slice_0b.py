@@ -550,15 +550,17 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
     )
 
     class ProjectRegistryStub:
+        memory_transactions: object
+
+        def __init__(self) -> None:
+            self.memory_transactions = self
+
         def find_or_create_for_directory(self, _root: Path) -> object:
             project_calls.append(threading.get_ident())
             return project
 
-        def memory_format(self, _project_id: str) -> int:
-            return 1
-
-        def load_memory(self, _project_id: str) -> list[object]:
-            return []
+        def read(self, _project_id: str) -> object:
+            return SimpleNamespace(mirror_files=lambda: {})
 
     async def persist(*_args: object) -> None:
         return None
