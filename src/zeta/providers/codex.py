@@ -41,7 +41,7 @@ from .completion import (
     is_completion_sentinel,
     report_provider_record,
 )
-from .codex_arguments import _parse_complete_object, _parse_partial_object
+from .codex_arguments import _parse_complete_object
 from .must_complete_close import task_is_cancelling
 from .codex_payload import (
     _cache_affinity_json,
@@ -104,7 +104,6 @@ class _BlockState:
     kind: str
     state: str = "active"
     text: str = ""
-    arguments: str = ""
     text_done: bool = False
 
 
@@ -725,12 +724,10 @@ def _translate_delta(
         delta = payload.get("delta")
         if type(delta) is not str:
             raise CodexStreamError("Codex tool delta is invalid")
-        block.arguments += delta
         item.arguments += delta
-        arguments = _parse_partial_object(block.arguments)
         return StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
-            tool_call=ToolCall(item.call_id, item.name, arguments),
+            tool_call=ToolCall(item.call_id, item.name, {}),
             data={"tool_call_delta": delta, "index": index},
         )
     if event_type in {
@@ -882,11 +879,10 @@ def _finish_block(
             _rebuild_item_text(item, blocks)
         complete_args = payload.get("arguments")
         if type(complete_args) is str and block.kind == "tool_call":
-            if block.arguments and complete_args != block.arguments:
+            if item.arguments and complete_args != item.arguments:
                 raise _stream_inconsistent(
                     "Codex completed arguments do not match deltas"
                 )
-            block.arguments = complete_args
             item.arguments = complete_args
     if event_type == "response.reasoning_summary_text.done":
         if block.text_done:

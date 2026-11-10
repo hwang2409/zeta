@@ -68,13 +68,6 @@ def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
     )
     return receipt_tool_result(ToolCall.from_dict(marker["tool_call"]).id, result)
 
-def _existing_tool_result(store: ConversationStore, tool_call_id: str) -> bool:
-    return any(
-        message.tool_result is not None
-        and message.tool_result.tool_call_id == tool_call_id
-        for message in store.messages()
-    )
-
 @dataclass(frozen=True)
 class _BackgroundTerminal:
     status: str
@@ -209,7 +202,7 @@ def _recover_nested_children(
                     notification_store,
                     recovery_stores,
                 )
-            existing_result = _existing_tool_result(store, tool_call.id)
+            existing_result = store.tool_result(tool_call.id) is not None
             notification_status: str | None = None
             notification_text: str | None = None
             notification_stats: dict[str, object] | None = None

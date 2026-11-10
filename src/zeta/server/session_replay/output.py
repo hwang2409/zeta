@@ -232,9 +232,15 @@ class ReplayOutput:
         if self.replay.is_pending(connection):
             return False
         frontier = self.replay.frontier(connection)
-        if frontier is None or frontier.row_id is None:
+        if frontier is None:
             return False
-        if store.row_id_at(frontier.seq) != frontier.row_id:
+        if frontier.seq == 0:
+            self.replay.refresh_reset_generation(connection, current)
+            return True
+        if (
+            frontier.row_id is None
+            or store.row_id_at(frontier.seq) != frontier.row_id
+        ):
             return False
         self.replay.refresh_reset_generation(connection, current)
         return True

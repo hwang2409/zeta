@@ -44,6 +44,7 @@ class ReplayClient:
     writer: asyncio.StreamWriter
     websocket: bool
     buffered: deque[dict[str, Any]] = field(default_factory=deque)
+    wire_received: list[dict[str, Any]] = field(default_factory=list)
 
     async def send(self, request_id: int, method: str, params: dict[str, object]) -> None:
         value = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
@@ -65,12 +66,10 @@ class ReplayClient:
         self,
         *,
         what: str = "replay frame",
-        received: list[dict[str, Any]] | None = None,
         diagnostic: Callable[[], str] | None = None,
     ) -> dict[str, Any] | None:
-        received = list(self.buffered) if received is None else received
         describe = lambda: (
-            f"{what}; received={received!r}"
+            f"{what}; received={self.wire_received!r}"
             + (f"; {diagnostic()}" if diagnostic is not None else "")
         )
         # a write to a connection the server closed surfaces on the next read
@@ -83,7 +82,11 @@ class ReplayClient:
                     self.reader.readline(),
                     what=describe,
                 )
-                return json.loads(line) if line else None
+                if not line:
+                    return None
+                frame = json.loads(line)
+                self.wire_received.append(frame)
+                return frame
             first, second = await await_or_fail(
                 self.reader.readexactly(2),
                 what=describe,
@@ -98,7 +101,9 @@ class ReplayClient:
             size = int.from_bytes(await self.reader.readexactly(2), "big")
         elif size == 127:
             size = int.from_bytes(await self.reader.readexactly(8), "big")
-        return json.loads(await self.reader.readexactly(size))
+        frame = json.loads(await self.reader.readexactly(size))
+        self.wire_received.append(frame)
+        return frame
 
     async def closed(self, request_id: int) -> list[dict[str, Any]]:
         """Send status; return the frames before the server closed, failing if it answers."""
@@ -113,17 +118,13 @@ class ReplayClient:
 
     async def response(self, request_id: int) -> dict[str, Any]:
         skipped: list[dict[str, Any]] = []
-        received = list(self.buffered)
         try:
             while True:
-                frame = await self._read_or_eof(
-                    what=f"response id {request_id}", received=received
-                )
+                frame = await self._read_or_eof(what=f"response id {request_id}")
                 assert frame is not None, "server closed replay connection"
                 if frame.get("id") == request_id:
                     return frame
                 skipped.append(frame)
-                received.append(frame)
         finally:
             self.buffered.extend(skipped)
 
@@ -150,17 +151,14 @@ class ReplayClient:
                 del self.buffered[index]
                 return frame["params"]
         skipped: list[dict[str, Any]] = []
-        received = list(self.buffered)
         try:
             while not matches(
                 frame := await self._read_or_eof(
                     what=f"event {name or '<any>'}",
-                    received=received,
                     diagnostic=diagnostic,
                 )
             ):
                 skipped.append(frame)
-                received.append(frame)
             return frame["params"]
         finally:
             self.buffered.extend(skipped)

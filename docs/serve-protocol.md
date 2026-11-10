@@ -1341,7 +1341,10 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    outcome of the whole served turn. Its `data.turn_id` matches every negotiated
    provider-segment `turn_start` in that served turn. It occurs at most once per
    served turn and has one closed `data.reason`: `completed`, `user_stop`,
-   `error`, or `disconnect`. Clients must wait for `agent_end` before idle-only
+   `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
+   and `status.state` is `idle` until the next `turn_start`; a queued
+   notification turn is not busy until its `turn_start` is published, so a send
+   that arrives first wins. Clients must wait for `agent_end` before idle-only
    requests such as `new_session`; the server commits `served_turn_end` before
    cleanup. Error
    and abort paths still end with `error` or `turn_aborted`.
