@@ -196,6 +196,8 @@ _LIVE_KINDS = (
     EventDescriptor.USAGE,
     EventDescriptor.SESSION_GRANTS_CHANGED,
     EventDescriptor.CONFIG_CHANGED,
+    EventDescriptor.BACKGROUND_TASK_UPDATED,
+    EventDescriptor.TODO_UPDATED,
 )
 
 ROUTES: dict[tuple[EventDescriptor, str], Source] = {
