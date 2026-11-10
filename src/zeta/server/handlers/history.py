@@ -317,11 +317,21 @@ def _projected_backward_history_request(
     )
     before = params["before"]
     end = len(projection.entry_groups) - 1
+    repair_generation = getattr(store, "_repair_generation", None)
     if before is None:
-        validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
+        validator = {
+            "end": end,
+            "entry_id": _history_endpoint(projection, end),
+            "repair_generation": repair_generation,
+        }
         cursor, first_page = end + 1, True
     else:
         validator = params["history_validator"]
+        if validator.get("repair_generation", object()) != repair_generation:
+            raise ProtocolError(
+                ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+                "session history changed; restart from the newest page",
+            )
         cursor, first_page = before, False
     result, expanded = page_history(
         projection,
@@ -390,9 +400,14 @@ def _backward_history_request(
             content_read=content_read,
             served_turn_end=served_turn_end,
         )
+    page_validator = {
+        "end": page.total,
+        "entry_id": page.endpoint,
+        "repair_generation": page.repair_generation,
+    }
     if before is None:
-        validator = {"end": page.total, "entry_id": page.endpoint}
-    elif validator != {"end": page.total, "entry_id": page.endpoint}:
+        validator = page_validator
+    elif validator != page_validator:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
             "session history changed; restart from the newest page",
@@ -486,12 +501,17 @@ def _validate_history_params(params: dict) -> None:
         )
     if before is not None and (
         not isinstance(validator, dict)
-        or set(validator) != {"end", "entry_id"}
+        or set(validator) not in ({"end", "entry_id"}, {"end", "entry_id", "repair_generation"})
         or type(validator.get("end")) is not int
         or validator.get("end") < 0
         or (
             validator.get("entry_id") is not None
             and not isinstance(validator.get("entry_id"), str)
+        )
+        or (
+            "repair_generation" in validator
+            and validator.get("repair_generation") is not None
+            and not isinstance(validator.get("repair_generation"), str)
         )
     ):
         raise ProtocolError(

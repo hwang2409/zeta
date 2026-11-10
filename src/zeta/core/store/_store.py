@@ -69,6 +69,7 @@ from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
     RepairTarget,
+    recovery_status,
     repair_target_for_session_dir,
 )
 from ._approval_display import ApprovalAuditRequest, normalize_approval_requests
@@ -181,6 +182,7 @@ class ConversationStore(
                 self.session_dir, self.session_id
             )
             self._last_repair_result: RepairResult | None = None
+            self._repair_generation: str | None = None
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
@@ -238,6 +240,7 @@ class ConversationStore(
                 if _read_only:
                     self._load()
                     self._load_session_state()
+                    self._refresh_repair_generation()
                     self._initialize_history_index(observer=True)
                 else:
                     self._runtime_lease = self._open_execution_lease(
@@ -253,6 +256,7 @@ class ConversationStore(
                         self._strict_snapshot_sync = True
                     with self._append_lock(deadline=_lock_deadline):
                         self._load_session_state()
+                        self._refresh_repair_generation()
                         self._initialize_history_index(observer=False)
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
@@ -266,6 +270,10 @@ class ConversationStore(
             storage_ownership.pop_all()
         if not _read_only and not _mutation_target:
             register_conversation_target(self)
+
+    def _refresh_repair_generation(self) -> None:
+        record = recovery_status(self.directory_fd, self._repair_target).latest_committed
+        self._repair_generation = record.quarantine_id if record is not None else None
 
     def _initialize_history_index(self, *, observer: bool) -> None:
         if self._history_index is None:
@@ -299,6 +307,7 @@ class ConversationStore(
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
             "prefix_digest": self._entry_prefix_digest.hex(),
+            "repair_generation": self._repair_generation,
         }
 
     def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:

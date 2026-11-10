@@ -59,6 +59,7 @@ class IndexedHistoryPage:
     total: int
     approval_calls: Mapping[str, object]
     endpoint: str | None
+    repair_generation: str | None
 
 
 class HistoryIndex:
@@ -159,7 +160,7 @@ class HistoryIndex:
             key: getattr(value, key)
             for key in (
                 "st_dev", "st_ino", "byte_boundary", "last_seq", "last_id",
-                "last_parent", "prefix_digest", "reset_generation",
+                "last_parent", "prefix_digest", "reset_generation", "repair_generation",
             )
             if hasattr(value, key)
         }
@@ -282,7 +283,8 @@ class HistoryIndex:
         rows: Sequence[object],
     ) -> int | None:
         if stored.get("schema_version") != self.SCHEMA_VERSION or any(
-            stored.get(key) != expected.get(key) for key in ("st_dev", "st_ino")
+            stored.get(key) != expected.get(key)
+            for key in ("st_dev", "st_ino", "repair_generation")
         ):
             return None
         stored_boundary = stored.get("byte_boundary")
@@ -535,6 +537,7 @@ class HistoryIndex:
         connection: sqlite3.Connection,
         request: Mapping[str, object],
         total: int,
+        stored_generation: object,
     ) -> IndexedHistoryPage:
         start, stop = self._page_bounds(request, total)
         groups, request_ids = self._read_groups(connection, start, stop)
@@ -549,6 +552,7 @@ class HistoryIndex:
             total,
             self._approval_calls(connection, request_ids),
             endpoint_row[0] if endpoint_row else None,
+            stored_generation if isinstance(stored_generation, str) else None,
         )
 
     def page(self, request: object, g0: object) -> IndexedHistoryPage:
@@ -572,7 +576,9 @@ class HistoryIndex:
                 total = int(page_request.get("end", current_total))
                 if total < 0 or total > current_total:
                     raise StaleHistorySnapshot
-                return self._query_page(connection, page_request, total)
+                return self._query_page(
+                    connection, page_request, total, stored.get("repair_generation")
+                )
             except HistoryIndexError:
                 raise
             except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:

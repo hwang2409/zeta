@@ -237,6 +237,40 @@ async def test_real_socket_backward_continuation_survives_append(tmp_path: Path,
         )
         assert "new" not in {row["content"][0]["text"] for row in page["messages"] if row["role"] == "user"}
 
+        transcript = server.runtime.opened.store.path
+        await request(reader, writer, 5, "new_session", {"provider": "codex"})
+        with transcript.open("ab") as stream:
+            stream.write(b'{"seq":"invalid"}\n')
+        diagnosis = (await request(
+            reader, writer, 7, "resume", {"session_id": session_id}
+        ))[-1]
+        assert diagnosis["error"]["data"]["code"] == "corrupt_transcript"
+        repaired = (await request(
+            reader,
+            writer,
+            8,
+            "repair_transcript",
+            {"session_id": session_id, "confirm": True},
+        ))[-1]
+        assert "error" not in repaired, repaired
+        resumed = (await request(
+            reader, writer, 9, "resume", {"session_id": session_id}
+        ))[-1]
+        assert "error" not in resumed, resumed
+        response = (await request(
+            reader,
+            writer,
+            10,
+            "session_history",
+            {
+                "session_id": session_id,
+                "before": first["next_before"],
+                "history_validator": first["history_validator"],
+            },
+        ))[-1]
+        assert response["error"]["code"] == -32009
+        assert response["error"]["data"] == {"code": "stale_history_snapshot"}
+
 
 @pytest.mark.asyncio
 async def test_real_socket_branch_during_read_is_stale_and_not_cached(
