@@ -153,7 +153,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     @property
     def observed_storage_epoch(self) -> int:
-        """Return the home epoch held by this manager's writer lease."""
         return self._storage_lease.observed_epoch
 
     def create(
@@ -279,15 +278,11 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         with execution_authority, publication as authority:
                             assert authority is not None
                             return self._publish_created_session(
-                                root_fd=root_fd,
-                                staged=staged,
-                                metadata=metadata,
+                                root_fd=root_fd, staged=staged, metadata=metadata,
                                 session_id=session_id,
                                 parent_session_id=parent_session_id,
-                                project_id=project_id,
-                                project_role=project_role,
-                                execution_lease=execution_lease,
-                                authority=authority,
+                                project_id=project_id, project_role=project_role,
+                                execution_lease=execution_lease, authority=authority,
                                 before_reference_publication=_before_reference_publication,
                             )
                     except BaseException:
@@ -301,13 +296,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     def _publish_created_session(
         self,
         *,
-        root_fd: int,
-        staged: SessionManager,
-        metadata: SessionMetadata,
-        session_id: str,
-        parent_session_id: str | None,
-        project_id: str | None,
-        project_role: str | None,
+        root_fd: int, staged: SessionManager, metadata: SessionMetadata,
+        session_id: str, parent_session_id: str | None,
+        project_id: str | None, project_role: str | None,
         execution_lease: SessionExecutionLease,
         authority: SessionReferenceAuthority,
         before_reference_publication: Callable[[OpenedSession], None] | None,
@@ -1105,8 +1096,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return metadata
 
     def session_owner_status(self, session_id: str) -> tuple[bool, int | None]:
-        """Return the live diagnostic owner without taking its execution lock."""
-
         with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
             return session_owner_status(directory_fd)
 
