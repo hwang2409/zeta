@@ -15,8 +15,9 @@ MAX_FILE_LINES = 1277
 # Bumped on 2026-09-10 for the ZETA-103 fd-anchored session-file safety seam,
 # on 2026-10-09 for the stdlib-only migration-plan seam shipped over SSH, and
 # on 2026-11-03 for the explicit child-lifecycle seam, and on 2026-11-06 for
-# the stored-format gate shared by every persistent writer.
-MAX_FILES_PER_DIRECTORY = 22
+# the stored-format gate shared by every persistent writer, and on 2026-11-09
+# for the child-history observer store seam.
+MAX_FILES_PER_DIRECTORY = 23
 
 
 def test_module_limits() -> None:

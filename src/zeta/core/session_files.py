@@ -103,6 +103,15 @@ def _component(name: str) -> None:
 
 
 @contextmanager
+def descend_directory(parent_fd: int, components: tuple[str, ...]):
+    with ExitStack() as cleanup:
+        directory_fd = parent_fd
+        for component in components:
+            directory_fd = cleanup.enter_context(child_directory(directory_fd, component))
+        yield directory_fd
+
+
+@contextmanager
 def child_directory(parent_fd: int, name: str, *, create: bool = False):
     """Pin a child without following symbolic links, including during creation."""
     _component(name)
