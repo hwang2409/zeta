@@ -292,15 +292,15 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             ) as destination_fd, session_directory(
                                 staged.sessions_dir, session_id
                             ) as (_, source_fd):
-                                names = [
-                                    filename
-                                    for filename in os.listdir(source_fd)
-                                    if filename != RUNTIME_LEASE_NAME
-                                ]
-                                # Publish metadata last so discovery skips incomplete sessions.
-                                for filename in sorted(
-                                    names, key=lambda item: item == "meta.json"
-                                ):
+                                names = sorted(
+                                    (
+                                        filename
+                                        for filename in os.listdir(source_fd)
+                                        if filename != RUNTIME_LEASE_NAME
+                                    ),
+                                    key=lambda item: item == "meta.json",
+                                )
+                                for filename in names:
                                     os.replace(
                                         filename,
                                         filename,
