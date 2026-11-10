@@ -672,8 +672,3 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
             store.close()
         await second.close()
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
