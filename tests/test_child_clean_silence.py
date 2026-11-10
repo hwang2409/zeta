@@ -326,7 +326,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                     child_backend.notification_ready.wait(),
                     what="thinking-only notification response",
                 )
-            if ending in {"thinking_only", "non_explicit"}:
+            if ending == "non_explicit":
                 await await_or_fail(
                     registry.background_tasks.input(
                         running[1].task_id, "done\n", eof=True
