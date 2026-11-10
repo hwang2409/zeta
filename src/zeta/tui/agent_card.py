@@ -809,6 +809,8 @@ class AgentNavigation:
         self._main_transcript: Any = None
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
+        self._external_view_container: Any = None
+        self._external_view_transcript: Any = None
         self._todo_control = AgentTodoControl(cwd=self.store.cwd)
         self._metadata_cache: dict[Path, tuple[tuple[int, ...], dict[str, Any]]] = {}
         self._refresh_signature: tuple[object, ...] | None = None
@@ -922,12 +924,34 @@ class AgentNavigation:
                 self._main_transcript_index = index
                 return
 
+    @property
+    def viewed_transcript(self) -> Any:
+        if self._external_view_transcript is not None:
+            return self._external_view_transcript
+        if self.child_view_active:
+            return self.transcript_control.transcript
+        return self._main_transcript
+
+    def show_external_view(self, container: Any, transcript: Any) -> None:
+        self._external_view_container = container
+        self._external_view_transcript = transcript
+        self._switch_transcript()
+
+    def clear_external_view(self) -> None:
+        self._external_view_container = None
+        self._external_view_transcript = None
+        self._switch_transcript()
+
     def _switch_transcript(self) -> None:
         if on_view_change := getattr(self, "_on_view_change", None):
             on_view_change()
         if self._transcript_layout is None:
             return
-        replacement = self.view_container if self.child_view_active else self._main_transcript
+        replacement = (
+            self._external_view_container
+            if self._external_view_container is not None
+            else self.view_container if self.child_view_active else self._main_transcript
+        )
         if self._main_transcript_parent is not None and self._main_transcript_index is not None:
             self._main_transcript_parent.children[self._main_transcript_index] = replacement
         else:

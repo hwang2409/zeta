@@ -6,16 +6,10 @@ import contextlib
 import queue
 import shlex
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 MAX_QUEUE = 256
-REMOTE_COMMAND = 'if command -v zeta >/dev/null 2>&1; then zeta; elif [ -x "$HOME/.local/bin/zeta" ]; then exec "$HOME/.local/bin/zeta"; else exit 127; fi'
-
-
-def shell_command(*args: str) -> str:
-    if any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in args):
-        raise ValueError("remote arguments must be nonempty strings without NUL")
-    return "exec " + " ".join(shlex.quote(arg) for arg in args)
 
 
 def remote_bridge_command(mode: str, session_id: str | None = None) -> str:
@@ -23,7 +17,7 @@ def remote_bridge_command(mode: str, session_id: str | None = None) -> str:
         raise ValueError("invalid bridge mode")
     args = ["__remote_bridge", mode]
     if session_id is not None:
-        if session_id != session_id.strip() or any(c in session_id for c in ":/;'\"\\n\\x00"):
+        if session_id != session_id.strip() or any(c in session_id for c in ":/;'\"\\n\x00"):
             raise ValueError("invalid session id")
         args.append(session_id)
     bridge_args = " ".join(shlex.quote(arg) for arg in args)
@@ -39,10 +33,11 @@ class TransportItem:
 
 
 class RemoteTransport:
-    """Run ssh and bridge IO in a private thread and loop."""
+    """run ssh and bridge io in a private thread and loop."""
 
-    def __init__(self, host: str, *, ssh: str = "ssh", max_queue: int = MAX_QUEUE) -> None:
-        if not host or any(c.isspace() for c in host) or any(c in host for c in "/'\";\n\x00"):
+    def __init__(self, host: str, *, ssh: str = "ssh", max_queue: int = MAX_QUEUE,
+                 callback: Callable[[TransportItem], None] | None = None) -> None:
+        if not host or any(c.isspace() or c in "/'\";\n\x00" for c in host):
             raise ValueError("invalid remote host")
         self.host, self.ssh = host, ssh
         self.items: queue.Queue[TransportItem] = queue.Queue(maxsize=max_queue)
@@ -50,6 +45,7 @@ class RemoteTransport:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._process: asyncio.subprocess.Process | None = None
+        self._callback = callback
 
     def start(self, command: str) -> None:
         if self._thread is not None:
@@ -73,19 +69,32 @@ class RemoteTransport:
         if self._thread is not None:
             self._thread.join(timeout=5)
 
-    def _publish(self, item: TransportItem) -> None:
+    async def close_async(self) -> None:
+        self._stop.set()
         with contextlib.suppress(queue.Full):
-            self.items.put_nowait(item)
+            self._input.put_nowait(None)
+        if self._thread is not None:
+            await asyncio.to_thread(self._thread.join, 5)
+
+    def _publish(self, item: TransportItem) -> None:
+        if self._callback is not None:
+            self._callback(item)
+        else:
+            with contextlib.suppress(queue.Full):
+                self.items.put_nowait(item)
 
     def _run(self, command: str) -> None:
         asyncio.run(self._main(command))
 
     async def _main(self, command: str) -> None:
-        process = await asyncio.create_subprocess_exec(
-            self.ssh, self.host, command,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self.ssh, self.host, command, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            self._publish(TransportItem("exit", str(exc).encode()))
+            return
         self._process = process
 
         async def read(name: str, stream: asyncio.StreamReader) -> None:
@@ -104,7 +113,9 @@ class RemoteTransport:
                     process.stdin.write(data)
                     await process.stdin.drain()
 
-        readers = [asyncio.create_task(read("stdout", process.stdout)), asyncio.create_task(read("stderr", process.stderr)), asyncio.create_task(write())]
+        readers = [asyncio.create_task(read("stdout", process.stdout)),
+                   asyncio.create_task(read("stderr", process.stderr)),
+                   asyncio.create_task(write())]
         waiter = asyncio.create_task(process.wait())
         await asyncio.wait({waiter, *readers}, return_when=asyncio.FIRST_COMPLETED)
         if self._stop.is_set() and process.returncode is None:

@@ -806,11 +806,17 @@ class SubmissionMixin:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> None:
+        if self._remote_view is not None and not value.strip().startswith(("/detach", "/remote")):
+            self._print_system("remote view is read only; use /detach first")
+            return
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
         self._dismiss_model_picker()
         text, steer, passthrough = parse_submission(value)
         if passthrough is not None:
+            if self._remote_view is not None:
+                self._print_system("remote view is read only; use /detach first")
+                return
             self._draft.mark_submitted()
             task = asyncio.create_task(self._run_shell_passthrough(passthrough))
             self._active_task = task
@@ -818,7 +824,7 @@ class SubmissionMixin:
             return
         if text is None:
             return
-        if getattr(self, "_remote_view", None) is not None:
+        if self._remote_view is not None:
             self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()
@@ -844,12 +850,15 @@ class SubmissionMixin:
             return
         text, steer, passthrough = parse_submission(value)
         if passthrough is not None:
+            if self._remote_view is not None:
+                self._print_system("remote view is read only; use /detach first")
+                return
             self._draft.mark_submitted()
             await self._run_shell_passthrough(passthrough)
             return
         if text is None:
             return
-        if getattr(self, "_remote_view", None) is not None:
+        if self._remote_view is not None:
             self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()

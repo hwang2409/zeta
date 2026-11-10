@@ -331,6 +331,12 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._remote_view = None
+        self._remote_session_client = None
+        self._remote_event_task = None
+        self._remote_picker = None
+        self._remote_picker_unit = None
+        self._remote_saved_composer = None
         self._history_finder = HistoryFinder(
             lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
@@ -436,6 +442,9 @@ class TUIApp(
             self._model_catalog_loaded = True
             self._model_catalog_task = None
             self.refresh_model_picker()
+
+    def _composer_placeholder(self) -> str:
+        return "view only · /detach to return" if self._remote_view is not None else "type a message..."
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
@@ -629,9 +638,7 @@ class TUIApp(
         return self.loop.store.session_dir
 
     def _viewed_transcript(self) -> TranscriptWidget:
-        if self._agent_navigation.child_view_active:
-            return self._agent_navigation.transcript_control.transcript
-        return self._transcript
+        return self._agent_navigation.viewed_transcript
 
     def _viewed_session_changed(self) -> None:
         self._prompt_history.reset_navigation()
@@ -1064,7 +1071,7 @@ class TUIApp(
             value = await session.prompt_async(
                 [("class:prompt", " › ")],
                 bottom_toolbar=lambda: app._status_toolbar(),
-                placeholder=[("class:placeholder", "type a message...")],
+                placeholder=lambda: [("class:placeholder", self._composer_placeholder())],
                 pre_run=insert_pending_tokens,
             )
         except EOFError:
