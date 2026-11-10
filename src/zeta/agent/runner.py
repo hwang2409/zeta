@@ -1080,7 +1080,7 @@ async def run_agent_tool(
         return CancellationRequest(confirmation, cleanup)
 
     async def cancel_child() -> None:
-        await asyncio.shield(request_child_cancel().cleanup)
+        await request_child_cancel().cleanup
 
     if background:
         # Notification text has a stricter durable contract than the foreground
