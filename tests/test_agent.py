@@ -4874,7 +4874,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
     model_turn = asyncio.create_task(
         state.run_model_turn(
             child_loop,
-            OllamaBackend(stall_seconds=0).complete(
+            OllamaBackend().complete(
                 [], [], control=completion_control()
             ),
             consume_stream,

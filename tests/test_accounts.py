@@ -2306,12 +2306,12 @@ def test_every_backend_path_uses_session_resolver(
     primary, _ = build_backend("claude", None, home=home, account=selected["anthropic"])
     captured: list[tuple[AccountId | None, Path | None]] = []
 
-    async def capture(_query, _signal, *, account=None, home=None):
+    async def capture(_query, _signal, *, account=None, home=None, web_clients=None):
         captured.append((account, home))
         return websearch_codex.CodexSearchResult("answer", [])
 
     monkeypatch.setattr(websearch.codex, "search", capture)
-    registry = SimpleNamespace(account_context=resolver)
+    registry = SimpleNamespace(account_context=resolver, web_clients=object())
     asyncio.run(
         websearch._websearch(
             registry,
@@ -2472,7 +2472,7 @@ async def test_live_child_websearch_ignores_later_parent_switch(
     parent.tool_registry.account_context = resolver
     captured: list[AccountId | None] = []
 
-    async def capture(_query, _signal, *, account=None, home=None):
+    async def capture(_query, _signal, *, account=None, home=None, web_clients=None):
         captured.append(account)
         return websearch_codex.CodexSearchResult("answer", [])
 
