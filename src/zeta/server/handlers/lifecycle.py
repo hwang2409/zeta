@@ -27,6 +27,7 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
+            self.server.connections.replay_session_replaced()
             cwd = None
             if "cwd" in params:
                 validation.require_feature(self, "session_cwd", "cwd")
@@ -61,6 +62,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
+            self.server.connections.replay_session_replaced()
             session_id = validation.required_string(params, "session_id")
             try:
                 session_id = await asyncio.to_thread(

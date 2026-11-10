@@ -53,6 +53,7 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
+from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -75,6 +76,8 @@ class NotificationPresentation:
         notification: Mapping[str, object],
         protocol_version: str,
         send: NotificationSender,
+        *,
+        row_seq: int | None = None,
     ) -> None:
         notification_id = notification.get("notification_id")
         key = (
@@ -94,6 +97,7 @@ class NotificationPresentation:
                 event_name,
                 session_id,
                 data=event_contract.notification_payload(notification),
+                replay_row=RowFacts(seq=row_seq),
             )
         except FrameWriteCancelled as cancelled:
             if not cancelled.written and key is not None:
@@ -168,6 +172,10 @@ class ServeControl:
                 allow_assistant_reset=allow_assistant_reset,
             )
         )
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is not None and session_id is not None:
+            connections.close_deferred_replay_when_done(session_id, self._turn_task)
 
     def unhealthy(self) -> bool:
         return self._approvals.state.health is not None
@@ -399,26 +407,41 @@ class ServeControl:
         features: frozenset[str],
         attachments: list[dict[str, object]] | None = None,
         delivery_id: str | None = None,
+        origin: MessageOrigin = MessageOrigin.USER,
     ) -> None:
-        """Echo an accepted user message so observers can rebuild the transcript."""
-        if "user_message_event" in features:
-            fields: dict[str, object] = {
-                "text": bounded(text, USER_MESSAGE_MAX_BYTES),
-                "mode": mode,
-                "attachments": attachments or [],
-            }
-            if (
-                delivery_id is not None
-                and {"delivery_id", "user_message_delivery_id"} <= features
-            ):
-                fields["delivery_id"] = delivery_id
-            await self._notify(
-                event_contract.AUXILIARY_WIRE_EVENTS[
-                    event_contract.AuxiliaryEvent.USER_MESSAGE
-                ],
-                self.server.runtime.session_id,
-                **fields,
-            )
+        """Echo an accepted user message so observers can rebuild the transcript.
+
+        Without a delivery id the row installs later in the turn, so ``origin``
+        (what the caller passes to ``start_turn``) and the mark find it.
+        """
+        fields: dict[str, object] = {
+            "text": bounded(text, USER_MESSAGE_MAX_BYTES),
+            "mode": mode,
+            "attachments": attachments or [],
+        }
+        if delivery_id is not None:
+            fields["delivery_id"] = delivery_id
+        await self._notify(
+            event_contract.AUXILIARY_WIRE_EVENTS[
+                event_contract.AuxiliaryEvent.USER_MESSAGE
+            ],
+            self.server.runtime.session_id,
+            replay_row=RowFacts(delivery_id=delivery_id)
+            if delivery_id is not None
+            else RowFacts(seq=self._row_mark(), origin=origin),
+            **fields,
+        )
+
+    def _row_mark(self) -> int | None:
+        """The newest resident row seq; a publish-first row installs after it."""
+        opened = self.server.runtime.opened
+        return None if opened is None else opened.store.active_branch_head_sequence()
+
+    def _close_deferred_replay(self, session_id: str | None) -> None:
+        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        connections = self.server.connections
+        if connections is not None and session_id is not None:
+            connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
         if self.closing:
@@ -610,6 +633,7 @@ class ServeControl:
                 terminal_events.clear()
                 terminal_error = None
                 agent_end = None
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -716,6 +740,7 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -783,6 +808,7 @@ class ServeControl:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -797,12 +823,7 @@ class ServeControl:
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None
     ) -> None:
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections is not None
-            else None
-        )
-        if controller is None or "live_config_changed" not in controller.features:
+        if self.server.connections is None:
             return
         self._end_stale_approvals(session_id)
         await self._notify(
@@ -871,7 +892,10 @@ class ServeControl:
                 )
             if event.message is not None:
                 await self._notify(
-                    wire_event, session_id, **event_contract.assistant_message(event)
+                    wire_event,
+                    session_id,
+                    replay_row=RowFacts(seq=self._row_mark()),
+                    **event_contract.assistant_message(event),
                 )
             return
         connections = getattr(self.server, "connections", None)
@@ -916,7 +940,9 @@ class ServeControl:
             ):
                 await self._notify(wire_event, session_id, _admitted=True, **fields)
                 return
-            await self._notify(wire_event, session_id, **fields)
+            await self._notify(
+                wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
+            )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -930,7 +956,11 @@ class ServeControl:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
-                session_id, event.data, self._protocol_version(), self._notify
+                session_id,
+                event.data,
+                self._protocol_version(),
+                self._notify,
+                row_seq=event.row_seq,
             )
             return
         if kind is StreamEventType.ERROR:
@@ -993,16 +1023,7 @@ class ServeControl:
 
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections
-            else None
-        )
-        if (
-            not self.closing
-            and controller is not None
-            and "memory_updated" in controller.features
-        ):
+        if not self.closing and self.server.connections is not None:
             asyncio.create_task(
                 self._notify(
                     event_contract.AUXILIARY_WIRE_EVENTS[
