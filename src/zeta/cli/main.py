@@ -292,6 +292,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     commands = parser.add_subparsers(dest="command")
+    bridge_parser = commands.add_parser("__remote_bridge", help=argparse.SUPPRESS)
+    bridge_parser.add_argument("bridge_action", choices=("list", "attach"))
+    bridge_parser.add_argument("descriptor", nargs="?")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
     login_parser.add_argument(
         "provider",
@@ -1047,6 +1050,14 @@ def _main(argv: list[str] | None = None) -> int:
     entrypoint = sys.argv[0]
     parser = build_parser()
     args = parser.parse_args(original_argv)
+    if args.command == "__remote_bridge":
+        from ..remote.bridge import run as run_remote_bridge
+
+        return run_remote_bridge(
+            env_home(),
+            session_id=args.descriptor, 
+            list_mode=args.bridge_action == "list",
+        )
     if args.command == "login":
         return _handle_login(args)
     if args.command == "accounts":
