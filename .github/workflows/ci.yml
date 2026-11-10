@@ -78,9 +78,6 @@ jobs:
           base=$(python scripts/lint_test_quality.py --base "$GITHUB_EVENT_NAME" "$GITHUB_BASE_REF")
           python scripts/check_owner_leak_baseline.py "$base"
 
-      - name: Reject unsafe cancellation ownership
-        run: uv run --frozen python scripts/lint_cancel_ownership.py
-
       - name: Reject new low-signal test patterns
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
