@@ -700,16 +700,17 @@ class ServeControl:
             if event.type in {StreamEventType.TURN_END, StreamEventType.ERROR}:
                 terminal_events.append(event)
             else:
+                if event.type is StreamEventType.TURN_START:
+                    # Set busy before the awaited write so send cannot win after turn_start is visible.
+                    self._notification_turn_started = True
+                    started = True
+                    state.turn_started()
                 await self._event(
                     event,
                     session_id=session_id,
                     background=background,
                     turn_id=turn_id,
                 )
-                if event.type is StreamEventType.TURN_START:
-                    self._notification_turn_started = True
-                    started = True
-                    state.turn_started()
 
         try:
             success, agent_end = await self.server.turn_contexts.run_notification_turn(

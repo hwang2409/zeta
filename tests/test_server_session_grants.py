@@ -1862,8 +1862,18 @@ async def test_turn_end_send_ready_orders(
         )
         assert status == 101
 
+    turn_starts = 0
+    turn_ends = 0
+
     async def receive() -> dict[str, Any]:
-        return await (_read(reader) if transport == "unix" else _read_json(reader))
+        nonlocal turn_starts, turn_ends
+        frame = await (_read(reader) if transport == "unix" else _read_json(reader))
+        event_name = frame.get("params", {}).get("event")
+        if event_name == "turn_start":
+            turn_starts += 1
+        elif event_name == "turn_end":
+            turn_ends += 1
+        return frame
 
     async def send_request(
         request_id: int, method: str, params: dict[str, object]
@@ -1894,11 +1904,39 @@ async def test_turn_end_send_ready_orders(
     turn_end_published = asyncio.Event()
     notification_start_ready = asyncio.Event()
     release_notification_start = asyncio.Event()
+    notification_run_started = asyncio.Event()
+    release_notification_run = asyncio.Event()
     original_event = server.control._event
+    original_run_notification_turn = server.turn_contexts.run_notification_turn
+
+    async def gated_notification_turn(*args: object, **kwargs: object) -> object:
+        if order == "send_first":
+            notification_run_started.set()
+            await await_or_fail(
+                release_notification_run.wait(), what="notification turn scheduling"
+            )
+        return await original_run_notification_turn(*args, **kwargs)
+
+    async def gated_write(payload: bytes) -> bool:
+        frame = json.loads(payload)
+        is_notification_start = (
+            frame.get("params", {}).get("event") == "turn_start"
+            and order == "notification_first"
+            and turn_end_published.is_set()
+        )
+        result = await original_write(payload)
+        if is_notification_start:
+            notification_start_ready.set()
+            await await_or_fail(
+                release_notification_start.wait(), what="notification start write"
+            )
+        return result
 
     async def gated_event(event: object, *args: object, **kwargs: object) -> None:
         if (
             getattr(event, "type", None) is StreamEventType.TURN_START
+            and kwargs.get("background") is True
+            and order == "send_first"
             and turn_end_published.is_set()
             and not notification_start_ready.is_set()
         ):
@@ -1916,8 +1954,17 @@ async def test_turn_end_send_ready_orders(
 
     # test-contract: seam gate the real notification wake before turn_start publication
     monkeypatch.setattr(server.control, "_event", gated_event)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )
     try:
         await request(1, "hello", {"protocol_version": "1.2"})
+        controller = server.connections.controller_metadata()
+        assert controller is not None
+        connection = controller.connection
+        original_write = connection._write_physical
+        # test-contract: seam the real controller transport write
+        monkeypatch.setattr(connection, "_write_physical", gated_write)
         session = (await request(2, "new_session", {"provider": "codex"}))[-1][
             "result"
         ]["session"]
@@ -1943,9 +1990,8 @@ async def test_turn_end_send_ready_orders(
             owner_task = server.control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
-            await await_or_fail(owner_task, what="turn owner return")
             await await_or_fail(
-                notification_start_ready.wait(), what="notification scheduling"
+                notification_run_started.wait(), what="notification turn scheduling"
             )
             await send_request(4, "status", {})
             await send_request(5, "send", {"text": "send first"})
@@ -1956,23 +2002,29 @@ async def test_turn_end_send_ready_orders(
                     responses[frame["id"]] = frame
             assert responses[4]["result"]["state"] == "idle"
             assert responses[5]["result"]["accepted"] is True
-            release_notification_start.set()
+            release_notification_run.set()
+            await await_or_fail(owner_task, what="turn owner return")
         else:
             status_frames = await request(4, "status", {})
             assert status_frames[-1]["result"]["state"] == "idle"
             owner_task = server.control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
-            await await_or_fail(owner_task, what="turn owner return")
             await await_or_fail(
-                notification_start_ready.wait(), what="notification scheduling"
+                notification_start_ready.wait(), what="notification start write"
             )
-            status_frames = await request(4, "status", {})
-            assert status_frames[-1]["result"]["state"] == "idle"
+            await send_request(5, "send", {"text": "too late"})
             release_notification_start.set()
-            await event("turn_start")
-            refused = await request(5, "send", {"text": "too late"})
+            refused: list[dict[str, Any]] = []
+            while True:
+                frame = await receive()
+                refused.append(frame)
+                if frame.get("id") == 5:
+                    break
             assert refused[-1]["error"]["code"] == -32004
+            await await_or_fail(owner_task, what="notification turn return")
+        await event("turn_end")
+        assert turn_starts == turn_ends
         assert session_id == server.runtime.session_id
     finally:
         release_turn_end.set()
