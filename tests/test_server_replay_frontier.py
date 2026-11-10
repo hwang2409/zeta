@@ -749,6 +749,27 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_generation_overcount_keeps_empty_frontier_stream(
+    tmp_path: Path, transport: Transport
+) -> None:
+    serve = await _serve(tmp_path, transport, FakeBackend([]))
+    try:
+        joined = await serve.join(serve.observer)
+        assert joined["replay"]["history_seq"] == 0, joined
+        # test-contract: seam forces the documented async generation over-count
+        serve.store._reset_generation += 1
+        _tool_rows(serve.store, "covered-call")
+        await _publish_tool_end(serve, "covered-call")
+        frames = await serve.live(serve.observer)
+        assert [(frame["event"], frame.get("seq")) for frame in frames] == [
+            ("tool_end", 1)
+        ], frames
+    finally:
+        await _close(serve)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pending_join", (False, True), ids=("live", "pending-join"))
 @pytest.mark.parametrize("renumber", (False, True), ids=("over-count", "renumber"))
 @pytest.mark.parametrize("transport", TRANSPORTS)
