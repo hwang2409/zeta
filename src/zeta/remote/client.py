@@ -10,7 +10,7 @@ from pathlib import Path
 from ..protocol.types import StreamEvent
 from .discovery import RemoteSession, configured_hosts, dedupe_rows, split_target
 from .transport import RemoteTransport, remote_bridge_command
-from .wire import decode_event
+from .wire import RemoteWireError, decode_event, history_events
 
 COMPATIBILITY_MESSAGE = "remote zeta is missing or too old. update ~/me/fun/zeta on HOST, then run: cd ~/me/fun/zeta && uv tool install --editable ."
 
@@ -70,6 +70,8 @@ class RemoteSessionClient:
         self.detach()
         transport = self._transport_factory(host, ssh=self.ssh)
         transport.start(remote_bridge_command("attach", session_id))
+        transport.send((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["session_replay_seq"]}}, separators=(",", ":")) + "\n").encode())
+        transport.send((json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session_history_and_subscribe", "params": {"session_id": session_id}}, separators=(",", ":")) + "\n").encode())
         self.transport = transport
         self.view = RemoteView(host, session_id, session.name if isinstance(session, RemoteSession) else session_id, replay_seq)
         return self.view
@@ -89,5 +91,15 @@ class RemoteSessionClient:
             item = self.transport.receive()
             if item is None: break
             if item.stream == "stdout":
-                events.extend(decode_event(line) for line in item.data.splitlines() if line)
+                for line in item.data.splitlines():
+                    if not line:
+                        continue
+                    try:
+                        frame = json.loads(line)
+                        if isinstance(frame, dict) and isinstance(frame.get("result"), dict):
+                            events.extend(history_events(frame["result"]))
+                        elif isinstance(frame, dict) and frame.get("method") == "event":
+                            events.append(decode_event(line))
+                    except (ValueError, TypeError, RemoteWireError):
+                        continue
         return tuple(events)

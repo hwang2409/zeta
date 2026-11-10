@@ -97,13 +97,13 @@ from .render import (
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
-from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget

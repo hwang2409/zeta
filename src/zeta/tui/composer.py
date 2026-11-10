@@ -819,6 +819,9 @@ class SubmissionMixin:
             return
         if text is None:
             return
+        if getattr(self, "_remote_view", None) is not None:
+            self._print_system("remote view is read only; use /detach first")
+            return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
         self._submissions.submit(
@@ -846,6 +849,9 @@ class SubmissionMixin:
             await self._run_shell_passthrough(passthrough)
             return
         if text is None:
+            return
+        if getattr(self, "_remote_view", None) is not None:
+            self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()

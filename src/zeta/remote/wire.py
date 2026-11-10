@@ -21,14 +21,39 @@ def decode_frame(raw: bytes | str) -> tuple[str, Mapping[str, object]]:
         value = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RemoteWireError("invalid remote frame") from exc
-    if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
+    if not isinstance(value, dict) or value.get("method") != "event":
         raise RemoteWireError("invalid remote frame")
-    if value.get("method") != "event" or not isinstance(value.get("params"), dict):
+    if "jsonrpc" in value and value.get("jsonrpc") != "2.0":
+        raise RemoteWireError("invalid remote frame")
+    if not isinstance(value.get("params"), dict):
         raise RemoteWireError("unsupported remote frame")
     params = value["params"]
-    if not isinstance(params.get("event"), str):
+    event = params.get("event", params.get("type"))
+    if not isinstance(event, str):
         raise RemoteWireError("remote frame has no event")
-    return params["event"], params
+    if "event" not in params:
+        params = dict(params)
+        params["event"] = event
+    return event, params
+
+
+def history_events(result: Mapping[str, object]) -> tuple[StreamEvent, ...]:
+    messages = result.get("messages")
+    if not isinstance(messages, list) or len(messages) > 4096:
+        raise RemoteWireError("invalid remote history")
+    events: list[StreamEvent] = []
+    for row in messages:
+        if not isinstance(row, dict) or set(row) - {"id", "role", "content", "tool_result", "metadata", "event", "data"}:
+            raise RemoteWireError("invalid remote history row")
+        if not isinstance(row.get("role"), str) or not isinstance(row.get("content"), list):
+            raise RemoteWireError("invalid remote history row")
+        try:
+            from ..protocol.types import Message
+            message = Message.from_dict({key: row[key] for key in ("role", "content", "tool_result", "metadata") if key in row})
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RemoteWireError("invalid remote history row") from exc
+        events.append(StreamEvent(StreamEventType.MESSAGE_END, message=message, data={"remote_history": True}))
+    return tuple(events)
 
 
 def decode_event(raw: bytes | str) -> StreamEvent:
@@ -37,7 +62,7 @@ def decode_event(raw: bytes | str) -> StreamEvent:
         kind = StreamEventType(name)
     except ValueError as exc:
         raise RemoteWireError("unknown remote event") from exc
-    allowed = {"event", "session_id", "data", "delta", "kind", "message", "content", "tool_call", "tool_result", "error"}
+    allowed = {"event", "type", "session_id", "data", "delta", "kind", "message", "content", "tool_call", "tool_result", "error", "row_seq"}
     if set(params) - allowed:
         raise RemoteWireError("unknown remote event field")
     value = {key: item for key, item in params.items() if key != "session_id"}
