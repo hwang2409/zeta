@@ -159,6 +159,8 @@ class BackgroundTaskRegistry:
         if not waits:
             return
         try:
+            if self.observe_finish_gate()[1] != generation:
+                return
             await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for wait in waits:
