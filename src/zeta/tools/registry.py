@@ -281,7 +281,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self._todo_store = session_store
         self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
-        self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, int, int], str]] = OrderedDict()
+        self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, bytes], str]] = OrderedDict()
         self._agent_output_cache_chars = 0
         self._execution_guard: Callable[[str], str | None] | None = None
         self._spill_byte_budget = SpillByteBudget()
