@@ -256,9 +256,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             session_id=session_id,
                             owner=OwnerHint(self._owner_surface),
                         )
-                    referenced_ids = (
-                        (parent_session_id,) if parent_session_id is not None else ()
-                    )
+                    referenced_ids = (parent_session_id,) if parent_session_id else ()
                     if _reference_authority is not None:
                         execution_authority, publication = (
                             nullcontext(),
@@ -273,7 +271,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             installed_ids=(session_id,),
                             referenced_ids=referenced_ids,
                         )
-                    store: ConversationStore | None = None
                     try:
                         with execution_authority, publication as authority:
                             assert authority is not None
@@ -285,10 +282,6 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                                 execution_lease=execution_lease, authority=authority,
                                 before_reference_publication=_before_reference_publication,
                             )
-                    except BaseException:
-                        if store is not None:
-                            store.close()
-                        raise
                     finally:
                         execution_lease.close()
         raise SessionError("could not allocate a unique session id")
