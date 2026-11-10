@@ -124,6 +124,10 @@ class TurnConsumerMixin:
     def _invalidate_background_prompt(self) -> None:
         """Coalesce visible background changes to ten paints per second."""
 
+        if self._fork_controller is not None and not self._fork_controller.is_visible(
+            self
+        ):
+            return
         if self._background_invalidation_handle is not None:
             return
         try:
