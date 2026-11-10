@@ -17,10 +17,8 @@ from .background_spawn import _group_exists, _signal_group
 from .background_task_types import (
     BackgroundTaskKillOutcome,
     BackgroundTaskNotice,
-    TaskExitInput,
     _BackgroundRecord,
 )
-from .process_output import command_headline, output_tail
 
 if TYPE_CHECKING:
     from .process import BackgroundTaskRegistry
@@ -51,9 +49,6 @@ class _OwnerState(Enum):
     ARCHIVING = auto()
     PERSISTING_TERMINAL = auto()
     DURABLE_TERMINAL = auto()
-    EVIDENCE_PENDING = auto()
-    INSTALLED_TERMINAL = auto()
-    NOTICE_PENDING = auto()
     TERMINAL = auto()
 
 
@@ -79,9 +74,6 @@ class _BackgroundTaskOwner:
         self.terminal_candidate: _BackgroundRecord | None = None
         self.kill_cause: str | None = record.note if record.note_priority == _NOTE_PRIORITY_CAUSE else None
         self.killed_by_claimant = False
-        self.defer_receipt_for_close = False
-        self._receipt_release = asyncio.Event()
-        self._receipt_release.set()
         self._finish_output_drain = asyncio.Event()
         self._output_done = asyncio.Event()
         self.terminal_durable = asyncio.Event()
@@ -216,6 +208,7 @@ class _BackgroundTaskOwner:
                 exit_code=exit_code,
                 ended_at=time.monotonic(),
                 process=None,
+                receipt_pending=self.record.receipt_pending or self.record.notify_on_exit,
                 terminal_phase=self.record.terminal_phase or "natural_exit",
             )
             self.terminal_candidate = candidate
@@ -237,7 +230,22 @@ class _BackgroundTaskOwner:
             attempts = 0
             while not self.terminal_durable.is_set():
                 try:
-                    await self.registry._commit_transition(rows, lambda: None, None)
+                    notice = BackgroundTaskNotice(
+                        process_output.task_exit_headline(
+                            candidate.task_id,
+                            candidate.exit_code,
+                            candidate.command,
+                            candidate.note,
+                        ),
+                        candidate.task_id,
+                        candidate.terminal_phase or "natural_exit",
+                        candidate.owner,
+                    )
+                    await self.registry._commit_transition(
+                        rows,
+                        lambda: self._publish_terminal(candidate),
+                        notice,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -250,53 +258,18 @@ class _BackgroundTaskOwner:
                     continue
                 self.state = _OwnerState.DURABLE_TERMINAL
                 self.terminal_durable.set()
-        if self.defer_receipt_for_close:
-            self._receipt_release.clear()
-            # test-contract: durability close releases receipts after aggregate state
-            await self._receipt_release.wait()
-        self.state = _OwnerState.EVIDENCE_PENDING
-        if self.record.notify_on_exit:
-            await self._deliver_exit(
-                TaskExitInput(
-                    task_id=candidate.task_id,
-                    command=command_headline(candidate.command),
-                    exit_code=candidate.exit_code,
-                    output_tail=output_tail(candidate.output),
-                    log_path=(
-                        None
-                        if candidate.remove_log_on_archive
-                        else str(candidate.log_path)
-                        if candidate.log_path is not None
-                        else None
-                    ),
-                    note=candidate.note,
-                    owner=candidate.owner,
-                    phase=candidate.terminal_phase or "natural_exit",
-                    tui_presented=candidate.tui_presented,
-                )
-            )
-        self.state = _OwnerState.INSTALLED_TERMINAL
-        self.record.running = False
+        if candidate.notify_on_exit and not self.registry._closing:
+            await self.registry._notify_terminal_exit(candidate)
+        self.state = _OwnerState.TERMINAL
+
+    def _publish_terminal(self, candidate: _BackgroundRecord) -> None:
+        self.record.running = candidate.running
         self.record.exit_code = candidate.exit_code
         self.record.ended_at = candidate.ended_at
-        self.record.process = None
+        self.record.process = candidate.process
+        self.record.receipt_pending = candidate.receipt_pending
         self.record.terminal_phase = candidate.terminal_phase
         self.process = None
-        self.state = _OwnerState.NOTICE_PENDING
-        self.registry._notice(
-            BackgroundTaskNotice(
-                process_output.task_exit_headline(
-                    self.record.task_id,
-                    candidate.exit_code,
-                    self.record.command,
-                    self.record.note,
-                ),
-                self.record.task_id,
-                candidate.terminal_phase or "natural_exit",
-                self.record.owner,
-            )
-        )
-        self.state = _OwnerState.TERMINAL
 
     async def _claim_termination(
         self,
@@ -360,27 +333,15 @@ class _BackgroundTaskOwner:
             status="killed" if killed else "exited",
         )
 
-    async def _deliver_exit(self, item: TaskExitInput) -> None:
-        sink = self.registry._notification_sink
-        if sink is None:
-            return
-        try:
-            await sink(item)
-        except ValueError as exc:
-            if str(exc) != "session store is closed":
-                raise
-            return
-        self.registry._pending_recovery.pop(item.task_id, None)
-
     async def finish_for_close(
         self, cause: str
     ) -> asyncio.subprocess.Process | None:
-        self.defer_receipt_for_close = self.record.notify_on_exit
-        if self.defer_receipt_for_close:
-            self._receipt_release.clear()
-        process, _ = await self._claim_termination(
-            cause, "session_shutdown", False
+        phase: Literal["task_kill", "session_shutdown"] = (
+            "task_kill"
+            if cause.startswith("finish-gate task safety bound expired")
+            else "session_shutdown"
         )
+        process, _ = await self._claim_termination(cause, phase, False)
         return process
 
     def finish_close_output_drain(self) -> None:
@@ -415,9 +376,3 @@ class _BackgroundTaskOwner:
             # Propagate the bounded terminal-write failure. Close must not
             # publish an aggregate success notice or release a receipt.
             lifecycle.result()
-
-    async def release_close_receipt(self) -> None:
-        self.defer_receipt_for_close = False
-        self._receipt_release.set()
-        # test-contract: durability released receipts finish before close returns
-        await self.wait()

@@ -27,7 +27,6 @@ import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
 import zeta.runtime.loop.agent as agent_loop_module
-import zeta.tools._shared.process as background_process_module
 import zeta.tui.cards.agent as agent_card_module
 from tests.support.agent_lifecycle import (
     wait_background_owner,
@@ -13037,58 +13036,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
-    evidence_entered = asyncio.Event()
-    allow_evidence = asyncio.Event()
-    registries: list[background_process_module.BackgroundTaskRegistry] = []
-    original_registry_init = background_process_module.BackgroundTaskRegistry.__init__
-
-    def capture_registry(registry, *args, **kwargs):
-        original_registry_init(registry, *args, **kwargs)
-        registries.append(registry)
-
-    # test-contract: seam retain the public registry used by the background child
-    monkeypatch.setattr(
-        background_process_module.BackgroundTaskRegistry,
-        "__init__",
-        capture_registry,
-    )
-    if not hasattr(
-        background_process_module.BackgroundTaskRegistry, "deliver_recovered_exit"
-    ):
-        original_notify = (
-            background_process_module.BackgroundTaskRegistry._notify_terminal_exit
-        )
-
-        async def hold_legacy_task_exit_evidence(registry, record):
-            evidence_entered.set()
-            await asyncio.wait_for(allow_evidence.wait(), 10)
-            return await original_notify(registry, record)
-
-        # test-contract: seam prove the prior publication-before-commit ordering
-        monkeypatch.setattr(
-            background_process_module.BackgroundTaskRegistry,
-            "_notify_terminal_exit",
-            hold_legacy_task_exit_evidence,
-        )
-    else:
-        original_produce = pending_delivery_module.StepDeliveryFlow.produce
-
-        async def hold_task_exit_evidence(flow, item):
-            if (
-                isinstance(item, pending_delivery_module.NotificationInput)
-                and item.kind == "task_exit"
-            ):
-                evidence_entered.set()
-                await asyncio.wait_for(allow_evidence.wait(), 10)
-            return await original_produce(flow, item)
-
-        # test-contract: seam hold the durable evidence commit at its public flow
-        monkeypatch.setattr(
-            pending_delivery_module.StepDeliveryFlow,
-            "produce",
-            hold_task_exit_evidence,
-        )
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
     command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, gate_delay=True)
@@ -13108,24 +13056,11 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 
     await await_or_fail(backend.task_started.wait(), what="test await")
     await await_or_fail(backend.gate_seen.wait(), what="test await")
-    release.touch()
-    await await_or_fail(evidence_entered.wait(), what="test await")
-    process_registry = next(registry for registry in registries if registry.snapshot())
-    running_task = process_registry.snapshot()[0]
-    state_before_evidence = await process_registry.output(running_task.task_id)
-    assert state_before_evidence["running"] is True
     assert len(deadlines.started) == 1
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_model_bound(state)
-    try:
-        await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
-        for _ in range(3):
-            barrier = asyncio.get_running_loop().create_future()
-            asyncio.get_running_loop().call_soon(barrier.set_result, None)
-            await await_or_fail(barrier, what="test await")
-        assert not completion_published.is_set()
-    finally:
-        allow_evidence.set()
+    await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
+    release.touch()
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
@@ -13746,7 +13681,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         for entry in child_store.agent_notifications(pending_only=False)
         if entry.data.get("kind") == "task_exited"
     )
-    assert task_exit.data["background_phase"] == "session_shutdown"
+    assert task_exit.data["background_phase"] == "task_kill"
     assert (
         task_exit.data["note"]
         == "finish-gate task safety bound expired after 0.05 seconds"
@@ -16639,7 +16574,16 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
         if answer_consumed:
-            answer_idle_entered.set()
+            notices = [
+                entry
+                for entry in parent.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "child_idle"
+            ]
+            if any(
+                entry.data.get("text") == "after Re q-reset: approved"
+                for entry in notices
+            ):
+                answer_idle_entered.set()
         await asyncio.wait_for(wake(), 10)
         return True
 

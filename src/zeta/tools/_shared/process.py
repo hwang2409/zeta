@@ -47,7 +47,7 @@ from .background_task_types import (
     _BackgroundRecord,
 )
 from .log_open import open_log_off_loop
-from .process_output import command_headline, utf8_char_chunk, utf8_chunk
+from .process_output import command_headline, output_tail, utf8_char_chunk, utf8_chunk
 from .tool_spawn import create_tool_subprocess_shell
 
 logger = logging.getLogger(__name__)
@@ -186,7 +186,17 @@ class BackgroundTaskRegistry:
         return tuple(self._pending_recovery.values())
 
     async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
-        await self._owners[item.task_id]._deliver_exit(item)
+        await self._notify_exit(
+            item.task_id,
+            item.command,
+            item.exit_code,
+            item.output_tail,
+            item.log_path,
+            item.note,
+            owner=item.owner,
+            phase=item.phase,
+            tui_presented=item.tui_presented,
+        )
 
     def bind_session_dir(
         self,
@@ -693,7 +703,9 @@ class BackgroundTaskRegistry:
                 )
             )
             await finish(
-                asyncio.gather(*(owner.release_close_receipt() for owner in owners))
+                asyncio.gather(
+                    *(self._notify_terminal_exit(owner.record) for owner in owners)
+                )
             )
         if self._start_cleanup_error is not None:
             raise self._start_cleanup_error
@@ -862,6 +874,71 @@ class BackgroundTaskRegistry:
         if self._notice_sink is not None:
             self._notice_sink(notice)
 
+    async def _notify_terminal_exit(self, record: _BackgroundRecord) -> None:
+        if not record.notify_on_exit:
+            return
+        await self._notify_exit(
+            record.task_id,
+            record.command,
+            record.exit_code,
+            output_tail(record.output),
+            None if record.remove_log_on_archive else record.log_path,
+            record.note,
+            owner=record.owner,
+            phase=record.terminal_phase or "natural_exit",
+            tui_presented=record.tui_presented,
+        )
+        record.notify_on_exit = False
+
+    async def _notify_exit(
+        self,
+        task_id: str,
+        command: str,
+        exit_code: int | None,
+        output_tail: str,
+        log_path: str | Path | None,
+        note: str | None = None,
+        *,
+        owner: str = "run_background",
+        phase: str = "natural_exit",
+        tui_presented: bool = False,
+    ) -> None:
+        sink = self._notification_sink
+        if sink is None:
+            return
+        item = TaskExitInput(
+            task_id=task_id,
+            command=command_headline(command),
+            exit_code=exit_code,
+            output_tail=output_tail,
+            log_path=str(log_path) if log_path is not None else None,
+            note=note,
+            owner=owner,
+            phase=phase,
+            tui_presented=tui_presented,
+        )
+        try:
+            await sink(item)
+        except ValueError as exc:
+            if str(exc) != "session store is closed":
+                raise
+            return
+        record = self._records.get(task_id)
+        if record is not None and record.receipt_pending:
+            async with self._transition_lock:
+                record.receipt_pending = False
+                try:
+                    await self._commit_notice(None)
+                except BaseException:
+                    record.receipt_pending = True
+                    raise
+        self._pending_recovery.pop(task_id, None)
+
+    async def _commit_notice(
+        self, notice: BackgroundTaskNoticeSinkValue | None
+    ) -> None:
+        await self._commit_transition(self._persistence_rows(), lambda: None, notice)
+
     def _load_previous(self) -> None:
         if self._directory_fd is None:
             return
@@ -917,6 +994,7 @@ class BackgroundTaskRegistry:
                     if type(note) is str
                     else "task exited when the previous session ended"
                 ),
+                receipt_pending=legacy_pending,
                 notify_on_exit=notify_on_exit,
                 tui_presented=tui_presented,
                 owner=owner_name if type(owner_name) is str else "run_background",
@@ -985,6 +1063,7 @@ class BackgroundTaskRegistry:
                 "started_at": record.started_at,
                 "ended_at": record.ended_at,
                 "note": record.note,
+                "receipt_pending": record.receipt_pending,
                 "terminal_phase": record.terminal_phase,
                 "tui_presented": record.tui_presented,
                 "owner": record.owner,
