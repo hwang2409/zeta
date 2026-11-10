@@ -64,10 +64,12 @@ async def test_inbox_provenance_routes(
     tmp_path: Path, case: str, epoch: int, route: str
 ) -> None:
     """Every public route projects the same current inbox authority."""
-    home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
-    registry._storage_lease.close()
+    home = tmp_path / ".zeta"
+    home.mkdir()
     (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
     registry = ProjectRegistry(home / "projects")
+    sender = registry.create_project("sender", "sender work")
+    recipient = registry.create_project("recipient", "recipient work")
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="fake", cwd=home,
