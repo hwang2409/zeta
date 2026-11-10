@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.runtime.foreground_events import ForegroundEventPublisher
 
@@ -23,7 +24,7 @@ async def test_admission_preserves_order_for_primary_and_subscriber() -> None:
     subscription = publisher.subscribe()
 
     primary = [event async for event in publisher.events(_source(4))]
-    observed = [await asyncio.wait_for(subscription.__anext__(), 1) for _ in range(4)]
+    observed = [await await_or_fail(subscription.__anext__(), what="subscriber event") for _ in range(4)]
 
     assert [event.delta for event in primary] == ["0", "1", "2", "3"]
     assert [event.delta for event in observed] == ["0", "1", "2", "3"]
@@ -38,9 +39,9 @@ async def test_slow_subscriber_never_blocks_producer() -> None:
     primary = [event async for event in publisher.events(_source(3))]
 
     assert len(primary) == 3
-    assert (await asyncio.wait_for(slow.__anext__(), 1)).delta == "0"
+    assert (await await_or_fail(slow.__anext__(), what="slow subscriber event")).delta == "0"
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(slow.__anext__(), 1)
+        await await_or_fail(slow.__anext__(), what="slow subscriber shutdown")
     publisher.close()
 
 
@@ -54,18 +55,18 @@ async def test_overflow_isolates_slow_subscriber() -> None:
     async def source():
         for index in range(4):
             yield _event(index)
-            observed.append(await asyncio.wait_for(fast.__anext__(), 1))
+            observed.append(await await_or_fail(fast.__anext__(), what="fast subscriber event"))
 
     primary = [event async for event in publisher.events(source())]
 
     assert len(primary) == 4
     assert [event.delta for event in observed] == ["0", "1", "2", "3"]
     assert [
-        (await asyncio.wait_for(slow.__anext__(), 1)).delta
+        (await await_or_fail(slow.__anext__(), what="slow subscriber event")).delta
         for _ in range(2)
     ] == ["0", "1"]
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(slow.__anext__(), 1)
+        await await_or_fail(slow.__anext__(), what="slow subscriber shutdown")
     publisher.close()
 
 
@@ -77,12 +78,12 @@ async def test_unsubscribe_and_close_wake_waiting_subscribers() -> None:
     await asyncio.sleep(0)
     publisher.unsubscribe(subscription)
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(waiting, 1)
+        await await_or_fail(waiting, what="subscriber shutdown")
 
     second = publisher.subscribe()
     waiting = asyncio.create_task(second.__anext__())
     await asyncio.sleep(0)
     publisher.close()
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(waiting, 1)
+        await await_or_fail(waiting, what="closed subscriber shutdown")
     assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
