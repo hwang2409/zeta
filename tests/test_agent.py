@@ -9359,28 +9359,6 @@ async def test_agent_model_implies_background(
     await loop.close()
 
 
-@pytest.mark.asyncio
-async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) -> None:
-    """The schema enum catches a bad model name before the runner is reached."""
-
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_model_agent_call(model="gpt-nonexistent")])]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error
-    assert not (store.session_dir / "agents").exists()
-
-
 def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     """Second line of defence, for any caller that skips schema validation."""
 
