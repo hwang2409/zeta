@@ -702,15 +702,16 @@ class StepDeliveryFlow:
             "nudge",
         }:
             raise ValueError("unknown terminal intent")
-        pending, closed = await self.store.admit_step_delivery_terminal(intent)
-        prompt_pending = bool(self.store._active_pending_prompt_entries)
-        if self._low_capacity_notifications and not prompt_pending:
-            pending = False
-        if pending and self.pending_ids():
-            self._edges.update(("prompt", "notification"))
-        elif pending:
-            pending = False
-        return TerminalResult(pending, closed)
+        async with self._input_admission_lock:
+            pending, closed = await self.store.admit_step_delivery_terminal(intent)
+            prompt_pending = bool(self.store._active_pending_prompt_entries)
+            if self._low_capacity_notifications and not prompt_pending:
+                pending = False
+            if pending and self.pending_ids():
+                self._edges.update(("prompt", "notification"))
+            elif pending:
+                pending = False
+            return TerminalResult(pending, closed)
 
     def initialize_resident_edges(self) -> None:
         """Seed level state from the already-loaded resident store."""
