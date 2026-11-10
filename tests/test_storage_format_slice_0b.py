@@ -560,7 +560,7 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
             return project
 
         def read(self, _project_id: str) -> object:
-            return SimpleNamespace(mirror_files=lambda: {})
+            return SimpleNamespace(mirror_files=dict)
 
     async def persist(*_args: object) -> None:
         return None
