@@ -103,12 +103,14 @@ def provider_for_model(model: str) -> str:
     for provider, models in PROVIDER_MODELS.items():
         if model in models or model in _LIVE_MODELS.get(provider, ()):
             return provider
-    if model.startswith("claude-"):
-        return "claude"
-    if model.startswith(("gpt-", "o1", "o3", "o4")):
-        return "codex"
     if ":" in model:
         return "ollama"
+    if model.startswith("claude-"):
+        return "claude"
+    if model.startswith("gpt-") or (
+        len(model) > 1 and model[0] == "o" and model[1].isdigit()
+    ):
+        return "codex"
     choices = ", ".join(known_model_names())
     raise ValueError(f"unknown model {model!r}; choose one of: {choices}")
 

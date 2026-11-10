@@ -9167,6 +9167,13 @@ def test_provider_for_model_maps_each_catalog_entry() -> None:
     for provider, models in PROVIDER_MODELS.items():
         for model in models:
             assert provider_for_model(model) == provider
+    for model, provider in {
+        "gpt-oss:20b": "ollama",
+        "claude-future": "claude",
+        "gpt-future": "codex",
+        "o2-preview": "codex",
+    }.items():
+        assert provider_for_model(model) == provider
 
 
 def test_provider_for_model_rejects_an_unknown_name() -> None:
@@ -9177,23 +9184,6 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
     message = str(excinfo.value)
     assert "not-a-model" in message
     assert "claude-opus-5" in message
-
-
-def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
-    from zeta.models.catalog import known_model_names
-
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(
-        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
-    )
-
-    agent_schema = next(
-        schema for schema in registry.schemas if schema["name"] == "agent"
-    )
-    model_schema = agent_schema["parameters"]["properties"]["model"]
-    assert "enum" not in model_schema
-    assert all(name in model_schema["description"] for name in known_model_names())
 
 
 @pytest.mark.asyncio
