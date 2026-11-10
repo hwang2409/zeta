@@ -176,28 +176,35 @@ class BackgroundAgentOwner:
                     changed = True
         return selected
 
+    def _request_cancellation(
+        self, instance_id: str
+    ) -> _CancellationConfirmation | None:
+        confirmation = self._cancel_confirmations.get(instance_id)
+        if instance_id not in self._cancel_requested:
+            self._cancel_requested.add(instance_id)
+            if confirmation is None:
+                result = self._cancellers[instance_id]()
+                if isinstance(result, CancellationRequest):
+                    confirmation = result.confirmation
+                elif isinstance(result, asyncio.Task):
+                    confirmation = result
+                if confirmation is not None:
+                    self._cancel_confirmations[instance_id] = confirmation
+        if confirmation is None:
+            return None
+        return _CancellationConfirmation(instance_id, confirmation)
+
     def cancel_subtree(
         self, instance_id: str
     ) -> tuple[_CancellationConfirmation, ...]:
         selected = self._subtree_ids(instance_id)
-        confirmations: list[_CancellationConfirmation] = []
-        for child in tuple(self._cancellers):
-            if child not in selected:
-                continue
-            confirmation = self._cancel_confirmations.get(child)
-            if child not in self._cancel_requested:
-                self._cancel_requested.add(child)
-                if confirmation is None:
-                    result = self._cancellers[child]()
-                    if isinstance(result, CancellationRequest):
-                        confirmation = result.confirmation
-                    elif isinstance(result, asyncio.Task):
-                        confirmation = result
-                    if confirmation is not None:
-                        self._cancel_confirmations[child] = confirmation
-            if confirmation is not None:
-                confirmations.append(_CancellationConfirmation(child, confirmation))
-        return tuple(confirmations)
+        return tuple(
+            confirmation
+            for child in tuple(self._cancellers)
+            if child in selected
+            for confirmation in (self._request_cancellation(child),)
+            if confirmation is not None
+        )
 
     async def wait_for_descendant_watchers(self, instance_id: str) -> None:
         """Keep the parent's routing alive through descendant publication."""
@@ -344,7 +351,7 @@ class BackgroundAgentOwner:
         self._canceling = True
         try:
             for instance_id in tuple(self._cancellers):
-                self.cancel_subtree(instance_id)
+                self._request_cancellation(instance_id)
         finally:
             self._canceling = False
 
