@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ..agent.budget import HARD_MAX_AGENT_DEPTH
 from ..agent.presets import AGENT_PRESETS, AgentPreset, valid_max_turns
-from ..models.catalog import known_model_names
+from ..models.catalog import provider_for_model
 from .discovery import (
     MarkdownDocument,
     discover_markdown,
@@ -176,15 +176,18 @@ def _build_agent(
     model = metadata.get("model")
     if model is not None and (type(model) is not str or not model.strip()):
         raise ValueError(f"agent {document.path} frontmatter model must be a nonempty string")
-    if model is not None and model not in known_model_names():
-        notice = warn_discovery(
-            document.path,
-            f"unknown model {model!r}; agent will inherit the parent model",
-            "agent",
-        )
-        if notices is not None:
-            notices.append(notice)
-        model = None
+    if model is not None:
+        try:
+            provider_for_model(model)
+        except ValueError:
+            notice = warn_discovery(
+                document.path,
+                f"unknown model {model!r}; agent will inherit the parent model",
+                "agent",
+            )
+            if notices is not None:
+                notices.append(notice)
+            model = None
     allow_delegation = metadata.get("allow_delegation", True)
     if type(allow_delegation) is not bool:
         raise ValueError(
