@@ -814,6 +814,10 @@ class AgentNavigation:
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
+        self._signature_task: asyncio.Task[tuple[object, ...]] | None = None
+        self._signature_generation = 0
+        self._signature_dirty = False
+        self._signature_force = False
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
 
@@ -859,6 +863,9 @@ class AgentNavigation:
         return self._todo_control.snapshot(self.current_path)
 
     async def close(self) -> None:
+        if self._signature_task is not None:
+            self._signature_task.cancel()
+            self._signature_task = None
         await close_agent_owners(self.transcript_control.close, self._todo_control.close)
 
     def child_view_focused(self) -> bool:
@@ -903,6 +910,9 @@ class AgentNavigation:
         if self._refresh_handle is not None:
             self._refresh_handle.cancel()
             self._refresh_handle = None
+        if self._signature_task is not None:
+            self._signature_task.cancel()
+            self._signature_task = None
         self._invalidate = None
         self._layout = None
         self._composer_buffer = None
@@ -944,6 +954,70 @@ class AgentNavigation:
         return agent_tree_signature(
             self.current_path, self.selected_index, running, self._path_signature
         )
+
+    async def _compute_agent_tree_signature(
+        self,
+        path: Path,
+        selected_index: int,
+        running: tuple[Path, ...],
+    ) -> tuple[object, ...]:
+        return await asyncio.to_thread(
+            agent_tree_signature, path, selected_index, running, self._path_signature
+        )
+
+    def _request_agent_tree_signature(self, force: bool) -> None:
+        if self._invalidate is None:
+            return
+        self._signature_generation += 1
+        generation = self._signature_generation
+        self._signature_force |= force
+        if self._signature_task is not None:
+            self._signature_dirty = True
+            return
+        running = tuple(
+            entry.path for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._compute_agent_tree_signature(
+                self.current_path, self.selected_index, running
+            )
+        )
+        self._signature_task = task
+        task.add_done_callback(
+            lambda completed: self._agent_tree_signature_done(
+                generation, force, completed
+            )
+        )
+
+    def _agent_tree_signature_done(
+        self,
+        generation: int,
+        force: bool,
+        task: asyncio.Task[tuple[object, ...]],
+    ) -> None:
+        if self._signature_task is task:
+            self._signature_task = None
+        if task.cancelled():
+            return
+        if generation != self._signature_generation or self._signature_dirty:
+            self._signature_dirty = False
+            pending_force = self._signature_force
+            self._signature_force = False
+            self._request_agent_tree_signature(pending_force)
+            return
+        self._signature_force = False
+        try:
+            signature = task.result()
+        except (OSError, ValueError):
+            return
+        if self._invalidate is not None and self._refresh_with_signature(signature, force):
+            self._invalidate()
 
     def _schedule_refresh(self, delay: float) -> None:
         if self._invalidate is None or self._refresh_handle is not None:
@@ -998,9 +1072,19 @@ class AgentNavigation:
             if self.child_view_active
             else False
         )
-        signature = self._agent_tree_signature()
+        if self._invalidate is None:
+            signature = self._agent_tree_signature()
+            return transcript_changed or todo_changed or self._refresh_with_signature(
+                signature, force
+            )
+        self._request_agent_tree_signature(force)
+        return transcript_changed or todo_changed
+
+    def _refresh_with_signature(
+        self, signature: tuple[object, ...], force: bool
+    ) -> bool:
         if not force and signature == self._refresh_signature:
-            return transcript_changed or todo_changed
+            return False
         was_list_focused = bool(self.entries) and self.list_focused()
         selected_path = self.entries[self.selected_index].path if self.entries else None
         previous_index = self.selected_index
