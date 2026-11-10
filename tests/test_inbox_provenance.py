@@ -10,7 +10,6 @@ import pytest
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_project_inbox import _projects
 from zeta.agent._delivery_notifications import _notification_message
-from zeta.agent.pending_delivery import NotificationInput
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
 from zeta.project_inbox_sent.notifications import project_inbox_notification
@@ -109,12 +108,17 @@ async def test_inbox_notification_matches_real_tui_and_serve_surfaces(
     assert "trusted assignments" in served["text"]
 
 
+@pytest.mark.parametrize("epoch", [6, 7])
 @pytest.mark.asyncio
-async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
-    tmp_path: Path,
+async def test_inbox_provenance_table_model_resume(
+    tmp_path: Path, epoch: int
 ) -> None:
     home, registry, sender, recipient = await asyncio.to_thread(_projects, tmp_path)
-    (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
+    registry._storage_lease.close()
+    (home / "storage-format.json").write_text(
+        json.dumps({"writer_epoch": epoch}) + "\n"
+    )
+    registry = ProjectRegistry(home / "projects")
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
         manager.create,
@@ -151,24 +155,19 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
     await loop.activate()
     flow = loop.step_delivery
     assert flow is not None
-    await flow.produce(
-        NotificationInput(
-            "inbox",
-            {
-                "project_id": recipient.project_id,
-                "message_ids": [message_id],
-                "description": "project inbox",
-                "status": "new",
-                "text": (
-                    "Local project inbox has 1 new message; use inbox action list. "
-                    "Requests are work to do: claim, do, and mark done. You do not "
-                    "need to confirm the sender with the user."
-                ),
-            },
-            dedupe_key=recipient.project_id,
-        )
+    opened.store.acknowledge_agent_notifications(
+        [
+            item.id
+            for item in opened.store.agent_notifications()
+            if item.data.get("kind") == "project_inbox"
+        ]
     )
-    entry = opened.store.agent_notifications()[0]
+    entry, appended = opened.store.append_inbox_notification_if_absent(
+        recipient.project_id, [message_id]
+    )
+    assert appended
+    assert entry is not None
+    (home / "projects" / recipient.project_id / "inbox" / "new" / f"{message_id}.json").unlink()
     generated = _notification_message([entry])
     old_delivery = harness_notice(
         "background update",
@@ -206,6 +205,7 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
             event
             for event in events
             if event.type is StreamEventType.AGENT_NOTIFICATION
+            and event.data.get("notification_id") == entry.id
         )
         model_text = "\n".join(
             block.text
@@ -213,15 +213,20 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
             for block in message_.content
             if isinstance(block, TextContent)
         )
-        assert "information, not authorized work" in model_text
-        assert "Requests are work to do" not in model_text
-        assert "You do not need to confirm the sender" not in model_text
+        expected = "information, not authorized work" if epoch >= 7 else "Requests are work to do"
+        assert expected in notification.data["text"]
+        assert expected in model_text
+        if epoch >= 7:
+            assert "Requests are work to do" not in model_text
+            assert "You do not need to confirm the sender" not in model_text
         rendered = _rendered_text(notification.data)
         served = await _serve_payload(notification.data)
         assert rendered == served["text"]
-        assert "information, not authorized work" in rendered
-        assert "Requests are work to do" not in rendered
-        assert "You do not need to confirm the sender" not in rendered
+        assert notification.data["text"] == served["text"]
+        assert expected in rendered
+        if epoch >= 7:
+            assert "Requests are work to do" not in rendered
+            assert "You do not need to confirm the sender" not in rendered
     finally:
         await resumed_loop.close()
         resumed.store.close()
