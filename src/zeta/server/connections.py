@@ -350,7 +350,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -370,6 +370,7 @@ class ConnectionRegistry(ReplayOutput):
             session_id,
             self._fields_for_connection(self._controller, event, fields),
             covers,
+            replay_row=replay_row,
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -404,7 +405,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -425,6 +426,7 @@ class ConnectionRegistry(ReplayOutput):
             session_id,
             self._fields_for_connection(state, event, fields),
             covers,
+            replay_row=replay_row,
         ):
             return True
         if not self._admit(state, frame):

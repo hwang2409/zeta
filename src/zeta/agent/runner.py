@@ -166,12 +166,14 @@ async def consume_child(
                     "approval_start",
                     event.tool_call,
                     depth=lifecycle_depth(event.tool_call),
+                    owner=event.data.get("agent_instance_id"),
                 )
             elif event.type is StreamEventType.TOOL_APPROVAL_END:
                 publish_lifecycle(
                     "approval_end",
                     event.tool_call,
                     depth=lifecycle_depth(event.tool_call),
+                    owner=event.data.get("agent_instance_id"),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
                 record_tool_call()
@@ -187,6 +189,7 @@ async def consume_child(
                     "execution_start",
                     event.tool_call,
                     depth=lifecycle_depth(event.tool_call),
+                    owner=event.data.get("agent_instance_id"),
                 )
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
                 if (
@@ -202,6 +205,7 @@ async def consume_child(
                     event.tool_call,
                     tool_result=event.tool_result,
                     depth=lifecycle_depth(event.tool_call),
+                    owner=event.data.get("agent_instance_id"),
                 )
             elif event.type is StreamEventType.TURN_END:
                 last_message = event.message
@@ -952,6 +956,7 @@ async def run_agent_tool(
         *,
         tool_result: ToolResult | None = None,
         depth: int | None = None,
+        owner: object = None,
     ) -> None:
         if call is None:
             return
@@ -964,7 +969,7 @@ async def run_agent_tool(
         if event_type is None:
             return
         data = {"depth": child_depth if depth is None else depth}
-        data["agent_instance_id"] = child_instance_id
+        data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
         if background:
             loop._publish_background_event(
                 StreamEvent(

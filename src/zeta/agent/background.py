@@ -633,6 +633,7 @@ def _recover_nested_children(
                     store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if existing is None:
                     lifecycle = (
@@ -819,6 +820,7 @@ def _recover_agent_children(
                     loop.store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if notification is None:
                     lifecycle = (

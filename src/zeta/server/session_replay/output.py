@@ -43,6 +43,7 @@ class ReplayOutput:
         required_feature: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        replay_row: rows.RowFacts | None = None,
     ) -> None:
         """Send a controller event to observers that joined its replay scope."""
         for observer in tuple(self._observers):
@@ -53,6 +54,7 @@ class ReplayOutput:
                     session_id,
                     self._fields_for_connection(observer, event, fields),
                     covers,
+                    replay_row=replay_row,
                 )
 
     def _replay_covers(
@@ -318,6 +320,25 @@ class ReplayOutput:
             output.queue = kept
             self._assert_retained_accounting(output)
 
+    def _member_scope(
+        self,
+        connection: Any,
+        session_id: str,
+        fields: dict[str, object],
+        facts: rows.RowFacts | None,
+    ) -> ReplayScopeId | None:
+        scope = self.replay.scope_for(connection)
+        if scope is None:
+            return None
+        if scope.kind == "top":
+            return scope if scope.value == session_id else None
+        data = fields.get("data")
+        agent = data.get("agent_instance_id") if isinstance(data, dict) else None
+        agent = agent or fields.get("agent_instance_id") or (facts.agent if facts else None)
+        if type(agent) is str and (agent == scope.value or agent.startswith(scope.value + ":")):
+            return scope
+        return None
+
     def _publish_replay(
         self,
         state: Any,
@@ -327,12 +348,16 @@ class ReplayOutput:
         covers: rows.Covers,
         *,
         scope: ReplayScopeId | None = None,
+        replay_row: rows.RowFacts | None = None,
     ) -> bool:
         """Admit one frame to a replay stream; False when the caller sends it plainly."""
         if "session_replay_seq" not in state.features or session_id is None:
             return False
-        scope = scope or ReplayScopeId.top(session_id)
         connection = state.connection
+        if scope is None:
+            scope = self._member_scope(connection, session_id, fields, replay_row)
+            if scope is None:
+                return False
         if covers is not None and not self._frontier_holds(connection, scope):
             if self.replay.is_pending(connection):
                 self.replay.mark_pending_stale(connection)
