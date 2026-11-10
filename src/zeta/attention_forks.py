@@ -20,7 +20,7 @@ from .attention_records import (
 )
 from .config.tool_policy import ToolPolicy
 from .core.checkpoints import ConversationEntry
-from .core.session import SessionManager
+from .core.session import OpenedSession, SessionManager
 from .core.session_files import (
     SessionNotFoundError,
     SessionReferenceGate,
@@ -242,6 +242,33 @@ def _create_fork_session(
     reference_gate: SessionReferenceGate,
     reference_stack: ExitStack,
 ) -> str:
+    note = _attention_fork_note(record)
+
+    def populate(fork: OpenedSession) -> None:
+        log_path = fork.store.session_dir / "conversation.jsonl"
+        with fork.store._append_lock():
+            header = log_path.read_bytes().splitlines(keepends=True)[0]
+            log_path.write_bytes(
+                header
+                + b"".join(
+                    (
+                        json.dumps(
+                            entry.to_dict(), sort_keys=True, separators=(",", ":")
+                        )
+                        + "\n"
+                    ).encode()
+                    for entry in branch[:cut]
+                )
+            )
+            fork.store._load()
+        fork.store.append_message(
+            Message(
+                MessageRole.SYSTEM,
+                [TextContent(note)],
+                metadata={"origin": "harness", "kind": "attention_fork"},
+            )
+        )
+
     metadata = source_metadata
     fork = manager.create(
         provider=metadata.provider,
@@ -261,57 +288,28 @@ def _create_fork_session(
         _session_id=fork_id,
         _reference_gate=reference_gate,
         _reference_stack=reference_stack,
+        _before_reference_publication=populate,
     )
     try:
-        try:
-            with session_directory(manager.sessions_dir, fork_id) as (_, fork_fd):
-                write_session_file(
-                    fork_fd,
-                    "attention_fork.json",
-                    (
-                        json.dumps(
-                            {
-                                "forked_from_session": record.session_id,
-                                "forked_at_entry": record.entry_id,
-                                "attention_id": record.id,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        + "\n"
-                    ).encode(),
-                )
-        finally:
-            fork.store.close()
-        log_path = fork.store.session_dir / "conversation.jsonl"
-        header = log_path.read_bytes().splitlines(keepends=True)[0]
-        log_path.write_bytes(
-            header
-            + b"".join(
+        with session_directory(manager.sessions_dir, fork_id) as (_, fork_fd):
+            write_session_file(
+                fork_fd,
+                "attention_fork.json",
                 (
-                    json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
+                    json.dumps(
+                        {
+                            "forked_from_session": record.session_id,
+                            "forked_at_entry": record.entry_id,
+                            "attention_id": record.id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
                     + "\n"
-                ).encode()
-                for entry in branch[:cut]
+                ).encode(),
             )
-        )
-        reopened = manager.open(
-            fork_id, _read_only=True, _reference_gate=reference_gate
-        )
-        try:
-            note = _attention_fork_note(record)
-            reopened.store.append_message(
-                Message(
-                    MessageRole.SYSTEM,
-                    [TextContent(note)],
-                    metadata={"origin": "harness", "kind": "attention_fork"},
-                )
-            )
-        finally:
-            reopened.store.close()
-    except BaseException:
-        manager.delete(fork_id)
-        raise
+    finally:
+        fork.store.close()
     return fork_id
 
 

@@ -186,6 +186,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         _session_id: str | None = None,
         _reference_gate: SessionReferenceGate | None = None,
         _reference_stack: ExitStack | None = None,
+        _before_reference_publication: Callable[[OpenedSession], None] | None = None,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
@@ -281,6 +282,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         _owner_surface=self._owner_surface,
                     )
                     metadata._execution_lease = store.execution_lease
+                    if _before_reference_publication is not None:
+                        try:
+                            _before_reference_publication(OpenedSession(metadata, store))
+                        except BaseException:
+                            store.close()
+                            execution_lease.close()
+                            raise
                     gate = _reference_gate or SessionReferenceGate(
                         self.home, self._storage_lease
                     )
@@ -481,7 +489,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 ),
                 _on_initialized=initialize,
             )
-        except (SessionOwnedError, TranscriptLoadError):
+        except (SessionError, SessionOwnedError, TranscriptLoadError):
             raise
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
