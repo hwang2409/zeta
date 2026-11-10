@@ -807,6 +807,7 @@ class AgentNavigation:
         self._composer_buffer: Any = None
         self._transcript_layout: Any = None
         self._main_transcript: Any = None
+        self._main_transcript_widget: Any = None
         self._main_transcript_parent: Any = None
         self._main_transcript_index: int | None = None
         self._external_view_container: Any = None
@@ -930,7 +931,7 @@ class AgentNavigation:
             return self._external_view_transcript
         if self.child_view_active:
             return self.transcript_control.transcript
-        return self._main_transcript
+        return self._main_transcript_widget
 
     def show_external_view(self, container: Any, transcript: Any) -> None:
         self._external_view_container = container

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit.document import Document
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from rich.console import Group
@@ -130,6 +131,7 @@ class RemoteViewMixin:
 
     async def _attach_remote(self, chosen: RemoteSession) -> None:
         await self._remote_client().attach(chosen.host, chosen)
+        self._save_remote_composer()
         state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
         self._remote_view = state
         self._agent_navigation.show_external_view(state.container, state.transcript)
@@ -142,6 +144,28 @@ class RemoteViewMixin:
                 Path(self._zeta_home or Path.home() / ".zeta")
             )
         return self._remote_session_client
+
+    def _save_remote_composer(self) -> None:
+        session = self._active_session
+        if session is None:
+            return
+        buffer = session.default_buffer
+        self._remote_saved_composer = (
+            Document(buffer.text, buffer.cursor_position),
+            tuple(self._pending_attachments),
+            self._next_image_token,
+        )
+
+    def _restore_remote_composer(self) -> None:
+        saved = self._remote_saved_composer
+        self._remote_saved_composer = None
+        session = self._active_session
+        if saved is None or session is None:
+            return
+        document, attachments, next_image_token = saved
+        session.default_buffer.set_document(document, bypass_readonly=True)
+        self._pending_attachments[:] = attachments
+        self._next_image_token = next_image_token
 
     async def slash_remote(self, args: str) -> str:
         target = args.strip()
@@ -167,6 +191,7 @@ class RemoteViewMixin:
             await client.attach(chosen.host, chosen)
         except (RemoteWireError, ValueError) as exc:
             return str(exc)
+        self._save_remote_composer()
         state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
         self._remote_view = state
         self._agent_navigation.show_external_view(state.container, state.transcript)
@@ -196,6 +221,7 @@ class RemoteViewMixin:
         if self._remote_session_client is not None:
             await self._remote_session_client.detach()
         self._agent_navigation.clear_external_view()
+        self._restore_remote_composer()
         self._remote_view = None
         self._invalidate_prompt()
         return ""
