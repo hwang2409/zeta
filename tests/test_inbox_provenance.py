@@ -32,7 +32,13 @@ from zeta.tui.slash_handlers import SlashHandlerMixin
 async def _serve_payload(data: dict[str, object]) -> dict[str, object]:
     sent: list[dict[str, object]] = []
 
-    async def send(_event: object, _session: object, *, data: dict[str, object]) -> bool:
+    async def send(
+        _event: object,
+        _session: object,
+        *,
+        data: dict[str, object],
+        replay_row: object = None,
+    ) -> bool:
         sent.append(data)
         return True
 
