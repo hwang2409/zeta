@@ -8,7 +8,7 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -279,7 +279,7 @@ class HistoryIndex:
         self,
         stored: Mapping[str, object],
         expected: Mapping[str, object],
-        rows: tuple[object, ...],
+        rows: Sequence[object],
     ) -> int | None:
         if stored.get("schema_version") != self.SCHEMA_VERSION or any(
             stored.get(key) != expected.get(key) for key in ("st_dev", "st_ino")
@@ -370,6 +370,42 @@ class HistoryIndex:
             )
             self._write_correlations(connection, entries)
             self._set_meta(connection, facts, total=total)
+
+    def catch_up_validated(
+        self, source_facts: object, validated_rows: Sequence[object]
+    ) -> bool:
+        """Append only rows after a matching indexed boundary."""
+        with self._lock:
+            self._check_open()
+            if self._observer:
+                return False
+            expected = self._facts(source_facts)
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connection(write=True)
+                self._create_schema(connection)
+                stored = self._stored_facts(connection)
+                if stored is None:
+                    return False
+                if all(
+                    stored.get(key) == value for key, value in expected.items()
+                ) and stored.get("schema_version") == self.SCHEMA_VERSION:
+                    self._available = True
+                    return True
+                suffix_start = self._suffix_start(stored, expected, validated_rows)
+                if suffix_start is None:
+                    return False
+                self._append_entries(
+                    connection, source_facts, tuple(validated_rows[suffix_start:])
+                )
+                self._available = True
+                return True
+            except (HistoryIndexError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                self._available = False
+                return False
+            finally:
+                if connection is not None:
+                    connection.close()
 
     def sync_validated(self, source_facts: object, validated_rows: Iterable[object]) -> None:
         """Make the disposable index match validated authority without failing it."""
@@ -552,6 +588,9 @@ def _rebuild_history_index(store: ConversationStore) -> None:
     writer = store._new_persistent_durable_writer()
     try:
         with writer._append_lock():
+            facts = store._history_index_facts()
+            if store._history_index.catch_up_validated(facts, store._entries):
+                return
             store._sync_history_index(store.active_branch_snapshot())
     finally:
         writer.close()
