@@ -386,7 +386,7 @@ class _Client:
         self.logins = login.Logins(server.home)
         self.handshaken = False
         self.role: str | None = None
-        self.max_role = server._max_role
+        self.max_role = getattr(reader, "max_role", server._max_role)
         self.protocol_version = "1.0"
         self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()

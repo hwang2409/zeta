@@ -86,8 +86,9 @@ class RuntimeCloseMixin:
                 await self._draft.shutdown_pending()
             except Exception:  # noqa: BLE001, S110 - notice already reported
                 pass
-            if self.observer_host is not None:
-                await attempt_async(self.observer_host.close)
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None:
+                await attempt_async(observer_host.close)
             if self._on_session_close is not None:
                 await attempt_async(self._on_session_close)
             await attempt_async(
@@ -106,7 +107,9 @@ class RuntimeCloseMixin:
         finally:
             self._workspace_snapshot_store = None
             attempt(lambda: self.loop.set_background_event_sink(None))
-            attempt(self.foreground_event_publisher.close)
+            foreground_event_publisher = getattr(self, "foreground_event_publisher", None)
+            if foreground_event_publisher is not None:
+                attempt(foreground_event_publisher.close)
             attempt(lambda: self.loop.set_background_wake_callback(None))
             attempt(self._detach_ui_notice_sinks)
             attempt(lambda: self.loop.set_mcp_prompt_refresh(None))

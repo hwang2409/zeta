@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..server.runtime import ServerRuntime
@@ -17,6 +18,11 @@ class ObserverHost:
         *,
         home: Path,
         session_id: str,
+        opened: Any | None = None,
+        loop: Any | None = None,
+        policy: Any | None = None,
+        project_dir: Path | None = None,
+        repo_root: Path | None = None,
         runtime: ServerRuntime | None = None,
         publisher: ForegroundEventPublisher,
         name: str = "",
@@ -27,6 +33,7 @@ class ObserverHost:
         self.home = home
         self.session_id = session_id
         self.runtime = runtime
+        self._runtime_args = (opened, loop, policy, project_dir, repo_root)
         self.publisher = publisher
         self.name, self.provider, self.model = name, provider, model
         self.cwd = "~" + cwd[len(str(home)):] if cwd == str(home) or cwd.startswith(str(home) + "/") else cwd
@@ -35,6 +42,18 @@ class ObserverHost:
         self._server: ZetaServer | None = None
 
     async def start(self) -> None:
+        if self.runtime is None:
+            opened, loop, policy, project_dir, repo_root = self._runtime_args
+            if not all(value is not None for value in (opened, loop, policy, project_dir, repo_root)):
+                raise RuntimeError("observer host requires a borrowed runtime")
+            self.runtime = ServerRuntime.borrowed(
+                home=self.home,
+                opened=opened,
+                loop=loop,
+                policy=policy,
+                project_dir=project_dir,
+                repo_root=repo_root,
+            )
         server = ZetaServer(
             home=self.home,
             socket_path=self.socket,
@@ -48,13 +67,7 @@ class ObserverHost:
             await server.close()
             raise
         self._server = server
-        publish(
-            self.home,
-            Descriptor(
-                str(self.socket), self.session_id, os.getpid(), self.name,
-                self.cwd, self.provider, self.model,
-            ),
-        )
+        publish(self.home, Descriptor(str(self.socket), self.session_id, os.getpid(), self.name, self.cwd, self.provider, self.model))
 
     async def close(self) -> None:
         server, self._server = self._server, None

@@ -1145,8 +1145,9 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
-            if self.observer_host is not None:
-                await self.observer_host.start()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None:
+                await observer_host.start()
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)

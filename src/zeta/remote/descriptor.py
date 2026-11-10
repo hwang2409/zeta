@@ -62,8 +62,8 @@ class Descriptor:
             raise DescriptorError("invalid observer descriptor") from exc
         if not isinstance(value, dict):
             raise DescriptorError("invalid observer descriptor")
-        required = {"socket", "session_id", "pid"}
-        if set(value) - required - {"name", "cwd", "provider", "model"}:
+        allowed = ("socket", "session_id", "pid", "name", "cwd", "provider", "model")
+        if any(key not in allowed for key in value):
             raise DescriptorError("unknown observer descriptor field")
         if not all(isinstance(value.get(key), str) for key in ("socket", "session_id")):
             raise DescriptorError("invalid observer descriptor")
