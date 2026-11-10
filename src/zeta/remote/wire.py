@@ -77,8 +77,14 @@ def decode_event(raw: bytes | str) -> StreamEvent:
         kind = aliases[name] if name in aliases else StreamEventType(name)
     except ValueError as exc:
         raise RemoteWireError("unknown remote event") from exc
-    allowed = {"event", "type", "session_id", "data", "delta", "kind", "message", "content", "tool_call", "tool_result", "error", "row_seq", "usage", "stream_id", "seq"}
-    if set(params) - allowed:
+    if any(
+        key not in (
+            "event", "type", "session_id", "data", "delta", "kind", "message",
+            "content", "tool_call", "tool_result", "error", "row_seq", "usage",
+            "stream_id", "seq",
+        )
+        for key in params
+    ):
         raise RemoteWireError("unknown remote event field")
     value = {key: item for key, item in params.items() if key != "session_id"}
     value["type"] = kind.value
