@@ -7,6 +7,7 @@ from pathlib import Path
 from ...protocol.types import StreamEvent, StreamEventType
 from ...remote.client import RemoteSessionClient
 from ...remote.discovery import choose_session, split_target
+from ...remote.wire import RemoteWireError
 from ..render import render_event
 
 
@@ -23,12 +24,18 @@ class RemoteViewMixin:
         target = args.strip()
         client = self._remote_client()
         if not target:
-            rows = await client.discover()
+            try:
+                rows = await client.discover()
+            except RemoteWireError as exc:
+                return str(exc)
             if not rows:
                 return "no remote sessions found"
             return "\n".join(f"{row.host}  {row.name or row.session_id[:8]}  {row.state or 'unknown'}" for row in rows)
         host, prefix = split_target(target)
-        rows = await client.discover((host,))
+        try:
+            rows = await client.discover((host,))
+        except RemoteWireError as exc:
+            return str(exc)
         if prefix is None:
             if len(rows) != 1:
                 if not rows:

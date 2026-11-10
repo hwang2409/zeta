@@ -44,16 +44,20 @@ class RemoteSessionClient:
         transport = self._transport_factory(validate, ssh=self.ssh)
         transport.start(remote_bridge_command("list"))
         chunks: list[bytes] = []
+        diagnostics: list[bytes] = []
         while True:
             item = await asyncio.to_thread(transport.receive, 0.1)
             if item is None:
                 continue
             if item.stream == "stderr":
+                diagnostics.append(item.data)
                 continue
             if item.stream == "exit":
                 break
             chunks.append(item.data)
         transport.close()
+        if any(b"command not found" in data or b"invalid choice" in data for data in diagnostics):
+            raise RemoteWireError(COMPATIBILITY_MESSAGE.replace("HOST", validate))
         rows = []
         for line in b"".join(chunks).splitlines():
             try: value = json.loads(line)
