@@ -110,7 +110,7 @@ async def attach(home: Path, session_id: str) -> int:
 
     async def stdin_to_socket() -> None:
         while True:
-            chunk = await asyncio.to_thread(sys.stdin.buffer.read, 65536)
+            chunk = await asyncio.to_thread(sys.stdin.buffer.readline)
             if not chunk:
                 with contextlib.suppress(NotImplementedError):
                     writer.write_eof()
