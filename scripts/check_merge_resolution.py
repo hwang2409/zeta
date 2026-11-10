@@ -1074,6 +1074,13 @@ def _element_findings(
 def _render_finding(
     finding: Item, main_items: dict, branch_items: dict, merge_items: dict
 ) -> None:
+    if finding.kind == "main-deleted-line":
+        print(
+            f"{finding.path}: main deletion re-added ({finding.name}, "
+            f"main parent line {finding.line}); line {finding.value!r} is present in the merge"
+        )
+        print("  fix: keep main's deletion or justify it in the PR")
+        return
     key = item_key(finding)
     branch_item = branch_items.get(key)
     merged = merge_items.get(key)
@@ -1167,6 +1174,45 @@ def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[st
     return changed, all_paths
 
 
+def _removed_line_findings(
+    path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
+    main_range: str,
+) -> list[Item]:
+    base = base_text.splitlines()
+    branch = branch_text.splitlines()
+    merge = merge_text.splitlines()
+    branch_added = {
+        line
+        for tag, _old_start, _old_end, new_start, new_end in difflib.SequenceMatcher(
+            None, base, branch, autojunk=False
+        ).get_opcodes()
+        if tag in {"insert", "replace"}
+        for line in branch[new_start:new_end]
+    }
+    findings = []
+    for tag, old_start, old_end, _new_start, _new_end in difflib.SequenceMatcher(
+        None, base, main_text.splitlines(), autojunk=False
+    ).get_opcodes():
+        if tag not in {"delete", "replace"}:
+            continue
+        removed = base[old_start:old_end]
+        for line_number, line in enumerate(removed, old_start + 1):
+            if line in branch_added:
+                continue
+            # Match the deleted hunk with two lines of its original context. This
+            # avoids treating an unrelated repeated line as a resolution error.
+            context_start = max(0, old_start - 2)
+            context_end = min(len(base), old_end + 2)
+            pattern = base[context_start:context_end]
+            for index in range(len(merge) - len(pattern) + 1):
+                if merge[index : index + len(pattern)] == pattern:
+                    findings.append(
+                        Item(path, "main-deleted-line", main_range, line_number, line)
+                    )
+                    break
+    return findings
+
+
 def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: dict) -> list[Item]:
     texts = [sources.get((revision, path)) for revision in revisions]
     if any(text is None or not text for text in texts[:3]) or texts[3] is None:
@@ -1180,7 +1226,9 @@ def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: 
         _owner_translation(path_items[1], path_items[2]),
         _owner_translation(path_items[3], path_items[2]),
     )
-    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps)
+    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps) + _removed_line_findings(
+        path, texts[0], texts[1], texts[2], texts[3], f"{revisions[0]}..{revisions[1]}"
+    )
 
 
 def _parse_merge_data(commit: str, main: str, branch: str, args):
