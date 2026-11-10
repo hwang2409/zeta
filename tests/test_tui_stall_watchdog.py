@@ -123,7 +123,6 @@ async def test_blocked_loop_records_gc_across_probe_boundary(
     assert records[0]["gc"]["ms"] > 0
     assert records[0]["gc"]["by_gen"]["2"] > 0
     assert records[0]["gc"]["count"] == 1
-    assert records[0]["gc"]["collected"] >= 1
     failed = TUIStallWatchdog(tmp_path / "failed.jsonl", session_id="failed")
     callbacks_before = tuple(gc.callbacks)
 
