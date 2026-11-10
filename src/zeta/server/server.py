@@ -465,11 +465,17 @@ class _Client:
                         )
                     )
                 else:
-                    response = self.codec.response(request_id, result)
-                    if request["method"] == "session_history_and_subscribe":
-                        written = await self.connections.admit_join_response(self, response)
+                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
+                        baseline_builder = (
+                            self.connections.child_runs.with_baseline
+                            if request["method"] == "child_run_events"
+                            else None
+                        )
+                        written = await self.connections.admit_join_response(
+                            self, request_id, result, baseline_builder
+                        )
                     else:
-                        written = await self._write(response)
+                        written = await self._write(self.codec.response(request_id, result))
                     if (
                         written
                         and request["method"] == "hello"

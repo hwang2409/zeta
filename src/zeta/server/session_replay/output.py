@@ -387,7 +387,13 @@ class ReplayOutput:
         )
         return True
 
-    async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
+    async def admit_join_response(
+        self,
+        connection: Any,
+        request_id: str | int | None,
+        result: object,
+        baseline_builder: Any = None,
+    ) -> bool:
         state = self._connections.get(connection)
         if state is None or state.output is None:
             self.invalidate_replay_connection(connection)
@@ -396,6 +402,17 @@ class ReplayOutput:
         if output.phase not in {"claimed_buffering", "flushing", "ready"}:
             self.invalidate_replay_connection(connection)
             return False
+        scope = self.replay.scope_for(connection)
+        if scope is None or not self._frontier_holds(connection, scope):
+            self.invalidate_replay_connection(connection)
+            return False
+        if baseline_builder is not None:
+            result = baseline_builder(result)
+        frame = connection.codec.result_response(request_id, result)
+        if frame is None:
+            # fail closed: the client never gets this stream id, so no frame may carry it
+            self.invalidate_replay_connection(connection)
+            return await self.send(connection, connection.codec.response(request_id, result))
         held = self.replay.pending_tail(connection)
         stream_id = self.replay.pending_stream_id(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
