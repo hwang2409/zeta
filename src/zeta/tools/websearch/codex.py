@@ -23,7 +23,6 @@ from ...codex import (
 )
 from ...core.abort import AbortSignal
 from ...core.session import account_home
-from .._web_clients import SessionWebClients
 
 CODEX_SEARCH_MODEL = DEFAULT_CODEX_MODEL
 CODEX_SEARCH_TIMEOUT = 120.0
@@ -209,20 +208,10 @@ async def search(
     *,
     account: AccountId | None = None,
     home: Path | None = None,
-    web_clients: SessionWebClients | None = None,
 ) -> CodexSearchResult:
     registry = AccountStore(account_home(home))
     selected = account or await asyncio.to_thread(registry.resolve_account, "codex")
-    owns_web_clients = web_clients is None
-    if web_clients is None:
-        web_clients = SessionWebClients()
-    try:
-        return await _search_with_account(
-            query, abort_signal, selected, registry, web_clients
-        )
-    finally:
-        if owns_web_clients:
-            await web_clients.close()
+    return await _search_with_account(query, abort_signal, selected, registry)
 
 
 async def _search_with_account(
@@ -230,7 +219,6 @@ async def _search_with_account(
     abort_signal: AbortSignal,
     account: AccountId,
     registry: AccountStore,
-    web_clients: SessionWebClients,
 ) -> CodexSearchResult:
     store = AccountCredentials(
         registry,
@@ -262,9 +250,12 @@ async def _search_with_account(
                 "reasoning": {"summary": "auto"},
                 "include": CODEX_SEARCH_INCLUDE,
             }
-            async with web_clients.codex(timeout) as client, client.stream(
-                "POST", CODEX_API_URL, headers=headers, json=payload
-            ) as response:
+            async with (
+                httpx.AsyncClient(timeout=timeout) as client,
+                client.stream(
+                    "POST", CODEX_API_URL, headers=headers, json=payload
+                ) as response,
+            ):
                 if response.status_code >= 400:
                     raise CodexHTTPError(
                         f"Codex search failed with HTTP {response.status_code}",

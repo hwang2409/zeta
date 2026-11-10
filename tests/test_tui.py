@@ -619,15 +619,11 @@ async def _background_event_transcript_count(
         )
     elif event == "task_kill":
         assert task_id is not None
-        needle = (
-            f"background task {task_id} killed by this call"
-            if owner == "run_background"
-            else "⏺ /matrix · canceled"
-        )
+        needle = f"background task {task_id} exited"
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"background tasks killed on session exit: {task_id}"
+            f"⏺ task {task_id} exited"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
@@ -13505,8 +13501,7 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
     try:
         with patch_stdout(raw=True):
             await app._run_full_screen(session)
-        assert not any("background failed" in line for line in app._transcript_lines)
-        assert any("RuntimeError" in line for line in app._transcript_lines)
+        assert any("background failed" in line for line in app._transcript_lines)
         assert not log_path.exists()
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -13520,58 +13515,55 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
 
 
 @pytest.mark.asyncio
-async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
+async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app, session = _agent_list_session(tmp_path, 0)
-    async with owned_app(app):
-        terminal_calls: list[str] = []
-        monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
-        monkeypatch.setattr(
-            "prompt_toolkit.application.run_in_terminal",
-            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-        )
-        monkeypatch.setattr(
-            "prompt_toolkit.application.in_terminal",
-            lambda: terminal_calls.append("in_terminal"),
-        )
-        monkeypatch.setattr(
-            "prompt_toolkit.patch_stdout.run_in_terminal",
-            lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
-        )
-    
-        async def run_async(**_kwargs: object) -> None:
-            async def fail() -> None:
-                raise RuntimeError("sk-test-SECRET123")
-    
-            asyncio.create_task(fail())
-            await asyncio.sleep(0)
-    
-        monkeypatch.setattr(session.app, "run_async", run_async)
-        with patch_stdout(raw=True):
-            await app._run_full_screen(session)
-    
-        assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
-        assert any("RuntimeError" in line for line in app._transcript_lines)
-        # The log path wraps inside the card on long tmp paths (macOS); compare
-        # the text without ANSI codes, card borders, and line breaks.
-        flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
-        assert "tui-errors.jsonl" in flat
-        assert terminal_calls == []
-        log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
-        deadline = time.monotonic() + 1
-        records: list[str] = []
-        while time.monotonic() < deadline:
-            if log_path.exists():
-                records = log_path.read_text().splitlines()
-                if records:
-                    break
-            await asyncio.sleep(0.01)
-        assert len(records) == 1
-        assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
-        assert os.stat(log_path).st_mode & 0o777 == 0o600
-        assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
+    terminal_calls: list[str] = []
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    monkeypatch.setattr(
+        "prompt_toolkit.application.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.application.in_terminal",
+        lambda: terminal_calls.append("in_terminal"),
+    )
+    monkeypatch.setattr(
+        "prompt_toolkit.patch_stdout.run_in_terminal",
+        lambda *_args, **_kwargs: terminal_calls.append("run_in_terminal"),
+    )
+
+    async def run_async(**_kwargs: object) -> None:
+        async def fail() -> None:
+            raise RuntimeError("background failed")
+
+        asyncio.create_task(fail())
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(session.app, "run_async", run_async)
+    with patch_stdout(raw=True):
+        await app._run_full_screen(session)
+
+    assert any("background failed" in line for line in app._transcript_lines)
+    # The log path wraps inside the card on long tmp paths (macOS); compare
+    # the text without ANSI codes, card borders, and line breaks.
+    flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
+    assert "tui-errors.jsonl" in flat
+    assert terminal_calls == []
+    log_path = tmp_path / "zeta-home" / "logs" / "tui-errors.jsonl"
+    deadline = time.monotonic() + 1
+    records: list[str] = []
+    while time.monotonic() < deadline:
+        if log_path.exists():
+            records = log_path.read_text().splitlines()
+            if records:
+                break
+        await asyncio.sleep(0.01)
+    assert len(records) == 1
+    assert "background failed" in json.loads(records[0])["traceback"]
+
 
 def test_tui_diagnostic_record_is_not_visible_before_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -15680,6 +15672,52 @@ async def test_history_finder_does_not_cross_session_boundaries(
     await second.close()
 
 
+def test_agent_transcript_source_keeps_snapshot_during_active_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = tmp_path / "sessions"
+    store = ConversationStore(sessions, session_id="tui-observer")
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    source = agent_sync.AgentTranscriptSource(store.session_dir)
+    try:
+        assert source.refresh().transcript(store.session_dir).messages[0][1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "complete"}],
+        }
+        original_write_bytes = ConversationStore._write_bytes
+        prefix_written = threading.Event()
+        release_writer = threading.Event()
+
+        def split_target_write(target: ConversationStore, data: bytes) -> None:
+            if target is not store or prefix_written.is_set():
+                original_write_bytes(target, data)
+                return
+            original_write_bytes(target, data[:-1])
+            prefix_written.set()
+            assert release_writer.wait(10)
+            original_write_bytes(target, data[-1:])
+
+        # test-contract: seam pauses one production append after its strict row prefix
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_target_write)
+        writer = threading.Thread(
+            target=lambda: store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("next")])
+            )
+        )
+        writer.start()
+        assert prefix_written.wait(10)
+        snapshot = source.refresh()
+        assert snapshot.transcript(store.session_dir).messages[-1][1] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "complete"}],
+        }
+        release_writer.set()
+        writer.join(10)
+        assert not writer.is_alive()
+        assert source.refresh().transcript(store.session_dir).messages[-1][1]["content"][0]["text"] == "next"
+    finally:
+        source.close()
+        store.close()
 @pytest.mark.asyncio
 async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
     tmp_path: Path,

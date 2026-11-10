@@ -591,7 +591,6 @@ class _Client:
 
     _dispatch = _dispatch_request
 
-
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:
             raise ProtocolError(

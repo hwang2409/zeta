@@ -1012,6 +1012,12 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"content not found","data":{"code":"content_not_found"}}}\n',
     ),
     (
+        ErrorDescriptor.CHILD_RUN_NOT_FOUND,
+        "child run not found",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"child run not found","data":{"code":"child_run_not_found"}}}\n',
+    ),
+    (
         ErrorDescriptor.CORRUPT_TRANSCRIPT,
         "transcript terminated invalid conversation row at row 2 (session s1)",
         {

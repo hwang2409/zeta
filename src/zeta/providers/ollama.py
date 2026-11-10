@@ -25,8 +25,6 @@ from ..protocol.types import (
     ToolUseContent,
 )
 from .completion import (
-    MAX_STALL_RETRIES,
-    TRANSPORT_IDLE_SECONDS,
     CompletionControl,
     CompletionRun,
     IteratorProviderAttempt,
@@ -43,6 +41,8 @@ from .payload_common import (
     provider_messages,
 )
 from .transport import (
+    DEFAULT_STREAM_STALL_RETRIES,
+    DEFAULT_STREAM_STALL_SECONDS,
     HTTPClientLease,
     cleanup_transport,
     close_transport_resources,
@@ -66,11 +66,13 @@ class OllamaError(RuntimeError):
         status_code: int | None = None,
         retry_after: float | None = None,
         retryable: bool = False,
+        is_stall: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
         self.retryable = retryable
+        self.is_stall = is_stall
 
 
 async def _bounded_stream_lines(response: httpx.Response) -> AsyncIterator[bytes]:
@@ -241,18 +243,16 @@ class OllamaBackend(CompletionBackend):
         base_url: str = OLLAMA_API_URL,
         client: httpx.AsyncClient | None = None,
         timeout: float | None = None,
-        stall_seconds: float = TRANSPORT_IDLE_SECONDS,
-        stall_retries: int = MAX_STALL_RETRIES,
+        stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
+        stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
         diagnostics_path: str | Path | None = None,
         token_budget: int | None = None,
         model_context_window: int | None = None,
     ) -> None:
         if not base_url or any(ch.isspace() for ch in base_url):
             raise ValueError("Ollama base URL must be a nonempty URL")
-        if stall_seconds <= 0 or stall_retries < 0:
-            raise ValueError(
-                "Ollama stall seconds must be positive and stall retries nonnegative"
-            )
+        if stall_seconds < 0 or stall_retries < 0:
+            raise ValueError("Ollama stall settings must be nonnegative")
         if model_context_window is None:
             model_context_window = (
                 context_window("ollama", model) or DEFAULT_OLLAMA_TOKEN_BUDGET
@@ -266,7 +266,7 @@ class OllamaBackend(CompletionBackend):
         self.model_context_window = model_context_window
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
         self.set_token_budget(token_budget)
-        # The completion owner enforces stall_seconds. Keep HTTPX from racing it.
+        # The shared watchdog owns read-stall timing. Keep HTTPX from racing it.
         self.timeout = (
             httpx.Timeout(None, connect=10.0, write=10.0, pool=10.0)
             if timeout is None
@@ -286,14 +286,7 @@ class OllamaBackend(CompletionBackend):
         *,
         control: CompletionControl,
     ) -> CompletionRun:
-        return own_completion(
-            self,
-            messages,
-            tool_schemas,
-            control=control,
-            transport_idle=self.stall_seconds,
-            max_stall_retries=self.stall_retries,
-        )
+        return own_completion(self, messages, tool_schemas, control=control)
 
     def create_attempt(
         self,
@@ -347,6 +340,13 @@ class OllamaBackend(CompletionBackend):
         entered = False
         primary_exception: BaseException | None = None
         try:
+            def stall_error(elapsed: float) -> OllamaError:
+                error = OllamaError(
+                    f"Ollama stream stalled for {elapsed:.0f}s", is_stall=True
+                )
+                error.stall_seconds = elapsed
+                return error
+
             stream = client.stream(
                 "POST", f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
             )
