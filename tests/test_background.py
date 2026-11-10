@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import pty
@@ -23,12 +24,14 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.owned import await_or_fail
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -36,7 +39,9 @@ from tests.support.processes import (
     wait_pid_exited,
 )
 from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
+from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -44,34 +49,32 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     StreamEvent,
+    StreamEventType,
     TextContent,
     ToolCall,
     ToolUseContent,
     with_message_origin,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.server import event_contract
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._shared import background_spawn as spawn_module
+from zeta.tools._shared.background_log_writer import _OrderedLogWriter
 from zeta.tools._shared.background_output_archive import _BackgroundOutputArchive
-from zeta.tools._shared.background_spawn import _terminate_process
-from zeta.tools._shared.process import (
-    BackgroundTaskRegistry,
-    TaskExitInput,
-    _BackgroundRecord,
-    _group_exists,
-    _OrderedLogWriter,
-)
-from zeta.tui.render import format_status
+from zeta.tools._shared.background_spawn import _group_exists, _terminate_process
+from zeta.tools._shared.background_task_types import TaskExitInput, _BackgroundRecord
+from zeta.tools._shared.process import BackgroundTaskRegistry
+from zeta.tui.render import format_status, render_event
 
 
 def _python(*parts: str) -> str:
     return shlex.join((sys.executable, "-c", *parts))
 
 
-def _renderable_plain(renderable: object) -> str:
+def _renderable_plain(renderable: object, *, width: int = 80) -> str:
     output = StringIO()
-    Console(file=output, width=80, force_terminal=True).print(renderable)
+    Console(file=output, width=width, force_terminal=True).print(renderable)
     return Text.from_ansi(output.getvalue()).plain
 
 
@@ -226,58 +229,6 @@ async def test_real_background_producers_preserve_owner_on_start_and_exit(
 
 
 @pytest.mark.asyncio
-async def test_wait_returns_terminal_state_after_kill_cancels_monitor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    archive_entered = asyncio.Event()
-    monitor_cancelled = asyncio.Event()
-    release_archive = asyncio.Event()
-    original_archive_record = registry._archive_record
-    original_terminate_process = process_module._terminate_process
-
-    async def terminate_after_archive(*args, **kwargs) -> None:
-        await original_terminate_process(*args, **kwargs)
-        await asyncio.wait_for(archive_entered.wait(), 10)
-
-    async def gated_archive_record(record, log_handle) -> None:
-        archive_entered.set()
-        try:
-            await asyncio.wait_for(release_archive.wait(), 10)
-        except asyncio.CancelledError:
-            monitor_cancelled.set()
-            await asyncio.wait_for(release_archive.wait(), 10)
-            await original_archive_record(record, log_handle)
-            raise
-        await original_archive_record(record, log_handle)
-
-    # test-contract: seam force the archive-pending monitor cancellation order
-    monkeypatch.setattr(registry, "_archive_record", gated_archive_record)
-    # test-contract: seam delay monitor cancellation until archive entry
-    monkeypatch.setattr(process_module, "_terminate_process", terminate_after_archive)
-    monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
-    waiter = asyncio.create_task(registry.wait(task_id))
-    cause = "test requested task stop"
-    killer = asyncio.create_task(registry.kill(task_id, cause=cause))
-    try:
-        await asyncio.wait_for(archive_entered.wait(), 10)
-        await asyncio.wait_for(monitor_cancelled.wait(), 10)
-        release_archive.set()
-
-        status = await asyncio.wait_for(waiter, 10)
-        assert status["running"] is False
-        await asyncio.wait_for(killer, 10)
-        assert registry.snapshot()[0].note == cause
-    finally:
-        release_archive.set()
-        await asyncio.wait_for(
-            asyncio.gather(waiter, killer, return_exceptions=True), 10
-        )
-        await asyncio.wait_for(registry.close(), 10)
-
-
-@pytest.mark.asyncio
 async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
     tmp_path: Path,
 ) -> None:
@@ -303,60 +254,10 @@ async def test_cancelled_wait_caller_does_not_cancel_registry_monitor(
         await asyncio.wait_for(registry.close(), 10)
 
 
-@pytest.mark.asyncio
-async def test_canceled_monitor_propagates_when_record_already_stopped() -> None:
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        "import time; time.sleep(30)",
-        stdout=asyncio.subprocess.PIPE,
-    )
-    record = _BackgroundRecord(
-        task_id="task-cancel",
-        command="sleep",
-        pid=process.pid,
-        process=process,
-    )
-    registry = BackgroundTaskRegistry()
-    monitor = asyncio.create_task(registry._monitor(record))
-    await asyncio.sleep(0)
-    record.running = False
-    monitor.cancel()
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await monitor
-    finally:
-        process.kill()
-        await process.wait()
 
 
 async def _collect(events):
     return [event async for event in events]
-
-
-@pytest.mark.asyncio
-async def test_archive_failure_does_not_replace_task_kill_cause(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    registry = BackgroundTaskRegistry()
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    cause = "test requested task stop"
-
-    async def fail_archive(record, log_handle) -> None:
-        log_handle.close()
-        record.log_fd = None
-        raise OSError("injected archive failure")
-
-    # test-contract: seam force output archiving to fail after the kill cause is durable
-    monkeypatch.setattr(registry, "_archive_record", fail_archive)
-    try:
-        with pytest.raises(OSError, match="injected archive failure"):
-            await asyncio.wait_for(registry.kill(task_id, cause=cause), 10)
-
-        assert registry.snapshot()[0].note == cause
-        assert "failed to archive background task output" in caplog.text
-    finally:
-        await asyncio.wait_for(registry.close(), 10)
 
 
 @pytest.mark.asyncio
@@ -404,13 +305,17 @@ async def test_registry_close_persists_specific_kill_cause(
     task_id, _ = await registry.start(_python("import time; time.sleep(30)"), Path.cwd())
     terminate_processes = process_module._terminate_processes
 
-    async def assert_cause_before_signal(processes, term_grace, *, finish):
+    async def assert_cause_before_signal(
+        processes, term_grace, *, finish, after_signal=None
+    ):
         rows = json.loads((store.session_dir / "background_tasks.json").read_text())
         row = next(row for row in rows if row["task_id"] == task_id)
         assert row["running"] is True
-        assert row["terminal_phase"] == "task_kill"
+        assert row["terminal_phase"] == "session_shutdown"
         assert row["note"] == "tool registry closed"
-        return await terminate_processes(processes, term_grace, finish=finish)
+        return await terminate_processes(
+            processes, term_grace, finish=finish, after_signal=after_signal
+        )
 
     # test-contract: seam inspect the durable record immediately before signaling
     monkeypatch.setattr(
@@ -424,7 +329,7 @@ async def test_registry_close_persists_specific_kill_cause(
         notifications = store.agent_notifications(pending_only=False)
         assert len(notifications) == 1
         assert notifications[0].data["task_id"] == task_id
-        assert notifications[0].data["background_phase"] == "task_kill"
+        assert notifications[0].data["background_phase"] == "session_shutdown"
         assert notifications[0].data["note"] == "tool registry closed"
         assert wakes == 1
     finally:
@@ -517,41 +422,1136 @@ async def test_failed_macro_start_is_visible_once_as_tool_error(tmp_path: Path) 
     await registry.close()
 
 
+async def _cancel_gate(owner, entered, release, *, name: str) -> None:
+    lifecycle = owner.lifecycle
+    assert lifecycle is not None
+    await await_or_fail(entered.wait(), what=f"{name} entered")
+    lifecycle.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await await_or_fail(owner.wait(), what=f"{name} cancellation completion")
+
+
+async def _cancel_at_gate(owner, install, *, name: str) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold() -> None:
+        entered.set()
+        await await_or_fail(release.wait(), what=f"{name} release")
+
+    await install(hold)
+    await _cancel_gate(owner, entered, release, name=name)
+
+
+async def _cancel_process_wait(registry, owner, monkeypatch) -> None:
+    process = owner.process
+    assert process is not None
+    original = process.wait
+
+    async def install(hold):
+        async def wait():
+            await hold()
+            return await original()
+        monkeypatch.setattr(process, "wait", wait)
+
+    await _cancel_at_gate(owner, install, name="process-wait")
+
+
+async def _cancel_reader_drain(registry, owner, monkeypatch) -> None:
+    original = owner._finish_output_drain.wait
+
+    async def install(hold):
+        async def wait():
+            await hold()
+            return await original()
+        monkeypatch.setattr(owner._finish_output_drain, "wait", wait)
+
+    await _cancel_at_gate(owner, install, name="reader-drain")
+
+
+async def _cancel_writer_close(registry, owner, monkeypatch) -> None:
+    original = _OrderedLogWriter.close
+
+    async def install(hold):
+        async def close(writer):
+            await hold()
+            return await original(writer)
+        monkeypatch.setattr(_OrderedLogWriter, "close", close)
+
+    await _cancel_at_gate(owner, install, name="writer-close")
+
+
+async def _cancel_archive(registry, owner, monkeypatch) -> None:
+    tasks = registry.background_tasks
+    archive = tasks._archive
+    assert archive is not None
+    original_append = archive.append
+    append_entered = asyncio.Event()
+    release_append = threading.Event()
+    loop = asyncio.get_running_loop()
+    source_fds: list[int] = []
+
+    def append(task_id: str, source_fd: int, length: int) -> None:
+        source_fds.append(source_fd)
+        loop.call_soon_threadsafe(append_entered.set)
+        assert release_append.wait(timeout=10)
+        original_append(task_id, source_fd, length)
+
+    # test-contract: seam cancel the real cleanup task inside the real archive append.
+    monkeypatch.setattr(archive, "append", append)
+    try:
+        await await_or_fail(append_entered.wait(), what="archive append entered")
+        lifecycle = owner.lifecycle
+        assert lifecycle is not None
+        cleanup = lifecycle.get_stack()[-1].f_locals["cleanup"]
+        cleanup.cancel()
+        cancellation_delivered = asyncio.Event()
+        loop.call_soon(cancellation_delivered.set)
+        await await_or_fail(
+            cancellation_delivered.wait(), what="archive cancellation delivered"
+        )
+
+        os.fstat(source_fds[0])
+        assert not owner.terminal_durable.is_set()
+        assert archive.pread(owner.record.task_id, 0, owner.record.total_bytes) == b""
+
+        release_append.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(owner.wait(), what="archive cancellation completion")
+
+        assert owner.terminal_durable.is_set()
+        assert archive.pread(
+            owner.record.task_id, 0, owner.record.total_bytes
+        ) == bytes(owner.record.output)
+    finally:
+        release_append.set()
+
+
+async def _cancel_persist(registry, owner, monkeypatch) -> None:
+    owner_registry = registry.background_tasks
+    original = owner_registry._commit_transition
+
+    async def install(hold):
+        async def commit(*args, **kwargs):
+            await hold()
+            return await original(*args, **kwargs)
+        # test-contract: seam gate terminal persistence at the owner await
+        monkeypatch.setattr(owner_registry, "_commit_transition", commit)
+
+    await _cancel_at_gate(owner, install, name="persist")
+
+
+async def _cancel_evidence(registry, owner, monkeypatch) -> None:
+    owner_registry = registry.background_tasks
+    original = owner_registry._notification_sink
+
+    async def install(hold):
+        async def sink(item):
+            await hold()
+            return await original(item)
+        # test-contract: seam gate evidence delivery at the owner await
+        monkeypatch.setattr(owner_registry, "_notification_sink", sink)
+
+    await _cancel_at_gate(owner, install, name="evidence")
+
+
+async def _cancel_install(registry, owner, monkeypatch) -> None:
+    original = owner._deliver_exit
+
+    async def install(hold):
+        async def deliver(item):
+            await hold()
+            return await original(item)
+        # test-contract: seam gate the install predecessor at the owner await
+        monkeypatch.setattr(owner, "_deliver_exit", deliver)
+
+    await _cancel_at_gate(owner, install, name="install")
+
+
+async def _cancel_notice(registry, owner, monkeypatch) -> None:
+    entered = asyncio.Event()
+    owner_registry = registry.background_tasks
+    original = owner_registry._notice
+
+    def notice(value):
+        entered.set()
+        lifecycle = owner.lifecycle
+        assert lifecycle is not None
+        lifecycle.cancel()
+        original(value)
+
+    # test-contract: seam gate the synchronous lifecycle notice
+    monkeypatch.setattr(owner_registry, "_notice", notice)
+    await await_or_fail(entered.wait(), what="notice entered")
+    with pytest.raises(asyncio.CancelledError):
+        await await_or_fail(owner.wait(), what="notice cancellation completion")
+
+
+_CANCEL_ROW_HANDLERS = {
+    "process-wait": _cancel_process_wait,
+    "reader-drain": _cancel_reader_drain,
+    "ordered-writer-close": _cancel_writer_close,
+    "archive": _cancel_archive,
+    "persist": _cancel_persist,
+    "evidence-submit": _cancel_evidence,
+    "install": _cancel_install,
+    "notice": _cancel_notice,
+}
+
+
+async def _cancel_close_at(
+    registry, store, task_id: str, row: str, install
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    await install(entered, release)
+    closing = asyncio.create_task(registry.close())
+    try:
+        await await_or_fail(entered.wait(), what=f"{row} entered")
+        closing.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(closing, what=f"{row} cancellation completion")
+        await await_or_fail(registry.close(), what=f"{row} close completion")
+        rows = json.loads(
+            (store.session_dir / "background_tasks.json").read_text()
+        )
+        assert rows and all(not item["running"] for item in rows)
+        assert len(store.agent_notifications(pending_only=False)) == 1
+        assert (await registry.execute(
+            ToolCall("output", "task_output", {"task_id": task_id})
+        ))["structuredContent"]["running"] is False
+    finally:
+        release.set()
+        if not closing.done():
+            closing.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(closing, return_exceptions=True), 10
+            )
+
+
 @pytest.mark.asyncio
-async def test_task_kill_tool_records_agent_as_cause(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "row",
+    [
+        "1-natural-exit-wins-kill-race",
+        "2-agent-kill-wins",
+        "3-external-cause",
+        "4-exit-evidence-precedes-not-running",
+        "natural-exit-success",
+        "persist-failure-retries-same-candidate",
+        "duplicate-input",
+        "durable-receipt-dedupe-after-eviction",
+        "live-close-defers-receipt",
+        "restart-recovers-running-row",
+        "suppressed-task-stays-suppressed",
+        "legacy-pending-recovers-once",
+        "cancel-process-wait",
+        "cancel-reader-drain",
+        "cancel-live-group-probe",
+        "cancel-ordered-writer-close",
+        "cancel-archive",
+        "cancel-persist",
+        "cancel-evidence-submit",
+        "cancel-install",
+        "cancel-notice",
+        "cancel-close-snapshot",
+        "cancel-close-finish-owners",
+        "cancel-close-terminate",
+        "cancel-close-wait-until-durable",
+        "cancel-close-aggregate-notice",
+        "cancel-close-release-receipts",
+        "cancel-close-coordinator",
+        "archive-failure-recovers-once",
+        "restart-durable-terminal-notify-true",
+        "restart-durable-terminal-notify-false",
+        "two-task-close-ordering",
+        "two-task-close-cancellation",
+        "persistent-terminal-write-failure-close",
+        "crash-before-aggregate",
+        "group-exit-after-positive-probe",
+    ],
+)
+async def test_background_task_owner_state_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    async with contextlib.AsyncExitStack() as stack:
+        store = ConversationStore(tmp_path / row)
+        stack.callback(store.close)
+        registry = ToolRegistry(
+            tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+        )
+        stack.push_async_callback(registry.close)
+        flow = pending_delivery_module.StepDeliveryFlow(store)
+        registry.background_tasks.set_notification_sink(
+            lambda item: flow.produce(_task_notification(item))
+        )
+
+        async def start_registered(command: str) -> str:
+            result = await registry.execute(
+                ToolCall("start", "run_background", {"command": command})
+            )
+            return result["structuredContent"]["task_id"]
+
+        async def output_registered(task_id: str) -> dict[str, object]:
+            result = await registry.execute(
+                ToolCall("output", "task_output", {"task_id": task_id})
+            )
+            return result["structuredContent"]
+
+        if row == "cancel-live-group-probe":
+            child_ready = tmp_path / "detached-probe-child"
+            probe_entered = asyncio.Event()
+            probed_pids: list[int] = []
+            original_group_exists = owner_module._group_exists
+
+            def group_exists(pid: int) -> bool:
+                exists = original_group_exists(pid)
+                if exists and child_ready.exists():
+                    probed_pids.append(pid)
+                    probe_entered.set()
+                return exists
+
+            # test-contract: seam hold cancellation at the live-group probe await
+            monkeypatch.setattr(owner_module, "_group_exists", group_exists)
+            child = "import os,signal; print(os.getpid(), flush=True); signal.pause()"
+            leader = (
+                "import pathlib,subprocess,sys\n"
+                f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
+                "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)\n"
+                f"pathlib.Path({str(child_ready)!r}).write_text(child.stdout.readline())\n"
+            )
+            task_id = await start_registered(_python(leader))
+            owner = registry.background_tasks._owners[task_id]
+            leader_pid = owner.record.pid
+            child_pid = await read_pid_file(child_ready)
+            try:
+                await await_or_fail(probe_entered.wait(), what="live group probe")
+                assert probed_pids == [leader_pid]
+                lifecycle = owner.lifecycle
+                assert lifecycle is not None
+                lifecycle.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await await_or_fail(
+                        owner.wait(), what="probe cancellation completion"
+                    )
+                await wait_pid_exited(child_pid)
+                assert (await output_registered(task_id))["running"] is False
+                rows = json.loads(
+                    (store.session_dir / "background_tasks.json").read_text()
+                )
+                assert rows and all(not item["running"] for item in rows)
+            finally:
+                kill_group_if_present(leader_pid)
+            return
+
+        if row.startswith("cancel-close-") and row != "cancel-close-coordinator":
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            owner = registry.background_tasks._owners[task_id]
+
+            async def install(entered, release):
+                if row == "cancel-close-snapshot":
+                    async def pending_start():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="snapshot release")
+                    pending = asyncio.create_task(pending_start())
+                    registry.background_tasks._pending_starts.add(pending)
+                    pending.add_done_callback(
+                        registry.background_tasks._pending_starts.discard
+                    )
+                elif row == "cancel-close-finish-owners":
+                    original = owner.finish_for_close
+                    async def finish(cause):
+                        entered.set()
+                        await await_or_fail(release.wait(), what="finish release")
+                        return await original(cause)
+                    monkeypatch.setattr(owner, "finish_for_close", finish)
+                elif row == "cancel-close-terminate":
+                    original = registry.background_tasks._terminate_owned
+                    async def terminate(*args, **kwargs):
+                        entered.set()
+                        await await_or_fail(release.wait(), what="terminate release")
+                        return await original(*args, **kwargs)
+                    # test-contract: seam gate the close terminator await.
+                    monkeypatch.setattr(registry.background_tasks, "_terminate_owned", terminate)
+                elif row == "cancel-close-wait-until-durable":
+                    original = owner.wait_until_durable
+                    async def durable():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="durable release")
+                        return await original()
+                    monkeypatch.setattr(owner, "wait_until_durable", durable)
+                elif row == "cancel-close-release-receipts":
+                    original = owner.release_close_receipt
+                    async def receipt():
+                        entered.set()
+                        await await_or_fail(release.wait(), what="receipt release")
+                        return await original()
+                    monkeypatch.setattr(owner, "release_close_receipt", receipt)
+                else:
+                    original = registry.background_tasks._notice
+                    def notice(value):
+                        if hasattr(value, "tasks"):
+                            entered.set()
+                            current = asyncio.current_task()
+                            # test-contract: seam cancel at aggregate notice.
+                            assert current is not None
+                            current.cancel()
+                        return original(value)
+                    # test-contract: seam gate the aggregate notice await.
+                    monkeypatch.setattr(registry.background_tasks, "_notice", notice)
+
+            await _cancel_close_at(registry, store, task_id, row, install)
+            return
+
+        if row == "cancel-close-coordinator":
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            closing = asyncio.create_task(registry.close())
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, 10)
+            await asyncio.wait_for(registry.close(), 10)
+            assert (await output_registered(task_id))["running"] is False
+            return
+
+        if row == "cancel-process-wait":
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_wait = asyncio.subprocess.Process.wait
+
+            async def gated_wait(process):
+                entered.set()
+                await await_or_fail(release.wait(), what="process-wait release")
+                return await original_wait(process)
+
+            monkeypatch.setattr(asyncio.subprocess.Process, "wait", gated_wait)
+            task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
+            owner = registry.background_tasks._owners[task_id]
+            await _cancel_gate(owner, entered, release, name="process-wait")
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
+            return
+
+        if row.startswith("cancel-"):
+            task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
+            owner = registry.background_tasks._owners[task_id]
+            handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
+            await handler(registry, owner, monkeypatch)
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
+            assert owner.record.terminal_phase in {"natural_exit", "task_kill", "session_shutdown"}
+            return
+
+        if row == "archive-failure-recovers-once":
+            task_id = await start_registered(_python("print('archive-me')"))
+            archive = registry.background_tasks._archive
+            assert archive is not None
+            original_append = archive.append
+            failed = False
+
+            def fail_once(*args, **kwargs):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("archive failed")
+                return original_append(*args, **kwargs)
+
+            monkeypatch.setattr(archive, "append", fail_once)
+            with pytest.raises(OSError, match="archive failed"):
+                await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert failed is True
+            assert status["running"] is False
+            assert "archive failed" in status["note"] or "recovery" in status["note"]
+            return
+
+        if row in {"restart-durable-terminal-notify-true", "restart-durable-terminal-notify-false"}:
+            await registry.close()
+            task_id = "durable-terminal"
+            persisted = {
+                "task_id": task_id, "command": "old command", "pid": 12345,
+                "running": False, "exit_code": 0, "note": "done",
+                "owner": "run_background",
+                "notify_on_exit": row.endswith("true"),
+            }
+            (store.session_dir / "background_tasks.json").write_text(
+                json.dumps([persisted]), encoding="utf-8"
+            )
+            resumed = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+            stack.push_async_callback(resumed.close)
+            pending = resumed.background_tasks.set_notification_sink(
+                lambda item: flow.produce(_task_notification(item))
+            )
+            for item in pending:
+                await resumed.background_tasks.deliver_recovered_exit(item)
+            receipts = store.agent_notifications(pending_only=False)
+            assert bool(receipts) is row.endswith("true")
+            return
+
+        if row == "persistent-terminal-write-failure-close":
+            events: list[str] = []
+            original_notice = registry.background_tasks._notice
+            registry.background_tasks._notice = lambda notice: (
+                events.append("aggregate") if hasattr(notice, "tasks") else None,
+                original_notice(notice),
+            )[1]
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            original_commit = registry.background_tasks._commit_transition
+
+            async def fail_terminal_write(rows, publish, notice):
+                if any(
+                    item["task_id"] == task_id and not item["running"]
+                    for item in rows
+                ):
+                    raise OSError("terminal write failed permanently")
+                return await original_commit(rows, publish, notice)
+
+            # test-contract: seam inject persistent terminal-write failure
+            monkeypatch.setattr(
+                registry.background_tasks, "_commit_transition", fail_terminal_write
+            )
+            with pytest.raises(OSError, match="terminal write failed permanently"):
+                await asyncio.wait_for(registry.close(), 10)
+            # test-contract: seam aggregate callback is the required internal absence check
+            assert events == []
+            assert store.agent_notifications(pending_only=False) == []
+            # The owner is intentionally still running in storage after the
+            # bounded failure; finish fixture cleanup without retrying close.
+            registry.background_tasks._closed = True
+            registry.background_tasks._closing = False
+            return
+
+        if row in {"two-task-close-ordering", "two-task-close-cancellation"}:
+            events: list[str] = []
+            task_ids: list[str] = []
+            original_notice = registry.background_tasks._notice
+
+            def record_aggregate(notice):
+                if hasattr(notice, "tasks"):
+                    rows = json.loads(
+                        (store.session_dir / "background_tasks.json").read_text()
+                    )
+                    by_id = {item["task_id"]: item for item in rows}
+                    assert all(by_id[task_id]["running"] is False for task_id in task_ids)
+                    events.append("aggregate")
+                return original_notice(notice)
+
+            registry.background_tasks._notice = record_aggregate
+            original_produce = flow.produce
+
+            async def record_receipt(item):
+                events.append("receipt")
+                return await original_produce(item)
+
+            monkeypatch.setattr(flow, "produce", record_receipt)
+            task_ids.extend(
+                [
+                    await start_registered(_python("import time; time.sleep(30)")),
+                    await start_registered(_python("import time; time.sleep(30)")),
+                ]
+            )
+            if row.endswith("cancellation"):
+                closing = asyncio.create_task(registry.close())
+                closing.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(closing, 10)
+            await asyncio.wait_for(registry.close(), 10)
+            assert events.count("aggregate") == 1
+            assert events.count("receipt") == 2
+            assert events.index("aggregate") < events.index("receipt")
+            return
+
+        if row == "crash-before-aggregate":
+            eligible = [
+                await start_registered(_python("import time; time.sleep(30)"))
+                for _ in range(2)
+            ]
+            suppressed, _ = await registry.background_tasks.start(
+                _python("import time; time.sleep(30)"),
+                tmp_path,
+                notify_on_exit=False,
+                owner="background_macro",
+            )
+            original_notice = registry.background_tasks._notice
+
+            def crash_aggregate(notice):
+                if hasattr(notice, "tasks"):
+                    raise RuntimeError("aggregate crash")
+                original_notice(notice)
+
+            registry.background_tasks._notice = crash_aggregate
+            registry.background_tasks.begin_shutdown("session shutdown")
+            with pytest.raises(RuntimeError, match="aggregate crash"):
+                await registry.close()
+            registry.background_tasks._notice = original_notice
+            persisted = json.loads(
+                (store.session_dir / "background_tasks.json").read_text()
+            )
+            by_id = {item["task_id"]: item for item in persisted}
+            assert all(by_id[task_id]["running"] is False for task_id in eligible)
+            assert all(
+                by_id[task_id]["terminal_phase"] == "session_shutdown"
+                and "session" in by_id[task_id]["note"]
+                for task_id in eligible
+            )
+            assert by_id[suppressed]["running"] is False
+            assert by_id[suppressed]["notify_on_exit"] is False
+            assert store.agent_notifications(pending_only=False) == []
+
+            store.close()
+            resumed_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
+            )
+            resumed_loop = AgentLoop(
+                FakeBackend([]),
+                resumed_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            )
+            resumed_notices = []
+            resumed_loop.tool_registry.background_tasks.set_notice_sink(
+                resumed_notices.append
+            )
+            assert len(resumed_loop._pending_task_recovery) == 2
+            await resumed_loop.activate()
+            receipts = [
+                entry
+                for entry in resumed_store.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "task_exited"
+            ]
+            assert {entry.data["task_id"] for entry in receipts} == set(eligible)
+            assert all(
+                entry.data["background_phase"] == "session_shutdown"
+                and "session" in entry.data["note"]
+                for entry in receipts
+            )
+            assert not any(
+                getattr(notice, "phase", None) == "session_shutdown"
+                for notice in resumed_notices
+            )
+            flow = pending_delivery_module.StepDeliveryFlow(resumed_store)
+            await flow.prepare_request("terminal_fallback", [], None)
+            await flow.acknowledge_active()
+            for receipt in receipts:
+                resumed_store.append_compaction_marker(
+                    "task exit receipt evicted",
+                    receipt.seq,
+                    receipt.seq,
+                    kind="evict",
+                    view=[
+                        {
+                            "seq": receipt.seq,
+                            "message": Message(
+                                MessageRole.ASSISTANT,
+                                [TextContent("[task exit receipt evicted]")],
+                                metadata={
+                                    "context_evicted": True,
+                                    "eviction_receipt": "assistant",
+                                    "source_seq": receipt.seq,
+                                },
+                            ).to_dict(),
+                        }
+                    ],
+                )
+            assembler = ContextAssembler(
+                resumed_store,
+                token_budget=1000,
+                retained_tail=1,
+                token_counter=lambda _message: 1,
+            )
+            await assembler.assemble_context(
+                force=True, bypass_eviction_hysteresis=True
+            )
+            assert all(
+                any(
+                    entry.type == "compaction"
+                    and entry.data["source_seq_start"] <= receipt.seq
+                    <= entry.data["source_seq_end"]
+                    for entry in resumed_store.replay()
+                )
+                for receipt in receipts
+            )
+            await resumed_loop.close()
+            resumed_store.close()
+
+            second_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
+            )
+            second_loop = AgentLoop(
+                FakeBackend([]),
+                second_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            )
+            await second_loop.activate()
+            assert len(
+                [
+                    entry
+                    for entry in second_store.agent_notifications(pending_only=False)
+                    if entry.data.get("kind") == "task_exited"
+                ]
+            ) == 2
+            await second_loop.close()
+            second_store.close()
+            return
+
+        if row == "group-exit-after-positive-probe":
+            task_id = await start_registered(_python("print('positive-probe')"))
+            await _wait_for_exit(registry.background_tasks, task_id)
+            assert (await output_registered(task_id))["running"] is False
+            return
+
+        if row in {
+            "restart-recovers-running-row",
+            "suppressed-task-stays-suppressed",
+            "legacy-pending-recovers-once",
+        }:
+            await registry.close()
+            task_id = "persisted-task"
+            persisted: dict[str, object] = {
+                "task_id": task_id,
+                "command": "old command",
+                "pid": 12345,
+                "running": row != "legacy-pending-recovers-once",
+                "exit_code": None,
+                "note": "old terminal",
+                "owner": "run_background",
+            }
+            if row == "suppressed-task-stays-suppressed":
+                persisted["notify_on_exit"] = False
+            elif row == "restart-recovers-running-row":
+                persisted["notify_on_exit"] = True
+            else:
+                persisted["receipt_pending"] = True
+            (store.session_dir / "background_tasks.json").write_text(
+                json.dumps([persisted]), encoding="utf-8"
+            )
+            store.close()
+            resumed_store = ConversationStore(
+                tmp_path / row, session_id=store.session_id
+            )
+            resumed_loop = AgentLoop(
+                FakeBackend([]),
+                resumed_store,
+                max_turns=1,
+                skill_catalog=SkillCatalog.empty(),
+            )
+            try:
+                await resumed_loop.activate()
+                receipts = resumed_store.agent_notifications(pending_only=False)
+                if row == "suppressed-task-stays-suppressed":
+                    assert receipts == []
+                else:
+                    assert len(receipts) == 1
+                    assert receipts[0].data["task_id"] == task_id
+                    await resumed_loop.activate()
+                    assert len(
+                        resumed_store.agent_notifications(pending_only=False)
+                    ) == 1
+            finally:
+                await resumed_loop.close()
+                resumed_store.close()
+            return
+
+        if row in {"duplicate-input", "durable-receipt-dedupe-after-eviction"}:
+            item = TaskExitInput(
+                task_id="dedupe-task",
+                command="printf done",
+                exit_code=0,
+                note="exited with code 0",
+                owner="run_background",
+                phase="natural_exit",
+            )
+            await flow.produce(_task_notification(item))
+            await flow.produce(_task_notification(item))
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            if row == "duplicate-input":
+                return
+            await flow.prepare_request("terminal_fallback", [], None)
+            await flow.acknowledge_active()
+            receipt = store.agent_notifications(pending_only=False)[0]
+            store.append_compaction_marker(
+                "receipt evicted",
+                receipt.seq,
+                receipt.seq,
+                kind="evict",
+                view=[
+                    {
+                        "seq": receipt.seq,
+                        "message": Message(
+                            MessageRole.ASSISTANT,
+                            [TextContent("[task exit receipt evicted]")],
+                            metadata={
+                                "context_evicted": True,
+                                "eviction_receipt": "assistant",
+                                "source_seq": receipt.seq,
+                            },
+                        ).to_dict(),
+                    }
+                ],
+            )
+            assembler = ContextAssembler(
+                store,
+                token_budget=1000,
+                retained_tail=1,
+                token_counter=lambda _message: 1,
+            )
+            await assembler.assemble_context(
+                force=True, bypass_eviction_hysteresis=True
+            )
+            marker = next(
+                entry
+                for entry in store.replay()
+                if entry.type == "compaction"
+                and entry.data["source_seq_start"] <= receipt.seq
+                <= entry.data["source_seq_end"]
+            )
+            assert marker.data["source_seq_start"] <= receipt.seq
+            await flow.produce(_task_notification(item))
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "4-exit-evidence-precedes-not-running":
+            from tests.test_agent import (
+                _completion_after_publication,
+                _start_task_gate,
+                _TaskFinishGateBackend,
+            )
+
+            backend = _TaskFinishGateBackend(
+                _python("import time; time.sleep(30)"), action="kill"
+            )
+            gate_store, gate_loop, run, completion_published = await _start_task_gate(
+                tmp_path / "finish-gate", backend
+            )
+            try:
+                await asyncio.wait_for(run, 10)
+                completion = await _completion_after_publication(
+                    gate_store, completion_published
+                )
+                child_path = Path(completion.data["child_session_path"])
+                child_store = ConversationStore(
+                    child_path.parent, session_id=child_path.name
+                )
+                try:
+                    task_receipts = [
+                        entry
+                        for entry in child_store.agent_notifications(
+                            pending_only=False
+                        )
+                        if entry.data.get("kind") == "task_exited"
+                    ]
+                    assert len(task_receipts) == 1
+                    rows = json.loads(
+                        (child_store.session_dir / "background_tasks.json").read_text()
+                    )
+                    assert len(rows) == 1
+                    assert rows[0]["running"] is False
+                    assert task_receipts[0].data["background_phase"] == rows[0]["terminal_phase"]
+                finally:
+                    child_store.close()
+            finally:
+                await gate_loop.close()
+                gate_store.close()
+            return
+
+        if row == "persist-failure-retries-same-candidate":
+            task_id = await start_registered(_python("print('done')"))
+            original_commit = registry.background_tasks._commit_transition
+            failed = False
+
+            async def fail_terminal_once(rows, publish, notice):
+                nonlocal failed
+                if not failed and any(item["task_id"] == task_id and not item["running"] for item in rows):
+                    failed = True
+                    raise OSError("terminal write failed")
+                return await original_commit(rows, publish, notice)
+
+            # test-contract: seam fail the terminal persistence after process exit
+            monkeypatch.setattr(
+                registry.background_tasks, "_commit_transition", fail_terminal_once
+            )
+            await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert failed is True
+            assert status["running"] is False
+            assert status["exit_code"] == 0
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "natural-exit-success":
+            task_id = await start_registered(_python("print('done')"))
+            await _wait_for_exit(registry.background_tasks, task_id)
+            status = await output_registered(task_id)
+            assert status["running"] is False
+            assert status["exit_code"] == 0
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "live-close-defers-receipt":
+            receipt_entered = asyncio.Event()
+            release_receipt = asyncio.Event()
+            produce = flow.produce
+
+            async def gated_close_receipt(item):
+                receipt_entered.set()
+                await asyncio.wait_for(release_receipt.wait(), 10)
+                return await produce(item)
+
+            monkeypatch.setattr(flow, "produce", gated_close_receipt)
+            task_id = await start_registered(_python("import time; time.sleep(30)"))
+            closing = asyncio.create_task(registry.close())
+            try:
+                await asyncio.wait_for(receipt_entered.wait(), 10)
+                assert not closing.done()
+                persisted = json.loads(
+                    (store.session_dir / "background_tasks.json").read_text()
+                )
+                task_row = next(item for item in persisted if item["task_id"] == task_id)
+                assert task_row["running"] is False
+                assert store.agent_notifications(pending_only=False) == []
+            finally:
+                release_receipt.set()
+            await asyncio.wait_for(closing, 10)
+            assert len(store.agent_notifications(pending_only=False)) == 1
+            return
+
+        if row == "1-natural-exit-wins-kill-race":
+            task_id = await start_registered(
+                _python("import sys; sys.stdin.read(1); raise SystemExit(7)")
+            )
+            termination_entered = asyncio.Event()
+            release_termination = asyncio.Event()
+            terminator_name = (
+                "_terminate_processes"
+                if hasattr(process_module, "_terminate_processes")
+                else "_terminate_process"
+            )
+            terminator = getattr(process_module, terminator_name)
+
+            async def gated_terminator(*args, **kwargs):
+                termination_entered.set()
+                await asyncio.wait_for(release_termination.wait(), 10)
+                return await terminator(*args, **kwargs)
+
+            # test-contract: seam hold the shared group terminator while the process exits
+            monkeypatch.setattr(process_module, terminator_name, gated_terminator)
+            killing = asyncio.create_task(
+                registry.execute(ToolCall("kill", "task_kill", {"task_id": task_id}))
+            )
+            try:
+                await asyncio.wait_for(termination_entered.wait(), 10)
+                await asyncio.wait_for(
+                    registry.background_tasks.input(task_id, "x", eof=True), 10
+                )
+                terminal = await asyncio.wait_for(
+                    registry.background_tasks.wait(task_id), 10
+                )
+                assert terminal["exit_code"] == 7
+            finally:
+                release_termination.set()
+            result = await asyncio.wait_for(killing, 10)
+            assert result["content"][0]["text"] == (
+                f"background task {task_id} exited, code 7"
+            )
+            outcome = result["structuredContent"]
+            assert outcome.get("killed_by_this_call") is False
+            assert outcome.get("cause") is None
+            assert outcome.get("exit_code") == 7
+            return
+
+        task_id = await start_registered(_python("import time; time.sleep(30)"))
+        if row == "3-external-cause":
+            cause = "task safety deadline expired"
+            outcome = await asyncio.wait_for(
+                registry.background_tasks.kill(task_id, cause=cause), 10
+            )
+            assert outcome.get("killed_by_this_call") is True
+            assert outcome.get("cause") == cause
+            assert outcome.get("status") == "killed"
+            assert outcome.get("exit_code") is not None
+            return
+
+        call = ToolCall("kill", "task_kill", {"task_id": task_id})
+        result = await asyncio.wait_for(registry.execute(call), 10)
+        cause = "task_kill tool requested by the agent"
+        outcome = result["structuredContent"]
+        assert outcome.get("killed_by_this_call") is True
+        assert outcome.get("cause") == cause
+        assert outcome.get("status") == "killed"
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=receipt_tool_result(call.id, result),
+        )
+        rendered = render_event(event)
+        assert rendered is not None
+        card = _renderable_plain(rendered, width=120)
+        assert "killed by this call" in card
+        assert cause in card
+        projected = event_contract.tool_end(event)
+        assert "killed by this call" in projected["tool_result"]["content"]
+        assert projected["tool_result"]["structured_content"]["cause"] == cause
+
+
+_ARCHIVE_NOTE = "background output archive failed; recovery will retry the retained log"
+
+
+def _fail_archive_append(tasks: BackgroundTaskRegistry, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        raise OSError("forced archive failure")
+
+    assert tasks._archive is not None
+    # test-contract: seam inject archive failure through the owner's real archive call
+    monkeypatch.setattr(tasks._archive, "append", fail)
+
+
+@pytest.mark.asyncio
+async def test_kill_cause_leads_archive_note_published_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    tasks = tools.background_tasks
     flow = pending_delivery_module.StepDeliveryFlow(store)
-    registry = ToolRegistry(
-        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
-    )
-    registry.background_tasks.set_notification_sink(
-        lambda item: flow.produce(_task_notification(item))
-    )
-    task_id, _ = await registry.background_tasks.start(
-        _python("import time; time.sleep(30)"), Path.cwd()
-    )
+    tasks.set_notification_sink(lambda item: flow.produce(_task_notification(item)))
+    cause = "test kill after archive failure"
+    archive_noted = asyncio.Event()
+    claimed = asyncio.Event()
+    release_terminal = asyncio.Event()
+    original_finish = owner_module._BackgroundTaskOwner._finish_terminal
+    original_claim = owner_module._BackgroundTaskOwner._claim_termination
 
-    await registry.execute(
-        ToolCall("kill", "task_kill", {"task_id": task_id})
-    )
+    async def gated_finish(self, exit_code):
+        archive_noted.set()
+        await await_or_fail(release_terminal.wait(), what="terminal release")
+        return await original_finish(self, exit_code)
 
-    task_exits = [
-        entry
-        for entry in store.agent_notifications(pending_only=False)
-        if entry.data.get("kind") == "task_exited"
-    ]
-    assert len(task_exits) == 1
-    assert task_exits[0].data["task_id"] == task_id
-    assert task_exits[0].data["note"] == "task_kill tool requested by the agent"
-    assert store.is_agent_notification_presented_to_tui(task_exits[0].id)
-    await registry.close()
-    assert len(store.agent_notifications(pending_only=False)) == 1
-    store.close()
+    async def signalled_claim(self, *args, **kwargs):
+        result = await original_claim(self, *args, **kwargs)
+        claimed.set()
+        return result
+
+    _fail_archive_append(tasks, monkeypatch)
+    # test-contract: seam hold the owner between archive-note publication and terminal commit
+    monkeypatch.setattr(owner_module._BackgroundTaskOwner, "_finish_terminal", gated_finish)
+    # test-contract: seam signal once the concurrent kill has published its cause
+    monkeypatch.setattr(owner_module._BackgroundTaskOwner, "_claim_termination", signalled_claim)
+    killer: asyncio.Task[dict[str, object]] | None = None
+    try:
+        task_id, _ = await tasks.start("true", tmp_path)
+        await await_or_fail(archive_noted.wait(), what="archive note published")
+        assert tasks._owners[task_id].record.note == _ARCHIVE_NOTE
+        killer = asyncio.create_task(tasks.kill(task_id, cause=cause))
+        await await_or_fail(claimed.wait(), what="kill cause published")
+        release_terminal.set()
+        with pytest.raises(OSError, match="forced archive failure"):
+            await await_or_fail(killer, what="kill completion")
+        rows = json.loads((store.session_dir / "background_tasks.json").read_text())
+        receipts = [
+            entry
+            for entry in store.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert rows[0]["note"] == f"{cause}; {_ARCHIVE_NOTE}"
+        assert len(receipts) == 1
+        assert receipts[0].data["note"] == f"{cause}; {_ARCHIVE_NOTE}"
+        # the precedence state is runtime-only: the real stored row never carries it
+        assert "note_priority" not in rows[0]
+    finally:
+        release_terminal.set()
+        if killer is not None:
+            await asyncio.wait_for(asyncio.gather(killer, return_exceptions=True), 10)
+        await asyncio.wait_for(tools.close(), 10)
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["archive", "kill", "shutdown", "cutoff"])
+async def test_terminal_note_writer_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    store = ConversationStore(tmp_path / "session")
+    tools = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
+    tasks = tools.background_tasks
+    cause = f"table {writer} cause"
+    try:
+        if writer == "archive":
+            _fail_archive_append(tasks, monkeypatch)
+            task_id, _ = await tasks.start("true", tmp_path)
+            with pytest.raises(OSError, match="forced archive failure"):
+                await await_or_fail(tasks.wait(task_id), what="archive failure exit")
+            expected = _ARCHIVE_NOTE
+        elif writer == "kill":
+            task_id, _ = await tasks.start("sleep 30", tmp_path)
+            await await_or_fail(tasks.kill(task_id, cause=cause), what="kill")
+            expected = cause
+        else:
+            if writer == "cutoff":
+                held = asyncio.Event()
+
+                async def held_output(*args: object, **kwargs: object) -> None:
+                    await asyncio.wait_for(held.wait(), 10)
+
+                # test-contract: seam keep task output open so close must cut it off
+                monkeypatch.setattr(tasks, "_read_output", held_output)
+                monkeypatch.setattr(process_module, "BACKGROUND_OUTPUT_DRAIN_TIMEOUT", 0.0)
+            task_id, _ = await tasks.start("sleep 30", tmp_path)
+            tasks.begin_shutdown(cause)
+            await await_or_fail(tasks.close(), what="shutdown")
+            expected = cause if writer == "shutdown" else f"{cause}; {owner_module.OUTPUT_CUTOFF_NOTE}"
+        rows = json.loads((store.session_dir / "background_tasks.json").read_text())
+        assert tasks.snapshot()[0].note == expected
+        assert rows[0]["note"] == expected
+    finally:
+        await asyncio.wait_for(tools.close(), 10)
+        store.close()
+
+
+def test_background_note_has_one_writer() -> None:
+    import ast
+
+    root = Path(owner_module.__file__).parent
+    offenders = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        allowed = {
+            id(node)
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef) and fn.name == "_set_terminal_note"
+            for node in ast.walk(fn)
+        }
+        for node in ast.walk(tree):
+            if id(node) in allowed:
+                continue
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                else []
+            )
+            direct = any(isinstance(t, ast.Attribute) and t.attr == "note" for t in targets)
+            via_setattr = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "note"
+            )
+            if direct or via_setattr:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == [], (
+        f"direct background note writes at {offenders}; route through _set_terminal_note "
+        "so a kill or shutdown cause keeps precedence over archive and cutoff notes"
+    )
 
 
 @pytest.mark.asyncio
 async def test_task_exit_recovers_original_receipt_after_store_closes(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from tests.support.fake_backend import FakeBackend
 
@@ -565,11 +1565,13 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
     )
     task_id, _ = await tools.background_tasks.start("sleep 30", tmp_path)
     cause = "test closed-store kill cause"
+    _fail_archive_append(tools.background_tasks, monkeypatch)
     try:
         store.close()
-        await tools.background_tasks.kill(
-            task_id, cause=cause, tui_presented=True
-        )
+        with pytest.raises(OSError, match="forced archive failure"):
+            await tools.background_tasks.kill(
+                task_id, cause=cause, tui_presented=True
+            )
     finally:
         await asyncio.wait_for(tools.close(), 10)
 
@@ -594,18 +1596,19 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
             if entry.data.get("kind") == "task_exited"
         ]
         assert len(receipts) == 1
-        assert archived_rows[0]["receipt_pending"] is True
-        assert archived_rows[0]["note"] == cause
+        assert archived_rows[0]["notify_on_exit"] is True
+        assert "receipt_pending" not in archived_rows[0]
+        assert archived_rows[0]["note"] == f"{cause}; {_ARCHIVE_NOTE}"
         assert archived_rows[0]["terminal_phase"] == "task_kill"
         assert archived_rows[0]["tui_presented"] is True
         assert receipts[0].data["task_id"] == task_id
-        assert receipts[0].data["note"] == cause
+        assert receipts[0].data["note"] == f"{cause}; {_ARCHIVE_NOTE}"
         assert receipts[0].data["background_phase"] == "task_kill"
         assert resumed_store.is_agent_notification_presented_to_tui(receipts[0].id)
         rows = json.loads(
             (resumed_store.session_dir / "background_tasks.json").read_text()
         )
-        assert rows[0]["receipt_pending"] is False
+        assert "receipt_pending" not in rows[0]
     finally:
         await loop.close()
         resumed_store.close()
@@ -1702,64 +2705,6 @@ def test_journal_commit_cost_is_bounded_and_torn_tail_recovers(
         os.close(directory_fd)
 
 
-@pytest.mark.asyncio
-async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    with ConversationStore(tmp_path / "sessions", session_id="archive-cancel") as store:
-        tasks = BackgroundTaskRegistry(
-            session_dir=store.session_dir,
-            directory_fd=store.directory_fd,
-            output_limit=4,
-        )
-        archive = tasks._archive
-        assert archive is not None
-        real_append = archive.append
-        entered = threading.Event()
-        release = threading.Event()
-        append_errors: list[BaseException] = []
-
-        def blocked_append(task_id: str, source_fd: int, length: int) -> None:
-            entered.set()
-            assert release.wait(timeout=10)
-            try:
-                real_append(task_id, source_fd, length)
-            except BaseException as exc:
-                append_errors.append(exc)
-                raise
-
-        monkeypatch.setattr(archive, "append", blocked_append)
-        task_id, _ = await tasks.start("printf cancellation-output", tmp_path)
-        assert await asyncio.to_thread(entered.wait, 10)
-
-        real_wait = tasks._wait_for_archive_workers
-        wait_entered = threading.Event()
-
-        async def tracked_wait() -> None:
-            wait_entered.set()
-            await real_wait()
-
-        monkeypatch.setattr(tasks, "_wait_for_archive_workers", tracked_wait)
-        close_task = asyncio.create_task(tasks.close())
-        assert await asyncio.to_thread(wait_entered.wait, 10)
-        close_task.cancel()
-        await asyncio.sleep(0)
-        assert not close_task.done()
-        assert not archive._closed
-
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await close_task
-        assert append_errors == []
-        assert archive._closed
-
-        resumed = BackgroundTaskRegistry(
-            session_dir=store.session_dir,
-            directory_fd=store.directory_fd,
-            output_limit=4,
-        )
-        assert (await resumed.output(task_id, since=0))["output"] == "cancellation-output"
-        await resumed.close()
 
 
 @pytest.mark.asyncio
@@ -2328,24 +3273,47 @@ async def test_background_output_caps_at_utf8_boundary(tmp_path: Path) -> None:
 async def test_background_task_stays_running_for_detached_group_member(
     tmp_path: Path,
 ) -> None:
+    ready = tmp_path / "detached-ready"
+    terminated = tmp_path / "detached-terminated"
+    child = (
+        "import os,pathlib,signal,time; "
+        f"ready=pathlib.Path({str(ready)!r}); "
+        f"terminated=pathlib.Path({str(terminated)!r}); "
+        "signal.signal(signal.SIGTERM, lambda *_: "
+        "(terminated.write_text(str(os.getpid())), exit())[1]); "
+        "ready.write_text(str(os.getpid())); "
+        "time.sleep(300)"
+    )
     tasks = BackgroundTaskRegistry()
     task_id, pid = await tasks.start(
         _python(
             "import subprocess,sys; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}], "
             "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
         ),
         tmp_path,
     )
-    # test-contract: latency allow the detached child to enter the process group.
-    await asyncio.sleep(0.1)
+    child_pid = await read_pid_file(ready)
+    await wait_pid_exited(pid)
     assert (await tasks.output(task_id))["running"] is True
     assert _group_exists(pid)
 
-    result = await tasks.kill(task_id, cause="test requested task stop")
-    assert result["running"] is False
-    assert not _group_exists(pid)
-    await tasks.close()
+    killing = asyncio.create_task(tasks.kill(task_id, cause="test requested task stop"))
+    try:
+        assert await read_pid_file(terminated) == child_pid
+        result = await await_or_fail(killing, what="detached group kill completion")
+        assert result["running"] is False
+        assert not _group_exists(pid)
+    finally:
+        if not killing.done():
+            os.kill(child_pid, signal.SIGKILL)
+        await await_or_fail(
+            asyncio.gather(killing, return_exceptions=True),
+            what="detached group cleanup",
+        )
+        await tasks.close()
+
+
 
 
 @pytest.mark.asyncio
@@ -2464,83 +3432,6 @@ async def test_start_during_shutdown_is_rejected_and_nothing_escapes(
             kill_group_if_present(record.pid)
 
 
-def test_asyncio_run_teardown_right_after_close_starts_terminates_all_groups(
-    tmp_path: Path,
-) -> None:
-    # Teardown lands one loop step after close() begins: a separately
-    # scheduled shutdown task would be cancelled before its first instruction.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import asyncio
-import os
-import signal
-import sys
-import threading
-import time
-
-from zeta.tools._shared import background_spawn as spawn_module
-from tests.support.processes import kill_group_if_present
-from zeta.tools._shared import process as process_module
-from zeta.tools._shared.process import BackgroundTaskRegistry
-
-
-snapshot_started = threading.Event()
-original_snapshot = spawn_module._snapshot_descendants_sync
-original_group_exists = process_module._group_exists
-group_reap_checks = 3
-
-
-def slow_snapshot(root_pids):
-    snapshot_started.set()
-    time.sleep(0.5)
-    return original_snapshot(root_pids)
-
-
-def delayed_group_reap(process_id):
-    global group_reap_checks
-    exists = original_group_exists(process_id)
-    if not exists and group_reap_checks:
-        group_reap_checks -= 1
-        return True
-    return exists
-
-
-spawn_module._snapshot_descendants_sync = slow_snapshot
-process_module._group_exists = delayed_group_reap
-
-
-async def main():
-    tasks = BackgroundTaskRegistry(term_grace=0.25)
-    _, pid = await tasks.start(
-        f"{sys.executable} -c \\\"import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)\\\"",
-        sys.argv[1],
-    )
-    await asyncio.sleep(0.1)
-    asyncio.create_task(tasks.close())
-    while not snapshot_started.is_set():
-        await asyncio.sleep(0)
-    return tasks, pid
-
-
-tasks, pid = asyncio.run(main())
-alive = process_module._group_exists(pid)
-closed = tasks._closed
-kill_group_if_present(pid)
-print({"group_alive_after_asyncio_run_teardown": alive, "closed": closed})
-raise SystemExit(1 if alive or not closed else 0)
-""",
-            str(tmp_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.asyncio
@@ -2588,9 +3479,11 @@ async def test_close_terminates_many_tasks_in_one_grace_period(
     # test-contract: complexity no public process-termination batch seam exists
     terminate_processes = process_module._terminate_processes
 
-    async def record_batch(processes, term_grace, *, finish):
+    async def record_batch(processes, term_grace, *, finish, after_signal=None):
         termination_batches.append(len(processes))
-        return await terminate_processes(processes, term_grace, finish=finish)
+        return await terminate_processes(
+            processes, term_grace, finish=finish, after_signal=after_signal
+        )
 
     # test-contract: complexity shutdown must expose one bounded termination batch
     monkeypatch.setattr(process_module, "_terminate_processes", record_batch)

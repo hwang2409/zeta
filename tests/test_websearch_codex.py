@@ -131,7 +131,7 @@ def sse(*events: dict) -> bytes:
 def install_ddg_result(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     calls: list[str] = []
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         calls.append(query)
         return [{"title": "D", "url": "https://d.example", "snippet": "s"}]
 
@@ -141,10 +141,10 @@ def install_ddg_result(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_websearch_no_codex_login_uses_duckduckgo(monkeypatch, registry):
-    async def no_login(query, signal):
+    async def no_login(query, signal, **_kwargs):
         raise CodexLoginRequiredError("no Codex OAuth login found; log in first")
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         return [{"title": "D", "url": "https://d.example", "snippet": "s"}]
 
     monkeypatch.setattr(codex, "search", no_login)
@@ -160,7 +160,7 @@ async def test_websearch_codex_success_returns_answer_and_sources(
     fixture = (Path(__file__).parent / "fixtures/codex_search_success.sse").read_text()
     assert "response.output_text.delta" in fixture
 
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         return CodexSearchResult(
             "The answer is 42.",
             [{"title": "Example source", "url": "https://example.com/source"}],
@@ -180,12 +180,12 @@ async def test_websearch_codex_success_returns_answer_and_sources(
 async def test_websearch_codex_http_error_falls_back_to_duckduckgo(
     monkeypatch, registry, status
 ):
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         raise codex.CodexHTTPError(
             f"Codex search failed with HTTP {status}", status_code=status
         )
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         return []
 
     monkeypatch.setattr(codex, "search", hosted)
@@ -201,10 +201,10 @@ async def test_websearch_codex_http_error_falls_back_to_duckduckgo(
     [codex.CodexStreamError("stream failed"), codex.CodexBackendError("timed out")],
 )
 async def test_websearch_codex_failures_fall_back(monkeypatch, registry, failure):
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         raise failure
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         return []
 
     monkeypatch.setattr(codex, "search", hosted)
@@ -215,10 +215,10 @@ async def test_websearch_codex_failures_fall_back(monkeypatch, registry, failure
 
 @pytest.mark.asyncio
 async def test_websearch_both_fail_error_has_both_reasons(monkeypatch, registry):
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         raise codex.CodexHTTPError("Codex is unavailable", status_code=500)
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         raise ValueError("DuckDuckGo is unavailable")
 
     monkeypatch.setattr(codex, "search", hosted)
@@ -235,10 +235,10 @@ async def test_websearch_abort_does_not_fall_back(monkeypatch, registry):
     signal.abort()
     called = False
 
-    async def hosted(query, received):
+    async def hosted(query, received, **_kwargs):
         raise ValueError("should not be converted to fallback")
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         nonlocal called
         called = True
         return []
@@ -254,14 +254,14 @@ async def test_websearch_abort_does_not_fall_back(monkeypatch, registry):
 async def test_websearch_login_checked_per_call(monkeypatch, registry):
     calls = 0
 
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             return CodexSearchResult("ok", [])
         raise CodexLoginRequiredError("no Codex OAuth login found; log in first")
 
-    async def ddg(query, max_results):
+    async def ddg(query, max_results, _web_clients):
         return []
 
     monkeypatch.setattr(codex, "search", hosted)
@@ -286,7 +286,7 @@ async def test_websearch_receipt_shows_backend_from_real_tool_content(
 ):
     from zeta.tui.render import _receipt_arguments
 
-    async def hosted(query, signal):
+    async def hosted(query, signal, **_kwargs):
         return CodexSearchResult(
             "answer", [{"title": "source", "url": "https://example.com"}]
         )
