@@ -34,6 +34,8 @@ from ..checkpoints import (
 from ..checkpoints.entry_types import sent_message_receipts
 from ..session_files import open_session_file
 from ..transcript_recovery import (
+    TranscriptFailureKind,
+    TranscriptLoadError,
     TranscriptSourceFacts,
     ValidatedPrefix,
     reconcile_pending,
@@ -69,88 +71,6 @@ MAX_PENDING_APPEND_RECEIPTS = 256
 type InstalledEntriesDelta = tuple[ConversationEntry, ...] | Literal["reset"]
 
 _LOGGER = logging.getLogger(__name__)
-
-
-TranscriptFailureKind = Literal[
-    "torn_tail",
-    "invalid_row",
-    "broken_links",
-    "unsupported_format",
-    "unrecoverable_header",
-]
-
-
-class TranscriptLoadError(ConversationIntegrityError):
-    """A typed transcript refusal that never exposes persisted content or paths."""
-
-    def __init__(
-        self,
-        *,
-        kind: TranscriptFailureKind,
-        session_id: str,
-        row_number: int | None,
-        byte_offset: int | None,
-        valid_prefix_end: int | None,
-        reason_code: str,
-        repairable: bool,
-        repair_available: bool,
-        source_device: int,
-        source_inode: int,
-        source_size: int,
-        prefix_digest: str,
-        source_facts: TranscriptSourceFacts | None = None,
-    ) -> None:
-        self.kind = kind
-        self.session_id = session_id
-        self.row_number = row_number
-        self.byte_offset = byte_offset
-        self.valid_prefix_end = valid_prefix_end
-        self.reason_code = reason_code
-        self.repairable = repairable
-        self.repair_available = repair_available
-        self.source_device = source_device
-        self.source_inode = source_inode
-        self.source_size = source_size
-        self.prefix_digest = prefix_digest
-        self._source_facts = source_facts
-        location = f" at row {row_number}" if row_number is not None else ""
-        detail = {
-            "invalid_payload": "invalid payload for conversation entry",
-            "missing_parent": "missing prior parent",
-            "duplicate_id": "duplicate conversation id",
-            "orphaned_root": "orphaned root",
-            "invalid_sequence": "non-monotonic conversation sequence",
-            "unlinked_approval_resolution": "approval resolution is not linked",
-            "header_session_mismatch": "conversation header session id mismatch",
-            "invalid_json": (
-                "terminated invalid conversation row"
-                if kind == "invalid_row"
-                else kind.replace("_", " ")
-            ),
-        }.get(reason_code)
-        label = detail or kind.replace("_", " ")
-        super().__init__(f"transcript {label}{location} (session {session_id})")
-
-    def protocol_data(self) -> dict[str, object]:
-        """Return the bounded public diagnosis used by every serve error path."""
-        return {
-            "code": "corrupt_transcript",
-            "kind": self.kind,
-            "row": self.row_number,
-            "repairable": self.repairable,
-            "session_id": self.session_id,
-            "actions": (
-                [
-                    {
-                        "method": "repair_transcript",
-                        "session_id": self.session_id,
-                        "requires_confirmation": True,
-                    }
-                ]
-                if self.repair_available
-                else []
-            ),
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +222,6 @@ class _FullLoadValidator:
                     repairable=False,
                 ) from exc
             return None
-
         entry_type = value.get("type")
         if type(entry_type) is str and entry_type not in CONVERSATION_ENTRY_TYPES:
             try:
@@ -428,7 +347,7 @@ class _FullLoadValidator:
             "invalid_active_branch_links",
         )
 
-    def finish(self) -> None:
+    def finish(self, *, install: bool = True) -> None:
         if not self.header_seen:
             raise self.store._transcript_error(
                 kind="unrecoverable_header",
@@ -444,10 +363,11 @@ class _FullLoadValidator:
         if self.state._entries:
             self._select_branch(self.state._entries[-1])
         self.state._rebuild_client_deliveries(self.state._entries)
-        if self.resets_resident_rows:
-            self.store._reset_generation += 1
-        for attribute in self._STATE_ATTRIBUTES:
-            setattr(self.store, attribute, getattr(self.state, attribute))
+        if install:
+            if self.resets_resident_rows:
+                self.store._reset_generation += 1
+            for attribute in self._STATE_ATTRIBUTES:
+                setattr(self.store, attribute, getattr(self.state, attribute))
 
     @property
     def resets_resident_rows(self) -> bool:
@@ -720,6 +640,9 @@ class ConversationLogMixin:
 
     def _sync_log_without_waiting(self: ConversationStore) -> None:
         """Synchronize changed log metadata unless another writer owns it."""
+        if self._observer_snapshot:
+            self._sync_observer_snapshot()
+            return
         if self._log_metadata_matches():
             return
         with self._append_lock(wait=False, observer=self._read_only) as acquired:
@@ -842,7 +765,11 @@ class ConversationLogMixin:
     ) -> TranscriptLoadError:
         return TranscriptLoadError(
             kind=kind,
-            session_id=self.session_id,
+            session_id=(
+                self._repair_target.root_session_id
+                if getattr(self, "_child_history_reader", False)
+                else self.session_id
+            ),
             row_number=row_number,
             byte_offset=byte_offset,
             valid_prefix_end=valid_prefix_end,
@@ -853,6 +780,7 @@ class ConversationLogMixin:
             source_inode=stat.st_ino,
             source_size=stat.st_size,
             prefix_digest=prefix_digest,
+            child_run_id=self._repair_target.child_run_id,
             source_facts=(
                 TranscriptSourceFacts(
                     device=stat.st_dev,

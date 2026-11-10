@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import errno
+import http.server
 import queue
+import socketserver
 import sys
 import threading
 import time
@@ -141,6 +143,24 @@ async def _publish_credentials(
     return arbiter
 
 
+async def _close_listener(
+    server: http.server.ThreadingHTTPServer,
+    server_thread: threading.Thread,
+    publication_arbiter: _PublicationArbiter | None,
+) -> None:
+    def close() -> None:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+    cleanup = asyncio.create_task(asyncio.to_thread(close))
+    cancelled = await _wait_bounded_work(cleanup)
+    if cancelled and (
+        publication_arbiter is None or not publication_arbiter.committed
+    ):
+        raise asyncio.CancelledError
+
+
 class CredentialSink(Protocol[TokenT]):
     """The part of a provider credential store used by login."""
 
@@ -257,6 +277,45 @@ def _query_value(query: dict[str, list[str]], name: str) -> str:
     return values[0]
 
 
+def _handler_for(receiver: _CallbackReceiver) -> type[http.server.BaseHTTPRequestHandler]:
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            status, message = receiver.receive(self.path)
+            body = message.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: str) -> None:
+            del format, args
+
+    return CallbackHandler
+
+
+class _RedirectServer(http.server.ThreadingHTTPServer):
+    """The callback server, minus ``HTTPServer.server_bind``'s reverse DNS.
+
+    The stock ``server_bind`` resolves the bind address with
+    ``socket.getfqdn``, a reverse lookup that blocks until the resolver gives
+    up on hosts with no PTR record for 127.0.0.1 (GitHub's macOS runners;
+    ZETA-91), so ``zeta login`` sat silent instead of printing its URL. The
+    name is never used: the server only answers the local OAuth redirect.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+def _create_redirect_server(
+    handler: type[http.server.BaseHTTPRequestHandler], *, port: int
+) -> http.server.ThreadingHTTPServer:
+    return _RedirectServer(("127.0.0.1", port), handler)
+
+
 async def run_login(
     provider: LoginProvider[TokenT],
     build_pkce: Callable[[], tuple[str, str, str]],
@@ -271,58 +330,28 @@ async def run_login(
 
     verifier, challenge, state = build_pkce()
     callback_ready = asyncio.Event()
-    receiver = _CallbackReceiver(state, provider.callback_path, callback_ready.set)
+    loop = asyncio.get_running_loop()
+    publication_arbiter: _PublicationArbiter | None = None
 
-    async def handle_callback(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        try:
-            request_line = await reader.readline()
-            try:
-                method, target, _version = request_line.decode("latin-1").split(" ", 2)
-            except ValueError:
-                status, message = 400, "bad request"
-            else:
-                while True:
-                    header = await reader.readline()
-                    if header in {b"", b"\r\n", b"\n"}:
-                        break
-                if method.upper() != "GET":
-                    status, message = 405, "method not allowed"
-                else:
-                    status, message = receiver.receive(target)
-            body = message.encode("utf-8")
-            writer.write(
-                f"HTTP/1.1 {status}\r\n"
-                "Content-Type: text/plain; charset=utf-8\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Connection: close\r\n\r\n".encode("ascii") + body
-            )
-            await writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError):
-            pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, RuntimeError):
-                pass
+    def notify() -> None:
+        loop.call_soon_threadsafe(callback_ready.set)
 
+    receiver = _CallbackReceiver(state, provider.callback_path, notify)
     try:
-        server = await asyncio.start_server(
-            handle_callback, host="127.0.0.1", port=provider.callback_port
+        server = _create_redirect_server(
+            _handler_for(receiver), port=provider.callback_port
         )
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
             raise
         raise LoginPortInUseError(provider.name, provider.callback_port) from exc
-    sockets = server.sockets or ()
-    if not sockets:
-        server.close()
-        await server.wait_closed()
-        raise LoginError("login callback listener could not start")
-    callback_port = sockets[0].getsockname()[1]
-    redirect_uri = f"http://localhost:{callback_port}{provider.callback_path}"
+    redirect_uri = f"http://localhost:{server.server_port}{provider.callback_path}"
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        name="zeta-login-redirect",
+        daemon=True,
+    )
+    server_thread.start()
     try:
         authorization_url = provider.build_authorization_url(state, challenge, redirect_uri)
         if on_authorization_url is not None:
@@ -351,7 +380,7 @@ async def run_login(
                 verifier,
                 redirect_uri,
             )
-        await _publish_credentials(
+        publication_arbiter = await _publish_credentials(
             provider,
             tokens,
             publication_timeout_seconds,
@@ -359,8 +388,8 @@ async def run_login(
         )
         return provider.token_handle(tokens)
     finally:
-        server.close()
-        await server.wait_closed()
+        # Finish closing the listener before reporting a terminal login state.
+        await _close_listener(server, server_thread, publication_arbiter)
 
 
 __all__ = [

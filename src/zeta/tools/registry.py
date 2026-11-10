@@ -86,10 +86,7 @@ from ._shared.cwd_state import (
     open_session_cwd,
     open_verified_directory,
 )
-from ._shared.process import (
-    background_tasks_for_session,
-    bind_background_tasks_to_session,
-)
+from ._shared.process import BackgroundTaskRegistry
 from ._shared.sandbox import SandboxPolicy
 from ._spill import SpillByteBudget, SpillStore
 from ._validation import (
@@ -99,7 +96,6 @@ from ._validation import (
     _validate_arguments,
     validate_tool_result,
 )
-from ._web_clients import SessionWebClients
 
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
@@ -285,7 +281,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self._todo_store = session_store
         self.sent_message_tracker: Any = None
         self._agent_runner: Callable[..., Awaitable[ToolHandlerResult]] | None = None
-        self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, int, int], str]] = OrderedDict()
+        self._agent_output_cache: OrderedDict[Path, tuple[tuple[int, bytes], str]] = OrderedDict()
         self._agent_output_cache_chars = 0
         self._execution_guard: Callable[[str], str | None] | None = None
         self._spill_byte_budget = SpillByteBudget()
@@ -307,8 +303,17 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         # Set by AgentLoop; copied into child session clones.  Kept optional so
         # registries used by standalone tool tests remain valid.
         self._agent_owner: Any = None
-        self.background_tasks = background_tasks_for_session(
-            session_store, command_niceness=command_niceness
+        self.background_tasks = BackgroundTaskRegistry(
+            session_dir=session_store.session_dir
+            if session_store is not None
+            else None,
+            directory_fd=session_store.directory_fd
+            if session_store is not None
+            else None,
+            command_niceness=command_niceness,
+            storage_lease=(
+                session_store._storage_lease if session_store is not None else None
+            ),
         )
         self.bash_cwd = (
             session_store.bash_cwd if session_store is not None else str(self.cwd)
@@ -324,7 +329,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
         self._closed = False
-        self.web_clients = SessionWebClients()
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
         self.skill_catalog = skill_catalog
         self._live_config_refresher: Callable[[bool], Awaitable[None]] | None = None
@@ -692,7 +696,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
-        clone.web_clients = SessionWebClients()
         clone._agent_output_cache = OrderedDict()
         clone._agent_output_cache_chars = 0
         clone._mcp_excluded_names = frozenset(exclude_names)
@@ -724,8 +727,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone.cwd,
             allow_outside=not clone.tool_policy.restricted,
         )
-        clone.background_tasks = background_tasks_for_session(
-            store, command_niceness=clone.command_niceness
+        clone.background_tasks = BackgroundTaskRegistry(
+            session_dir=store.session_dir,
+            directory_fd=store.directory_fd,
+            command_niceness=clone.command_niceness,
+            storage_lease=store._storage_lease,
         )
         clone.bash_cwd = store.bash_cwd
         clone.abort_signal = clone._abort_registry.new_generation()
@@ -788,7 +794,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             self.cwd,
             allow_outside=not self.tool_policy.restricted,
         )
-        bind_background_tasks_to_session(self.background_tasks, store)
+        self.background_tasks.bind_session_dir(
+            store.session_dir, store.directory_fd, store._storage_lease
+        )
         self.bash_cwd = store.bash_cwd
 
     @property
@@ -814,7 +822,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
 
         callbacks, self._cleanup_callbacks = self._cleanup_callbacks, []
         try:
-            await self.web_clients.close()
             for callback in callbacks:
                 await callback()
         finally:

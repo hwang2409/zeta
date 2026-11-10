@@ -103,10 +103,10 @@ async def run_prompt_toolkit(
         error = context.get("exception")
         log_path = env_home() / "logs" / _TUI_ERROR_LOG
         if isinstance(error, BaseException):
-            message = f"unexpected ui error: {type(error).__name__}"
+            message = str(error).strip() or type(error).__name__
             stack = "".join(traceback.format_exception(error))
         else:
-            message = "unexpected ui error"
+            message = str(context.get("message", "unexpected ui error"))
             stack = message
         message = f"{message} (details in {log_path})"
         app._print_unit(
