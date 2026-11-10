@@ -173,8 +173,6 @@ def _capture_baseline(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> li
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
