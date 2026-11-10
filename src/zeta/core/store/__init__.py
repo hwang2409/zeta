@@ -3,7 +3,12 @@
 # isort: skip_file
 
 # isort: skip
-from ._log import SCHEMA, InstalledEntriesDelta, PersistedAppend, TranscriptLoadError
+from ._log import (
+    SCHEMA,
+    InstalledEntriesDelta,
+    PersistedAppend,
+)
+from ..transcript_recovery import ObserverSnapshotChanged, TranscriptLoadError
 from ._row_history import (
     RECENT_ROW_WINDOW,
     ApprovalHistory,
@@ -109,6 +114,7 @@ __all__ = [
     "Mapping",
     "Message",
     "MessageRole",
+    "ObserverSnapshotChanged",
     "Path",
     "PendingPromptCommitTimeoutError",
     "PendingPromptQueue",
