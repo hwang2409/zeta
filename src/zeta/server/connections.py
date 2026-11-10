@@ -1028,6 +1028,7 @@ class ConnectionRegistry(ReplayOutput):
                 self._child_reader[1].close()
                 self._child_reader = None
 
+    # merge-resolution: src/zeta/server/connections.py pr-lines ConnectionRegistry.read_status@9bb4d2bb8ef9 -> keep the shared status method after adding child history reads
     async def read_status(
         self, connection: Any, status: dict[str, Any], session_id: str | None
     ) -> object:
