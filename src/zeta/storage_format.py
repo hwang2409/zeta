@@ -40,7 +40,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.TRANSCRIPT_REPAIR: 4,
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
-    StorageFeature.PROJECT_LOCKS: WRITER_EPOCH,
+    StorageFeature.PROJECT_LOCKS: 6,
 }
 
 
