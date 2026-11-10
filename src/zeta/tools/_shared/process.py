@@ -149,11 +149,14 @@ class BackgroundTaskRegistry:
         current = self.observe_finish_gate()[1]
         if current != generation:
             return
-        waits = [
-            asyncio.create_task(owner.generation_event.wait())
+        events = [
+            owner.generation_event
             for owner in self._owners.values()
             if owner.state.name != "TERMINAL"
         ]
+        if self.observe_finish_gate()[1] != generation:
+            return
+        waits = [asyncio.create_task(event.wait()) for event in events]
         if not waits:
             return
         try:
