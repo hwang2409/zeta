@@ -15,7 +15,7 @@ from zeta.memory.auto import AutoMemoryReconciler
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 from zeta.skills import SkillCatalog
-from zeta.storage_format import StorageFormatError, open_writer
+from zeta.storage_format import StorageFormatError, advance, open_writer
 from zeta.tools.registry import ToolRegistry
 
 
@@ -89,6 +89,7 @@ def test_writer_epoch_token_checker_ignores_strings_and_comments() -> None:
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])
 def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, case):
+    advance(tmp_path, expected_epoch=0, target_epoch=5)
     opened = _session(tmp_path)
     opened.store.close()
     monkeypatch.setattr(storage_format, "WRITER_EPOCH", storage_format.WRITER_EPOCH)
