@@ -348,7 +348,7 @@ def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
         console.print(value)
 
     background_notice(
-        SimpleNamespace(_print=print_notice, _invalidate_prompt=lambda: None),
+        SimpleNamespace(_print=print_notice, _invalidate_background_prompt=lambda: None),
         "mcp · server mounted",
     )
 
@@ -955,7 +955,7 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
 def test_other_background_notices_remain_visible() -> None:
     rendered: list[Text] = []
     background_notice(
-        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
+        SimpleNamespace(_print=rendered.append, _invalidate_background_prompt=lambda: None),
         "background task task-1 killed",
     )
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
