@@ -89,7 +89,7 @@ class SessionMetadata:
     project_role: str | None = None
     parent_session_id: str | None = None
     # Structured location of the owned project-memory block within
-    # ``system_prompt`` (see project_context.refresh_project_memory).  Absent on
+    # ``system_prompt`` during conservative resume.  Absent on
     # legacy sessions, which are refreshed by never touching their prompt.
     project_memory_offset: int | None = None
     project_memory_length: int | None = None

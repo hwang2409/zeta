@@ -164,6 +164,7 @@ feature. Observer connections receive only methods with `read` access.
 | `set_settings` | `1.1` | `none` | `session_mutation` |
 | `set_compaction` | `1.1` | `none` | `session_mutation` |
 | `send_images` | `1.1` | `none` | `delivery` |
+| `path_complete` | `1.0` | `path_completion` | `controller_read` |
 | `slash_list` | `1.1` | `none` | `controller_read` |
 | `slash_run` | `1.1` | `none` | `session_mutation` |
 | `account_list` | `1.1` | `none` | `controller_read` |
@@ -184,6 +185,8 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+| `child_run_list` | `1.0` | `child_runs` | `controller_read` |
+| `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -410,7 +413,12 @@ the runtime.
 If the session does not exist, `resume` returns `-32602` with structured error
 data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
-recovery.
+recovery. A session id prefix must contain at least 4 characters.
+
+If the prefix matches more than one session, `resume` returns `-32602` with
+`data` shaped as `{"code":"session_id_ambiguous","session_id":"<requested id>","candidates":["<short id>", ...]}`.
+`candidates` contains the same bounded list of at most 8 short ids shown in the
+unchanged human-readable message.
 
 If the transcript is corrupt or uses a newer conversation format, `resume`
 returns `-32000` with bounded data:
@@ -744,6 +752,27 @@ while pending or already authorized calls are unchanged. A controller handoff
 or observer reconnect gets no replay: the client reads `session_grants` for
 the current state.
 
+### child runs (`child_runs` feature)
+
+`child_run_list` lets the controller inspect child runs owned by the active
+session. Params are `session_id` plus optional nonnegative `offset` and `limit`
+from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
+Each row contains `run_id`, the top-level `session_id`, nullable
+`parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
+`turns_used`, `tool_count`, `current_step`, `started_at`, optional or null
+`finished_at`, and `elapsed_seconds`. `tool_count` is the total for the whole
+child run, cumulative across its follow-up segments, and never decreases. The
+public `run_id` is the existing child
+instance id. Child-local store ids and the agent tool's `handle` name are not
+exposed.
+
+`child_run_send` queues one message at the child's existing safe delivery
+point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
+`{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
+`-32005`. Both methods return `-32601` unless `child_runs` was negotiated, and
+observers cannot call either method. This feature emits no event; clients call
+`child_run_list` again to read changes.
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`
@@ -813,7 +842,14 @@ The result contains `session` (full metadata or `null`), `state` (`idle`,
 `running`, or `tool`), `explicit_finish`, `pending_approvals`, `usage`, and
 `compaction_markers`. Each pending approval has `request_id`, `tool_call`, and
 `delegated`. Delegated approvals also have `agent_instance_id`, the child agent
-instance that owns the approval.
+instance that owns the approval. An approval may also carry `label`, an optional
+display-only string naming the call's target; it is absent when there is none.
+
+`state` is `"running"` whenever `send` would refuse with `-32004`
+(`a turn is already running`) because `turn_busy()` is true. If the server is
+unhealthy because approval persistence failed, `state` remains `"idle"` and
+`send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
+separate error and does not change the unhealthy status behavior.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
@@ -935,7 +971,11 @@ separate ACP or app-server mapping. The `max_turns` error code is preserved
 on the wire.
 
 `approval_request` carries `request_id` and `tool_call`. It also carries
-`delegated: true` and `agent_instance_id` for delegated approvals. `approval_end`
+`delegated: true` and `agent_instance_id` for delegated approvals. It may also
+carry `label`, an optional display-only string that names the call's target for
+the operator (for example `"beta (p_...)"` for an inbox send to a project); it is
+derived from the call, never stored, and is absent when there is no label or when
+the lookup that would produce it fails. `approval_end`
 carries the same `request_id` as its matching `approval_request`, the tool call,
 and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`,
 or `abort`, and an abort also sets `data.reason`. `data` can carry other
@@ -1087,6 +1127,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
@@ -1144,11 +1185,11 @@ ToolResult = {
 }
 Approval = {
   required: { request_id: string, tool_call: ToolCall, delegated: boolean },
-  optional: { agent_instance_id: string (delegated only) }
+  optional: { agent_instance_id: string (delegated only), label: string (display-only) }
 }
 StatusPendingApproval = {
   required: { request_id: string, tool_call: ToolCall, delegated: boolean },
-  optional: { agent_instance_id: string (delegated only) }
+  optional: { agent_instance_id: string (delegated only), label: string (display-only) }
 }
 Attachment = { required: { name: string, mime_type: string, size: integer } }
 Usage = object with provider-defined JSON values
@@ -1207,7 +1248,7 @@ Event fields are:
 | `tool_start` | `event`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `tool_output` | `event`, `tool_call: ToolCall`, `output: string`, `data: object` | `session_id` |
 | `tool_end` | `event`, `tool_call: ToolCall`, `tool_result: ToolResult or null`, `data: object` | `session_id` |
-| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only) |
+| `approval_request` | `event`, `request_id: string`, `tool_call: ToolCall`, `delegated: boolean` | `session_id`, `agent_instance_id: string` (delegated only), `label: string` (display-only) |
 | `approval_end` | `event`, `request_id: string`, `tool_call: ToolCall`, `data: object` | `session_id` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |
@@ -1525,6 +1566,24 @@ or one stored by a release that predates the field), and older 1.0 servers
 omit the key entirely. Clients must fall back to their configured default in
 both cases.
 
+### Workspace path completion
+
+With `path_completion` negotiated, `path_complete` accepts `session_id` and
+`text_before_cursor`. The text is limited to 4,096 UTF-8 bytes. The request
+completes the active `@` path token relative to the session working directory.
+It returns `entries` and `truncated`; each entry has `text`, `display`, `kind`
+(`directory` or `file`), and `start_position`. The start position is zero or
+negative and is measured in Unicode code points. Clients that use UTF-16 text
+indices must convert it before replacing the active token.
+
+The result uses the same hidden-file, quoting, sorting, and scan limits as the
+TUI composer. A symlink found while listing is returned as an entry, but
+completion does not descend into it when its resolved target is outside the
+session working directory. Lexical `..` and `~` prefixes keep the TUI's normal
+completion behavior. The request returns `-32003` when `session_id` is not the active
+session, `-32602` for invalid parameters, and `-32601` when the feature was not
+negotiated. It emits no event and is not available to observer connections.
+
 ### Slash commands (ZETA-130)
 
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
@@ -1687,7 +1746,9 @@ negotiate a feature sees the behavior from before the feature existed.
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
+| `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -1705,7 +1766,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `child_run_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. `child_run_history` is available only when the `child_run_history` feature is negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `child_run_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. `child_run_history` is available only when the `child_run_history` feature is negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

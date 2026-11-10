@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Self  # noqa: F401 - re-exported by the store facade
 
 from ...agent.receipt import encode_json
+from ...locking import shape_lock
 from ...protocol.types import (
     Message,
     MessageRole,
@@ -190,7 +191,7 @@ class ConversationStore(
             self._transcript_generation = 0
             self._initialize_async_writes()
             if not _read_only and not _must_exist:
-                with session_root(self.root_dir, create=True) as root_fd:
+                with shape_lock(), session_root(self.root_dir, create=True) as root_fd:
                     # Serialize first publication of the permanent append lock. On
                     # Darwin, racing O_CREAT | O_NOFOLLOW opens can transiently
                     # report ENOENT even though neither constructor removes it.
@@ -218,8 +219,8 @@ class ConversationStore(
             self._collect_persisted_appends = _collect_persisted_appends
             self._persisted_appends: list[PersistedAppend] = []
             self._persisted_appends_unverified = False
-            # Task-exit task ids for O(1) append_task_notification dedupe (task ids
-            # are unique and exit once, so this mirrors the active-branch scan).
+            # Task-exit task ids from all durable history. Acknowledgement and
+            # compaction do not make a task eligible for a second exit receipt.
             self._task_notification_ids: set[str] = set()
             self._sent_message_receipts: list[tuple[str, str]] = []
             self._todo_items: list[TodoItem] = []
@@ -233,7 +234,7 @@ class ConversationStore(
             self.pending_prompt_queue = PendingPromptQueue(self)
             with ExitStack() as lease:
                 _, self.directory_fd = lease.enter_context(
-                    session_directory(self.root_dir, self.session_id)
+                    session_directory(self.root_dir, self.session_id, lifetime=True)
                 )
                 if _read_only:
                     if _observer_snapshot:

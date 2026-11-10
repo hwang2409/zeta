@@ -318,6 +318,7 @@ def _create_app_with_root(
             except (EOFError, ValueError) as exc:
                 raise SessionError("invalid resume session selection") from exc
         if resume_id is not None:
+            resume_id = manager.resolve_id(resume_id, min_prefix_length=4)
             opened = manager.open(resume_id)
         else:
             recent = manager.find_most_recent(cwd=invocation_cwd)
@@ -422,7 +423,7 @@ def _create_app_with_root(
             system_append=system_prompt_append,
             context_loader=_app.load_project_context,
             project_features_enabled=registry is not None,
-            registry=registry,
+            registry=manager.project_registry_state,
             project_projection=projection,
         )
         project_context = resumed_prompt.context
@@ -445,7 +446,7 @@ def _create_app_with_root(
             session_project=session_project,
             cwd_project=cwd_project,
             inbox_enabled=config.inbox_enabled,
-            registry=registry,
+            registry=manager.project_registry_state,
             project_projection=projection,
         )
     recency: _SessionRecency | None = None

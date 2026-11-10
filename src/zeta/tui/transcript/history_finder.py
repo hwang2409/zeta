@@ -68,12 +68,10 @@ class HistoryFinder:
 
     def __init__(
         self,
-        load_history: Callable[[], None],
         history_snapshot: Callable[[], tuple[str, ...]],
         *,
         on_accept: Callable[[], None] | None = None,
     ) -> None:
-        self._load_history = load_history
         self._history_snapshot = history_snapshot
         self._on_accept = on_accept
         self._finder: MessageFinder | None = None

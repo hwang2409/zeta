@@ -22,7 +22,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Self
 
-WRITER_EPOCH: Final = 5
+from .locking import format_lock, shape_lock
+
+WRITER_EPOCH: Final = 6
 
 
 class StorageFeature(StrEnum):
@@ -30,6 +32,7 @@ class StorageFeature(StrEnum):
     TRANSCRIPT_REPAIR = "transcript_repair"
     PROJECT_WRITES = "project_writes"
     ATTENTION_KINDS = "attention_kinds"
+    PROJECT_LOCKS = "project_locks"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -37,6 +40,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.TRANSCRIPT_REPAIR: 4,
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
+    StorageFeature.PROJECT_LOCKS: 6,
 }
 
 
@@ -592,10 +596,16 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
     fcntl.flock(fd, fcntl.LOCK_SH)
 
 
-def open_writer(home: str | Path, *, capability: int = WRITER_EPOCH) -> WriterLease:
+def open_writer(home: str | Path, *, capability: int | None = None) -> WriterLease:
     """Retain a process-shared home lease after checking writer compatibility."""
-
     drain_releases()
+    if capability is None:
+        capability = WRITER_EPOCH
+    with format_lock():
+        return _open_writer(home, capability=capability)
+
+
+def _open_writer(home: str | Path, *, capability: int) -> WriterLease:
     canonical = _canonical_home(home)
     with _REGISTRY_LOCK:
         registered = _REGISTRY.get(canonical)
@@ -657,13 +667,16 @@ def _publish_manifest(home: Path, epoch: int) -> None:
 
 
 def advance(
-    home: str | Path, *, expected_epoch: int, target_epoch: int = WRITER_EPOCH
+    home: str | Path, *, expected_epoch: int, target_epoch: int | None = None
 ) -> None:
     """Advance an idle home to a strictly newer supported writer epoch."""
 
+    if target_epoch is None:
+        target_epoch = WRITER_EPOCH
     if target_epoch > WRITER_EPOCH or target_epoch <= expected_epoch:
         raise StorageFormatError("stored-format target must be newer and supported")
     canonical = _canonical_home(home)
+    drain_releases()  # a lease this process dropped must not count as an active writer
     fd = _open_lock(canonical)
     try:
         try:
@@ -862,7 +875,7 @@ class WriterLease:
     ) -> dict[str, Any]:
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -898,7 +911,7 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
@@ -944,7 +957,7 @@ class WriterLease:
 
         if self._closed:
             raise StorageFormatError("stored-format lease is closed")
-        with _shape_lock(self._entry, self.home, directory_fd, name):
+        with shape_lock(), _shape_lock(self._entry, self.home, directory_fd, name):
             try:
                 os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError:

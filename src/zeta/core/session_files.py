@@ -9,9 +9,10 @@ import os
 import stat
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
+from ..locking import shape_lock
 from ..storage_format import drain_releases
 
 
@@ -21,6 +22,14 @@ class SessionError(ValueError):
 
 class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
+
+
+class SessionIdAmbiguousError(SessionError):
+    """Raised when a session id prefix matches more than one session."""
+
+    def __init__(self, message: str, candidates: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.candidates = candidates
 
 
 class SessionFileReplaced(SessionError):
@@ -47,7 +56,13 @@ def require_off_loop_lock(
 
 
 @contextmanager
-def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
+def session_directory(
+    root: Path,
+    session_id: str,
+    *,
+    exclusive: bool = False,
+    lifetime: bool = False,
+):
     """Never create directories; lease the pinned directory inode itself.
 
     Shared leases cover store lifetimes and metadata mutations. Deletion needs
@@ -55,6 +70,7 @@ def session_directory(root: Path, session_id: str, *, exclusive: bool = False):
     releases the lease without leaving a stale lock file.
     """
     with ExitStack() as cleanup:
+        cleanup.enter_context(nullcontext() if lifetime else shape_lock())
         try:
             _component(session_id)
             root_fd = cleanup.enter_context(session_root(root))

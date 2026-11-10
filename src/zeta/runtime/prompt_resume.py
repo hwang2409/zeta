@@ -9,18 +9,22 @@ from functools import partial
 from pathlib import Path
 
 from ..core.project_context import (
+    CONTEXT_BYTE_CAP,
     ProjectContext,
     _format_section,
+    budget_memory_block,
     load_project_context,
-    refresh_project_memory,
 )
 from ..core.session import SessionManager, SessionMetadata
 from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
+from ..memory.entry_store import utc_now
+from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
 from ..project_context.projection import ProjectContextProjection
 from ..project_registry import Project, ProjectRegistry
 from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
+from .project_registry_state import ProjectRegistryState
 from .prompt import PromptFragment, RuntimePrompt, replace_owned_fragment
 
 ContextLoader = Callable[..., ProjectContext]
@@ -40,6 +44,31 @@ def _catalogs(*, home: Path, repo_root: Path) -> tuple[SkillCatalog, AgentCatalo
         discover_session_skills(home=home, project_dir=repo_root),
         discover_session_agents(home=home, project_dir=repo_root),
     )
+
+
+def _projected_memory_block(
+    *,
+    home: Path,
+    project_id: str,
+    projection: ProjectContextProjection,
+    prefix: str,
+    suffix: str,
+) -> str:
+    remaining = max(
+        0,
+        CONTEXT_BYTE_CAP
+        - len(prefix.encode("utf-8"))
+        - len(suffix.encode("utf-8")),
+    )
+    if projection.entry_memory is not None:
+        return render_entry_memory(
+            projection.entry_memory.state,
+            now=utc_now(),
+            byte_cap=min(MEMORY_PROMPT_BYTE_CAP, remaining),
+        ).block
+    return budget_memory_block(
+        home, project_id, projection.memory, remaining
+    )[0]
 
 
 def _conservative_context(
@@ -121,14 +150,24 @@ def _conservative_context(
             prompt_components=components,
             health=projection.health,
         )
-    refreshed = refresh_project_memory(
-        prompt,
-        home=home,
-        project_id=metadata.project_id if project_features_enabled else None,
-        memory_offset=offset,
-        memory_length=length,
-        memory_digest=digest,
-    )
+    refreshed = prompt
+    if (
+        project_features_enabled
+        and owned
+        and offset is not None
+        and length is not None
+        and metadata.project_id is not None
+        and projection is not None
+    ):
+        prefix = prompt[:offset]
+        suffix = prompt[offset + length :]
+        refreshed = prefix + _projected_memory_block(
+            home=home,
+            project_id=metadata.project_id,
+            projection=projection,
+            prefix=prefix,
+            suffix=suffix,
+        ) + suffix
     if not project_features_enabled:
         components.pop("project_memory", None)
     if owned and offset is not None and length is not None:
@@ -263,7 +302,7 @@ def _resume_composition(
     agents: AgentCatalog,
     explicit_custom: bool,
     project_features_enabled: bool,
-    registry: ProjectRegistry | None,
+    registry: ProjectRegistry | ProjectRegistryState,
     projection: ProjectContextProjection | None,
 ) -> PromptComposition:
     rebuild = (
@@ -333,7 +372,7 @@ def resume_prompt(
     system_append: str | None = None,
     context_loader: ContextLoader = load_project_context,
     project_features_enabled: bool = True,
-    registry: ProjectRegistry | None = None,
+    registry: ProjectRegistry | ProjectRegistryState,
     project_projection: ProjectContextProjection | None = None,
 ) -> ResumedPrompt:
     """Classify, safely recompose, persist, and adopt one resumed prompt.
@@ -349,7 +388,7 @@ def resume_prompt(
     explicit_custom = system_override is not None or system_append is not None
     skills, agents = _catalogs(home=home, repo_root=repo_root)
 
-    compose = partial(
+    compose_with = partial(
         _resume_composition,
         home=home,
         repo_root=repo_root,
@@ -364,13 +403,28 @@ def resume_prompt(
         explicit_custom=explicit_custom,
         project_features_enabled=project_features_enabled,
         registry=registry,
-        projection=project_projection,
     )
+    projection = project_projection
+    capture = manager.project_registry if projection is not None else None
+
+    def compose(current: SessionMetadata) -> PromptComposition:
+        # Re-read project memory with no session shape lock held; a change since
+        # the last capture is a changed composition input, so compose again.
+        nonlocal projection
+        while True:
+            composition = compose_with(current, projection=projection)
+            if capture is None:
+                return composition
+            fresh = capture.project_context_projection(current.project_id)
+            if fresh == projection:
+                return composition
+            projection = fresh
+
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
     context = replace(
         _adopted_context(metadata, composition.notices),
-        health=(project_projection.health if project_projection is not None else None),
+        health=(projection.health if projection is not None else None),
     )
     if owns_skill_index:
         context = _replace_context_skill_index(context, skills)
