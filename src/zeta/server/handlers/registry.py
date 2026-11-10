@@ -15,6 +15,7 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
+from ..session_replay import join_history_and_subscribe
 from . import child_runs, lifecycle, path_completion, session, settings, validation
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
@@ -128,8 +129,16 @@ async def session_history(client, request_id, params):
     return await client.connections.read_history(client, params)
 
 
+async def session_history_and_subscribe(client, request_id, params):
+    return await join_history_and_subscribe(client, params)
+
+
 async def content_read(client, request_id, params):
     return await client.connections.read_content(client, params)
+
+
+async def child_run_history(client, request_id, params):
+    return await client.connections.read_child_run_history(client, params)
 
 
 async def _mutable_store(client, params):
@@ -367,7 +376,9 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.REPAIR_TRANSCRIPT: repair_transcript,
     MethodDescriptor.SESSION_TREE: session_tree,
     MethodDescriptor.SESSION_HISTORY: session_history,
+    MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE: session_history_and_subscribe,
     MethodDescriptor.CONTENT_READ: content_read,
+    MethodDescriptor.CHILD_RUN_HISTORY: child_run_history,
     MethodDescriptor.SWITCH_BRANCH: switch_branch,
     MethodDescriptor.FORK_MESSAGE: fork_message,
     MethodDescriptor.MODEL_CATALOG: model_catalog,

@@ -989,9 +989,12 @@ with held:
     try:
         manager.read_metadata(session_id, lock_timeout=10)
     except Exception as exc:
-        (signals / "metadata-done").write_text(f"refused: {exc}")
+        status = f"refused: {exc}"
     else:
-        (signals / "metadata-done").write_text("read")
+        status = "read"
+    done = signals / "metadata-done.tmp"
+    done.write_text(status)
+    done.replace(signals / "metadata-done")
     wait("release")
 """
 

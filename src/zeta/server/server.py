@@ -465,7 +465,11 @@ class _Client:
                         )
                     )
                 else:
-                    written = await self._write(self.codec.response(request_id, result))
+                    response = self.codec.response(request_id, result)
+                    if request["method"] == "session_history_and_subscribe":
+                        written = await self.connections.admit_join_response(self, response)
+                    else:
+                        written = await self._write(response)
                     if (
                         written
                         and request["method"] == "hello"
@@ -586,7 +590,6 @@ class _Client:
         return False, None
 
     _dispatch = _dispatch_request
-
 
     def _hello(self, params: dict[str, Any]) -> dict[str, object]:
         if self.handshaken:

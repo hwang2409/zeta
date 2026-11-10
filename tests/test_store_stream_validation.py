@@ -5,6 +5,7 @@ import json
 import os
 from collections.abc import Iterable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -161,6 +162,67 @@ def test_stream_classification_matches_whole_file_splitlines(
         os.close(fd)
 
     assert actual == _legacy_classification(raw)
+
+
+def test_stream_accepts_append_metadata_race_but_rejects_shrink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.transcript_recovery import stream as stream_module
+    from zeta.core.transcript_recovery.stream import TranscriptStream
+
+    initial = _json_line({"before": True})
+    appended = _json_line({"after": True})
+    path = tmp_path / "conversation.jsonl"
+    path.write_bytes(initial)
+    fd = os.open(path, os.O_RDONLY)
+    initial_stat = os.fstat(fd)
+    appended_during_read = False
+
+    def read_then_append(read_fd: int, length: int) -> bytes:
+        nonlocal appended_during_read
+        chunk = os.read(read_fd, length)
+        with path.open("ab") as transcript:
+            transcript.write(appended)
+        appended_during_read = True
+        return chunk
+
+    metadata_before_size = SimpleNamespace(
+        st_dev=initial_stat.st_dev,
+        st_ino=initial_stat.st_ino,
+        st_size=initial_stat.st_size,
+        st_mtime_ns=initial_stat.st_mtime_ns + 1,
+        st_ctime_ns=initial_stat.st_ctime_ns + 1,
+    )
+    try:
+        source = TranscriptStream(fd, initial_stat, read=read_then_append)
+        rows = list(source.rows())
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                stream_module.os,
+                "fstat",
+                lambda _fd: metadata_before_size,
+            )
+            try:
+                digest = source.finish_digest()
+            except ConversationIntegrityError as exc:
+                pytest.fail(f"append-only prefix validation failed: {exc}")
+    finally:
+        os.close(fd)
+
+    assert appended_during_read
+    assert [row.data for row in rows] == [initial]
+    assert digest == hashlib.sha256(initial).hexdigest()
+    assert path.read_bytes() == initial + appended
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        source = TranscriptStream(fd, os.fstat(fd))
+        list(source.rows())
+        path.write_bytes(b"")
+        with pytest.raises(ConversationIntegrityError, match="file shrank"):
+            source.finish_digest()
+    finally:
+        os.close(fd)
 
 
 def test_transcript_stream_bounds_each_read(

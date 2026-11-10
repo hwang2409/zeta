@@ -105,16 +105,14 @@ class TranscriptStream:
         while self._read_offset < self.stat.st_size and self._fill():
             pass
         current = os.fstat(self.fd)
-        changed_identity = (
-            current.st_dev != self.stat.st_dev or current.st_ino != self.stat.st_ino
+        if current.st_dev != self.stat.st_dev or current.st_ino != self.stat.st_ino:
+            reason = "identity changed"
+        elif current.st_size < self.stat.st_size:
+            reason = "file shrank"
+        elif self._read_offset < self.stat.st_size:
+            reason = "short read"
+        else:
+            return self._source_digest.hexdigest()
+        raise ConversationIntegrityError(
+            f"transcript changed during validation: {reason}"
         )
-        changed_prefix = current.st_size < self.stat.st_size or (
-            current.st_size == self.stat.st_size
-            and (
-                current.st_mtime_ns != self.stat.st_mtime_ns
-                or current.st_ctime_ns != self.stat.st_ctime_ns
-            )
-        )
-        if changed_identity or changed_prefix or self._read_offset < self.stat.st_size:
-            raise ConversationIntegrityError("transcript changed during validation")
-        return self._source_digest.hexdigest()

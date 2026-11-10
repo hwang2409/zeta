@@ -56,6 +56,7 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
+            attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             prepare_ui_session_change = getattr(

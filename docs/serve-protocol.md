@@ -155,6 +155,8 @@ feature. Observer connections receive only methods with `read` access.
 | `repair_transcript` | `1.1` | `none` | `session_mutation` |
 | `session_tree` | `1.1` | `none` | `read` |
 | `session_history` | `1.1` | `none` | `read` |
+| `session_history_and_subscribe` | `1.1` | `session_replay_seq` | `read` |
+| `child_run_history` | `1.1` | `child_run_history` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
 | `fork_message` | `1.1` | `none` | `session_mutation` |
@@ -1059,7 +1061,8 @@ not start a concurrent notification turn.
 {"jsonrpc":"2.0","method":"event","params":{"event":"compaction_end","session_id":"abc123","data":{"turn":2,"token_count":1200}}}
 ```
 
-`user_message` requires the `user_message_event` feature. The server emits it
+`user_message` requires the `user_message_event` feature, which
+`session_replay_seq` implies. The server emits it
 when it accepts `send`, `steer`, or `send_images`, before the acknowledgement.
 It carries `text` (the user text, bounded to 262,144 UTF-8 bytes), `mode`
 (`"send"` or `"steer"`; `send_images` uses `"send"`), and `attachments`, an
@@ -1106,10 +1109,12 @@ Error descriptors are:
 | `approval_unavailable` | `-32006` | none | approval request is missing, resolved, or reserved |
 | `frame_too_large` | `-32007` | none | outbound frame exceeds the size limit |
 | `history_snapshot_stale` | `-32009` | `stale_history_snapshot` | session history snapshot is stale |
+| `stale_event_sequence` | `-32009` | `stale_event_sequence` | replay continuity was invalidated |
 | `delivery_id_evicted` | `-32010` | none | delivery ID details were evicted |
 | `controller_output_overflow` | `-32011` | none | controller output overflow |
 | `observer_output_overflow` | `-32011` | none | observer output overflow |
 | `content_not_found` | `-32012` | `content_not_found` | content handle was not found |
+| `child_run_not_found` | `-32012` | `child_run_not_found` | child run was not found |
 | `transcript_repair_requires_upgrade` | `-32013` | `transcript_repair_requires_upgrade` | transcript repair requires the stored-format upgrade |
 | `corrupt_transcript` | `-32000` | `corrupt_transcript` | transcript is corrupt or uses an unsupported format |
 | `active_session` | `-32005` | `active_session` | the active session cannot be deleted |
@@ -1261,6 +1266,7 @@ Event fields are:
 | `error` | `event`, `error: {code: string, message: string}`, `data: object` | `session_id` |
 | `user_message` (feature `user_message_event`) | `event`, `text: string`, `mode: string`, `attachments: array[Attachment]` | `session_id`, `delivery_id: string` (features `user_message_delivery_id` and `delivery_id`) |
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
+| `replay_stream_ended` (feature `session_replay_seq`) | `event`, `session_id: string`, `stream_id: string`, `reason: "session_replaced"|"evicted"|"rejoined"` | none; never carries `seq` |
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
@@ -1427,6 +1433,58 @@ error code and message. Provider status and origin remain internal.
 - `switch_branch`: takes `head_id`, an existing leaf. Calls `switch_to_branch`
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
+- `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
+  active `session_id` and atomically returns the newest bounded history page plus
+  `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
+  join carry that opaque stream id and monotonically increasing `seq`, starting
+  at 1. The result has the same shape as `session_history` with `before: null`
+  (`messages`, `next_before`, `history_validator`). Negotiating
+  `session_replay_seq` also gives the connection the semantics of
+  `session_history_fidelity`, `session_history_backward`, and
+  `user_message_event`, for the join result, later `session_history` pages, and
+  the `delivery_status` and `user_message` live filters. A replay client's
+  history always carries user-message rows, so it also receives the live
+  `user_message` echo (the `delivery_id` field stays per-connection). Observers
+  receive controller session events only through a successful join.
+  An event whose history row is already in the join's history is not sent on
+  that stream and spends no `seq`, so each effect appears once, in history or
+  live. `assistant_message` and the `user_message` echo of a `send` or
+  `send_images` without `delivery_id` are published before their history row is
+  written, so on a replay stream (also a controller's own, when it negotiated
+  `session_replay_seq`) they can arrive later than on a connection without
+  `session_replay_seq`: with the first event after the row is written (for the
+  echo, before `agent_start`, which can follow MCP server startup), or at the end
+  of the turn. When the row is never written (for example an aborted reply whose
+  partial row failed to persist, or a reply replaced by a retry), the stream
+  still gets the event once, but a client that joins later sees it in neither
+  history nor live: such an event is provisional across a stream end.
+  A stream ends only on session replacement, replay pressure, a second join on
+  the same connection (even a rejected one), a failed write or admission on the
+  connection, or the connection's close; it also ends with `evicted` when a late
+  event's history row is too old to place against the join's history, and with
+  `session_replaced` when the session's stored rows were reloaded in a way that
+  can renumber them. Observers' streams are not ended by a
+  controller disconnect; a controller's own stream ends with its connection, and a
+  reconnecting controller must join again.
+  A join that is still pending when its stream ends returns `-32009` with data
+  code `stale_event_sequence` and gets no event. A join may also return this
+  error when the session rows may have changed during the join; the client
+  retries the join. An active stream that ends on a
+  live connection gets exactly one `replay_stream_ended` event with that
+  `stream_id` and a `reason` from the closed set `session_replaced`, `evicted`,
+  `rejoined`; a client treats any other reason as "rejoin". The event has no
+  `seq`, is sent at most once per `stream_id`, follows every frame of that stream
+  already on the wire, and precedes any later frame; queued frames of the ended
+  stream are discarded. After it, no frame carries that `stream_id`, and later
+  controller events carry no `stream_id` or `seq`. A failed write or admission
+  closes the connection instead (no event); the client reconnects and joins.
+  Connections without `session_replay_seq` never receive the event. In every
+  case the client sends a new join.
+  The server retains at most 64 records/1 MiB per scope and 256 records/4 MiB
+  globally, evicting the largest scope first; a scope holds at most two waiting
+  events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
+  `session_history` and do not change the live stream.
+- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, `-32602` for malformed ids or parameters, and `-32009` with `stale_history_snapshot` for a changed snapshot.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
@@ -1743,6 +1801,8 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
+| `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
+| `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
@@ -1765,7 +1825,8 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `child_run_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. `child_run_history` is available only when the `child_run_history` feature is negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
