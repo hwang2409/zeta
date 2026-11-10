@@ -85,7 +85,7 @@ _RAW_DELETION = {
     ("core/checkpoints/workspace.py", "_write_current_shadow_commit", "unlink"),
     ("core/checkpoints/workspace.py", "reset_corruption", "unlink"),
     ("core/project_context.py", "_load_home_identity", "unlink"),
-    ("core/session.py", "_reconcile_project_link", "unlink"),
+    ("core/session.py", "_reconcile_project_link_gated", "unlink"),
     ("core/session_files.py", "copy_session_tree", "unlink"),
     ("core/session_files.py", "unlink_session_file", "unlink"),
     ("core/session_files.py", "write_session_file", "unlink"),
