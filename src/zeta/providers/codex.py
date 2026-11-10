@@ -31,6 +31,8 @@ from typing import Any
 import httpx
 
 from .completion import (
+    MAX_STALL_RETRIES,
+    TRANSPORT_IDLE_SECONDS,
     AuthIteratorProviderAttempt,
     CompletionControl,
     CompletionRun,
@@ -39,7 +41,7 @@ from .completion import (
     is_completion_sentinel,
     report_provider_record,
 )
-from .codex_arguments import _parse_complete_object, _parse_partial_object
+from .codex_arguments import _parse_complete_object
 from .must_complete_close import task_is_cancelling
 from .codex_payload import (
     _cache_affinity_json,
@@ -48,11 +50,8 @@ from .codex_payload import (
 from .stream_diagnostics import StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
-    DEFAULT_STREAM_STALL_RETRIES,
-    DEFAULT_STREAM_STALL_SECONDS,
     HTTPClientLease,
     SSEEventAccumulator,
-    StreamFinished,
     StreamProgressDiagnostics,
     build_response_error,
     cleanup_transport,
@@ -105,7 +104,6 @@ class _BlockState:
     kind: str
     state: str = "active"
     text: str = ""
-    arguments: str = ""
     text_done: bool = False
 
 
@@ -148,8 +146,8 @@ class CodexBackend(CompletionBackend):
         token_store: Any | None = None,
         client: httpx.AsyncClient | None = None,
         diagnostics_path: str | Path | None = None,
-        stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
-        stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
+        stall_seconds: float = TRANSPORT_IDLE_SECONDS,
+        stall_retries: int = MAX_STALL_RETRIES,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -175,7 +173,14 @@ class CodexBackend(CompletionBackend):
         *,
         control: CompletionControl,
     ) -> CompletionRun:
-        return own_completion(self, messages, tool_schemas, control=control)
+        return own_completion(
+            self,
+            messages,
+            tool_schemas,
+            control=control,
+            transport_idle=self.stall_seconds,
+            max_stall_retries=self.stall_retries,
+        )
 
     def create_attempt(
         self,
@@ -279,15 +284,9 @@ class CodexBackend(CompletionBackend):
                         lambda status, body, headers: _http_error(
                             status, body, headers, account=account
                         ),
-                        stall_seconds=self.stall_seconds,
-                        on_stall=lambda elapsed: CodexStreamError(
-                            f"Codex error body stalled for {elapsed:.0f}s",
-                            is_stall=True,
-                        ),
                     )
                 async for event in _decode_response(
                     response,
-                    self.stall_seconds,
                     diagnostics_path=self.diagnostics_path,
                 ):
                     completed = is_completion_sentinel(event)
@@ -391,7 +390,6 @@ def _http_error(
 
 async def _decode_response(
     response: httpx.Response,
-    stall_seconds: float = 0.0,
     *,
     diagnostics_path: Path | None = None,
 ) -> AsyncIterator[StreamEvent]:
@@ -402,7 +400,6 @@ async def _decode_response(
     usage: dict[str, Any] = {}
     response_data: dict[str, Any] = {"stream_started_at": monotonic()}
     reassembly = _ReassemblyState()
-    finished = StreamFinished()
     progress = StreamProgressDiagnostics()
 
     def record_mismatches() -> None:
@@ -413,13 +410,7 @@ async def _decode_response(
                 diagnostics_path, provider="codex", count=reassembly.mismatches
             )
 
-    async for line in sse_lines(
-        response,
-        stall_seconds,
-        "Codex",
-        CodexStreamError,
-        finished=finished,
-    ):
+    async for line in sse_lines(response):
         record = decoder.feed(line)
         if record is None:
             continue
@@ -440,7 +431,6 @@ async def _decode_response(
         )
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
-                finished.value = True
                 record_mismatches()
             yield translated
     record = decoder.finish()
@@ -461,7 +451,6 @@ async def _decode_response(
         )
         if translated is not None:
             if translated.type is StreamEventType.MESSAGE_END:
-                finished.value = True
                 record_mismatches()
             yield translated
     if response_state != "stopped":
@@ -735,12 +724,10 @@ def _translate_delta(
         delta = payload.get("delta")
         if type(delta) is not str:
             raise CodexStreamError("Codex tool delta is invalid")
-        block.arguments += delta
         item.arguments += delta
-        arguments = _parse_partial_object(block.arguments)
         return StreamEvent(
             StreamEventType.MESSAGE_UPDATE,
-            tool_call=ToolCall(item.call_id, item.name, arguments),
+            tool_call=ToolCall(item.call_id, item.name, {}),
             data={"tool_call_delta": delta, "index": index},
         )
     if event_type in {
@@ -892,11 +879,10 @@ def _finish_block(
             _rebuild_item_text(item, blocks)
         complete_args = payload.get("arguments")
         if type(complete_args) is str and block.kind == "tool_call":
-            if block.arguments and complete_args != block.arguments:
+            if item.arguments and complete_args != item.arguments:
                 raise _stream_inconsistent(
                     "Codex completed arguments do not match deltas"
                 )
-            block.arguments = complete_args
             item.arguments = complete_args
     if event_type == "response.reasoning_summary_text.done":
         if block.text_done:

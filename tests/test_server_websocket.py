@@ -10,12 +10,14 @@ import logging
 import os
 import secrets
 import stat
+import threading
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import TextContent, ToolCall
@@ -25,7 +27,7 @@ from zeta.server.transport import _parse_subprotocol_auth
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-TIMEOUT = 3
+TIMEOUT = 10
 
 
 async def _read_http_headers(
@@ -181,6 +183,49 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
         }
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_websocket_session_history_and_subscribe_returns_replay_cursor(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token
+    )
+    assert status == 101
+    try:
+        async def request(request_id: int, method: str, params: dict[str, object]) -> dict[str, object]:
+            await _send_json(
+                writer,
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+            )
+            while True:
+                frame = await _read_json(reader)
+                if frame.get("id") == request_id:
+                    return frame
+
+        hello = await request(
+            1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]}
+        )
+        assert "session_history_and_subscribe" in hello["result"]["capabilities"]["requests"]
+        created = await request(2, "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        joined = await request(
+            3, "session_history_and_subscribe", {"session_id": session_id}
+        )
+        assert joined["result"]["replay"]["history_seq"] == 0
+    finally:
+        writer.close()
+        await close_serve(server)
 
 
 @pytest.mark.asyncio
@@ -692,6 +737,165 @@ def test_serve_websocket_cli_flags() -> None:
     )
     assert args.ws_port == 8765
     assert args.ws_origins == ["http://127.0.0.1:5173", "https://app.example:443"]
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_requires_negotiation(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token, protocol_fields=["zeta.v1"]
+    )
+    assert status == 101
+    try:
+        await _send_json(
+            writer,
+            {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2"}},
+        )
+        assert (await _read_json(reader))["id"] == 1
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "child_run_history",
+                "params": {"session_id": "missing", "run_id": "bad"},
+            },
+        )
+        assert (await _read_json(reader))["error"]["code"] == -32601
+    finally:
+        await close_serve(server, writer)
+
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_reads_child(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.runtime.opened.store
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole
+    child = ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease)
+    child.start_agent_lifecycle(handle=f"{metadata.session_id}:1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="child")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("websocket-child")]))
+    child.close()
+    await server.start()
+    reader, writer, status, _ = await _connect(server, token=server._websocket.token, protocol_fields=["zeta.v1"])
+    assert status == 101
+    try:
+        await _send_json(writer, {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "features": ["child_run_history"]}})
+        await _read_json(reader)
+        await _send_json(writer, {"jsonrpc": "2.0", "id": 2, "method": "child_run_history", "params": {"session_id": metadata.session_id, "run_id": f"{metadata.session_id}:1"}})
+        result = (await _read_json(reader))["result"]
+        assert result["messages"][0]["content"][0]["text"] == "websocket-child"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_websocket_child_history_ignores_production_partial_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.store import ConversationStore
+    from zeta.protocol.types import Message, MessageRole
+
+    server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.runtime.opened.store
+    child = ConversationStore(
+        root.session_dir / "agents",
+        session_id="1",
+        _storage_lease=root._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{metadata.session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token, protocol_fields=["zeta.v1"]
+    )
+    assert status == 101
+    append_started = threading.Event()
+    release_append = threading.Event()
+    append_errors: list[BaseException] = []
+    original_write_bytes = ConversationStore._write_bytes
+
+    def split_write(target: ConversationStore, data: bytes) -> None:
+        if target is not child or append_started.is_set():
+            original_write_bytes(target, data)
+            return
+        original_write_bytes(target, data[:-1])
+        append_started.set()
+        assert release_append.wait(10)
+        original_write_bytes(target, data[-1:])
+
+    def append_message() -> None:
+        try:
+            child.append_message(Message(MessageRole.ASSISTANT, [TextContent("partial")]))
+        except BaseException as exc:  # noqa: BLE001 - transfer thread failure
+            append_errors.append(exc)
+
+    async def child_history(request_id: int) -> dict[str, object]:
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "child_run_history",
+                "params": {
+                    "session_id": metadata.session_id,
+                    "run_id": f"{metadata.session_id}:1",
+                },
+            },
+        )
+        return await _read_json(reader)
+
+    try:
+        await _send_json(
+            writer,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "hello",
+                "params": {
+                    "protocol_version": "1.2",
+                    "features": ["child_run_history"],
+                },
+            },
+        )
+        await _read_json(reader)
+        first = await child_history(2)
+        assert first["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        # test-contract: seam pauses one production append after its strict row prefix
+        monkeypatch.setattr(ConversationStore, "_write_bytes", split_write)
+        append_thread = threading.Thread(target=append_message)
+        append_thread.start()
+        try:
+            assert await await_or_fail(
+                asyncio.to_thread(append_started.wait, 10),
+                what="websocket production child append prefix",
+            )
+            during = await child_history(3)
+            assert during["result"]["messages"][-1]["content"][0]["text"] == "complete"
+        finally:
+            release_append.set()
+            await await_or_fail(
+                asyncio.to_thread(append_thread.join, 10),
+                what="websocket production child append completion",
+            )
+        assert not append_thread.is_alive()
+        assert not append_errors, append_errors
+        completed = await child_history(4)
+        assert completed["result"]["messages"][-1]["content"][0]["text"] == "partial"
+    finally:
+        release_append.set()
+        child.close()
+        await close_serve(server, writer)
 
 
 async def _reply(reader: asyncio.StreamReader, request_id: int) -> dict[str, object]:

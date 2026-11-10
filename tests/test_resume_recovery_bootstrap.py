@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -329,24 +330,27 @@ async def test_resume_recovery_cancel_during_setup_is_safe(tmp_path: Path) -> No
     entered = threading.Event()
     release = threading.Event()
 
-    from zeta.agent import background
+    import zeta.agent.background_lifecycle
 
-    original_recover = background.recover_agent_children
+    original_recover = zeta.agent.background_lifecycle.recover_agent_children
 
     def gated_recover(loop):
         entered.set()
         assert release.wait(2)
         return original_recover(loop)
 
-    with patch.object(background, "recover_agent_children", gated_recover):
+    with patch.object(zeta.agent.background_lifecycle, "recover_agent_children", gated_recover):
         resume = asyncio.create_task(runtime.resume_session(session_id))
         assert await asyncio.to_thread(entered.wait, 2)
         resume.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await resume
+            await await_or_fail(resume, what="resume cancellation")
         if runtime._setup_reapers:
-            await asyncio.gather(*tuple(runtime._setup_reapers))
+            await await_or_fail(
+                asyncio.gather(*tuple(runtime._setup_reapers)),
+                what="resume setup reapers",
+            )
 
     await runtime.resume_session(session_id)
     try:
