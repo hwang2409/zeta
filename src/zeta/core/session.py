@@ -292,15 +292,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             ) as destination_fd, session_directory(
                                 staged.sessions_dir, session_id
                             ) as (_, source_fd):
-                                names = sorted(
+                                for filename in sorted(
                                     (
-                                        filename
-                                        for filename in os.listdir(source_fd)
-                                        if filename != RUNTIME_LEASE_NAME
+                                        name
+                                        for name in os.listdir(source_fd)
+                                        if name != RUNTIME_LEASE_NAME
                                     ),
                                     key=lambda item: item == "meta.json",
-                                )
-                                for filename in names:
+                                ):
                                     os.replace(
                                         filename,
                                         filename,
