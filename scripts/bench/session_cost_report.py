@@ -24,7 +24,14 @@ def parse_time(value: str | None) -> dt.datetime | None:
 
 
 def row_time(row: dict, fallback: dt.datetime | None) -> dt.datetime | None:
-    for value in (row.get("created_at"), row.get("timestamp"), row.get("data", {}).get("created_at")):
+    message = row.get("data", {}).get("message", {})
+    metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
+    for value in (
+        row.get("created_at"),
+        row.get("timestamp"),
+        row.get("data", {}).get("created_at"),
+        metadata.get("created_at") if isinstance(metadata, dict) else None,
+    ):
         if isinstance(value, str):
             try:
                 return parse_time(value)
@@ -78,6 +85,24 @@ def model_for(path: Path, assistant_models: set[str]) -> str:
         for key in ("model", "selected_model"):
             if lifecycle.get(key):
                 return str(lifecycle[key])
+        # Older lifecycle files keep the launch model in the parent's child table.
+        for ancestor in path.parents:
+            state = read_json(ancestor / "session_state.json")
+            for child in state.get("agent_children", {}).values():
+                if not isinstance(child, dict):
+                    continue
+                child_path = child.get("child_session_path")
+                if not isinstance(child_path, str):
+                    continue
+                try:
+                    matches_path = Path(child_path).expanduser().resolve() == path.parent
+                except OSError:
+                    matches_path = False
+                if not matches_path:
+                    continue
+                arguments = child.get("tool_call", {}).get("arguments", {})
+                if arguments.get("model"):
+                    return str(arguments["model"])
         if len(assistant_models) == 1:
             return next(iter(assistant_models))
         return "unknown"
@@ -105,6 +130,7 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None) 
     evictions = evicted_bytes = skipped = 0
     fallback = None
     try:
+        file_time = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.UTC)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         with os.fdopen(fd, encoding="utf-8") as stream:
@@ -118,6 +144,16 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None) 
                     fallback = row_time(row, None)
                 when = row_time(row, fallback)
                 message = row.get("data", {}).get("message", {})
+                # shortcut: legacy rows have no timestamps; use the file's last append time until row timestamps exist.
+                if (
+                    row.get("type") == "message"
+                    and since
+                    and when is not None
+                    and when < since
+                    and not any(row.get(key) or row.get("data", {}).get(key) for key in ("created_at", "timestamp"))
+                    and not (isinstance(message, dict) and isinstance(message.get("metadata"), dict) and message["metadata"].get("created_at"))
+                ):
+                    when = file_time
                 is_assistant = isinstance(message, dict) and message.get("role") == "assistant"
                 if is_assistant and result["first_in_window"] is None:
                     result["first_in_window"] = (when, message)
@@ -246,11 +282,12 @@ def self_check() -> None:
         root = Path(td); session = root / "sessions" / "s" / "agents" / "1"; session.mkdir(parents=True)
         (root / "sessions" / "s" / "meta.json").write_text('{"model":"test"}')
         (session / "agent_lifecycle.json").write_text('{"agent_type":"worker","description":"fix PR #12"}')
-        row = {"type":"message","data":{"message":{"role":"assistant","content":[{"text":"sleep 1"}],"metadata":{"output_tokens":3,"provider_usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}}}}
-        later = {"created_at":"2026-01-03T00:00:00Z", **row}
+        (root / "sessions" / "s" / "session_state.json").write_text(json.dumps({"agent_children": {"s:1": {"child_session_path": str(session), "tool_call": {"arguments": {"model": "gpt-5.6-luna"}}}}}))
+        row = {"created_at":"2026-01-01T00:00:00Z","type":"message","data":{"message":{"role":"assistant","content":[{"text":"sleep 1"}],"metadata":{"output_tokens":3,"provider_usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}}}}
+        later = {**row, "created_at":"2026-01-03T00:00:00Z"}
         (session / "conversation.jsonl").write_text(json.dumps({"type":"header","data":{"created_at":"2026-01-01T00:00:00Z"}})+"\n"+json.dumps(row)+"\n"+json.dumps(later)+"\n")
         result = report(root, ["s"], None, None)
-        assert result["turns"] == 2 and result["groups"][0]["uncached_per_turn"] == 10 and result["groups"][0]["polling_turns"] == 2
+        assert result["turns"] == 2 and result["groups"][0]["model"] == "gpt-5.6-luna" and result["groups"][0]["uncached_per_turn"] == 10 and result["groups"][0]["polling_turns"] == 2
         windowed = report(root, ["s"], parse_time("2026-01-02T00:00:00Z"), None)
         assert windowed["turns"] == 1 and windowed["groups"][0]["median_first_request_total_input"] is None
         assert result["groups"][0]["median_first_request_total_input"] == 16
