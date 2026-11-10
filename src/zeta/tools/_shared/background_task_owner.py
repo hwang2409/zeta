@@ -234,26 +234,11 @@ class _BackgroundTaskOwner:
                     for item in self.registry._records.values()
                 )
             )
-            attempts = 0
-            while not self.terminal_durable.is_set():
-                try:
-                    await self.registry._commit_transition(rows, lambda: None, None)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    attempts += 1
-                    if attempts >= 3:
-                        raise
-                    # Keep the same terminal candidate. A failed write must not
-                    # end the owner while the live record still says running.
-                    await asyncio.sleep(0)
-                    continue
-                self.state = _OwnerState.DURABLE_TERMINAL
-                self.terminal_durable.set()
         if self.defer_receipt_for_close:
             self._receipt_release.clear()
             # test-contract: durability close releases receipts after aggregate state
             await self._receipt_release.wait()
+        # keep the task running until its exit evidence is durably admitted.
         self.state = _OwnerState.EVIDENCE_PENDING
         if self.record.notify_on_exit:
             await self._deliver_exit(
@@ -275,6 +260,22 @@ class _BackgroundTaskOwner:
                     tui_presented=candidate.tui_presented,
                 )
             )
+        attempts = 0
+        while not self.terminal_durable.is_set():
+            try:
+                await self.registry._commit_transition(rows, lambda: None, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                attempts += 1
+                if attempts >= 3:
+                    raise
+                # Keep the same terminal candidate. A failed write must not
+                # end the owner while the live record still says running.
+                await asyncio.sleep(0)
+                continue
+            self.state = _OwnerState.DURABLE_TERMINAL
+            self.terminal_durable.set()
         self.state = _OwnerState.INSTALLED_TERMINAL
         self.record.running = False
         self.record.exit_code = candidate.exit_code
