@@ -311,7 +311,12 @@ class HistoryIndex:
         suffix = rows[start:]
         if not suffix:
             return None
+        parent_id = stored.get("last_id")
         for entry in suffix:
+            row = self._row(entry)
+            if row[2] != parent_id:
+                return None
+            parent_id = row[1]
             digest = self._entry_digest(digest, entry)
         return start if digest.hex() == expected.get("prefix_digest") else None
 
