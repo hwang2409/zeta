@@ -9167,34 +9167,23 @@ def test_provider_for_model_maps_each_catalog_entry() -> None:
     for provider, models in PROVIDER_MODELS.items():
         for model in models:
             assert provider_for_model(model) == provider
+    for model, provider in {
+        "gpt-oss:20b": "ollama",
+        "claude-future": "claude",
+        "gpt-future": "codex",
+        "o2-preview": "codex",
+    }.items():
+        assert provider_for_model(model) == provider
 
 
 def test_provider_for_model_rejects_an_unknown_name() -> None:
     from zeta.models.catalog import provider_for_model
 
     with pytest.raises(ValueError) as excinfo:
-        provider_for_model("gpt-nonexistent")
+        provider_for_model("not-a-model")
     message = str(excinfo.value)
-    assert "gpt-nonexistent" in message
+    assert "not-a-model" in message
     assert "claude-opus-5" in message
-
-
-def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
-    from zeta.models.catalog import known_model_names
-
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(
-        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
-    )
-
-    agent_schema = next(
-        schema for schema in registry.schemas if schema["name"] == "agent"
-    )
-    model_schema = agent_schema["parameters"]["properties"]["model"]
-    assert model_schema["enum"] == known_model_names()
-    assert "claude-opus-5" in model_schema["enum"]
-    assert "gpt-5.4" in model_schema["enum"]
 
 
 @pytest.mark.asyncio
@@ -9370,29 +9359,6 @@ async def test_agent_model_implies_background(
     await loop.close()
 
 
-@pytest.mark.asyncio
-async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) -> None:
-    """The schema enum catches a bad model name before the runner is reached."""
-
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_model_agent_call(model="gpt-nonexistent")])]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error
-    assert "model is not an allowed value" in result.content
-    assert not (store.session_dir / "agents").exists()
-
-
 def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     """Second line of defence, for any caller that skips schema validation."""
 
@@ -9406,7 +9372,7 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     # No model at all keeps the parent's backend.
     assert resolve_child_backend(loop, None) == (parent_backend, None)
 
-    backend, error = resolve_child_backend(loop, "gpt-nonexistent")
+    backend, error = resolve_child_backend(loop, "not-a-model")
     assert backend is None
     assert error is not None and "unknown model" in error
 
