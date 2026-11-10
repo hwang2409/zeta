@@ -85,7 +85,6 @@ from .session_links import (
 )
 
 logger = logging.getLogger(__name__)
-
 class SessionLoopThreadLockError(SessionError):
     pass
 
