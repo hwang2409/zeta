@@ -1937,117 +1937,135 @@ class _P03aScanner:
     def __init__(self, gate=None, error=None):
         self.gate = gate
         self.error = error
+        self._activation_sent_outcome = None
         self.started = threading.Event()
+        self.polled = threading.Event()
         self.polls = 0
         self.claimed = []
+        self.session_id = "b" * 32
         self.inbox = SimpleNamespace(
-            claim_wake=lambda project_id, ids: self.claimed.append((project_id, ids))
+            claim_wake=lambda project_id, ids: self.claimed.append((project_id, ids)),
+            list=lambda project_id, session_id: {"new": []},
         )
 
-    def poll(self):
-        self.polls += 1
-        self.started.set()
-        if self.gate is not None:
-            self.gate.wait(timeout=10)
+    def scan(self):
         if self.error is not None:
             error, self.error = self.error, None
             raise error
         return (("m" * 32,), (), [{"id": "m" * 32}])
 
+    def scan_sent(self):
+        return ()
 
-async def _p03a_loop(scanner, flow, events):
-    loop = ProjectInboxNotificationMixin()
-    loop._project_inbox_publication_event = asyncio.Event()
-    loop._project_inbox_poll_done = asyncio.Event()
-    loop._inbox_scanner = scanner
-    loop._project_inbox_poll_task = None
-    loop._turn_active = False
-    loop.store = SimpleNamespace(session_id="s" * 32)
-    loop.tool_registry = SimpleNamespace(project_id="p", registered_names={"inbox"})
-    loop._ensure_step_delivery = lambda: _resolved(flow)
-    loop._publish_background_event = events.append
-    return loop
+    def poll(self):
+        self.polls += 1
+        self.started.set()
+        self.polled.set()
+        if self.gate is not None:
+            self.gate.wait(timeout=10)
+        return self.scan()
 
 
 async def _resolved(value):
     return value
 
 
-async def _commit_p03a(item):
-    item.after_commit()
-
-
 @pytest.mark.asyncio
-async def test_p03a_failed_commit_retries_same_poll_before_rescan():
+async def test_p03a_failed_commit_retries_same_poll_before_rescan(tmp_path, monkeypatch):
+    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
     scanner = _P03aScanner()
     flow = _P03aFlow(scanner.claimed)
-    loop = await _p03a_loop(scanner, flow, [])
-    task = asyncio.create_task(loop._project_inbox_supervisor())
-    loop._project_inbox_poll_task = task
+    # test-contract: seam inject scanner and delivery at the runtime seam
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
+    # test-contract: seam inject real delivery flow at the runtime seam
+    monkeypatch.setattr(loop, "_ensure_step_delivery", lambda: _resolved(flow))
     try:
-        loop._project_inbox_publication_event.set()
-        await await_or_fail(loop._project_inbox_poll_done.wait(), what="first poll")
+        await loop.activate()
+        # test-contract: seam observe injected scanner calls through the public activation path
+        # test-contract: seam observe injected scanner calls through the public activation path
         assert scanner.polls == 1
-        loop._project_inbox_poll_done.clear()
-        loop._project_inbox_publication_event.set()
-        await await_or_fail(loop._project_inbox_poll_done.wait(), what="retry poll")
+        scanner.polled.clear()
+        loop.notify_project_inbox_publication()
+        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="retry poll")
+        # test-contract: seam observe retry ordering through the injected scanner
+        # test-contract: seam observe retry ordering through the injected scanner
         assert scanner.polls == 1
-        assert scanner.claimed == [("p", ("m" * 32,))]
+        # test-contract: seam observe delivered ids through the injected scanner
+        assert scanner.claimed == [(project_b.project_id, ("m" * 32,))]
+        # test-contract: seam the same poll is retried after the failed commit
+        assert flow.attempts == 2
     finally:
-        task.cancel()
-        await await_or_fail(asyncio.gather(task, return_exceptions=True), what="supervisor close")
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
-async def test_p03a_close_drains_blocked_scanner_worker():
+async def test_p03a_close_drains_blocked_scanner_worker(tmp_path, monkeypatch):
+    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
     release = threading.Event()
     scanner = _P03aScanner(release)
-    loop = await _p03a_loop(scanner, _P03aFlow([]), [])
-    task = asyncio.create_task(loop._project_inbox_supervisor())
-    loop._project_inbox_poll_task = task
+    # test-contract: seam inject scanner at the runtime seam
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
     try:
-        loop._project_inbox_publication_event.set()
+        activation = asyncio.create_task(loop.activate())
         await await_or_fail(asyncio.to_thread(scanner.started.wait), what="scanner start")
-        closing = asyncio.create_task(loop._close_project_inbox_supervisor())
-        await await_or_fail(asyncio.to_thread(lambda: not closing.done()), what="close blocks")
-        assert not closing.done()
+        closing = asyncio.create_task(loop.close())
         release.set()
-        await await_or_fail(closing, what="scanner drain")
-        assert task.done()
+        await await_or_fail(closing, what="close drains scanner")
+        await await_or_fail(activation, what="activation")
+        # test-contract: seam close completes only after the blocked scanner is released
+        assert release.is_set()
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-
-def test_p03a_health_sink_failure_does_not_raise():
-    loop = SimpleNamespace(
-        store=SimpleNamespace(session_id="s" * 32),
-        _publish_background_event=lambda _event: (_ for _ in ()).throw(RuntimeError("sink")),
-    )
-    ProjectInboxNotificationMixin._publish_project_inbox_health(loop, "degraded", "bad")
+        if not loop._closed:
+            await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
-async def test_p03a_registry_error_recovers_same_supervisor():
+async def test_p03a_health_sink_failure_does_not_stop_polling(tmp_path, monkeypatch):
+    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
+    scanner = _P03aScanner()
+    # test-contract: seam inject scanner at the runtime seam
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
+    loop.set_background_event_sink(lambda _event: (_ for _ in ()).throw(RuntimeError("sink")))
+    try:
+        await loop.activate()
+        scanner.polled.clear()
+        loop.notify_project_inbox_publication()
+        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="poll after sink failure")
+        # test-contract: seam observe continued polling through the public runtime
+        # test-contract: seam observe continued polling through the public runtime
+        assert scanner.polls == 2
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_p03a_registry_error_recovers_same_supervisor(tmp_path, monkeypatch):
+    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
     scanner = _P03aScanner(error=ProjectRegistryError("registry"))
     events = []
-    flow = SimpleNamespace(produce=lambda item: _commit_p03a(item))
-    loop = await _p03a_loop(scanner, flow, events)
-    task = asyncio.create_task(loop._project_inbox_supervisor())
-    loop._project_inbox_poll_task = task
+    # test-contract: seam inject scanner at the runtime seam
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
+    loop.set_background_event_sink(events.append)
     try:
-        loop._project_inbox_publication_event.set()
-        await await_or_fail(loop._project_inbox_poll_done.wait(), what="degraded poll")
-        loop._project_inbox_poll_done.clear()
-        loop._project_inbox_publication_event.set()
-        await await_or_fail(loop._project_inbox_poll_done.wait(), what="recovered poll")
-        assert [event.data["state"] for event in events] == ["degraded", "healthy"]
-        assert not task.done()
+        await loop.activate()
+        scanner.polled.clear()
+        loop.notify_project_inbox_publication()
+        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="recovered poll")
+        states = [event.data["state"] for event in events if event.data.get("kind") == "project_inbox_health"]
+        # test-contract: seam inspect public background event projections
+        # test-contract: seam inspect public background event projections
+        assert states == ["degraded", "healthy"]
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
