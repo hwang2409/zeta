@@ -248,6 +248,7 @@ FEATURES = (
     "served_turn_end",
     "content_read",
     "session_grants",
+    "path_completion",
     "child_runs",
     "delivery_session_guard",
 )
@@ -286,6 +287,12 @@ class MethodDescriptor(Enum):
     SET_SETTINGS = ("set_settings", "1.1", None, Access.SESSION_MUTATION)
     SET_COMPACTION = ("set_compaction", "1.1", None, Access.SESSION_MUTATION)
     SEND_IMAGES = ("send_images", "1.1", None, Access.DELIVERY)
+    PATH_COMPLETE = (
+        "path_complete",
+        None,
+        "path_completion",
+        Access.CONTROLLER_READ,
+    )
     SLASH_LIST = ("slash_list", "1.1", None, Access.CONTROLLER_READ)
     SLASH_RUN = ("slash_run", "1.1", None, Access.SESSION_MUTATION)
     ACCOUNT_LIST = ("account_list", "1.1", None, Access.CONTROLLER_READ)

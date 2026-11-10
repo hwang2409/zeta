@@ -24,7 +24,6 @@ from ..protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
-from ..runtime._async_close import is_control_exception, merge_exception
 from .must_complete_close import (
     DeadlineClock,
     MonotonicDeadlineClock,
@@ -47,7 +46,6 @@ MAX_PROVIDER_RETRY_DELAY_SECONDS = 30.0
 MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
-MAX_STALL_RETRIES = 2
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
 _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
@@ -76,6 +74,41 @@ class AttemptSignal:
     activity: TransportActivity
     event: StreamEvent | None = None
 
+
+
+def is_control_exception(value: BaseException) -> bool:
+    return isinstance(value, (asyncio.CancelledError, GeneratorExit))
+
+
+def _control_priority(value: BaseException) -> int:
+    if isinstance(value, asyncio.CancelledError):
+        return 2
+    if isinstance(value, GeneratorExit):
+        return 1
+    return 0
+
+
+def merge_exception(
+    primary: BaseException | None,
+    cleanup: BaseException,
+) -> BaseException:
+    if primary is None:
+        return cleanup
+    primary_is_control = is_control_exception(primary)
+    cleanup_is_control = is_control_exception(cleanup)
+    if cleanup_is_control and not primary_is_control:
+        cleanup.__cause__ = primary
+        cleanup.__context__ = primary
+        return cleanup
+    if (
+        cleanup_is_control
+        and primary_is_control
+        and _control_priority(cleanup) > _control_priority(primary)
+    ):
+        return cleanup
+    if primary_is_control and not cleanup_is_control:
+        primary.__context__ = cleanup
+    return primary
 
 
 def _first_provider_error(*errors: BaseException | None) -> BaseException | None:
@@ -124,7 +157,7 @@ class CompletionRetryBudget:
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
     exhausted: bool = False
-    max_stall_retries: int = MAX_STALL_RETRIES
+    max_stall_retries: int = 2
     stall_retries: int = 0
     excluded_stall_seconds: float = 0.0
     records: list[dict[str, object]] = field(default_factory=list)
@@ -1142,11 +1175,7 @@ def complete(
     control: CompletionControl,
     clock: DeadlineClock | None = None,
     wait: Callable[[float], Awaitable[None]] | None = None,
-    transport_idle: float = TRANSPORT_IDLE_SECONDS,
-    max_stall_retries: int = MAX_STALL_RETRIES,
 ) -> CompletionRun:
-    """Run one owned completion with the backend's configured stall limits."""
-    control.budget.max_stall_retries = max_stall_retries
     return CompletionRun(
         adapter,
         messages,
@@ -1154,9 +1183,6 @@ def complete(
         control,
         clock=clock or getattr(adapter, "_completion_clock", None),
         wait=wait or getattr(adapter, "_completion_wait", None),
-        transport_idle=transport_idle,
-        # a silent stream must reach the user's transport limit, not stall earlier as "model progress"
-        model_idle=max(MODEL_PROGRESS_IDLE_SECONDS, transport_idle),
     )
 
 
