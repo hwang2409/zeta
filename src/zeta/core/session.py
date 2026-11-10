@@ -445,7 +445,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     )
                 return OpenedSession(metadata, store)
 
-        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+        with session_root(self.sessions_dir) as root_fd, child_directory(
+            root_fd, session_id
+        ) as directory_fd:
             execution_lease = SessionExecutionLease.acquire(
                 directory_fd,
                 session_id=session_id,
