@@ -29,6 +29,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
@@ -114,8 +115,15 @@ class NotificationPresentation:
 class ServeControl:
     """Own the active semantic lifetime independently of physical clients."""
 
-    def __init__(self, server: ZetaServer) -> None:
+    def __init__(
+        self,
+        server: ZetaServer,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
+    ) -> None:
         self.server = server
+        self.foreground_event_publisher = (
+            foreground_event_publisher or ForegroundEventPublisher()
+        )
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._session_swap_active = False
@@ -589,18 +597,20 @@ class ServeControl:
         terminal_error: dict[str, object] | None = None
         agent_end: StreamEvent | None = None
         try:
-            async for event in loop.run_turn(
-                text,
-                origin=origin,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-                host_environment=None
-                if host_commands is None
-                else host_commands.environment,
-                host_instruction=""
-                if host_commands is None
-                else host_commands.instruction,
-                allow_assistant_reset=allow_assistant_reset,
+            async for event in self.foreground_event_publisher.events(
+                loop.run_turn(
+                    text,
+                    origin=origin,
+                    user_message=user_message,
+                    persist_user_message=persist_user_message,
+                    host_environment=None
+                    if host_commands is None
+                    else host_commands.environment,
+                    host_instruction=""
+                    if host_commands is None
+                    else host_commands.instruction,
+                    allow_assistant_reset=allow_assistant_reset,
+                )
             ):
                 if pending_turn_end is not None:
                     if event.type is StreamEventType.AGENT_END:
