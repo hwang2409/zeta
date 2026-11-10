@@ -749,34 +749,22 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_generation_overcount_keeps_empty_frontier_stream(
-    tmp_path: Path, transport: Transport
-) -> None:
-    serve = await _serve(tmp_path, transport, FakeBackend([]))
-    try:
-        joined = await serve.join(serve.observer)
-        assert joined["replay"]["history_seq"] == 0, joined
-        # test-contract: seam forces the documented async generation over-count
-        serve.store._reset_generation += 1
-        _tool_rows(serve.store, "covered-call")
-        await _publish_tool_end(serve, "covered-call")
-        frames = await serve.live(serve.observer)
-        assert [(frame["event"], frame.get("seq")) for frame in frames] == [
-            ("tool_end", 1)
-        ], frames
-    finally:
-        await _close(serve)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("pending_join", (False, True), ids=("live", "pending-join"))
-@pytest.mark.parametrize("renumber", (False, True), ids=("over-count", "renumber"))
+@pytest.mark.parametrize(
+    ("pending_join", "renumber", "empty_frontier"),
+    (
+        pytest.param(False, False, False, id="live-over-count"),
+        pytest.param(True, False, False, id="pending-join-over-count"),
+        pytest.param(False, True, False, id="live-renumber"),
+        pytest.param(True, True, False, id="pending-join-renumber"),
+        pytest.param(False, False, True, id="live-empty-frontier-over-count"),
+    ),
+)
 @pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_replay_frontier_table(
     tmp_path: Path,
     pending_join: bool,
     renumber: bool,
+    empty_frontier: bool,
     transport: Transport,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -799,7 +787,7 @@ async def test_replay_frontier_table(
         assert write_release.wait(10)
 
     try:
-        for index in range(6):
+        for index in range(0 if empty_frontier else 6):
             serve.store.append_task_notification(task_id=f"before-{index}", command="true", exit_code=0)
         if pending_join:
             connections.run_read = held_read  # type: ignore[method-assign]
