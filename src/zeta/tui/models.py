@@ -12,13 +12,11 @@ import httpx
 
 from ..accounts import SessionAccountContext
 from ..core.session import env_home
-from ..models.catalog import PROVIDER_MODELS
+from ..models.catalog import PROVIDER_MODELS, update_live_catalog
 from ..providers.factory import credential_store
 
 
-MODEL_CATALOGS = {
-    "ollama": frozenset({"qwen3:4b", "qwen3:4b-instruct"}),
-}
+MODEL_CATALOGS: dict[str, frozenset[str]] = {}
 _MODEL_CATALOG_TIMEOUT = 2.0
 _WRONG_PROVIDER_PREFIXES = {
     "claude": ("gpt-", "o1", "o3", "o4", "gemini-", "llama-"),
@@ -100,24 +98,28 @@ def _load_codex_model_catalog() -> frozenset[str] | None:
     return None
 
 
-def load_model_catalog(
-    provider: str,
-    *,
-    account_context: SessionAccountContext | None = None,
-) -> frozenset[str] | None:
-    """Load a provider catalog, returning None when it cannot be obtained."""
-
-    if provider == "codex":
-        return _load_codex_model_catalog()
-    if provider != "claude":
+def _load_ollama_model_catalog() -> frozenset[str] | None:
+    try:
+        response = httpx.get(
+            os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+            + "/api/tags",
+            timeout=1.0,
+        )
+        response.raise_for_status()
+        return _model_names_from_payload(response.json())
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, httpx.HTTPError):
         return None
 
+
+def _load_claude_model_catalog(
+    account_context: SessionAccountContext | None,
+) -> frozenset[str] | None:
     if account_context is not None and account_context.auth_mode == "api-key":
         return None
     backend_kwargs = (
         {"home": env_home()}
         if account_context is None
-        else account_context.backend_kwargs(provider)
+        else account_context.backend_kwargs("claude")
     )
     auth_home = Path(backend_kwargs["home"])
     account = backend_kwargs.get("account")
@@ -147,3 +149,23 @@ def load_model_catalog(
         httpx.HTTPError,
     ):
         return None
+
+
+def load_model_catalog(
+    provider: str,
+    *,
+    account_context: SessionAccountContext | None = None,
+) -> frozenset[str] | None:
+    """Load a provider catalog, returning None when it cannot be obtained."""
+
+    if provider == "codex":
+        catalog = _load_codex_model_catalog()
+    elif provider == "ollama":
+        catalog = _load_ollama_model_catalog()
+    elif provider == "claude":
+        catalog = _load_claude_model_catalog(account_context)
+    else:
+        return None
+    if catalog is not None:
+        update_live_catalog(provider, catalog)
+    return catalog
