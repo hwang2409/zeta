@@ -62,17 +62,8 @@ class SessionReferenceAuthority:
 
     gate: SessionReferenceGate
     session_ids: frozenset[str]
-    project_domains: tuple[tuple[str, str], ...]
-
     def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
         self.gate.validate(session_ids)
-
-    def validate_project_domains(
-        self, project_domains: tuple[tuple[str, str], ...]
-    ) -> None:
-        declared = set(self.project_domains)
-        if not set(project_domains).issubset(declared):
-            raise AssertionError("project domain was not declared for reference admission")
 
 
 class SessionReferenceGate:
@@ -129,16 +120,13 @@ class SessionReferenceGate:
         *,
         installed_ids: tuple[str, ...],
         referenced_ids: tuple[str, ...],
-        project_domains: tuple[tuple[str, str], ...],
     ):
         ids = (*installed_ids, *referenced_ids)
-        if project_domains != tuple(sorted(set(project_domains))):
-            raise AssertionError("project domains must be unique and sorted")
         with self._locked(exclusive=False, unavailable_id=ids[0] if ids else None):
             self.validate(ids)
             if installed_ids:
                 self.bump_generation()
-            yield SessionReferenceAuthority(self, frozenset(ids), project_domains)
+            yield SessionReferenceAuthority(self, frozenset(ids))
 
     def exclusive(self, *, session_id: str | None = None):
         return self._locked(exclusive=True, unavailable_id=session_id)
@@ -193,14 +181,12 @@ def reference_publication(
     *,
     installed_ids: tuple[str, ...] = (),
     referenced_ids: tuple[str, ...] = (),
-    project_domains: tuple[tuple[str, str], ...] = (),
 ):
     """Enter reference admission once for one complete public transaction."""
     gate = SessionReferenceGate(home, lease)
     with gate._shared(
         installed_ids=installed_ids,
         referenced_ids=referenced_ids,
-        project_domains=project_domains,
     ) as authority:
         yield authority
 

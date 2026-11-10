@@ -915,7 +915,6 @@ class ProjectRegistry(
             self.root.parent,
             self._storage_lease,
             referenced_ids=ids,
-            project_domains=((project_id, "sessions"),),
         ), self._project_lock(project_id, "sessions", exclusive=True) as project_fd:
             self._update_sessions_locked(project_fd, set(), prepared)
 

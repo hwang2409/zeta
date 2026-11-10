@@ -44,7 +44,7 @@ _RAW_PUBLICATION = {
     ("project_inbox.py", "_recover_stale", "os.rename"),
     ("project_memory_history.py", "_publish_mirror_file", "os.replace"),
     ("tools/_spill.py", "_publish_staged", "os.replace"),
-    ("core/session.py", "create", "os.replace"),
+    ("core/session.py", "_publish_created_session", "os.replace"),
     ("core/session_links.py", "_quarantine_entry", "os.rename"),
     ("core/session_files.py", "write_session_file", "os.replace"),
     ("core/session_files.py", "bump_generation", "os.replace"),

@@ -311,7 +311,6 @@ class ProjectInbox:
             self.registry.root.parent,
             self.registry._storage_lease,
             referenced_ids=(session, to_session) if to_session else (session,),
-            project_domains=((target.project_id, "inbox"),),
         ):
             self._publish_outgoing(target.project_id, message_id, body, record)
             if on_visible is not None:
@@ -700,7 +699,6 @@ class ProjectInbox:
             self.registry.root.parent,
             self.registry._storage_lease,
             referenced_ids=(session_id,),
-            project_domains=((target.project_id, "inbox"),),
         ), self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:

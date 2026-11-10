@@ -156,7 +156,6 @@ def persist_pending_root_link(
         lease,
         installed_ids=(session_id,),
         referenced_ids=(parent_session_id,) if parent_session_id else (),
-        project_domains=((project_id, "sessions"),),
     ) as authority:
         _persist_pending_root_link(
             sessions_dir, session_id, project_id, role, parent_session_id, lease,
@@ -210,7 +209,6 @@ def persist_pending_child_link(
         root.parent.parent, lease,
         installed_ids=(str(link["session_id"]),),
         referenced_ids=tuple(value for value in (link.get("parent_session_id"), root.name) if isinstance(value, str)),
-        project_domains=(((str(link["project_id"]), "sessions"),) if isinstance(link.get("project_id"), str) else ()),
     ) as authority:
         _persist_pending_child_link(root_session_dir, link, lease, authority=authority)
 
@@ -283,16 +281,11 @@ class ChildLineagePublisher:
             for session_id in (value.get("parent_session_id"), self._root_session_dir.name)
             if isinstance(session_id, str)
         )
-        project_id = value.get("project_id")
-        project_domains = (
-            ((project_id, "sessions"),) if isinstance(project_id, str) else ()
-        )
         with reference_publication(
             self._root_session_dir.parent.parent,
             self._storage_lease,
             installed_ids=installed_ids,
             referenced_ids=referenced_ids,
-            project_domains=project_domains,
         ) as authority:
             self._publish_admitted(value, authority)
 
@@ -379,7 +372,6 @@ def reconcile_child_links(
             Path(sessions_dir).parent,
             project_registry._storage_lease,
             referenced_ids=(session_id,),
-            project_domains=tuple((value, "sessions") for value in sorted(project_ids)),
         ) as authority:
             outcome = _reconcile_child_links_pass(
                 project_registry, sessions_dir, session_id,
@@ -744,15 +736,6 @@ def associate_project(manager, metadata, project_id: str):
         for value in (metadata.session_id, metadata.parent_session_id)
         if value is not None
     )
-    project_domains = tuple(
-        sorted(
-            {
-                (value, "sessions")
-                for value in (previous_project_id, project_id)
-                if value is not None
-            }
-        )
-    )
     authority_holder: list[SessionReferenceAuthority] = []
 
     @contextmanager
@@ -761,7 +744,6 @@ def associate_project(manager, metadata, project_id: str):
             manager.home,
             manager._storage_lease,
             referenced_ids=referenced_ids,
-            project_domains=project_domains,
         ) as authority:
             authority_holder.append(authority)
             yield authority
