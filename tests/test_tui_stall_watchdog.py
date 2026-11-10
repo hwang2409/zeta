@@ -123,6 +123,7 @@ async def test_blocked_loop_records_gc_across_probe_boundary(
     assert records[0]["duration_ms"] == 50
     assert records[0]["session_id"] == "session-123"
     assert records[0]["gc"]["ms"] > 0
+    assert records[0]["gc"]["ms"] <= records[0]["duration_ms"]
     assert records[0]["gc"]["by_gen"]["2"] > 0
     assert records[0]["gc"]["count"] == 2
     assert len(watchdog._gc_totals) == 7

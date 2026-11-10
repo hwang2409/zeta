@@ -179,6 +179,9 @@ class TUIStallWatchdog:
         ] | None = None,
     ) -> None:
         duration = self._clock() - started_monotonic
+        gc_totals = self._gc_totals
+        gc_started = self._gc_started
+        gc_end = time.perf_counter()
         if duration < self.stall_threshold:
             return
         try:
@@ -190,6 +193,7 @@ class TUIStallWatchdog:
                     other_threads,
                     observed_thread_count,
                     gc_probe_start,
+                    (gc_totals, gc_started, gc_end),
                 )
             )
         except Exception:
@@ -247,6 +251,9 @@ class TUIStallWatchdog:
         gc_probe_start: tuple[
             tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
         ] | None = None,
+        gc_probe_end: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ] | None = None,
     ) -> dict[str, Any]:
         ordered = sorted(stacks.items(), key=lambda item: (-item[1][0], item[1][1]))
         threads = []
@@ -284,7 +291,9 @@ class TUIStallWatchdog:
             )
         )
         retained_threads = threads[:_MAX_RETAINED_THREADS]
-        gc_record = self._gc_record(gc_probe_start or self._gc_probe_start)
+        if gc_probe_end is None:
+            gc_probe_end = (self._gc_totals, self._gc_started, time.perf_counter())
+        gc_record = self._gc_record(gc_probe_start or self._gc_probe_start, gc_probe_end, duration)
         return {
             "start_time": started.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "duration_ms": round(max(0.0, duration) * 1000, 3),
@@ -337,37 +346,42 @@ class TUIStallWatchdog:
         probe_start: tuple[
             tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
         ],
+        probe_end: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ],
+        duration: float,
     ) -> dict[str, Any]:
         totals_at_probe, started_at_probe, probe_time = probe_start
-        totals = self._gc_totals
+        totals, started_at_end, end_time = probe_end
         delta = [current - previous for current, previous in zip(totals, totals_at_probe)]
-        if started_at_probe is not None and self._gc_started != started_at_probe:
+        if started_at_probe is not None and started_at_end != started_at_probe:
             generation = started_at_probe[1]
             elapsed_before_probe = max(0.0, probe_time - started_at_probe[0]) * 1000
             delta[0] -= elapsed_before_probe
             if 0 <= generation < 3:
                 delta[4 + generation] -= elapsed_before_probe
         in_progress_ms = 0.0
-        if self._gc_started is not None:
-            generation = self._gc_started[1]
+        if started_at_end is not None:
+            generation = started_at_end[1]
             in_progress_ms = max(
-                0.0, time.perf_counter() - max(self._gc_started[0], probe_time)
+                0.0, end_time - max(started_at_end[0], probe_time)
             ) * 1000
             delta[0] += in_progress_ms
             if 0 <= generation < 3:
                 delta[4 + generation] += in_progress_ms
+        duration_ms = max(0.0, duration) * 1000
         gc_by_generation = {
-            str(generation): round(milliseconds, 3)
+            str(generation): round(min(max(milliseconds, 0.0), duration_ms), 3)
             for generation, milliseconds in enumerate(delta[4:])
             if milliseconds > 0
         }
         return {
-            "ms": round(max(0.0, delta[0]), 3),
+            "ms": round(min(max(delta[0], 0.0), duration_ms), 3),
             "by_gen": gc_by_generation,
             "count": delta[1],
             "collected": delta[2],
             "uncollectable": delta[3],
-            "in_progress_ms": round(in_progress_ms, 3),
+            "in_progress_ms": round(min(max(in_progress_ms, 0.0), duration_ms), 3),
             "freeze_count": gc.get_freeze_count(),
             "counts": gc.get_count(),
         }
