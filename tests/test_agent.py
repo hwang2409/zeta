@@ -16043,9 +16043,6 @@ async def _cancel_idle_fixture(
     child.close()
 
 
-@pytest.mark.parametrize(
-    "wake_source", ["task", "child", "idle_child", "question"]
-)
 @pytest.mark.asyncio
 async def test_empty_idle_notifies_parent_once_with_last_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
