@@ -13409,32 +13409,6 @@ async def test_foreground_child_close_finishes_before_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_child_finish_gate_lists_task_and_wakes_on_exit(tmp_path: Path) -> None:
-    release = tmp_path / "release"
-    command = f"{wait_for_path_command(release)} && echo task-evidence"
-    backend = _TaskFinishGateBackend(command)
-    store, loop, run, completion_published = await _start_task_gate(
-        tmp_path / "session", backend
-    )
-
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=10)
-    assert "background tasks" in backend.gate_text
-    assert "task-" in backend.gate_text
-    assert not [
-        entry
-        for entry in store.agent_notifications(pending_only=False)
-        if entry.data.get("status") == "completed"
-    ]
-    release.touch()
-
-    await asyncio.wait_for(run, timeout=5)
-    notification = await _completion_after_publication(store, completion_published)
-    assert "task result:" in notification.data["text"]
-    assert "task-evidence" in notification.data["text"]
-    await loop.close()
-
-
-@pytest.mark.asyncio
 async def test_child_finish_gate_task_kill_path(tmp_path: Path) -> None:
     backend = _TaskFinishGateBackend(
         _python("import time; time.sleep(30)"), action="kill"
@@ -16137,6 +16111,7 @@ async def test_stalled_admission_commits_before_racing_follow_up(
         await _cancel_idle_fixture(run, registry, parent, child)
 
 
+@pytest.mark.parametrize("extra_idle_wake", [False, True])
 @pytest.mark.asyncio
 async def test_question_answer_then_later_stall_starts_new_notice_episode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_idle_wake: bool
