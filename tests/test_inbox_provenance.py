@@ -8,15 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.serve_close import close_serve
 from tests.test_project_inbox import _projects
 from tests.test_server import _connect, _request
 from tests.test_server_projects import _hello, _server
-from tests.support.serve_close import close_serve
-from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.pending_delivery import DeliveryPublications
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
-from zeta.project_inbox_sent.notifications import project_inbox_notification
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     MessageOrigin,
@@ -127,7 +125,7 @@ async def test_inbox_provenance_routes(
         root_project_id=recipient.project_id, project_registry=registry,
     )
     await loop.activate()
-    entry, appended = opened.store.append_inbox_notification_if_absent(
+    entry, _appended = opened.store.append_inbox_notification_if_absent(
         recipient.project_id, [message_id]
     )
     if entry is None:
