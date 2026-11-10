@@ -878,5 +878,3 @@ def _start_public_resume(
     resume = threading.Thread(target=public_resume)
     resume.start()
     return captured, go, outcome, resume
-
-
