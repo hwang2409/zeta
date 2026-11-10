@@ -182,6 +182,9 @@ class ReplayOutput:
 
     def _replay_store(self, scope: ReplayScopeId) -> Any:
         """The scope's store while a replay stream or join needs it, else None."""
+        if scope.kind == "child":
+            from ...core.agent_progress import live_child_store
+            return live_child_store(scope.value)
         for connection in self._connections:
             if self.replay.scope_for(connection) == scope:
                 runtime = connection.server.runtime
