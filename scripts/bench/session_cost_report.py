@@ -117,13 +117,16 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None) 
                 if row.get("type") == "header":
                     fallback = row_time(row, None)
                 when = row_time(row, fallback)
+                message = row.get("data", {}).get("message", {})
+                is_assistant = isinstance(message, dict) and message.get("role") == "assistant"
+                if is_assistant and result["first_in_window"] is None:
+                    result["first_in_window"] = (when, message)
                 if not in_window(when, since, until):
                     continue
                 if row.get("type") == "compaction" and row.get("data", {}).get("kind") == "evict":
                     evictions += 1
                     evicted_bytes += len(line.encode("utf-8"))
-                message = row.get("data", {}).get("message", {})
-                if not isinstance(message, dict) or message.get("role") != "assistant":
+                if not is_assistant:
                     continue
                 metadata = message.get("metadata", {})
                 usage = metadata.get("provider_usage", metadata.get("usage", {}))
@@ -144,8 +147,19 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None) 
                 result["cache_create"] += cache_create
                 result["output"] += output
                 result["eligible"] = True
-                if result["first_in_window"] is None:
-                    result["first_in_window"] = uncached + cache_read + cache_create
+                if isinstance(result["first_in_window"], tuple):
+                    first_when, first_message = result["first_in_window"]
+                    first_metadata = first_message.get("metadata", {})
+                    first_usage = first_metadata.get("provider_usage", first_metadata.get("usage", {}))
+                    if not isinstance(first_usage, dict):
+                        first_usage = {}
+                    result["first_in_window"] = (
+                        int(first_usage.get("input_tokens", 0) or 0)
+                        + int(first_usage.get("cache_read_input_tokens", 0) or 0)
+                        + int(first_usage.get("cache_creation_input_tokens", 0) or 0)
+                        if in_window(first_when, since, until)
+                        else None
+                    )
                 if POLL_RE.search(text_of(message)):
                     result["polling_turns"] += 1
     except (OSError, UnicodeDecodeError):
@@ -198,7 +212,8 @@ def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None,
             g["agents"].add(str(path.parent))
             for field in ("turns", "uncached", "cache_read", "cache_create", "output", "polling_turns"):
                 g[field] += raw[field]
-            g["first_inputs"].append(raw["first_in_window"])
+            if raw["first_in_window"] is not None:
+                g["first_inputs"].append(raw["first_in_window"])
             if role in {"worker", "reviewer"}:
                 lifecycle = read_json(path.parent / "agent_lifecycle.json")
                 matches = {a or b for a, b in PR_RE.findall(str(lifecycle.get("description", "")))}
@@ -208,7 +223,7 @@ def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None,
     for (role, model), g in sorted(groups.items()):
         total = g["uncached"] + g["cache_read"] + g["cache_create"]
         turns = g["turns"]
-        rows.append({"role": role, "model": model, "agents": len(g["agents"]), "turns": turns, "turns_per_agent": round(turns / len(g["agents"]), 2), "uncached_per_turn": round(g["uncached"] / turns, 2), "cache_read_per_turn": round(g["cache_read"] / turns, 2), "cache_create_per_turn": round(g["cache_create"] / turns, 2), "output_per_turn": round(g["output"] / turns, 2), "cache_read_rate": round(g["cache_read"] / total, 4) if total else 0, "median_first_request_total_input": statistics.median(g["first_inputs"]), "polling_turns": g["polling_turns"]})
+        rows.append({"role": role, "model": model, "agents": len(g["agents"]), "turns": turns, "turns_per_agent": round(turns / len(g["agents"]), 2), "uncached_per_turn": round(g["uncached"] / turns, 2), "cache_read_per_turn": round(g["cache_read"] / turns, 2), "cache_create_per_turn": round(g["cache_create"] / turns, 2), "output_per_turn": round(g["output"] / turns, 2), "cache_read_rate": round(g["cache_read"] / total, 4) if total else 0, "median_first_request_total_input": statistics.median(g["first_inputs"]) if g["first_inputs"] else None, "polling_turns": g["polling_turns"]})
     turns = sum(x["turns"] for x in rows)
     pr_rows = [{"pr": pr, "workers": len(v["worker"]), "reviewers": len(v["reviewer"]), "workers_3_plus": len(v["worker"]) >= 3, "reviewers_3_plus": len(v["reviewer"]) >= 3} for pr, v in sorted(prs.items(), key=lambda x: int(x[0]))]
     return {"groups": rows, "evictions": {**evictions, "per_1000_turns": round(evictions["count"] * 1000 / turns, 2) if turns else 0}, "pull_requests": pr_rows, "skipped_rows": skipped, "turns": turns}
@@ -232,9 +247,13 @@ def self_check() -> None:
         (root / "sessions" / "s" / "meta.json").write_text('{"model":"test"}')
         (session / "agent_lifecycle.json").write_text('{"agent_type":"worker","description":"fix PR #12"}')
         row = {"type":"message","data":{"message":{"role":"assistant","content":[{"text":"sleep 1"}],"metadata":{"output_tokens":3,"provider_usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}}}}
-        (session / "conversation.jsonl").write_text(json.dumps({"type":"header","data":{"created_at":"2026-01-01T00:00:00Z"}})+"\n"+json.dumps(row)+"\n")
+        later = {"created_at":"2026-01-03T00:00:00Z", **row}
+        (session / "conversation.jsonl").write_text(json.dumps({"type":"header","data":{"created_at":"2026-01-01T00:00:00Z"}})+"\n"+json.dumps(row)+"\n"+json.dumps(later)+"\n")
         result = report(root, ["s"], None, None)
-        assert result["turns"] == 1 and result["groups"][0]["uncached_per_turn"] == 10 and result["groups"][0]["polling_turns"] == 1
+        assert result["turns"] == 2 and result["groups"][0]["uncached_per_turn"] == 10 and result["groups"][0]["polling_turns"] == 2
+        windowed = report(root, ["s"], parse_time("2026-01-02T00:00:00Z"), None)
+        assert windowed["turns"] == 1 and windowed["groups"][0]["median_first_request_total_input"] is None
+        assert result["groups"][0]["median_first_request_total_input"] == 16
         assert result["pull_requests"][0]["pr"] == "12"
         outside = root / "outside"; outside.write_text("x")
         (root / "sessions" / "escape").symlink_to(outside)
@@ -249,4 +268,7 @@ if __name__ == "__main__":
         self_check(); print("self-check: ok")
     else:
         data = report(Path(args.zeta_home), args.session_ids or None, parse_time(args.since), parse_time(args.until))
-        print(json.dumps(data, indent=2) if args.json else print_report(data))
+        if args.json:
+            print(json.dumps(data, indent=2))
+        else:
+            print_report(data)
