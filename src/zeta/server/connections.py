@@ -9,6 +9,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.agent_progress import register_child_run_sink
 from ..core.session_files import descend_directory
 from ..core.store import ConversationStore, ObserverSnapshotChanged, TranscriptLoadError
 from ..core.store._child_runs import (
@@ -19,6 +20,7 @@ from ..core.store._child_runs import (
 from ..core.thread_call import ThreadCallWorkers
 from . import content
 from .handlers import history, lifecycle, session, settings, validation
+from .session_replay.children import ChildRunProjection
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -171,6 +173,8 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
+        self.child_runs = ChildRunProjection(loop, self)
+        self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
@@ -973,6 +977,35 @@ class ConnectionRegistry(ReplayOutput):
             session_id=runtime.session_id,
         )
 
+    async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
+        if set(params) != {"session_id", "run_id"} or type(params.get("session_id")) is not str or type(params.get("run_id")) is not str:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
+        runtime = connection.server.runtime
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
+        def read():
+            result = perform_child_history_read(target, params, registry=self, fidelity="session_history_fidelity" in features)
+            from ..core.child_runs import child_run_rows, project_child_run_row, read_agent_status
+            row = next((item for item in child_run_rows(target[1]) if item["run_id"] == params["run_id"]), None)
+            if row is None:
+                reader = self._child_reader_for(target[1], params["run_id"])
+                item = next((item for item in read_agent_status(reader) if item["handle"] == params["run_id"]), None)
+                if item is None:
+                    from ..core.agent_progress import read_agent_lifecycle
+                    lifecycle = read_agent_lifecycle(reader.session_dir / "agent_lifecycle.json")
+                    item = lifecycle if isinstance(lifecycle, dict) else None
+                    if item is not None:
+                        item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0)}
+                if item is not None:
+                    row = project_child_run_row(item, session_id=target[0], parent_run_id=params["run_id"].rpartition(":")[0] or None, accepts_follow_ups=False)
+            if row is None:
+                raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
+            return result, row
+        result = await self.run_read(connection, read, session_id=runtime.session_id)
+        return result[0], 0, result[1]
+
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str
     ) -> ConversationStore:
@@ -1041,6 +1074,7 @@ class ConnectionRegistry(ReplayOutput):
 
     async def aclose(self) -> None:
         self._closed = True
+        self._unregister_child_run_sink()
         states = tuple(self._connections.values())
         await asyncio.to_thread(self.close_child_reader)
         self._reads.close()

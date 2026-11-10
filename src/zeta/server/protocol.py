@@ -380,6 +380,17 @@ class MethodDescriptor(Enum):
 
 
 
+CHILD_RUN_EVENTS_PREREQUISITES = frozenset(
+    descriptor.feature
+    for descriptor in (
+        MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE,
+        MethodDescriptor.CHILD_RUN_HISTORY,
+        MethodDescriptor.CHILD_RUN_LIST,
+    )
+    if descriptor.feature is not None
+)
+
+
 _LOGIN_METHODS = frozenset(
     MethodDescriptor[name]
     for name in ("LOGIN_START", "LOGIN_STATUS", "LOGIN_CANCEL", "LOGIN_PROVIDERS")

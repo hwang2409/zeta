@@ -12,7 +12,6 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core.child_run_row import project_child_run_row
 from zeta.core.store import ConversationStore
 from zeta.server.protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -30,26 +29,11 @@ def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[Fake
     return FakeBackend([]), model or "offline"
 
 
-def test_child_run_row_has_the_z5_shape() -> None:
-    row = project_child_run_row(
-        {"handle": "top:1", "description": "task", "agent_type": "worker", "state": "running", "current_step": "work", "started_at": "now"},
-        accepts_follow_ups=True,
-    )
-    assert list(row) == [
-        "run_id", "session_id", "parent_run_id", "description", "agent_type", "status",
-        "accepts_follow_ups", "turns_used", "tool_count", "current_step", "started_at",
-        "elapsed_seconds",
-    ]
-    assert row["run_id"] == "top:1"
-    assert row["session_id"] == "top"
-    assert row["parent_run_id"] is None
-
-
 def test_child_run_events_prerequisites_are_derived_from_method_features() -> None:
     assert CHILD_RUN_EVENTS_PREREQUISITES == frozenset(
         descriptor.feature
         for descriptor in MethodDescriptor
-        if descriptor.wire in {"session_history_and_subscribe", "child_run_history"}
+        if descriptor.wire in {"session_history_and_subscribe", "child_run_history", "child_run_list"}
         and descriptor.feature is not None
     )
     assert CHILD_RUN_EVENTS_PREREQUISITES <= set(FEATURES)

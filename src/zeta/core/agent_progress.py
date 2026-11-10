@@ -51,14 +51,13 @@ def live_child_store(run_id: str) -> ConversationStore | None:
 def post_child_progress(store: ConversationStore, lifecycle: dict[str, Any]) -> None:
     """Post one semantic lifecycle change with the next revision to every sink."""
     global _revision
-    from .child_run_row import project_child_run_row
+    from .child_runs import project_child_run_row
 
     run_id = lifecycle.get("handle")
     if type(run_id) is not str:
         return
-    row = project_child_run_row(
-        lifecycle, accepts_follow_ups=store.accepts_follow_ups
-    )
+    run_id = str(lifecycle["handle"])
+    row = project_child_run_row(lifecycle, session_id=store.session_id, parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=store.accepts_follow_ups)
     with _lock:
         _live_stores[run_id] = weakref.ref(store)
         _revision += 1
@@ -71,9 +70,10 @@ def publish_child_started(
     run_id: str, sequence: int, data: dict[str, Any], *, accepts_follow_ups: bool
 ) -> None:
     """Publish a durable start row installed in the immediate parent's store."""
-    from .child_run_row import started_child_run_row
+    from .child_runs import project_child_run_row
 
-    row = started_child_run_row(data, accepts_follow_ups=accepts_follow_ups)
+    run_id = str(data["run_id"])
+    row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=accepts_follow_ups)
     with _lock:
         for sink in tuple(_sinks):
             sink("started", run_id, row, sequence)
@@ -82,14 +82,14 @@ def publish_child_started(
 def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -> None:
     """The one publisher of ``child_ended``: call it only after the immediate
     parent durably installed a new receipt for a run whose lifecycle is terminal."""
-    from .child_run_row import project_child_run_row
+    from .child_runs import project_child_run_row
 
     if not isinstance(lifecycle, dict) or lifecycle.get("handle") != run_id:
         return
     if lifecycle.get("finished_at") is None:
         _LOGGER.error("child_ended for %s before its lifecycle is final", run_id)
         return
-    row = project_child_run_row(lifecycle, accepts_follow_ups=False)
+    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=False)
     with _lock:
         for sink in tuple(_sinks):
             sink("ended", run_id, row, receipt_sequence)

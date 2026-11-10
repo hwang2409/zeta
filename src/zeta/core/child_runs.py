@@ -349,6 +349,30 @@ def read_agent_status(
     return sorted(children, key=lambda child: str(child["started_at"]))
 
 
+def project_child_run_row(
+    item: dict[str, Any],
+    *,
+    session_id: str,
+    parent_run_id: str | None,
+    accepts_follow_ups: bool,
+) -> dict[str, StructuredContentValue]:
+    return {
+        "run_id": str(item["handle"]),
+        "session_id": session_id,
+        "parent_run_id": parent_run_id,
+        "description": item["description"],
+        "agent_type": item["agent_type"],
+        "status": item["state"],
+        "accepts_follow_ups": accepts_follow_ups,
+        "turns_used": item["turns_used"],
+        "tool_count": item["tool_calls"],
+        "current_step": item["current_step"],
+        "started_at": item["started_at"],
+        "finished_at": item["finished_at"],
+        "elapsed_seconds": item["elapsed"],
+    }
+
+
 def child_run_rows(
     store: ConversationStore,
     *,
@@ -365,20 +389,11 @@ def child_run_rows(
         run_id = str(item["handle"])
         _, parent_run_id = parse_child_run_id(store.session_id, run_id)
         marker = markers.get(run_id, {})
-        row: dict[str, StructuredContentValue] = {
-            "run_id": run_id,
-            "session_id": store.session_id,
-            "parent_run_id": parent_run_id,
-            "description": item["description"],
-            "agent_type": item["agent_type"],
-            "status": item["state"],
-            "accepts_follow_ups": marker.get("accepts_follow_ups") is True,
-            "turns_used": item["turns_used"],
-            "tool_count": item["tool_calls"],
-            "current_step": item["current_step"],
-            "started_at": item["started_at"],
-            "finished_at": item["finished_at"],
-            "elapsed_seconds": item["elapsed"],
-        }
+        row = project_child_run_row(
+            item,
+            session_id=store.session_id,
+            parent_run_id=parent_run_id,
+            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+        )
         rows.append(row)
     return rows

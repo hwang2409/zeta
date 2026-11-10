@@ -141,6 +141,24 @@ async def child_run_history(client, request_id, params):
     return await client.connections.read_child_run_history(client, params)
 
 
+async def child_run_events(client, request_id, params):
+    from ..session_replay import ReplayScopeId
+    connections = client.connections
+    if set(params) != {"session_id", "run_id"} or not all(type(params.get(key)) is str for key in ("session_id", "run_id")):
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
+    if client.server.runtime.session_id != params["session_id"]:
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+    try:
+        connections.begin_replay_join(client, ReplayScopeId.child(params["run_id"]))
+        history, frontier_seq, row = await connections.read_child_run_events(client, params)
+        result = connections.finish_replay_join(client, history, frontier_seq, None)
+        current = connections.child_runs.current(params["run_id"])
+        return {**result, "child": current[0] if current is not None else row, "revision": current[1] if current is not None else 0}
+    except BaseException:
+        connections.invalidate_replay_connection(client, reason="rejoined")
+        raise
+
+
 async def _mutable_store(client, params):
     runtime = client.server.runtime
     store = validation.active(runtime, params)
@@ -379,6 +397,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE: session_history_and_subscribe,
     MethodDescriptor.CONTENT_READ: content_read,
     MethodDescriptor.CHILD_RUN_HISTORY: child_run_history,
+    MethodDescriptor.CHILD_RUN_EVENTS: child_run_events,
     MethodDescriptor.SWITCH_BRANCH: switch_branch,
     MethodDescriptor.FORK_MESSAGE: fork_message,
     MethodDescriptor.MODEL_CATALOG: model_catalog,

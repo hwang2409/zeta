@@ -191,8 +191,13 @@ class ReplayOutput:
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        store = validation.active(connection.server.runtime, {"session_id": scope.value})
-        self.replay.begin_join(connection, scope, store.reset_generation())
+        if scope.kind == "child":
+            from ...core.agent_progress import live_child_store
+            store = live_child_store(scope.value)
+            self.replay.begin_join(connection, scope, None if store is None else store.reset_generation())
+        else:
+            store = validation.active(connection.server.runtime, {"session_id": scope.value})
+            self.replay.begin_join(connection, scope, store.reset_generation())
 
     def finish_replay_join(
         self,
@@ -317,11 +322,13 @@ class ReplayOutput:
         session_id: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        *,
+        scope: ReplayScopeId | None = None,
     ) -> bool:
         """Admit one frame to a replay stream; False when the caller sends it plainly."""
         if "session_replay_seq" not in state.features or session_id is None:
             return False
-        scope = ReplayScopeId.top(session_id)
+        scope = scope or ReplayScopeId.top(session_id)
         connection = state.connection
         if covers is not None and not self._frontier_holds(connection, scope):
             if self.replay.is_pending(connection):
@@ -440,6 +447,16 @@ class ReplayOutput:
         # fail closed: a failed connection cannot reliably get an end event; it rejoins
         self.invalidate_replay_connection(state.connection)
         state.connection.writer.close()
+
+    def publish_child_lifecycle(self, event, scope, session_id, fields, covers=None):
+        for state in (self._controller, *self._observers):
+            if state is None or "child_run_events" not in state.features:
+                continue
+            if self.replay.scope_for(state.connection) != scope:
+                continue
+            if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(state.connection):
+                continue
+            self._publish_replay(state, event, session_id, fields, covers, scope=scope)
 
     async def read_replay_history(
         self, connection: Any, session_id: str

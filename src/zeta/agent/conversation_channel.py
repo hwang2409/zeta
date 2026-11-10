@@ -9,11 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-<<<<<<< HEAD
 from ..accounts.session import account_provider
-=======
 from ..core.agent_progress import publish_child_ended
->>>>>>> 87741f36d (feat(serve): child lifecycle facts from the lifecycle owner and terminal seams)
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType
