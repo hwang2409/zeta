@@ -296,6 +296,7 @@ class ProjectRequests:
             self.registry._storage_lease.observed_epoch,
             StorageFeature.INBOX_DELEGATION,
         )
+        projected_by_id = {item["id"]: item for item in projected}
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
@@ -306,9 +307,13 @@ class ProjectRequests:
             extra_for_page=lambda page: {
                 "status": status,
                 "untrusted": any(
-                    message.get("authority") != "trusted_assignment"
+                    (
+                        projected_by_id.get(message.get("id"), {}).get("authority")
+                        != "trusted_assignment"
+                    )
                     if provenance_enabled
-                    else message.get("origin") != "local"
+                    else projected_by_id.get(message.get("id"), {}).get("origin")
+                    != "local"
                     for message in page
                 ),
                 "invalid": invalid,
