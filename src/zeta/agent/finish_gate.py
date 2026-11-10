@@ -259,11 +259,14 @@ class FinishGateState:
 
     @staticmethod
     def owned_tasks(child_loop: AgentLoop) -> tuple[tuple[str, str], ...]:
-        return tuple(
+        registry = child_loop.tool_registry.background_tasks
+        running = tuple(
             (task.task_id, task.headline)
-            for task in child_loop.tool_registry.background_tasks.snapshot()
+            for task in registry.snapshot()
             if task.running
         )
+        pending = registry.pending_exit_tasks()
+        return tuple(dict.fromkeys((*running, *pending)))
 
     def can_wake_again(self, child_loop: AgentLoop) -> bool:
         """Return whether this idle child still owns a future wake source."""
