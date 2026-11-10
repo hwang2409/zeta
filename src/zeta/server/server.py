@@ -128,11 +128,12 @@ class _UnixSocketListener:
 
     @staticmethod
     def _prepare_parent(path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        parent_stat = path.parent.lstat()
+        directory = path.parent
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_stat = directory.lstat()
         if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.getuid()
                 or stat.S_IMODE(parent_stat.st_mode) != 0o700):
-            raise RuntimeError(f"unsafe observer socket directory: {path.parent}")
+            raise RuntimeError(f"unsafe observer socket directory: {directory}")
 
     @classmethod
     def _prepare_path(cls, path: Path) -> None:
