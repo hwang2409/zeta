@@ -981,7 +981,9 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             else _AGENT_IDLE_REFRESH_INTERVAL_SECONDS
         )
         self._schedule_refresh(delay)
-    def refresh(self, *, force: bool = False) -> bool:
+    def refresh(
+        self, *, force: bool = False, _signature: tuple[object, ...] | None = None
+    ) -> bool:
         """Refresh at most once per second unless fresh state is required."""
 
         now = _monotonic()
@@ -1001,13 +1003,11 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             if self.child_view_active
             else False
         )
-        if self._invalidate is None or not event_loop_running():
-            signature = self._agent_tree_signature()
-            return transcript_changed or todo_changed or self._refresh_with_signature(
-                signature, force
-            )
-        self._request_agent_tree_signature(force)
-        return transcript_changed or todo_changed
+        if _signature is None and self._invalidate is not None and event_loop_running():
+            self._request_agent_tree_signature(force)
+            return transcript_changed or todo_changed
+        signature = _signature or self._agent_tree_signature()
+        return transcript_changed or todo_changed or self._refresh_with_signature(signature, force)
 
     def _refresh_with_signature(
         self, signature: tuple[object, ...], force: bool

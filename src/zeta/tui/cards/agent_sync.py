@@ -93,7 +93,8 @@ class AgentSignatureRefreshMixin:
         self._signature_force = False
         try: signature = task.result()
         except (OSError, ValueError): return
-        if self._invalidate is not None and self._refresh_with_signature(signature, force): self._invalidate()
+        if self.refresh(force=force, _signature=signature) and self._invalidate is not None:
+            self._invalidate()
 
 
 def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
