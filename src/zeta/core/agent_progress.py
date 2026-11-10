@@ -57,7 +57,7 @@ def post_child_progress(store: ConversationStore, lifecycle: dict[str, Any]) -> 
     if type(run_id) is not str:
         return
     run_id = str(lifecycle["handle"])
-    row = project_child_run_row(lifecycle, session_id=store.session_id, parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=store.accepts_follow_ups)
+    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=store.accepts_follow_ups)
     with _lock:
         _live_stores[run_id] = weakref.ref(store)
         _revision += 1
@@ -73,7 +73,7 @@ def publish_child_started(
     from .child_runs import project_child_run_row
 
     run_id = str(data["run_id"])
-    row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=accepts_follow_ups)
+    row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=accepts_follow_ups)
     with _lock:
         for sink in tuple(_sinks):
             sink("started", run_id, row, sequence)
@@ -89,7 +89,7 @@ def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -
     if lifecycle.get("finished_at") is None:
         _LOGGER.error("child_ended for %s before its lifecycle is final", run_id)
         return
-    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] or None, accepts_follow_ups=False)
+    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=False)
     with _lock:
         for sink in tuple(_sinks):
             sink("ended", run_id, row, receipt_sequence)

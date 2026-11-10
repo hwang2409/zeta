@@ -499,8 +499,6 @@ class ReplayOutput:
                 continue
             if self.replay.scope_for(state.connection) != scope:
                 continue
-            if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(state.connection):
-                continue
             self._publish_replay(state, event, session_id, fields, covers, scope=scope)
 
     async def read_replay_history(
