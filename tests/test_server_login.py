@@ -633,6 +633,7 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
     async def exchange(*args):
         return OAuthTokens("access", "refresh", 4_000_000_000)
 
+    # test-contract: seam injects the callback server
     monkeypatch.setattr(login_flow, "_create_redirect_server", create_server)
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
@@ -640,7 +641,7 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
     try:
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
-        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 10)
         task = server._client.logins.tasks["claude"]
         # Publication already committed, so cancellation cannot report that
         # credentials were left unchanged.

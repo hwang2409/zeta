@@ -471,49 +471,6 @@ class TranscriptIndex:
             self._require_ready()
             return self._append_locked(source)
 
-    def append_units(
-        self,
-        session_id: str,
-        units: Sequence[TranscriptUnit],
-        *,
-        cursor: int,
-    ) -> None:
-        """Store trusted units for evaluation and focused index tests."""
-
-        if not session_id or type(cursor) is not int or cursor < 0:
-            raise ValueError("invalid session cursor")
-        if any(
-            unit.project_id != self.project_id or unit.session_id != session_id
-            for unit in units
-        ):
-            raise ValueError("transcript unit belongs to another project or session")
-        try:
-            with self._write_guard(), self._connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                stored = connection.execute(
-                    "SELECT last_seq FROM session_cursors WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                if stored is not None and int(stored[0]) > cursor:
-                    connection.rollback()
-                    return
-                self._replace_units(connection, session_id, units)
-                connection.execute(
-                    """INSERT INTO session_cursors(
-                        session_id, byte_offset, last_seq, source_device,
-                        source_inode, source_mtime_ns, source_ctime_ns,
-                        source_size, incremental_ready, last_entry_id, active_tail_json,
-                        prefix_digest
-                    ) VALUES (?, 0, ?, 0, 0, 0, 0, 0, 1, NULL, '[]', NULL)
-                    ON CONFLICT(session_id) DO UPDATE SET last_seq=excluded.last_seq""",
-                    (session_id, cursor),
-                )
-                connection.commit()
-        except sqlite3.Error as exc:
-            raise TranscriptIndexError(
-                f"could not update transcript index: {exc}"
-            ) from exc
-
     @classmethod
     def _reference(cls, project_dir: Path, project_id: str) -> TranscriptIndex:
         index = object.__new__(cls)

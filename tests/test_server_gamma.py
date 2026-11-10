@@ -29,7 +29,8 @@ from tests.test_server import (
     _read,
     _request,
 )
-from zeta.core.session import SessionMetadata
+from zeta.core.session import SessionManager, SessionMetadata
+from zeta.core.session_execution import SessionOwnedError
 from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
@@ -2333,6 +2334,82 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
 
 
 @pytest.mark.asyncio
+async def test_resume_accepts_unique_id_prefix_through_serve(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        created = (await _request(reader, writer, 2, "new_session", {}))[-1][
+            "result"
+        ]
+        session_id = created["session"]["session_id"]
+        await _request(reader, writer, 3, "new_session", {})
+        resumed = await _request(
+            reader, writer, 4, "resume", {"session_id": session_id[:8]}
+        )
+        assert resumed[-1]["result"]["session"]["session_id"] == session_id
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resume_ambiguous_prefix_has_dedicated_error(
+    tmp_path: Path,
+) -> None:
+    server = _server(tmp_path, None, _launch(tmp_path))
+    sessions = server.runtime.manager.sessions_dir
+    (sessions / "abcd1111").mkdir(parents=True)
+    (sessions / "abcd2222").mkdir(parents=True)
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        failed = await _request(
+            reader, writer, 2, "resume", {"session_id": "abcd"}
+        )
+        assert failed[-1]["error"]["data"] == {
+            "code": "session_id_ambiguous",
+            "session_id": "abcd",
+            "candidates": ["abcd1111", "abcd2222"],
+        }
+        assert "abcd1111" in failed[-1]["error"]["message"]
+        assert "abcd2222" in failed[-1]["error"]["message"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resume_owned_session_prefix_preserves_session_owned_error(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path / "home")
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+    held = await asyncio.to_thread(
+        SessionManager(tmp_path / "home").open, session_id
+    )
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _legacy_hello(reader, writer)
+        async def owned_resume(_session_id, *, force=False):
+            raise SessionOwnedError("session is active in another process")
+
+        server.runtime.resume_session = owned_resume
+        failed = await _request(
+            reader, writer, 2, "resume", {"session_id": session_id[:8]}
+        )
+        assert failed[-1]["error"]["data"]["code"] == "session_owned"
+    finally:
+        held.store.close()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_session_host_commands_replacement_failure_matches_runtime_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2350,6 +2427,13 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
         session_id = created[-1]["result"]["session"]["session_id"]
         binding_a = server.control._active_host_commands
         real_resume = server.runtime.resume_session
+        monkeypatch.setattr(
+            server.runtime.manager,
+            "resolve_id",
+            lambda requested, **kwargs: (
+                session_id if requested == session_id[:8] else requested
+            ),
+        )
 
         async def fail_with_runtime(_session_id, *, force=False):
             assert not force
@@ -2380,7 +2464,10 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             writer,
             4,
             "resume",
-            {"session_id": session_id, "host_commands": _host_binding("c")},
+            {
+                "session_id": session_id[:8],
+                "host_commands": _host_binding("c"),
+            },
         )
         assert forced[-1]["error"]["code"] == -32000
         assert server.runtime.state is None
