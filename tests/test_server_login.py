@@ -605,8 +605,26 @@ async def test_cancel_during_provider_lock_release_reports_success(
         await close_serve(server, writer)
 
 
-async def test_successful_login_cleanup_reports_published_login(tmp_path, monkeypatch):
+async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, monkeypatch):
+    import threading
+
+    from zeta.core import login_flow
+
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    create = login_flow._create_redirect_server
     captured = {}
+
+    def create_server(handler, *, port):
+        server = create(handler, port=port)
+        shutdown = server.shutdown
+        def slow_shutdown():
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(3)
+            shutdown()
+        server.shutdown = slow_shutdown
+        return server
 
     def build(state, challenge, redirect):
         captured.update(state=state, redirect=redirect)
@@ -615,14 +633,26 @@ async def test_successful_login_cleanup_reports_published_login(tmp_path, monkey
     async def exchange(*args):
         return OAuthTokens("access", "refresh", 4_000_000_000)
 
+    # test-contract: seam injects the callback server
+    monkeypatch.setattr(login_flow, "_create_redirect_server", create_server)
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
     server, reader, writer, _ = await connect(tmp_path)
     try:
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
+        await asyncio.wait_for(entered.wait(), 10)
         task = server._client.logins.tasks["claude"]
-        assert await asyncio.wait_for(task, 10) == {"state": "succeeded"}
+        # Publication already committed, so cancellation cannot report that
+        # credentials were left unchanged.
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
+        listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", urlsplit(captured["redirect"]).port)
+        listener.close()
+        await listener.wait_closed()
     finally:
+        release.set()
         await close_serve(server, writer)
