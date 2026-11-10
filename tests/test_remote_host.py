@@ -38,7 +38,6 @@ def test_descriptor_rejects_permissive_descriptor(tmp_path: Path) -> None:
 async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from zeta.remote.host import ObserverHost
     from zeta.runtime.foreground_events import ForegroundEventPublisher
-
     from zeta.server.runtime import ServerRuntime
 
     path = socket_path(tmp_path, "session")
