@@ -519,6 +519,7 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                child_runs="child_run_events" in features,
             )
             return history, frontier_seq, frontier_row_id
 

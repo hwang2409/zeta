@@ -468,7 +468,7 @@ class _Client:
                     if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
                         baseline_builder = (
                             self.connections.child_runs.with_baseline
-                            if request["method"] == "child_run_events"
+                            if request["method"] in {"session_history_and_subscribe", "child_run_events"}
                             else None
                         )
                         written = await self.connections.admit_join_response(

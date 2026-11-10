@@ -18,6 +18,7 @@ from .history_projection import (
     _publish_cache,
     history_projection,
 )
+from . import child_run_lifecycle
 
 if TYPE_CHECKING:
     from ...core.store import ConversationStore
@@ -35,6 +36,7 @@ def _fit_history_groups(
     content_read: bool,
     backward: bool,
     validator: dict[str, object] | None = None,
+    child_runs: bool = False,
 ) -> tuple[
     list[dict[str, object]],
     list[int],
@@ -70,28 +72,33 @@ def _fit_history_groups(
             sizes.append(size)
         cursor = index if backward else min(index + 1, end)
         raw_group = projection.entry_groups[index]
-        fits, group, size = _history_group_fits(
-            codec,
-            request_id,
-            groups[index],
-            sizes[index],
-            body_size=body_size,
-            rows=rows,
-            cursor=cursor,
-            end=end,
-            backward=backward,
-            validator=validator,
-            raw_group=raw_group,
-            projection=projection,
-            include_delivery_id=include_delivery_id,
-            fidelity=fidelity,
-            content_read=content_read,
-        )
+        reserve = child_run_lifecycle.baseline_reserve(groups[index]) if backward and child_runs else 0
+        while True:
+            fits, group, size = _history_group_fits(
+                codec,
+                request_id,
+                groups[index],
+                sizes[index],
+                body_size=body_size + reserve,
+                rows=rows,
+                cursor=cursor,
+                end=end,
+                backward=backward,
+                validator=validator,
+                raw_group=raw_group,
+                projection=projection,
+                include_delivery_id=include_delivery_id,
+                fidelity=fidelity,
+                content_read=content_read,
+            )
+            if fits or rows or not reserve:
+                break
+            reserve = 0
         if not fits:
             break
         groups[index], sizes[index] = group, size
         rows.extend(group)
-        body_size += int(bool(rows[: -len(group)] and group)) + size if group else 0
+        body_size += int(bool(rows[: -len(group)] and group)) + size + reserve if group else 0
         selected.append(index)
         response_groups.append(group)
     return (
@@ -116,6 +123,7 @@ def _forward_page_history(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    child_runs: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     entry_count = len(projection.entry_groups) - 1
     if offset > entry_count:
@@ -131,6 +139,7 @@ def _forward_page_history(
         fidelity=fidelity,
         content_read=content_read,
         backward=False,
+        child_runs=child_runs,
     )
     next_offset = min(selected[-1] + 1, entry_count) if selected else offset
     return {
@@ -148,6 +157,7 @@ def _backward_page_history(
     fidelity: bool,
     content_read: bool,
     first_page: bool = False,
+    child_runs: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     end = len(projection.entry_groups) - 1
     stable_end = validator["end"]
@@ -173,6 +183,7 @@ def _backward_page_history(
         content_read=content_read,
         backward=True,
         validator=validator,
+        child_runs=child_runs,
     )
     selected.reverse()
     response_groups.reverse()
@@ -195,6 +206,7 @@ def page_history(
     backward: bool = False,
     validator: dict[str, object] | None = None,
     first_page: bool = False,
+    child_runs: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     assert cursor is not None
     if backward:
@@ -207,6 +219,7 @@ def page_history(
             fidelity=fidelity,
             content_read=content_read,
             first_page=first_page,
+            child_runs=child_runs,
         )
     return _forward_page_history(
         projection,
@@ -214,6 +227,7 @@ def page_history(
         include_delivery_id=include_delivery_id,
         fidelity=fidelity,
         content_read=content_read,
+        child_runs=child_runs,
     )
 
 
@@ -277,6 +291,7 @@ def replay_history(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool = False,
 ) -> tuple[dict, int, str | None]:
     """Return the newest backward page and its stable frontier row."""
     return _backward_history_page(
@@ -286,6 +301,7 @@ def replay_history(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
 
 
@@ -297,6 +313,7 @@ def _backward_history_page(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool = False,
 ) -> tuple[dict, int, str | None]:
     before = params["before"]
     validator = params.get("history_validator")
@@ -310,6 +327,7 @@ def _backward_history_page(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )
     end = len(projection.entry_groups) - 1
     if before is None:
@@ -326,6 +344,7 @@ def _backward_history_page(
         backward=True,
         validator=validator,
         first_page=first_page,
+        child_runs=child_runs,
     )
     return _publish_history_page(
         store,
