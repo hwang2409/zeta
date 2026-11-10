@@ -195,6 +195,12 @@ class ProjectInbox:
             for project in self.registry.list_projects()
         ]
 
+    def _inbox_delegation_enabled(self) -> bool:
+        return feature_enabled(
+            self.registry._storage_lease.observed_epoch,
+            StorageFeature.INBOX_DELEGATION,
+        )
+
     @staticmethod
     def _origin_author(origin: object) -> str:
         return "user" if origin == USER_ORIGIN else "agent"
@@ -229,6 +235,8 @@ class ProjectInbox:
         return result
 
     def _decorate(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        if not self._inbox_delegation_enabled():
+            return dict(record)
         author = self._origin_author(record.get("origin"))
         sender = record.get("from")
         source = sender.get("project") if isinstance(sender, dict) else None
@@ -400,7 +408,6 @@ class ProjectInbox:
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
-            "origin": origin,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
             "to_session": to_session,
@@ -410,6 +417,8 @@ class ProjectInbox:
             "in_reply_to": in_reply_to,
             "created_at": _now(),
         }
+        if self._inbox_delegation_enabled():
+            record["origin"] = origin
         return session, target.project_id, message_id, body, record
 
     def _publish_outgoing(
@@ -779,7 +788,11 @@ class ProjectInbox:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
-                if self._decorate(target.project_id, record)["authority"] != "trusted_assignment":
+                if (
+                    self._inbox_delegation_enabled()
+                    and self._decorate(target.project_id, record)["authority"]
+                    != "trusted_assignment"
+                ):
                     raise InboxError("inbox message is information, not an authorized assignment")
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:

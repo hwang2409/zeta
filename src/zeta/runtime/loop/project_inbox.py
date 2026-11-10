@@ -191,7 +191,7 @@ class ProjectInboxNotificationMixin:
                 lambda: (
                     scanner.scan(),
                     scanner.scan_sent(),
-                    scanner.inbox.list(project_id)["new"],
+                    scanner.inbox.list(project_id, session_id=scanner.session_id)["new"],
                 )
             )
         except (InboxError, OSError, ProjectRegistryError):

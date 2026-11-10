@@ -146,9 +146,12 @@ def _reuse_persisted_notification_delivery(
     if not represented or not represented.issubset(pending_ids):
         return None
     selected = [entry for entry in pending if entry.id in represented]
-    if not _notification_fits(persisted, notification_budget, token_counter):
+    projected = _notification_message(selected)
+    projected.metadata = dict(persisted.metadata)
+    projected.tool_result = persisted.tool_result
+    if not _notification_fits(projected, notification_budget, token_counter):
         return None
-    return selected, persisted, True
+    return selected, projected, True
 
 
 def _largest_fitting_notification_delivery(

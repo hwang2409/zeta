@@ -165,4 +165,12 @@ async def test_epoch_five_refuses_delegation_through_tui_and_serve_slash_paths(
     assert not (home / "projects" / recipient.project_id / "inbox" / "delegations.json").exists()
     listed = (await asyncio.to_thread(inbox.list, recipient.project_id))["new"][0]
     assert listed["id"] == message_id
-    assert listed["authority"] == "information"
+    stored = json.loads(
+        (home / "projects" / recipient.project_id / "inbox" / "new" / f"{message_id}.json").read_text()
+    )
+    assert "origin" not in stored
+    claimed = await asyncio.to_thread(
+        inbox.claim, recipient.project_id, message_id, "b" * 32
+    )
+    assert claimed is not None
+    assert "authority" not in claimed

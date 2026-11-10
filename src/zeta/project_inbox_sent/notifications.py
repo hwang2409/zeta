@@ -26,10 +26,13 @@ def project_inbox_notification(data: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(data)
     if result.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND:
         messages = result.get("messages")
-        trusted = isinstance(messages, list) and bool(messages) and all(
-            isinstance(message, Mapping)
-            and message.get("authority") == "trusted_assignment"
+        if not isinstance(messages, list) or not messages or not all(
+            isinstance(message, Mapping) and "authority" in message
             for message in messages
+        ):
+            return result
+        trusted = all(
+            message.get("authority") == "trusted_assignment" for message in messages
         )
         result["text"] = TRUSTED_INBOX_TEXT if trusted else NEUTRAL_INBOX_TEXT
     return result
