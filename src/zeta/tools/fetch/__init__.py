@@ -21,6 +21,7 @@ import httpx
 from ...core.abort import AbortSignal
 from ...core.thread_call import run_owned_thread_call
 from ...protocol.types import StructuredToolResult
+from .._web_clients import SessionWebClients
 from ..registry import (
     ToolExecutionContext,
     ToolRegistry,
@@ -160,6 +161,7 @@ async def get_response(
     method: str = "GET",
     data: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
+    web_clients: SessionWebClients | None = None,
 ) -> httpx.Response:
     """Make a bounded, manually redirected request in memory.
 
@@ -168,24 +170,32 @@ async def get_response(
     needs a body-sized allocation.
     """
 
-    with io.BytesIO() as destination:
-        response = await _get_response_to_file(
-            url,
-            destination=destination,
-            user_agent=user_agent,
-            max_bytes=max_bytes,
-            params=params,
-            method=method,
-            data=data,
-            headers=headers,
-        )
-        return httpx.Response(
-            response.status_code,
-            headers=response.headers,
-            content=destination.getvalue(),
-            request=response.request,
-            extensions=response.extensions,
-        )
+    owns_web_clients = web_clients is None
+    if web_clients is None:
+        web_clients = SessionWebClients()
+    try:
+        with io.BytesIO() as destination:
+            response = await _get_response_to_file(
+                url,
+                destination=destination,
+                user_agent=user_agent,
+                max_bytes=max_bytes,
+                params=params,
+                method=method,
+                data=data,
+                headers=headers,
+                web_clients=web_clients,
+            )
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                content=destination.getvalue(),
+                request=response.request,
+                extensions=response.extensions,
+            )
+    finally:
+        if owns_web_clients:
+            await web_clients.close()
 
 
 def _reset_destinations(
@@ -217,6 +227,7 @@ async def _get_response_to_file(
     data: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
     received_destination: BinaryIO | None = None,
+    web_clients: SessionWebClients,
 ) -> httpx.Response:
     """Stream a bounded, decoded response body into a seekable file."""
 
@@ -235,6 +246,7 @@ async def _get_response_to_file(
                 data=data,
                 destination=destination,
                 received_destination=received_destination,
+                web_clients=web_clients,
             )
         except _DecompressionFailed as exc:
             if attempt == 0 and not _has_identity_encoding(request_headers):
@@ -261,75 +273,73 @@ async def _request_and_decode(
     data: Mapping[str, str] | None,
     destination: BinaryIO,
     received_destination: BinaryIO | None,
+    web_clients: SessionWebClients,
 ) -> httpx.Response:
     try:
-        async with httpx.AsyncClient(
-            timeout=HTTP_TIMEOUT_SECONDS,
-            follow_redirects=False,
-            trust_env=False,
-            headers=request_headers,
-        ) as client:
-            current_url = url
-            current_method = method
-            current_data = data
-            redirects_followed = 0
-            while True:
-                _validate_url(current_url)
-                addresses = await _target_addresses(current_url)
-                private_target = _classify_target(addresses)
-                address = addresses[0]
-                async with client.stream(
-                    current_method,
-                    _pinned_url(current_url, address),
-                    params=params if redirects_followed == 0 else None,
-                    data=current_data,
-                    headers={"Host": _host_header(current_url)},
-                    extensions={"sni_hostname": urlsplit(current_url).hostname},
-                ) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ValueError(
-                                "request failed: redirect response missing location"
-                            )
-                        if redirects_followed >= MAX_REDIRECTS:
-                            raise ValueError(
-                                f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
-                            )
-                        if response.status_code in {301, 302, 303}:
-                            current_method = "GET"
-                            current_data = None
-                        current_url = urljoin(current_url, location)
-                        redirects_followed += 1
-                        continue
-                    if response.status_code >= 400:
-                        reason = response.reason_phrase or "HTTP error"
+        current_url = url
+        current_method = method
+        current_data = data
+        redirects_followed = 0
+        while True:
+            _validate_url(current_url)
+            addresses = await _target_addresses(current_url)
+            private_target = _classify_target(addresses)
+            address = addresses[0]
+            parsed = urlsplit(current_url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
+            async with web_clients.anonymous(origin) as client, client.stream(
+                current_method,
+                _pinned_url(current_url, address),
+                params=params if redirects_followed == 0 else None,
+                data=current_data,
+                headers={**request_headers, "Host": _host_header(current_url)},
+                extensions={"sni_hostname": parsed.hostname},
+            ) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
                         raise ValueError(
-                            f"request failed: HTTP {response.status_code} {reason}"
+                            "request failed: redirect response missing location"
                         )
-                    partial_notice = await _decode_body_to_file(
-                        response,
-                        destination=destination,
-                        received_destination=received_destination,
-                        max_bytes=max_bytes,
+                    if redirects_followed >= MAX_REDIRECTS:
+                        raise ValueError(
+                            f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
+                        )
+                    if response.status_code in {301, 302, 303}:
+                        current_method = "GET"
+                        current_data = None
+                    current_url = urljoin(current_url, location)
+                    redirects_followed += 1
+                    continue
+                if response.status_code >= 400:
+                    reason = response.reason_phrase or "HTTP error"
+                    raise ValueError(
+                        f"request failed: HTTP {response.status_code} {reason}"
                     )
-                    await _run_worker(
-                        _flush_destinations, destination, received_destination
-                    )
-                    headers = response.headers.copy()
-                    headers.pop("content-encoding", None)
-                    headers.pop("content-length", None)
-                    return httpx.Response(
-                        response.status_code,
-                        headers=headers,
-                        content=b"",
-                        request=httpx.Request(current_method, current_url),
-                        extensions={
-                            **response.extensions,
-                            _PRIVATE_TARGET_EXTENSION: private_target,
-                            _PARTIAL_BODY_NOTICE_EXTENSION: partial_notice,
-                        },
-                    )
+                partial_notice = await _decode_body_to_file(
+                    response,
+                    destination=destination,
+                    received_destination=received_destination,
+                    max_bytes=max_bytes,
+                )
+                await _run_worker(
+                    _flush_destinations, destination, received_destination
+                )
+                headers = response.headers.copy()
+                headers.pop("content-encoding", None)
+                headers.pop("content-length", None)
+                return httpx.Response(
+                    response.status_code,
+                    headers=headers,
+                    content=b"",
+                    request=httpx.Request(current_method, current_url),
+                    extensions={
+                        **response.extensions,
+                        _PRIVATE_TARGET_EXTENSION: private_target,
+                        _PARTIAL_BODY_NOTICE_EXTENSION: partial_notice,
+                    },
+                )
     except httpx.TooManyRedirects as exc:
         raise ValueError(
             f"request failed: redirect limit exceeded ({MAX_REDIRECTS})"
@@ -759,6 +769,7 @@ async def _fetch(
             user_agent="zeta/fetch (web tool)",
             max_bytes=max_bytes,
             received_destination=received_body,
+            web_clients=registry.web_clients,
         )
         if abort_signal.is_set():
             raise asyncio.CancelledError()
