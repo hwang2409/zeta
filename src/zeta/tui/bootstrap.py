@@ -627,6 +627,21 @@ def _create_app_with_root(
         startup_alerts = (
             "system prompt overridden for this session; prompt cache will rebuild",
         )
+    from ..remote.host import ObserverHost
+    from ..runtime.foreground_events import ForegroundEventPublisher
+
+    foreground_event_publisher = ForegroundEventPublisher()
+    observer_host = None
+    if not ephemeral:
+        observer_host = ObserverHost(
+            home=home,
+            session_id=metadata.session_id,
+            publisher=foreground_event_publisher,
+            name=metadata.name,
+            cwd=str(metadata.cwd),
+            provider=metadata.provider,
+            model=metadata.model,
+        )
     app = _app.TUIApp(
         loop,
         provider=provider,
@@ -652,6 +667,8 @@ def _create_app_with_root(
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
         on_session_close=recency.flush,
+        foreground_event_publisher=foreground_event_publisher,
+        observer_host=observer_host,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system

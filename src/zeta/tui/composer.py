@@ -240,6 +240,9 @@ class TurnConsumerMixin:
                     abort_signal=turn_abort_signal,
                 )
             )
+            publisher = getattr(self, "foreground_event_publisher", None)
+            if publisher is not None:
+                events = publisher.events(events)
             async for event in events:
                 if notification and event.type is StreamEventType.ERROR:
                     notification_failure = NotificationFailure(
