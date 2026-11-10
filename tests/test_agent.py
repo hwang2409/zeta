@@ -9173,9 +9173,9 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
     from zeta.models.catalog import provider_for_model
 
     with pytest.raises(ValueError) as excinfo:
-        provider_for_model("gpt-nonexistent")
+        provider_for_model("not-a-model")
     message = str(excinfo.value)
-    assert "gpt-nonexistent" in message
+    assert "not-a-model" in message
     assert "claude-opus-5" in message
 
 
@@ -9192,9 +9192,8 @@ def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
         schema for schema in registry.schemas if schema["name"] == "agent"
     )
     model_schema = agent_schema["parameters"]["properties"]["model"]
-    assert model_schema["enum"] == known_model_names()
-    assert "claude-opus-5" in model_schema["enum"]
-    assert "gpt-5.4" in model_schema["enum"]
+    assert "enum" not in model_schema
+    assert all(name in model_schema["description"] for name in known_model_names())
 
 
 @pytest.mark.asyncio
@@ -9389,7 +9388,6 @@ async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) ->
         message.tool_result for message in store.messages() if message.tool_result
     )
     assert result.is_error
-    assert "model is not an allowed value" in result.content
     assert not (store.session_dir / "agents").exists()
 
 
@@ -9406,7 +9404,7 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     # No model at all keeps the parent's backend.
     assert resolve_child_backend(loop, None) == (parent_backend, None)
 
-    backend, error = resolve_child_backend(loop, "gpt-nonexistent")
+    backend, error = resolve_child_backend(loop, "not-a-model")
     assert backend is None
     assert error is not None and "unknown model" in error
 
