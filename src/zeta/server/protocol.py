@@ -223,6 +223,9 @@ class EventDescriptor(StrEnum):
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     REPLAY_STREAM_ENDED = "replay_stream_ended"
     CONFIG_CHANGED = "config_changed"
+    CHILD_STARTED = "child_started"
+    CHILD_PROGRESS = "child_progress"
+    CHILD_ENDED = "child_ended"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -253,7 +256,8 @@ FEATURES = (
     "session_host_commands",
     "session_history_fidelity",
     "session_replay_seq",
-"child_run_history",
+    "child_run_history",
+    "child_run_events",
     "served_turn_end",
     "content_read",
     "session_grants",
@@ -295,6 +299,7 @@ class MethodDescriptor(Enum):
         Access.READ,
     )
     CHILD_RUN_HISTORY = ("child_run_history", "1.1", "child_run_history", Access.READ)
+    CHILD_RUN_EVENTS = ("child_run_events", "1.1", "child_run_events", Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
     SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
     FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
