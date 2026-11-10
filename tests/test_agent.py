@@ -16540,7 +16540,16 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
         if answer_consumed:
-            answer_idle_entered.set()
+            notices = [
+                entry
+                for entry in parent.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "child_idle"
+            ]
+            if any(
+                entry.data.get("text") == "after Re q-reset: approved"
+                for entry in notices
+            ):
+                answer_idle_entered.set()
         await asyncio.wait_for(wake(), 10)
         return True
 

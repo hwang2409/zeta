@@ -42,7 +42,7 @@ async def await_or_fail[T](
     awaitable: Awaitable[T],
     *,
     timeout: float = 10,
-    what: str,
+    what: str | Callable[[], str],
 ) -> T:
     if timeout < 10:
         raise ValueError("timeout must be at least 10 s")
@@ -52,6 +52,8 @@ async def await_or_fail[T](
     if done:
         return future.result()
 
+    if callable(what):
+        what = what()
     timeout_error = TimeoutError(f"{what} did not finish within {timeout} s")
     try:
         await _cancel_and_drain([future], timeout=10, what=what)
