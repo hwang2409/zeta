@@ -277,8 +277,8 @@ def replay_history(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
-) -> tuple[dict, int]:
-    """Return the newest backward page and the seq of the newest row it covers."""
+) -> tuple[dict, int, str | None]:
+    """Return the newest backward page and its stable frontier row."""
     return _backward_history_page(
         runtime,
         {"before": None},
@@ -297,7 +297,7 @@ def _backward_history_page(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
-) -> tuple[dict, int]:
+) -> tuple[dict, int, str | None]:
     before = params["before"]
     validator = params.get("history_validator")
     if before is None:
@@ -336,7 +336,7 @@ def _backward_history_page(
         fidelity,
         content_read,
         served_turn_end,
-    ), projection.frontier
+    ), projection.frontier, projection.frontier_row_id
 
 
 def _forward_history_request(

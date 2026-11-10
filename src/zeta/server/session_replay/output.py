@@ -192,22 +192,40 @@ class ReplayOutput:
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
         store = validation.active(connection.server.runtime, {"session_id": scope.value})
-        self.replay.begin_join(connection, scope, store.reset_generation())
+        frontier_seq = store.active_branch_head_sequence()
+        self.replay.begin_join(
+            connection,
+            scope,
+            store.reset_generation(),
+            frontier_seq,
+            store.active_branch_head_id(),
+        )
 
     def finish_replay_join(
-        self, connection: Any, history: dict[str, object], frontier_seq: int
+        self,
+        connection: Any,
+        history: dict[str, object],
+        frontier_seq: int,
+        frontier_row_id: str | None,
     ) -> dict[str, object]:
         scope = self.replay.scope_for(connection)
-        store = self._replay_store(scope) if scope is not None else None
+        pending = self.replay.frontier_identity(connection)
         if scope is not None and not self._frontier_holds(
-            connection, scope, frontier_seq=frontier_seq
+            connection,
+            scope,
+            frontier_seq=pending[0] if pending is not None else frontier_seq,
+            frontier_row_id=pending[1] if pending is not None else frontier_row_id,
         ):
             self.invalidate_replay_scope(scope, "session_replaced")
-        row_id = None if store is None else store.row_id_at(frontier_seq)
-        return self.replay.finish_join(connection, history, frontier_seq, row_id)
+        return self.replay.finish_join(connection, history, frontier_seq, frontier_row_id)
 
     def _frontier_holds(
-        self, connection: Any, scope: ReplayScopeId, *, frontier_seq: int | None = None
+        self,
+        connection: Any,
+        scope: ReplayScopeId,
+        *,
+        frontier_seq: int | None = None,
+        frontier_row_id: str | None = None,
     ) -> bool:
         """Check a generation change against the frontier's stable row id."""
         generation = self.replay.reset_generation(connection)
@@ -218,10 +236,15 @@ class ReplayOutput:
         if current == generation:
             return True
         frontier = self.replay.frontier(connection)
-        if frontier is None:
+        identity = self.replay.frontier_identity(connection)
+        if frontier is None and frontier_row_id is None and identity is None:
             return False
-        seq = frontier.seq if frontier_seq is None else frontier_seq
-        row_id = frontier.row_id
+        if frontier is None and identity is not None:
+            identity_seq, identity_row_id = identity
+            frontier_seq = identity_seq if frontier_seq is None else frontier_seq
+            frontier_row_id = identity_row_id
+        seq = frontier.seq if frontier is not None and frontier_seq is None else frontier_seq
+        row_id = frontier_row_id if frontier_row_id is not None else frontier.row_id
         if row_id is None or store.row_id_at(seq) != row_id:
             return False
         self.replay.refresh_reset_generation(connection, current)
@@ -438,17 +461,13 @@ class ReplayOutput:
 
     async def read_replay_history(
         self, connection: Any, session_id: str
-    ) -> tuple[dict[str, object], int]:
-        """Read the newest history page of the pinned active store off-loop.
-
-        Also return the seq of the newest row that page's history includes.
-        """
+    ) -> tuple[dict[str, object], int, str | None]:
+        """Read the newest history page and its stable frontier row off-loop."""
         store = validation.active(connection.server.runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
         features = history_features(self._connections[connection].features)
-        result = await self.run_read(
-            connection,
-            lambda: replay_history(
+        def read() -> tuple[dict[str, object], int, str | None]:
+            history, frontier_seq, frontier_row_id = replay_history(
                 pinned,
                 include_delivery_id={
                     "delivery_id", "user_message_event", "user_message_delivery_id"
@@ -456,7 +475,9 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
-            ),
-        )
+            )
+            return history, frontier_seq, frontier_row_id
+
+        result = await self.run_read(connection, read)
         assert isinstance(result, tuple)
         return result

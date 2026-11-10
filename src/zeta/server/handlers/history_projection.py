@@ -63,8 +63,9 @@ class HistoryProjection:
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
-    # seq of the newest active-branch row this projection includes
+    # seq and stable id of the newest active-branch row this projection includes
     frontier: int = 0
+    frontier_row_id: str | None = None
 
 
 @dataclass
@@ -309,6 +310,7 @@ def history_projection(
         MappingProxyType(approval_calls),
         MappingProxyType(entry_index),
         frontier=branch[-1].seq if branch else 0,
+        frontier_row_id=branch[-1].id if branch else None,
     )
     with _cache_creation_lock:
         cached = _cache(
