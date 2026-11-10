@@ -13567,6 +13567,7 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
     assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
     assert os.stat(log_path).st_mode & 0o777 == 0o600
     assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
+    await app.close()
 
 
 def test_tui_diagnostic_record_is_not_visible_before_write(
