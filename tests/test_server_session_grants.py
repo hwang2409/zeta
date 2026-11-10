@@ -1916,6 +1916,7 @@ async def test_turn_end_send_ready_orders(
         notification_started.set()
         return await original_notification_turn(*args, **kwargs)
 
+    # test-contract: seam gate the real serve event publication before task return
     monkeypatch.setattr(server.control, "_event", gated_event)
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
