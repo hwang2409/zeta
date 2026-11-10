@@ -1967,6 +1967,8 @@ class FinishGateBackend(CompletionBackend):
 class PostCapBudgetBackend(CompletionBackend):
     def __init__(self) -> None:
         self.release_grandchild = asyncio.Event()
+        self.hold_post_cap = False
+        self.hold_fresh_prompt = False
         self.release_post_cap = asyncio.Event()
         self.post_cap_exhausted = asyncio.Event()
         self.fresh_prompt_seen = asyncio.Event()
@@ -2023,9 +2025,11 @@ class PostCapBudgetBackend(CompletionBackend):
         elif last_user == "fresh external prompt":
             self.fresh_requests.append(list(messages))
             self.fresh_prompt_seen.set()
-            await await_or_fail(
-                self.release_fresh_prompt.wait(), what="release fresh prompt response"
-            )
+            if self.hold_fresh_prompt:
+                await await_or_fail(
+                    self.release_fresh_prompt.wait(),
+                    what="release fresh prompt response",
+                )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -2053,9 +2057,10 @@ class PostCapBudgetBackend(CompletionBackend):
         # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate and self.gate_calls == 4:
             self.post_cap_exhausted.set()
-            await await_or_fail(
-                self.release_post_cap.wait(), what="release post-cap response"
-            )
+            if self.hold_post_cap:
+                await await_or_fail(
+                    self.release_post_cap.wait(), what="release post-cap response"
+                )
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
@@ -3959,6 +3964,8 @@ async def _run_post_cap_tool_cycle(
         monkeypatch, hold_child_bound=True
     )
     backend = PostCapBudgetBackend()
+    backend.hold_post_cap = send_fresh_prompt
+    backend.hold_fresh_prompt = send_fresh_prompt
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1, finish_gate_timeout=60)
     loop = AgentLoop(
