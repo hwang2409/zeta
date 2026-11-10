@@ -1251,13 +1251,12 @@ async def run_agent_tool(
                 )[0],
             )
         )
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            while not close_task.done():
-                try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    continue
-            close_task.result()
-            raise
+        cancelled = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
