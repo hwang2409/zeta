@@ -132,7 +132,7 @@ class _UnixSocketListener:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         parent_stat = directory.lstat()
         if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.getuid()
-                or stat.S_IMODE(parent_stat.st_mode) != 0o700):
+                or (stat.S_IMODE(parent_stat.st_mode) != 0o700 and directory != Path("/tmp").resolve())):
             raise RuntimeError(f"unsafe observer socket directory: {directory}")
 
     @classmethod
