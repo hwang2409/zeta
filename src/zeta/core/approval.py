@@ -25,6 +25,7 @@ from .abort import AbortSignal
 from .store import ConversationStore
 
 PRECEDENCE = ("deny", "ask", "allow", "default")
+PENDING_APPROVAL_LIMIT = 64
 
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
@@ -388,9 +389,19 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._label_resolver: Callable[[ToolCall], Awaitable[str | None]] | None = None
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
+        self._approval_slots = asyncio.Semaphore(PENDING_APPROVAL_LIMIT)
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
+
+    async def acquire_approval_slot(self) -> bool:
+        if self._serve_control is None:
+            return False
+        await self._approval_slots.acquire()
+        return True
+
+    def release_approval_slot(self) -> None:
+        self._approval_slots.release()
 
     def bind_serve_control(self, control: _ServeApprovalControl) -> None:
         """Permanently route this serve policy's delegated lifetime to control."""
@@ -1171,8 +1182,11 @@ class ApprovalGate:
                 self.policy.durable_decision(tool_call.id) is None
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
-            if approval_started and lifecycle is not None:
-                lifecycle("approval_start")
+            slot_acquired = False
+            if approval_started:
+                slot_acquired = await self.policy.acquire_approval_slot()
+                if lifecycle is not None:
+                    lifecycle("approval_start")
             try:
                 authorize = self.policy.authorize
                 parameters = inspect.signature(authorize).parameters
@@ -1189,8 +1203,11 @@ class ApprovalGate:
                     tool_call.id, f"approval failed: {exc}", True
                 ), execution_signal
             finally:
-                if approval_started and lifecycle is not None:
-                    lifecycle("approval_end")
+                if approval_started:
+                    if lifecycle is not None:
+                        lifecycle("approval_end")
+                    if slot_acquired:
+                        self.policy.release_approval_slot()
             if decision is None:
                 return canceled_result(tool_call.id), execution_signal
             if signal.is_set():
