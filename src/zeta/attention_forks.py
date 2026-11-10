@@ -23,7 +23,7 @@ from .core.checkpoints import ConversationEntry
 from .core.session import OpenedSession, SessionManager
 from .core.session_files import (
     SessionNotFoundError,
-    SessionReferenceGate,
+    SessionReferenceAuthority,
     child_directory,
     open_session_file,
     session_directory,
@@ -239,14 +239,14 @@ def _create_fork_session(
     branch: list[ConversationEntry],
     cut: int,
     fork_id: str,
-    reference_gate: SessionReferenceGate,
     reference_stack: ExitStack,
+    reference_authorities: list[SessionReferenceAuthority],
 ) -> str:
     note = _attention_fork_note(record)
 
     def populate(fork: OpenedSession) -> None:
         log_path = fork.store.session_dir / "conversation.jsonl"
-        with fork.store._append_lock():
+        with fork.store._append_lock(rank_execution=False):
             header = log_path.read_bytes().splitlines(keepends=True)[0]
             log_path.write_bytes(
                 header
@@ -286,8 +286,8 @@ def _create_fork_session(
         tool_allow=ATTENTION_FORK_POLICY.allow,
         auto_project=False,
         _session_id=fork_id,
-        _reference_gate=reference_gate,
         _reference_stack=reference_stack,
+        _reference_authorities=reference_authorities,
         _before_reference_publication=populate,
     )
     try:
@@ -357,7 +357,7 @@ def create_discussion_fork(
             source.store.close()
 
         fork_id = uuid4().hex
-        gate = SessionReferenceGate(home, manager._storage_lease)
+        reference_authorities: list[SessionReferenceAuthority] = []
         with ExitStack() as publication:
             fork_id = _create_fork_session(
                 manager=manager,
@@ -366,9 +366,10 @@ def create_discussion_fork(
                 branch=branch,
                 cut=cut,
                 fork_id=fork_id,
-                reference_gate=gate,
                 reference_stack=publication,
+                reference_authorities=reference_authorities,
             )
+            authority = reference_authorities[0]
             bound_record = AttentionRecord.from_dict(
                 {**record.to_dict(), "fork_session_id": fork_id}
             )
@@ -376,7 +377,7 @@ def create_discussion_fork(
                 reopened_source = manager.open(
                     source_session_id,
                     _read_only=True,
-                    _reference_gate=gate,
+                    _reference_authority=authority,
                 )
                 try:
                     current = attention_store.get(attention_id)

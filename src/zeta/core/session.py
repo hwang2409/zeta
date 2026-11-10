@@ -47,7 +47,9 @@ from .session_files import (
     SessionIdAmbiguousError,
     SessionInUseError,
     SessionNotFoundError,
-    SessionReferenceGate,
+    SessionReferenceAuthority,
+    reference_publication,
+    retained_reference_publication,
     open_session_file,
     mutate_session_metadata,
     read_session_file,
@@ -185,8 +187,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
         auto_project: bool = True,
         _session_id: str | None = None,
-        _reference_gate: SessionReferenceGate | None = None,
+        _reference_authority: SessionReferenceAuthority | None = None,
         _reference_stack: ExitStack | None = None,
+        _reference_authorities: list[SessionReferenceAuthority] | None = None,
         _before_reference_publication: Callable[[OpenedSession], None] | None = None,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
@@ -251,84 +254,67 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         os.mkdir(session_id, mode=0o700, dir_fd=root_fd)
                     except FileExistsError:
                         continue
-                    with (
-                        child_directory(root_fd, session_id) as destination_fd,
-                        session_directory(staged.sessions_dir, session_id) as (
-                            _,
-                            source_fd,
-                        ),
-                    ):
-                        names = os.listdir(source_fd)
-                        for filename in names:
-                            if filename != "meta.json":
-                                os.replace(
-                                    filename,
-                                    filename,
-                                    src_dir_fd=source_fd,
-                                    dst_dir_fd=destination_fd,
-                                )
-                        os.fsync(destination_fd)
                     with child_directory(root_fd, session_id) as destination_fd:
                         execution_lease = SessionExecutionLease.acquire(
                             destination_fd,
                             session_id=session_id,
                             owner=OwnerHint(self._owner_surface),
                         )
-                    store = ConversationStore(
-                        self.sessions_dir,
-                        session_id=session_id,
-                        _must_exist=True,
-                        _storage_lease=self._storage_lease,
-                        _execution_lease=execution_lease,
-                        _owner_surface=self._owner_surface,
+                    referenced_ids = (
+                        (parent_session_id,) if parent_session_id is not None else ()
                     )
-                    metadata._execution_lease = store.execution_lease
-                    if _before_reference_publication is not None:
-                        try:
-                            _before_reference_publication(OpenedSession(metadata, store))
-                        except BaseException:
-                            store.close()
-                            execution_lease.close()
-                            raise
-                    gate = _reference_gate or SessionReferenceGate(
-                        self.home, self._storage_lease
+                    project_domains = (
+                        ((project_id, "sessions"),) if project_id is not None else ()
                     )
-                    reference_operation = gate.shared(
-                        installed_ids=(session_id,),
-                        referenced_ids=(parent_session_id,)
-                        if parent_session_id is not None
-                        else (),
-                    )
-                    if _reference_stack is not None:
-                        _reference_stack.enter_context(reference_operation)
-                        authority = nullcontext(gate)
-                    elif _reference_gate is not None:
-                        authority = nullcontext(gate)
+                    if _reference_authority is not None:
+                        execution_authority, publication = (
+                            nullcontext(),
+                            nullcontext(_reference_authority),
+                        )
                     else:
-                        authority = reference_operation
+                        execution_authority, publication = retained_reference_publication(
+                            self.home,
+                            self._storage_lease,
+                            _reference_stack,
+                            _reference_authorities,
+                            installed_ids=(session_id,),
+                            referenced_ids=referenced_ids,
+                            project_domains=project_domains,
+                        )
+                    store: ConversationStore | None = None
                     try:
-                        with authority:
+                        with execution_authority, publication as authority:
+                            assert authority is not None
+                            authority.validate((session_id, *referenced_ids))
                             with child_directory(
                                 root_fd, session_id
                             ) as destination_fd, session_directory(
                                 staged.sessions_dir, session_id
                             ) as (_, source_fd):
-                                if _reference_gate is not None:
-                                    gate.validate(
-                                        (session_id, parent_session_id)
-                                        if parent_session_id is not None
-                                        else (session_id,)
+                                for filename in os.listdir(source_fd):
+                                    os.replace(
+                                        filename,
+                                        filename,
+                                        src_dir_fd=source_fd,
+                                        dst_dir_fd=destination_fd,
                                     )
-                                # Metadata is the discovery boundary; publish it only
-                                # after execution ownership and reference admission.
-                                os.replace(
-                                    "meta.json",
-                                    "meta.json",
-                                    src_dir_fd=source_fd,
-                                    dst_dir_fd=destination_fd,
-                                )
                                 os.fsync(destination_fd)
                                 os.fsync(root_fd)
+                            store = ConversationStore(
+                                self.sessions_dir,
+                                session_id=session_id,
+                                _must_exist=True,
+                                _storage_lease=self._storage_lease,
+                                _execution_lease=execution_lease,
+                                _owner_surface=self._owner_surface,
+                                _initialization_execution_ranked=False,
+                            )
+                            metadata._execution_lease = store.execution_lease
+                            if _before_reference_publication is not None:
+                                _before_reference_publication(
+                                    OpenedSession(metadata, store)
+                                )
+                            store._rank_execution = True
                             store.activate_runtime_lease()
                             if project_id is not None:
                                 try:
@@ -339,7 +325,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                                         project_role or "session",
                                         parent_session_id,
                                         self._storage_lease,
-                                        _reference_gate=gate,
+                                        _reference_authority=authority,
                                     )
                                 except (SessionError, OSError) as exc:
                                     logger.warning(
@@ -347,11 +333,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                                         exc,
                                     )
                                 self._reconcile_project_link(
-                                    session_id, _reference_gate=gate
+                                    session_id, _reference_authority=authority
                                 )
                             return OpenedSession(metadata, store)
                     except BaseException:
-                        store.close()
+                        if store is not None:
+                            store.close()
                         raise
                     finally:
                         execution_lease.close()
@@ -376,17 +363,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         session_id: str,
         *,
         _read_only: bool = False,
-        _reference_gate: SessionReferenceGate | None = None,
+        _reference_authority: SessionReferenceAuthority | None = None,
     ) -> OpenedSession:
         self._validate_id(session_id)
-        if _reference_gate is not None and not _read_only:
+        if _reference_authority is not None and not _read_only:
             raise SessionError("an already-gated open must be read-only")
-        gate = _reference_gate or SessionReferenceGate(
-            self.home, self._storage_lease
-        )
         if _read_only:
-            if _reference_gate is not None:
-                gate.validate((session_id,))
+            if _reference_authority is not None:
+                _reference_authority.validate((session_id,))
             metadata = self.read_metadata(session_id)
             try:
                 store = ConversationStore(
@@ -416,9 +400,21 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 owner=OwnerHint(self._owner_surface),
             )
         opened_metadata: SessionMetadata | None = None
+        reference_authority: SessionReferenceAuthority | None = None
+        @contextmanager
+        def initialize_authority():
+            nonlocal reference_authority
+            with reference_publication(
+                self.home,
+                self._storage_lease,
+                referenced_ids=(session_id,),
+            ) as authority:
+                reference_authority = authority
+                yield authority
 
         def initialize(store: ConversationStore) -> None:
             nonlocal opened_metadata
+            assert reference_authority is not None
             metadata = self.read_metadata(session_id)
             if store.cwd != metadata.cwd:
                 raise SessionError(
@@ -426,8 +422,12 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 )
             metadata._execution_lease = store.execution_lease
             if metadata.project_id is not None and self.project_registry is not None:
-                self._reconcile_project_link(session_id, _reference_gate=gate)
-                self._reconcile_child_links(session_id, _reference_gate=gate)
+                self._reconcile_project_link(
+                    session_id, _reference_authority=reference_authority
+                )
+                self._reconcile_child_links(
+                    session_id, _reference_authority=reference_authority
+                )
             opened_metadata = metadata
 
         try:
@@ -438,9 +438,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 _storage_lease=self._storage_lease,
                 _execution_lease=execution_lease,
                 _owner_surface=self._owner_surface,
-                _initialization_authority=gate.shared(
-                    referenced_ids=(session_id,)
-                ),
+                _initialization_authority=initialize_authority(),
                 _on_initialized=initialize,
             )
         except (SessionError, SessionOwnedError, TranscriptLoadError):
@@ -581,19 +579,23 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self,
         session_id: str,
         *,
-        _reference_gate: SessionReferenceGate | None = None,
+        _reference_authority: SessionReferenceAuthority | None = None,
     ) -> None:
-        gate = _reference_gate or SessionReferenceGate(self.home, self._storage_lease)
-        authority = (
-            nullcontext(gate)
-            if _reference_gate is not None
-            else gate.shared(referenced_ids=(session_id,))
+        publication = (
+            nullcontext(_reference_authority)
+            if _reference_authority is not None
+            else reference_publication(
+                self.home,
+                self._storage_lease,
+                referenced_ids=(session_id,),
+            )
         )
-        with authority:
-            self._reconcile_project_link_gated(session_id, gate)
+        with publication as authority:
+            assert authority is not None
+            self._reconcile_project_link_gated(session_id, authority)
 
     def _reconcile_project_link_gated(
-        self, session_id: str, gate: SessionReferenceGate
+        self, session_id: str, authority: SessionReferenceAuthority
     ) -> None:
         registry = self.project_registry
         if registry is None:
@@ -642,7 +644,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             json.dumps(pending, sort_keys=True).encode("utf-8"),
                         )
 
-                gate.validate(
+                authority.validate(
                     tuple(
                         value
                         for value in (session_id, pending.get("parent_session_id"))
@@ -725,14 +727,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self,
         session_id: str,
         *,
-        _reference_gate: SessionReferenceGate | None = None,
+        _reference_authority: SessionReferenceAuthority | None = None,
     ) -> None:
         if self.project_registry is not None:
             reconcile_child_links(
                 self.project_registry,
                 self.sessions_dir,
                 session_id,
-                _reference_gate=_reference_gate,
+                _reference_authority=_reference_authority,
             )
 
     def list_sessions(self) -> list[SessionMetadata]:

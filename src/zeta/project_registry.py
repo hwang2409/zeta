@@ -26,9 +26,9 @@ from pathlib import Path
 from . import project_schema
 from .core.session_files import (
     SessionError,
-    SessionReferenceGate,
     atomic_publish_file,
     open_session_file,
+    reference_publication,
 )
 from .locking import format_lock
 from .project_context.projection import (
@@ -911,11 +911,12 @@ class ProjectRegistry(
             for session_id in (record["session_id"], record.get("parent_session_id"))
             if isinstance(session_id, str)
         )
-        with SessionReferenceGate(self.root.parent, self._storage_lease).shared(
-            referenced_ids=ids
-        ), self._project_lock(
-            project_id, "sessions", exclusive=True
-        ) as project_fd:
+        with reference_publication(
+            self.root.parent,
+            self._storage_lease,
+            referenced_ids=ids,
+            project_domains=((project_id, "sessions"),),
+        ), self._project_lock(project_id, "sessions", exclusive=True) as project_fd:
             self._update_sessions_locked(project_fd, set(), prepared)
 
     @staticmethod

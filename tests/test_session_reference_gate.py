@@ -6,8 +6,8 @@ import pytest
 
 from zeta.core.session_files import (
     SessionError,
-    SessionReferenceGate,
     SessionReferenceUnavailable,
+    reference_publication,
 )
 from zeta.storage_format import open_writer
 
@@ -15,8 +15,12 @@ from zeta.storage_format import open_writer
 def test_shared_reference_gate_publishes_generation_and_rejects_reserved_id(tmp_path):
     lease = open_writer(tmp_path)
     try:
-        gate = SessionReferenceGate(tmp_path, lease)
-        with gate.shared(installed_ids=("root",), referenced_ids=("parent",)):
+        with reference_publication(
+            tmp_path,
+            lease,
+            installed_ids=("root",),
+            referenced_ids=("parent",),
+        ):
             generation = int((tmp_path / "session-reference-generation").read_text())
             assert generation == 1
 
@@ -26,7 +30,7 @@ def test_shared_reference_gate_publishes_generation_and_rejects_reserved_id(tmp_
         with pytest.raises(
             SessionReferenceUnavailable,
             match=r"session reference unavailable: root is being deleted",
-        ), gate.shared(installed_ids=("root",)):
+        ), reference_publication(tmp_path, lease, installed_ids=("root",)):
             pass
     finally:
         lease.close()
@@ -37,7 +41,7 @@ def test_reference_gate_is_dormant_below_feature_epoch(tmp_path):
     lease = open_writer(tmp_path)
 
     async def use_gate() -> None:
-        with SessionReferenceGate(tmp_path, lease).shared(installed_ids=("bad/id",)):
+        with reference_publication(tmp_path, lease, installed_ids=("bad/id",)):
             pass
 
     try:
@@ -56,7 +60,7 @@ def test_reference_gate_rejects_malformed_generation(tmp_path, content):
         path.write_text(content, encoding="ascii")
         with (
             pytest.raises(SessionError, match="session reference generation"),
-            SessionReferenceGate(tmp_path, lease).shared(installed_ids=("root",)),
+            reference_publication(tmp_path, lease, installed_ids=("root",)),
         ):
             pass
         assert path.read_text(encoding="ascii") == content

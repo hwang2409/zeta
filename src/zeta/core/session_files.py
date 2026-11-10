@@ -12,10 +12,10 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 
-from ..locking import RETENTION_HOME_ID, domain_authority, identity_lock, shape_lock
+from ..locking import RETENTION_HOME_ID, domain_authority, execution_lock, shape_lock
 from ..storage_format import (
     StorageFeature,
     WriterLease,
@@ -56,6 +56,18 @@ _READ_RETRIES = 3
 _SESSION_REFERENCE_GENERATION = "session-reference-generation"
 
 
+@dataclass(frozen=True)
+class SessionReferenceAuthority:
+    """Proof that one outer publication owns reference admission."""
+
+    gate: SessionReferenceGate
+    session_ids: frozenset[str]
+    project_domains: tuple[tuple[str, str], ...]
+
+    def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
+        self.gate.validate(session_ids)
+
+
 class SessionReferenceGate:
     """Coordinate all durable session references with retention."""
 
@@ -82,38 +94,44 @@ class SessionReferenceGate:
                 "exclusive session reference authority requested on an asyncio event-loop thread"
             )
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
-        try:
-            with domain_authority(
-                self.home,
-                RETENTION_HOME_ID,
-                "references",
-                exclusive=exclusive,
-                nonblocking=on_loop,
-            ):
-                yield self
-        except BlockingIOError as exc:
-            session_id = unavailable_id or "unknown"
-            raise SessionReferenceUnavailable(
-                f"session reference unavailable: {session_id} is being deleted"
-            ) from exc
+        with ExitStack() as authority:
+            try:
+                authority.enter_context(
+                    domain_authority(
+                        self.home,
+                        RETENTION_HOME_ID,
+                        "references",
+                        exclusive=exclusive,
+                        nonblocking=on_loop,
+                    )
+                )
+            except BlockingIOError as exc:
+                session_id = unavailable_id or "unknown"
+                raise SessionReferenceUnavailable(
+                    f"session reference unavailable: {session_id} is being deleted"
+                ) from exc
+            except OSError as exc:
+                raise SessionError(
+                    "session reference authority is unsafe or unavailable"
+                ) from exc
+            yield self
 
-    def shared(
+    @contextmanager
+    def _shared(
         self,
         *,
-        installed_ids: tuple[str, ...] = (),
-        referenced_ids: tuple[str, ...] = (),
+        installed_ids: tuple[str, ...],
+        referenced_ids: tuple[str, ...],
+        project_domains: tuple[tuple[str, str], ...],
     ):
-        @contextmanager
-        def operation():
-            ids = (*installed_ids, *referenced_ids)
-            with self._locked(
-                exclusive=False, unavailable_id=ids[0] if ids else None
-            ):
-                self.validate(ids)
-                if installed_ids:
-                    self.bump_generation()
-                yield self
-        return operation()
+        ids = (*installed_ids, *referenced_ids)
+        if project_domains != tuple(sorted(set(project_domains))):
+            raise AssertionError("project domains must be unique and sorted")
+        with self._locked(exclusive=False, unavailable_id=ids[0] if ids else None):
+            self.validate(ids)
+            if installed_ids:
+                self.bump_generation()
+            yield SessionReferenceAuthority(self, frozenset(ids), project_domains)
 
     def exclusive(self, *, session_id: str | None = None):
         return self._locked(exclusive=True, unavailable_id=session_id)
@@ -159,6 +177,44 @@ class SessionReferenceGate:
         finally:
             os.close(directory_fd)
         return value
+
+
+@contextmanager
+def reference_publication(
+    home: Path,
+    lease: WriterLease,
+    *,
+    installed_ids: tuple[str, ...] = (),
+    referenced_ids: tuple[str, ...] = (),
+    project_domains: tuple[tuple[str, str], ...] = (),
+):
+    """Enter reference admission once for one complete public transaction."""
+    gate = SessionReferenceGate(home, lease)
+    with gate._shared(
+        installed_ids=installed_ids,
+        referenced_ids=referenced_ids,
+        project_domains=project_domains,
+    ) as authority:
+        yield authority
+
+
+def retained_reference_publication(
+    home: Path,
+    lease: WriterLease,
+    stack: ExitStack | None,
+    authorities: list[SessionReferenceAuthority] | None,
+    **publication_ids,
+):
+    """Keep execution and reference admission alive for a larger transaction."""
+    if stack is None:
+        return execution_lock(), reference_publication(home, lease, **publication_ids)
+    stack.enter_context(execution_lock())
+    authority = stack.enter_context(
+        reference_publication(home, lease, **publication_ids)
+    )
+    if authorities is not None:
+        authorities.append(authority)
+    return nullcontext(), nullcontext(authority)
 
 
 def copy_session_metadata(target, source) -> None:
@@ -235,24 +291,31 @@ def session_metadata_lock(
             if time.monotonic() >= deadline:
                 raise SessionError("session metadata lock acquisition timed out")
             time.sleep(min(0.05, deadline - time.monotonic()))
-    with session_root(sessions_dir) as root_fd, child_directory(
-        root_fd, session_id
-    ) as directory_fd, identity_lock():
-        lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+    with (
+        authority or nullcontext(),
+        session_root(sessions_dir) as root_fd,
+        child_directory(root_fd, session_id) as directory_fd,
+    ):
+        try:
+            lock_fd = open_session_file(
+                directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT
+            )
+        except OSError as exc:
+            raise SessionError("session metadata lock could not be opened") from exc
         try:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                fcntl.flock(
+                    lock_fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                )
             except BlockingIOError:
                 yield None
                 return
-            with authority or nullcontext():
-                with shape_lock():
-                    yield directory_fd
-                if after_shape is not None:
-                    after_shape()
+            with shape_lock():
+                yield directory_fd
+            if after_shape is not None:
+                after_shape()
         finally:
             os.close(lock_fd)
-
 
 def require_off_loop_lock(
     kind: str, error: Callable[[str], BaseException] = RuntimeError

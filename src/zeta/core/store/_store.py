@@ -144,6 +144,7 @@ class ConversationStore(
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
         _initialization_authority: AbstractContextManager[object] | None = None,
+        _initialization_execution_ranked: bool = True,
         _on_initialized: Callable[[ConversationStore], None] | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
@@ -228,6 +229,7 @@ class ConversationStore(
             self._agent_canceled: dict[str, Any] | None = None
             self._agent_lifecycle: dict[str, Any] | None = None
             self._write_deadline: float | None = None
+            self._rank_execution = _initialization_execution_ranked
             self.pending_prompt_queue = PendingPromptQueue(self)
             with ExitStack() as lease:
                 _, self.directory_fd = lease.enter_context(
@@ -250,6 +252,7 @@ class ConversationStore(
                         self._strict_snapshot_sync = True
                     with self._append_lock(
                         deadline=_lock_deadline,
+                        rank_execution=_initialization_execution_ranked,
                         nested_authority=_initialization_authority,
                         after_shape=(
                             None

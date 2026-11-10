@@ -23,6 +23,7 @@ class ExecutionOwnerStoreMixin:
         deadline: float | None = None,
         wait: bool = True,
         observer: bool = False,
+        rank_execution: bool = True,
         nested_authority: AbstractContextManager[object] | None = None,
         after_shape: Callable[[], None] | None = None,
     ) -> Iterator[bool]:
@@ -31,7 +32,11 @@ class ExecutionOwnerStoreMixin:
             raise ValueError("session store is closed")
         if not observer:
             self.assert_execution_owner()
-        authority = nullcontext() if observer else execution_lock()
+        authority = (
+            nullcontext()
+            if observer or not rank_execution or not self._rank_execution
+            else execution_lock()
+        )
         started = False
         try:
             with authority, nested_authority or nullcontext():

@@ -20,10 +20,10 @@ from typing import Any
 
 from .core.session_files import (
     SessionError,
-    SessionReferenceGate,
     atomic_publish_file,
     child_directory,
     open_session_file,
+    reference_publication,
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
@@ -307,9 +307,12 @@ class ProjectInbox:
             "in_reply_to": in_reply_to,
             "created_at": _now(),
         }
-        with SessionReferenceGate(
-            self.registry.root.parent, self.registry._storage_lease
-        ).shared(referenced_ids=(session, to_session) if to_session else (session,)):
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session, to_session) if to_session else (session,),
+            project_domains=((target.project_id, "inbox"),),
+        ):
             self._publish_outgoing(target.project_id, message_id, body, record)
             if on_visible is not None:
                 try:
@@ -693,11 +696,12 @@ class ProjectInbox:
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
         name = f"{message_id}.json"
-        with SessionReferenceGate(
-            self.registry.root.parent, self.registry._storage_lease
-        ).shared(referenced_ids=(session_id,)), self._directories(
-            target.project_id, create=True
-        ) as dirs:
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session_id,),
+            project_domains=((target.project_id, "inbox"),),
+        ), self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)

@@ -27,7 +27,7 @@ from ..core.session_execution import RUNTIME_LEASE_NAME
 from ..core.session_files import (
     SessionError,
     SessionInUseError,
-    SessionReferenceGate,
+    reference_publication,
     session_directory,
 )
 from ..core.session_metadata import SessionMetadata
@@ -106,7 +106,9 @@ class LocalTransport:
             installed_ids, referenced_ids = _snapshot_reference_ids(
                 snapshot, str(manifest["session_id"])
             )
-            with SessionReferenceGate(self.home, lease).shared(
+            with reference_publication(
+                self.home,
+                lease,
                 installed_ids=installed_ids,
                 referenced_ids=referenced_ids,
             ):
@@ -310,7 +312,9 @@ def _pull_session(
             else nullcontext()
         )
         try:
-            with SessionReferenceGate(local_home, storage_lease).shared(
+            with reference_publication(
+                local_home,
+                storage_lease,
                 installed_ids=installed_ids,
                 referenced_ids=referenced_ids,
             ), lease:
