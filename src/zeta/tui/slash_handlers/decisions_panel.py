@@ -14,7 +14,9 @@ import asyncio
 import threading
 from pathlib import Path
 
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding.vi_state import InputMode
 
 from ...attention_records import Broken, broken_record_refusal
 from ...protocol.types import StreamEvent, StreamEventType
@@ -25,6 +27,7 @@ from ...runtime.project_registry_state import (
 from ..cards.decisions import DecisionsPanel
 from ..composer import FullScreenPromptSession
 from ..overlay import OverlayControl
+from ..overlay_text_field import OverlayTextField
 
 # The scan touches the filesystem (a directory flock per session plus its
 # attention records); a few-second cadence keeps the status-bar count fresh
@@ -166,7 +169,8 @@ class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
     def _init_decisions_panel(self) -> None:
-        self._decisions_panel = DecisionsPanel()
+        self._decisions_answer_field = OverlayTextField("DECISIONS_ANSWER")
+        self._decisions_panel = DecisionsPanel(self._decisions_answer_field)
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
@@ -178,7 +182,6 @@ class DecisionsMixin:
         self._decisions_stopping = False
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
-        self._decisions_answer_buffer = ""
         self._decisions_switching = False
 
     @property
@@ -477,7 +480,12 @@ class DecisionsMixin:
             return
         elif key == "a":
             panel.enter_answer()
-            self._decisions_answer_buffer = ""
+            self._decisions_answer_field.reset()
+            session = self._active_session
+            if isinstance(session, FullScreenPromptSession):
+                session.layout.focus(self._decisions_answer_field.window)
+                if get_app().editing_mode.name == "VI":
+                    get_app().vi_state.input_mode = InputMode.INSERT
         elif key == "enter":
             self._discuss_selected()
             return
@@ -492,21 +500,17 @@ class DecisionsMixin:
         if key == "escape":
             self._decisions_panel.exit_answer()
         elif key == "enter":
-            text = self._decisions_answer_buffer.strip()
+            text = self._decisions_answer_field.text.strip()
             if text:
                 self._deliver_quick_answer(text)
                 return
             self._decisions_panel.exit_answer()
-        elif key == "backspace":
-            self._decisions_answer_buffer = self._decisions_answer_buffer[:-1]
-            self._decisions_panel.set_answer(self._decisions_answer_buffer)
         self._refresh_decisions_panel(keep_offset=True)
 
     def _decisions_answer_input(self, text: str) -> None:
+        del text
         if self._decisions_panel.mode != "answer":
             return
-        self._decisions_answer_buffer += text
-        self._decisions_panel.set_answer(self._decisions_answer_buffer)
         self._refresh_decisions_panel(keep_offset=True)
 
     def _refresh_decisions_panel(self, *, keep_offset: bool = False) -> None:

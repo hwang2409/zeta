@@ -18,6 +18,7 @@ from prompt_toolkit.utils import get_cwidth
 from ...attention_decisions import DecisionItem
 from ...attention_records import Broken
 from .. import overlay, theme
+from ..overlay_text_field import OverlayTextField
 from .shared import wrap_by_cells
 
 # The popup settles near, but not beyond, the shared overlay cap so the text
@@ -71,12 +72,12 @@ def _option_lines(index: int, text: str, width: int) -> list[FragmentLine]:
 class DecisionsPanel:
     """Interactive state for the open-decisions list and the answer field."""
 
-    def __init__(self) -> None:
+    def __init__(self, answer_field: OverlayTextField | None = None) -> None:
         self._items: tuple[DecisionItem, ...] = ()
         self._staged: dict[str, str] = {}
         self._selected_id: str | None = None
         self._mode: str = "list"
-        self._answer: str = ""
+        self.answer_field = answer_field or OverlayTextField("DECISIONS_ANSWER")
 
     # -- snapshot ingestion -------------------------------------------------
 
@@ -90,7 +91,8 @@ class DecisionsPanel:
         if self._selected_id not in ids:
             self._selected_id = ids[0] if ids else None
             if self._mode == "answer":
-                self._mode, self._answer = "list", ""
+                self._mode = "list"
+                self.answer_field.reset()
 
     # -- read-only state ----------------------------------------------------
 
@@ -138,15 +140,15 @@ class DecisionsPanel:
         if self.selected is None or isinstance(self.selected.record, Broken):
             return False
         self._mode = "answer"
-        self._answer = ""
+        self.answer_field.reset()
         return True
 
     def set_answer(self, text: str) -> None:
-        self._answer = text
+        self.answer_field.set_text(text)
 
     def exit_answer(self) -> None:
         self._mode = "list"
-        self._answer = ""
+        self.answer_field.reset()
 
     # -- rendering ----------------------------------------------------------
 
@@ -173,8 +175,7 @@ class DecisionsPanel:
         ):
             lines.append(overlay.hint("d dismiss"))
         if self._mode == "answer":
-            lines.append(self._answer_line())
-            lines.append(overlay.hint("enter send · esc cancel"))
+            lines.extend(self.answer_field.lines(CONTENT_WIDTH - 2, prefix="answer ❯ "))
         return lines
 
     def _list_row(self, item: DecisionItem) -> FragmentLine:
@@ -244,12 +245,6 @@ class DecisionsPanel:
         lines.append(overlay.rule())
         return lines
 
-    def _answer_line(self) -> FragmentLine:
-        return [
-            overlay.value("answer ❯ ", theme.ACCENT),
-            overlay.value(self._answer),
-            (theme.prompt_toolkit_style(f"bold {theme.ACCENT}"), "▌"),
-        ]
 
 
 __all__ = ["CONTENT_WIDTH", "DecisionsPanel"]

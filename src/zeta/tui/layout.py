@@ -562,6 +562,7 @@ def full_screen_content(
     finder_window: AnyContainer | None = None,
     finder_active: Callable[[], bool] | None = None,
     queued_messages: Callable[[], Sequence[str]] = tuple,
+    overlay_field_windows: Sequence[AnyContainer] = (),
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -626,7 +627,7 @@ def full_screen_content(
         ),
         Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
     )
-    bottom_rows = [spacer, todo_panel, queued_rows, *padded_composer_rows]
+    bottom_rows = [*overlay_field_windows, spacer, todo_panel, queued_rows, *padded_composer_rows]
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)

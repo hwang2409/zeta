@@ -324,6 +324,7 @@ def build_key_bindings(
     on_decisions_open: Callable[[], None] | None = None,
     on_decisions_key: Callable[[str], None] | None = None,
     on_decisions_input: Callable[[str], None] | None = None,
+    decisions_buffer: Buffer | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
@@ -337,6 +338,7 @@ def build_key_bindings(
     on_finder_accept: Callable[[], None] | None = None,
     on_finder_cancel: Callable[[], None] | None = None,
     on_finder_toggle_preview: Callable[[], None] | None = None,
+    finder_buffer: Buffer | None = None,
     search_active: Callable[[], bool] | None = None,
     on_search_next: Callable[[], None] | None = None,
     on_search_previous: Callable[[], None] | None = None,
@@ -391,7 +393,8 @@ def build_key_bindings(
     history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
     suppress_history_detach = False
-    finder_buffer = Buffer(name="TRANSCRIPT_FINDER")
+    finder_buffer = finder_buffer or Buffer(name="TRANSCRIPT_FINDER")
+    decisions_buffer = decisions_buffer or Buffer(name="DECISIONS_ANSWER")
 
     def track_history_buffer(buffer: Buffer) -> None:
         nonlocal history_navigation_active, history_navigation_buffer
@@ -757,6 +760,14 @@ def build_key_bindings(
 
         @bindings.add(Keys.Escape, filter=decisions_panel_mode, eager=True)
         def decisions_escape(event: KeyPressEvent) -> None:
+            if (
+                decisions_answering is not None
+                and decisions_answering()
+                and get_app().editing_mode is EditingMode.VI
+                and get_app().vi_state.input_mode is InputMode.INSERT
+            ):
+                get_app().vi_state.input_mode = InputMode.NAVIGATION
+                return
             del event
             on_decisions_key("escape")
 
@@ -767,15 +778,16 @@ def build_key_bindings(
 
         @bindings.add("backspace", filter=decisions_answer_mode, eager=True)
         def decisions_answer_backspace(event: KeyPressEvent) -> None:
-            del event
-            on_decisions_key("backspace")
+            event.current_buffer.delete_before_cursor()
+            on_decisions_input(event.current_buffer.text)
 
     if on_decisions_input is not None:
 
         @bindings.add(Keys.Any, filter=decisions_answer_mode, eager=True)
         def decisions_answer_input(event: KeyPressEvent) -> None:
             if event.data:
-                on_decisions_input(event.data)
+                event.current_buffer.insert_text(event.data)
+                on_decisions_input(event.current_buffer.text)
 
     native_escape = next(
         binding

@@ -21,6 +21,7 @@ from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.utils import get_cwidth
 
 from .. import overlay, theme
+from ..overlay_text_field import OverlayTextField
 from .message_finder import FinderRow, Role
 
 _MAX_WIDTH = 96
@@ -96,8 +97,9 @@ def _list_window(selected: int, count: int, height: int) -> int:
 class FinderControl(UIControl):
     """Paint the finder overlay from the transcript's live finder state."""
 
-    def __init__(self, get_state: Callable[[], FinderState | None]) -> None:
+    def __init__(self, get_state: Callable[[], FinderState | None], field: OverlayTextField | None = None) -> None:
         self._get_state = get_state
+        self._field = field
         self._lines: list[list[tuple[str, str]]] = []
 
     def _result_line(
@@ -146,14 +148,17 @@ class FinderControl(UIControl):
         lines: list[list[tuple[str, str]]] = []
         if state.title is not None:
             lines.append([(f"bold {theme.ACCENT}", state.title)])
-        # Query line.
-        lines.append(
-            [
-                (theme.ACCENT, "❯ "),
-                (theme.BODY, _truncate(state.query, content_width - 3)),
-                (f"bold {theme.ACCENT}", "▌"),
-            ]
-        )
+        # Query field.
+        if self._field is None:
+            lines.append(
+                [
+                    (theme.ACCENT, "❯ "),
+                    (theme.BODY, _truncate(state.query, content_width - 3)),
+                    (f"bold {theme.ACCENT}", "▌"),
+                ]
+            )
+        else:
+            lines.extend(self._field.lines(content_width, prefix="❯ "))
         lines.append([(theme.DIM, "─" * content_width)])
         # Result rows.
         if not state.rows:

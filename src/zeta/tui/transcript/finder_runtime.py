@@ -56,12 +56,21 @@ class FinderRuntimeMixin:
     def _finder_open(self) -> None:
         self._active_finder = self._viewed_transcript()
         finder = self._active_finder
+        session = getattr(self, "_active_session", None)
+        field = getattr(self, "_finder_field", None)
+        if session is not None and field is not None:
+            session.layout.focus(field.window)
         request = finder.open_finder()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
         self._active_finder = self._history_finder
         finder = self._history_finder
+        session = getattr(self, "_active_session", None)
+        field = getattr(self, "_finder_field", None)
+        if session is not None and field is not None:
+            session.layout.focus(field.window)
+            field.buffer.set_document(buffer.document, bypass_readonly=True)
         request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
 

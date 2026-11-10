@@ -88,6 +88,7 @@ from .loop_errors import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
+from .overlay_text_field import OverlayTextField
 from .paste_runtime import PasteRuntime
 from .render import (
     render_markdown,
@@ -328,8 +329,9 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
+        self._finder_field = OverlayTextField("TRANSCRIPT_FINDER")
         self._finder_control = FinderControl(
-            lambda: app._active_finder.finder_state()
+            lambda: app._active_finder.finder_state(), self._finder_field
         )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
@@ -503,6 +505,7 @@ class TUIApp(
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
             on_decisions_input=lambda text: app._decisions_answer_input(text),
+            decisions_buffer=app._decisions_answer_field.buffer,
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
@@ -516,6 +519,7 @@ class TUIApp(
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
             on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
+            finder_buffer=app._finder_field.buffer,
             search_active=lambda: app._viewed_transcript().search_active,
             on_search_next=lambda: app._viewed_transcript().next_search_match(),
             on_search_previous=lambda: app._viewed_transcript().previous_search_match(),
@@ -1110,6 +1114,7 @@ class TUIApp(
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._active_finder.finder_active,
                 queued_messages=lambda: app.queued_messages,
+                overlay_field_windows=(app._decisions_answer_field.window, app._finder_field.window),
             )
         ]
         self._agent_navigation.bind_layout(
