@@ -66,7 +66,7 @@ class RemoteViewState:
         state = cls(host, session_id, name, transcript, presenter, header, Window(
             FormattedTextControl(lambda: state._banner_text()), height=1
         ), HSplit([]))
-        state.container.children[:] = [header, Window(content=transcript)]
+        state.container.children[:] = [header, transcript.window()]
         return state
 
     def _banner_text(self) -> list[tuple[str, str]]:
@@ -76,7 +76,7 @@ class RemoteViewState:
 
     def show_disconnected(self) -> None:
         self.disconnected = True
-        self.container.children[:] = [self.header, self.banner, Window(content=self.transcript)]
+        self.container.children[:] = [self.header, self.banner, self.transcript.window()]
 
     def render(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_END and event.message is not None:
