@@ -1396,6 +1396,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
             assert release_owner.wait(120), "owner release was not signalled"
         return real_session_directory(*args, **kwargs)
 
+    # test-contract: seam observe admitted child publication on its owner thread
     monkeypatch.setattr(session_links, "_persist_pending_child_link", observe_admission)
     monkeypatch.setattr(session_links, "session_directory", gate_before_collection)
     real_read = registry._read_session_records
@@ -1516,7 +1517,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
             if admission_count == 257:
                 all_admissions_ready.set()
 
-    # test-contract: count real admissions before the second bounded pass
+    # test-contract: seam count real admissions before the second bounded pass
     monkeypatch.setattr(session_links, "_persist_pending_child_link", count_admission)
     real_reconcile = session_links._reconcile_child_links_pass
     reconcile_calls = 0
@@ -1708,7 +1709,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
                 if admission_count == 4:
                     all_admissions_ready.set()
 
-        # test-contract: count real admissions before the second bounded pass
+        # test-contract: seam count real admissions before the second bounded pass
         monkeypatch.setattr(session_links, "_persist_pending_child_link", count_admission)
         real_reconcile = session_links._reconcile_child_links_pass
         reconcile_calls = 0
@@ -1879,6 +1880,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
         order.append("storage_return")
         first_phase.set()
 
+    # test-contract: seam hold admitted publication across cancellation
     monkeypatch.setattr(session_links, "_persist_pending_child_link", gated_persist)
     call = ToolCall(
         "child-cancel",
