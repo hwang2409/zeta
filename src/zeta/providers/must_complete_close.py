@@ -7,6 +7,8 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
+from ..runtime._async_close import task_is_cancelling
+
 
 class DeadlineClock(Protocol):
     def now(self) -> float: ...
@@ -33,11 +35,6 @@ class MonotonicDeadlineClock:
 CLOSE_CLOCK: DeadlineClock = MonotonicDeadlineClock()
 # Must-complete cleanup tasks stay owned after their caller is cancelled.
 _CLOSING_TASKS: set[asyncio.Task[None]] = set()
-
-
-def task_is_cancelling() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
 
 
 class MustCompleteClose:

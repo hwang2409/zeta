@@ -44,6 +44,27 @@ class TUIReplayEntry:
 class NotificationStateMixin:
     """Keep human presentation separate from parent-agent consumption."""
 
+    def task_exit_notification(
+        self: ConversationStore, task_id: str
+    ) -> ConversationEntry | None:
+        """Return the durable task-exit receipt, including acknowledged history."""
+
+        if task_id not in self._task_notification_ids:
+            return None
+        return next(
+            (
+                self._snapshot_entry(entry)
+                for entry in reversed(self._entries)
+                if entry.type == "notification"
+                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
+                and entry.data.get("task_id") == task_id
+            ),
+            None,
+        )
+
+    def has_task_exit_notification(self: ConversationStore, task_id: str) -> bool:
+        return task_id in self._task_notification_ids
+
     @staticmethod
     def _agent_notification_data(
         child_instance_id: str,

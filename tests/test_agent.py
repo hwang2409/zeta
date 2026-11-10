@@ -27,6 +27,7 @@ import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
 import zeta.runtime.loop.agent as agent_loop_module
+import zeta.tools._shared.process as background_process_module
 import zeta.tui.cards.agent as agent_card_module
 from tests.support.agent_lifecycle import (
     wait_background_owner,
@@ -4875,7 +4876,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
     model_turn = asyncio.create_task(
         state.run_model_turn(
             child_loop,
-            OllamaBackend(stall_seconds=0).complete(
+            OllamaBackend().complete(
                 [], [], control=completion_control()
             ),
             consume_stream,
@@ -7709,6 +7710,7 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
         self.child_a_finished = asyncio.Event()
         self.child_a_id: str | None = None
         self.child_a_path: Path | None = None
+        self.child_b_started = asyncio.Event()
         self.release_child_b = asyncio.Event()
 
     @owned_completion
@@ -7797,22 +7799,10 @@ class NestedLoopBoundHandlerBackend(CompletionBackend):
             else:
                 blocks = [TextContent("child a done")]
         elif prompt == "child-b":
-            release_wait = asyncio.create_task(
-                asyncio.wait_for(self.release_child_b.wait(), 10)
+            self.child_b_started.set()
+            await await_or_fail(
+                self.release_child_b.wait(), what="release nested child b"
             )
-            try:
-                await asyncio.wait_for(release_wait, 10)
-            except TimeoutError as exc:
-                raise AssertionError(
-                    "timed out waiting to release nested child b"
-                ) from exc
-            finally:
-                if not release_wait.done():
-                    release_wait.cancel()
-                await await_or_fail(
-                    asyncio.gather(release_wait, return_exceptions=True),
-                    what="test await",
-                )
             blocks = [TextContent("child b done")]
         else:
             blocks = [TextContent("done")]
@@ -7932,7 +7922,9 @@ async def _run_nested_loop_bound_case(
     monkeypatch.setattr(loop._background_owner, "finish_store", observe_finish_store)
     monkeypatch.setattr(loop._background_owner, "unregister", observe_unregister)
     await _collect(loop.run_turn("root", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.child_a_started.wait(), 10)
+    await await_or_fail(
+        backend.child_a_started.wait(), what="nested child a start"
+    )
     return loop, store, backend
 
 
@@ -7951,7 +7943,12 @@ async def test_unrestricted_nested_child_never_receives_parent_loop_handlers(
             "agent_handoff",
         }
         assert {"runtime_schema", "skill", "test_mcp"} <= backend.child_a_schemas
-        await asyncio.wait_for(backend.child_a_finished.wait(), 10)
+        await await_or_fail(
+            backend.child_a_finished.wait(), what="nested child a finish"
+        )
+        await await_or_fail(
+            backend.child_b_started.wait(), what="nested child b start"
+        )
         lead_id = next(
             instance_id
             for instance_id, description in loop._background_owner._descriptions.items()
@@ -8008,7 +8005,12 @@ async def test_nested_explicit_finisher_does_not_see_lead_sibling_as_owned_work(
         )
 
         assert {"finish", "agent_handoff"} <= backend.child_a_schemas
-        await asyncio.wait_for(backend.child_a_finished.wait(), 10)
+        await await_or_fail(
+            backend.child_a_finished.wait(), what="nested child a finish"
+        )
+        await await_or_fail(
+            backend.child_b_started.wait(), what="nested child b start"
+        )
         assert backend.child_a_id is not None
         assert backend.child_a_path is not None
         lead_id = next(
@@ -13036,7 +13038,58 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
+    evidence_entered = asyncio.Event()
+    allow_evidence = asyncio.Event()
+    registries: list[background_process_module.BackgroundTaskRegistry] = []
+    original_registry_init = background_process_module.BackgroundTaskRegistry.__init__
+
+    def capture_registry(registry, *args, **kwargs):
+        original_registry_init(registry, *args, **kwargs)
+        registries.append(registry)
+
+    # test-contract: seam retain the public registry used by the background child
+    monkeypatch.setattr(
+        background_process_module.BackgroundTaskRegistry,
+        "__init__",
+        capture_registry,
+    )
+    if not hasattr(
+        background_process_module.BackgroundTaskRegistry, "deliver_recovered_exit"
+    ):
+        original_notify = (
+            background_process_module.BackgroundTaskRegistry._notify_terminal_exit
+        )
+
+        async def hold_legacy_task_exit_evidence(registry, record):
+            evidence_entered.set()
+            await asyncio.wait_for(allow_evidence.wait(), 10)
+            return await original_notify(registry, record)
+
+        # test-contract: seam prove the prior publication-before-commit ordering
+        monkeypatch.setattr(
+            background_process_module.BackgroundTaskRegistry,
+            "_notify_terminal_exit",
+            hold_legacy_task_exit_evidence,
+        )
+    else:
+        original_produce = pending_delivery_module.StepDeliveryFlow.produce
+
+        async def hold_task_exit_evidence(flow, item):
+            if (
+                isinstance(item, pending_delivery_module.NotificationInput)
+                and item.kind == "task_exit"
+            ):
+                evidence_entered.set()
+                await asyncio.wait_for(allow_evidence.wait(), 10)
+            return await original_produce(flow, item)
+
+        # test-contract: seam hold the durable evidence commit at its public flow
+        monkeypatch.setattr(
+            pending_delivery_module.StepDeliveryFlow,
+            "produce",
+            hold_task_exit_evidence,
+        )
     release = tmp_path / "release"
     command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, gate_delay=True)
@@ -13056,11 +13109,24 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 
     await await_or_fail(backend.task_started.wait(), what="test await")
     await await_or_fail(backend.gate_seen.wait(), what="test await")
+    release.touch()
+    await await_or_fail(evidence_entered.wait(), what="test await")
+    process_registry = next(registry for registry in registries if registry.snapshot())
+    running_task = process_registry.snapshot()[0]
+    state_before_evidence = await process_registry.output(running_task.task_id)
+    assert state_before_evidence["running"] is True
     assert len(deadlines.started) == 1
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_model_bound(state)
-    await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
-    release.touch()
+    try:
+        await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
+        for _ in range(3):
+            barrier = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(barrier.set_result, None)
+            await await_or_fail(barrier, what="test await")
+        assert not completion_published.is_set()
+    finally:
+        allow_evidence.set()
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
@@ -13681,7 +13747,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         for entry in child_store.agent_notifications(pending_only=False)
         if entry.data.get("kind") == "task_exited"
     )
-    assert task_exit.data["background_phase"] == "task_kill"
+    assert task_exit.data["background_phase"] == "session_shutdown"
     assert (
         task_exit.data["note"]
         == "finish-gate task safety bound expired after 0.05 seconds"
