@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     from ..core.context import ContextAssembler
     from ..core.context_parts.admission import AdmittedSessionRequest
     from ..core.store._client_delivery import ClientSteeringBatch
-    from .background import BackgroundAgentOwner
+    from .background_owner import BackgroundAgentOwner
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_DELIVERY_TIMEOUT_SECONDS = 1.0

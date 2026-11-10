@@ -15,7 +15,7 @@ from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.agent import pending_delivery as pending_delivery_module
-from zeta.agent.background import (
+from zeta.agent.background_lifecycle import (
     BackgroundAgentOwner,
     finish_background_child,
     recover_agent_children,
