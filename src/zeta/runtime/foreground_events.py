@@ -89,8 +89,14 @@ class ForegroundEventPublisher:
             subscription.close()
 
     async def events(self, source: AsyncIterable[StreamEvent]) -> AsyncIterator[StreamEvent]:
-        async for event in source:
-            for subscription in tuple(self._subscriptions):
-                if not subscription._admit(event):
-                    self.unsubscribe(subscription)
-            yield event
+        iterator = aiter(source)
+        try:
+            async for event in iterator:
+                for subscription in tuple(self._subscriptions):
+                    if not subscription._admit(event):
+                        self.unsubscribe(subscription)
+                yield event
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()

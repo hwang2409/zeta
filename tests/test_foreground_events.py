@@ -18,6 +18,26 @@ async def _source(count: int):
 
 
 @pytest.mark.asyncio
+async def test_closing_wrapper_closes_source_immediately() -> None:
+    publisher = ForegroundEventPublisher()
+    finalized = asyncio.Event()
+    release = asyncio.Event()
+
+    async def source():
+        try:
+            yield _event(0)
+            await asyncio.wait_for(release.wait(), 10)
+        finally:
+            finalized.set()
+
+    wrapped = publisher.events(source())
+    assert (await asyncio.wait_for(wrapped.__anext__(), 10)).delta == "0"
+    await asyncio.wait_for(wrapped.aclose(), 10)
+    assert finalized.is_set()
+    publisher.close()
+
+
+@pytest.mark.asyncio
 async def test_admission_preserves_order_for_primary_and_subscriber() -> None:
     publisher = ForegroundEventPublisher(max_pending=8)
     subscription = publisher.subscribe()
@@ -74,15 +94,13 @@ async def test_unsubscribe_and_close_wake_waiting_subscribers() -> None:
     publisher = ForegroundEventPublisher()
     subscription = publisher.subscribe()
     waiting = asyncio.create_task(subscription.__anext__())
-    await asyncio.sleep(0)
-    publisher.unsubscribe(subscription)
+    asyncio.get_running_loop().call_soon(publisher.unsubscribe, subscription)
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(waiting, 10)
 
     second = publisher.subscribe()
     waiting = asyncio.create_task(second.__anext__())
-    await asyncio.sleep(0)
-    publisher.close()
+    asyncio.get_running_loop().call_soon(publisher.close)
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(waiting, 10)
     assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
