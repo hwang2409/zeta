@@ -265,7 +265,11 @@ class FinishGateState:
             for task in registry.snapshot()
             if task.running
         )
-        pending = registry.pending_exit_tasks()
+        pending = (
+            registry.pending_exit_tasks()
+            if hasattr(registry, "pending_exit_tasks")
+            else ()
+        )
         return tuple(dict.fromkeys((*running, *pending)))
 
     def can_wake_again(self, child_loop: AgentLoop) -> bool:
