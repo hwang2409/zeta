@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.agent.background_lifecycle import _recover_nested_children
 from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolResult
@@ -57,7 +58,10 @@ async def test_cancel_all_visits_each_child_once_without_subtree_walks(
     owner._subtree_ids = count_subtree_walk
     try:
         owner.cancel_all()
-        await asyncio.gather(*confirmations.values())
+        await await_or_fail(
+            asyncio.gather(*confirmations.values()),
+            what="background cancellation confirmations",
+        )
 
         assert subtree_walks == []
         assert owner._cancel_requested == set(expected_order)
@@ -74,7 +78,10 @@ async def test_cancel_all_visits_each_child_once_without_subtree_walks(
     finally:
         for confirmation in confirmations.values():
             confirmation.cancel()
-        await asyncio.gather(*confirmations.values(), return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(*confirmations.values(), return_exceptions=True),
+            what="background cancellation confirmation cleanup",
+        )
 
 
 def test_nested_recovery_uses_indexed_tool_result_lookup() -> None:
