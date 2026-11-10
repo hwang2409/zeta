@@ -43,7 +43,10 @@ def history_events(result: Mapping[str, object]) -> tuple[StreamEvent, ...]:
         raise RemoteWireError("invalid remote history")
     events: list[StreamEvent] = []
     for row in messages:
-        if not isinstance(row, dict) or set(row) - {"id", "role", "content", "tool_result", "metadata", "event", "data"}:
+        if not isinstance(row, dict) or any(
+            key not in {"id", "role", "content", "tool_result", "metadata", "event", "data"}
+            for key in row
+        ):
             raise RemoteWireError("invalid remote history row")
         if not isinstance(row.get("role"), str) or not isinstance(row.get("content"), list):
             raise RemoteWireError("invalid remote history row")
