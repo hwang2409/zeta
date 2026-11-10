@@ -104,7 +104,7 @@ def acquire_recovery_subtree(
 def bootstrap_agent_children(loop: AgentLoopForRecovery) -> None:
     """Repair restart state before the opened store reaches the event loop."""
 
-    from .background import recover_agent_children
+    from .background_lifecycle import recover_agent_children
 
     recover_agent_children(loop)
     loop._children_recovered = True
@@ -133,7 +133,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     stop_recovery = threading.Event()
 
     def recover() -> None:
-        from .background import _recover_agent_children
+        from .background_lifecycle import _recover_agent_children
 
         with ConversationStore(
             root.root_dir,
