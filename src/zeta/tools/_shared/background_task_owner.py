@@ -82,6 +82,8 @@ class _BackgroundTaskOwner:
         self.state = _OwnerState.RUNNING if process is not None else _OwnerState.TERMINAL
         self.generation = 0
         self.generation_event = asyncio.Event()
+        self.evidence_commit_started = asyncio.Event()
+        self.evidence_commit_finished = asyncio.Event()
         self.lifecycle: asyncio.Task[None] | None = None
         self.terminal_candidate: _BackgroundRecord | None = None
         self.kill_cause: str | None = record.note if record.note_priority == _NOTE_PRIORITY_CAUSE else None
@@ -263,6 +265,7 @@ class _BackgroundTaskOwner:
             # test-contract: durability close releases receipts after aggregate state
             await self._receipt_release.wait()
         self._set_state(_OwnerState.EVIDENCE_COMMITTING)
+        self.evidence_commit_started.set()
         item = TaskExitInput(
             task_id=candidate.task_id,
             command=command_headline(candidate.command),
@@ -310,6 +313,7 @@ class _BackgroundTaskOwner:
             )
         )
         self._set_state(_OwnerState.TERMINAL)
+        self.evidence_commit_finished.set()
 
     def _set_state(self, state: _OwnerState) -> None:
         if self.state is not state:
