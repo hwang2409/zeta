@@ -296,8 +296,10 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             try:
-                await self.control.close()
-                self.foreground_event_publisher.close()
+                try:
+                    await self.control.close()
+                finally:
+                    self.foreground_event_publisher.close()
                 try:
                     await self.runtime.close()
                 finally:
