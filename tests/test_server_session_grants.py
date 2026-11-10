@@ -1864,7 +1864,6 @@ async def test_turn_end_send_ready_orders(
 
     turn_starts = 0
     turn_ends = 0
-
     async def receive() -> dict[str, Any]:
         nonlocal turn_starts, turn_ends
         frame = await (_read(reader) if transport == "unix" else _read_json(reader))
@@ -1945,6 +1944,15 @@ async def test_turn_end_send_ready_orders(
                 release_notification_start.wait(), what="notification start"
             )
         await original_event(event, *args, **kwargs)  # type: ignore[arg-type]
+        if (
+            getattr(event, "type", None) is StreamEventType.TURN_START
+            and kwargs.get("background") is True
+            and order == "notification_first"
+        ):
+            notification_start_ready.set()
+            await await_or_fail(
+                release_notification_start.wait(), what="notification start write"
+            )
         if (
             getattr(event, "type", None) is StreamEventType.TURN_END
             and not turn_end_published.is_set()
