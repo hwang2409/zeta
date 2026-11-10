@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import json
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -803,7 +802,7 @@ class SlashHandlerMixin:
             )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
-        return json.dumps(state, indent=2, sort_keys=True)
+        return state
 
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""

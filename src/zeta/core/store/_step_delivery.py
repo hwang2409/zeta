@@ -332,6 +332,13 @@ def _attach_notification_context(
         or notification_message.metadata.get("turn_context") is True
     ):
         return notification_message, notification_persisted
+    metadata = {
+        **notification_message.metadata,
+        **notification_context.metadata,
+    }
+    persisted = notification_persisted
+    if persisted:
+        persisted = False
     return (
         Message(
             MessageRole.SYSTEM,
@@ -347,12 +354,9 @@ def _attach_notification_context(
                     )
                 )
             ],
-            metadata={
-                **notification_message.metadata,
-                **notification_context.metadata,
-            },
+            metadata=metadata,
         ),
-        False,
+        persisted,
     )
 
 

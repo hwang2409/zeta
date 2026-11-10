@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 7
+WRITER_EPOCH: Final = 8
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -43,7 +43,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
-    StorageFeature.INBOX_DELEGATION: WRITER_EPOCH,
+    StorageFeature.INBOX_DELEGATION: 8,
 }
 
 

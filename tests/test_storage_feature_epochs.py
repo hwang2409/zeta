@@ -68,9 +68,9 @@ def test_writer_epoch_token_checker_ignores_strings_and_comments() -> None:
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])
 def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, case):
+    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
     opened = _session(tmp_path)
     opened.store.close()
-    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
 
     if case == "repair":
         # the real conversation-store constructor repairs a torn tail.

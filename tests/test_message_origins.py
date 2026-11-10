@@ -609,6 +609,10 @@ async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:
             def claim_wake(_project_id: str, _message_ids: tuple[str, ...]) -> bool:
                 return True
 
+            @staticmethod
+            def list(_project_id: str) -> dict[str, list[dict[str, object]]]:
+                return {"new": []}
+
         class Scanner:
             inbox = Inbox()
 
