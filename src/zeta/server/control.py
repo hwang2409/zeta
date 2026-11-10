@@ -124,6 +124,8 @@ class ServeControl:
         self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._turn_end_published = False
+        self._notification_turn_started = False
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -167,6 +169,16 @@ class ServeControl:
         allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
+        loop = self.server.runtime.loop
+        if (
+            self._turn_end_published
+            and loop is not None
+            and loop.notification_turn_state != "idle"
+        ):
+            notification_task = self._turn_task
+            loop.cancel_scheduled_notification_turn()
+            if notification_task is not None and not notification_task.done():
+                notification_task.cancel()
         self._turn_task = asyncio.create_task(
             self._run_turn(
                 text,
@@ -209,12 +221,21 @@ class ServeControl:
         loop = self.server.runtime.loop
         return (
             self._session_swap_active
-            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_task is not None
+                and not self._turn_task.done()
+                and (
+                    loop is None
+                    or loop.notification_turn_state == "idle"
+                    or self._notification_turn_started
+                    or not self._turn_end_published
+                )
+            )
             or (
                 self._turn_handoff_task is not None
                 and not self._turn_handoff_task.done()
+                and not self._turn_end_published
             )
-            or (loop is not None and loop.notification_turn_state != "idle")
         )
 
     async def require_idle(self) -> None:
@@ -225,7 +246,10 @@ class ServeControl:
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
-        if self.turn_busy():
+        if self.turn_busy() or (
+            self._turn_handoff_task is not None
+            and not self._turn_handoff_task.done()
+        ):
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
@@ -647,7 +671,7 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
+                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -660,8 +684,8 @@ class ServeControl:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -675,6 +699,7 @@ class ServeControl:
             self._host_binding_required and host_commands is None
         ) or not loop.schedule_notification_turn():
             return
+        self._notification_turn_started = False
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(
                 session_id, host_commands, turn_id=uuid.uuid4().hex
@@ -703,6 +728,7 @@ class ServeControl:
             session_id: str | None = None,
             background: bool = False,
         ) -> None:
+            nonlocal started
             if event.type in {StreamEventType.TURN_END, StreamEventType.ERROR}:
                 terminal_events.append(event)
             else:
@@ -712,11 +738,13 @@ class ServeControl:
                     background=background,
                     turn_id=turn_id,
                 )
+                if event.type is StreamEventType.TURN_START:
+                    # After _event publishes, update busy state before the caller settles.
+                    self._notification_turn_started = True
+                    started = True
+                    state.turn_started()
 
         try:
-            await asyncio.sleep(0.01)
-            state.turn_started()
-            started = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
@@ -748,20 +776,22 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
-            self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-                schedule_wake=agent_end is None,
-            )
+            self._notification_turn_started = False
+            if started:
+                self._close_deferred_replay(session_id)
+                await self.deliveries.finalize_turn(
+                    session_id,
+                    state,
+                    turn_id,
+                    outcome,
+                    schedule_wake=False,
+                )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -1009,6 +1039,8 @@ class ServeControl:
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
         await self._notify(wire_event, session_id, data=dict(event.data))
+        if kind is StreamEventType.TURN_END:
+            self._turn_end_published = True
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor

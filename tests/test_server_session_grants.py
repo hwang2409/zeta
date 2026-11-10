@@ -15,6 +15,7 @@ import pytest
 from rich.console import Console
 from websockets.asyncio.client import connect
 
+import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support import server_client
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -38,7 +39,7 @@ from tests.test_server_websocket import (
     _send_json,
 )
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import MessageRole, TextContent, ToolCall
+from zeta.protocol.types import MessageRole, StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
@@ -1833,6 +1834,187 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
 
 
 @pytest.mark.parametrize("transport", ["unix", "websocket"])
+@pytest.mark.parametrize("order", ["send_first", "notification_first"])
+@pytest.mark.asyncio
+async def test_turn_end_send_ready_orders(
+    tmp_path: Path, transport: str, order: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("send")]),
+            ScriptedTurn([TextContent("notification")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    if transport == "unix":
+        reader, writer = await _connect(server)
+    else:
+        await server.start()
+        reader, writer, status, _headers = await _connect_websocket(
+            server, token=None, protocol_token=server._websocket.token
+        )
+        assert status == 101
+
+    turn_starts = 0
+    turn_ends = 0
+    async def receive() -> dict[str, Any]:
+        nonlocal turn_starts, turn_ends
+        frame = await (_read(reader) if transport == "unix" else _read_json(reader))
+        event_name = frame.get("params", {}).get("event")
+        if event_name == "turn_start":
+            turn_starts += 1
+        elif event_name == "turn_end":
+            turn_ends += 1
+        return frame
+
+    async def send_request(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> None:
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        if transport == "unix":
+            writer.write((json.dumps(payload) + "\n").encode())
+            await writer.drain()
+        else:
+            await _send_json(writer, payload)
+
+    async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        await send_request(request_id, method, params)
+        frames = []
+        while True:
+            frame = await receive()
+            frames.append(frame)
+            if frame.get("id") == request_id:
+                return frames
+
+    async def event(name: str) -> dict[str, Any]:
+        while True:
+            frame = await receive()
+            if frame.get("params", {}).get("event") == name:
+                return frame["params"]
+
+    release_turn_end = asyncio.Event()
+    turn_end_published = asyncio.Event()
+    notification_start_ready = asyncio.Event()
+    release_notification_start = asyncio.Event()
+    notification_run_started = asyncio.Event()
+    release_notification_run = asyncio.Event()
+    original_event = server.control._event
+    original_run_notification_turn = server.turn_contexts.run_notification_turn
+
+    async def gated_notification_turn(
+        session_id: str, loop: object, emit: object, **kwargs: object
+    ) -> object:
+        if order == "send_first":
+            notification_run_started.set()
+            await await_or_fail(
+                release_notification_run.wait(), what="notification turn scheduling"
+            )
+        async def gated_emit(event: object, **emit_kwargs: object) -> object:
+            result = await emit(event, **emit_kwargs)  # type: ignore[misc]
+            if (
+                order == "notification_first"
+                and getattr(event, "type", None) is StreamEventType.TURN_START
+            ):
+                notification_start_ready.set()
+                await await_or_fail(
+                    release_notification_start.wait(), what="notification start write"
+                )
+            return result
+        return await original_run_notification_turn(
+            session_id, loop, gated_emit, **kwargs
+        )
+
+    async def gated_event(event: object, *args: object, **kwargs: object) -> None:
+        await original_event(event, *args, **kwargs)  # type: ignore[arg-type]
+        if (
+            getattr(event, "type", None) is StreamEventType.TURN_END
+            and not turn_end_published.is_set()
+        ):
+            turn_end_published.set()
+            await await_or_fail(release_turn_end.wait(), what="turn_end owner")
+
+    # test-contract: seam gate the real notification wake before turn_start publication
+    monkeypatch.setattr(server.control, "_event", gated_event)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )
+    try:
+        await request(1, "hello", {"protocol_version": "1.2"})
+        session = (await request(2, "new_session", {"provider": "codex"}))[-1][
+            "result"
+        ]["session"]
+        session_id = session["session_id"]
+        await request(3, "send", {"text": "first"})
+        await event("turn_start")
+        await await_or_fail(turn_end_published.wait(), what="turn_end publication")
+        assert server.runtime.loop.step_delivery is not None
+        await server.runtime.loop.step_delivery.produce(
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                {
+                    "child_instance_id": "queued",
+                    "child_session_path": "/tmp/queued",
+                    "description": "queued",
+                    "status": "completed",
+                    "text": "queued notification",
+                },
+                dedupe_key="queued",
+            )
+        )
+        if order == "send_first":
+            owner_task = server.control._turn_handoff_task
+            assert owner_task is not None
+            release_turn_end.set()
+            await await_or_fail(
+                notification_run_started.wait(), what="notification turn scheduling"
+            )
+            await send_request(4, "status", {})
+            await send_request(5, "send", {"text": "send first"})
+            responses: dict[int, dict[str, Any]] = {}
+            while len(responses) < 2:
+                frame = await receive()
+                if frame.get("id") in {4, 5}:
+                    responses[frame["id"]] = frame
+            assert responses[4]["result"]["state"] == "idle"
+            assert responses[5]["result"]["accepted"] is True
+            release_notification_run.set()
+            await await_or_fail(owner_task, what="turn owner return")
+        else:
+            status_frames = await request(4, "status", {})
+            assert status_frames[-1]["result"]["state"] == "idle"
+            owner_task = server.control._turn_handoff_task
+            assert owner_task is not None
+            release_turn_end.set()
+            await await_or_fail(
+                notification_start_ready.wait(), what="notification start write"
+            )
+            await send_request(5, "send", {"text": "too late"})
+            release_notification_start.set()
+            refused: list[dict[str, Any]] = []
+            while True:
+                frame = await receive()
+                refused.append(frame)
+                if frame.get("id") == 5:
+                    break
+            assert refused[-1]["error"]["code"] == -32004
+            await await_or_fail(owner_task, what="notification turn return")
+        await event("turn_end")
+        assert turn_starts == turn_ends
+        assert session_id == server.runtime.session_id
+    finally:
+        release_turn_end.set()
+        release_notification_start.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
 @pytest.mark.parametrize(
     "case",
     [
@@ -2400,31 +2582,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     )
                     snapshot_frames = await request(11, "session_grants", {})
                     assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
-                    # Force the real busy predicate to remain active while the
-                    # replacement controller queries status and sends.
-                    release_handoff = asyncio.Event()
-                    handoff = asyncio.create_task(
-                        await_or_fail(
-                            release_handoff.wait(),
-                            timeout=10,
-                            what="replacement turn handoff gate",
-                        )
-                    )
-                    server.control._turn_handoff_task = handoff
-                    try:
-                        busy_status = (await request(12, "status", {}))[-1]
-                        assert busy_status["result"]["state"] == "running"
-                        busy_send = await request(13, "send", {"text": "ask again"})
-                        assert busy_send[-1]["error"]["code"] == -32004
-                    finally:
-                        release_handoff.set()
-                        await await_or_fail(
-                            handoff, timeout=10, what="replacement turn handoff"
-                        )
-
-                    idle_status = (await request(14, "status", {}))[-1]
+                    idle_status = (await request(12, "status", {}))[-1]
                     assert idle_status["result"]["state"] == "idle"
-                    send_frames = await request(15, "send", {"text": "ask again"})
+                    send_frames = await request(13, "send", {"text": "ask again"})
                     assert send_frames[-1].get("result", {}).get("accepted") is True, (
                         "cancel_write replacement send was not accepted: "
                         f"{send_frames[-1]!r}"
