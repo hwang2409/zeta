@@ -164,6 +164,7 @@ feature. Observer connections receive only methods with `read` access.
 | `set_settings` | `1.1` | `none` | `session_mutation` |
 | `set_compaction` | `1.1` | `none` | `session_mutation` |
 | `send_images` | `1.1` | `none` | `delivery` |
+| `path_complete` | `1.0` | `path_completion` | `controller_read` |
 | `slash_list` | `1.1` | `none` | `controller_read` |
 | `slash_run` | `1.1` | `none` | `session_mutation` |
 | `account_list` | `1.1` | `none` | `controller_read` |
@@ -412,7 +413,12 @@ the runtime.
 If the session does not exist, `resume` returns `-32602` with structured error
 data `{"code":"session_not_found","session_id":"<requested id>"}`. Clients
 must use `data.code`, not the human-readable message, for stale-session
-recovery.
+recovery. A session id prefix must contain at least 4 characters.
+
+If the prefix matches more than one session, `resume` returns `-32602` with
+`data` shaped as `{"code":"session_id_ambiguous","session_id":"<requested id>","candidates":["<short id>", ...]}`.
+`candidates` contains the same bounded list of at most 8 short ids shown in the
+unchanged human-readable message.
 
 If the transcript is corrupt or uses a newer conversation format, `resume`
 returns `-32000` with bounded data:
@@ -1122,6 +1128,7 @@ Error descriptors are:
 | `project_registry_busy` | `-32000` | `project_registry_busy` | another process holds the project registry lock |
 | `session_grant_not_found` | `-32602` | `session_grant_not_found` | the requested session grant does not exist |
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
+| `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 
 Error objects have `code` and `message`, and may have a method-specific
@@ -1609,6 +1616,24 @@ or one stored by a release that predates the field), and older 1.0 servers
 omit the key entirely. Clients must fall back to their configured default in
 both cases.
 
+### Workspace path completion
+
+With `path_completion` negotiated, `path_complete` accepts `session_id` and
+`text_before_cursor`. The text is limited to 4,096 UTF-8 bytes. The request
+completes the active `@` path token relative to the session working directory.
+It returns `entries` and `truncated`; each entry has `text`, `display`, `kind`
+(`directory` or `file`), and `start_position`. The start position is zero or
+negative and is measured in Unicode code points. Clients that use UTF-16 text
+indices must convert it before replacing the active token.
+
+The result uses the same hidden-file, quoting, sorting, and scan limits as the
+TUI composer. A symlink found while listing is returned as an entry, but
+completion does not descend into it when its resolved target is outside the
+session working directory. Lexical `..` and `~` prefixes keep the TUI's normal
+completion behavior. The request returns `-32003` when `session_id` is not the active
+session, `-32602` for invalid parameters, and `-32601` when the feature was not
+negotiated. It emits no event and is not available to observer connections.
+
 ### Slash commands (ZETA-130)
 
 Protocol 1.1 exposes the shared slash dispatcher without forking a second
@@ -1771,6 +1796,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
+| `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 | `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
@@ -1790,7 +1816,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

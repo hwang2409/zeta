@@ -3647,9 +3647,12 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     marker = tmp_path / "foreground-finished"
     release = tmp_path / "release-foreground"
     pid_path = tmp_path / "foreground-pid"
+    # Fork the waiter before writing the pid: an abort sent while the shell
+    # is still forking can miss the new child (macOS killpg race).
     command = (
+        f"{wait_for_path_command(release)} & "
         f"echo $$ > {shlex.quote(str(pid_path))} && "
-        f"{wait_for_path_command(release)} && touch {shlex.quote(str(marker))}"
+        f"wait $! && touch {shlex.quote(str(marker))}"
     )
     backend = BackgroundChildAndForegroundToolBackend(command)
     server = ZetaServer(
