@@ -190,7 +190,7 @@ def _restore_persisted_delivery_context(
         )
     return replace(
         projected,
-        metadata=dict(persisted.metadata),
+        metadata={**persisted.metadata, **projected.metadata},
         tool_result=persisted.tool_result,
     )
 
