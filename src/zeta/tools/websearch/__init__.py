@@ -13,6 +13,7 @@ import httpx
 from ...codex import CodexLoginRequiredError
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
+from .._web_clients import SessionWebClients
 from ..fetch import MAX_RESPONSE_BYTES, get_response, response_text
 from ..registry import ToolRegistry, _success_result, text_block
 from . import codex
@@ -219,7 +220,9 @@ def parse_lite_search_results(body: str, *, max_results: int) -> list[SearchResu
     return parser.results[:max_results]
 
 
-async def _ddg_search(query: str, max_results: int) -> list[SearchResult]:
+async def _ddg_search(
+    query: str, max_results: int, web_clients: SessionWebClients
+) -> list[SearchResult]:
     response = await get_response(
         DDG_HTML_ENDPOINT,
         user_agent=DDG_BROWSER_USER_AGENT,
@@ -227,6 +230,7 @@ async def _ddg_search(query: str, max_results: int) -> list[SearchResult]:
         method="POST",
         data={"q": query},
         headers=DDG_BROWSER_HEADERS,
+        web_clients=web_clients,
     )
     try:
         return parse_search_results(response_text(response), max_results=max_results)
@@ -239,6 +243,7 @@ async def _ddg_search(query: str, max_results: int) -> list[SearchResult]:
                 method="POST",
                 data={"q": query},
                 headers=DDG_BROWSER_HEADERS,
+                web_clients=web_clients,
             )
             return parse_lite_search_results(
                 response_text(lite_response), max_results=max_results
@@ -270,7 +275,9 @@ async def _websearch(
             if context is not None
             else {}
         )
-        hosted = await codex.search(query, abort_signal, **account_kwargs)
+        hosted = await codex.search(
+            query, abort_signal, web_clients=registry.web_clients, **account_kwargs
+        )
     except CodexLoginRequiredError:
         hosted = None
     except Exception as exc:
@@ -278,7 +285,7 @@ async def _websearch(
             raise
         codex_reason = str(exc)
         try:
-            results = await _ddg_search(query, max_results)
+            results = await _ddg_search(query, max_results, registry.web_clients)
         except Exception as ddg_exc:
             raise WebsearchError(
                 f"Codex search failed: {codex_reason}; DuckDuckGo search failed: {ddg_exc}"
@@ -327,7 +334,7 @@ async def _websearch(
             text_block(serialized),
             structured_content=answer,
         )
-    results = await _ddg_search(query, max_results)
+    results = await _ddg_search(query, max_results, registry.web_clients)
     serialized = json.dumps(
         {"backend": "duckduckgo", "results": results},
         ensure_ascii=False,
