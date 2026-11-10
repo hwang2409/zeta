@@ -160,10 +160,11 @@ def background_notice(
             app._print(Text(message, style=_theme.DIM))
         except (ValueError, BrokenPipeError, OSError):
             pass
-    try:
-        app._invalidate_prompt()
-    except (ValueError, BrokenPipeError, OSError):
-        pass
+    if message is not None:
+        try:
+            app._invalidate_background_prompt()
+        except (ValueError, BrokenPipeError, OSError):
+            pass
 
 
 def surface_shutdown_notifications(app: Any, pending_before: set[str]) -> None:
