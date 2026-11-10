@@ -1205,15 +1205,21 @@ async def test_background_task_owner_state_table(
                     and any(item["task_id"] == task_id and not item["running"] for item in rows)
                 ):
                     cancelled = True
+                    observer = asyncio.create_task(observe_sink_admission())
                     assert owner.lifecycle is not None
                     owner.lifecycle.cancel()
 
             receipts: list[TaskExitInput] = []
+            observer: asyncio.Task[None] | None = None
 
             async def receipt(item):
                 # test-contract: seam prove durable publication precedes notification sink.
                 assert registry.background_tasks._records[task_id].running is False
                 receipts.append(item)
+
+            async def observe_sink_admission():
+                await asyncio.sleep(0)
+                assert len(receipts) == 1
 
             # test-contract: seam force cancellation at the terminal publication boundary.
             monkeypatch.setattr(registry.background_tasks, "_commit_transition", cancel_after_publish)
@@ -1228,6 +1234,8 @@ async def test_background_task_owner_state_table(
             assert rows[0]["running"] is False
             assert owner.record.running is False
             assert len(receipts) == 1
+            if observer is not None:
+                await await_or_fail(observer, what="terminal sink observer")
             return
 
         if row == "persist-failure-retries-same-candidate":
