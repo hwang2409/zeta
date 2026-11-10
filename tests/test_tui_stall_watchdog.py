@@ -74,9 +74,10 @@ async def test_blocked_loop_records_gc_across_probe_boundary(
         # SimpleQueue.get waits in C, so block_loop stays the innermost Python
         # frame; stack trimming keeps only Zeta, stdlib and innermost frames.
         loop_blocked.set()
-        watchdog._gc_callback("start", {"generation": 2})
         if not sampled.wait(timeout=10):
             raise TimeoutError("stall sample was not signaled")
+        watchdog._gc_callback("stop", {"generation": 2, "collected": 1, "uncollectable": 0})
+        watchdog._gc_callback("start", {"generation": 2})
         watchdog._gc_callback("stop", {"generation": 2, "collected": 1, "uncollectable": 0})
         release_loop.put(None)
         try:
@@ -103,6 +104,7 @@ async def test_blocked_loop_records_gc_across_probe_boundary(
 
     # test-contract: seam no public watchdog-record publication event exists
     watchdog._append_record = append_and_signal  # type: ignore[method-assign]
+    watchdog._gc_callback("start", {"generation": 2})
     watchdog.start(asyncio.get_running_loop())
     try:
         assert await asyncio.to_thread(probe_ready.wait, 10)
@@ -122,7 +124,8 @@ async def test_blocked_loop_records_gc_across_probe_boundary(
     assert records[0]["session_id"] == "session-123"
     assert records[0]["gc"]["ms"] > 0
     assert records[0]["gc"]["by_gen"]["2"] > 0
-    assert records[0]["gc"]["count"] == 1
+    assert records[0]["gc"]["count"] == 2
+    assert len(watchdog._gc_totals) == 7
     failed = TUIStallWatchdog(tmp_path / "failed.jsonl", session_id="failed")
     callbacks_before = tuple(gc.callbacks)
 
