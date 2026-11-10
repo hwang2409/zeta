@@ -769,13 +769,15 @@ class ServeControl:
             ):
                 self._schedule_background_wake(session_id)
             self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-                schedule_wake=agent_end is None,
-            )
+            self._notification_turn_started = False
+            if started:
+                await self.deliveries.finalize_turn(
+                    session_id,
+                    state,
+                    turn_id,
+                    outcome,
+                    schedule_wake=False,
+                )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
