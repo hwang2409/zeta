@@ -8917,7 +8917,7 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
 async def test_exit_during_committed_recovery_persists_child_completion_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.agent import background
+    import zeta.agent.background_lifecycle
     from zeta.tui import app as tui_app
 
     root = ConversationStore(tmp_path / "sessions")
@@ -8951,7 +8951,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_mutated = threading.Event()
     recovery_release = threading.Event()
     activation_cancelled = asyncio.Event()
-    recover_agent_children = background._recover_agent_children
+    recover_agent_children = zeta.agent.background_lifecycle._recover_agent_children
     cancel_activation = tui_app.cancel_activation
 
     async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
@@ -8985,7 +8985,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
 
-    monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
+    # test-contract: seam recovery must stop while the TUI is shutting down.
+    monkeypatch.setattr(zeta.agent.background_lifecycle, "_recover_agent_children", gated_recovery)
     app = TUIApp(
         AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty()),
         provider="codex",
