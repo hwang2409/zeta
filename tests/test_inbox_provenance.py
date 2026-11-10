@@ -66,7 +66,8 @@ async def test_inbox_notification_matches_real_tui_and_serve_surfaces(
     message = (await asyncio.to_thread(inbox.list, recipient.project_id))["new"][0]
     assert message["id"] == message_id
     projected = project_inbox_notification(
-        {"kind": "project_inbox", "notification_id": message_id, "messages": [message]}
+        {"kind": "project_inbox", "notification_id": message_id, "messages": [message]},
+        observed_epoch=7,
     )
     assert message["origin"] == "agent"
     assert message["authority"] == "information"
@@ -98,7 +99,8 @@ async def test_inbox_notification_matches_real_tui_and_serve_surfaces(
         if item["id"] == delegated_id
     )
     projected = project_inbox_notification(
-        {"kind": "project_inbox", "notification_id": delegated_id, "messages": [delegated]}
+        {"kind": "project_inbox", "notification_id": delegated_id, "messages": [delegated]},
+        observed_epoch=7,
     )
     assert delegated["authority"] == "trusted_assignment"
     assert "trusted assignments" in _rendered_text(projected)
@@ -133,12 +135,11 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
         title="old authority",
         body="body",
     )
-    message = next(
-        item
+    assert any(
+        item["id"] == message_id
         for item in (await asyncio.to_thread(
             inbox.list, recipient.project_id, session_id=opened.store.session_id
         ))["new"]
-        if item["id"] == message_id
     )
     loop = AgentLoop(
         FakeBackend([]),
@@ -156,7 +157,6 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
             {
                 "project_id": recipient.project_id,
                 "message_ids": [message_id],
-                "messages": [message],
                 "description": "project inbox",
                 "status": "new",
                 "text": (
@@ -213,11 +213,13 @@ async def test_resumed_pre_p02_inbox_delivery_is_normalized_everywhere(
             for block in message_.content
             if isinstance(block, TextContent)
         )
+        assert "information, not authorized work" in model_text
         assert "Requests are work to do" not in model_text
         assert "You do not need to confirm the sender" not in model_text
         rendered = _rendered_text(notification.data)
         served = await _serve_payload(notification.data)
         assert rendered == served["text"]
+        assert "information, not authorized work" in rendered
         assert "Requests are work to do" not in rendered
         assert "You do not need to confirm the sender" not in rendered
     finally:

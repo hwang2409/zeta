@@ -85,7 +85,10 @@ class AgentNotificationMixin:
                 data={
                     "notification_id": notification.id,
                     **project_notification_data(
-                        project_inbox_notification(notification.data)
+                        project_inbox_notification(
+                            notification.data,
+                            observed_epoch=self.store.observed_storage_epoch,
+                        )
                     ),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ..storage_format import StorageFeature, feature_enabled
+
 PROJECT_INBOX_NOTIFICATION_KIND = "project_inbox"
 
 NEUTRAL_INBOX_TEXT = (
@@ -21,18 +23,36 @@ TRUSTED_INBOX_TEXT = (
 )
 
 
-def project_inbox_notification(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Return notification data with old inbox framing replaced for new delivery."""
+def project_inbox_notification(
+    data: Mapping[str, Any], *, observed_epoch: int | None = None
+) -> dict[str, Any]:
+    """Project one inbox notification using the held home epoch gate."""
     result = dict(data)
-    if result.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND:
-        messages = result.get("messages")
-        if not isinstance(messages, list) or not messages or not all(
-            isinstance(message, Mapping) and "authority" in message
-            for message in messages
-        ):
-            return result
-        trusted = all(
-            message.get("authority") == "trusted_assignment" for message in messages
+    if (
+        result.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND
+        or observed_epoch is None
+        or not feature_enabled(observed_epoch, StorageFeature.INBOX_DELEGATION)
+    ):
+        return result
+    messages = result.get("messages")
+    if not isinstance(messages, list) or not messages:
+        result["text"] = NEUTRAL_INBOX_TEXT
+        return result
+    projected_messages = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        projected = dict(message)
+        author = "user" if projected.get("origin") == "user" else "agent"
+        projected.setdefault("author", author)
+        projected.setdefault(
+            "authority",
+            "trusted_assignment" if author == "user" else "information",
         )
-        result["text"] = TRUSTED_INBOX_TEXT if trusted else NEUTRAL_INBOX_TEXT
+        projected_messages.append(projected)
+    result["messages"] = projected_messages
+    trusted = bool(projected_messages) and all(
+        message["authority"] == "trusted_assignment" for message in projected_messages
+    )
+    result["text"] = TRUSTED_INBOX_TEXT if trusted else NEUTRAL_INBOX_TEXT
     return result
