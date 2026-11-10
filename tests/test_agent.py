@@ -25,6 +25,7 @@ import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
+import zeta.core.agent_state as agent_state_module
 import zeta.core.store._log as store_log_module
 import zeta.runtime.loop.agent as agent_loop_module
 import zeta.tui.cards.agent as agent_card_module
@@ -9016,6 +9017,14 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
         raise RuntimeError("child setup failed")
 
     monkeypatch.setattr(registry, "clone_for_session", fail_setup)
+    clock_values = iter((0.0, 0.04, 0.24))
+
+    def monotonic() -> float:
+        return next(clock_values, 0.24)
+
+    monkeypatch.setattr(
+        agent_state_module, "time", SimpleNamespace(monotonic=monotonic)
+    )
     await _collect(
         AgentLoop(
             backend,
