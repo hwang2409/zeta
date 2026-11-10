@@ -352,7 +352,10 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
     controller_reader, controller_writer = await _connect_transport(server, transport)
     try:
         await _rpc_transport(controller_reader, controller_writer, transport, "hello", "hello", {"protocol_version": "1.2", "features": ["run_work"]})
-        await _rpc_transport(controller_reader, controller_writer, transport, "new", "new_session", {"provider": "codex"})
+        created = await _rpc_transport(
+            controller_reader, controller_writer, transport, "new", "new_session", {"provider": "codex"}
+        )
+        session_id = created["result"]["session"]["session_id"]  # type: ignore[index]
         if transport == "unix":
             observer_reader, observer_writer = await asyncio.open_unix_connection(str(server.socket_path))
         else:
@@ -360,7 +363,16 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
             observer_reader, observer_writer, status, _ = await websocket._connect(server, token=None, protocol_token=server._websocket.observer_token)
             assert status == 101
         try:
-            await _rpc_transport(observer_reader, observer_writer, transport, "observer-hello", "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "run_work"]})
+            await _rpc_transport(observer_reader, observer_writer, transport, "observer-hello", "hello", {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "session_replay_seq", "run_work"]})
+            joined = await _rpc_transport(
+                observer_reader,
+                observer_writer,
+                transport,
+                "observer-replay",
+                "session_history_and_subscribe",
+                {"session_id": session_id},
+            )
+            assert "error" not in joined
             await server.runtime.loop.tool_registry.background_tasks.start("true", tmp_path)
             server.runtime.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
             sentinel, frames = await _rpc_transport_with_frames(

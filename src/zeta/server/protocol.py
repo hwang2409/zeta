@@ -384,6 +384,11 @@ class MethodDescriptor(Enum):
         return sorted(methods) if role == "observer" else methods
 
 
+EVENT_ACCESS = {
+    EventDescriptor.BACKGROUND_TASK_UPDATED: Access.CONTROLLER_READ,
+    EventDescriptor.TODO_UPDATED: Access.CONTROLLER_READ,
+}
+
 
 _LOGIN_METHODS = frozenset(
     MethodDescriptor[name]

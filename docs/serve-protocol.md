@@ -840,7 +840,7 @@ Both methods require the negotiated `run_work` feature and an active session.
 
 Task status is one of `starting`, `running`, `stopping`, `exited`, `failed`, or `killed`. `starting` and `stopping` are lifecycle events; `exited` is a clean natural exit, `failed` is a known nonzero natural exit, and `killed` is a killed or terminated task. `cancelable` is true only for `starting`, `running`, and `stopping`.
 
-`background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`.
+`background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`. These are live-only events, not replay rows; after reconnect, a replacement controller must call `run_work_list` to recover the current `tasks` and `todo` snapshots.
 
 ### `status`
 
