@@ -765,6 +765,7 @@ async def finish_background_child(
                 tool_call=tool_call,
                 tool_result=validate_result(terminal_payload, tool_call.id),
                 data=event_data,
+                row_seq=notification.seq,
             )
         )
         if deferred_cancel:
