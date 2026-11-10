@@ -57,26 +57,30 @@ class AgentSignatureRefreshMixin:
         )
         return self._agent_tree_signature_function(self.current_path, self.selected_index, running, self._path_signature)
 
-    def _request_agent_tree_signature(self, force: bool) -> None:
+    def _request_agent_tree_signature(self, force: bool) -> bool:
         if self._invalidate is None:
-            return
+            return False
         self._signature_generation += 1
         generation = self._signature_generation
         self._signature_force |= force
         if self._signature_task is not None:
             self._signature_dirty = True
-            return
+            return True
         running = tuple(
             entry.path for entry in self.entries
             if entry.state not in _SIGNATURE_TERMINAL_STATES
             and (entry.path != self.root_path or self.child_view_active)
         )
-        task = asyncio.create_task(asyncio.to_thread(
-            self._agent_tree_signature_function, self.current_path, self.selected_index,
-            running, self._path_signature
-        ))
+        try:
+            task = asyncio.create_task(asyncio.to_thread(
+                self._agent_tree_signature_function, self.current_path, self.selected_index,
+                running, self._path_signature
+            ))
+        except RuntimeError:
+            return False
         self._signature_task = task
         task.add_done_callback(lambda completed: self._agent_tree_signature_done(generation, force, completed))
+        return True
 
     def _agent_tree_signature_done(
         self, generation: int, force: bool, task: asyncio.Task[tuple[object, ...]]

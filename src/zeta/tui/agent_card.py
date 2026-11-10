@@ -1003,8 +1003,7 @@ class AgentNavigation(AgentSignatureRefreshMixin):
             if self.child_view_active
             else False
         )
-        if _signature is None and self._invalidate is not None and event_loop_running():
-            self._request_agent_tree_signature(force)
+        if _signature is None and event_loop_running() and self._request_agent_tree_signature(force):
             return transcript_changed or todo_changed
         signature = _signature or self._agent_tree_signature()
         return transcript_changed or todo_changed or self._refresh_with_signature(signature, force)
