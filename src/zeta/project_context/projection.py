@@ -195,12 +195,22 @@ class ProjectContextProjectionMixin:
                 memory, entry_memory, memory_health = [], None, None
             else:
                 try:
-                    projection = self.memory_transactions.read(selected.project_id)
+                    projection, malformed_source = (
+                        self.memory_transactions.read_for_context(selected.project_id)
+                    )
                     memory = list(projection.memory)
                     entry_memory = (
                         projection.snapshot if projection.format == 2 else None
                     )
-                    memory_health = None
+                    memory_health = (
+                        _health(
+                            "malformed_memory",
+                            selected.project_id,
+                            malformed_source,
+                        )
+                        if malformed_source is not None
+                        else None
+                    )
                 except (OSError, ProjectRegistryError, ValueError):
                     memory, entry_memory = [], None
                     source = "memory"

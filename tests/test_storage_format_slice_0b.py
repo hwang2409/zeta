@@ -683,7 +683,7 @@ async def test_tui_project_dispatch_reads_storage_off_loop(
     assert output is not None
     assert output.startswith(f"project: {project.name} ({project.project_id})\n")
     assert f"root: {project_root}\n" in output
-    assert len(read_threads) >= 3
+    assert len(read_threads) == 2
     assert all(thread_id != loop_thread for thread_id in read_threads)
 
 
