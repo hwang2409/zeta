@@ -112,7 +112,8 @@ async def attach(home: Path, session_id: str) -> int:
         while True:
             chunk = await asyncio.to_thread(sys.stdin.buffer.read, 65536)
             if not chunk:
-                writer.close()
+                with contextlib.suppress(NotImplementedError):
+                    writer.write_eof()
                 return
             if len(chunk) > MAX_INPUT_BYTES:
                 raise ValueError("bridge input is too large")
