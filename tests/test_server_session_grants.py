@@ -15,6 +15,7 @@ import pytest
 from rich.console import Console
 from websockets.asyncio.client import connect
 
+import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support import server_client
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -38,7 +39,7 @@ from tests.test_server_websocket import (
     _send_json,
 )
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import MessageRole, TextContent, ToolCall
+from zeta.protocol.types import MessageRole, StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer, approval_lifecycle, approval_settlement
 from zeta.server.approval_lifecycle import ExternalEnd
@@ -1829,6 +1830,171 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
         assert status["result"]["state"] in {"idle", "running"}
     finally:
         release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("transport", ["unix", "websocket"])
+@pytest.mark.parametrize("order", ["send_first", "notification_first"])
+@pytest.mark.asyncio
+async def test_turn_end_send_ready_orders(
+    tmp_path: Path, transport: str, order: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn([TextContent("first")]),
+            ScriptedTurn([TextContent("send")]),
+            ScriptedTurn([TextContent("notification")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        ws_port=0 if transport == "websocket" else None,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    if transport == "unix":
+        reader, writer = await _connect(server)
+    else:
+        await server.start()
+        reader, writer, status, _headers = await _connect_websocket(
+            server, token=None, protocol_token=server._websocket.token
+        )
+        assert status == 101
+
+    async def receive() -> dict[str, Any]:
+        return await (_read(reader) if transport == "unix" else _read_json(reader))
+
+    async def send_request(
+        request_id: int, method: str, params: dict[str, object]
+    ) -> None:
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        if transport == "unix":
+            writer.write((json.dumps(payload) + "\n").encode())
+            await writer.drain()
+        else:
+            await _send_json(writer, payload)
+
+    async def request(request_id: int, method: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        await send_request(request_id, method, params)
+        frames = []
+        while True:
+            frame = await receive()
+            frames.append(frame)
+            if frame.get("id") == request_id:
+                return frames
+
+    async def event(name: str) -> dict[str, Any]:
+        while True:
+            frame = await receive()
+            if frame.get("params", {}).get("event") == name:
+                return frame["params"]
+
+    release_turn_end = asyncio.Event()
+    turn_end_published = asyncio.Event()
+    notification_started = asyncio.Event()
+    release_notification = asyncio.Event()
+    original_event = server.control._event
+    original_notification_turn = server.turn_contexts.run_notification_turn
+
+    async def gated_event(event: object, *args: object, **kwargs: object) -> None:
+        await original_event(event, *args, **kwargs)  # type: ignore[arg-type]
+        if (
+            getattr(event, "type", None) is StreamEventType.TURN_END
+            and not turn_end_published.is_set()
+        ):
+            turn_end_published.set()
+            await await_or_fail(release_turn_end.wait(), what="turn_end owner")
+        elif (
+            getattr(event, "type", None) is StreamEventType.TURN_START
+            and kwargs.get("turn_id") == "queued-notification"
+        ):
+            notification_started.set()
+            await await_or_fail(release_notification.wait(), what="notification turn")
+
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        notification_started.set()
+        return await original_notification_turn(*args, **kwargs)
+
+    monkeypatch.setattr(server.control, "_event", gated_event)
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )
+    try:
+        await request(1, "hello", {"protocol_version": "1.2"})
+        session = (await request(2, "new_session", {"provider": "codex"}))[-1][
+            "result"
+        ]["session"]
+        session_id = session["session_id"]
+        server.runtime.loop.set_background_wake_callback(None)
+        await request(3, "send", {"text": "first"})
+        await event("turn_start")
+        await await_or_fail(turn_end_published.wait(), what="turn_end publication")
+        assert server.runtime.loop.step_delivery is not None
+        await server.runtime.loop.step_delivery.produce(
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                {
+                    "child_instance_id": "queued",
+                    "child_session_path": "/tmp/queued",
+                    "description": "queued",
+                    "status": "completed",
+                    "text": "queued notification",
+                },
+                dedupe_key="queued",
+            )
+        )
+        if order == "send_first":
+            await send_request(4, "status", {})
+            await send_request(5, "send", {"text": "send first"})
+            responses: dict[int, dict[str, Any]] = {}
+            while len(responses) < 2:
+                frame = await receive()
+                if frame.get("id") in {4, 5}:
+                    responses[frame["id"]] = frame
+            assert responses[4]["result"]["state"] == "idle"
+            assert responses[5]["result"]["accepted"] is True
+            owner_task = server.control._turn_handoff_task
+            assert owner_task is not None
+            release_turn_end.set()
+            server.runtime.loop.set_background_wake_callback(
+                lambda: server.control._schedule_background_wake(session_id)
+            )
+            await await_or_fail(owner_task, what="turn owner return")
+            await event("turn_start")
+            assert not notification_started.is_set()
+            await event("turn_end")
+            server.control._turn_task = asyncio.create_task(
+                server.control._run_notification_turn(
+                    session_id, turn_id="queued-notification"
+                )
+            )
+            await await_or_fail(notification_started.wait(), what="notification start")
+            release_notification.set()
+        else:
+            status_frames = await request(4, "status", {})
+            assert status_frames[-1]["result"]["state"] == "idle"
+            owner_task = server.control._turn_handoff_task
+            assert owner_task is not None
+            release_turn_end.set()
+            server.runtime.loop.set_background_wake_callback(
+                lambda: server.control._schedule_background_wake(session_id)
+            )
+            await await_or_fail(owner_task, what="turn owner return")
+            server.control._turn_task = asyncio.create_task(
+                server.control._run_notification_turn(
+                    session_id, turn_id="queued-notification"
+                )
+            )
+            await await_or_fail(notification_started.wait(), what="notification start")
+            await event("turn_start")
+            refused = await request(5, "send", {"text": "too late"})
+            assert refused[-1]["error"]["code"] == -32004
+            release_notification.set()
+        assert session_id == server.runtime.session_id
+    finally:
+        release_turn_end.set()
+        release_notification.set()
         await close_serve(server, writer)
 
 
