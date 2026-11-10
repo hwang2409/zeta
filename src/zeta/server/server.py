@@ -17,6 +17,7 @@ from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..storage_format import drain_releases, pending_releases
 from . import (
     accounts,
@@ -84,7 +85,7 @@ class _UnixSocketListener:
         path: Path,
         accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
     ) -> _UnixSocketListener:
-        cls._prepare_parent(path)
+        await asyncio.to_thread(cls._prepare_parent, path)
         lock_fd = os.open(
             f"{path}.lock",
             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -96,7 +97,7 @@ class _UnixSocketListener:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError(f"a server is already listening on {path}") from exc
-            cls._prepare_path(path)
+            await asyncio.to_thread(cls._prepare_path, path)
             unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             identity: tuple[int, int] | None = None
             try:
@@ -190,6 +191,9 @@ class ZetaServer:
         max_turns: int | None = None,
         approval_reconnect_grace: int = 90,
         backend_factory: BackendFactory | None = None,
+        runtime: ServerRuntime | None = None,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
+        max_role: str = "controller",
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -205,7 +209,8 @@ class ZetaServer:
         )
         self.port = port
         self.approval_reconnect_grace = approval_reconnect_grace
-        self.runtime = ServerRuntime(
+        self._borrowed = runtime is not None
+        self.runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
             provider=provider,
@@ -219,6 +224,10 @@ class ZetaServer:
             max_turns=max_turns,
             backend_factory=backend_factory,
         )
+        self._max_role = max_role
+        self._foreground_event_publisher = foreground_event_publisher
+        self._foreground_subscription = None
+        self._foreground_task: asyncio.Task[None] | None = None
         self._server: asyncio.AbstractServer | None = None
         self._websocket = (
             WebSocketServer(
@@ -240,10 +249,18 @@ class ZetaServer:
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.control = ServeControl(self)
-        self.runtime.set_approval_control_binder(self.control.bind_policy)
-        self.runtime.set_background_event_sink(self.control._publish_background_event)
-        self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
-        self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+        if not self._borrowed:
+            self.runtime.set_approval_control_binder(self.control.bind_policy)
+            self.runtime.set_background_event_sink(self.control._publish_background_event)
+            self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
+            self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+
+    async def _publish_foreground_events(self) -> None:
+        assert self._foreground_subscription is not None
+        async for event in self._foreground_subscription:
+            await self.control._event(
+                event, session_id=self.runtime.session_id, turn_id=None
+            )
 
     @property
     def address(self) -> str:
@@ -252,8 +269,9 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
-        await self.runtime.initialize_project_registry()
-        self._account_warnings = await accounts.migrate(self.home)
+        if not self._borrowed:
+            await self.runtime.initialize_project_registry()
+            self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
             self._unix_listener = await _UnixSocketListener.start(
@@ -274,6 +292,9 @@ class ZetaServer:
                 await self.close()
                 raise
         self._idle_drain = asyncio.create_task(_drain_released_leases())
+        if self._foreground_event_publisher is not None:
+            self._foreground_subscription = self._foreground_event_publisher.subscribe()
+            self._foreground_task = asyncio.create_task(self._publish_foreground_events())
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -296,7 +317,8 @@ class ZetaServer:
             try:
                 await self.control.close()
                 try:
-                    await self.runtime.close()
+                    if not self._borrowed:
+                        await self.runtime.close()
                 finally:
                     await self.control.wait_for_approval_settlement(
                         approval_settlement_timeout
@@ -315,6 +337,13 @@ class ZetaServer:
                         self._server.close()
                         await self._server.wait_closed()
                 finally:
+                    if self._foreground_subscription is not None:
+                        self._foreground_subscription.close()
+                        self._foreground_subscription = None
+                    if self._foreground_task is not None:
+                        self._foreground_task.cancel()
+                        await asyncio.gather(self._foreground_task, return_exceptions=True)
+                        self._foreground_task = None
                     self._server = None
                     self._unix_listener = None
 
@@ -357,7 +386,7 @@ class _Client:
         self.logins = login.Logins(server.home)
         self.handshaken = False
         self.role: str | None = None
-        self.max_role = getattr(reader, "max_role", "controller")
+        self.max_role = getattr(reader, "max_role", server._max_role)
         self.protocol_version = "1.0"
         self.features: frozenset[str] = frozenset()
         self._write_lock = asyncio.Lock()

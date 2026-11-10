@@ -38,6 +38,7 @@ def test_descriptor_rejects_permissive_descriptor(tmp_path: Path) -> None:
 async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from zeta.remote.host import ObserverHost
     from zeta.runtime.foreground_events import ForegroundEventPublisher
+    from zeta.server.runtime import ServerRuntime
 
     path = socket_path(tmp_path, "session")
     path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -53,7 +54,12 @@ async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.Mon
         return await original(function, *args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", checked)
-    host = ObserverHost(home=tmp_path, session_id="session", publisher=ForegroundEventPublisher())
+    host = ObserverHost(
+        home=tmp_path,
+        session_id="session",
+        runtime=ServerRuntime(tmp_path, provider="codex", model="gpt-5"),
+        publisher=ForegroundEventPublisher(),
+    )
     await host.start()
     try:
         assert called

@@ -629,13 +629,17 @@ def _create_app_with_root(
         )
     from ..remote.host import ObserverHost
     from ..runtime.foreground_events import ForegroundEventPublisher
-
     foreground_event_publisher = ForegroundEventPublisher()
     observer_host = None
     if not ephemeral:
         observer_host = ObserverHost(
             home=home,
             session_id=metadata.session_id,
+            opened=opened,
+            loop=loop,
+            policy=approval_policy,
+            project_dir=project_dir,
+            repo_root=repo_root,
             publisher=foreground_event_publisher,
             name=metadata.name,
             cwd=str(metadata.cwd),

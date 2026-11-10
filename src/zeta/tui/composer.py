@@ -241,9 +241,8 @@ class TurnConsumerMixin:
                 )
             )
             publisher = getattr(self, "foreground_event_publisher", None)
-            if publisher is not None:
-                events = publisher.events(events)
-            async for event in events:
+            event_stream = publisher.events(events) if publisher is not None else events
+            async for event in event_stream:
                 if notification and event.type is StreamEventType.ERROR:
                     notification_failure = NotificationFailure(
                         event.error or ErrorInfo("backend_error", "notification turn failed"),

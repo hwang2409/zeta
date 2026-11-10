@@ -49,6 +49,7 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
@@ -217,11 +218,15 @@ class TUIApp(
         project_eligible: bool | None = None,
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
-        foreground_event_publisher: Any | None = None,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
         observer_host: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
+        self.foreground_event_publisher = (
+            foreground_event_publisher or ForegroundEventPublisher()
+        )
+        self.observer_host = observer_host
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -239,8 +244,6 @@ class TUIApp(
         self._active_task: asyncio.Task[None] | None = None
         self._paste_runtime = PasteRuntime(app)
         self._on_session_close = on_session_close
-        self.foreground_event_publisher = foreground_event_publisher
-        self.observer_host = observer_host
         self._init_runtime_close()
         self._init_fork_runtime()
         self._resumed_session = resumed
@@ -1144,8 +1147,9 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
-            if self.observer_host is not None:
-                await self.observer_host.start()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None:
+                await observer_host.start()
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
