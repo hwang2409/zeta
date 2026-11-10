@@ -179,10 +179,6 @@ def _validate_lifecycle_start(
 def _lifecycle_elapsed(
     lifecycle: dict[str, Any], *, finished_at: str | None = None
 ) -> float:
-    if finished_at is None and lifecycle.get("finished_at") is not None:
-        stored_elapsed = lifecycle.get("elapsed")
-        if type(stored_elapsed) in {int, float}:
-            return max(0.0, float(stored_elapsed))
     started_monotonic = lifecycle.get("started_monotonic")
     if (
         type(started_monotonic) in {int, float}
