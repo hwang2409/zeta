@@ -13039,6 +13039,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 ) -> None:
     deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
     evidence_entered = asyncio.Event()
+    admission_entered = asyncio.Event()
     allow_evidence = asyncio.Event()
     registries: list[background_process_module.BackgroundTaskRegistry] = []
     original_registry_init = background_process_module.BackgroundTaskRegistry.__init__
@@ -13089,6 +13090,19 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
             "produce",
             hold_task_exit_evidence,
         )
+    original_admit_terminal = pending_delivery_module.StepDeliveryFlow.admit_terminal
+
+    async def mark_finish_gate_admission(flow, intent):
+        if intent == "finish_gate_wait":
+            admission_entered.set()
+        return await original_admit_terminal(flow, intent)
+
+    # test-contract: force terminal admission to overlap the held task evidence.
+    monkeypatch.setattr(
+        pending_delivery_module.StepDeliveryFlow,
+        "admit_terminal",
+        mark_finish_gate_admission,
+    )
     release = tmp_path / "release"
     command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, gate_delay=True)
@@ -13119,6 +13133,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     deadlines.expire_model_bound(state)
     try:
         await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
+        await await_or_fail(admission_entered.wait(), what="test await")
         for _ in range(3):
             barrier = asyncio.get_running_loop().create_future()
             asyncio.get_running_loop().call_soon(barrier.set_result, None)
