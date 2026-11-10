@@ -103,8 +103,12 @@ class LocalTransport:
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
         with open_writer(self.home) as lease:
             manifest = _read_manifest(snapshot)
+            installed_ids, referenced_ids = _snapshot_reference_ids(
+                snapshot, str(manifest["session_id"])
+            )
             with SessionReferenceGate(self.home, lease).shared(
-                installed_ids=(manifest["session_id"],)
+                installed_ids=installed_ids,
+                referenced_ids=referenced_ids,
             ):
                 return self._publish_session(snapshot, force=force)
 
@@ -299,13 +303,17 @@ def _pull_session(
                 direction="pull",
             )
         destination = sessions / safe_id
+        installed_ids, referenced_ids = _snapshot_reference_ids(snapshot, safe_id)
         lease = (
             session_directory(sessions, safe_id, exclusive=True)
             if destination.exists()
             else nullcontext()
         )
         try:
-            with lease:
+            with SessionReferenceGate(local_home, storage_lease).shared(
+                installed_ids=installed_ids,
+                referenced_ids=referenced_ids,
+            ), lease:
                 if destination.exists():
                     source_state = _tree_state(snapshot)
                     destination_state = _tree_state(destination)
@@ -611,6 +619,18 @@ def _validate_snapshot(
                 store.close()
     except (OSError, ValueError) as exc:
         raise RemoteSyncError(f"session transcript is invalid: {target_label}") from exc
+
+
+def _snapshot_reference_ids(
+    snapshot: Path, session_id: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    metadata = _read_json(snapshot / "meta.json")
+    parent = metadata.get("parent_session_id")
+    if parent is None:
+        return (session_id,), ()
+    if type(parent) is not str:
+        raise RemoteSyncError("session parent id is invalid")
+    return (session_id,), (_safe_component(parent, "parent session id"),)
 
 
 def _snapshot_transcripts(

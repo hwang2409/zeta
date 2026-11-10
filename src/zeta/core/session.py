@@ -12,7 +12,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +48,7 @@ from .session_files import (
     SessionIdAmbiguousError,
     SessionInUseError,
     SessionNotFoundError,
+    SessionReferenceGate,
     open_session_file,
     read_session_file,
     require_off_loop_lock,
@@ -182,6 +183,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         tool_deny: tuple[str, ...] = (),
         tool_allow_layers: tuple[tuple[str, ...], ...] = (),
         auto_project: bool = True,
+        _session_id: str | None = None,
+        _reference_gate: SessionReferenceGate | None = None,
+        _reference_stack: ExitStack | None = None,
     ) -> OpenedSession:
         resolved_cwd = str(Path(cwd or Path.cwd()).expanduser().resolve())
         if project_role is not None and project_role not in _PROJECT_ROLES:
@@ -200,7 +204,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         with session_root(self.sessions_dir, create=True):
             pass
         for _ in range(8):
-            session_id = uuid.uuid4().hex
+            session_id = _session_id or uuid.uuid4().hex
             metadata = SessionMetadata.new(
                 session_id=session_id,
                 provider=provider,
@@ -253,48 +257,95 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         ),
                     ):
                         names = os.listdir(source_fd)
-                        # Publish metadata last so discovery skips incomplete sessions.
-                        for filename in sorted(
-                            names, key=lambda item: item == "meta.json"
-                        ):
-                            os.replace(
-                                filename,
-                                filename,
-                                src_dir_fd=source_fd,
-                                dst_dir_fd=destination_fd,
-                            )
+                        for filename in names:
+                            if filename != "meta.json":
+                                os.replace(
+                                    filename,
+                                    filename,
+                                    src_dir_fd=source_fd,
+                                    dst_dir_fd=destination_fd,
+                                )
                         os.fsync(destination_fd)
-                    os.fsync(root_fd)
-            store = ConversationStore(
-                self.sessions_dir,
-                session_id=session_id,
-                _must_exist=True,
-                _storage_lease=self._storage_lease,
-                _owner_surface=self._owner_surface,
-            )
-            metadata._execution_lease = store.execution_lease
-            try:
-                store.activate_runtime_lease()
-                if project_id is not None:
-                    # The durable intent makes a crash at either boundary repairable.
+                    with child_directory(root_fd, session_id) as destination_fd:
+                        execution_lease = SessionExecutionLease.acquire(
+                            destination_fd,
+                            session_id=session_id,
+                            owner=OwnerHint(self._owner_surface),
+                        )
+                    store = ConversationStore(
+                        self.sessions_dir,
+                        session_id=session_id,
+                        _must_exist=True,
+                        _storage_lease=self._storage_lease,
+                        _execution_lease=execution_lease,
+                        _owner_surface=self._owner_surface,
+                    )
+                    metadata._execution_lease = store.execution_lease
+                    gate = _reference_gate or SessionReferenceGate(
+                        self.home, self._storage_lease
+                    )
+                    reference_operation = gate.shared(
+                        installed_ids=(session_id,),
+                        referenced_ids=(parent_session_id,)
+                        if parent_session_id is not None
+                        else (),
+                    )
+                    if _reference_stack is not None:
+                        _reference_stack.enter_context(reference_operation)
+                        authority = nullcontext(gate)
+                    elif _reference_gate is not None:
+                        authority = nullcontext(gate)
+                    else:
+                        authority = reference_operation
                     try:
-                        persist_pending_root_link(
-                            self.sessions_dir,
-                            session_id,
-                            project_id,
-                            project_role or "session",
-                            parent_session_id,
-                            self._storage_lease,
-                        )
-                    except (SessionError, OSError) as exc:
-                        logger.warning(
-                            "could not persist project linkage intent: %s", exc
-                        )
-                    self._reconcile_project_link(session_id)
-                return OpenedSession(metadata, store)
-            except BaseException:
-                store.close()
-                raise
+                        with authority:
+                            with child_directory(
+                                root_fd, session_id
+                            ) as destination_fd, session_directory(
+                                staged.sessions_dir, session_id
+                            ) as (_, source_fd):
+                                if _reference_gate is not None:
+                                    gate.validate(
+                                        (session_id, parent_session_id)
+                                        if parent_session_id is not None
+                                        else (session_id,)
+                                    )
+                                # Metadata is the discovery boundary; publish it only
+                                # after execution ownership and reference admission.
+                                os.replace(
+                                    "meta.json",
+                                    "meta.json",
+                                    src_dir_fd=source_fd,
+                                    dst_dir_fd=destination_fd,
+                                )
+                                os.fsync(destination_fd)
+                                os.fsync(root_fd)
+                            store.activate_runtime_lease()
+                            if project_id is not None:
+                                try:
+                                    persist_pending_root_link(
+                                        self.sessions_dir,
+                                        session_id,
+                                        project_id,
+                                        project_role or "session",
+                                        parent_session_id,
+                                        self._storage_lease,
+                                        _reference_gate=gate,
+                                    )
+                                except (SessionError, OSError) as exc:
+                                    logger.warning(
+                                        "could not persist project linkage intent: %s",
+                                        exc,
+                                    )
+                                self._reconcile_project_link(
+                                    session_id, _reference_gate=gate
+                                )
+                            return OpenedSession(metadata, store)
+                    except BaseException:
+                        store.close()
+                        raise
+                    finally:
+                        execution_lease.close()
         raise SessionError("could not allocate a unique session id")
 
     def associate_project(
@@ -306,29 +357,39 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         if registry is None:
             raise ProjectRegistryError("project registry capability is unavailable")
         registry.show_project(project_id)
-        bind = lambda item: setattr(item, "project_id", project_id) or item
-        current = self._mutate(
-            metadata.session_id, bind, execution_lease=metadata._execution_lease
+        gate = SessionReferenceGate(self.home, self._storage_lease)
+        referenced_ids = tuple(
+            session_id
+            for session_id in (metadata.session_id, metadata.parent_session_id)
+            if session_id is not None
         )
-        self._copy_metadata(metadata, current)
-        try:
-            persist_pending_root_link(
-                self.sessions_dir,
-                current.session_id,
-                project_id,
-                current.project_role or "session",
-                current.parent_session_id,
-                self._storage_lease,
-                previous_project_id=previous_project_id,
+        with gate.shared(referenced_ids=referenced_ids):
+            bind = lambda item: setattr(item, "project_id", project_id) or item
+            current = self._mutate(
+                metadata.session_id, bind, execution_lease=metadata._execution_lease
             )
-        except (SessionError, OSError) as exc:
-            logger.warning("could not persist project linkage intent: %s", exc)
-        self._reconcile_project_link(current.session_id)
-        if previous_project_id is not None and previous_project_id != project_id:
-            delete_indexed_session(
-                registry.root, previous_project_id, current.session_id
+            self._copy_metadata(metadata, current)
+            try:
+                persist_pending_root_link(
+                    self.sessions_dir,
+                    current.session_id,
+                    project_id,
+                    current.project_role or "session",
+                    current.parent_session_id,
+                    self._storage_lease,
+                    previous_project_id=previous_project_id,
+                    _reference_gate=gate,
+                )
+            except (SessionError, OSError) as exc:
+                logger.warning("could not persist project linkage intent: %s", exc)
+            self._reconcile_project_link(
+                current.session_id, _reference_gate=gate
             )
-        return current
+            if previous_project_id is not None and previous_project_id != project_id:
+                delete_indexed_session(
+                    registry.root, previous_project_id, current.session_id
+                )
+            return current
 
     def read_metadata(
         self, session_id: str, *, lock_timeout: float | None = None
@@ -341,38 +402,92 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             assert directory_fd is not None
             return self._read(session_id, directory_fd=directory_fd)
 
-    def open(self, session_id: str, *, _read_only: bool = False) -> OpenedSession:
-        metadata = self.read_metadata(session_id)
+    def open(
+        self,
+        session_id: str,
+        *,
+        _read_only: bool = False,
+        _reference_gate: SessionReferenceGate | None = None,
+    ) -> OpenedSession:
+        self._validate_id(session_id)
+        if _reference_gate is not None and not _read_only:
+            raise SessionError("an already-gated open must be read-only")
+        gate = _reference_gate or SessionReferenceGate(
+            self.home, self._storage_lease
+        )
+        if _read_only:
+            authority = (
+                nullcontext(gate)
+                if _reference_gate is not None
+                else gate.shared(referenced_ids=(session_id,))
+            )
+            with authority:
+                if _reference_gate is not None:
+                    gate.validate((session_id,))
+                metadata = self.read_metadata(session_id)
+                try:
+                    store = ConversationStore(
+                        self.sessions_dir,
+                        session_id=session_id,
+                        _read_only=True,
+                        _must_exist=True,
+                        _storage_lease=self._storage_lease,
+                        _owner_surface=self._owner_surface,
+                    )
+                except (TranscriptLoadError, OSError, ValueError) as exc:
+                    raise SessionError(
+                        f"session {session_id} could not be opened"
+                    ) from exc
+                if store.cwd != metadata.cwd:
+                    store.close()
+                    raise SessionError(
+                        f"session {session_id} cwd does not match its metadata"
+                    )
+                return OpenedSession(metadata, store)
+
+        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+            execution_lease = SessionExecutionLease.acquire(
+                directory_fd,
+                session_id=session_id,
+                owner=OwnerHint(self._owner_surface),
+            )
+        opened_metadata: SessionMetadata | None = None
+
+        def initialize(store: ConversationStore) -> None:
+            nonlocal opened_metadata
+            metadata = self.read_metadata(session_id)
+            if store.cwd != metadata.cwd:
+                raise SessionError(
+                    f"session {session_id} cwd does not match its metadata"
+                )
+            metadata._execution_lease = store.execution_lease
+            if metadata.project_id is not None and self.project_registry is not None:
+                self._reconcile_project_link(session_id, _reference_gate=gate)
+                self._reconcile_child_links(session_id, _reference_gate=gate)
+            opened_metadata = metadata
+
         try:
             store = ConversationStore(
                 self.sessions_dir,
                 session_id=session_id,
-                _read_only=_read_only,
                 _must_exist=True,
                 _storage_lease=self._storage_lease,
+                _execution_lease=execution_lease,
                 _owner_surface=self._owner_surface,
+                _initialization_authority=gate.shared(
+                    referenced_ids=(session_id,)
+                ),
+                _on_initialized=initialize,
             )
         except (SessionOwnedError, TranscriptLoadError):
             raise
         except (OSError, ValueError) as exc:
             raise SessionError(f"session {session_id} could not be opened") from exc
-        if store.cwd != metadata.cwd:
-            store.close()
-            raise SessionError(f"session {session_id} cwd does not match its metadata")
-        if not _read_only:
-            self._complete_root_recovery(metadata, store)
-        if _read_only:
-            return OpenedSession(metadata, store)
-        metadata._execution_lease = store.execution_lease
-        try:
-            if metadata.project_id is not None and self.project_registry is not None:
-                # Ownership precedes repairs that publish project or child links.
-                self._reconcile_project_link(session_id)
-                self._reconcile_child_links(session_id)
-        except BaseException:
-            store.close()
-            raise
-        return OpenedSession(metadata, store)
+        finally:
+            execution_lease.close()
+        assert opened_metadata is not None
+        self._complete_root_recovery(opened_metadata, store)
+        return OpenedSession(opened_metadata, store)
 
     def repair_transcript(
         self,
@@ -498,7 +613,24 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             paused=paused,
         )
 
-    def _reconcile_project_link(self, session_id: str) -> None:
+    def _reconcile_project_link(
+        self,
+        session_id: str,
+        *,
+        _reference_gate: SessionReferenceGate | None = None,
+    ) -> None:
+        gate = _reference_gate or SessionReferenceGate(self.home, self._storage_lease)
+        authority = (
+            nullcontext(gate)
+            if _reference_gate is not None
+            else gate.shared(referenced_ids=(session_id,))
+        )
+        with authority:
+            self._reconcile_project_link_gated(session_id, gate)
+
+    def _reconcile_project_link_gated(
+        self, session_id: str, gate: SessionReferenceGate
+    ) -> None:
         registry = self.project_registry
         if registry is None:
             return
@@ -546,6 +678,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             json.dumps(pending, sort_keys=True).encode("utf-8"),
                         )
 
+                gate.validate(
+                    tuple(
+                        value
+                        for value in (session_id, pending.get("parent_session_id"))
+                        if isinstance(value, str)
+                    )
+                )
                 project_id = str(pending["project_id"])
                 previous = pending.get("previous_project_id")
                 project_ids = {project_id}
@@ -618,9 +757,19 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 "project session linkage remains pending for %s: %s", session_id, exc
             )
 
-    def _reconcile_child_links(self, session_id: str) -> None:
+    def _reconcile_child_links(
+        self,
+        session_id: str,
+        *,
+        _reference_gate: SessionReferenceGate | None = None,
+    ) -> None:
         if self.project_registry is not None:
-            reconcile_child_links(self.project_registry, self.sessions_dir, session_id)
+            reconcile_child_links(
+                self.project_registry,
+                self.sessions_dir,
+                session_id,
+                _reference_gate=_reference_gate,
+            )
 
     def list_sessions(self) -> list[SessionMetadata]:
         sessions = self.list_sessions_read_only()

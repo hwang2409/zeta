@@ -311,18 +311,23 @@ class ProjectInbox:
             self.registry.root.parent, self.registry._storage_lease
         ).shared(referenced_ids=(session, to_session) if to_session else (session,)):
             self._publish_outgoing(target.project_id, message_id, body, record)
+            tracker = (
+                self.sent_tracker
+                if self.sent_tracker is not None
+                and self.sent_tracker.session_id == session
+                else SentMessageTracker(self.sessions_root, session)
+            )
+            outcome = tracker.record(
+                message_id,
+                target.project_id,
+                _storage_lease=self.registry._storage_lease,
+            )
         if on_visible is not None:
             try:
                 on_visible()
             except Exception:  # noqa: BLE001,S110
                 # The durable record remains authoritative if its wake cannot run.
                 pass
-        tracker = (
-            self.sent_tracker
-            if self.sent_tracker is not None and self.sent_tracker.session_id == session
-            else SentMessageTracker(self.sessions_root, session)
-        )
-        outcome = tracker.record(message_id, target.project_id)
         return message_id, outcome
 
     def _publish_outgoing(
@@ -688,7 +693,11 @@ class ProjectInbox:
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
         name = f"{message_id}.json"
-        with self._directories(target.project_id, create=True) as dirs:
+        with SessionReferenceGate(
+            self.registry.root.parent, self.registry._storage_lease
+        ).shared(referenced_ids=(session_id,)), self._directories(
+            target.project_id, create=True
+        ) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)

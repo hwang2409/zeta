@@ -258,8 +258,28 @@ class ChildLineagePublisher:
 
     def publish(self, link: Mapping[str, object]) -> None:
         value = dict(link)
+        installed_ids = (str(value["session_id"]),)
+        referenced_ids = tuple(
+            session_id
+            for session_id in (value.get("parent_session_id"), self._root_session_dir.name)
+            if isinstance(session_id, str)
+        )
+        gate = SessionReferenceGate(
+            self._root_session_dir.parent.parent, self._storage_lease
+        )
+        with gate.shared(
+            installed_ids=installed_ids, referenced_ids=referenced_ids
+        ):
+            self._publish_gated(value, gate)
+
+    def _publish_gated(
+        self, value: dict[str, object], gate: SessionReferenceGate
+    ) -> None:
         persist_pending_child_link(
-            self._root_session_dir, value, self._storage_lease
+            self._root_session_dir,
+            value,
+            self._storage_lease,
+            _reference_gate=gate,
         )
         with self._mutex:
             self._generation += 1
@@ -280,6 +300,7 @@ class ChildLineagePublisher:
                     self._root_session_dir.parent,
                     self._root_session_dir.name,
                     ready_collection_started=ready_collection_started,
+                    _reference_gate=gate,
                 )
                 if outcome == "failed":
                     raise ProjectRegistryError("child project lineage remains pending")
@@ -299,7 +320,11 @@ class ChildLineagePublisher:
 
 
 def reconcile_child_links(
-    project_registry: ProjectRegistry, sessions_dir: os.PathLike[str] | str, session_id: str
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    *,
+    _reference_gate: SessionReferenceGate | None = None,
 ) -> None:
     """Publish durable child-lineage intents from the ROOT's pending index.
 
@@ -312,7 +337,12 @@ def reconcile_child_links(
     crash, a failed append, or a bounded pass is recovered on the next open
     without ever double-recording a link.
     """
-    outcome = _reconcile_child_links_pass(project_registry, sessions_dir, session_id)
+    outcome = _reconcile_child_links_pass(
+        project_registry,
+        sessions_dir,
+        session_id,
+        _reference_gate=_reference_gate,
+    )
     if outcome == "failed":
         logger.warning("child project linkage reconciliation failed for %s", session_id)
 
@@ -322,6 +352,33 @@ def _reconcile_child_links_pass(
     sessions_dir: os.PathLike[str] | str,
     session_id: str,
     *,
+    ready_collection_started: Callable[[], None] | None = None,
+    _reference_gate: SessionReferenceGate | None = None,
+) -> _ReconcileOutcome:
+    gate = _reference_gate or SessionReferenceGate(
+        Path(sessions_dir).parent, project_registry._storage_lease
+    )
+    authority = (
+        nullcontext(gate)
+        if _reference_gate is not None
+        else gate.shared(referenced_ids=(session_id,))
+    )
+    with authority:
+        return _reconcile_child_links_pass_gated(
+            project_registry,
+            sessions_dir,
+            session_id,
+            gate=gate,
+            ready_collection_started=ready_collection_started,
+        )
+
+
+def _reconcile_child_links_pass_gated(
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    *,
+    gate: SessionReferenceGate,
     ready_collection_started: Callable[[], None] | None = None,
 ) -> _ReconcileOutcome:
     try:
@@ -350,6 +407,18 @@ def _reconcile_child_links_pass(
         if not intents:
             return "more" if more else "drained"
 
+        gate.validate(
+            tuple(
+                reference
+                for _name, link in intents
+                for reference in (
+                    str(link["session_id"]),
+                    link.get("parent_session_id"),
+                    session_id,
+                )
+                if isinstance(reference, str)
+            )
+        )
         project_ids = {
             str(project_id)
             for _name, link in intents

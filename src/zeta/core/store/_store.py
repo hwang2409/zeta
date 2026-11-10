@@ -19,6 +19,7 @@ from collections.abc import (  # noqa: F401 - re-exported by store facade
     Mapping,
 )
 from contextlib import (  # noqa: F401 - re-exported by the store facade
+    AbstractContextManager,
     ExitStack,
     contextmanager,
     nullcontext,
@@ -142,6 +143,8 @@ class ConversationStore(
         _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
+        _initialization_authority: AbstractContextManager[object] | None = None,
+        _on_initialized: Callable[[ConversationStore], None] | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -245,7 +248,15 @@ class ConversationStore(
                     if _validated_log_state is not None:
                         self._install_log_state(_validated_log_state)
                         self._strict_snapshot_sync = True
-                    with self._append_lock(deadline=_lock_deadline):
+                    with self._append_lock(
+                        deadline=_lock_deadline,
+                        nested_authority=_initialization_authority,
+                        after_shape=(
+                            None
+                            if _on_initialized is None
+                            else lambda: _on_initialized(self)
+                        ),
+                    ):
                         self._load_session_state()
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
