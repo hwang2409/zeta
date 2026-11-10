@@ -246,7 +246,8 @@ class ZetaServer:
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-        self.control = ServeControl(self)
+        self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
+        self.control = ServeControl(self, self.foreground_event_publisher)
         if not self._borrowed:
             self.runtime.set_approval_control_binder(self.control.bind_policy)
             self.runtime.set_background_event_sink(self.control._publish_background_event)
