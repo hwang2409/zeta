@@ -336,12 +336,9 @@ class _BackgroundTaskOwner:
     async def finish_for_close(
         self, cause: str
     ) -> asyncio.subprocess.Process | None:
-        phase: Literal["task_kill", "session_shutdown"] = (
-            "task_kill"
-            if cause.startswith("finish-gate task safety bound expired")
-            else "session_shutdown"
+        process, _ = await self._claim_termination(
+            cause, self.registry._shutdown_phase, False
         )
-        process, _ = await self._claim_termination(cause, phase, False)
         return process
 
     def finish_close_output_drain(self) -> None:

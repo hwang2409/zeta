@@ -13,7 +13,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from ...core.store import ConversationStore
@@ -115,6 +115,7 @@ class BackgroundTaskRegistry:
         self._start_cleanup_error: BackgroundSpawnCleanupError | None = None
         self._shutdown_killed: tuple[str, ...] = ()
         self._shutdown_cause: str | None = None
+        self._shutdown_phase: Literal["task_kill", "session_shutdown"] = "session_shutdown"
         if session_dir is not None:
             if directory_fd is None:
                 raise ValueError("session directory descriptor is required")
@@ -547,9 +548,16 @@ class BackgroundTaskRegistry:
                 "retry": False,
             }
 
-    def begin_shutdown(self, cause: str = "session shutdown") -> None:
+    def begin_shutdown(
+        self,
+        cause: str = "session shutdown",
+        *,
+        phase: Literal["task_kill", "session_shutdown"] = "session_shutdown",
+    ) -> None:
         """Mark cancellations caused by session teardown as shutdown kills."""
-        self._shutdown_cause = self._shutdown_cause or cause
+        if self._shutdown_cause is None:
+            self._shutdown_cause = cause
+            self._shutdown_phase = phase
 
     async def kill(
         self, task_id: str, *, cause: str, tui_presented: bool = False
@@ -668,10 +676,13 @@ class BackgroundTaskRegistry:
             if owner.record.running and owner.process is not None
         ]
         killed = tuple(owner.record.task_id for owner in owners)
+        notified_records = [owner.record for owner in owners if owner.record.notify_on_exit]
         cause = self._shutdown_cause or "background task registry closed"
         if owners:
             await finish(
-                asyncio.gather(*(owner.finish_for_close(cause) for owner in owners))
+                asyncio.gather(
+                    *(owner.finish_for_close(cause) for owner in owners)
+                )
             )
             processes = [owner.process for owner in owners if owner.process is not None]
 
@@ -702,11 +713,9 @@ class BackgroundTaskRegistry:
                     ),
                 )
             )
-            await finish(
-                asyncio.gather(
-                    *(self._notify_terminal_exit(owner.record) for owner in owners)
-                )
-            )
+            for record in notified_records:
+                record.notify_on_exit = True
+                await finish(self._notify_terminal_exit(record))
         if self._start_cleanup_error is not None:
             raise self._start_cleanup_error
         self._closing = False
