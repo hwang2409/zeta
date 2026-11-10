@@ -79,7 +79,9 @@ class RemoteViewState:
         self.container.children[:] = [self.header, self.banner, self.transcript.window()]
 
     def render(self, event: StreamEvent) -> None:
-        if event.type is StreamEventType.MESSAGE_END and event.message is not None:
+        if event.type is StreamEventType.MESSAGE_START:
+            self.presenter.reset_assistant_message()
+        elif event.type is StreamEventType.MESSAGE_END and event.message is not None:
             render_replayed_message(
                 event.message, presenter=self.presenter,
                 print_user=lambda message: self.presenter.print_user(
