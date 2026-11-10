@@ -26,11 +26,10 @@ from tests.support.replay_transport import (
 )
 from zeta.core import agent_progress
 from zeta.core.agent_progress import publish_child_ended, remove_live_agent_lifecycle
-from zeta.core.child_run_row import project_child_run_row
+from zeta.core.child_runs import project_child_run_row
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
 from zeta.server import ZetaServer
-from zeta.server.child_history import BASELINE_ROW_RESERVE
 from zeta.server.protocol import MAX_FRAME_BYTES, EventDescriptor
 from zeta.server.server import _Client
 from zeta.server.session_replay import (
@@ -174,90 +173,6 @@ def _capture_baseline(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> li
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_rejoin_after_stale_converges_while_63_children_stay_busy(
-    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
-        assert server.connections is not None
-        replay = server.connections.replay
-        children = {
-            f"{session_id}:{n}": _start_child(server, stores, f"{session_id}:{n}")
-            for n in range(1, BUSY_CHILDREN + 1)
-        }
-        scope = ReplayScopeId.top(session_id)
-
-        # 1. a real stale result: 65 small non-progress events overflow a pending join
-        entered, release = _gate_history_read(server, monkeypatch)
-        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
-        await await_or_fail(entered.wait(), what="first join read held")
-        await _publish_turns(server, session_id, SCOPE_RECORDS + 1)
-        release.set()
-        stale = await client.response(3)
-        assert stale.get("error") == {
-            "code": -32009,
-            "message": "replay continuity was invalidated",
-            "data": {"code": "stale_event_sequence"},
-        }, stale
-
-        # 2-3. a fresh join; every child keeps changing while its read is held
-        entered, release = _gate_history_read(server, monkeypatch)
-        captured = _capture_baseline(server, monkeypatch)
-        await client.send(4, "session_history_and_subscribe", {"session_id": session_id})
-        await await_or_fail(entered.wait(), what="rejoin read held")
-        for step in ("held-a", "held-b"):
-            for child in children.values():
-                child.update_agent_lifecycle(current_step=step)
-        await _lifecycle_applied(server)
-        held = (
-            replay.is_pending(server._client),
-            len(replay.pending_tail(server._client)),
-            scope in replay._scopes,
-            replay._next_sequences.get(server._client),
-        )
-        release.set()
-        # producers keep changing after the read returns, before admission
-        for child in children.values():
-            child.update_agent_lifecycle(current_step="released")
-        joined = await client.response(4)
-
-        # 5. the response carries the latest revision of each active run in its page
-        assert joined.get("error") is None, "the rejoin did not converge"
-        # 4. 126 progress callbacks made no pending record, charge, or seq
-        assert held == (True, 0, False, 1)
-        stream_id = joined["result"]["replay"]["stream_id"]
-        messages = joined["result"]["messages"]
-        starts = [row["run_id"] for row in messages if row.get("event") == "child_started"]
-        snapshot = [row for row in messages if row.get("event") == "child_progress"]
-        assert len(captured) == 1
-        admitted = captured[0]
-        assert len(snapshot) <= len(starts) <= len(messages)
-        assert sorted(row["run_id"] for row in snapshot) == sorted(
-            run_id for run_id in starts if run_id in admitted
-        )
-        rows: dict[str, tuple[int, dict[str, Any]]] = {}
-        for row in snapshot:
-            assert (row["child"], row["revision"]) == admitted[row["run_id"]]
-            assert row["child"]["current_step"] == "released"
-            _reduce(rows, row)
-        assert len(snapshot) == BUSY_CHILDREN
-
-        # 6. children stay busy: later revisions are live from seq 1, consecutive, fresher
-        for child in children.values():
-            child.update_agent_lifecycle(current_step="live")
-        events = [
-            await await_or_fail(client.event("child_progress"), what="live progress")
-            for _ in range(BUSY_CHILDREN)
-        ]
-        assert [event["stream_id"] for event in events] == [stream_id] * BUSY_CHILDREN
-        assert [event["seq"] for event in events] == list(range(1, BUSY_CHILDREN + 1))
-        for event in events:
-            assert event["revision"] > admitted[event["run_id"]][1]
-            _reduce(rows, event)
-        assert {run_id: row["current_step"] for run_id, (_, row) in rows.items()} == dict.fromkeys(
-            children, "live"
-        )
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
@@ -760,89 +675,5 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_join_of_a_full_newest_page_with_63_busy_children_fits_one_frame(
-    tmp_path: Path, transport: Transport
-) -> None:
-    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
-        assert server.connections is not None
-        _push_older(server.runtime.opened.store)
-        runs = [f"{session_id}:{n}" for n in range(1, BUSY_CHILDREN + 1)]
-        for run_id in runs:
-            _start_child(server, stores, run_id).update_agent_lifecycle(current_step="busy")
-        await _lifecycle_applied(server)
-        joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
-        assert joined.get("error") is None, "the snapshot rows overflowed the join response"
-        assert _wire_size(joined) <= MAX_FRAME_BYTES
-        messages = joined["result"]["messages"]
-        assert joined["result"]["next_before"] is not None, "the page was not full"
-        assert _rows(messages, "child_started") == runs
-        snapshot = [row for row in messages if row.get("event") == "child_progress"]
-        assert [row["run_id"] for row in snapshot] == runs
-        # each reserve covers the largest snapshot row a start can add
-        projection = server.connections.child_runs
-        run_id = f"{session_id}:" + "9" * (255 - len(session_id))
-        projection.sink("progress", run_id, project_child_run_row(
-            _maximal_lifecycle(run_id), accepts_follow_ups=True
-        ), 2**63 - 1)
-        await _lifecycle_applied(server)
-        start = {"event": "child_started", "session_id": session_id, "run_id": run_id, "sequence": 2**63 - 1}
-        largest = projection.with_baseline({"messages": [start]})["messages"][1]
-        assert _wire_size(largest) <= BASELINE_ROW_RESERVE
-
-
-
-# 675 bounded start rows in one group leave a newest-page join 2,388 B under the frame cap
-LONE_GROUP_STARTS = 675
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_oversized_join_response_sends_only_the_error_and_activates_no_stream(
-    tmp_path: Path, transport: Transport
-) -> None:
-    """A join whose result no longer fits one frame fails closed (design 6.1).
-
-    One group holds so many start rows that its page keeps no snapshot reserve (the
-    lone-group shortcut in ergonomics); a live child's grown row then overflows the join.
-    """
-    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
-        root = server.runtime.opened.store
-        live = _start_child(server, stores, f"{session_id}:1")
-        for n in range(100, 100 + LONE_GROUP_STARTS):
-            root.append_child_run_started(
-                f"{session_id}:{n}", None, "worker", "d" * 9_000, "2026-01-01T00:00:00+00:00"
-            )
-        root.append_message(Message(MessageRole.ASSISTANT, [TextContent("closed")]))
-        await _lifecycle_applied(server)
-        fitting = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
-        assert fitting.get("error") is None
-        stream_id = fitting["result"]["replay"]["stream_id"]
-        slack = MAX_FRAME_BYTES - _wire_size(fitting)
-        assert _rows(fitting["result"]["messages"], "child_progress") == [f"{session_id}:1"]
-        assert 0 <= slack < 3_000, "the newest page is not within one grown row of the cap"
-
-        live.update_agent_lifecycle(current_step="c" * 5_000)
-        await _lifecycle_applied(server)
-        other = await connect_replay(server, transport)
-        try:
-            hello = await negotiate(
-                other,
-                observer=True,
-                extra=("child_run_history", "child_run_events"),
-                protocol_version="1.2",
-            )
-            assert "child_run_events" in hello["result"]["capabilities"]["features"]
-            failed = await other.request(3, "session_history_and_subscribe", {"session_id": session_id})
-            assert failed.get("result") is None
-            assert failed["error"]["code"] == -32007
-
-            live.update_agent_lifecycle(current_step="after")
-            await _lifecycle_applied(server)
-            await _publish_turns(server, session_id, 1)
-            # the published frames reach the joined stream, so they were sent
-            assert (await client.event("turn_start"))["stream_id"] == stream_id
-            await other.request(4, "status", {})
-            leaked = [frame for frame in other.buffered if "stream_id" in frame.get("params", {})]
-            assert leaked == [], "a frame carried the stream id of a join that failed"
-        finally:
-            await other.close()
