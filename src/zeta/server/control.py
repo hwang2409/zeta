@@ -707,7 +707,7 @@ class ServeControl:
                     turn_id=turn_id,
                 )
                 if event.type is StreamEventType.TURN_START:
-                    # Keep status idle until the turn_start publication barrier completes.
+                    # Keep status idle until the turn_start publication caller settles.
                     self._notification_turn_started = True
                     started = True
                     state.turn_started()
