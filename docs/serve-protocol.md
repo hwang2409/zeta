@@ -1333,8 +1333,8 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    served turn and has one closed `data.reason`: `completed`, `user_stop`,
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
    and `status.state` is `idle` until the next `turn_start`; a queued
-   notification turn is scheduled only after that handoff, so a send that
-   arrives first wins. Clients must wait for `agent_end` before idle-only
+   notification turn is not busy until its `turn_start` is published, so a send
+   that arrives first wins. Clients must wait for `agent_end` before idle-only
    requests such as `new_session`; the server commits `served_turn_end` before
    cleanup. Error
    and abort paths still end with `error` or `turn_aborted`.

@@ -1892,12 +1892,20 @@ async def test_turn_end_send_ready_orders(
 
     release_turn_end = asyncio.Event()
     turn_end_published = asyncio.Event()
-    notification_started = asyncio.Event()
-    release_notification = asyncio.Event()
+    notification_start_ready = asyncio.Event()
+    release_notification_start = asyncio.Event()
     original_event = server.control._event
-    original_notification_turn = server.turn_contexts.run_notification_turn
 
     async def gated_event(event: object, *args: object, **kwargs: object) -> None:
+        if (
+            getattr(event, "type", None) is StreamEventType.TURN_START
+            and turn_end_published.is_set()
+            and not notification_start_ready.is_set()
+        ):
+            notification_start_ready.set()
+            await await_or_fail(
+                release_notification_start.wait(), what="notification start"
+            )
         await original_event(event, *args, **kwargs)  # type: ignore[arg-type]
         if (
             getattr(event, "type", None) is StreamEventType.TURN_END
@@ -1905,29 +1913,15 @@ async def test_turn_end_send_ready_orders(
         ):
             turn_end_published.set()
             await await_or_fail(release_turn_end.wait(), what="turn_end owner")
-        elif (
-            getattr(event, "type", None) is StreamEventType.TURN_START
-            and kwargs.get("turn_id") == "queued-notification"
-        ):
-            notification_started.set()
-            await await_or_fail(release_notification.wait(), what="notification turn")
 
-    async def gated_notification_turn(*args: object, **kwargs: object):
-        notification_started.set()
-        return await original_notification_turn(*args, **kwargs)
-
-    # test-contract: seam gate the real serve event publication before task return
+    # test-contract: seam gate the real notification wake before turn_start publication
     monkeypatch.setattr(server.control, "_event", gated_event)
-    monkeypatch.setattr(
-        server.turn_contexts, "run_notification_turn", gated_notification_turn
-    )
     try:
         await request(1, "hello", {"protocol_version": "1.2"})
         session = (await request(2, "new_session", {"provider": "codex"}))[-1][
             "result"
         ]["session"]
         session_id = session["session_id"]
-        server.runtime.loop.set_background_wake_callback(None)
         await request(3, "send", {"text": "first"})
         await event("turn_start")
         await await_or_fail(turn_end_published.wait(), what="turn_end publication")
@@ -1946,6 +1940,13 @@ async def test_turn_end_send_ready_orders(
             )
         )
         if order == "send_first":
+            owner_task = server.control._turn_handoff_task
+            assert owner_task is not None
+            release_turn_end.set()
+            await await_or_fail(owner_task, what="turn owner return")
+            await await_or_fail(
+                notification_start_ready.wait(), what="notification scheduling"
+            )
             await send_request(4, "status", {})
             await send_request(5, "send", {"text": "send first"})
             responses: dict[int, dict[str, Any]] = {}
@@ -1955,47 +1956,27 @@ async def test_turn_end_send_ready_orders(
                     responses[frame["id"]] = frame
             assert responses[4]["result"]["state"] == "idle"
             assert responses[5]["result"]["accepted"] is True
-            owner_task = server.control._turn_handoff_task
-            assert owner_task is not None
-            release_turn_end.set()
-            server.runtime.loop.set_background_wake_callback(
-                lambda: server.control._schedule_background_wake(session_id)
-            )
-            await await_or_fail(owner_task, what="turn owner return")
-            await event("turn_start")
-            assert not notification_started.is_set()
-            await event("turn_end")
-            server.control._turn_task = asyncio.create_task(
-                server.control._run_notification_turn(
-                    session_id, turn_id="queued-notification"
-                )
-            )
-            await await_or_fail(notification_started.wait(), what="notification start")
-            release_notification.set()
+            release_notification_start.set()
         else:
             status_frames = await request(4, "status", {})
             assert status_frames[-1]["result"]["state"] == "idle"
             owner_task = server.control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
-            server.runtime.loop.set_background_wake_callback(
-                lambda: server.control._schedule_background_wake(session_id)
-            )
             await await_or_fail(owner_task, what="turn owner return")
-            server.control._turn_task = asyncio.create_task(
-                server.control._run_notification_turn(
-                    session_id, turn_id="queued-notification"
-                )
+            await await_or_fail(
+                notification_start_ready.wait(), what="notification scheduling"
             )
-            await await_or_fail(notification_started.wait(), what="notification start")
+            status_frames = await request(4, "status", {})
+            assert status_frames[-1]["result"]["state"] == "idle"
+            release_notification_start.set()
             await event("turn_start")
             refused = await request(5, "send", {"text": "too late"})
             assert refused[-1]["error"]["code"] == -32004
-            release_notification.set()
         assert session_id == server.runtime.session_id
     finally:
         release_turn_end.set()
-        release_notification.set()
+        release_notification_start.set()
         await close_serve(server, writer)
 
 

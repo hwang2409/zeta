@@ -115,6 +115,7 @@ class ServeControl:
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
+        self._notification_turn_started = False
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -158,6 +159,12 @@ class ServeControl:
         allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
+        loop = self.server.runtime.loop
+        if loop is not None and loop.notification_turn_state != "idle":
+            notification_task = self._turn_task
+            loop.cancel_scheduled_notification_turn()
+            if notification_task is not None and not notification_task.done():
+                notification_task.cancel()
         self._turn_task = asyncio.create_task(
             self._run_turn(
                 text,
@@ -196,13 +203,20 @@ class ServeControl:
         loop = self.server.runtime.loop
         return (
             self._session_swap_active
-            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_task is not None
+                and not self._turn_task.done()
+                and (
+                    loop is None
+                    or loop.notification_turn_state == "idle"
+                    or self._notification_turn_started
+                )
+            )
             or (
                 self._turn_handoff_task is not None
                 and not self._turn_handoff_task.done()
                 and not self._turn_end_published
             )
-            or (loop is not None and loop.notification_turn_state != "idle")
         )
 
     async def require_idle(self) -> None:
@@ -648,6 +662,7 @@ class ServeControl:
             self._host_binding_required and host_commands is None
         ) or not loop.schedule_notification_turn():
             return
+        self._notification_turn_started = False
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(
                 session_id, host_commands, turn_id=uuid.uuid4().hex
@@ -676,6 +691,7 @@ class ServeControl:
             session_id: str | None = None,
             background: bool = False,
         ) -> None:
+            nonlocal started
             if event.type in {StreamEventType.TURN_END, StreamEventType.ERROR}:
                 terminal_events.append(event)
             else:
@@ -685,11 +701,12 @@ class ServeControl:
                     background=background,
                     turn_id=turn_id,
                 )
+                if event.type is StreamEventType.TURN_START:
+                    self._notification_turn_started = True
+                    started = True
+                    state.turn_started()
 
         try:
-            await asyncio.sleep(0.01)
-            state.turn_started()
-            started = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
@@ -721,13 +738,15 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-                schedule_wake=False,
-            )
+            self._notification_turn_started = False
+            if started:
+                await self.deliveries.finalize_turn(
+                    session_id,
+                    state,
+                    turn_id,
+                    outcome,
+                    schedule_wake=False,
+                )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
