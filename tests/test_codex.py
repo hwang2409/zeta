@@ -50,6 +50,103 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 
+def test_tool_argument_deltas_parse_only_at_item_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loads = 0
+    original_loads = codex_module.json.loads
+
+    def counting_loads(value, *args, **kwargs):
+        nonlocal loads
+        loads += 1
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(codex_module.json, "loads", counting_loads)
+    items: dict[int, codex_module._ItemState] = {}
+    blocks: dict[codex_module.BlockKey, codex_module._BlockState] = {}
+    usage: dict[str, object] = {}
+    response_data: dict[str, object] = {}
+    codex_module._translate_event(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "item-1",
+                "call_id": "call-1",
+                "name": "write",
+            },
+        },
+        "started",
+        items,
+        blocks,
+        usage,
+        response_data,
+    )
+    parts = ['{"content":"', "x" * 100, '"}']
+    events = []
+    for part in parts:
+        event, _ = codex_module._translate_event(
+            "response.function_call_arguments.delta",
+            {"type": "response.function_call_arguments.delta", "output_index": 0, "delta": part},
+            "started",
+            items,
+            blocks,
+            usage,
+            response_data,
+        )
+        events.append(event)
+    assert loads == 0
+    assert [event.tool_call.arguments for event in events if event and event.tool_call] == [
+        {},
+        {},
+        {},
+    ]
+    arguments = '{"content":"' + "x" * 100 + '"}'
+    codex_module._translate_event(
+        "response.function_call_arguments.done",
+        {"type": "response.function_call_arguments.done", "output_index": 0, "arguments": arguments},
+        "started",
+        items,
+        blocks,
+        usage,
+        response_data,
+    )
+    codex_module._translate_event(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "item-1",
+                "call_id": "call-1",
+                "name": "write",
+                "arguments": arguments,
+            },
+        },
+        "started",
+        items,
+        blocks,
+        usage,
+        response_data,
+    )
+    event, state = codex_module._translate_event(
+        "response.completed",
+        {"type": "response.completed", "response": {"usage": {}}},
+        "started",
+        items,
+        blocks,
+        usage,
+        response_data,
+    )
+    assert state == "stopped"
+    assert loads == 1
+    assert event is not None and event.message is not None
+    assert event.message.content[0].tool_call.arguments == {"content": "x" * 100}
+
+
 def test_codex_replays_removed_tool_call_and_result() -> None:
     call_id = "agent-wait-call-1"
     messages = [
