@@ -318,6 +318,8 @@ async def test_real_method_conformance_matrix(transport: str, tmp_path: Path) ->
             await contract.close()
 
 
+
+
 def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     registry = create_slash_registry(skill_catalog=SkillCatalog(()), surface="serve")
     safe = {
@@ -346,6 +348,9 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
     assert not registry.command_for("plan").serve.can_run_while_busy("on")
     assert not registry.command_for("plan").serve.can_run_while_busy("write a plan")
     assert not registry.command_for("implement").serve.can_run_while_busy("")
+
+
+
 
 
 def test_protocol_registry_matches_documented_errors_and_events() -> None:
@@ -1083,6 +1088,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "session grant not found",
         {"grant": "bash"},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session grant not found","data":{"code":"session_grant_not_found","grant":"bash"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SESSION_ID_AMBIGUOUS,
+        "session id 'abcd' is ambiguous; matches: abcd1111, abcd2222; please provide more characters",
+        {"session_id": "abcd", "candidates": ["abcd1111", "abcd2222"]},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session id \'abcd\' is ambiguous; matches: abcd1111, abcd2222; please provide more characters","data":{"code":"session_id_ambiguous","session_id":"abcd","candidates":["abcd1111","abcd2222"]}}}\n',
     ),
     (
         ErrorDescriptor.SESSION_MISMATCH,

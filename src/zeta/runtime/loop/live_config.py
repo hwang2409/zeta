@@ -75,7 +75,7 @@ class LiveConfigMixin:
 
     def _set_runtime_prompt(self, runtime_prompt: RuntimePrompt) -> None:
         self._runtime_prompt = runtime_prompt
-        self.context_assembler.system_prompt = runtime_prompt.system_prompt
+        self.context_assembler.update_system_prompt(runtime_prompt.system_prompt)
         self._prompt_generation += 1
 
     def _skill_prompt_base(self) -> RuntimePrompt:

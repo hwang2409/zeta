@@ -41,6 +41,8 @@ from .anthropic_errors import (
     http_error as _http_error,
 )
 from .completion import (
+    MAX_STALL_RETRIES,
+    TRANSPORT_IDLE_SECONDS,
     AuthIteratorProviderAttempt,
     CompletionControl,
     CompletionRun,
@@ -53,11 +55,8 @@ from .must_complete_close import task_is_cancelling
 from .stream_diagnostics import Cause, StreamDiagnostics
 from .stream_errors import decode_stream_error
 from .transport import (
-    DEFAULT_STREAM_STALL_RETRIES,
-    DEFAULT_STREAM_STALL_SECONDS,
     HTTPClientLease,
     SSEEventAccumulator,
-    StreamFinished,
     StreamProgressDiagnostics,
     build_response_error,
     cleanup_transport,
@@ -449,8 +448,8 @@ class AnthropicBackend(CompletionBackend):
         token_store: AnthropicCredential | None = None,
         client: httpx.AsyncClient | None = None,
         diagnostics_path: str | Path | None = None,
-        stall_seconds: float = DEFAULT_STREAM_STALL_SECONDS,
-        stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
+        stall_seconds: float = TRANSPORT_IDLE_SECONDS,
+        stall_retries: int = MAX_STALL_RETRIES,
     ) -> None:
         _validate_thinking_parameters(max_tokens, thinking_budget)
         self.model = model
@@ -479,7 +478,14 @@ class AnthropicBackend(CompletionBackend):
         *,
         control: CompletionControl,
     ) -> CompletionRun:
-        return own_completion(self, messages, tool_schemas, control=control)
+        return own_completion(
+            self,
+            messages,
+            tool_schemas,
+            control=control,
+            transport_idle=self.stall_seconds,
+            max_stall_retries=self.stall_retries,
+        )
 
     def create_attempt(
         self,
@@ -594,18 +600,12 @@ class AnthropicBackend(CompletionBackend):
                     raise await build_response_error(
                         response,
                         _http_error,
-                        stall_seconds=self.stall_seconds,
-                        on_stall=lambda elapsed: AnthropicStreamError(
-                            f"Anthropic error body stalled for {elapsed:.0f}s",
-                            is_stall=True,
-                        ),
                     )
                 async for event in _decode_response(
                     response,
                     diagnostics_path=self.diagnostics_path,
                     model=self.model,
                     stream_started_at=stream_started_at,
-                    stall_seconds=self.stall_seconds,
                 ):
                     completed = is_completion_sentinel(event)
                     yield event
@@ -655,7 +655,6 @@ async def _decode_response(
     diagnostics_path: Path | None = None,
     model: str | None = None,
     stream_started_at: float | None = None,
-    stall_seconds: float = 0.0,
 ) -> AsyncIterator[StreamEvent]:
     decoder = SSEEventAccumulator("Anthropic", AnthropicStreamError)
     blocks: dict[int, _BlockState] = {}
@@ -663,7 +662,7 @@ async def _decode_response(
     stopped_blocks: set[int] = set()
     usage: dict[str, Any] = {}
     stop_reason: str | None = None
-    finished = StreamFinished()
+    finished = False
     progress = StreamProgressDiagnostics()
     message_state = "not-started"
     started_at = time.monotonic() if stream_started_at is None else stream_started_at
@@ -792,13 +791,7 @@ async def _decode_response(
             return salvage(type(exc)), exc
 
     try:
-        async for line in sse_lines(
-            response,
-            stall_seconds,
-            "Anthropic",
-            AnthropicStreamError,
-            finished=finished,
-        ):
+        async for line in sse_lines(response):
             bytes_received += len(line.encode()) + 1
             record = decoder.feed(line)
             if record is None:
@@ -820,12 +813,12 @@ async def _decode_response(
                         "stop_reason": stop_reason,
                     },
                 )
-                finished.value = True
+                finished = True
             yield translated
             if provider_error is not None:
                 raise provider_error
     except httpx.HTTPError as exc:
-        if finished.value or message_state == "not-started":
+        if finished or message_state == "not-started":
             raise
         yield salvage(type(exc))
         raise AnthropicStreamError(
@@ -857,7 +850,7 @@ async def _decode_response(
             yield translated
             if provider_error is not None:
                 raise provider_error
-    if not finished.value:
+    if not finished:
         if message_state == "not-started":
             raise AnthropicStreamError("Anthropic stream ended before message_start")
         yield salvage("clean-eof")
