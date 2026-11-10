@@ -695,6 +695,69 @@ def _remove_entry(pending_fd: int, name: str) -> bool:
     return True
 
 
+def associate_project(manager, metadata, project_id: str):
+    """Associate metadata and its registry row under one reference authority."""
+    previous_project_id = metadata.project_id
+    registry = manager.project_registry
+    if registry is None:
+        raise ProjectRegistryError("project registry capability is unavailable")
+    registry.show_project(project_id)
+    gate = SessionReferenceGate(manager.home, manager._storage_lease)
+    referenced_ids = tuple(
+        value
+        for value in (metadata.session_id, metadata.parent_session_id)
+        if value is not None
+    )
+    publish = lambda current: publish_project_association(
+        manager,
+        current,
+        project_id=project_id,
+        previous_project_id=previous_project_id,
+        gate=gate,
+    )
+    bind = lambda item: setattr(item, "project_id", project_id) or item
+    current = manager._mutate(
+        metadata.session_id,
+        bind,
+        execution_lease=metadata._execution_lease,
+        authority=gate.shared(referenced_ids=referenced_ids),
+        before_release=publish,
+    )
+    manager._copy_metadata(metadata, current)
+    return current
+
+
+def publish_project_association(
+    manager,
+    current,
+    *,
+    project_id: str,
+    previous_project_id: str | None,
+    gate: SessionReferenceGate,
+) -> None:
+    """Finish the metadata-to-registry handoff under reference authority."""
+    try:
+        persist_pending_root_link(
+            manager.sessions_dir,
+            current.session_id,
+            project_id,
+            current.project_role or "session",
+            current.parent_session_id,
+            manager._storage_lease,
+            previous_project_id=previous_project_id,
+            _reference_gate=gate,
+        )
+    except (SessionError, OSError) as exc:
+        logger.warning("could not persist project linkage intent: %s", exc)
+    manager._reconcile_project_link(current.session_id, _reference_gate=gate)
+    if previous_project_id is not None and previous_project_id != project_id:
+        from ..transcript_search.index import delete_indexed_session
+
+        delete_indexed_session(
+            manager.project_registry.root, previous_project_id, current.session_id
+        )
+
+
 __all__ = [
     "PENDING_CHILD_LINKS_DIRNAME",
     "_PROJECT_ROLES",

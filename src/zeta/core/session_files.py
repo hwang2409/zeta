@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import fcntl
 import json
 import os
 import stat
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import fields
 from pathlib import Path
 
-from ..locking import RETENTION_HOME_ID, domain_authority, shape_lock
+from ..locking import RETENTION_HOME_ID, domain_authority, identity_lock, shape_lock
 from ..storage_format import (
     StorageFeature,
     WriterLease,
@@ -64,16 +67,35 @@ class SessionReferenceGate:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
 
     @contextmanager
-    def _locked(self, *, exclusive: bool):
+    def _locked(self, *, exclusive: bool, unavailable_id: str | None = None):
         if not self._enabled():
             yield self
             return
-        require_off_loop_lock("session reference authority", SessionError)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop = False
+        else:
+            on_loop = True
+        if exclusive and on_loop:
+            raise SessionError(
+                "exclusive session reference authority requested on an asyncio event-loop thread"
+            )
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with domain_authority(
-            self.home, RETENTION_HOME_ID, "references", exclusive=exclusive
-        ):
-            yield self
+        try:
+            with domain_authority(
+                self.home,
+                RETENTION_HOME_ID,
+                "references",
+                exclusive=exclusive,
+                nonblocking=on_loop,
+            ):
+                yield self
+        except BlockingIOError as exc:
+            session_id = unavailable_id or "unknown"
+            raise SessionReferenceUnavailable(
+                f"session reference unavailable: {session_id} is being deleted"
+            ) from exc
 
     def shared(
         self,
@@ -83,14 +105,18 @@ class SessionReferenceGate:
     ):
         @contextmanager
         def operation():
-            with self._locked(exclusive=False):
-                self.validate((*installed_ids, *referenced_ids))
-                self.bump_generation()
+            ids = (*installed_ids, *referenced_ids)
+            with self._locked(
+                exclusive=False, unavailable_id=ids[0] if ids else None
+            ):
+                self.validate(ids)
+                if installed_ids:
+                    self.bump_generation()
                 yield self
         return operation()
 
-    def exclusive(self):
-        return self._locked(exclusive=True)
+    def exclusive(self, *, session_id: str | None = None):
+        return self._locked(exclusive=True, unavailable_id=session_id)
 
     def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
         if not self._enabled():
@@ -133,6 +159,99 @@ class SessionReferenceGate:
         finally:
             os.close(directory_fd)
         return value
+
+
+def copy_session_metadata(target, source) -> None:
+    for metadata_field in fields(source):
+        if metadata_field.name != "_execution_lease":
+            setattr(
+                target,
+                metadata_field.name,
+                copy.deepcopy(getattr(source, metadata_field.name)),
+            )
+
+
+def mutate_session_metadata(
+    manager,
+    session_id: str,
+    update,
+    *,
+    lock_timeout: float | None,
+    execution_lease,
+    authority,
+    before_release,
+):
+    updated = None
+
+    def release() -> None:
+        if before_release is not None:
+            assert updated is not None
+            before_release(updated)
+
+    with (
+        manager._execution_owner(session_id, execution_lease),
+        manager._metadata_lock(
+            session_id,
+            timeout=lock_timeout,
+            authority=authority,
+            after_shape=release,
+        ) as directory_fd,
+    ):
+        current = manager._read(session_id, directory_fd=directory_fd)
+        updated = update(current)
+        manager._write_unlocked(updated, directory_fd=directory_fd)
+    assert updated is not None
+    return updated
+
+
+@contextmanager
+def session_metadata_lock(
+    sessions_dir: Path,
+    session_id: str,
+    *,
+    blocking: bool,
+    timeout: float | None,
+    authority,
+    after_shape: Callable[[], None] | None,
+    loop_error: type[SessionError],
+):
+    if blocking:
+        require_off_loop_lock("session metadata", loop_error)
+    if timeout is not None:
+        deadline = time.monotonic() + timeout
+        while True:
+            with session_metadata_lock(
+                sessions_dir,
+                session_id,
+                blocking=False,
+                timeout=None,
+                authority=authority,
+                after_shape=after_shape,
+                loop_error=loop_error,
+            ) as directory_fd:
+                if directory_fd is not None:
+                    yield directory_fd
+                    return
+            if time.monotonic() >= deadline:
+                raise SessionError("session metadata lock acquisition timed out")
+            time.sleep(min(0.05, deadline - time.monotonic()))
+    with session_root(sessions_dir) as root_fd, child_directory(
+        root_fd, session_id
+    ) as directory_fd, identity_lock():
+        lock_fd = open_session_file(directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield None
+                return
+            with authority or nullcontext():
+                with shape_lock():
+                    yield directory_fd
+                if after_shape is not None:
+                    after_shape()
+        finally:
+            os.close(lock_fd)
 
 
 def require_off_loop_lock(

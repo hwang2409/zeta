@@ -56,7 +56,7 @@ def test_reference_gate_rejects_malformed_generation(tmp_path, content):
         path.write_text(content, encoding="ascii")
         with (
             pytest.raises(SessionError, match="session reference generation"),
-            SessionReferenceGate(tmp_path, lease).shared(),
+            SessionReferenceGate(tmp_path, lease).shared(installed_ids=("root",)),
         ):
             pass
         assert path.read_text(encoding="ascii") == content

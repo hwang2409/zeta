@@ -8,12 +8,11 @@ import fcntl
 import json
 import logging
 import os
-import time
 import uuid
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -50,11 +49,13 @@ from .session_files import (
     SessionNotFoundError,
     SessionReferenceGate,
     open_session_file,
+    mutate_session_metadata,
     read_session_file,
-    require_off_loop_lock,
     session_directory,
     session_root,
+    session_metadata_lock,
     child_directory,
+    copy_session_metadata,
     write_session_file,
 )
 from ..project_registry import ProjectRegistryError
@@ -74,6 +75,7 @@ from .store.preview import first_user_message
 from .session_metadata import META_VERSION, OpenedSession, SessionMetadata
 from .session_links import (
     _PROJECT_ROLES,
+    associate_project as associate_project_link,
     persist_pending_root_link,
     project_links_lock,
     reconcile_child_links,
@@ -82,9 +84,8 @@ from .session_links import (
 
 logger = logging.getLogger(__name__)
 
-
 class SessionLoopThreadLockError(SessionError):
-    """A session metadata lock was requested on an asyncio loop thread."""
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,48 +357,8 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                         execution_lease.close()
         raise SessionError("could not allocate a unique session id")
 
-    def associate_project(
-        self, metadata: SessionMetadata, project_id: str
-    ) -> SessionMetadata:
-        """Associate an existing session with a project."""
-        previous_project_id = metadata.project_id
-        registry = self.project_registry
-        if registry is None:
-            raise ProjectRegistryError("project registry capability is unavailable")
-        registry.show_project(project_id)
-        gate = SessionReferenceGate(self.home, self._storage_lease)
-        referenced_ids = tuple(
-            session_id
-            for session_id in (metadata.session_id, metadata.parent_session_id)
-            if session_id is not None
-        )
-        with gate.shared(referenced_ids=referenced_ids):
-            bind = lambda item: setattr(item, "project_id", project_id) or item
-            current = self._mutate(
-                metadata.session_id, bind, execution_lease=metadata._execution_lease
-            )
-            self._copy_metadata(metadata, current)
-            try:
-                persist_pending_root_link(
-                    self.sessions_dir,
-                    current.session_id,
-                    project_id,
-                    current.project_role or "session",
-                    current.parent_session_id,
-                    self._storage_lease,
-                    previous_project_id=previous_project_id,
-                    _reference_gate=gate,
-                )
-            except (SessionError, OSError) as exc:
-                logger.warning("could not persist project linkage intent: %s", exc)
-            self._reconcile_project_link(
-                current.session_id, _reference_gate=gate
-            )
-            if previous_project_id is not None and previous_project_id != project_id:
-                delete_indexed_session(
-                    registry.root, previous_project_id, current.session_id
-                )
-            return current
+    def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
+        return associate_project_link(self, metadata, project_id)
 
     def read_metadata(
         self, session_id: str, *, lock_timeout: float | None = None
@@ -424,35 +385,28 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             self.home, self._storage_lease
         )
         if _read_only:
-            authority = (
-                nullcontext(gate)
-                if _reference_gate is not None
-                else gate.shared(referenced_ids=(session_id,))
-            )
-            with authority:
-                if _reference_gate is not None:
-                    gate.validate((session_id,))
-                metadata = self.read_metadata(session_id)
-                try:
-                    store = ConversationStore(
-                        self.sessions_dir,
-                        session_id=session_id,
-                        _read_only=True,
-                        _must_exist=True,
-                        _storage_lease=self._storage_lease,
-                        _owner_surface=self._owner_surface,
-                    )
-                except (TranscriptLoadError, OSError, ValueError) as exc:
-                    raise SessionError(
-                        f"session {session_id} could not be opened"
-                    ) from exc
-                if store.cwd != metadata.cwd:
-                    store.close()
-                    raise SessionError(
-                        f"session {session_id} cwd does not match its metadata"
-                    )
-                return OpenedSession(metadata, store)
+            if _reference_gate is not None:
+                gate.validate((session_id,))
+            metadata = self.read_metadata(session_id)
+            try:
+                store = ConversationStore(
+                    self.sessions_dir,
+                    session_id=session_id,
+                    _read_only=True,
+                    _must_exist=True,
+                    _storage_lease=self._storage_lease,
+                    _owner_surface=self._owner_surface,
+                )
+            except (TranscriptLoadError, OSError, ValueError) as exc:
+                raise SessionError(f"session {session_id} could not be opened") from exc
+            if store.cwd != metadata.cwd:
+                store.close()
+                raise SessionError(
+                    f"session {session_id} cwd does not match its metadata"
+                )
+            return OpenedSession(metadata, store)
 
+        self.read_metadata(session_id)
         with session_root(self.sessions_dir) as root_fd, child_directory(
             root_fd, session_id
         ) as directory_fd:
@@ -1177,28 +1131,20 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         *,
         lock_timeout: float | None = None,
         execution_lease: SessionExecutionLease | None = None,
+        authority=None,
+        before_release: Callable[[SessionMetadata], None] | None = None,
     ) -> SessionMetadata:
-        with (
-            self._execution_owner(session_id, execution_lease),
-            self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd,
-        ):
-            current = self._read(session_id, directory_fd=directory_fd)
-            updated = update(current)
-            self._write_unlocked(updated, directory_fd=directory_fd)
-            return updated
+        return mutate_session_metadata(
+            self,
+            session_id,
+            update,
+            lock_timeout=lock_timeout,
+            execution_lease=execution_lease,
+            authority=authority,
+            before_release=before_release,
+        )
 
-    @staticmethod
-    def _copy_metadata(target: SessionMetadata, source: SessionMetadata) -> None:
-        """Adopt every persisted field into the caller's live metadata object."""
-
-        for metadata_field in fields(SessionMetadata):
-            if metadata_field.name == "_execution_lease":
-                continue
-            setattr(
-                target,
-                metadata_field.name,
-                copy.deepcopy(getattr(source, metadata_field.name)),
-            )
+    _copy_metadata = staticmethod(copy_session_metadata)
 
     def _read(
         self, session_id: str, *, directory_fd: int | None = None
@@ -1256,46 +1202,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             lambda fd, name, data: write_session_file(fd, name, data, sync=sync),
         )
 
-    @contextmanager
-    def _metadata_lock(
-        self,
-        session_id: str,
-        *,
-        blocking: bool = True,
-        timeout: float | None = None,
-    ):
-        if blocking:
-            # the loop may do non-waiting local file ops; anything that can wait or fsyncs goes off-loop
-            require_off_loop_lock("session metadata", SessionLoopThreadLockError)
+    def _metadata_lock(self, session_id: str, **kwargs):
         self._validate_id(session_id)
-        if timeout is not None:
-            deadline = time.monotonic() + timeout
-            while True:
-                with self._metadata_lock(session_id, blocking=False) as directory_fd:
-                    if directory_fd is not None:
-                        yield directory_fd
-                        return
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise SessionError("session metadata lock acquisition timed out")
-                time.sleep(min(0.05, remaining))
-        with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
-            try:
-                lock_fd = open_session_file(
-                    directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT
-                )
-            except OSError as exc:
-                raise SessionError("session metadata lock could not be opened") from exc
-            try:
-                flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-                try:
-                    fcntl.flock(lock_fd, flags)
-                except BlockingIOError:
-                    yield None
-                    return
-                yield directory_fd
-            finally:
-                os.close(lock_fd)
+        return session_metadata_lock(
+            self.sessions_dir, session_id, loop_error=SessionLoopThreadLockError,
+            blocking=kwargs.pop("blocking", True), timeout=kwargs.pop("timeout", None),
+            authority=kwargs.pop("authority", None),
+            after_shape=kwargs.pop("after_shape", None),
+        )
 
     @staticmethod
     def _validate_id(session_id: str) -> None:

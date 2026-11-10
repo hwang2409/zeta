@@ -86,7 +86,12 @@ def shape_lock() -> AbstractContextManager[None]:
 
 @contextmanager
 def domain_authority(
-    home: Path, project_id: str, domain: str, *, exclusive: bool
+    home: Path,
+    project_id: str,
+    domain: str,
+    *,
+    exclusive: bool,
+    nonblocking: bool = False,
 ) -> Iterator[None]:
     """Hold one ranked domain authority and its process-shared lock file."""
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -96,7 +101,10 @@ def domain_authority(
     fd = os.open(lock_dir / lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         with domain_lock(project_id, domain):
-            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if nonblocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(fd, operation)
             try:
                 yield
             finally:

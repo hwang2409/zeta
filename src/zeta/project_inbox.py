@@ -311,6 +311,12 @@ class ProjectInbox:
             self.registry.root.parent, self.registry._storage_lease
         ).shared(referenced_ids=(session, to_session) if to_session else (session,)):
             self._publish_outgoing(target.project_id, message_id, body, record)
+            if on_visible is not None:
+                try:
+                    on_visible()
+                except Exception:  # noqa: BLE001,S110
+                    # The durable record remains authoritative if its wake cannot run.
+                    pass
             tracker = (
                 self.sent_tracker
                 if self.sent_tracker is not None
@@ -322,12 +328,6 @@ class ProjectInbox:
                 target.project_id,
                 _storage_lease=self.registry._storage_lease,
             )
-        if on_visible is not None:
-            try:
-                on_visible()
-            except Exception:  # noqa: BLE001,S110
-                # The durable record remains authoritative if its wake cannot run.
-                pass
         return message_id, outcome
 
     def _publish_outgoing(
