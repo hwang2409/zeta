@@ -5,50 +5,80 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import sys
 import time
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, ClassVar, TypeVar
 
 import httpx
 
-from ..protocol.types import StreamEvent, StreamEventType
-from ..runtime._async_close import (
-    CloseFailureReporter,
-    CloseOutcome,  # noqa: F401 - preserve the provider transport import
-    close_resource,
-    close_transport_resources,
-    is_control_exception,
-    merge_exception,
-    task_is_cancelling,
-)
-from ..runtime._async_close import (
-    cleanup_failure_context as _cleanup_failure_context,
-)
-from ..runtime._async_close import (
-    report_loop_cleanup_failure as _report_loop_cleanup_failure,
-)
-from ..runtime._async_close import (
-    retain_background_closes as _retain_background_closes,
-)
-from .retry_policy import (
-    MAX_PROVIDER_ATTEMPTS,
-    ProviderRetryBudget,
-    current_retry_budget,
-    retry_error_label,
-)
+from .completion import is_control_exception, merge_exception, report_transport_activity
 from .stream_diagnostics import StreamDiagnostics
 
 ErrorT = TypeVar("ErrorT", bound=RuntimeError)
-DEFAULT_STREAM_STALL_SECONDS = 90.0  # Transport idle, including missing keepalives.
-# Long hidden reasoning is normal; diagnostics will let us safely tighten this later.
-MODEL_PROGRESS_STALL_SECONDS = 15 * 60.0
-DEFAULT_STREAM_STALL_RETRIES = 2
+_BACKGROUND_CLOSE_TASKS: set[asyncio.Task[object]] = set()
 _BACKGROUND_CLEANUP_REPORT_TASKS: set[asyncio.Task[object]] = set()
 _MAX_BACKGROUND_CLEANUP_REPORTS = 16
 _dropped_cleanup_reports = 0
+CloseFailureReporter = Callable[[int, BaseException], None]
+
+
+@dataclass(frozen=True, slots=True)
+class CloseFailure:
+    index: int
+    error: BaseException
+
+
+@dataclass(frozen=True, slots=True)
+class CloseOutcome:
+    """Failures from one aggregate close; an empty tuple means success."""
+
+    failures: tuple[CloseFailure, ...]
+
+
+def _exception_type_name(error: BaseException) -> str:
+    name = f"{type(error).__module__}.{type(error).__qualname__}"
+    return name.encode()[:128].decode(errors="ignore")
+
+
+def _primary_outcome(primary_exception: BaseException | None) -> str:
+    if isinstance(primary_exception, asyncio.CancelledError):
+        return "cancelled"
+    return "error" if primary_exception is not None else "success"
+
+
+def _cleanup_failure_context(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None = None,
+) -> dict[str, object]:
+    return {
+        "exception_type": _exception_type_name(error),
+        "stage": stage,
+        "index": index,
+        "primary_outcome": _primary_outcome(primary_exception),
+    }
+
+
+def _report_loop_cleanup_failure(
+    error: BaseException,
+    *,
+    stage: str,
+    index: int,
+    primary_exception: BaseException | None = None,
+) -> None:
+    asyncio.get_running_loop().call_exception_handler(
+        _cleanup_failure_context(
+            error,
+            stage=stage,
+            index=index,
+            primary_exception=primary_exception,
+        )
+    )
 
 
 async def _report_cleanup_failure(
@@ -91,6 +121,37 @@ async def _report_cleanup_failure(
             stage=f"{stage}_diagnostic",
             index=index,
             primary_exception=primary_exception,
+        )
+
+
+def _release_background_close(
+    task: asyncio.Task[object],
+    index: int,
+    report_failure: CloseFailureReporter | None,
+) -> None:
+    _BACKGROUND_CLOSE_TASKS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None or is_control_exception(error):
+        return
+    if report_failure is None:
+        _report_loop_cleanup_failure(error, stage="background_close", index=index)
+    else:
+        with contextlib.suppress(BaseException):
+            report_failure(index, error)
+
+
+def _retain_background_closes(
+    tasks: tuple[asyncio.Task[object], ...],
+    report_failure: CloseFailureReporter | None,
+) -> None:
+    for index, task in enumerate(tasks):
+        _BACKGROUND_CLOSE_TASKS.add(task)
+        task.add_done_callback(
+            lambda done, index=index: _release_background_close(
+                done, index, report_failure
+            )
         )
 
 
@@ -148,34 +209,8 @@ def format_retry_delay(delay: float) -> str:
     return f"{delay:.1f}".rstrip("0").rstrip(".")
 
 
-def stall_retry_notice(
-    retry_number: int, delay: float, max_retries: int
-) -> StreamEvent:
-    """Build a stall RETRY event; ``is_stall`` also signals the loop to
-    clear its accumulated partial before the retry resumes streaming."""
-
-    return StreamEvent(
-        StreamEventType.RETRY,
-        data={
-            "text": (
-                f"provider stalled, retrying ({retry_number}/{max_retries})"
-                f" in {format_retry_delay(delay)}s"
-            ),
-            "retry": retry_number,
-            "delay": delay,
-            "is_stall": True,
-        },
-    )
 
 
-def stall_retry_kwargs(stall_retries: int) -> dict[str, object]:
-    """Wire ``retry_provider_completion`` with the shared stall predicate."""
-
-    return {
-        "is_stall": lambda error: getattr(error, "is_stall", False),
-        "stall_notice": lambda n, d, _e: stall_retry_notice(n, d, stall_retries),
-        "max_stall_retries": stall_retries,
-    }
 
 
 class SSEEventAccumulator[ErrorT: RuntimeError]:
@@ -299,43 +334,28 @@ async def build_response_error[ErrorT: RuntimeError](
     response: httpx.Response,
     build: Callable[[int, bytes, Mapping[str, str]], ErrorT],
     limit: int = 8192,
-    *,
-    stall_seconds: float,
-    on_stall: Callable[[float], BaseException],
 ) -> ErrorT:
     """Build a provider error from a bounded streaming response body."""
 
     body = bytearray()
-    source = stall_watchdog(response.aiter_bytes(), seconds=stall_seconds, on_stall=on_stall)
-    async for chunk in source:
+    async for chunk in response.aiter_bytes():
+        report_transport_activity()
         body.extend(chunk[: limit - len(body)])
         if len(body) >= limit:
             break
     return build(response.status_code, bytes(body), response.headers)
 
 
-class StreamFinished:
-    """Mutable flag the provider decoder sets when the completion sentinel
-    arrives, so ``sse_lines``' stall watchdog treats any post-completion
-    silence as a clean EOF instead of a spurious stall retry."""
+class StreamProgressDiagnostics:
+    """Measure decoded model gaps without owning any deadline."""
 
-    __slots__ = ("value",)
-
-    def __init__(self) -> None:
-        self.value = False
-
-
-class StreamProgress:
-    """Track decoded model progress without counting transport keepalives."""
-
-    __slots__ = ("last_at", "max_gap_s", "version")
+    __slots__ = ("last_at", "max_gap_s")
 
     _NON_PROGRESS_EVENTS: ClassVar[frozenset[str]] = frozenset(
         {"keepalive", "ping", "response.in_progress", "response.metadata"}
     )
 
     def __init__(self) -> None:
-        self.version = 0
         self.last_at = time.monotonic()
         self.max_gap_s = 0.0
 
@@ -345,273 +365,27 @@ class StreamProgress:
             now = time.monotonic()
             self.max_gap_s = max(self.max_gap_s, now - self.last_at)
             self.last_at = now
-            self.version += 1
 
     def maximum_gap_s(self) -> float:
         return max(self.max_gap_s, time.monotonic() - self.last_at)
 
 
-class _StreamDeadlines:
-    """Keep transport activity and decoded model progress independent."""
-
-    __slots__ = (
-        "progress",
-        "progress_at",
-        "progress_version",
-        "transport_at",
-        "transport_seconds",
-    )
-
-    def __init__(self, transport_seconds: float, progress: StreamProgress | None) -> None:
-        now = time.monotonic()
-        self.transport_seconds = transport_seconds
-        self.transport_at = now + transport_seconds
-        self.progress_at = now + MODEL_PROGRESS_STALL_SECONDS
-        self.progress = progress
-        self.progress_version = progress.version if progress is not None else 0
-
-    def next(self) -> tuple[float, float, bool]:
-        now = time.monotonic()
-        if self.progress is not None and self.progress.version != self.progress_version:
-            self.progress_version = self.progress.version
-            self.progress_at = now + MODEL_PROGRESS_STALL_SECONDS
-        model_stall = self.progress is not None and self.progress_at < self.transport_at
-        deadline = self.progress_at if model_stall else self.transport_at
-        limit = MODEL_PROGRESS_STALL_SECONDS if model_stall else self.transport_seconds
-        return deadline - now, limit, model_stall
-
-    def transport_activity(self) -> None:
-        self.transport_at = time.monotonic() + self.transport_seconds
+async def sse_lines(response: httpx.Response) -> AsyncIterator[str]:
+    """Yield low-level SSE lines while the completion owner tracks activity."""
+    async for line in response.aiter_lines():
+        report_transport_activity()
+        yield line
 
 
-async def wait_for_response_headers[E: RuntimeError](
-    enter: Awaitable[httpx.Response],
-    seconds: float,
-    provider: str,
-    error_class: type[E],
-) -> httpx.Response:
-    """Apply the stream stall limit before SSE iteration can start."""
-
-    try:
-        return await asyncio.wait_for(enter, timeout=seconds if seconds > 0 else None)
-    except TimeoutError as exc:
-        error = error_class(
-            f"{provider} response headers stalled for {seconds:.0f}s", is_stall=True
-        )
-        error.stall_seconds = seconds
-        raise error from exc
 
 
-def sse_lines[E: RuntimeError](
-    response: httpx.Response,
-    seconds: float,
-    provider: str,
-    error_class: type[E],
-    finished: StreamFinished | None = None,
-    progress: StreamProgress | None = None,
-) -> AsyncIterator[str]:
-    """Yield SSE lines from ``response`` and raise ``error_class`` on stall.
-
-    A ``finished`` flag lets the caller signal that the provider has already
-    emitted its completion sentinel; post-completion silence is then treated
-    as a clean EOF instead of a stall retry."""
-
-    def on_stall(elapsed: float) -> E:
-        error = error_class(
-            f"{provider} stream stalled for {elapsed:.0f}s", is_stall=True
-        )
-        error.stall_seconds = elapsed
-        return error
-
-    def on_model_stall(elapsed: float) -> E:
-        error = error_class(
-            f"{provider} model progress stalled for {elapsed:.0f}s", is_stall=True
-        )
-        error.stall_seconds = elapsed
-        return error
-
-    is_finished = (lambda: finished.value) if finished is not None else None
-    return stall_watchdog(
-        response.aiter_lines(),
-        seconds=seconds,
-        on_stall=on_stall,
-        on_model_stall=on_model_stall,
-        is_finished=is_finished,
-        progress=progress,
-    )
 
 
-def provider_retry_notice(
-    retry_number: int, delay: float, error: RuntimeError
-) -> StreamEvent:
-    """Build the shared visible notice for a transient provider retry."""
-
-    return StreamEvent(
-        StreamEventType.RETRY,
-        data={
-            "text": (
-                f"{retry_error_label(error)}, retrying in "
-                f"{format_retry_delay(delay)}s "
-                f"(attempt {retry_number + 1}/{MAX_PROVIDER_ATTEMPTS})"
-            ),
-            "retry": retry_number,
-            "delay": delay,
-        },
-    )
 
 
-async def retry_provider_completion(
-    first: Callable[[], AsyncIterator[StreamEvent]],
-    retry: Callable[[str], AsyncIterator[StreamEvent]],
-    refresh: Callable[[], Awaitable[str]],
-    is_unauthorized: Callable[[RuntimeError], bool],
-    auth_exhausted: Callable[[RuntimeError], RuntimeError],
-    notice: Callable[[int, float, RuntimeError], StreamEvent],
-    on_exhausted: Callable[[RuntimeError, int], None],
-    is_stall: Callable[[RuntimeError], bool] = lambda _error: False,
-    stall_notice: Callable[[int, float, RuntimeError], StreamEvent] | None = None,
-    max_stall_retries: int = DEFAULT_STREAM_STALL_RETRIES,
-    sleep: Callable[[float], Awaitable[None]] | None = None,
-    defer_truncated_message_end: bool = False,
-) -> AsyncIterator[StreamEvent]:
-    """Retry failures before the provider emits its first stream event.
-
-    Once stream output starts, the agent loop owns retry safety and reset
-    ordering. Both layers consume the same turn-level retry budget.
-    """
-
-    sleep = asyncio.sleep if sleep is None else sleep
-    budget = current_retry_budget()
-    if budget is None:
-        budget = ProviderRetryBudget()
-        if not budget.start_attempt("transport"):
-            raise RuntimeError("provider retry budget exhausted")
-    attempt_factory: Callable[[], AsyncIterator[StreamEvent]] = first
-    refreshed = False
-    budget.max_stall_retries = max_stall_retries
-    while True:
-        attempt = attempt_factory()
-        started = False
-        committed = False
-        error: RuntimeError | None = None
-        pending_truncated_end: StreamEvent | None = None
-        try:
-            async for value in attempt:
-                started = True
-                committed = committed or (
-                    value.message is not None
-                    or value.content is not None
-                    or value.delta is not None
-                    or value.tool_call is not None
-                )
-                if (
-                    defer_truncated_message_end
-                    and value.type is StreamEventType.MESSAGE_END
-                    and value.data.get("truncated")
-                ):
-                    pending_truncated_end = value
-                    continue
-                yield value
-        except RuntimeError as exc:
-            error = exc
-        finally:
-            await close_resource(attempt)
-        if error is None:
-            if pending_truncated_end is not None:
-                yield pending_truncated_end
-            return
-        stalled = is_stall(error)
-        # MESSAGE_START carries response.created metadata, not assistant content.
-        # A stall after that event can still be retried safely.
-        # A response.failed server_error may follow response.created; it still
-        # has no persisted assistant content and is safe under the shared budget.
-        if committed or (
-            started and not stalled and getattr(error, "code", None) != "server_error"
-        ):
-            if pending_truncated_end is not None:
-                yield pending_truncated_end
-            StreamDiagnostics.record_failure_decision(
-                error, provider="codex", will_retry=False
-            )
-            raise error
-        if is_unauthorized(error):
-            if refreshed:
-                raise auth_exhausted(error) from error
-            if not budget.start_attempt("transport"):
-                raise error
-            token = await refresh()
-            refreshed = True
-            attempt_factory = lambda token=token: retry(token)
-            continue
-        plan = budget.plan(
-            error,
-            owner="transport",
-            event_data={"retryable": True} if stalled else None,
-        )
-        StreamDiagnostics.record_failure_decision(
-            error, provider="codex", will_retry=plan is not None
-        )
-        if plan is None:
-            if budget.exhausted:
-                on_exhausted(error, budget.attempts - 1)
-            raise error
-        if stalled:
-            emit = stall_notice if stall_notice is not None else notice
-            retry_event = emit(budget.stall_retries, plan.delay, error)
-        else:
-            retry_event = notice(budget.attempts, plan.delay, error)
-        yield retry_event
-        await sleep(plan.delay)
-        budget.record_retry(plan)
-        if not budget.start_attempt("transport", is_stall=stalled):
-            on_exhausted(error, budget.attempts - 1)
-            raise error
-
-
-async def stall_watchdog[T](
-    source: AsyncIterable[T],
-    *,
-    seconds: float,
-    on_stall: Callable[[float], BaseException],
-    on_model_stall: Callable[[float], BaseException] | None = None,
-    is_finished: Callable[[], bool] | None = None,
-    progress: StreamProgress | None = None,
-) -> AsyncIterator[T]:
-    """Raise on transport silence or, when tracked, missing model progress."""
-
-    iterator = source.__aiter__()
-    deadlines = _StreamDeadlines(seconds, progress)
-    finished = is_finished or (lambda: False)
-    try:
-        while True:
-            remaining, limit, model_stall = deadlines.next()
-            try:
-                timeout = None if seconds <= 0 else max(0, remaining)
-                item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
-            except StopAsyncIteration:
-                return
-            except TimeoutError as exc:
-                if finished():
-                    return
-                factory = on_model_stall if model_stall else None
-                raise (factory or on_stall)(limit) from exc
-            deadlines.transport_activity()
-            yield item
-    finally:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            primary_exception = sys.exception()
-            outcome = await close_transport_resources(close())
-            for failure in outcome.failures:
-                if is_control_exception(failure.error):
-                    raise merge_exception(primary_exception, failure.error)
-                await _report_cleanup_failure(
-                    failure.error,
-                    stage="stream_iterator",
-                    index=failure.index,
-                    primary_exception=primary_exception,
-                )
-
+def task_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def request_error[ErrorT: RuntimeError](
@@ -621,6 +395,59 @@ def request_error[ErrorT: RuntimeError](
     error.__cause__ = cause
     return error
 
+
+async def close_transport_resources(
+    *closes: Awaitable[object],
+    report_failure: CloseFailureReporter | None = None,
+) -> CloseOutcome:
+    """Close every owned resource and return each ordinary failure."""
+
+    created: list[asyncio.Task[object]] = []
+    try:
+        for close in closes:
+            created.append(asyncio.create_task(close))
+        tasks = tuple(created)
+        if task_is_cancelling():
+            await asyncio.sleep(0)
+            for task in tasks:
+                task.cancel()
+        results = tuple(await asyncio.gather(*tasks, return_exceptions=True))
+        cancellation = next(
+            (result for result in results if isinstance(result, asyncio.CancelledError)),
+            None,
+        )
+        if cancellation is not None:
+            raise cancellation
+        return CloseOutcome(
+            tuple(
+                CloseFailure(index, result)
+                for index, result in enumerate(results)
+                if isinstance(result, BaseException)
+            )
+        )
+    finally:
+        tasks = tuple(created)
+        pending = tuple(task for task in tasks if not task.done())
+        for task in pending:
+            task.cancel()
+        if task_is_cancelling():
+            _retain_background_closes(tasks, report_failure)
+        elif pending:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                _retain_background_closes(tasks, report_failure)
+                raise
+
+
+async def close_resource(resource: object) -> None:
+    """Close one async resource through the shared cancellation-safe owner."""
+
+    outcome = await close_transport_resources(
+        resource.aclose()  # type: ignore[attr-defined]
+    )
+    if outcome.failures:
+        raise outcome.failures[0].error
 
 
 async def cleanup_transport[ErrorT: RuntimeError](

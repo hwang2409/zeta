@@ -45,6 +45,7 @@ from zeta.providers.completion import (
     ProviderStallError,
     owned_completion,
 )
+from zeta.providers.ollama import OllamaBackend
 from zeta.runtime.headless import drive_turn
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -220,7 +221,6 @@ async def test_anthropic_backend_stalls_and_retries_mid_stream(
     backend = AnthropicBackend(
         client=client,
         token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=0.05,
         stall_retries=2,
     )
     clock = ManualDeadlineClock()
@@ -324,7 +324,6 @@ async def test_anthropic_backend_stall_budget_exhausts(
     backend = AnthropicBackend(
         client=client,
         token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=0.05,
         stall_retries=2,
     )
     clock = ManualDeadlineClock()
@@ -374,7 +373,6 @@ async def test_anthropic_backend_ignores_stall_after_message_end(
     backend = AnthropicBackend(
         client=client,
         token_store=_anthropic_store(tmp_path / "zeta.json"),
-        stall_seconds=0.05,
         stall_retries=2,
     )
     events = [event async for event in backend.complete([], [], control=completion_control())]
@@ -441,7 +439,6 @@ async def test_provider_stalls_waiting_for_response_headers(
         backend = AnthropicBackend(
             client=client,
             token_store=_anthropic_store(tmp_path / "claude.json"),
-            stall_seconds=0.05,
             stall_retries=0,
         )
     else:
@@ -449,7 +446,6 @@ async def test_provider_stalls_waiting_for_response_headers(
             client=client,
             token_store=_codex_store(tmp_path / "codex.json"),
             base_url="https://test.invalid/codex/responses",
-            stall_seconds=0.05,
             stall_retries=0,
         )
     try:
@@ -457,7 +453,6 @@ async def test_provider_stalls_waiting_for_response_headers(
         backend._completion_clock = clock
         backend._completion_wait = _no_op_sleep
         control = completion_control()
-        control.budget.max_stall_retries = 0
         with pytest.raises(ProviderStallError, match="transport stalled for 90s") as caught:
             await _collect_after_expirations(
                 backend.complete([], [], control=control), clock, [headers_waiting]
@@ -619,7 +614,6 @@ async def test_codex_keepalives_do_not_reset_progress_deadline(
     backend._completion_clock = clock
     backend._completion_wait = _no_op_sleep
     control = completion_control()
-    control.budget.max_stall_retries = 0
     with pytest.raises(ProviderStallError, match="model progress stalled for 900s") as excinfo:
         await asyncio.wait_for(_collect(backend.complete([], [], control=control)), 10)
 
@@ -660,7 +654,6 @@ async def test_codex_backend_stalls_and_retries_mid_stream(
         client=client,
         token_store=_codex_store(tmp_path / "codex.json"),
         base_url="https://test.invalid/codex/responses",
-        stall_seconds=0.05,
         stall_retries=2,
     )
     clock = ManualDeadlineClock()
@@ -703,14 +696,12 @@ async def test_codex_backend_stall_budget_exhausts_raises(
         client=client,
         token_store=_codex_store(tmp_path / "codex.json"),
         base_url="https://test.invalid/codex/responses",
-        stall_seconds=0.05,
         stall_retries=1,
     )
     clock = ManualDeadlineClock()
     backend._completion_clock = clock
     backend._completion_wait = _no_op_sleep
     control = completion_control()
-    control.budget.max_stall_retries = 1
     with pytest.raises(ProviderStallError) as excinfo:
         await _collect_after_expirations(
             backend.complete([], [], control=control),
@@ -744,7 +735,6 @@ async def test_codex_backend_ignores_stall_after_message_end(
         client=client,
         token_store=_codex_store(tmp_path / "codex.json"),
         base_url="https://test.invalid/codex/responses",
-        stall_seconds=0.05,
         stall_retries=2,
     )
     events = [event async for event in backend.complete([], [], control=completion_control())]
@@ -1005,3 +995,81 @@ async def test_fake_backend_completion_does_not_trigger_watchdog(tmp_path: Path)
     loop = AgentLoop(backend, ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty())
     events = [event async for event in loop.run_turn("hi", origin=MessageOrigin.USER)]
     assert any(event.type is StreamEventType.TURN_END for event in events)
+
+
+# ------------------------ stall settings reach the owner ------------------- #
+
+
+def _stalling_backend(provider: str, client: httpx.AsyncClient, tmp_path: Path, **stall):
+    if provider == "anthropic":
+        return AnthropicBackend(
+            client=client, token_store=_anthropic_store(tmp_path / "claude.json"), **stall
+        )
+    if provider == "codex":
+        return CodexBackend(
+            client=client,
+            token_store=_codex_store(tmp_path / "codex.json"),
+            base_url="https://test.invalid/codex/responses",
+            **stall,
+        )
+    return OllamaBackend(client=client, base_url="http://ollama.invalid", **stall)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "codex", "ollama"])
+@pytest.mark.parametrize(
+    ("stall", "idle_seconds", "attempts"),
+    [
+        pytest.param({}, 90.0, 3, id="production-defaults"),
+        pytest.param({"stall_seconds": 30}, 30.0, 3, id="stall_seconds=30"),
+        # above the 15-minute model-progress limit, the transport limit still wins
+        pytest.param({"stall_seconds": 1200}, 1200.0, 3, id="stall_seconds=1200"),
+        pytest.param({"stall_retries": 0}, 90.0, 1, id="stall_retries=0"),
+        pytest.param({"stall_retries": 1}, 90.0, 2, id="stall_retries=1"),
+    ],
+)
+async def test_stream_stall_settings_set_owner_deadline_and_retry_count(
+    tmp_path: Path, provider: str, stall: dict[str, int], idle_seconds: float, attempts: int
+) -> None:
+    """stream_stall_seconds / stream_stall_retries, as the backend receives them,
+    set the completion owner's transport deadline and stall retry count."""
+
+    streams = [_HangingByteStream(b"") for _ in range(4)]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=streams[sum(s.entered.is_set() for s in streams)])
+
+    client = _mock_client(handler)
+    backend = _stalling_backend(provider, client, tmp_path, **stall)
+    clock = ManualDeadlineClock()
+    backend._completion_clock = clock
+    backend._completion_wait = _no_op_sleep
+    task = asyncio.create_task(
+        _collect(backend.complete([], [], control=completion_control()))
+    )
+    stalls: list[float] = []
+    try:
+        for stream in streams:
+            entered = asyncio.ensure_future(asyncio.wait_for(stream.entered.wait(), 10))
+            try:
+                done, _ = await await_or_fail(
+                    asyncio.wait({task, entered}, return_when=asyncio.FIRST_COMPLETED),
+                    what="next attempt or completion end",
+                )
+            finally:
+                entered.cancel()
+            if task in done:
+                break
+            opened_at = clock.now()
+            await clock.expire_next()
+            stalls.append(clock.now() - opened_at)
+        with pytest.raises(ProviderStallError) as caught:
+            await await_or_fail(task, what="stalled completion")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await client.aclose()
+
+    assert stalls == [idle_seconds] * attempts
+    assert str(caught.value) == f"provider transport stalled for {idle_seconds:.0f}s"
+
