@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import threading
 
-from ...core.store._history_index import StaleHistorySnapshot
+from ...core.store._history_index import (
+    InvalidHistoryPageRequest,
+    StaleHistorySnapshot,
+)
 from ..protocol import MAX_REQUEST_ID_BYTES, ErrorDescriptor, FrameCodec, ProtocolError
 from ..runtime import ServerRuntime
 from .history_projection import (
@@ -371,6 +374,8 @@ def _backward_history_request(
                 **({"end": validator["end"]} if before is not None else {}),
             }
         ) if read_page is not None else None
+    except InvalidHistoryPageRequest as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
     except StaleHistorySnapshot as exc:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
@@ -428,6 +433,8 @@ def _forward_history_request(
     offset = params.get("offset", 0)
     try:
         page = read_page({"offset": offset}) if read_page is not None else None
+    except InvalidHistoryPageRequest as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
     except StaleHistorySnapshot as exc:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,

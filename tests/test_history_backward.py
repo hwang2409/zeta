@@ -148,6 +148,49 @@ async def test_real_store_history_uses_index_not_full_projection(
     ]
 
 
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+@pytest.mark.asyncio
+async def test_real_store_history_preserves_out_of_range_cursor_response(
+    tmp_path: Path, direction: str
+) -> None:
+    async with _real_history_server(tmp_path, count=3) as (
+        reader,
+        writer,
+        session_id,
+        _server,
+    ):
+        if direction == "forward":
+            response = (await request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id, "offset": 100},
+            ))[-1]
+            assert response == {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"messages": [], "next_offset": None},
+            }
+            return
+
+        newest = await _history_request(
+            reader, writer, 3, session_id, {"before": None}
+        )
+        response = (await request(
+            reader,
+            writer,
+            4,
+            "session_history",
+            {
+                "session_id": session_id,
+                "before": newest["history_validator"]["end"] + 1,
+                "history_validator": newest["history_validator"],
+            },
+        ))[-1]
+        assert response["error"]["code"] == protocol.ErrorDescriptor.INVALID_PARAMS.value[0]
+
+
 @pytest.mark.asyncio
 async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -12,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...agent.receipt import encode_json
 from ...protocol.types import is_passive_harness_message, is_visible_harness_notice
 from ..checkpoints import ConversationEntry
 
@@ -44,6 +46,10 @@ class HistoryIndexThreadSafetyError(HistoryIndexError):
 
 class StaleHistorySnapshot(HistoryIndexError):
     """the authoritative transcript changed during a history request."""
+
+
+class InvalidHistoryPageRequest(HistoryIndexError):
+    """the caller supplied a cursor outside the indexed history."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +270,107 @@ class HistoryIndex:
             if connection is not None:
                 connection.close()
 
+    @staticmethod
+    def _entry_digest(previous: bytes, entry: object) -> bytes:
+        value = entry if isinstance(entry, Mapping) else entry.to_dict()
+        return hashlib.sha256(previous + encode_json(value) + b"\n").digest()
+
+    def _suffix_start(
+        self,
+        stored: Mapping[str, object],
+        expected: Mapping[str, object],
+        rows: tuple[object, ...],
+    ) -> int | None:
+        if stored.get("schema_version") != self.SCHEMA_VERSION or any(
+            stored.get(key) != expected.get(key) for key in ("st_dev", "st_ino")
+        ):
+            return None
+        stored_boundary = stored.get("byte_boundary")
+        expected_boundary = expected.get("byte_boundary")
+        if (
+            not isinstance(stored_boundary, int)
+            or not isinstance(expected_boundary, int)
+            or stored_boundary > expected_boundary
+        ):
+            return None
+        start = stored.get("last_seq")
+        if not isinstance(start, int) or not 0 <= start <= len(rows):
+            return None
+        boundary = rows[start - 1] if start else None
+        if stored.get("last_id") != (self._row(boundary)[1] if boundary else None):
+            return None
+        if stored.get("last_parent") != (self._row(boundary)[2] if boundary else None):
+            return None
+        digest_hex = stored.get("prefix_digest")
+        if not isinstance(digest_hex, str):
+            return None
+        try:
+            digest = bytes.fromhex(digest_hex)
+        except ValueError:
+            return None
+        suffix = rows[start:]
+        if not suffix:
+            return None
+        for entry in suffix:
+            digest = self._entry_digest(digest, entry)
+        return start if digest.hex() == expected.get("prefix_digest") else None
+
+    def _project_entries(
+        self, entries: tuple[object, ...], total: int
+    ) -> tuple[list[tuple[object, int | None]], int]:
+        projected: list[tuple[object, int | None]] = []
+        for entry in entries:
+            data = dict(entry.data)
+            group = total if self._belongs_in_history(entry.type, data) else None
+            projected.append((entry, group))
+            if self._starts_next_group(entry.type, data):
+                total += 1
+        return projected, total
+
+    def _write_correlations(
+        self, connection: sqlite3.Connection, entries: tuple[object, ...]
+    ) -> None:
+        for entry in entries:
+            data = dict(entry.data)
+            if entry.type == "message":
+                for approval in data.get("approval_requests", ()):
+                    connection.execute(
+                        "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
+                        (approval["request_id"], self._value(approval["tool_call"])),
+                    )
+            accepted = data.get("accepted_message")
+            if entry.type == "client_delivery" and isinstance(accepted, dict):
+                connection.execute(
+                    "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
+                    (data["delivery_id"], self._value(accepted)),
+                )
+
+    def _append_entries(
+        self,
+        connection: sqlite3.Connection,
+        facts: object,
+        entries: tuple[object, ...],
+    ) -> None:
+        if not entries:
+            return
+        expected_seq = int(
+            connection.execute("SELECT COALESCE(MAX(seq),0) + 1 FROM entries").fetchone()[0]
+        )
+        if expected_seq != self._row(entries[0])[0]:
+            raise HistoryIndexUnavailableError("history index delta is not contiguous")
+        stored = self._stored_facts(connection) or {}
+        projected, total = self._project_entries(
+            entries, int(stored.get("history_groups", 0))
+        )
+        with connection:
+            connection.executemany(
+                "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
+                "VALUES(?,?,?,?,?,?,?)",
+                ((*self._row(entry), group) for entry, group in projected),
+            )
+            self._write_correlations(connection, entries)
+            self._set_meta(connection, facts, total=total)
+
     def sync_validated(self, source_facts: object, validated_rows: Iterable[object]) -> None:
         """Make the disposable index match validated authority without failing it."""
         with self._lock:
@@ -272,15 +379,23 @@ class HistoryIndex:
                 self._available = self._exists()
                 return
             rows = tuple(validated_rows)
+            expected = self._facts(source_facts)
             try:
                 connection = self._connection(write=True)
                 try:
                     self._create_schema(connection)
                     stored = self._stored_facts(connection)
-                    expected = self._facts(source_facts)
                     if stored is not None and all(
                         stored.get(key) == value for key, value in expected.items()
                     ) and stored.get("schema_version") == self.SCHEMA_VERSION:
+                        self._available = True
+                        return
+                    suffix_start = (
+                        self._suffix_start(stored, expected, rows)
+                        if stored is not None else None
+                    )
+                    if suffix_start is not None:
+                        self._append_entries(connection, source_facts, rows[suffix_start:])
                         self._available = True
                         return
                 finally:
@@ -305,43 +420,7 @@ class HistoryIndex:
             connection: sqlite3.Connection | None = None
             try:
                 connection = self._connection(write=True)
-                expected = int(
-                    connection.execute(
-                        "SELECT COALESCE(MAX(seq),0) + 1 FROM entries"
-                    ).fetchone()[0]
-                )
-                if expected != entries[0].seq:
-                    raise HistoryIndexUnavailableError("history index delta is not contiguous")
-                stored = self._stored_facts(connection) or {}
-                total = int(stored.get("history_groups", 0))
-                projected: list[tuple[object, int | None]] = []
-                for entry in entries:
-                    data = dict(entry.data)
-                    group = total if self._belongs_in_history(entry.type, data) else None
-                    projected.append((entry, group))
-                    if self._starts_next_group(entry.type, data):
-                        total += 1
-                with connection:
-                    connection.executemany(
-                        "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        ((*self._row(entry), group) for entry, group in projected),
-                    )
-                    for entry in entries:
-                        data = dict(entry.data)
-                        if entry.type == "message":
-                            for approval in data.get("approval_requests", ()):
-                                connection.execute(
-                                    "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
-                                    (approval["request_id"], self._value(approval["tool_call"])),
-                                )
-                        accepted = data.get("accepted_message")
-                        if entry.type == "client_delivery" and isinstance(accepted, dict):
-                            connection.execute(
-                                "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
-                                (data["delivery_id"], self._value(accepted)),
-                            )
-                    self._set_meta(connection, facts, total=total)
+                self._append_entries(connection, facts, entries)
                 self._available = True
             except HistoryIndexError:
                 raise
@@ -351,6 +430,86 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
+    def _page_bounds(
+        self, request: Mapping[str, object], total: int
+    ) -> tuple[int, int]:
+        if request.get("backward"):
+            raw_before = request.get("before")
+            if raw_before is None:
+                before = total + 1
+            else:
+                before = int(raw_before)
+                if before < 0 or before > total:
+                    raise InvalidHistoryPageRequest("before must not exceed history end")
+            return max(0, before - self.PAGE_LIMIT), before
+        start = int(request.get("offset", 0))
+        if start < 0:
+            raise InvalidHistoryPageRequest("offset must be nonnegative")
+        if start > total:
+            return start, start
+        return start, min(total + 1, start + self.PAGE_LIMIT)
+
+    def _read_groups(
+        self, connection: sqlite3.Connection, start: int, stop: int
+    ) -> tuple[tuple[tuple[ConversationEntry, ...], ...], set[str]]:
+        raw = connection.execute(
+            "SELECT seq,id,parent_id,lane,type,data,history_group FROM entries "
+            "WHERE history_group>=? AND history_group<? ORDER BY seq",
+            (start, stop),
+        ).fetchall()
+        groups: list[list[ConversationEntry]] = [[] for _ in range(stop - start)]
+        request_ids: set[str] = set()
+        for seq, entry_id, parent_id, lane, entry_type, data_json, group in raw:
+            data = json.loads(data_json)
+            if entry_type == "approval_resolution":
+                request_ids.add(data["request_id"])
+            if entry_type == "client_delivery" and data.get("status") in {"delivered", "dropped"}:
+                accepted = connection.execute(
+                    "SELECT message FROM accepted_messages WHERE delivery_id=?",
+                    (data.get("delivery_id"),),
+                ).fetchone()
+                if accepted is not None:
+                    data = {**data, "_accepted_message": json.loads(accepted[0])}
+            groups[int(group) - start].append(
+                ConversationEntry(seq, entry_id, parent_id, lane, entry_type, data)
+            )
+        return tuple(tuple(group) for group in groups), request_ids
+
+    def _approval_calls(
+        self, connection: sqlite3.Connection, request_ids: set[str]
+    ) -> dict[str, object]:
+        if not request_ids:
+            return {}
+        placeholders = ",".join("?" for _ in request_ids)
+        return {
+            request_id: json.loads(tool_call)
+            for request_id, tool_call in connection.execute(
+                f"SELECT request_id,tool_call FROM approval_calls WHERE request_id IN ({placeholders})",
+                tuple(request_ids),
+            ).fetchall()
+        }
+
+    def _query_page(
+        self,
+        connection: sqlite3.Connection,
+        request: Mapping[str, object],
+        total: int,
+    ) -> IndexedHistoryPage:
+        start, stop = self._page_bounds(request, total)
+        groups, request_ids = self._read_groups(connection, start, stop)
+        endpoint_row = connection.execute(
+            "SELECT id FROM entries WHERE history_group=? AND type IN "
+            "('message','notification','warning') ORDER BY seq DESC LIMIT 1",
+            (total - 1,),
+        ).fetchone() if total else None
+        return IndexedHistoryPage(
+            groups,
+            start,
+            total,
+            self._approval_calls(connection, request_ids),
+            endpoint_row[0] if endpoint_row else None,
+        )
+
     def page(self, request: object, g0: object) -> IndexedHistoryPage:
         """Return at most one bounded group page; the caller performs g1."""
         with self._lock:
@@ -359,64 +518,20 @@ class HistoryIndex:
                 raise HistoryIndexUnavailableError("history index is unavailable")
             connection: sqlite3.Connection | None = None
             try:
-                request = request if isinstance(request, Mapping) else vars(request)
+                page_request = request if isinstance(request, Mapping) else vars(request)
                 connection = self._connection(write=False)
                 stored = self._stored_facts(connection)
                 requested = self._facts(g0)
-                if stored is None or any(stored.get(key) != value for key, value in requested.items()):
+                if stored is None or any(
+                    stored.get(key) != value for key, value in requested.items()
+                ):
                     self._available = False
                     raise StaleHistorySnapshot
                 current_total = int(stored.get("history_groups", 0))
-                total = int(request.get("end", current_total))
+                total = int(page_request.get("end", current_total))
                 if total < 0 or total > current_total:
                     raise StaleHistorySnapshot
-                if request.get("backward"):
-                    raw_before = request.get("before")
-                    before = total + 1 if raw_before is None else int(raw_before)
-                    start = max(0, before - self.PAGE_LIMIT)
-                    stop = before
-                else:
-                    start = int(request.get("offset", 0))
-                    stop = min(total + 1, start + self.PAGE_LIMIT)
-                if start < 0 or stop < start or stop > total + 1:
-                    raise ValueError("invalid history page")
-                raw = connection.execute(
-                    "SELECT seq,id,parent_id,lane,type,data,history_group FROM entries "
-                    "WHERE history_group>=? AND history_group<? ORDER BY seq",
-                    (start, stop),
-                ).fetchall()
-                groups: list[list[ConversationEntry]] = [[] for _ in range(stop - start)]
-                request_ids: set[str] = set()
-                for seq, entry_id, parent_id, lane, entry_type, data_json, group in raw:
-                    data = json.loads(data_json)
-                    if entry_type == "approval_resolution":
-                        request_ids.add(data["request_id"])
-                    if entry_type == "client_delivery" and data.get("status") in {"delivered", "dropped"}:
-                        accepted = connection.execute(
-                            "SELECT message FROM accepted_messages WHERE delivery_id=?",
-                            (data.get("delivery_id"),),
-                        ).fetchone()
-                        if accepted is not None:
-                            data = {**data, "_accepted_message": json.loads(accepted[0])}
-                    groups[int(group) - start].append(
-                        ConversationEntry(seq, entry_id, parent_id, lane, entry_type, data)
-                    )
-                approval_calls = {
-                    request_id: json.loads(tool_call)
-                    for request_id, tool_call in connection.execute(
-                        f"SELECT request_id,tool_call FROM approval_calls WHERE request_id IN ({','.join('?' for _ in request_ids)})",
-                        tuple(request_ids),
-                    ).fetchall()
-                } if request_ids else {}
-                endpoint_row = connection.execute(
-                    "SELECT id FROM entries WHERE history_group=? AND type IN "
-                    "('message','notification','warning') ORDER BY seq DESC LIMIT 1",
-                    (total - 1,),
-                ).fetchone() if total else None
-                return IndexedHistoryPage(
-                    tuple(tuple(group) for group in groups), start, total,
-                    approval_calls, endpoint_row[0] if endpoint_row else None,
-                )
+                return self._query_page(connection, page_request, total)
             except HistoryIndexError:
                 raise
             except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -433,6 +548,69 @@ class HistoryIndex:
             self._closed = True
 
 
+def _rebuild_history_index(store: ConversationStore) -> None:
+    writer = store._new_persistent_durable_writer()
+    try:
+        with writer._append_lock():
+            store._sync_history_index(store.active_branch_snapshot())
+    finally:
+        writer.close()
+
+
+def _read_stable_page(
+    store: ConversationStore,
+    index: HistoryIndex,
+    request: Mapping[str, object],
+) -> IndexedHistoryPage:
+    for attempt in range(_HISTORY_PAGE_ATTEMPTS):
+        if not index.available:
+            _rebuild_history_index(store)
+        facts = store._history_index_facts()
+        try:
+            page = index.page(request, facts)
+        except StaleHistorySnapshot:
+            if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+                raise
+            index._mark_unavailable()
+            continue
+        except HistoryIndexUnavailableError as exc:
+            if store._history_index_facts() != facts:
+                raise StaleHistorySnapshot from exc
+            if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+                raise
+            index._mark_unavailable()
+            continue
+        if store._history_index_facts() == facts:
+            return page
+        if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+            raise StaleHistorySnapshot
+    raise HistoryIndexUnavailableError("history index is unavailable")
+
+
+def _overlay_resident_entries(
+    store: ConversationStore, page: IndexedHistoryPage
+) -> IndexedHistoryPage:
+    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
+        if entry.seq > len(store._entries):
+            return entry
+        resident = store._entries[entry.seq - 1]
+        if resident.id != entry.id:
+            return entry
+        accepted = entry.data.get("_accepted_message")
+        if accepted is None:
+            return resident
+        return replace(
+            resident,
+            data={**resident.data, "_accepted_message": accepted},
+        )
+
+    groups = tuple(
+        tuple(resident_entry(entry) for entry in group)
+        for group in page.groups
+    )
+    return replace(page, groups=groups)
+
+
 class HistoryPageStoreMixin:
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]
@@ -443,51 +621,6 @@ class HistoryPageStoreMixin:
             return None
         if index is None or (self._read_only and not index.available):
             return None
-        for attempt in range(_HISTORY_PAGE_ATTEMPTS):
-            if not index.available:
-                writer = self._new_persistent_durable_writer()
-                try:
-                    with writer._append_lock():
-                        self._sync_history_index(self.active_branch_snapshot())
-                finally:
-                    writer.close()
-            facts = self._history_index_facts()
-            try:
-                page = index.page(request, facts)
-            except StaleHistorySnapshot:
-                if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                    raise
-                index._mark_unavailable()
-                continue
-            except HistoryIndexUnavailableError as exc:
-                if self._history_index_facts() != facts:
-                    raise StaleHistorySnapshot from exc
-                if self._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                    raise
-                index._mark_unavailable()
-                continue
-            if self._history_index_facts() != facts:
-                if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                    raise StaleHistorySnapshot
-                continue
-
-            def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-                if entry.seq > len(self._entries):
-                    return entry
-                resident = self._entries[entry.seq - 1]
-                if resident.id != entry.id:
-                    return entry
-                accepted = entry.data.get("_accepted_message")
-                if accepted is not None:
-                    return replace(
-                        resident,
-                        data={**resident.data, "_accepted_message": accepted},
-                    )
-                return resident
-
-            groups = tuple(
-                tuple(resident_entry(entry) for entry in group)
-                for group in page.groups
-            )
-            return replace(page, groups=groups)
-        raise HistoryIndexUnavailableError("history index is unavailable")
+        return _overlay_resident_entries(
+            self, _read_stable_page(self, index, request)
+        )
