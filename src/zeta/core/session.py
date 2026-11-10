@@ -600,6 +600,25 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         *,
         _reference_authority: SessionReferenceAuthority | None = None,
     ) -> None:
+        project_domains: set[tuple[str, str]] = set()
+        if _reference_authority is None:
+            try:
+                metadata = self._read(session_id)
+                if metadata.project_id is not None:
+                    project_domains.add((metadata.project_id, "sessions"))
+                with session_directory(self.sessions_dir, session_id) as (_, directory_fd):
+                    pending = json.loads(
+                        read_session_file(directory_fd, "project_link_pending.json")
+                    )
+                if isinstance(pending, dict):
+                    current = pending.get("project_id")
+                    if isinstance(current, str):
+                        project_domains.add((current, "sessions"))
+                    previous = pending.get("previous_project_id")
+                    if isinstance(previous, str):
+                        project_domains.add((previous, "sessions"))
+            except (FileNotFoundError, OSError, ValueError, SessionError):
+                pass
         publication = (
             nullcontext(_reference_authority)
             if _reference_authority is not None
@@ -607,6 +626,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 self.home,
                 self._storage_lease,
                 referenced_ids=(session_id,),
+                project_domains=tuple(sorted(project_domains)),
             )
         )
         with publication as authority:
