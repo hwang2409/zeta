@@ -1967,8 +1967,10 @@ class FinishGateBackend(CompletionBackend):
 class PostCapBudgetBackend(CompletionBackend):
     def __init__(self) -> None:
         self.release_grandchild = asyncio.Event()
+        self.release_post_cap = asyncio.Event()
         self.post_cap_exhausted = asyncio.Event()
         self.fresh_prompt_seen = asyncio.Event()
+        self.release_fresh_prompt = asyncio.Event()
         self.fresh_requests: list[list[Message]] = []
         self.gate_calls = 0
 
@@ -2021,6 +2023,9 @@ class PostCapBudgetBackend(CompletionBackend):
         elif last_user == "fresh external prompt":
             self.fresh_requests.append(list(messages))
             self.fresh_prompt_seen.set()
+            await await_or_fail(
+                self.release_fresh_prompt.wait(), what="release fresh prompt response"
+            )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -2048,6 +2053,9 @@ class PostCapBudgetBackend(CompletionBackend):
         # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate and self.gate_calls == 4:
             self.post_cap_exhausted.set()
+            await await_or_fail(
+                self.release_post_cap.wait(), what="release post-cap response"
+            )
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
@@ -3999,6 +4007,8 @@ async def _run_post_cap_tool_cycle(
         )
 
         child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
+        if not send_fresh_prompt:
+            backend.release_post_cap.set()
         if send_fresh_prompt:
             flow = owner.conversation_channel._delivery_targets[child_handle].flow
             prompt_suppressed = asyncio.Event()
@@ -4025,6 +4035,7 @@ async def _run_post_cap_tool_cycle(
                 )
                 is None
             )
+            backend.release_post_cap.set()
             done, pending = await await_or_fail(
                 asyncio.wait(
                     {fresh_response, suppressed_response},
@@ -4040,6 +4051,7 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
             state = next(
