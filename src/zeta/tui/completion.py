@@ -2,23 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import re
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 
+from ..core.commands.path_completion import complete_paths
 from ..core.slash import SlashCommandRegistry
 from ..skills.invocation import dollar_completion_prefix
 from .models import match_models
-
-PATH_COMPLETION_LIMIT = 50
-PATH_SCAN_LIMIT = 1000
-_PATH_TOKEN_RE = re.compile(
-    r'(?<!\S)@(?:"(?P<quoted>[^"\n]*)|(?P<unquoted>[^\s]*))$'
-)
 
 
 class SlashCompleter(Completer):
@@ -115,79 +108,16 @@ class PathCompleter(Completer):
         self, document: Document, complete_event: CompleteEvent
     ) -> Iterator[Completion]:
         del complete_event
-        match = _PATH_TOKEN_RE.search(document.text_before_cursor)
-        if match is None:
-            return
-        quoted = match.group("quoted") is not None
-        path_text = match.group("quoted") or match.group("unquoted") or ""
-        directory, display_prefix, basename = self._completion_context(path_text)
-        show_hidden = basename.startswith(".")
-
-        try:
-            entries = os.scandir(directory)
-        except OSError:
-            return
-        with entries:
-            matches: list[tuple[bool, str]] = []
-            for index, entry in enumerate(entries):
-                if index >= PATH_SCAN_LIMIT:
-                    break
-                name = entry.name
-                if not name.startswith(basename) or (
-                    name.startswith(".") and not show_hidden
-                ):
-                    continue
-                try:
-                    is_directory = entry.is_dir()
-                except OSError:
-                    continue
-                matches.append((is_directory, name))
-
-        matches.sort(key=lambda item: (not item[0], item[1]))
-        for is_directory, name in matches[:PATH_COMPLETION_LIMIT]:
-            candidate = self._candidate(display_prefix, name, is_directory)
-            completion_text = self._quoted_candidate(candidate, quoted, is_directory)
-            yield Completion(
-                completion_text,
-                start_position=-len(path_text),
-                display=f"@{completion_text}",
-                display_meta="directory" if is_directory else "file",
-            )
-
-    def _completion_context(self, path_text: str) -> tuple[Path, str, str]:
-        if path_text == "~":
-            return Path.home(), "~/", ""
-        slash = path_text.rfind("/")
-        if slash < 0:
-            return self.base_dir, "", path_text
-        display_prefix = path_text[: slash + 1]
-        directory_text = path_text[:slash] or "/"
-        directory = (
-            Path.home()
-            if directory_text == "~"
-            else Path(directory_text).expanduser()
+        rows, _truncated = complete_paths(
+            document.text_before_cursor, self.base_dir
         )
-        if not directory.is_absolute():
-            directory = self.base_dir / directory
-        return directory, display_prefix, path_text[slash + 1 :]
-
-    @staticmethod
-    def _candidate(display_prefix: str, name: str, is_directory: bool) -> str:
-        if display_prefix == "/":
-            candidate = f"/{name}"
-        else:
-            candidate = f"{display_prefix}{name}"
-        return f"{candidate}/" if is_directory else candidate
-
-    @staticmethod
-    def _quoted_candidate(candidate: str, quoted: bool, is_directory: bool) -> str:
-        if quoted:
-            closing_quote = "" if is_directory else '"'
-            return f"{candidate}{closing_quote}"
-        if not any(character.isspace() for character in candidate):
-            return candidate
-        closing_quote = "" if is_directory else '"'
-        return f'"{candidate}{closing_quote}'
+        for row in rows:
+            yield Completion(
+                row.text,
+                start_position=row.start_position,
+                display=row.display,
+                display_meta=row.kind,
+            )
 
 
 class ComposerCompleter(Completer):
