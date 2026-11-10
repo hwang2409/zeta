@@ -97,6 +97,8 @@ async def _probe_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         writer.write(b'{"jsonrpc":"2.0","method":"event","params":{}}\n')
         writer.write(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
         await writer.drain()
+        # test-contract: transport raw socket peer is required to exercise probe framing and eof.
+        await reader.readline()
         writer.write(b'{"jsonrpc":"2.0","id":2,"result":{"state":"tool"}}\n')
         await writer.drain()
     finally:
