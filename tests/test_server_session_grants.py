@@ -1908,51 +1908,31 @@ async def test_turn_end_send_ready_orders(
     original_event = server.control._event
     original_run_notification_turn = server.turn_contexts.run_notification_turn
 
-    async def gated_notification_turn(*args: object, **kwargs: object) -> object:
+    async def gated_notification_turn(
+        session_id: str, loop: object, emit: object, **kwargs: object
+    ) -> object:
         if order == "send_first":
             notification_run_started.set()
             await await_or_fail(
                 release_notification_run.wait(), what="notification turn scheduling"
             )
-        return await original_run_notification_turn(*args, **kwargs)
-
-    async def gated_write(payload: bytes) -> bool:
-        frame = json.loads(payload)
-        is_notification_start = (
-            frame.get("params", {}).get("event") == "turn_start"
-            and order == "notification_first"
-            and turn_end_published.is_set()
+        async def gated_emit(event: object, **emit_kwargs: object) -> object:
+            result = await emit(event, **emit_kwargs)  # type: ignore[misc]
+            if (
+                order == "notification_first"
+                and getattr(event, "type", None) is StreamEventType.TURN_START
+            ):
+                notification_start_ready.set()
+                await await_or_fail(
+                    release_notification_start.wait(), what="notification start write"
+                )
+            return result
+        return await original_run_notification_turn(
+            session_id, loop, gated_emit, **kwargs
         )
-        result = await original_write(payload)
-        if is_notification_start:
-            notification_start_ready.set()
-            await await_or_fail(
-                release_notification_start.wait(), what="notification start write"
-            )
-        return result
 
     async def gated_event(event: object, *args: object, **kwargs: object) -> None:
-        if (
-            getattr(event, "type", None) is StreamEventType.TURN_START
-            and kwargs.get("background") is True
-            and order == "send_first"
-            and turn_end_published.is_set()
-            and not notification_start_ready.is_set()
-        ):
-            notification_start_ready.set()
-            await await_or_fail(
-                release_notification_start.wait(), what="notification start"
-            )
         await original_event(event, *args, **kwargs)  # type: ignore[arg-type]
-        if (
-            getattr(event, "type", None) is StreamEventType.TURN_START
-            and kwargs.get("background") is True
-            and order == "notification_first"
-        ):
-            notification_start_ready.set()
-            await await_or_fail(
-                release_notification_start.wait(), what="notification start write"
-            )
         if (
             getattr(event, "type", None) is StreamEventType.TURN_END
             and not turn_end_published.is_set()
@@ -1967,12 +1947,6 @@ async def test_turn_end_send_ready_orders(
     )
     try:
         await request(1, "hello", {"protocol_version": "1.2"})
-        controller = server.connections.controller_metadata()
-        assert controller is not None
-        connection = controller.connection
-        original_write = connection._write_physical
-        # test-contract: seam the real controller transport write
-        monkeypatch.setattr(connection, "_write_physical", gated_write)
         session = (await request(2, "new_session", {"provider": "codex"}))[-1][
             "result"
         ]["session"]
