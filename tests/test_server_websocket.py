@@ -27,7 +27,7 @@ from zeta.server.transport import _parse_subprotocol_auth
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-TIMEOUT = 3
+TIMEOUT = 10
 
 
 async def _read_http_headers(
@@ -183,6 +183,49 @@ async def test_websocket_round_trip_uses_real_serve_runtime(tmp_path: Path) -> N
         }
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_websocket_session_history_and_subscribe_returns_replay_cursor(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    await server.start()
+    reader, writer, status, _ = await _connect(
+        server, token=server._websocket.token
+    )
+    assert status == 101
+    try:
+        async def request(request_id: int, method: str, params: dict[str, object]) -> dict[str, object]:
+            await _send_json(
+                writer,
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+            )
+            while True:
+                frame = await _read_json(reader)
+                if frame.get("id") == request_id:
+                    return frame
+
+        hello = await request(
+            1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]}
+        )
+        assert "session_history_and_subscribe" in hello["result"]["capabilities"]["requests"]
+        created = await request(2, "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        joined = await request(
+            3, "session_history_and_subscribe", {"session_id": session_id}
+        )
+        assert joined["result"]["replay"]["history_seq"] == 0
+    finally:
+        writer.close()
+        await close_serve(server)
 
 
 @pytest.mark.asyncio

@@ -104,6 +104,7 @@ def _fit_history_groups(
             projection.entry_index,
             tuple(cache_groups),
             tuple(cache_sizes),
+            projection.frontier,
         ),
     )
 
@@ -259,6 +260,44 @@ def _backward_history_request(
     content_read: bool,
     served_turn_end: bool,
 ) -> dict:
+    return _backward_history_page(
+        runtime,
+        params,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )[0]
+
+
+def replay_history(
+    runtime: ServerRuntime,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> tuple[dict, int, str | None]:
+    """Return the newest backward page and its stable frontier row."""
+    return _backward_history_page(
+        runtime,
+        {"before": None},
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )
+
+
+def _backward_history_page(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> tuple[dict, int, str | None]:
     before = params["before"]
     validator = params.get("history_validator")
     if before is None:
@@ -297,7 +336,7 @@ def _backward_history_request(
         fidelity,
         content_read,
         served_turn_end,
-    )
+    ), projection.frontier, projection.frontier_row_id
 
 
 def _forward_history_request(
