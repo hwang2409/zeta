@@ -952,6 +952,7 @@ class AgentNavigation:
             and (entry.path != self.root_path or self.child_view_active)
         )
         return agent_tree_signature(self.current_path, self.selected_index, running, self._path_signature)
+
     def _request_agent_tree_signature(self, force: bool) -> None:
         if self._invalidate is None:
             return
@@ -971,9 +972,7 @@ class AgentNavigation:
             running, self._path_signature
         ))
         self._signature_task = task
-        task.add_done_callback(
-            lambda completed: self._agent_tree_signature_done(generation, force, completed)
-        )
+        task.add_done_callback(lambda completed: self._agent_tree_signature_done(generation, force, completed))
     def _agent_tree_signature_done(
         self,
         generation: int,
@@ -992,8 +991,7 @@ class AgentNavigation:
         self._signature_force = False
         try: signature = task.result()
         except (OSError, ValueError): return
-        if self._invalidate is not None and self._refresh_with_signature(signature, force):
-            self._invalidate()
+        if self._invalidate is not None and self._refresh_with_signature(signature, force): self._invalidate()
     def _schedule_refresh(self, delay: float) -> None:
         if self._invalidate is None or self._refresh_handle is not None:
             return
@@ -1045,7 +1043,7 @@ class AgentNavigation:
             if self.child_view_active
             else False
         )
-        if self._invalidate is None:
+        if self._invalidate is None or not asyncio.get_event_loop().is_running():
             signature = self._agent_tree_signature()
             return transcript_changed or todo_changed or self._refresh_with_signature(
                 signature, force
