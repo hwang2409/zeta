@@ -1295,6 +1295,15 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
                 _assert_invalid(
                     case.validator, missing_key, f"{case.name} missing {key}"
                 )
+            if case.name.startswith("retention_"):
+                typed_key = min(case.required)
+                wrong_type = dict(case.valid)
+                wrong_type[typed_key] = object()
+                _assert_invalid(
+                    case.validator,
+                    wrong_type,
+                    f"{case.name} wrong type for {typed_key}",
+                )
     finally:
         os.close(account_fd)
         store.close()
