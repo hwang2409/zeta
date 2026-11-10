@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background_owner import BackgroundAgentOwner
 from zeta.agent.presets import AGENT_PRESETS
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall

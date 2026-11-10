@@ -1050,8 +1050,8 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
             },
             "model": {
                 "type": "string",
-                "enum": known_model_names(),
                 "description": (
+                    "Known model names include: " + ", ".join(known_model_names()) + ". " +
                     "Run the child on this model instead of inheriting the "
                     "parent's. The provider follows from the model, so this "
                     "is how one provider delegates to another. Implies "

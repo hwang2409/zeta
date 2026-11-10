@@ -2360,21 +2360,31 @@ async def test_resume_ambiguous_prefix_has_dedicated_error(
 ) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     sessions = server.runtime.manager.sessions_dir
-    (sessions / "abcd1111").mkdir(parents=True)
-    (sessions / "abcd2222").mkdir(parents=True)
+    session_ids = (
+        "abcd1111aaaa0000",
+        "abcd1111bbbb0000",
+        "abcd1111aaaa1111",
+    )
+    for session_id in session_ids:
+        (sessions / session_id).mkdir(parents=True)
     reader, writer = await _connect(server)
     try:
         await _legacy_hello(reader, writer)
         failed = await _request(
-            reader, writer, 2, "resume", {"session_id": "abcd"}
+            reader, writer, 2, "resume", {"session_id": "abcd1111"}
         )
-        assert failed[-1]["error"]["data"] == {
-            "code": "session_id_ambiguous",
-            "session_id": "abcd",
-            "candidates": ["abcd1111", "abcd2222"],
-        }
-        assert "abcd1111" in failed[-1]["error"]["message"]
-        assert "abcd2222" in failed[-1]["error"]["message"]
+        assert failed[-1]["error"]["data"]["code"] == "session_id_ambiguous"
+        assert failed[-1]["error"]["data"]["session_id"] == "abcd1111"
+        candidates = failed[-1]["error"]["data"]["candidates"]
+        assert candidates == [
+            "abcd1111aaaa0",
+            "abcd1111aaaa1",
+            "abcd1111b",
+        ]
+        resolved = tuple(
+            server.runtime.manager.resolve_id(candidate) for candidate in candidates
+        )
+        assert len(set(resolved)) == len(candidates)
     finally:
         await close_serve(server, writer)
 

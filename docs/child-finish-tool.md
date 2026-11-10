@@ -57,19 +57,19 @@ should mean “available for more work,” not “destroy this run.”
   (`src/zeta/agent/receipt.py:21-27`).
 - if an inferred final turn still owns children or tasks, the finish gate asks
   the model to wait, cancel, or call `agent_handoff`
-  (`src/zeta/agent/background.py:33-72`, `src/zeta/agent/finish_gate.py:195-229`).
+  (`src/zeta/agent/background_owner.py:33-72`, `src/zeta/agent/finish_gate.py:195-229`).
   its defaults are 8 model turns, 600 seconds for the model bound, and 3,600
-  seconds for a running task (`src/zeta/agent/background.py:91-122`). pr #512
+  seconds for a running task (`src/zeta/agent/background_owner.py:91-122`). pr #512
   lets a running task outlive the short bound but retains the one-hour safety
   bound.
 - child closure aborts the registry and waits for it to kill background tasks;
   the resulting killed task ids are included in the completion path
-  (`src/zeta/agent/background.py:880-931`).
+  (`src/zeta/agent/background_lifecycle.py:445-496`).
 - live markers and lifecycle files drive `agent_status` and tui run controls
   (`src/zeta/tools/agent/__init__.py:740-772`,
   `src/zeta/tui/cards/agent.py:726-843`). restart recovery cancels unfinished
   descendants instead of recreating their loops
-  (`src/zeta/agent/background.py:479-580`).
+  (`src/zeta/agent/background_lifecycle.py:44-145`).
 - a live child holds an asyncio run and its backend, store, registry, and tool
   state. it holds at least three fds: the session-directory fd in
   `ConversationStore`, the separate `runtime.lease` file fd held by its

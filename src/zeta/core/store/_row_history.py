@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from ...protocol.types import (
     ASSISTANT_RESPONSE_ABORTED,
     ASSISTANT_RESPONSE_COMPLETED,
+    ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
     MESSAGE_ORIGIN_METADATA,
     MessageOrigin,
@@ -65,16 +66,17 @@ class DeliveredMessage:
 
 @dataclass(frozen=True, slots=True)
 class AssistantResponseAfter:
-    """The first completed or aborted assistant reply after ``seq``."""
+    """The first completed, aborted, or failed assistant reply after ``seq``."""
 
     seq: int
 
 
 @dataclass(frozen=True, slots=True)
 class UserTurnMessageAfter:
-    """The first user-authored message after ``seq``."""
+    """The first user-role message with ``origin`` after ``seq``."""
 
     seq: int
+    origin: MessageOrigin
 
 
 type RecentRowKey = (
@@ -114,11 +116,11 @@ def _predicate(key: RecentRowKey) -> tuple[str, Callable[[dict[str, Any]], bool]
             )
         case AssistantResponseAfter():
             return "message", _is_assistant_response
-        case UserTurnMessageAfter():
+        case UserTurnMessageAfter(_seq, origin):
             return "message", lambda data: (
                 data["message"].get("role") == "user"
                 and _metadata(data["message"]).get(MESSAGE_ORIGIN_METADATA)
-                == MessageOrigin.USER.value
+                == origin.value
             )
     raise TypeError(f"unknown recent row key: {key!r}")
 
@@ -131,6 +133,7 @@ def _is_assistant_response(data: dict[str, Any]) -> bool:
     return metadata.get(ASSISTANT_RESPONSE_STATE) in {
         ASSISTANT_RESPONSE_COMPLETED,
         ASSISTANT_RESPONSE_ABORTED,
+        ASSISTANT_RESPONSE_FAILED,
     } and not metadata.get("compaction_summary")
 
 

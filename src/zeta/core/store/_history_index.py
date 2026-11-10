@@ -662,6 +662,10 @@ def _overlay_resident_entries(
 
 
 class HistoryPageStoreMixin:
+    @property
+    def repair_generation(self: ConversationStore) -> str | None:
+        return self._repair_generation
+
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]
     ) -> IndexedHistoryPage | None:

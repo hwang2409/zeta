@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -3766,3 +3767,43 @@ async def test_async_store_dispatches_a_typed_mutation(
         assert not isinstance(observed[0], str)
     finally:
         await asyncio.to_thread(store.close)
+
+
+def test_observer_snapshot_reports_stable_torn_tail(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="observer-stable")
+    store.append_message(message(MessageRole.ASSISTANT, "complete"))
+    with store.path.open("ab") as handle:
+        handle.write(b'{"type":"message"')
+    store.close()
+
+    with pytest.raises(ConversationIntegrityError):
+        ConversationStore(
+            tmp_path,
+            session_id="observer-stable",
+            _read_only=True,
+            _observer_snapshot=True,
+        )
+
+
+def test_observer_snapshot_keeps_prefix_during_active_append(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="observer-active")
+    store.append_message(message(MessageRole.ASSISTANT, "complete"))
+    lock_fd = os.open(store.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        with store.path.open("ab") as handle:
+            handle.write(b'{"type":"message"')
+        observed = ConversationStore(
+            tmp_path,
+            session_id="observer-active",
+            _read_only=True,
+            _observer_snapshot=True,
+        )
+        try:
+            assert [item.content[0].text for item in observed.messages()] == ["complete"]
+        finally:
+            observed.close()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        store.close()
