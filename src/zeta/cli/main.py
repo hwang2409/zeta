@@ -1055,7 +1055,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         return run_remote_bridge(
             env_home(),
-            session_id=args.descriptor, 
+            session_id=args.descriptor,
             list_mode=args.bridge_action == "list",
         )
     if args.command == "login":
