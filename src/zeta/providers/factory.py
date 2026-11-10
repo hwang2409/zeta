@@ -12,7 +12,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from ..accounts import AccountCredentials, AccountId, AccountStore
+from ..accounts import (
+    AccountCredentialLockTimeoutError,
+    AccountCredentials,
+    AccountId,
+    AccountStore,
+)
 from ..codex import CodexCredentialDriver
 from ..config.settings import load_settings
 from ..core.session import account_home, env_home
@@ -27,13 +32,13 @@ from .anthropic import (
     AnthropicCredentialDriver,
 )
 from .codex import DEFAULT_CODEX_MODEL, CodexBackend
+from .completion import MAX_STALL_RETRIES, TRANSPORT_IDLE_SECONDS
 from .ollama import (
     DEFAULT_OLLAMA_MODEL,
     OLLAMA_API_URL,
     OllamaBackend,
     model_context_window,
 )
-from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 
@@ -92,6 +97,20 @@ def _anthropic_credential(
     return AnthropicApiKeyCredential(api_key)
 
 
+def child_credential_error(
+    store: AccountCredentials | None, provider: str
+) -> str | None:
+    if store is None:
+        return None
+    try:
+        tokens = store.read() or store.bootstrap()
+    except AccountCredentialLockTimeoutError:
+        return None
+    if tokens is None:
+        return f"agent error: not logged in to {provider}; run zeta login --provider {provider}"
+    return None
+
+
 def build_backend(
     provider: str,
     model: str | None,
@@ -109,10 +128,10 @@ def build_backend(
     runtime_home = Path(home) if home is not None else env_home()
     stall_kwargs = {
         "stall_seconds": (
-            DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds
+            TRANSPORT_IDLE_SECONDS if stall_seconds is None else stall_seconds
         ),
         "stall_retries": (
-            DEFAULT_STREAM_STALL_RETRIES if stall_retries is None else stall_retries
+            MAX_STALL_RETRIES if stall_retries is None else stall_retries
         ),
     }
     if provider == "claude":
@@ -182,6 +201,7 @@ __all__ = [
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_OLLAMA_MODEL",
     "build_backend",
+    "child_credential_error",
     "credential_store",
     "provider_for_model",
 ]
