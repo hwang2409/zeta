@@ -132,6 +132,10 @@ async def content_read(client, request_id, params):
     return await client.connections.read_content(client, params)
 
 
+async def child_run_history(client, request_id, params):
+    return await client.connections.read_child_run_history(client, params)
+
+
 async def _mutable_store(client, params):
     runtime = client.server.runtime
     store = validation.active(runtime, params)
@@ -368,6 +372,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SESSION_TREE: session_tree,
     MethodDescriptor.SESSION_HISTORY: session_history,
     MethodDescriptor.CONTENT_READ: content_read,
+    MethodDescriptor.CHILD_RUN_HISTORY: child_run_history,
     MethodDescriptor.SWITCH_BRANCH: switch_branch,
     MethodDescriptor.FORK_MESSAGE: fork_message,
     MethodDescriptor.MODEL_CATALOG: model_catalog,

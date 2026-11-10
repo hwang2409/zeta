@@ -84,6 +84,7 @@ class TurnConsumerMixin:
 
     _stream_invalidation_handle: asyncio.TimerHandle | None = None
     _stream_invalidation_pending = False
+    _background_invalidation_handle: asyncio.TimerHandle | None = None
 
     def _schedule_stream_invalidation_release(self) -> None:
         try:
@@ -119,6 +120,43 @@ class TurnConsumerMixin:
             self._stream_invalidation_handle = None
         self._stream_invalidation_pending = False
         self._invalidate_prompt()
+
+    def _invalidate_background_prompt(self) -> None:
+        """Coalesce visible background changes to ten paints per second."""
+
+        if self._fork_controller is not None and not self._fork_controller.is_visible(
+            self
+        ):
+            return
+        if self._background_invalidation_handle is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._background_invalidation_handle = loop.call_later(
+            0.1, self._flush_background_invalidation
+        )
+
+    def _flush_background_invalidation(self) -> None:
+        self._background_invalidation_handle = None
+        if not getattr(self, "_closed", False):
+            self._invalidate_prompt()
+
+    def _finish_background_invalidation(self) -> None:
+        """Paint an approval or completed child event without waiting."""
+
+        if self._background_invalidation_handle is not None:
+            self._background_invalidation_handle.cancel()
+            self._background_invalidation_handle = None
+        if not getattr(self, "_closed", False):
+            self._invalidate_prompt()
+
+    def _cancel_background_invalidation(self) -> None:
+        handle = self._background_invalidation_handle
+        if handle is not None:
+            handle.cancel()
+            self._background_invalidation_handle = None
 
     async def _pulse_spinner(self) -> None:
         last_agent_refresh = 0.0

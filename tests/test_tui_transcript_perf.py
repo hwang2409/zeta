@@ -163,6 +163,49 @@ def test_stream_invalidation_does_not_add_an_idle_trailing_paint(
     assert frames[-1] == "first second third final"
 
 
+def test_background_repaint_coalescing_keeps_trailing_and_immediate_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[Callable[[], None]] = []
+    loop = Mock()
+    loop.call_later.side_effect = lambda _delay, callback: (
+        callbacks.append(callback) or Mock()
+    )
+    monkeypatch.setattr(composer_module.asyncio, "get_running_loop", lambda: loop)
+    app, transcript = _streaming_app()
+    app._fork_controller = None
+    paints: list[str] = []
+    app._invalidate_prompt = lambda: paints.append(
+        _content_text(transcript, 80, 20).strip()
+    )
+    call = ToolCall("background", "shell", {"command": "printf progress"})
+    app._presenter.handle_tool_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call),
+        aborted=False,
+    )
+    app._presenter.handle_tool_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_UPDATE,
+            tool_call=call,
+            data={"output": "progress"},
+        ),
+        aborted=False,
+    )
+    app._invalidate_background_prompt()
+    assert paints == []
+    callbacks.pop(0)()
+    assert paints and "progress" in paints[-1]
+
+    app._invalidate_background_prompt()
+    app._finish_background_invalidation()
+    assert len(paints) == 2
+    assert app._background_invalidation_handle is None
+
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput(), multiline=True)
+        assert session.app.min_redraw_interval is None
+
+
 def test_repaints_do_not_rescan_terminal_agent_sessions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
