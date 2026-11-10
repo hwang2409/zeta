@@ -240,7 +240,7 @@ class TurnConsumerMixin:
                     abort_signal=turn_abort_signal,
                 )
             )
-            async for event in events:
+            async for event in self.foreground_event_publisher.events(events):
                 if notification and event.type is StreamEventType.ERROR:
                     notification_failure = NotificationFailure(
                         event.error or ErrorInfo("backend_error", "notification turn failed"),
