@@ -824,7 +824,7 @@ class SubmissionMixin:
             return
         if text is None:
             return
-        if self._remote_view is not None:
+        if self._remote_view is not None and not text.lstrip().startswith(("/detach", "/remote")):
             self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()
@@ -858,7 +858,7 @@ class SubmissionMixin:
             return
         if text is None:
             return
-        if self._remote_view is not None:
+        if self._remote_view is not None and not text.lstrip().startswith(("/detach", "/remote")):
             self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()

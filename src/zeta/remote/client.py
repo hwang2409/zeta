@@ -143,7 +143,11 @@ class RemoteSessionClient:
                 if line:
                     try:
                         frame = json.loads(line)
-                        if isinstance(frame, dict) and isinstance(frame.get("result"), dict):
+                        if (
+                            isinstance(frame, dict)
+                            and frame.get("id") == 2
+                            and isinstance(frame.get("result"), dict)
+                        ):
                             for event in history_events(frame["result"]):
                                 await self._events.put(event)
                         elif isinstance(frame, dict) and frame.get("method") == "event":
