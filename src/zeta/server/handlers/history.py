@@ -273,6 +273,7 @@ def _backward_history_request(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
+    child_runs: bool = False,
 ) -> dict:
     return _backward_history_page(
         runtime,
@@ -281,6 +282,7 @@ def _backward_history_request(
         fidelity=fidelity,
         content_read=content_read,
         served_turn_end=served_turn_end,
+        child_runs=child_runs,
     )[0]
 
 
@@ -437,6 +439,7 @@ def history(
     fidelity: bool = False,
     content_read: bool = False,
     served_turn_end: bool = False,
+    child_runs: bool = False,
 ) -> dict:
     backward_keys = {"before", "history_validator"}
     if backward_keys.intersection(params) and not backward_enabled:
@@ -453,6 +456,7 @@ def history(
             fidelity=fidelity,
             content_read=content_read,
             served_turn_end=served_turn_end,
+            child_runs=child_runs,
         )
     if backward_keys.intersection(params):
         raise ProtocolError(

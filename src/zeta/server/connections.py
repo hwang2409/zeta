@@ -1209,6 +1209,7 @@ def perform_child_history_read(
         history_params,
         backward_enabled=True,
         fidelity=fidelity,
+        child_runs=True,
     )
 
 
