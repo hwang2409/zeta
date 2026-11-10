@@ -30,18 +30,24 @@ from zeta.project_inbox import (
     ProjectInboxScanner,
     SentMessageTracker,
 )
-from zeta.project_registry import ProjectRegistry
+from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEvent,
+    StreamEventType,
     TextContent,
 )
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
+from zeta.server.event_contract import notification_wire_event
+from zeta.server.protocol import EventDescriptor
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.registry import ToolRegistry
+from zeta.tui.render import render_agent_notification
 
 
 @pytest.fixture(autouse=True)
@@ -1454,12 +1460,21 @@ def test_newest_record_with_lowest_id_survives_pruning(
     tracker.record("e" * 32, project_b.project_id)
     tracker.record("0" * 32, project_b.project_id)
 
-    assert {record["id"] for record in tracker.records()} == {"e" * 32, "0" * 32}
+    # unresolved rows are retained; p03a prunes terminal rows only.
+    assert {record["id"] for record in tracker.records()} == {
+        "f" * 32,
+        "e" * 32,
+        "0" * 32,
+    }
 
     tracker.mark_reported(iter((("e" * 32, "done"),)))
     tracker.record("1" * 32, project_b.project_id)
 
-    assert {record["id"] for record in tracker.records()} == {"0" * 32, "1" * 32}
+    assert {record["id"] for record in tracker.records()} == {
+        "f" * 32,
+        "0" * 32,
+        "1" * 32,
+    }
 
 
 @pytest.mark.asyncio
@@ -1905,3 +1920,153 @@ async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
             )
         await loop.close()
         store.close()
+
+class _P03aFlow:
+    def __init__(self, claims):
+        self.claims = claims
+        self.attempts = 0
+
+    async def produce(self, item):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("commit failed")
+        item.after_commit()
+
+
+class _P03aScanner:
+    def __init__(self, gate=None, error=None):
+        self.gate = gate
+        self.error = error
+        self.started = threading.Event()
+        self.polls = 0
+        self.claimed = []
+        self.inbox = SimpleNamespace(
+            claim_wake=lambda project_id, ids: self.claimed.append((project_id, ids))
+        )
+
+    def poll(self):
+        self.polls += 1
+        self.started.set()
+        if self.gate is not None:
+            self.gate.wait(timeout=10)
+        if self.error is not None:
+            error, self.error = self.error, None
+            raise error
+        return (("m" * 32,), (), [{"id": "m" * 32}])
+
+
+async def _p03a_loop(scanner, flow, events):
+    loop = ProjectInboxNotificationMixin()
+    loop._project_inbox_publication_event = asyncio.Event()
+    loop._project_inbox_poll_done = asyncio.Event()
+    loop._inbox_scanner = scanner
+    loop._project_inbox_poll_task = None
+    loop._turn_active = False
+    loop.store = SimpleNamespace(session_id="s" * 32)
+    loop.tool_registry = SimpleNamespace(project_id="p", registered_names={"inbox"})
+    loop._ensure_step_delivery = lambda: _resolved(flow)
+    loop._publish_background_event = events.append
+    return loop
+
+
+async def _resolved(value):
+    return value
+
+
+async def _commit_p03a(item):
+    item.after_commit()
+
+
+@pytest.mark.asyncio
+async def test_p03a_failed_commit_retries_same_poll_before_rescan():
+    scanner = _P03aScanner()
+    flow = _P03aFlow(scanner.claimed)
+    loop = await _p03a_loop(scanner, flow, [])
+    task = asyncio.create_task(loop._project_inbox_supervisor())
+    loop._project_inbox_poll_task = task
+    try:
+        loop._project_inbox_publication_event.set()
+        await await_or_fail(loop._project_inbox_poll_done.wait(), what="first poll")
+        assert scanner.polls == 1
+        loop._project_inbox_poll_done.clear()
+        loop._project_inbox_publication_event.set()
+        await await_or_fail(loop._project_inbox_poll_done.wait(), what="retry poll")
+        assert scanner.polls == 1
+        assert scanner.claimed == [("p", ("m" * 32,))]
+    finally:
+        task.cancel()
+        await await_or_fail(asyncio.gather(task, return_exceptions=True), what="supervisor close")
+
+
+@pytest.mark.asyncio
+async def test_p03a_close_drains_blocked_scanner_worker():
+    release = threading.Event()
+    scanner = _P03aScanner(release)
+    loop = await _p03a_loop(scanner, _P03aFlow([]), [])
+    task = asyncio.create_task(loop._project_inbox_supervisor())
+    loop._project_inbox_poll_task = task
+    try:
+        loop._project_inbox_publication_event.set()
+        await await_or_fail(asyncio.to_thread(scanner.started.wait), what="scanner start")
+        closing = asyncio.create_task(loop._close_project_inbox_supervisor())
+        await await_or_fail(asyncio.to_thread(lambda: not closing.done()), what="close blocks")
+        assert not closing.done()
+        release.set()
+        await await_or_fail(closing, what="scanner drain")
+        assert task.done()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def test_p03a_health_sink_failure_does_not_raise():
+    loop = SimpleNamespace(
+        store=SimpleNamespace(session_id="s" * 32),
+        _publish_background_event=lambda _event: (_ for _ in ()).throw(RuntimeError("sink")),
+    )
+    ProjectInboxNotificationMixin._publish_project_inbox_health(loop, "degraded", "bad")
+
+
+@pytest.mark.asyncio
+async def test_p03a_registry_error_recovers_same_supervisor():
+    scanner = _P03aScanner(error=ProjectRegistryError("registry"))
+    events = []
+    flow = SimpleNamespace(produce=lambda item: _commit_p03a(item))
+    loop = await _p03a_loop(scanner, flow, events)
+    task = asyncio.create_task(loop._project_inbox_supervisor())
+    loop._project_inbox_poll_task = task
+    try:
+        loop._project_inbox_publication_event.set()
+        await await_or_fail(loop._project_inbox_poll_done.wait(), what="degraded poll")
+        loop._project_inbox_poll_done.clear()
+        loop._project_inbox_publication_event.set()
+        await await_or_fail(loop._project_inbox_poll_done.wait(), what="recovered poll")
+        assert [event.data["state"] for event in events] == ["degraded", "healthy"]
+        assert not task.done()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_p03a_status_backlog_has_no_count_cap():
+    loop = SimpleNamespace(_pending_sent_statuses={})
+    records = tuple(
+        {"id": f"{index:032x}", "status": "claimed", "reported": []}
+        for index in range(101)
+    )
+    await ProjectInboxNotificationMixin._record_sent_statuses(loop, records)
+    assert len(loop._pending_sent_statuses) == 101
+
+
+def test_p03a_health_reaches_tui_and_serve_projection():
+    event = StreamEvent(
+        StreamEventType.AGENT_NOTIFICATION,
+        data={"kind": "project_inbox_health", "state": "degraded", "reason": "broken"},
+    )
+    rendered = render_agent_notification(event)
+    assert rendered is not None
+    assert "project inbox degraded" in str(rendered)
+    assert notification_wire_event("project_inbox_health", "1.2") is EventDescriptor.PROJECT_INBOX_HEALTH

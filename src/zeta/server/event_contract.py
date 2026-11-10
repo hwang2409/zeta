@@ -97,7 +97,6 @@ NOTIFICATION_WIRE_EVENTS = {
     "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
-    "project_inbox_health": EventDescriptor.PROJECT_INBOX_HEALTH,
     "child_question": EventDescriptor.CHILD_QUESTION,
     "child_question_withdrawn": EventDescriptor.CHILD_QUESTION_WITHDRAWN,
 }
@@ -108,6 +107,8 @@ def notification_wire_event(kind: object, protocol_version: str) -> EventDescrip
 
     if protocol_version != "1.2":
         return LEGACY_NOTIFICATION_WIRE_EVENT
+    if kind == "project_inbox_health":
+        return EventDescriptor.PROJECT_INBOX_HEALTH
     return NOTIFICATION_WIRE_EVENTS.get(kind, LEGACY_NOTIFICATION_WIRE_EVENT)
 
 
