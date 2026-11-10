@@ -160,7 +160,11 @@ class ServeControl:
     ) -> None:
         host_commands = self._active_host_commands
         loop = self.server.runtime.loop
-        if loop is not None and loop.notification_turn_state != "idle":
+        if (
+            self._turn_end_published
+            and loop is not None
+            and loop.notification_turn_state != "idle"
+        ):
             notification_task = self._turn_task
             loop.cancel_scheduled_notification_turn()
             if notification_task is not None and not notification_task.done():
@@ -210,6 +214,7 @@ class ServeControl:
                     loop is None
                     or loop.notification_turn_state == "idle"
                     or self._notification_turn_started
+                    or not self._turn_end_published
                 )
             )
             or (
