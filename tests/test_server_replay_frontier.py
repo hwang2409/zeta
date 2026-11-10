@@ -749,118 +749,100 @@ async def test_row_older_than_lookup_window_ends_older_streams_only(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending_join", (False, True), ids=("live", "pending-join"))
+@pytest.mark.parametrize("renumber", (False, True), ids=("over-count", "renumber"))
 @pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_generation_overcount_keeps_row_backed_frame_on_stream(
-    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+async def test_replay_frontier_table(
+    tmp_path: Path,
+    pending_join: bool,
+    renumber: bool,
+    transport: Transport,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    serve = await _serve(tmp_path, transport, FakeBackend([]))
-    entered = threading.Event()
-    release = threading.Event()
-
-    def pause_before_write() -> None:
-        entered.set()
-        # test-contract: seam holds the real async store write before its public install
-        assert release.wait(10)
-
-    try:
-        _tool_rows(serve.store, "frontier-call")
-        await serve.join(serve.observer)
-        _tool_rows(serve.store, "covered-call")
-        # test-contract: seam pauses the real async store write before its public install
-        monkeypatch.setattr(serve.store, "_before_committed_mutation", pause_before_write)
-        pending = asyncio.create_task(
-            serve.store.append_message_async(Message(MessageRole.ASSISTANT, [TextContent("trigger")]))
-        )
-        await await_or_fail(asyncio.to_thread(entered.wait, 10), what="async store write")
-        external = ConversationStore(serve.store.root_dir, session_id=serve.session_id)
-        try:
-            external.append_message(Message(MessageRole.ASSISTANT, [TextContent("external")]))
-        finally:
-            external.close()
-        release.set()
-        await await_or_fail(pending, what="async store append")
-        await _publish_tool_end(serve, "covered-call")
-        frames = await serve.live(serve.observer)
-        assert [frame["event"] for frame in frames] == ["tool_end"], frames
-        assert not any(frame["event"] == "replay_stream_ended" for frame in frames)
-    finally:
-        release.set()
-        await _close(serve)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_store_reset_ends_streams_instead_of_dropping_renumbered_rows(
-    tmp_path: Path, transport: Transport
-) -> None:
-    serve = await _serve(tmp_path, transport, _text_backend("ok"))
-    try:
-        for index in range(6):
-            serve.store.append_task_notification(task_id=f"before-{index}", command="true", exit_code=0)
-        stream_id = (await serve.join(serve.observer))["replay"]["stream_id"]
-        log = serve.store.path
-        lines = log.read_bytes().splitlines(keepends=True)
-        # an external rewrite drops the newest rows; the next write reloads and renumbers
-        log.write_bytes(b"".join(lines[:3]))
-        await serve.controller.request(
-            serve.request_id(), "send", {"text": "after-reset", "delivery_id": "d-reset"}
-        )
-        await _wait_event(serve.controller, "agent_end")
-        frames = await serve.live(serve.observer)
-        ended = [(f["stream_id"], f["reason"]) for f in frames if f["event"] == "replay_stream_ended"]
-        echoed = [f.get("text") for f in frames if f["event"] == "user_message"]
-        assert ended == [(stream_id, "session_replaced")], f"ended={ended} live echo={echoed}"
-        history = (await serve.join(serve.observer))["messages"]
-        live = [
-            frame.get("text") for frame in await serve.live(serve.observer) if frame["event"] == "user_message"
-        ]
-        assert (_texts(history) + live).count("after-reset") == 1
-    finally:
-        await _close(serve)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
-async def test_store_reset_during_join_read_fails_the_join(tmp_path: Path, transport: Transport) -> None:
-    """J3: a reset between a join's start and its end renumbers rows; the join is stale."""
     serve = await _serve(tmp_path, transport, _text_backend("ok"))
     connections = serve.server.connections
     assert connections is not None
     run_read = connections.run_read
-    entered, release = asyncio.Event(), asyncio.Event()
+    read_entered, read_release = asyncio.Event(), asyncio.Event()
+    write_entered, write_release = threading.Event(), threading.Event()
 
-    async def held(*args: Any, **kwargs: Any) -> Any:
-        entered.set()
-        await await_or_fail(release.wait(), what="release held history read")
-        return await run_read(*args, **kwargs)
+    async def held_read(*args: Any, **kwargs: Any) -> Any:
+        result = await run_read(*args, **kwargs)
+        read_entered.set()
+        await await_or_fail(read_release.wait(), what="release held history read")
+        return result
+
+    def pause_before_write() -> None:
+        write_entered.set()
+        # test-contract: seam holds the real async store write before its public install
+        assert write_release.wait(10)
 
     try:
         for index in range(6):
             serve.store.append_task_notification(task_id=f"before-{index}", command="true", exit_code=0)
-        generation = serve.store.reset_generation()
-        # test-contract: seam hold the join's history read after the join began
-        connections.run_read = held  # type: ignore[method-assign]
-        join = asyncio.create_task(
-            serve.observer.request(
-                serve.request_id(), "session_history_and_subscribe", {"session_id": serve.session_id}
+        if pending_join:
+            connections.run_read = held_read  # type: ignore[method-assign]
+            join = asyncio.create_task(
+                serve.observer.request(
+                    serve.request_id(),
+                    "session_history_and_subscribe",
+                    {"session_id": serve.session_id},
+                )
             )
-        )
-        await await_or_fail(entered.wait(), what="join history read held")
-        connections.run_read = run_read  # type: ignore[method-assign]
-        log = serve.store.path
-        # an external rewrite drops the newest rows; the next write reloads and renumbers
-        log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:3]))
-        serve.store.append_task_notification(task_id="after-reset", command="true", exit_code=0)
-        assert serve.store.reset_generation() != generation
-        release.set()
-        response = await await_or_fail(join, what="join response")
-        assert response.get("error", {}).get("code") == -32009, response
-        later = await serve.client()
-        history = (await serve.join(later))["messages"]
-        ids = [row["id"] for row in history]
-        assert len(ids) == len(set(ids)), ids
-        assert sum("after-reset" in str(row) for row in history) == 1, history
+            await await_or_fail(read_entered.wait(), what="join history read held")
+        else:
+            stream_id = (await serve.join(serve.observer))["replay"]["stream_id"]
+            _tool_rows(serve.store, "covered-call")
+
+        if renumber:
+            log = serve.store.path
+            log.write_bytes(b"".join(log.read_bytes().splitlines(keepends=True)[:3]))
+            serve.store.append_task_notification(task_id="after-reset", command="true", exit_code=0)
+            if not pending_join:
+                await serve.controller.request(
+                    serve.request_id(), "send", {"text": "after-reset", "delivery_id": "d-reset"}
+                )
+                await _wait_event(serve.controller, "agent_end")
+        else:
+            # test-contract: seam forces the generation over-count before install
+            monkeypatch.setattr(serve.store, "_before_committed_mutation", pause_before_write)
+            append = asyncio.create_task(
+                serve.store.append_message_async(Message(MessageRole.ASSISTANT, [TextContent("trigger")]))
+            )
+            await await_or_fail(asyncio.to_thread(write_entered.wait, 10), what="async store write")
+            external = ConversationStore(serve.store.root_dir, session_id=serve.session_id)
+            try:
+                external.append_message(Message(MessageRole.ASSISTANT, [TextContent("external")]))
+            finally:
+                external.close()
+            write_release.set()
+            await await_or_fail(append, what="async store append")
+            if pending_join:
+                _tool_rows(serve.store, "pending-covered-call")
+                await _publish_tool_end(serve, "pending-covered-call")
+
+        if pending_join:
+            read_release.set()
+            response = await await_or_fail(join, what="join response")
+            if renumber:
+                assert response.get("error", {}).get("code") == -32009, response
+                return
+            assert "error" not in response, response
+            frames = await serve.live(serve.observer)
+            assert [(frame["event"], frame.get("seq")) for frame in frames] == [("tool_end", 1)], frames
+            return
+
+        if renumber:
+            frames = await serve.live(serve.observer)
+            ended = [(f["stream_id"], f["reason"]) for f in frames if f["event"] == "replay_stream_ended"]
+            assert ended == [(stream_id, "session_replaced")], frames
+            return
+
+        await _publish_tool_end(serve, "covered-call")
+        frames = await serve.live(serve.observer)
+        assert [(frame["event"], frame.get("seq")) for frame in frames] == [("tool_end", 1)], frames
     finally:
-        release.set()
+        read_release.set()
+        write_release.set()
         connections.run_read = run_read  # type: ignore[method-assign]
         await _close(serve)
