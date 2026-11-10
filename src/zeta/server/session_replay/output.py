@@ -192,14 +192,7 @@ class ReplayOutput:
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
         store = validation.active(connection.server.runtime, {"session_id": scope.value})
-        frontier_seq = store.active_branch_head_sequence()
-        self.replay.begin_join(
-            connection,
-            scope,
-            store.reset_generation(),
-            frontier_seq,
-            store.active_branch_head_id(),
-        )
+        self.replay.begin_join(connection, scope, store.reset_generation())
 
     def finish_replay_join(
         self,
@@ -209,25 +202,16 @@ class ReplayOutput:
         frontier_row_id: str | None,
     ) -> dict[str, object]:
         scope = self.replay.scope_for(connection)
-        pending = self.replay.frontier_identity(connection)
-        if scope is not None and not self._frontier_holds(
-            connection,
-            scope,
-            frontier_seq=pending[0] if pending is not None else frontier_seq,
-            frontier_row_id=pending[1] if pending is not None else frontier_row_id,
-        ):
-            self.invalidate_replay_scope(scope, "session_replaced")
+        if scope is not None and not self._frontier_holds(connection, scope):
+            self.replay.mark_pending_stale(connection)
         return self.replay.finish_join(connection, history, frontier_seq, frontier_row_id)
 
     def _frontier_holds(
         self,
         connection: Any,
         scope: ReplayScopeId,
-        *,
-        frontier_seq: int | None = None,
-        frontier_row_id: str | None = None,
     ) -> bool:
-        """Check a generation change against the frontier's stable row id."""
+        """Check a generation change against the stream or pending join."""
         generation = self.replay.reset_generation(connection)
         store = self._replay_store(scope)
         if generation is None or store is None:
@@ -235,17 +219,12 @@ class ReplayOutput:
         current = store.reset_generation()
         if current == generation:
             return True
-        frontier = self.replay.frontier(connection)
-        identity = self.replay.frontier_identity(connection)
-        if frontier is None and frontier_row_id is None and identity is None:
+        if self.replay.is_pending(connection):
             return False
-        if frontier is None and identity is not None:
-            identity_seq, identity_row_id = identity
-            frontier_seq = identity_seq if frontier_seq is None else frontier_seq
-            frontier_row_id = identity_row_id
-        seq = frontier.seq if frontier is not None and frontier_seq is None else frontier_seq
-        row_id = frontier_row_id if frontier_row_id is not None else frontier.row_id
-        if row_id is None or store.row_id_at(seq) != row_id:
+        frontier = self.replay.frontier(connection)
+        if frontier is None or frontier.row_id is None:
+            return False
+        if store.row_id_at(frontier.seq) != frontier.row_id:
             return False
         self.replay.refresh_reset_generation(connection, current)
         return True
@@ -345,7 +324,10 @@ class ReplayOutput:
         scope = ReplayScopeId.top(session_id)
         connection = state.connection
         if covers is not None and not self._frontier_holds(connection, scope):
-            self.invalidate_replay_scope(scope, "session_replaced")
+            if self.replay.is_pending(connection):
+                self.replay.mark_pending_stale(connection)
+            else:
+                self.invalidate_replay_scope(scope, "session_replaced")
             return False
         prepared = self.replay.prepare(connection, scope, covers)
         if prepared is DROP:

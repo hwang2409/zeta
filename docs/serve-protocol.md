@@ -1462,7 +1462,9 @@ error code and message. Provider status and origin remain internal.
   controller disconnect; a controller's own stream ends with its connection, and a
   reconnecting controller must join again.
   A join that is still pending when its stream ends returns `-32009` with data
-  code `stale_event_sequence` and gets no event. An active stream that ends on a
+  code `stale_event_sequence` and gets no event. A join may also return this
+  error when the session rows may have changed during the join; the client
+  retries the join. An active stream that ends on a
   live connection gets exactly one `replay_stream_ended` event with that
   `stream_id` and a `reason` from the closed set `session_replaced`, `evicted`,
   `rejoined`; a client treats any other reason as "rejoin". The event has no

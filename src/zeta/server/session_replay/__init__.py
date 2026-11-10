@@ -112,8 +112,6 @@ class PendingReplayJoin:
     scope: ReplayScopeId
     stream_id: str
     reset_generation: int
-    frontier_seq: int
-    frontier_row_id: str | None
     frames: list[HeldFrame] = field(default_factory=list)
     frontier: Frontier | None = None
     stale: bool = False
@@ -296,8 +294,6 @@ class SessionReplay:
         connection: Any,
         scope: ReplayScopeId,
         reset_generation: int,
-        frontier_seq: int,
-        frontier_row_id: str | None,
     ) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(
@@ -305,8 +301,6 @@ class SessionReplay:
             scope,
             secrets.token_urlsafe(9),
             reset_generation,
-            frontier_seq,
-            frontier_row_id,
         )
         self._next_sequences[connection] = 1
         self._pending[connection] = pending
@@ -363,9 +357,10 @@ class SessionReplay:
             pending.scope, pending.stream_id, pending.frontier
         )
 
-    def frontier_identity(self, connection: Any) -> tuple[int, str | None] | None:
+    def mark_pending_stale(self, connection: Any) -> None:
         pending = self._pending.get(connection)
-        return None if pending is None else (pending.frontier_seq, pending.frontier_row_id)
+        if pending is not None:
+            pending.stale = True
 
     def frontier(self, connection: Any) -> Frontier | None:
         subscription = self._subscriptions.get(connection)

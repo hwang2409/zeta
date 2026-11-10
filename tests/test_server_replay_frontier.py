@@ -824,12 +824,10 @@ async def test_replay_frontier_table(
         if pending_join:
             read_release.set()
             response = await await_or_fail(join, what="join response")
-            if renumber:
-                assert response.get("error", {}).get("code") == -32009, response
-                return
-            assert "error" not in response, response
-            frames = await serve.live(serve.observer)
-            assert [(frame["event"], frame.get("seq")) for frame in frames] == [("tool_end", 1)], frames
+            assert response.get("error", {}).get("code") == -32009, response
+            if not renumber:
+                retry = await serve.join(serve.observer)
+                assert "error" not in retry, retry
             return
 
         if renumber:
