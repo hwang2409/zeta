@@ -86,6 +86,8 @@ class RuntimeCloseMixin:
                 await self._draft.shutdown_pending()
             except Exception:  # noqa: BLE001, S110 - notice already reported
                 pass
+            if self.observer_host is not None:
+                await attempt_async(self.observer_host.close)
             if self._on_session_close is not None:
                 await attempt_async(self._on_session_close)
             await attempt_async(

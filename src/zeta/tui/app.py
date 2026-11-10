@@ -215,6 +215,8 @@ class TUIApp(
         project_eligible: bool | None = None,
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
+        foreground_event_publisher: Any | None = None,
+        observer_host: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -235,6 +237,8 @@ class TUIApp(
         self._active_task: asyncio.Task[None] | None = None
         self._paste_runtime = PasteRuntime(app)
         self._on_session_close = on_session_close
+        self.foreground_event_publisher = foreground_event_publisher
+        self.observer_host = observer_host
         self._init_runtime_close()
         self._init_fork_runtime()
         self._resumed_session = resumed
@@ -1138,6 +1142,8 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
+            if self.observer_host is not None:
+                await self.observer_host.start()
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
