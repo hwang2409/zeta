@@ -289,7 +289,7 @@ class ProjectRequests:
         state = self.inbox.read(project.project_id)
         messages = [self._bounded_message(request_id, item) for item in state[status]]
         decorated = {
-            item["id"]: self.inbox._decorate(project.project_id, item)
+            item["id"]: self.inbox.decorate(project.project_id, item)
             for item in state[status]
         }
         invalid = [item for item in state["invalid"] if item["status"] == status]

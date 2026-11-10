@@ -225,6 +225,9 @@ class ProjectInbox:
             result.add((source, kind))
         return result
 
+    def decorate(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        return decorate(self.registry, project_id, record, self._delegations(project_id))
+
     def send(
         self,
         *,
