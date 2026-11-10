@@ -260,23 +260,20 @@ class FinishGateState:
     @staticmethod
     def owned_tasks(child_loop: AgentLoop) -> tuple[tuple[str, str], ...]:
         registry = child_loop.tool_registry.background_tasks
-        running = tuple(
-            (task.task_id, task.headline)
-            for task in registry.snapshot()
-            if task.running
-        )
-        pending = (
-            registry.pending_exit_tasks()
-            if hasattr(registry, "pending_exit_tasks")
-            else ()
-        )
-        return tuple(dict.fromkeys((*running, *pending)))
+        return registry.observe_finish_gate()[0]
+
+    @staticmethod
+    async def terminal_pending(child_loop: AgentLoop, intent: str) -> bool:
+        registry = child_loop.tool_registry.background_tasks
+        if registry.observe_finish_gate()[0]:
+            return True
+        flow = getattr(child_loop, "step_delivery", None)
+        return flow is not None and (await flow.admit_terminal(intent)).pending
 
     def can_wake_again(self, child_loop: AgentLoop) -> bool:
         """Return whether this idle child still owns a future wake source."""
 
         instance_id = child_loop.agent_instance_id
-        flow = getattr(child_loop, "step_delivery", None)
         owned_children = bool(self.owned_children(child_loop))
         owned_tasks = bool(self.owned_tasks(child_loop))
         pending_question = instance_id is not None and (
@@ -284,6 +281,7 @@ class FinishGateState:
                 instance_id
             )
         )
+        flow = getattr(child_loop, "step_delivery", None)
         pending_delivery = flow is not None and flow.has_model_visible_delivery
         return any((owned_children, owned_tasks, pending_question, pending_delivery))
 
@@ -324,10 +322,8 @@ class FinishGateState:
         except TimeoutError:
             if task_running_at_entry and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
-            flow = getattr(child_loop, "step_delivery", None)
             if (
-                flow is not None
-                and (await flow.admit_terminal("finish_gate_timeout")).pending
+                await self.terminal_pending(child_loop, "finish_gate_timeout")
             ):
                 return None
             task_existed = (
@@ -375,26 +371,38 @@ class FinishGateState:
         if loop.time() >= deadline:
             if tasks_running and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
-            flow = getattr(child_loop, "step_delivery", None)
             if (
-                flow is not None
-                and (await flow.admit_terminal("finish_gate_timeout")).pending
+                await self.terminal_pending(child_loop, "finish_gate_timeout")
             ):
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
         try:
             async with asyncio.timeout_at(deadline):
-                # test-contract: seam timeout_at owns the transition deadline
-                await child_loop._background_owner.conversation_channel.wait(
-                    child_loop.agent_instance_id or ""
+                registry = child_loop.tool_registry.background_tasks
+                generation = registry.observe_finish_gate()[1]
+                channel_wait = asyncio.create_task(
+                    child_loop._background_owner.conversation_channel.wait(
+                        child_loop.agent_instance_id or ""
+                    )
                 )
+                generation_wait = asyncio.create_task(
+                    registry.wait_finish_gate_generation(generation)
+                )
+                try:
+                    await asyncio.wait(
+                        (channel_wait, generation_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for wait in (channel_wait, generation_wait):
+                        if not wait.done():
+                            wait.cancel()
+                    await asyncio.gather(channel_wait, generation_wait, return_exceptions=True)
         except TimeoutError:
             if tasks_running and loop.time() >= self._task_deadline():
                 return _task_safety_expired()
-            flow = getattr(child_loop, "step_delivery", None)
             if (
-                flow is not None
-                and (await flow.admit_terminal("finish_gate_timeout")).pending
+                await self.terminal_pending(child_loop, "finish_gate_timeout")
             ):
                 return None
             return self._wait_timeout_result(child_loop, tasks_running=tasks_running)
@@ -538,7 +546,7 @@ async def _wait_for_finish(
         pending_notification = child_loop.notification_system_message() is not None
         flow = getattr(child_loop, "step_delivery", None)
         delivery_pending = bool(
-            flow is not None and (await flow.admit_terminal("finish_gate_wait")).pending
+            await state.terminal_pending(child_loop, "finish_gate_wait")
         )
         terminal = await _terminal_transition(
             child_loop,

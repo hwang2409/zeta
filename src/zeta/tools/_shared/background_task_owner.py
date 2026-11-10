@@ -50,11 +50,16 @@ class _OwnerState(Enum):
     DRAINING = auto()
     ARCHIVING = auto()
     PERSISTING_TERMINAL = auto()
-    DURABLE_TERMINAL = auto()
-    EVIDENCE_PENDING = auto()
-    INSTALLED_TERMINAL = auto()
-    NOTICE_PENDING = auto()
+    TERMINAL_DURABLE = auto()
+    EVIDENCE_COMMITTING = auto()
+    EVIDENCE_COMMITTED = auto()
+    EVIDENCE_UNAVAILABLE = auto()
     TERMINAL = auto()
+
+    DURABLE_TERMINAL = TERMINAL_DURABLE
+
+
+EvidenceDisposition = Literal["committed", "unavailable"]
 
 
 class _BackgroundTaskOwner:
@@ -75,12 +80,14 @@ class _BackgroundTaskOwner:
         self.log_fd = log_handle.fileno() if log_handle is not None else None
         self.storage_lock = asyncio.Lock()
         self.state = _OwnerState.RUNNING if process is not None else _OwnerState.TERMINAL
+        self.generation = 0
+        self.generation_event = asyncio.Event()
         self.lifecycle: asyncio.Task[None] | None = None
         self.terminal_candidate: _BackgroundRecord | None = None
         self.kill_cause: str | None = record.note if record.note_priority == _NOTE_PRIORITY_CAUSE else None
         self.killed_by_claimant = False
         self.defer_receipt_for_close = False
-        self.evidence_pending = False
+        self._evidence_item: TaskExitInput | None = None
         self._receipt_release = asyncio.Event()
         self._receipt_release.set()
         self._finish_output_drain = asyncio.Event()
@@ -249,45 +256,46 @@ class _BackgroundTaskOwner:
                     # end the owner while the live record still says running.
                     await asyncio.sleep(0)
                     continue
-                self.state = _OwnerState.DURABLE_TERMINAL
+                self._set_state(_OwnerState.TERMINAL_DURABLE)
                 self.terminal_durable.set()
         if self.defer_receipt_for_close:
             self._receipt_release.clear()
             # test-contract: durability close releases receipts after aggregate state
             await self._receipt_release.wait()
-        # keep the task running until its exit evidence is durably admitted.
-        # keep the task owned until its exit evidence is durably admitted.
-        self.state = _OwnerState.EVIDENCE_PENDING
-        self.evidence_pending = self.record.notify_on_exit
+        self._set_state(_OwnerState.EVIDENCE_COMMITTING)
+        item = TaskExitInput(
+            task_id=candidate.task_id,
+            command=command_headline(candidate.command),
+            exit_code=candidate.exit_code,
+            output_tail=output_tail(candidate.output),
+            log_path=(
+                None
+                if candidate.remove_log_on_archive
+                else str(candidate.log_path)
+                if candidate.log_path is not None
+                else None
+            ),
+            note=candidate.note,
+            owner=candidate.owner,
+            phase=candidate.terminal_phase or "natural_exit",
+            tui_presented=candidate.tui_presented,
+        )
+        self._evidence_item = item
         if self.record.notify_on_exit:
-            await self._deliver_exit(
-                TaskExitInput(
-                    task_id=candidate.task_id,
-                    command=command_headline(candidate.command),
-                    exit_code=candidate.exit_code,
-                    output_tail=output_tail(candidate.output),
-                    log_path=(
-                        None
-                        if candidate.remove_log_on_archive
-                        else str(candidate.log_path)
-                        if candidate.log_path is not None
-                        else None
-                    ),
-                    note=candidate.note,
-                    owner=candidate.owner,
-                    phase=candidate.terminal_phase or "natural_exit",
-                    tui_presented=candidate.tui_presented,
-                )
+            disposition = await self._deliver_exit(item)
+            self._set_state(
+                _OwnerState.EVIDENCE_COMMITTED
+                if disposition == "committed"
+                else _OwnerState.EVIDENCE_UNAVAILABLE
             )
-        self.evidence_pending = False
-        self.state = _OwnerState.INSTALLED_TERMINAL
+        else:
+            self._set_state(_OwnerState.EVIDENCE_COMMITTED)
         self.record.running = False
         self.record.exit_code = candidate.exit_code
         self.record.ended_at = candidate.ended_at
         self.record.process = None
         self.record.terminal_phase = candidate.terminal_phase
         self.process = None
-        self.state = _OwnerState.NOTICE_PENDING
         self.registry._notice(
             BackgroundTaskNotice(
                 process_output.task_exit_headline(
@@ -301,7 +309,13 @@ class _BackgroundTaskOwner:
                 self.record.owner,
             )
         )
-        self.state = _OwnerState.TERMINAL
+        self._set_state(_OwnerState.TERMINAL)
+
+    def _set_state(self, state: _OwnerState) -> None:
+        if self.state is not state:
+            self.state = state
+            self.generation += 1
+            self.generation_event.set()
 
     async def _claim_termination(
         self,
@@ -365,17 +379,37 @@ class _BackgroundTaskOwner:
             status="killed" if killed else "exited",
         )
 
-    async def _deliver_exit(self, item: TaskExitInput) -> None:
+    async def _deliver_exit(self, item: TaskExitInput) -> EvidenceDisposition:
         sink = self.registry._notification_sink
         if sink is None:
-            return
+            return "unavailable"
         try:
-            await sink(item)
+            result = await sink(item)
         except ValueError as exc:
             if str(exc) != "session store is closed":
                 raise
-            return
+            return "unavailable"
         self.registry._pending_recovery.pop(item.task_id, None)
+        return "unavailable" if result == "unavailable" else "committed"
+
+    async def retry_evidence(self, item: TaskExitInput | None = None) -> None:
+        """Retry the sole evidence transition after a recoverable sink failure."""
+
+        if self.state is not _OwnerState.EVIDENCE_COMMITTING and self.state is not _OwnerState.TERMINAL_DURABLE:
+            return
+        evidence = item or self._evidence_item
+        if evidence is None:
+            return
+        self._set_state(_OwnerState.EVIDENCE_COMMITTING)
+        disposition = await self._deliver_exit(evidence)
+        self._set_state(
+            _OwnerState.EVIDENCE_COMMITTED
+            if disposition == "committed"
+            else _OwnerState.EVIDENCE_UNAVAILABLE
+        )
+        self.record.running = False
+        self.process = None
+        self._set_state(_OwnerState.TERMINAL)
 
     async def finish_for_close(
         self, cause: str

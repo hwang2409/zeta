@@ -134,14 +134,47 @@ class BackgroundTaskRegistry:
     def running_count(self) -> int:
         return sum(record.running for record in self._records.values())
 
-    def pending_exit_tasks(self) -> tuple[tuple[str, str], ...]:
-        """Return tasks whose exit evidence is still being admitted."""
+    def finish_gate_snapshot(self) -> tuple[tuple[str, str, object, int], ...]:
+        """Project each owner once for the finish gate."""
 
         return tuple(
-            (owner.record.task_id, owner.record.command)
+            (owner.record.task_id, owner.record.command, owner.state, owner.generation)
             for owner in self._owners.values()
-            if owner.evidence_pending
+            if owner.state.name != "TERMINAL"
         )
+
+    async def wait_finish_gate_generation(self, generation: tuple[tuple[str, int], ...]) -> None:
+        """Wake when an owner changes phase; no sink or registry lock is held."""
+
+        current = self.observe_finish_gate()[1]
+        if current != generation:
+            return
+        waits = [
+            asyncio.create_task(owner.generation_event.wait())
+            for owner in self._owners.values()
+            if owner.state.name != "TERMINAL"
+        ]
+        if not waits:
+            return
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                if not wait.done():
+                    wait.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+
+    def observe_finish_gate(
+        self, generation: tuple[tuple[str, int], ...] | None = None
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, int], ...]]:
+        """Return owned work and a stable owner-generation observation."""
+
+        snapshot = self.finish_gate_snapshot()
+        current = tuple(sorted((task_id, owner_generation) for task_id, _command, _state, owner_generation in snapshot))
+        if generation is not None and generation != current:
+            snapshot = self.finish_gate_snapshot()
+            current = tuple(sorted((task_id, owner_generation) for task_id, _command, _state, owner_generation in snapshot))
+        return tuple((task_id, command) for task_id, command, _state, _gen in snapshot), current
 
     @property
     def task_start_generation(self) -> int:
@@ -195,7 +228,7 @@ class BackgroundTaskRegistry:
         return tuple(self._pending_recovery.values())
 
     async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
-        await self._owners[item.task_id]._deliver_exit(item)
+        await self._owners[item.task_id].retry_evidence(item)
 
     def bind_session_dir(
         self,
@@ -943,6 +976,7 @@ class BackgroundTaskRegistry:
             )
             # Old terminal rows without the key were already treated as delivered.
             if should_recover:
+                owner._set_state(owner.state.TERMINAL_DURABLE)
                 self._pending_recovery[task_id] = TaskExitInput(
                     task_id=task_id,
                     command=command_headline(command),
