@@ -888,7 +888,6 @@ class BackgroundTaskRegistry:
             phase=record.terminal_phase or "natural_exit",
             tui_presented=record.tui_presented,
         )
-        record.notify_on_exit = False
 
     async def _notify_exit(
         self,
