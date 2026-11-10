@@ -254,10 +254,8 @@ class AgentLoop(
         self.tool_registry.bind_session_store(store)
         # Route model-owned task exits into this loop's depth-aware wake so a
         # child exit lands in the child store without waking the shared root.
-        self._pending_task_recovery = (
-            self.tool_registry.background_tasks.set_notification_sink(
-                self._produce_task_exit
-            )
+        self.tool_registry.background_tasks.set_notification_sink(
+            self._produce_task_exit
         )
         self.agent_catalog = self.tool_registry.agent_catalog
         if system_prompt is not None and runtime_prompt is not None:
@@ -554,9 +552,7 @@ class AgentLoop(
 
         await asyncio.to_thread(recover_attention)
         await self._ensure_step_delivery()
-        for item in self._pending_task_recovery:
-            await self.tool_registry.background_tasks.deliver_recovered_exit(item)
-        self._pending_task_recovery = ()
+        await self.tool_registry.background_tasks.recover_evidence()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
         if self.memory_reconciler is not None:

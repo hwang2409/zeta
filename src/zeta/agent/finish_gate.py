@@ -260,15 +260,30 @@ class FinishGateState:
     @staticmethod
     def owned_tasks(child_loop: AgentLoop) -> tuple[tuple[str, str], ...]:
         registry = child_loop.tool_registry.background_tasks
-        return registry.observe_finish_gate()[0]
+        observe = getattr(registry, "observe_finish_gate", None)
+        if observe is not None:
+            return observe()[0]
+        return tuple(
+            (task.task_id, task.headline)
+            for task in registry.snapshot()
+            if task.running
+        )
 
     @staticmethod
     async def terminal_pending(child_loop: AgentLoop, intent: str) -> bool:
         registry = child_loop.tool_registry.background_tasks
-        if registry.observe_finish_gate()[0]:
-            return True
         flow = getattr(child_loop, "step_delivery", None)
-        return flow is not None and (await flow.admit_terminal(intent)).pending
+        observe = getattr(registry, "observe_finish_gate", None)
+        owned = observe()[0] if observe is not None else tuple(
+            (task.task_id, task.headline)
+            for task in registry.snapshot()
+            if task.running
+        )
+        if owned:
+            return True
+        if flow is None:
+            return False
+        return (await flow.admit_terminal(intent)).pending
 
     def can_wake_again(self, child_loop: AgentLoop) -> bool:
         """Return whether this idle child still owns a future wake source."""

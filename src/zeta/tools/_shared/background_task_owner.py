@@ -391,8 +391,12 @@ class _BackgroundTaskOwner:
             if str(exc) != "session store is closed":
                 raise
             return "unavailable"
-        self.registry._pending_recovery.pop(item.task_id, None)
         return "unavailable" if result == "unavailable" else "committed"
+
+    def install_recovered_evidence(self, item: TaskExitInput) -> None:
+        """Restore the durable owner at the evidence transition."""
+        self._evidence_item = item
+        self._set_state(_OwnerState.TERMINAL_DURABLE)
 
     async def retry_evidence(self, item: TaskExitInput | None = None) -> None:
         """Retry the sole evidence transition after a recoverable sink failure."""

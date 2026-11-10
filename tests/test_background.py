@@ -882,11 +882,10 @@ async def test_background_task_owner_state_table(
             )
             resumed = ToolRegistry(tmp_path, session_store=store, skill_catalog=SkillCatalog.empty())
             stack.push_async_callback(resumed.close)
-            pending = resumed.background_tasks.set_notification_sink(
+            resumed.background_tasks.set_notification_sink(
                 lambda item: flow.produce(_task_notification(item))
             )
-            for item in pending:
-                await resumed.background_tasks.deliver_recovered_exit(item)
+            await resumed.background_tasks.recover_evidence()
             receipts = store.agent_notifications(pending_only=False)
             assert bool(receipts) is row.endswith("true")
             return
@@ -1015,7 +1014,6 @@ async def test_background_task_owner_state_table(
             resumed_loop.tool_registry.background_tasks.set_notice_sink(
                 resumed_notices.append
             )
-            assert len(resumed_loop._pending_task_recovery) == 2
             await resumed_loop.activate()
             receipts = [
                 entry

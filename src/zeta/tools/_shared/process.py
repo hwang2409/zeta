@@ -95,7 +95,6 @@ class BackgroundTaskRegistry:
         self._notice_sink = notice_sink
         self._notification_sink = notification_sink
         self._notification_exists = notification_exists or (lambda _task_id: False)
-        self._pending_recovery: dict[str, TaskExitInput] = {}
         self._records: dict[str, _BackgroundRecord] = {}
         self._owners: dict[str, _BackgroundTaskOwner] = {}
         self._session_dir: Path | None = None
@@ -224,14 +223,13 @@ class BackgroundTaskRegistry:
     def set_notification_sink(
         self,
         sink: Callable[[TaskExitInput], Awaitable[object]] | None,
-    ) -> tuple[TaskExitInput, ...]:
+    ) -> None:
         self._notification_sink = sink
-        if sink is None:
-            return ()
-        return tuple(self._pending_recovery.values())
 
-    async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
-        await self._owners[item.task_id].retry_evidence(item)
+    async def recover_evidence(self) -> None:
+        """Complete durable terminal owners before model activation."""
+        for owner in tuple(self._owners.values()):
+            await owner.retry_evidence()
 
     def bind_session_dir(
         self,
@@ -979,19 +977,20 @@ class BackgroundTaskRegistry:
             )
             # Old terminal rows without the key were already treated as delivered.
             if should_recover:
-                owner._set_state(owner.state.TERMINAL_DURABLE)
-                self._pending_recovery[task_id] = TaskExitInput(
-                    task_id=task_id,
-                    command=command_headline(command),
-                    exit_code=None if was_running else record.exit_code,
-                    note=(
-                        "exit not observed (zeta restarted)"
-                        if was_running
-                        else record.note
-                    ),
-                    owner=record.owner,
-                    phase=record.terminal_phase or "natural_exit",
-                    tui_presented=record.tui_presented,
+                owner.install_recovered_evidence(
+                    TaskExitInput(
+                        task_id=task_id,
+                        command=command_headline(command),
+                        exit_code=None if was_running else record.exit_code,
+                        note=(
+                            "exit not observed (zeta restarted)"
+                            if was_running
+                            else record.note
+                        ),
+                        owner=record.owner,
+                        phase=record.terminal_phase or "natural_exit",
+                        tui_presented=record.tui_presented,
+                    )
                 )
 
     async def _commit_transition(
