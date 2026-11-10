@@ -313,7 +313,10 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             try:
-                await self.control.close()
+                try:
+                    await self.control.close()
+                finally:
+                    self.foreground_event_publisher.close()
                 try:
                     if not self._borrowed:
                         await self.runtime.close()
