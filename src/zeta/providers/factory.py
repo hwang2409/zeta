@@ -32,13 +32,13 @@ from .anthropic import (
     AnthropicCredentialDriver,
 )
 from .codex import DEFAULT_CODEX_MODEL, CodexBackend
-from .completion import MAX_STALL_RETRIES, TRANSPORT_IDLE_SECONDS
 from .ollama import (
     DEFAULT_OLLAMA_MODEL,
     OLLAMA_API_URL,
     OllamaBackend,
     model_context_window,
 )
+from .transport import DEFAULT_STREAM_STALL_RETRIES, DEFAULT_STREAM_STALL_SECONDS
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 
@@ -128,10 +128,10 @@ def build_backend(
     runtime_home = Path(home) if home is not None else env_home()
     stall_kwargs = {
         "stall_seconds": (
-            TRANSPORT_IDLE_SECONDS if stall_seconds is None else stall_seconds
+            DEFAULT_STREAM_STALL_SECONDS if stall_seconds is None else stall_seconds
         ),
         "stall_retries": (
-            MAX_STALL_RETRIES if stall_retries is None else stall_retries
+            DEFAULT_STREAM_STALL_RETRIES if stall_retries is None else stall_retries
         ),
     }
     if provider == "claude":

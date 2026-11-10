@@ -219,8 +219,8 @@ class ConversationStore(
             self._collect_persisted_appends = _collect_persisted_appends
             self._persisted_appends: list[PersistedAppend] = []
             self._persisted_appends_unverified = False
-            # Task-exit task ids from all durable history. Acknowledgement and
-            # compaction do not make a task eligible for a second exit receipt.
+            # Task-exit task ids for O(1) append_task_notification dedupe (task ids
+            # are unique and exit once, so this mirrors the active-branch scan).
             self._task_notification_ids: set[str] = set()
             self._sent_message_receipts: list[tuple[str, str]] = []
             self._todo_items: list[TodoItem] = []
