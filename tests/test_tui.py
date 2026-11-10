@@ -5303,7 +5303,7 @@ async def test_agent_signature_drops_stale_result_and_coalesces_refresh(
         assert threading.current_thread() is not main_thread, "signature must run off the event loop"
         calls.append((path, selected_index, running))
         (started if len(calls) == 1 else second_started).set()
-        release.wait()
+        assert release.wait(timeout=10)
         return path, selected_index, (len(calls), None), ()
 
     monkeypatch.setattr(agent_card_module, "agent_tree_signature", signature)
