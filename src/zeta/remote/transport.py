@@ -23,7 +23,7 @@ def remote_bridge_command(mode: str, session_id: str | None = None) -> str:
         raise ValueError("invalid bridge mode")
     args = ["__remote_bridge", mode]
     if session_id is not None:
-        if session_id != session_id.strip() or ":" in session_id or "/" in session_id:
+        if session_id != session_id.strip() or any(c in session_id for c in ":/;'\"\\n\\x00"):
             raise ValueError("invalid session id")
         args.append(session_id)
     bridge_args = " ".join(shlex.quote(arg) for arg in args)
