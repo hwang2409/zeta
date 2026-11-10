@@ -634,6 +634,7 @@ async def test_login_reraises_non_port_bind_error(monkeypatch: pytest.MonkeyPatc
         del args, kwargs
         raise OSError(errno.EACCES, "permission denied")
 
+    # test-contract: seam injects the callback server failure
     monkeypatch.setattr(login_flow, "_create_redirect_server", raise_permission_denied)
     provider = _provider(_Store(), lambda *_: "https://authorize.invalid/", exchange)
 

@@ -921,6 +921,24 @@ async def test_stdio_handshake_list_call_and_close(
 
 
 @pytest.mark.asyncio
+async def test_stdio_stderr_log_does_not_recreate_deleted_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "deleted-worktree"
+    project.mkdir()
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(project / ".zeta"))
+    project.rmdir()
+
+    client = StdioMCPClient(_stderr_stdio_config("server"))
+    try:
+        with pytest.raises(MCPTransportError, match="Could not open MCP stderr log"):
+            await client.connect()
+        assert not project.exists()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_stderr_log_is_private_under_public_umask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

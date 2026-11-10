@@ -29,6 +29,7 @@ from tests.support.fake_backend import (
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.owned import await_or_fail
 from tests.support.processes import (
     kill_group_if_present,
     read_pid_file,
@@ -324,10 +325,10 @@ async def test_canceled_monitor_propagates_when_record_already_stopped() -> None
     monitor.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
-            await monitor
+            await await_or_fail(monitor, what="canceled background monitor")
     finally:
         process.kill()
-        await process.wait()
+        await await_or_fail(process.wait(), what="background process cleanup")
 
 
 async def _collect(events):
@@ -1739,6 +1740,7 @@ async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
             wait_entered.set()
             await real_wait()
 
+        # test-contract: seam archive worker lifecycle is intentionally private
         monkeypatch.setattr(tasks, "_wait_for_archive_workers", tracked_wait)
         close_task = asyncio.create_task(tasks.close())
         assert await asyncio.to_thread(wait_entered.wait, 10)
@@ -1749,7 +1751,7 @@ async def test_cancel_first_close_caller_during_archive_worker_wait_raises(
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await close_task
+            await await_or_fail(close_task, what="canceled registry close")
         assert append_errors == []
         assert archive._closed
 
