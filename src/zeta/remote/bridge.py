@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import os
 import socket
+import stat
 import sys
+import time
 from pathlib import Path
 from typing import TextIO
 
@@ -19,14 +22,34 @@ MAX_ROW_BYTES = 8192
 def _machine_id(home: Path) -> str:
     path = descriptor_dir(home) / ".machine-id"
     try:
-        value = path.read_text(encoding="ascii").strip()
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        fd = None
     except OSError:
-        value = ""
-    if not value:
-        value = os.urandom(16).hex()
+        return ""
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or not stat.S_ISREG(info.st_mode):
+                return ""
+            value = os.read(fd, 257).decode("ascii").strip()
+            return value if value and len(value) <= 256 else ""
+        except (OSError, UnicodeDecodeError):
+            return ""
+        finally:
+            os.close(fd)
+    value = os.urandom(16).hex()
+    try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.write_text(value, encoding="ascii")
-        os.chmod(path, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, value.encode("ascii"))
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        return _machine_id(home)
+    except OSError:
+        return ""
     return value
 
 
@@ -53,25 +76,51 @@ def _rows(home: Path) -> list[dict[str, object]]:
 
 def _probe_state(descriptor) -> str | None:
     # The bridge is a separate process, so a short blocking probe cannot stall the TUI.
-    import socket as _socket
     sock = None
+    deadline = time.monotonic() + 1.0
     try:
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        sock.settimeout(0.2)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(max(0.0, deadline - time.monotonic()))
         sock.connect(descriptor.socket)
-        hello = {"id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]}}
-        sock.sendall(json.dumps(hello, separators=(",", ":")).encode() + b"\\n")
+        hello = {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]}}
+        sock.sendall(json.dumps(hello, separators=(",", ":")).encode() + b"\n")
+
         data = b""
-        while b"\\n" not in data and len(data) <= MAX_INPUT_BYTES:
-            data += sock.recv(4096)
-        sock.sendall(b'{"id":2,"method":"status","params":{}}\\n')
-        while b"\\n" not in data:
-            data += sock.recv(4096)
-        response = json.loads(data.split(b"\\n", 1)[-1])
-        session = response.get("result", {}).get("session", {})
-        state = session.get("status") or session.get("state")
-        return state if state in {"idle", "running", "approval"} else None
-    except (OSError, ValueError, json.JSONDecodeError):
+
+        def receive_response(request_id: int) -> dict[str, object]:
+            nonlocal data
+            while True:
+                while b"\n" in data:
+                    line, data = data.split(b"\n", 1)
+                    if not line:
+                        continue
+                    response = json.loads(line)
+                    if response.get("id") == request_id:
+                        return response
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                sock.settimeout(remaining)
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("observer closed during probe")
+                data += chunk
+                if len(data) > MAX_INPUT_BYTES:
+                    raise ValueError("observer response is too large")
+
+        receive_response(1)
+        sock.sendall(b'{"jsonrpc":"2.0","id":2,"method":"status","params":{}}\n')
+        response = receive_response(2)
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            return None
+        if result.get("pending_approvals"):
+            return "approval"
+        state = result.get("state")
+        if state == "tool":
+            return "running"
+        return state if state in {"idle", "running"} else None
+    except (OSError, ValueError, TimeoutError, ConnectionError, json.JSONDecodeError):
         return None
     finally:
         if sock is not None:
@@ -80,7 +129,7 @@ def _probe_state(descriptor) -> str | None:
 
 
 def list_descriptors(home: Path, out: TextIO = sys.stdout) -> int:
-    header = {"kind": "host", "bridge_version": 1, "zeta_version": "unknown", "machine_id": _machine_id(home), "hostname": socket.gethostname()}
+    header = {"kind": "host", "bridge_version": 1, "zeta_version": importlib.metadata.version("zeta"), "machine_id": _machine_id(home), "hostname": socket.gethostname()}
     print(json.dumps(header, separators=(",", ":")), file=out, flush=True)
     for row in _rows(home):
         print(json.dumps(row, separators=(",", ":")), file=out, flush=True)
@@ -109,27 +158,52 @@ async def attach(home: Path, session_id: str) -> int:
         return 2
 
     async def stdin_to_socket() -> None:
-        while True:
-            chunk = await asyncio.to_thread(sys.stdin.buffer.readline)
-            if not chunk:
-                with contextlib.suppress(NotImplementedError):
-                    writer.write_eof()
-                return
-            if len(chunk) > MAX_INPUT_BYTES:
-                raise ValueError("bridge input is too large")
-            writer.write(chunk)
-            await writer.drain()
+        loop = asyncio.get_running_loop()
+        fd = sys.stdin.fileno()
+        pending: asyncio.Future[bytes] = loop.create_future()
+
+        def ready() -> None:
+            try:
+                chunk = os.read(fd, MAX_INPUT_BYTES + 1)
+            except OSError as exc:
+                if not pending.done():
+                    pending.set_exception(exc)
+            else:
+                if not pending.done():
+                    pending.set_result(chunk)
+
+        loop.add_reader(fd, ready)
+        try:
+            while True:
+                chunk = await pending
+                if not chunk:
+                    return
+                if len(chunk) > MAX_INPUT_BYTES:
+                    raise ValueError("bridge input is too large")
+                writer.write(chunk)
+                await writer.drain()
+                pending = loop.create_future()
+        finally:
+            loop.remove_reader(fd)
+            if not pending.done():
+                pending.cancel()
 
     async def socket_to_stdout() -> None:
         while True:
-            chunk = await reader.read(65536)
+            chunk = await reader.read(MAX_INPUT_BYTES)
             if not chunk:
                 return
-            sys.stdout.buffer.write(chunk)
+            await asyncio.to_thread(sys.stdout.buffer.write, chunk)
             await asyncio.to_thread(sys.stdout.buffer.flush)
 
     try:
-        await asyncio.gather(stdin_to_socket(), socket_to_stdout())
+        tasks = [asyncio.create_task(stdin_to_socket()), asyncio.create_task(socket_to_stdout())]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
     except (BrokenPipeError, ConnectionError, ValueError) as exc:
         print(f"zeta remote bridge: {exc}", file=sys.stderr)
         return 2

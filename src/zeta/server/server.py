@@ -128,13 +128,12 @@ class _UnixSocketListener:
 
     @staticmethod
     def _prepare_parent(path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            parent_stat = path.parent.stat()
-            if parent_stat.st_uid == os.getuid():
-                os.chmod(path.parent, 0o700)
-        except OSError:
-            pass
+        directory = path.parent
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_stat = directory.lstat()
+        if (not stat.S_ISDIR(parent_stat.st_mode) or parent_stat.st_uid != os.getuid()
+                or (stat.S_IMODE(parent_stat.st_mode) != 0o700 and directory != Path("/tmp").resolve())):
+            raise RuntimeError(f"unsafe observer socket directory: {directory}")
 
     @classmethod
     def _prepare_path(cls, path: Path) -> None:
@@ -248,7 +247,8 @@ class ZetaServer:
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-        self.control = ServeControl(self)
+        self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
+        self.control = ServeControl(self, self.foreground_event_publisher)
         if not self._borrowed:
             self.runtime.set_approval_control_binder(self.control.bind_policy)
             self.runtime.set_background_event_sink(self.control._publish_background_event)
@@ -315,7 +315,10 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             try:
-                await self.control.close()
+                try:
+                    await self.control.close()
+                finally:
+                    self.foreground_event_publisher.close()
                 try:
                     if not self._borrowed:
                         await self.runtime.close()

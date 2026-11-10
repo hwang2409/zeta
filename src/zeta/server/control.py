@@ -118,12 +118,10 @@ class ServeControl:
     def __init__(
         self,
         server: ZetaServer,
-        foreground_event_publisher: ForegroundEventPublisher | None = None,
+        foreground_event_publisher: ForegroundEventPublisher,
     ) -> None:
         self.server = server
-        self.foreground_event_publisher = (
-            foreground_event_publisher or ForegroundEventPublisher()
-        )
+        self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._session_swap_active = False
