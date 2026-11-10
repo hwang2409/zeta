@@ -1023,10 +1023,7 @@ class ApprovalLifecycle:
                     written = history_outcome is None and record.history_published
                     end_result = self._admit(
                         EventDescriptor.APPROVAL_END, session_id,
-                        replay_row=replace(
-                            DELEGATED if written else WRITE_FAILED,
-                            agent=record.target.key[0],
-                        ),
+                        replay_row=replace(DELEGATED if written else WRITE_FAILED, agent=record.target.key[0]),
                         **payload,
                     )
                     terminal_result = (

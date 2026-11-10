@@ -14,8 +14,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
-from ..core.agent_progress import publish_child_started
-from ..core.checkpoints import _now
 from ..core.session import env_home
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
@@ -74,6 +72,7 @@ from .receipt import (
 from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 from .turn_limit import (
     ChildTurnControl,
+    append_child_start,
     finalize_exhausted_child,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
@@ -751,24 +750,19 @@ async def run_agent_tool(
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
-        started_entry = await loop.store.append_child_run_started_async(
+        await append_child_start(
+            loop.store,
             child_instance_id,
             parent_identity if loop.agent_instance_id is not None else None,
             stored_agent_type,
             description,
-            _now(),
+            accepts_follow_ups=follow_up_loop,
         )
     except BaseException:
         loop._background_owner.mark_store_finished(child_store)
         loop._background_owner.release_unused_stores()
         await loop._background_owner.wait_for_store_closes()
         raise
-    publish_child_started(
-        child_instance_id,
-        started_entry.seq,
-        started_entry.data,
-        accepts_follow_ups=follow_up_loop,
-    )
     account_context = getattr(loop, "account_context", None)
     child_account_pins = (
         await asyncio.to_thread(

@@ -26,11 +26,10 @@ from tests.support.replay_transport import (
 )
 from zeta.core import agent_progress
 from zeta.core.agent_progress import publish_child_ended, remove_live_agent_lifecycle
-from zeta.core.child_runs import project_child_run_row
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
 from zeta.server import ZetaServer
-from zeta.server.protocol import MAX_FRAME_BYTES, EventDescriptor
+from zeta.server.protocol import EventDescriptor
 from zeta.server.server import _Client
 from zeta.server.session_replay import (
     REPLAY_SCOPE_MAX_BYTES,

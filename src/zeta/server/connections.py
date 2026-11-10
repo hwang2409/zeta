@@ -20,7 +20,6 @@ from ..core.store._child_runs import (
 from ..core.thread_call import ThreadCallWorkers
 from . import content
 from .handlers import history, lifecycle, session, settings, validation
-from .session_replay.children import ChildRunProjection
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -35,6 +34,7 @@ from .session_replay import (
     SessionReplay,
     history_features,
 )
+from .session_replay.children import ChildRunProjection
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -992,7 +992,11 @@ class ConnectionRegistry(ReplayOutput):
         target = (runtime.session_id, runtime.opened.store)
         def read():
             result = perform_child_history_read(target, params, registry=self, fidelity="session_history_fidelity" in features)
-            from ..core.child_runs import child_run_rows, project_child_run_row, read_agent_status
+            from ..core.child_runs import (
+                child_run_rows,
+                project_child_run_row,
+                read_agent_status,
+            )
             row = next((item for item in child_run_rows(target[1]) if item["run_id"] == params["run_id"]), None)
             if row is None:
                 reader = self._child_reader_for(target[1], params["run_id"])

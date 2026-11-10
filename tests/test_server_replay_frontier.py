@@ -47,7 +47,16 @@ from zeta.server.session_replay import DeferredFrame, rows
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
-CONTROLLER_FEATURES = ("delivery_id", "user_message_event", "user_message_delivery_id", "model_input_ids")
+CONTROLLER_FEATURES = (
+    "delivery_id",
+    "user_message_event",
+    "user_message_delivery_id",
+    "model_input_ids",
+    "session_replay_seq",
+    "child_runs",
+    "child_run_history",
+    "child_run_events",
+)
 Route = tuple[EventDescriptor, str]
 
 
@@ -132,6 +141,18 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
             serve.published.append((event, dict(fields), replay_row or rows.RowFacts(), covers))
         return covers
 
+    publish_child_lifecycle = server.connections.publish_child_lifecycle
+
+    def recorded_child_lifecycle(
+        event: EventDescriptor,
+        scope: Any,
+        session_id: str,
+        fields: dict[str, Any],
+        covers: int | None,
+    ) -> None:
+        serve.published.append((event, dict(fields), rows.RowFacts(), covers))
+        publish_child_lifecycle(event, scope, session_id, fields, covers)
+
     admit_deferred = server.connections._admit_deferred
 
     def recorded_deferred(record: DeferredFrame, covers: Any) -> None:
@@ -140,6 +161,8 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
 
     # test-contract: seam observe each publication's internal covers before the wire strips it
     server.connections._replay_covers = recorded  # type: ignore[method-assign]
+    # test-contract: seam observe child lifecycle publication at its scope router
+    server.connections.publish_child_lifecycle = recorded_child_lifecycle  # type: ignore[method-assign]
     # test-contract: seam observe each deferred copy's covers when its row is found
     server.connections._admit_deferred = recorded_deferred  # type: ignore[method-assign]
     return serve
@@ -166,7 +189,7 @@ def _history_rows_for(
     """The history rows that present the same effect as one live frame."""
     data = fields.get("data") or {}
     if isinstance(data, dict) and "notification_id" in data:
-        return [row for row in history if row["id"] == data["notification_id"]]
+        return [row for row in history if row.get("id") == data["notification_id"]]
     if event in {EventDescriptor.APPROVAL_REQUEST, EventDescriptor.APPROVAL_END}:
         return [
             row
@@ -200,6 +223,13 @@ def _history_rows_for(
             for row in history
             if isinstance(row.get("tool_result"), dict)
             and row["tool_result"].get("tool_call_id") == call_id
+        ]
+    if event in {EventDescriptor.CHILD_STARTED, EventDescriptor.CHILD_ENDED}:
+        return [
+            row
+            for row in history
+            if row.get("event") == event.value
+            and row.get("run_id") == fields["run_id"]
         ]
     raise AssertionError(f"no history-row matcher for {event.value}")
 
@@ -523,6 +553,8 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.APPROVAL_END, "foreground"): ("foreground_tool",),
     (EventDescriptor.APPROVAL_END, "delegated"): ("background_child_idle",),
     (EventDescriptor.DELIVERY_STATUS, ""): ("dropped_steer",),
+    (EventDescriptor.CHILD_STARTED, ""): ("background_child",),
+    (EventDescriptor.CHILD_ENDED, ""): ("background_child",),
     **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
 }
 ROW_BACKED = [
@@ -620,7 +652,8 @@ async def test_premise_row_backed_frame_covers_its_history_row(
         for fields, facts, covers in records:
             matched = _history_rows_for(route[0], fields, facts, history)
             assert len({row["id"] for row in matched}) == 1, (route, fields, matched)
-            assert covers == seqs[matched[0]["id"]], (route, covers, matched[0])
+            covered_seq = matched[0].get("sequence", seqs.get(matched[0]["id"]))
+            assert covers == covered_seq, (route, covers, matched[0])
     finally:
         await _close(serve)
 

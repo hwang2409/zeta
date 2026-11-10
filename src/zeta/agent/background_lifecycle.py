@@ -743,6 +743,7 @@ async def finish_background_child(
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
                 report=notification_report,
+                child_lifecycle=child_store.agent_lifecycle(),
             )
 
         transition = asyncio.create_task(commit_adopt_publish())

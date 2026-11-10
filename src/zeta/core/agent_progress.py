@@ -84,6 +84,8 @@ def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -
     parent durably installed a new receipt for a run whose lifecycle is terminal."""
     from .child_runs import project_child_run_row
 
+    if not isinstance(lifecycle, dict):
+        lifecycle = getattr(lifecycle, "value", None)
     if not isinstance(lifecycle, dict) or lifecycle.get("handle") != run_id:
         return
     if lifecycle.get("finished_at") is None:

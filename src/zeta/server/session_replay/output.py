@@ -433,7 +433,7 @@ class ReplayOutput:
             return False
         if baseline_builder is not None:
             result = baseline_builder(result)
-        frame = connection.codec.result_response(request_id, result)
+        frame = connection.codec._result_response(request_id, result)
         if frame is None:
             # fail closed: the client never gets this stream id, so no frame may carry it
             self.invalidate_replay_connection(connection)

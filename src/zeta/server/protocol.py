@@ -732,7 +732,7 @@ class FrameCodec:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}
         return self._bounded_json(value, request_id=request_id)
 
-    def result_response(self, request_id: str | int | None, result: object) -> _Frame | None:
+    def _result_response(self, request_id: str | int | None, result: object) -> _Frame | None:
         """The result frame, or None when only an error frame could go out."""
         try:
             payload = self._json_bytes({"jsonrpc": "2.0", "id": request_id, "result": result})

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from ..protocol import MAX_REQUEST_ID_BYTES, ErrorDescriptor, FrameCodec, ProtocolError
 from ..runtime import ServerRuntime
+from . import child_run_lifecycle
 from .history_projection import (
     HistoryProjection,
     _cache,
@@ -18,7 +19,6 @@ from .history_projection import (
     _publish_cache,
     history_projection,
 )
-from . import child_run_lifecycle
 
 if TYPE_CHECKING:
     from ...core.store import ConversationStore

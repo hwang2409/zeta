@@ -19,8 +19,8 @@ from ...protocol.types import (
     is_visible_harness_notice,
 )
 from .. import event_contract
-from . import child_run_lifecycle
 from ..protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec, bounded
+from . import child_run_lifecycle
 
 if TYPE_CHECKING:
     from ...core.store import ConversationStore

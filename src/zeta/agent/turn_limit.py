@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
 
+from ..core.agent_progress import publish_child_started
 from ..core.checkpoints import _now
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
 from ..protocol.types import Message, harness_notice
@@ -84,6 +85,27 @@ def turn_control_for(
     limit: int | None, child_session_path: str
 ) -> ChildTurnControl | None:
     return None if limit is None else ChildTurnControl(limit, child_session_path)
+
+
+async def append_child_start(
+    store: ConversationStore,
+    run_id: str,
+    parent_run_id: str | None,
+    agent_type: str,
+    description: str,
+    *,
+    accepts_follow_ups: bool,
+) -> None:
+    """Publish a child start only after its immediate parent stores it."""
+    entry = await store.append_child_run_started_async(
+        run_id, parent_run_id, agent_type, description, _now()
+    )
+    publish_child_started(
+        run_id,
+        entry.seq,
+        entry.data,
+        accepts_follow_ups=accepts_follow_ups,
+    )
 
 
 def handoff_path(child_session_path: str | Path) -> str:

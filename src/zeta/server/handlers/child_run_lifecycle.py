@@ -35,32 +35,36 @@ def started_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any:
     return replace(entry, data={**entry.data, "_row": row})
 
 
-def _receipt_run(entry: Any, runs: dict[str, str]) -> str | None:
+def _receipt_run(entry: Any, runs: dict[str, str]) -> tuple[str, str | None] | None:
     data = entry.data
     if entry.type == "notification":
         if data.get("kind", "agent_completion") != "agent_completion" or data.get("display_only"):
             return None
         run_id = data.get("child_instance_id")
-        return run_id if run_id in runs.values() else None
-    result = data["message"].get("tool_result")
-    structured = result.get("structured_content") if isinstance(result, dict) else None
-    if not isinstance(structured, dict) or structured.get("status") == "running":
-        return None
-    run_id = structured.get("child_instance_id")
-    if type(run_id) is not str:
+        path = data.get("child_session_path")
+    else:
+        result = data["message"].get("tool_result")
+        structured = result.get("structured_content") if isinstance(result, dict) else None
+        if not isinstance(structured, dict) or structured.get("status") == "running":
+            return None
+        run_id = structured.get("child_instance_id")
         path = structured.get("child_session_path")
-        run_id = runs.get(Path(path).name) if type(path) is str else None
-    return run_id if run_id in runs.values() else None
+        if type(run_id) is not str:
+            run_id = runs.get(Path(path).name) if type(path) is str else None
+    if run_id not in runs.values():
+        return None
+    return run_id, path if type(path) is str else None
 
 
 def ended_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any | None:
     if entry.type not in {"message", "notification"}:
         return None
-    run_id = _receipt_run(entry, runs)
-    if run_id is None:
+    receipt = _receipt_run(entry, runs)
+    if receipt is None:
         return None
+    run_id, receipt_path = receipt
     marker = store.agent_children().get(run_id) or {}
-    path = marker.get("child_session_path")
+    path = receipt_path or marker.get("child_session_path")
     if type(path) is not str:
         try:
             path = store.session_dir.joinpath(

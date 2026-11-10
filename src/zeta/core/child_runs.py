@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from ..protocol.types import StructuredContentValue, ToolCall
 from .agent_progress import live_agent_lifecycle
