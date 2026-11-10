@@ -151,6 +151,9 @@ class RemoteSessionClient:
                             for event in history_events(frame["result"]):
                                 await self._events.put(event)
                         elif isinstance(frame, dict) and frame.get("method") == "event":
+                            params = frame.get("params")
+                            if isinstance(params, dict) and params.get("event") == "usage":
+                                continue
                             await self._events.put(decode_event(line))
                     except (ValueError, TypeError, RemoteWireError) as exc:
                         await self._events.put("fatal: " + str(exc))

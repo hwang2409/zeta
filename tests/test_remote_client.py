@@ -47,6 +47,7 @@ async def test_attach_ignores_hello_result_before_history() -> None:
 
         def start(self, command: str) -> None:
             self.callback(TransportItem("stdout", b'{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.1"}}\n'))
+            self.callback(TransportItem("stdout", b'{"jsonrpc":"2.0","method":"event","params":{"event":"usage","usage":{"input_tokens":1}}}\n'))
             self.callback(TransportItem("stdout", b'{"jsonrpc":"2.0","id":2,"result":{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}}\n'))
 
         def send(self, data: bytes) -> None:
