@@ -20,7 +20,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 from rich.console import Console
 
-import zeta.agent.background as agent_background_module
+import zeta.agent.background_lifecycle as agent_background_module
 import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
@@ -39,12 +39,11 @@ from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
-from zeta.agent.background import (
-    BackgroundAgentOwner,
-    CancellationRequest,
+from zeta.agent.background_lifecycle import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
 from zeta.agent.child_context import _compose_child_system_prompt
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.finish_gate import (
@@ -4875,7 +4874,7 @@ async def test_finish_gate_ollama_stream_close_obeys_task_deadline(
     model_turn = asyncio.create_task(
         state.run_model_turn(
             child_loop,
-            OllamaBackend(stall_seconds=0).complete(
+            OllamaBackend().complete(
                 [], [], control=completion_control()
             ),
             consume_stream,
@@ -16575,7 +16574,16 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
         if answer_consumed:
-            answer_idle_entered.set()
+            notices = [
+                entry
+                for entry in parent.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "child_idle"
+            ]
+            if any(
+                entry.data.get("text") == "after Re q-reset: approved"
+                for entry in notices
+            ):
+                answer_idle_entered.set()
         await asyncio.wait_for(wake(), 10)
         return True
 
