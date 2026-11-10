@@ -221,7 +221,7 @@ async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_real_socket_backward_continuation_survives_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_real_socket_backward_continuation_survives_append_but_not_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})

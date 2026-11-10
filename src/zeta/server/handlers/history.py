@@ -501,7 +501,10 @@ def _validate_history_params(params: dict) -> None:
         )
     if before is not None and (
         not isinstance(validator, dict)
-        or set(validator) not in ({"end", "entry_id"}, {"end", "entry_id", "repair_generation"})
+        or set(validator) not in (
+            {"end", "entry_id"},
+            {"end", "entry_id", "repair_generation"},
+        )
         or type(validator.get("end")) is not int
         or validator.get("end") < 0
         or (
