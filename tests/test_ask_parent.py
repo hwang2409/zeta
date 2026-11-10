@@ -9,7 +9,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background_owner import BackgroundAgentOwner
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall

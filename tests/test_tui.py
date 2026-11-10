@@ -348,7 +348,7 @@ def test_mcp_background_notice_is_dim_in_forced_terminal() -> None:
         console.print(value)
 
     background_notice(
-        SimpleNamespace(_print=print_notice, _invalidate_prompt=lambda: None),
+        SimpleNamespace(_print=print_notice, _invalidate_background_prompt=lambda: None),
         "mcp · server mounted",
     )
 
@@ -955,7 +955,7 @@ def test_shutdown_does_not_surface_task_kill_notification_after_snapshot(
 def test_other_background_notices_remain_visible() -> None:
     rendered: list[Text] = []
     background_notice(
-        SimpleNamespace(_print=rendered.append, _invalidate_prompt=lambda: None),
+        SimpleNamespace(_print=rendered.append, _invalidate_background_prompt=lambda: None),
         "background task task-1 killed",
     )
     assert [item.plain for item in rendered] == ["background task task-1 killed"]
@@ -8917,7 +8917,7 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
 async def test_exit_during_committed_recovery_persists_child_completion_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from zeta.agent import background
+    import zeta.agent.background_lifecycle
     from zeta.tui import app as tui_app
 
     root = ConversationStore(tmp_path / "sessions")
@@ -8951,7 +8951,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_mutated = threading.Event()
     recovery_release = threading.Event()
     activation_cancelled = asyncio.Event()
-    recover_agent_children = background._recover_agent_children
+    recover_agent_children = zeta.agent.background_lifecycle._recover_agent_children
     cancel_activation = tui_app.cancel_activation
 
     async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
@@ -8985,7 +8985,8 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         recover_agent_children(loop, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
 
-    monkeypatch.setattr(background, "_recover_agent_children", gated_recovery)
+    # test-contract: seam recovery must stop while the TUI is shutting down.
+    monkeypatch.setattr(zeta.agent.background_lifecycle, "_recover_agent_children", gated_recovery)
     app = TUIApp(
         AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -13501,7 +13502,8 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
     try:
         with patch_stdout(raw=True):
             await app._run_full_screen(session)
-        assert any("background failed" in line for line in app._transcript_lines)
+        assert not any("background failed" in line for line in app._transcript_lines)
+        assert any("RuntimeError" in line for line in app._transcript_lines)
         assert not log_path.exists()
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -13515,7 +13517,7 @@ async def test_loop_error_notice_does_not_wait_for_diagnostic_lock(
 
 
 @pytest.mark.asyncio
-async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
+async def test_unhandled_loop_exception_shows_ui_error_without_leaking_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -13537,7 +13539,7 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
 
     async def run_async(**_kwargs: object) -> None:
         async def fail() -> None:
-            raise RuntimeError("background failed")
+            raise RuntimeError("sk-test-SECRET123")
 
         asyncio.create_task(fail())
         await asyncio.sleep(0)
@@ -13546,7 +13548,8 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
     with patch_stdout(raw=True):
         await app._run_full_screen(session)
 
-    assert any("background failed" in line for line in app._transcript_lines)
+    assert not any("sk-test-SECRET123" in line for line in app._transcript_lines)
+    assert any("RuntimeError" in line for line in app._transcript_lines)
     # The log path wraps inside the card on long tmp paths (macOS); compare
     # the text without ANSI codes, card borders, and line breaks.
     flat = re.sub(r"\x1b\[[0-9;]*m|[│\s]", "", "".join(app._transcript_lines))
@@ -13562,7 +13565,10 @@ async def test_unhandled_loop_exception_shows_ui_error_without_leaving_tui(
                 break
         await asyncio.sleep(0.01)
     assert len(records) == 1
-    assert "background failed" in json.loads(records[0])["traceback"]
+    assert "sk-test-SECRET123" in json.loads(records[0])["traceback"]
+    assert os.stat(log_path).st_mode & 0o777 == 0o600
+    assert os.stat(log_path.parent).st_mode & 0o777 == 0o700
+    await app.close()
 
 
 def test_tui_diagnostic_record_is_not_visible_before_write(
