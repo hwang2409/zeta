@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from ..core.checkpoints import ConversationEntry
 from ..project_inbox_sent.notifications import project_inbox_notification
-from ..protocol.types import Message, harness_notice
+from ..protocol.types import Message, TextContent, harness_notice
 
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
@@ -147,8 +147,27 @@ def _reuse_persisted_notification_delivery(
     if not represented or not represented.issubset(pending_ids):
         return None
     selected = [entry for entry in pending if entry.id in represented]
+    projected = _notification_message(selected)
+    persisted_text = "\n".join(
+        block.text for block in persisted.content if isinstance(block, TextContent)
+    )
+    marker = "Background updates only."
+    prefix = persisted_text[: persisted_text.find(marker)] if marker in persisted_text else ""
+    if prefix:
+        projected = replace(
+            projected,
+            content=[
+                TextContent(
+                    prefix + next(
+                        block.text
+                        for block in projected.content
+                        if isinstance(block, TextContent)
+                    )
+                )
+            ],
+        )
     projected = replace(
-        _notification_message(selected),
+        projected,
         metadata=dict(persisted.metadata),
         tool_result=persisted.tool_result,
     )

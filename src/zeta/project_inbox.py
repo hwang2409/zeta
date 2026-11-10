@@ -25,6 +25,7 @@ from .core.session_files import (
     open_session_file,
 )
 from .project_errors import ProjectNotFoundError
+from .project_inbox_provenance import decorate, delegation_enabled
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
 from .project_inbox_sent.scanner import ProjectInboxScanner  # noqa: F401
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
@@ -195,16 +196,6 @@ class ProjectInbox:
             for project in self.registry.list_projects()
         ]
 
-    def _inbox_delegation_enabled(self) -> bool:
-        return feature_enabled(
-            self.registry._storage_lease.observed_epoch,
-            StorageFeature.INBOX_DELEGATION,
-        )
-
-    @staticmethod
-    def _origin_author(origin: object) -> str:
-        return "user" if origin == USER_ORIGIN else "agent"
-
     def _delegations(self, project_id: str) -> set[tuple[str, str]]:
         path = self.registry.root / project_id / "inbox" / "delegations.json"
         try:
@@ -232,22 +223,6 @@ class ProjectInbox:
             except ValueError as exc:
                 raise InboxError("invalid inbox delegations") from exc
             result.add((source, kind))
-        return result
-
-    def _decorate(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
-        if not self._inbox_delegation_enabled():
-            return dict(record)
-        author = self._origin_author(record.get("origin"))
-        sender = record.get("from")
-        source = sender.get("project") if isinstance(sender, dict) else None
-        delegated = author == "agent" and isinstance(source, str) and (
-            source, record.get("kind")
-        ) in self._delegations(project_id)
-        result = dict(record)
-        result["author"] = author
-        result["authority"] = (
-            "trusted_assignment" if author == "user" or delegated else "information"
-        )
         return result
 
     def send(
@@ -417,8 +392,7 @@ class ProjectInbox:
             "in_reply_to": in_reply_to,
             "created_at": _now(),
         }
-        if self._inbox_delegation_enabled():
-            record["origin"] = origin
+        record.update({"origin": origin}) if delegation_enabled(self.registry) else None
         return session, target.project_id, message_id, body, record
 
     def _publish_outgoing(
@@ -504,7 +478,7 @@ class ProjectInbox:
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
         for status in ("new", "claimed", "done"):
             result[status] = [
-                self._decorate(target.project_id, item) for item in result[status]
+                decorate(self.registry, target.project_id, item, self._delegations(target.project_id)) for item in result[status]
             ]
         return result
 
@@ -788,11 +762,7 @@ class ProjectInbox:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
-                if (
-                    self._inbox_delegation_enabled()
-                    and self._decorate(target.project_id, record)["authority"]
-                    != "trusted_assignment"
-                ):
+                if delegation_enabled(self.registry) and decorate(self.registry, target.project_id, record, self._delegations(target.project_id))["authority"] != "trusted_assignment":
                     raise InboxError("inbox message is information, not an authorized assignment")
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:
@@ -1281,5 +1251,3 @@ class ProjectInbox:
             if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
                 raise InboxError("unsafe done history body")
             os.unlink(body_name, dir_fd=bodies_fd)
-
-

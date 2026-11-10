@@ -610,11 +610,14 @@ async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:
                 return True
 
             @staticmethod
-            def list(_project_id: str) -> dict[str, list[dict[str, object]]]:
+            def list(
+                _project_id: str, *, session_id: str | None = None
+            ) -> dict[str, list[dict[str, object]]]:
                 return {"new": []}
 
         class Scanner:
             inbox = Inbox()
+            session_id = None
 
             @staticmethod
             def scan() -> tuple[str, ...]:
