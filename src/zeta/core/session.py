@@ -88,7 +88,6 @@ logger = logging.getLogger(__name__)
 class SessionLoopThreadLockError(SessionError):
     pass
 
-
 @dataclass(frozen=True, slots=True)
 class SessionPreview:
     """A session row suitable for the interactive resume picker."""
