@@ -636,6 +636,10 @@ class SlashSession(Protocol):
 
     def slash_send(self, args: str) -> str | Awaitable[str]: ...
 
+    async def slash_remote(self, args: str) -> str: ...
+
+    def slash_detach(self, args: str) -> str: ...
+
     def slash_tools(self, args: str) -> str: ...
 
     def slash_undo(self, args: str) -> str: ...
@@ -1102,6 +1106,9 @@ def create_slash_registry(
             reason=native,
         )
     )
+    # These replace the viewed TUI and intentionally have no serve mapping.
+    registry.register(safe("remote", _delegate("slash_remote"), "attach to a remote session", reason=native))
+    registry.register(safe("detach", _delegate("slash_detach"), "return to the local session", reason=loop_owned))
     registry.register(
         safe(
             "help",

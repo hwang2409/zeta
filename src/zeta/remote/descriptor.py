@@ -53,7 +53,7 @@ class Descriptor:
         return value
 
     @classmethod
-    def decode(cls, raw: bytes) -> "Descriptor":
+    def decode(cls, raw: bytes) -> Descriptor:
         if len(raw) > MAX_DESCRIPTOR_BYTES:
             raise DescriptorError("observer descriptor is too large")
         try:

@@ -97,6 +97,7 @@ from .render import (
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
+from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.accounts_picker import AccountsPicker
 from .slash_handlers.command_runtime import CommandRuntimeMixin
 from .slash_handlers.decisions_panel import DecisionsMixin
@@ -173,6 +174,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    RemoteViewMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
     DecisionsMixin,
