@@ -66,15 +66,15 @@ def _probe_state(descriptor) -> str | None:
         sock.settimeout(0.2)
         sock.connect(descriptor.socket)
         hello = {"id": 1, "method": "hello", "params": {"protocol_version": "1.2", "role": "observer", "features": ["serve_observers"]}}
-        sock.sendall(json.dumps(hello, separators=(",", ":")).encode() + b"\\n")
+        sock.sendall(json.dumps(hello, separators=(",", ":")).encode() + b"\n")
         data = b""
-        while b"\\n" not in data and len(data) <= MAX_INPUT_BYTES:
+        while b"\n" not in data and len(data) <= MAX_INPUT_BYTES:
             data += sock.recv(4096)
-        data = data.split(b"\\n", 1)[1]
-        sock.sendall(b'{"id":2,"method":"status","params":{}}\\n')
-        while b"\\n" not in data and len(data) <= MAX_INPUT_BYTES:
+        data = data.split(b"\n", 1)[1]
+        sock.sendall(b'{"id":2,"method":"status","params":{}}\n')
+        while b"\n" not in data and len(data) <= MAX_INPUT_BYTES:
             data += sock.recv(4096)
-        response = json.loads(data.split(b"\\n", 1)[0])
+        response = json.loads(data.split(b"\n", 1)[0])
         state = response.get("result", {}).get("state")
         return state if state in {"idle", "running", "approval"} else None
     except (OSError, ValueError, json.JSONDecodeError):
@@ -114,24 +114,15 @@ async def attach(home: Path, session_id: str) -> int:
         print(f"zeta remote bridge: {exc}", file=sys.stderr)
         return 2
 
-    loop = asyncio.get_running_loop()
-    stdin_reader = asyncio.StreamReader(limit=MAX_INPUT_BYTES + 1)
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin_reader), sys.stdin)
-
     async def stdin_to_socket() -> None:
         while True:
-            try:
-                chunk = await stdin_reader.readuntil(b"\\n")
-            except asyncio.IncompleteReadError as exc:
-                chunk = exc.partial
-            except asyncio.LimitOverrunError as exc:
-                raise ValueError("bridge input is too large") from exc
+            chunk = await asyncio.to_thread(os.read, sys.stdin.fileno(), MAX_INPUT_BYTES + 1)
             if not chunk:
                 return
+            if len(chunk) > MAX_INPUT_BYTES:
+                raise ValueError("bridge input is too large")
             writer.write(chunk)
             await writer.drain()
-            if not chunk.endswith(b"\\n"):
-                return
 
     async def socket_to_stdout() -> None:
         while True:
