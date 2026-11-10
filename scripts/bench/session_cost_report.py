@@ -79,33 +79,30 @@ def role_for(path: Path) -> str:
     return value if value in ROLES else "other"
 
 
+def child_launch_model(path: Path) -> str | None:
+    for ancestor in path.parents:
+        state = read_json(ancestor / "session_state.json")
+        for child in state.get("agent_children", {}).values():
+            if not isinstance(child, dict) or not isinstance(child.get("child_session_path"), str):
+                continue
+            try:
+                matches_path = Path(child["child_session_path"]).expanduser().resolve() == path.parent
+            except OSError:
+                matches_path = False
+            if matches_path:
+                model = child.get("tool_call", {}).get("arguments", {}).get("model")
+                if model:
+                    return str(model)
+    return None
+
+
 def model_for(path: Path, assistant_models: set[str]) -> str:
     if "agents" in path.parts:
         lifecycle = read_json(path.parent / "agent_lifecycle.json")
         for key in ("model", "selected_model"):
             if lifecycle.get(key):
                 return str(lifecycle[key])
-        # Older lifecycle files keep the launch model in the parent's child table.
-        for ancestor in path.parents:
-            state = read_json(ancestor / "session_state.json")
-            for child in state.get("agent_children", {}).values():
-                if not isinstance(child, dict):
-                    continue
-                child_path = child.get("child_session_path")
-                if not isinstance(child_path, str):
-                    continue
-                try:
-                    matches_path = Path(child_path).expanduser().resolve() == path.parent
-                except OSError:
-                    matches_path = False
-                if not matches_path:
-                    continue
-                arguments = child.get("tool_call", {}).get("arguments", {})
-                if arguments.get("model"):
-                    return str(arguments["model"])
-        if len(assistant_models) == 1:
-            return next(iter(assistant_models))
-        return "unknown"
+        return child_launch_model(path) or (next(iter(assistant_models)) if len(assistant_models) == 1 else "unknown")
     for candidate in (path.parent / "meta.json", path.parent / "session_state.json"):
         data = read_json(candidate)
         for key in ("model", "selected_model"):
@@ -133,21 +130,25 @@ def stored_model(message: dict) -> str | None:
     return None
 
 
-def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, fallback_model: str, start_row: int = 0) -> tuple[dict, int, int, int]:
+def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, fallback_model: str, start_row: int = 0) -> tuple[dict, int, int, int, os.stat_result | None]:
     result = {"turns_by_model": defaultdict(empty_group), "unknown_time": 0, "row_count": 0}
     evictions = evicted_bytes = skipped = 0
+    file_stat = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
+        file_stat = os.fstat(fd)
         with os.fdopen(fd, encoding="utf-8") as stream:
             for index, line in enumerate(stream):
+                if not line.endswith(("\n", "\r")):
+                    continue
+                result["row_count"] += 1
+                if index < start_row:
+                    continue
                 try:
                     row = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     skipped += 1
-                    continue
-                result["row_count"] += 1
-                if index < start_row:
                     continue
                 when = row_time(row)
                 message = row.get("data", {}).get("message", {})
@@ -184,7 +185,7 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, 
                     group["polling_turns"] += 1
     except (OSError, UnicodeDecodeError):
         skipped += 1
-    return result, evictions, evicted_bytes, skipped
+    return result, evictions, evicted_bytes, skipped, file_stat
 
 
 def session_files(root: Path) -> list[Path]:
@@ -206,6 +207,32 @@ def valid_session_id(value: str) -> bool:
     return bool(value) and not os.path.isabs(value) and value not in {".", ".."} and "/" not in value and "\\" not in value and ".." not in value
 
 
+def load_snapshot(path: Path) -> dict:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            snapshot = json.load(stream)
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid snapshot {path}: cannot read valid JSON") from exc
+    files = snapshot.get("files") if isinstance(snapshot, dict) else None
+    if not isinstance(files, dict) or any(
+        not isinstance(entry, dict)
+        or any(not isinstance(entry.get(key), int) for key in ("rows", "size", "dev", "inode"))
+        for entry in files.values()
+    ):
+        raise ValueError(f"invalid snapshot {path}: expected files with rows, size, dev, and inode")
+    return snapshot
+
+
+def snapshot_plan(previous: dict | None, file_stat: os.stat_result | None) -> tuple[int, bool]:
+    if previous is None:
+        return 0, False
+    if file_stat is None:
+        return 0, True
+    replaced = (file_stat.st_dev, file_stat.st_ino) != (previous["dev"], previous["inode"])
+    regressed = file_stat.st_size < previous["size"] or previous["rows"] < 0
+    return (0, True) if replaced or regressed else (previous["rows"], False)
+
+
 def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None, until: dt.datetime | None, since_snapshot: Path | None = None, snapshot_out: Path | None = None) -> dict:
     home = home.expanduser().resolve()
     sessions = home / "sessions"
@@ -217,36 +244,22 @@ def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None,
     prs = defaultdict(lambda: defaultdict(set))
     evictions = {"count": 0, "bytes": 0}
     skipped = unknown_time = 0
-    snapshot = read_json(since_snapshot) if since_snapshot else {}
-    old_files = snapshot.get("files", {}) if isinstance(snapshot.get("files", {}), dict) else {}
+    snapshot = load_snapshot(since_snapshot) if since_snapshot else {}
+    old_files = snapshot.get("files", {})
     current_snapshot = {}
     for root in roots:
         for path in session_files(root):
             role = role_for(path)
             fallback_model = model_for(path, set())
             previous = old_files.get(str(path))
-            start_row = 0
-            snapshot_invalid = False
-            if since_snapshot:
-                if isinstance(previous, dict) and isinstance(previous.get("rows"), int) and isinstance(previous.get("size"), int):
-                    try:
-                        stat = path.stat()
-                        if stat.st_size >= previous["size"]:
-                            start_row = previous["rows"]
-                        else:
-                            snapshot_invalid = True
-                    except OSError:
-                        snapshot_invalid = True
-                elif previous is None:
-                    start_row = 0
-                else:
-                    snapshot_invalid = True
-            raw, count, size, bad = scan_file(path, since, until, fallback_model, start_row if not snapshot_invalid else 0)
-            try:
-                stat = path.stat()
-                current_snapshot[str(path)] = {"rows": raw["row_count"], "size": stat.st_size}
-            except OSError:
-                pass
+            raw, count, size, bad, file_stat = scan_file(path, since, until, fallback_model)
+            start_row, snapshot_invalid = snapshot_plan(previous, file_stat) if since_snapshot else (0, False)
+            if since_snapshot and isinstance(previous, dict) and raw["row_count"] < previous["rows"]:
+                start_row, snapshot_invalid = 0, True
+            if since_snapshot and start_row:
+                raw, count, size, bad, file_stat = scan_file(path, since, until, fallback_model, start_row)
+            if file_stat is not None:
+                current_snapshot[str(path)] = {"rows": raw["row_count"], "size": file_stat.st_size, "dev": file_stat.st_dev, "inode": file_stat.st_ino}
             if snapshot_invalid:
                 unknown_time += sum(group["turns"] for group in raw["turns_by_model"].values())
                 raw["turns_by_model"] = defaultdict(empty_group)
@@ -254,13 +267,6 @@ def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None,
             unknown_time += raw["unknown_time"]
             evictions["count"] += count
             evictions["bytes"] += size
-            start_row = None
-            if since_snapshot:
-                previous = old_files.get(str(path))
-                if isinstance(previous, dict) and raw["row_count"] >= previous.get("rows", -1) and path.stat().st_size >= previous.get("size", -1):
-                    start_row = previous["rows"]
-                elif previous is None:
-                    start_row = 0
             for model, source in raw["turns_by_model"].items():
                 if not source["turns"]:
                     continue
@@ -329,6 +335,28 @@ def self_check() -> None:
             stream.write(json.dumps(later) + "\n")
         diff = report(root, ["s"], None, None, since_snapshot=snapshot)
         assert diff["turns"] == 1
+        replacement = session / "conversation.jsonl"
+        original = replacement.read_bytes()
+        changed = original.replace(b'"model-a"', b'"model-b"')
+        temporary = replacement.with_suffix(".tmp")
+        temporary.write_bytes(changed)
+        os.replace(temporary, replacement)
+        replaced = report(root, ["s"], None, None, since_snapshot=snapshot)
+        assert replaced["turns"] == 0 and replaced["unknown_time"] == 4
+        malformed = session / "conversation.jsonl"
+        malformed.write_text(json.dumps(row) + "\nnot json\n" + json.dumps(later) + "\n")
+        report(root, ["s"], None, None, snapshot_out=snapshot)
+        with malformed.open("a") as stream:
+            stream.write(json.dumps(later) + "\n")
+        malformed_diff = report(root, ["s"], None, None, since_snapshot=snapshot)
+        assert malformed_diff["turns"] == 1
+        missing = root / "missing.json"
+        try:
+            report(root, ["s"], None, None, since_snapshot=missing)
+        except ValueError as exc:
+            assert "invalid snapshot" in str(exc)
+        else:
+            raise AssertionError("missing snapshot must be rejected")
         outside = root / "outside"; outside.write_text("x")
         (root / "sessions" / "escape").symlink_to(outside)
         assert not report(root, None, None, None)["groups"] or all(x["agents"] == 1 for x in report(root, None, None, None)["groups"])
@@ -341,7 +369,10 @@ if __name__ == "__main__":
     if args.self_check:
         self_check(); print("self-check: ok")
     else:
-        data = report(Path(args.zeta_home), args.session_ids or None, parse_time(args.since), parse_time(args.until), args.since_snapshot, args.snapshot_out)
+        try:
+            data = report(Path(args.zeta_home), args.session_ids or None, parse_time(args.since), parse_time(args.until), args.since_snapshot, args.snapshot_out)
+        except ValueError as exc:
+            parser.error(str(exc))
         if args.json:
             print(json.dumps(data, indent=2))
         else:
