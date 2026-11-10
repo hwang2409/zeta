@@ -17,23 +17,33 @@ async def _source(count: int):
         yield _event(index)
 
 
+class _ControlledIterator:
+    def __init__(self) -> None:
+        self._yielded = False
+        self.closed = asyncio.Event()
+
+    def __aiter__(self) -> _ControlledIterator:
+        return self
+
+    async def __anext__(self) -> StreamEvent:
+        if self._yielded:
+            raise AssertionError("the wrapper must close before requesting another event")
+        self._yielded = True
+        return _event(0)
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
 @pytest.mark.asyncio
-async def test_closing_wrapper_closes_source_immediately() -> None:
+async def test_closing_wrapper_closes_controlled_source_immediately() -> None:
     publisher = ForegroundEventPublisher()
-    finalized = asyncio.Event()
-    release = asyncio.Event()
+    source = _ControlledIterator()
+    wrapped = publisher.events(source)
 
-    async def source():
-        try:
-            yield _event(0)
-            await asyncio.wait_for(release.wait(), 10)
-        finally:
-            finalized.set()
-
-    wrapped = publisher.events(source())
     assert (await asyncio.wait_for(wrapped.__anext__(), 10)).delta == "0"
     await asyncio.wait_for(wrapped.aclose(), 10)
-    assert finalized.is_set()
+    assert source.closed.is_set()
     publisher.close()
 
 

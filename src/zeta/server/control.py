@@ -6,7 +6,7 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from ..core.approval import (
@@ -619,40 +619,43 @@ class ServeControl:
         terminal_error: dict[str, object] | None = None
         agent_end: StreamEvent | None = None
         try:
-            async for event in self.foreground_event_publisher.events(
-                loop.run_turn(
-                    text,
-                    origin=origin,
-                    user_message=user_message,
-                    persist_user_message=persist_user_message,
-                    host_environment=None
-                    if host_commands is None
-                    else host_commands.environment,
-                    host_instruction=""
-                    if host_commands is None
-                    else host_commands.instruction,
-                    allow_assistant_reset=allow_assistant_reset,
+            async with aclosing(
+                self.foreground_event_publisher.events(
+                    loop.run_turn(
+                        text,
+                        origin=origin,
+                        user_message=user_message,
+                        persist_user_message=persist_user_message,
+                        host_environment=None
+                        if host_commands is None
+                        else host_commands.environment,
+                        host_instruction=""
+                        if host_commands is None
+                        else host_commands.instruction,
+                        allow_assistant_reset=allow_assistant_reset,
+                    )
                 )
-            ):
-                if pending_turn_end is not None:
-                    if event.type is StreamEventType.AGENT_END:
-                        terminal_events.append(pending_turn_end)
+            ) as event_stream:
+                async for event in event_stream:
+                    if pending_turn_end is not None:
+                        if event.type is StreamEventType.AGENT_END:
+                            terminal_events.append(pending_turn_end)
+                        else:
+                            await self._event(
+                                pending_turn_end,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                            )
+                        pending_turn_end = None
+                    if event.type is StreamEventType.TURN_END:
+                        pending_turn_end = event
+                    elif event.type is StreamEventType.ERROR:
+                        outcome = TurnOutcome.FAILED
+                        terminal_events.append(event)
+                    elif event.type is StreamEventType.AGENT_END:
+                        agent_end = event
                     else:
-                        await self._event(
-                            pending_turn_end,
-                            session_id=session_id,
-                            turn_id=turn_id,
-                        )
-                    pending_turn_end = None
-                if event.type is StreamEventType.TURN_END:
-                    pending_turn_end = event
-                elif event.type is StreamEventType.ERROR:
-                    outcome = TurnOutcome.FAILED
-                    terminal_events.append(event)
-                elif event.type is StreamEventType.AGENT_END:
-                    agent_end = event
-                else:
-                    await self._event(event, session_id=session_id, turn_id=turn_id)
+                        await self._event(event, session_id=session_id, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
