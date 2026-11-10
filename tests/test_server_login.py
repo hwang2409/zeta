@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 
 from tests.support.login import block_loop_until_publication_decision_expires
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _request
@@ -623,7 +624,7 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
             entered.set()
 
         async def wait_closed(self):
-            await release.wait()
+            await await_or_fail(release.wait(), what="delayed listener close")
             await self._listener.wait_closed()
 
     async def start_server(callback, *args, **kwargs):
