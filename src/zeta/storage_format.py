@@ -25,7 +25,6 @@ from typing import Any, Final, Self
 from .locking import format_lock, shape_lock
 
 WRITER_EPOCH: Final = 7
-SESSION_RETENTION_FEATURE_EPOCH: Final = 7
 
 
 class StorageFeature(StrEnum):

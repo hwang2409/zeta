@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import io
 import json
@@ -16,6 +17,26 @@ from zeta.project_registry import ProjectRegistry
 from zeta.skills import SkillCatalog
 from zeta.storage_format import StorageFormatError, open_writer
 from zeta.tools.registry import ToolRegistry
+
+
+def test_feature_epochs_are_fixed_int_literals() -> None:
+    path = Path(__file__).resolve().parents[1] / "src" / "zeta" / "storage_format.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    feature_epochs = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "FEATURE_EPOCHS"
+    )
+    assert isinstance(feature_epochs.value, ast.Dict)
+    for key, value in zip(feature_epochs.value.keys, feature_epochs.value.values):
+        key_text = ast.unparse(key)
+        source = ast.unparse(value)
+        assert isinstance(value, ast.Constant) and type(value.value) is int, (
+            f"FEATURE_EPOCHS[{key_text}] must be a fixed int literal, not {source}; "
+            "a feature's epoch must not move when WRITER_EPOCH changes"
+        )
 
 
 def _writer_epoch_tokens(path: Path, source: str) -> list[str]:

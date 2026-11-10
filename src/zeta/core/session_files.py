@@ -29,6 +29,14 @@ class SessionNotFoundError(SessionError):
     """Raised when the requested session does not exist."""
 
 
+class SessionIdAmbiguousError(SessionError):
+    """Raised when a session id prefix matches more than one session."""
+
+    def __init__(self, message: str, candidates: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.candidates = candidates
+
+
 class SessionFileReplaced(SessionError):
     """Raised when read retries keep opening an unlinked session file."""
 
