@@ -84,6 +84,7 @@ from ._incremental_validation import (
 from ._lifecycle import StoreLifecycleMixin
 from ._log import ConversationLogMixin, PersistedAppend, _DetachedLogState
 from ._notifications import NotificationStateMixin
+from ._observer import ObserverSnapshotMixin
 from ._pending_prompts import (
     MAX_PENDING_PROMPT_TEXT,  # noqa: F401 - re-exported by store facade
     PendingPromptCommitTimeoutError,  # noqa: F401 - re-exported by store facade
@@ -112,6 +113,7 @@ class ConversationStore(
     ClientDeliveryMixin,
     StartupFactsMixin,
     ConversationLogMixin,
+    ObserverSnapshotMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
     session_execution.StoreRuntimeLeaseMixin,
@@ -133,6 +135,7 @@ class ConversationStore(
         bash_cwd: str | Path | None = None,
         _lock_deadline: float | None = None,
         _read_only: bool = False,
+        _observer_snapshot: bool = False,
         _must_exist: bool = False,
         _collect_persisted_appends: bool = False,
         _validated_log_state: _DetachedLogState | None = None,
@@ -171,7 +174,10 @@ class ConversationStore(
             self.on_persisted_activity: Callable[[int], None] | None = None
             self._initialize_entries_installed()
             self.session_dir = self.root_dir / self.session_id
+            if _observer_snapshot and not _read_only:
+                raise ValueError("observer snapshots must be read-only")
             self._read_only = _read_only
+            self._observer_snapshot = _observer_snapshot
             self._must_exist = _must_exist
             self._mutation_target = _mutation_target
             self._repair_explicit = _repair_explicit
@@ -233,7 +239,10 @@ class ConversationStore(
                     session_directory(self.root_dir, self.session_id, lifetime=True)
                 )
                 if _read_only:
-                    self._load()
+                    if _observer_snapshot:
+                        self._sync_observer_snapshot()
+                    else:
+                        self._load()
                     self._load_session_state()
                 else:
                     self._runtime_lease = self._open_execution_lease(
@@ -338,7 +347,6 @@ class ConversationStore(
 
     def set_todo_items(self, items: object) -> None:
         """Replace the session todo list in one atomic state-file update."""
-
         normalized = parse_todo_items(items)
         with self._append_lock():
             self._todo_items = [dict(item) for item in normalized]
@@ -573,7 +581,6 @@ class ConversationStore(
         self, rows: Iterable[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
         """Durably append ordered rows with one flock acquisition and one fsync.
-
         Rows become visible together at the byte-write boundary and are ordered
         exactly as supplied. Each later row is parented to the preceding row.
         """
@@ -789,7 +796,6 @@ class ConversationStore(
         fact_floor: Mapping[str, Any] | None = None,
     ) -> None:
         """Commit an unshared marker without copying its large payload."""
-
         data = self._compaction_marker_data(
             summary,
             source_seq_start,
@@ -837,7 +843,6 @@ class ConversationStore(
             data["telemetry"] = dict(telemetry)
         if fact_floor is not None:
             from ...context_eviction._fact_floor import validate_fact_floor
-
             if not validate_fact_floor(fact_floor):
                 raise ValueError("invalid eviction fact floor")
             data["fact_floor"] = dict(fact_floor)
@@ -894,7 +899,6 @@ class ConversationStore(
                     if existing_ids and existing_ids < request_ids:
                         entry = self._append_row_unlocked("message", data, parent_id)
                         return self._snapshot_entry(entry)
-
             persisted_requests = self._approval_request_entries(branch)
             missing_requests: list[dict[str, Any]] = []
             for request in request_data:
@@ -1002,7 +1006,6 @@ class ConversationStore(
 
         The state check and resolution append share one file lock.
         """
-
         if type(request_id) is not str or not request_id:
             raise ValueError("approval resolution id must be a nonempty string")
         if decision not in {"allow", "deny", "abort"}:
@@ -1119,12 +1122,10 @@ class ConversationStore(
 
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""
-
         return self._entries[-1].id if self._entries else None
 
     def active_branch_head_sequence(self) -> int:
         """Return the active leaf sequence without materializing the branch."""
-
         return self._entries[-1].seq if self._entries else 0
 
     def _active_branch(self) -> tuple[ConversationEntry, ...]:

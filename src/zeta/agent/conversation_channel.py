@@ -17,7 +17,7 @@ from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
-    from .background import BackgroundAgentOwner
+    from .background_owner import BackgroundAgentOwner
     from .pending_delivery import DeliveryInput, ProducerResult, StepDeliveryFlow
 
 

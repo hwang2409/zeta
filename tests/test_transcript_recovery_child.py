@@ -6,7 +6,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from zeta.agent.background import recover_agent_children
+from zeta.agent.background_lifecycle import recover_agent_children
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.core.transcript_recovery.runtime import (

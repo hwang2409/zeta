@@ -423,12 +423,12 @@ print('v4-found', flush=True)
         lock_held = threading.Event()
         release_append = threading.Event()
         append_errors: list[BaseException] = []
-        original_append = v5._append_locked
+        original_commit = v5._commit_prepared_locked
 
-        def hold_append(source: TranscriptSource, *, force_full: bool = False):
+        def hold_commit(prepared):
             lock_held.set()
             assert release_append.wait(10), "test did not release v5 append"
-            return original_append(source, force_full=force_full)
+            return original_commit(prepared)
 
         def append_with_held_lock() -> None:
             try:
@@ -437,7 +437,7 @@ print('v4-found', flush=True)
                 append_errors.append(exc)
 
         # test-contract: seam hold append after it acquires the production lock
-        monkeypatch.setattr(v5, "_append_locked", hold_append)
+        monkeypatch.setattr(v5, "_commit_prepared_locked", hold_commit)
         append_thread = threading.Thread(target=append_with_held_lock)
         append_thread.start()
         try:
@@ -1100,6 +1100,136 @@ def test_inflight_refresh_cannot_repopulate_unbound_project(
 
     assert not refresh.is_alive()
     assert index.search("binding canary") == ()
+
+
+def test_search_progresses_while_append_projects_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(
+        tmp_path / "sessions",
+        "one",
+        [
+            _row(1, "user", "old searchable canary"),
+            _row(2, "assistant", "old answer", state="completed"),
+        ],
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    index.append(source)
+    _write_rows(
+        source,
+        [
+            _row(1, "user", "old searchable canary"),
+            _row(2, "assistant", "old answer", state="completed"),
+            _row(3, "user", "new question"),
+            _row(4, "assistant", "new answer", state="completed"),
+        ],
+    )
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+    search_done = threading.Event()
+    original = index_module.render_transcript_units
+    hits = ()
+
+    def controlled(*args):
+        projection_entered.set()
+        assert release_projection.wait(10)
+        return original(*args)
+
+    def search() -> None:
+        nonlocal hits
+        search_index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+        hits = search_index.search("old searchable canary")
+        search_done.set()
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    append = threading.Thread(target=index.append, args=(source,))
+    search_thread = threading.Thread(target=search)
+    try:
+        append.start()
+        assert projection_entered.wait(10)
+        search_thread.start()
+        assert search_done.wait(10), "public search blocked on source projection"
+        assert [hit.unit.session_id for hit in hits] == ["one"]
+    finally:
+        release_projection.set()
+        append.join(10)
+        search_thread.join(10)
+    assert not append.is_alive() and not search_thread.is_alive()
+
+
+def test_append_retries_three_cursor_cas_losses_without_regressing_winners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        _row(1, "user", "initial question"),
+        _row(2, "assistant", "initial answer", state="completed"),
+    ]
+    source = _source(tmp_path / "sessions", "one", rows)
+    stale = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    winner = TranscriptIndex(tmp_path / "project", PROJECT_A)
+    entered = [threading.Event() for _ in range(3)]
+    releases = [threading.Event() for _ in range(3)]
+    original = index_module.render_transcript_units
+    stale_thread_id: int | None = None
+    attempts = 0
+    error: BaseException | None = None
+    winner_threads: list[threading.Thread] = []
+
+    def controlled(*args):
+        nonlocal attempts
+        if threading.get_ident() == stale_thread_id:
+            attempt = attempts
+            attempts += 1
+            entered[attempt].set()
+            assert releases[attempt].wait(10)
+        return original(*args)
+
+    def append_stale() -> None:
+        nonlocal stale_thread_id, error
+        stale_thread_id = threading.get_ident()
+        try:
+            stale.append(source)
+        except index_module.TranscriptIndexError as exc:
+            error = exc
+
+    monkeypatch.setattr(index_module, "render_transcript_units", controlled)
+    thread = threading.Thread(target=append_stale)
+    try:
+        thread.start()
+        for attempt in range(3):
+            assert entered[attempt].wait(10)
+            seq = len(rows) + 1
+            rows.extend(
+                [
+                    _row(seq, "user", f"winner {attempt} question"),
+                    _row(seq + 1, "assistant", "winner answer", state="completed"),
+                ]
+            )
+            _write_rows(source, rows)
+            winner_done = threading.Event()
+
+            def append_winner(done: threading.Event = winner_done) -> None:
+                winner.append(source)
+                done.set()
+
+            winner_thread = threading.Thread(target=append_winner)
+            winner_threads.append(winner_thread)
+            winner_thread.start()
+            assert winner_done.wait(10), "competing public append blocked on projection"
+            winner_thread.join(10)
+            releases[attempt].set()
+    finally:
+        for release in releases:
+            release.set()
+        thread.join(10)
+        for winner_thread in winner_threads:
+            winner_thread.join(10)
+    assert not thread.is_alive()
+    assert attempts == 3
+    assert isinstance(error, index_module.TranscriptIndexError)
+    assert str(error) == "transcript changed during index refresh; retry required"
+    assert stale.status().cursors["one"] == 8
+    assert len(stale.search("winner question", limit=20)) == 3
 
 
 def test_unbound_only_project_backfills_once_then_stays_ready(
