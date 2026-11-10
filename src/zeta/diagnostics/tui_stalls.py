@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import gc
 import json
 import logging
 import os
@@ -74,6 +75,14 @@ class TUIStallWatchdog:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._logging_failure_reported = False
+        self._gc_callback_installed = False
+        self._gc_started: tuple[float, int] | None = None
+        self._gc_ms = 0.0
+        self._gc_max_ms = 0.0
+        self._gc_by_generation = [0.0, 0.0, 0.0]
+        self._gc_count = 0
+        self._gc_collected = 0
+        self._gc_uncollectable = 0
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start probing. Call this method from the loop thread."""
@@ -82,6 +91,9 @@ class TUIStallWatchdog:
             raise RuntimeError("TUI stall watchdog is already started")
         self._loop = loop
         self._loop_thread_id = threading.get_ident()
+        gc.callbacks.append(self._gc_callback)
+        self._gc_callback_installed = True
+        self._reset_gc_stats()
         self._thread = threading.Thread(
             target=self._watch_safely,
             name="zeta-tui-stall-watchdog",
@@ -93,6 +105,12 @@ class TUIStallWatchdog:
         """Stop the daemon thread without blocking the event loop."""
 
         self._stop.set()
+        if self._gc_callback_installed:
+            try:
+                gc.callbacks.remove(self._gc_callback)
+            except ValueError:
+                pass
+            self._gc_callback_installed = False
         thread = self._thread
         if thread is not None:
             deadline = asyncio.get_running_loop().time() + 0.2
@@ -115,6 +133,7 @@ class TUIStallWatchdog:
             return
         while not self._stop.is_set():
             answered = threading.Event()
+            self._reset_gc_stats()
             started_monotonic = self._clock()
             started_utc = self._utc_now()
             if self._before_probe is not None:
@@ -261,6 +280,11 @@ class TUIStallWatchdog:
             )
         )
         retained_threads = threads[:_MAX_RETAINED_THREADS]
+        gc_by_generation = {
+            str(generation): round(milliseconds, 3)
+            for generation, milliseconds in enumerate(self._gc_by_generation)
+            if milliseconds
+        }
         return {
             "start_time": started.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "duration_ms": round(max(0.0, duration) * 1000, 3),
@@ -277,7 +301,50 @@ class TUIStallWatchdog:
                 0,
                 observed_thread_count - len(retained_threads),
             ),
+            "gc": {
+                "ms": round(self._gc_ms, 3),
+                "max_ms": round(self._gc_max_ms, 3),
+                "by_gen": gc_by_generation,
+                "count": self._gc_count,
+                "collected": self._gc_collected,
+                "uncollectable": self._gc_uncollectable,
+                "freeze_count": gc.get_freeze_count(),
+                "counts": gc.get_count(),
+            },
         }
+
+    def _reset_gc_stats(self) -> None:
+        self._gc_started = None
+        self._gc_ms = 0.0
+        self._gc_max_ms = 0.0
+        self._gc_by_generation = [0.0, 0.0, 0.0]
+        self._gc_count = 0
+        self._gc_collected = 0
+        self._gc_uncollectable = 0
+
+    def _gc_callback(self, phase: str, info: dict[str, Any]) -> None:
+        try:
+            if phase == "start":
+                generation = info.get("generation", 0)
+                self._gc_started = (time.perf_counter(), generation)
+                return
+            if phase != "stop":
+                return
+            started = self._gc_started
+            self._gc_started = None
+            if started is None:
+                return
+            milliseconds = max(0.0, time.perf_counter() - started[0]) * 1000
+            generation = started[1]
+            self._gc_ms += milliseconds
+            self._gc_max_ms = max(self._gc_max_ms, milliseconds)
+            if 0 <= generation < len(self._gc_by_generation):
+                self._gc_by_generation[generation] += milliseconds
+            self._gc_count += 1
+            self._gc_collected += info.get("collected", 0)
+            self._gc_uncollectable += info.get("uncollectable", 0)
+        except BaseException:  # noqa: BLE001 - diagnostics must never affect garbage collection
+            return
 
     def _append_record(self, record: dict[str, Any]) -> None:
         _append_bounded_record(self.path, _encode_bounded_record(record, self.max_bytes), self.max_bytes)

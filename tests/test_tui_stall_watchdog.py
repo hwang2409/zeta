@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import multiprocessing
 import queue
@@ -66,6 +67,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
 
     def after_sample() -> None:
         if loop_blocked.is_set():
+            gc.collect()
             release_loop.put(None)
 
     def block_loop() -> None:
@@ -113,6 +115,8 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     assert records[0]["start_time"] == "2026-01-02T03:04:05Z"
     assert records[0]["duration_ms"] == 50
     assert records[0]["session_id"] == "session-123"
+    assert records[0]["gc"]["ms"] > 0
+    assert records[0]["gc"]["by_gen"]["2"] > 0
     assert any(
         frame["function"] == "block_loop"
         for stack in records[0]["stacks"]
@@ -179,6 +183,8 @@ def test_idle_executor_worker_has_no_busy_samples(tmp_path: Path) -> None:
     assert record["other_threads"][0]["name"] == "idle-executor_0"
     assert record["other_threads"][0]["busy_samples"] == 0
     assert record["other_threads"][0]["stacks"][0]["idle"] is True
+    assert record["gc"]["ms"] == 0
+    assert record["gc"]["count"] == 0
 
 
 def test_cpu_bound_worker_is_recorded_during_loop_starvation(
@@ -441,3 +447,4 @@ async def test_close_stops_watchdog_thread(tmp_path: Path) -> None:
     await watchdog.close()
 
     assert not thread.is_alive()
+    assert watchdog._gc_callback not in gc.callbacks
