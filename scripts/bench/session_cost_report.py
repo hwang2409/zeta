@@ -8,6 +8,8 @@ import json
 import os
 import re
 import statistics
+import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -130,14 +132,20 @@ def stored_model(message: dict) -> str | None:
     return None
 
 
-def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, fallback_model: str, start_row: int = 0) -> tuple[dict, int, int, int, os.stat_result | None]:
+def scan_snapshot_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, fallback_model: str, previous: dict | None = None) -> tuple[dict, int, int, int, os.stat_result | None, bool]:
     result = {"turns_by_model": defaultdict(empty_group), "unknown_time": 0, "row_count": 0}
     evictions = evicted_bytes = skipped = 0
     file_stat = None
+    snapshot_invalid = False
     try:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         file_stat = os.fstat(fd)
+        if previous is not None:
+            replaced = (file_stat.st_dev, file_stat.st_ino) != (previous["dev"], previous["inode"])
+            regressed = file_stat.st_size < previous["size"] or previous["rows"] < 0
+            snapshot_invalid = replaced or regressed
+        start_row = 0 if previous is None or snapshot_invalid else previous["rows"]
         with os.fdopen(fd, encoding="utf-8") as stream:
             for index, line in enumerate(stream):
                 if not line.endswith(("\n", "\r")):
@@ -185,7 +193,7 @@ def scan_file(path: Path, since: dt.datetime | None, until: dt.datetime | None, 
                     group["polling_turns"] += 1
     except (OSError, UnicodeDecodeError):
         skipped += 1
-    return result, evictions, evicted_bytes, skipped, file_stat
+    return result, evictions, evicted_bytes, skipped, file_stat, snapshot_invalid
 
 
 def session_files(root: Path) -> list[Path]:
@@ -223,16 +231,6 @@ def load_snapshot(path: Path) -> dict:
     return snapshot
 
 
-def snapshot_plan(previous: dict | None, file_stat: os.stat_result | None) -> tuple[int, bool]:
-    if previous is None:
-        return 0, False
-    if file_stat is None:
-        return 0, True
-    replaced = (file_stat.st_dev, file_stat.st_ino) != (previous["dev"], previous["inode"])
-    regressed = file_stat.st_size < previous["size"] or previous["rows"] < 0
-    return (0, True) if replaced or regressed else (previous["rows"], False)
-
-
 def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None, until: dt.datetime | None, since_snapshot: Path | None = None, snapshot_out: Path | None = None) -> dict:
     home = home.expanduser().resolve()
     sessions = home / "sessions"
@@ -252,12 +250,9 @@ def report(home: Path, session_ids: list[str] | None, since: dt.datetime | None,
             role = role_for(path)
             fallback_model = model_for(path, set())
             previous = old_files.get(str(path))
-            raw, count, size, bad, file_stat = scan_file(path, since, until, fallback_model)
-            start_row, snapshot_invalid = snapshot_plan(previous, file_stat) if since_snapshot else (0, False)
-            if since_snapshot and isinstance(previous, dict) and raw["row_count"] < previous["rows"]:
-                start_row, snapshot_invalid = 0, True
-            if since_snapshot and start_row:
-                raw, count, size, bad, file_stat = scan_file(path, since, until, fallback_model, start_row)
+            raw, count, size, bad, file_stat, snapshot_invalid = scan_snapshot_file(
+                path, since, until, fallback_model, previous if since_snapshot else None
+            )
             if file_stat is not None:
                 current_snapshot[str(path)] = {"rows": raw["row_count"], "size": file_stat.st_size, "dev": file_stat.st_dev, "inode": file_stat.st_ino}
             if snapshot_invalid:
@@ -351,12 +346,31 @@ def self_check() -> None:
         malformed_diff = report(root, ["s"], None, None, since_snapshot=snapshot)
         assert malformed_diff["turns"] == 1
         missing = root / "missing.json"
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "s", "--zeta-home", str(root), "--since-snapshot", str(missing)],
+            capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode != 0 and "invalid snapshot" in completed.stderr
+        race_snapshot = root / "race-snapshot.json"
+        report(root, ["s"], None, None, snapshot_out=race_snapshot)
+        race_path = session / "conversation.jsonl"
+        race_replacement = race_path.with_suffix(".race")
+        race_replacement.write_bytes(race_path.read_bytes() + json.dumps(later).encode() + b"\n")
+        real_fstat = os.fstat
+        replaced = False
+        def replace_after_stat(fd):
+            nonlocal replaced
+            value = real_fstat(fd)
+            if not replaced and fd >= 0:
+                os.replace(race_replacement, race_path)
+                replaced = True
+            return value
+        os.fstat = replace_after_stat
         try:
-            report(root, ["s"], None, None, since_snapshot=missing)
-        except ValueError as exc:
-            assert "invalid snapshot" in str(exc)
-        else:
-            raise AssertionError("missing snapshot must be rejected")
+            raced = report(root, ["s"], None, None, since_snapshot=race_snapshot)
+        finally:
+            os.fstat = real_fstat
+        assert raced["turns"] == 0 and raced["unknown_time"] == 0
         outside = root / "outside"; outside.write_text("x")
         (root / "sessions" / "escape").symlink_to(outside)
         assert not report(root, None, None, None)["groups"] or all(x["agents"] == 1 for x in report(root, None, None, None)["groups"])
