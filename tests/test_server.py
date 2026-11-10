@@ -12968,15 +12968,23 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     history_write_started = asyncio.Event()
+    history_cancelled = asyncio.Event()
+    history_calls = 0
     history_release = asyncio.Event()
     original_append = ConversationStore.append_approval_history_async
 
     async def fail_terminal_history(self, payload):
+        nonlocal history_calls
         if payload.get("event") == "approval_end":
+            history_calls += 1
             history_write_started.set()
             if failure == "oserror":
                 raise OSError("forced delegated history failure")
-            await asyncio.wait_for(history_release.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(history_release.wait(), timeout=10)
+            except asyncio.CancelledError:
+                history_cancelled.set()
+                raise
         return await original_append(self, payload)
 
     # test-contract: seam the durable store has no deterministic failure hook
@@ -13047,6 +13055,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
+                await asyncio.wait_for(history_cancelled.wait(), timeout=10)
             approval_owner = (
                 "approval_end",
                 approval["session_id"],
@@ -13061,6 +13070,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 await asyncio.wait_for(settlement, timeout=10)
+                assert history_calls == 1
                 status_frames = await _request(reader, writer, 5, "status")
                 frames.extend(status_frames)
                 assert status_frames[-1].get("result", {}).get("state") in {
