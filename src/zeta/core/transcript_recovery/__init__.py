@@ -20,6 +20,15 @@ from ...storage_format import (
 )
 from ..checkpoints import ConversationEntry, load_session_json
 from ..session_files import open_session_file, write_json_file
+from .errors import (
+    ObserverSnapshotChanged as ObserverSnapshotChanged,
+)
+from .errors import (
+    TranscriptFailureKind as TranscriptFailureKind,
+)
+from .errors import (
+    TranscriptLoadError as TranscriptLoadError,
+)
 
 _BUFFER_SIZE = 1024 * 1024
 _MAX_RECORD_BYTES = 64 * 1024

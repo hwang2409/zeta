@@ -19,6 +19,7 @@ from ...project_errors import (
 from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_history import PROJECT_MEMORY_FILES
 from ...project_registry import Project, ProjectRegistry
+from ...storage_format import StorageFeature, feature_enabled
 from ..protocol import ErrorDescriptor, FrameCodec
 
 if TYPE_CHECKING:
@@ -287,11 +288,15 @@ class ProjectRequests:
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
         state = self.inbox.read(project.project_id)
-        messages = [self._bounded_message(request_id, item) for item in state[status]]
-        decorated = {
-            item["id"]: self.inbox.decorate(project.project_id, item)
-            for item in state[status]
-        }
+        projected = [
+            self.inbox.decorate(project.project_id, item) for item in state[status]
+        ]
+        messages = [self._bounded_message(request_id, item) for item in projected]
+        provenance_enabled = feature_enabled(
+            self.registry._storage_lease.observed_epoch,
+            StorageFeature.INBOX_DELEGATION,
+        )
+        projected_by_id = {item["id"]: item for item in projected}
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
@@ -302,8 +307,13 @@ class ProjectRequests:
             extra_for_page=lambda page: {
                 "status": status,
                 "untrusted": any(
-                    decorated.get(message.get("id"), {}).get("authority")
-                    != "trusted_assignment"
+                    (
+                        projected_by_id.get(message.get("id"), {}).get("authority")
+                        != "trusted_assignment"
+                    )
+                    if provenance_enabled
+                    else projected_by_id.get(message.get("id"), {}).get("origin")
+                    != "local"
                     for message in page
                 ),
                 "invalid": invalid,
@@ -533,7 +543,10 @@ class EntryProjectViews:
 
     def show(self, request_id: str | int, project: Project) -> dict[str, object]:
         sessions = self.runtime.manager.list_sessions_read_only()
-        snapshot = self.registry._entry_memory_state(project.project_id)
+        projection = self.registry.memory_transactions.read(project.project_id)
+        if projection.format != 2:
+            raise ProjectRegistryError("project uses legacy memory format")
+        snapshot = projection.snapshot
         kinds = kind_views(snapshot.state)
         result: dict[str, object] = {
             "project": self._project_metadata(project, sessions),

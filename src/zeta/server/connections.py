@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections import deque
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.session_files import descend_directory
+from ..core.store import ConversationStore, ObserverSnapshotChanged, TranscriptLoadError
+from ..core.store._child_runs import (
+    child_run_segments,
+    parse_child_run_id,
+    verify_child_run_directory,
+)
 from ..core.thread_call import ThreadCallWorkers
 from . import content
-from .handlers import history, session, settings, validation
+from .handlers import history, lifecycle, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -18,13 +27,84 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
+from .session_replay import (
+    DeferredFrame,
+    ReplayScopeId,
+    SessionReplay,
+    history_features,
+)
+from .session_replay.output import ReplayOutput, _OutputFrame
+from .session_replay.rows import RowFacts
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
+OBSERVER_REQUESTS = frozenset(
+    {
+        "list_sessions",
+        "status",
+        "session_tree",
+        "session_history",
+        "session_history_and_subscribe",
+        "content_read",
+        "model_catalog",
+        "session_settings",
+        "ping",
+        "delivery_status",
+        "session_grants",
+    }
+)
 MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
+
+# one owner for feature gates and optional wire fields on every output path
+NO_FEATURE = frozenset()
+EVENT_FEATURES = {
+    EventDescriptor.AGENT_START: NO_FEATURE,
+    EventDescriptor.TURN_START: NO_FEATURE,
+    EventDescriptor.COMPACTION_START: NO_FEATURE,
+    EventDescriptor.COMPACTION_END: NO_FEATURE,
+    EventDescriptor.MESSAGE_START: NO_FEATURE,
+    EventDescriptor.ASSISTANT_DELTA: NO_FEATURE,
+    EventDescriptor.ASSISTANT_MESSAGE: NO_FEATURE,
+    EventDescriptor.RETRY: NO_FEATURE,
+    EventDescriptor.ASSISTANT_RESET: NO_FEATURE,
+    EventDescriptor.APPROVAL_REQUEST: NO_FEATURE,
+    EventDescriptor.APPROVAL_END: NO_FEATURE,
+    EventDescriptor.TOOL_START: NO_FEATURE,
+    EventDescriptor.TOOL_OUTPUT: NO_FEATURE,
+    EventDescriptor.TOOL_END: NO_FEATURE,
+    EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
+    EventDescriptor.CHILD_IDLE: NO_FEATURE,
+    EventDescriptor.CHILD_HOLD: NO_FEATURE,
+    EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.CHILD_QUESTION: NO_FEATURE,
+    EventDescriptor.CHILD_QUESTION_WITHDRAWN: NO_FEATURE,
+    EventDescriptor.CHILD_MESSAGE_DELIVERED: NO_FEATURE,
+    EventDescriptor.ACCOUNT_LIMIT: NO_FEATURE,
+    EventDescriptor.ACCOUNT_STATE_UNKNOWN: NO_FEATURE,
+    EventDescriptor.TURN_END: NO_FEATURE,
+    EventDescriptor.SERVED_TURN_END: NO_FEATURE,
+    EventDescriptor.AGENT_END: NO_FEATURE,
+    EventDescriptor.ERROR: NO_FEATURE,
+    EventDescriptor.DELIVERY_STATUS: frozenset({"session_history_fidelity"}),
+    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
+    EventDescriptor.TURN_ABORTED: NO_FEATURE,
+    EventDescriptor.USAGE: NO_FEATURE,
+    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
+    EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
+    EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
+    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
+    EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
+    EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
+}
+OPTIONAL_FIELD_FEATURES = {
+    (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
+        {"delivery_id", "user_message_delivery_id"}
+    ),
+}
 
 
 async def _overflow_deadline_wait() -> None:
@@ -49,12 +129,6 @@ class ControllerMetadata:
     connection: Any
     protocol_version: str
     features: frozenset[str]
-
-
-@dataclass
-class _OutputFrame:
-    payload: _Frame
-    future: asyncio.Future[bool] | None = None
 
 
 @dataclass
@@ -88,7 +162,7 @@ class _Connection:
     output: _OutputState | None = None
 
 
-class ConnectionRegistry:
+class ConnectionRegistry(ReplayOutput):
     """Owns connection claims, output, and bounded observer reads."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -98,6 +172,9 @@ class ConnectionRegistry:
         self._controller_output_paused = False
         self._observers: list[_Connection] = []
         self._closed = False
+        self.replay = SessionReplay()
+        self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
+        self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
 
     def register(self, connection: Any) -> None:
@@ -207,15 +284,9 @@ class ConnectionRegistry:
             return Admission("no_controller"), None, None
         if state is self._controller and self._controller_output_paused:
             return Admission("not_writable"), None, None
-        if required_feature is not None and required_feature not in state.features:
+        if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
-        if (
-            event is EventDescriptor.APPROVAL_END
-            and "approval_reconnect" not in state.features
-            and isinstance(fields.get("data"), dict)
-            and fields["data"].get("reason") == "grace_expired"
-        ):
-            return Admission("feature_rejected"), None, None
+        fields = self._fields_for_connection(state, event, fields)
         frame = state.connection.codec.notification(event, session_id, **fields)
         if frame is None:
             return Admission("codec_rejected"), None, None
@@ -228,15 +299,57 @@ class ConnectionRegistry:
             return Admission("not_writable"), None, None
         return Admission("admitted", state.connection), frame, output
 
+    @staticmethod
+    def _feature_rejected(
+        state: _Connection,
+        event: EventDescriptor,
+        required_feature: str | None,
+        fields: dict[str, object],
+    ) -> bool:
+        if event not in EVENT_FEATURES:
+            # fail closed: an event the table does not name is never admitted.
+            return True
+        required = EVENT_FEATURES[event]
+        if required_feature is not None:
+            required |= frozenset({required_feature})
+        if not required <= history_features(state.features):
+            return True
+        return (
+            event is EventDescriptor.APPROVAL_END
+            and "approval_reconnect" not in state.features
+            and isinstance(fields.get("data"), dict)
+            and fields["data"].get("reason") == "grace_expired"
+        )
+
+    @staticmethod
+    def _fields_for_connection(
+        state: _Connection, event: EventDescriptor, fields: dict[str, object]
+    ) -> dict[str, object]:
+        shaped = dict(fields)
+        for (field_event, name), required in OPTIONAL_FIELD_FEATURES.items():
+            if field_event is event and name in shaped and not required <= history_features(
+                state.features
+            ):
+                shaped.pop(name)
+        return shaped
+
     def try_admit_controller(
         self,
         event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
+        replay_row: RowFacts | None = None,
         **fields: object,
     ) -> Admission:
         """Admit one controller event without waiting for physical output."""
+        covers = self._replay_covers(
+            event, session_id, fields, replay_row, required_feature
+        )
+        if not isinstance(covers, DeferredFrame):
+            self._publish_observer_replay(
+                event, session_id, required_feature, fields, covers
+            )
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -245,6 +358,17 @@ class ConnectionRegistry:
             fields=fields,
         )
         if outcome.kind != "admitted" or frame is None or output is None:
+            return outcome
+        assert self._controller is not None
+        if self._replay_holds_copy(self._controller, covers):
+            return outcome
+        if not isinstance(covers, DeferredFrame) and self._publish_replay(
+            self._controller,
+            event,
+            session_id,
+            self._fields_for_connection(self._controller, event, fields),
+            covers,
+        ):
             return outcome
         if not self._admit(self._controller, frame):
             return Admission("capacity_rejected")
@@ -255,14 +379,31 @@ class ConnectionRegistry:
         )
         return outcome
 
+    def _replay_holds_copy(self, state: _Connection, covers: object) -> bool:
+        """True when a deferred record will send the controller's copy on its stream.
+
+        A controller with no stream or join in the scope gets the frame plainly now.
+        """
+        return isinstance(covers, DeferredFrame) and self.replay.scope_for(
+            state.connection
+        ) == ReplayScopeId.top(covers.session_id)
+
     async def publish_controller(
         self,
         event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
+        replay_row: RowFacts | None = None,
         **fields: object,
     ) -> bool:
+        covers = self._replay_covers(
+            event, session_id, fields, replay_row, required_feature
+        )
+        if not isinstance(covers, DeferredFrame):
+            self._publish_observer_replay(
+                event, session_id, required_feature, fields, covers
+            )
         outcome, frame, output = self._controller_preflight(
             self._controller,
             event,
@@ -274,6 +415,16 @@ class ConnectionRegistry:
             return False
         state = self._controller
         assert state is not None
+        if self._replay_holds_copy(state, covers):
+            return True
+        if not isinstance(covers, DeferredFrame) and self._publish_replay(
+            state,
+            event,
+            session_id,
+            self._fields_for_connection(state, event, fields),
+            covers,
+        ):
+            return True
         if not self._admit(state, frame):
             return False
         if output.phase in {"claimed_buffering", "flushing"}:
@@ -301,9 +452,14 @@ class ConnectionRegistry:
             and feature in state.features
             and (state is not self._controller or not self._controller_output_paused)
         )
+        covers = self._replay_covers(event, session_id, {"data": data}, None)
+        # feature events have no publish-first route
+        assert not isinstance(covers, DeferredFrame)
         for state in states:
             frame = state.connection.codec.notification(event, session_id, data=data)
             if frame is None:
+                continue
+            if self._publish_replay(state, event, session_id, {"data": data}, covers):
                 continue
             if state is self._controller:
                 await self.send(state.connection, frame)
@@ -311,6 +467,7 @@ class ConnectionRegistry:
                 self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
+        self.invalidate_replay_connection(connection)
         state = self._connections.pop(connection, None)
         if state is None:
             return
@@ -340,7 +497,7 @@ class ConnectionRegistry:
         if (
             output.overflow_frame is not None
             and not output.overflowed
-            and not self._fits(output, frame)
+            and not self._fits(output, len(frame))
         ):
             self._begin_overflow(state, enqueue_control=False)
         hello = _OutputFrame(frame)
@@ -456,6 +613,7 @@ class ConnectionRegistry:
             result, _ = await output.current_write
         except asyncio.CancelledError:
             self._finish_frame_accounting(output, item)
+            self._fail_replay_frame(state, item)
             if not output.released:
                 self._finish_future(item.future, False)
             if asyncio.current_task().cancelling():
@@ -468,6 +626,7 @@ class ConnectionRegistry:
             return
         except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
             self._finish_frame_accounting(output, item)
+            self._fail_replay_frame(state, item)
             self._finish_future(item.future, error=exc)
             if output.phase == "flushing":
                 self._reset_flush(output, error=exc)
@@ -477,6 +636,8 @@ class ConnectionRegistry:
             output.current_write = None
         self._finish_frame_accounting(output, item)
         self._finish_future(item.future, result)
+        if not result:
+            self._fail_replay_frame(state, item)
         if not result and output.phase == "flushing":
             self._reset_flush(output, False)
 
@@ -523,12 +684,12 @@ class ConnectionRegistry:
             return
         self._enqueue(output, _OutputFrame(frame))
 
-    def _fits(self, output: _OutputState, frame: _Frame) -> bool:
+    def _fits(self, output: _OutputState, size: int, frames: int = 1) -> bool:
         control = output.overflow_frame
         assert control is not None
         return (
-            output.retained_bytes + len(frame) + len(control) <= OUTPUT_MAX_BYTES
-            and output.retained_frames + 2 <= OUTPUT_MAX_FRAMES
+            output.retained_bytes + size + len(control) <= OUTPUT_MAX_BYTES
+            and output.retained_frames + frames + 1 <= OUTPUT_MAX_FRAMES
         )
 
     def _admit(self, state: _Connection, frame: _Frame) -> bool:
@@ -536,7 +697,7 @@ class ConnectionRegistry:
         assert output is not None
         if output.overflowed:
             return False
-        if self._fits(output, frame):
+        if self._fits(output, len(frame)):
             return True
         self._begin_overflow(state, enqueue_control=output.phase != "claimed_buffering")
         return False
@@ -619,12 +780,15 @@ class ConnectionRegistry:
         output.retained_bytes += len(item.payload)
         output.retained_frames += 1
 
-    @staticmethod
-    def _finish_frame_accounting(output: _OutputState, item: _OutputFrame) -> None:
+    def _finish_frame_accounting(
+        self, output: _OutputState, item: _OutputFrame
+    ) -> None:
         output.retained_bytes -= len(item.payload)
         output.retained_frames -= 1
         assert output.retained_bytes >= 0
         assert output.retained_frames >= 0
+        if item.replay_scope is not None and item.replay_size:
+            self.replay.release(item.replay_scope, item.replay_size)
 
     @staticmethod
     def _assert_retained_accounting(output: _OutputState) -> None:
@@ -634,9 +798,8 @@ class ConnectionRegistry:
         assert output.retained_bytes == sum(len(item.payload) for item in frames)
         assert output.retained_frames == len(frames)
 
-    @staticmethod
     async def _cancel_frame(
-        output: _OutputState, item: _OutputFrame
+        self, output: _OutputState, item: _OutputFrame
     ) -> tuple[bool | None, FrameWriteCancelled | None]:
         if output.current_frame is item:
             if output.current_write is not None:
@@ -651,7 +814,7 @@ class ConnectionRegistry:
             output.queue.remove(item)
         except ValueError:
             return None, None
-        ConnectionRegistry._finish_frame_accounting(output, item)
+        self._finish_frame_accounting(output, item)
         if item.future is not None and not item.future.done():
             item.future.cancel()
         return None, None
@@ -697,11 +860,10 @@ class ConnectionRegistry:
             task.cancel()
         output.overflow_deadline_task = None
 
-    @staticmethod
-    def _clear_output(output: _OutputState, *, result: bool | None = None) -> None:
+    def _clear_output(self, output: _OutputState, *, result: bool | None = None) -> None:
         while output.queue:
             item = output.queue.popleft()
-            ConnectionRegistry._finish_frame_accounting(output, item)
+            self._finish_frame_accounting(output, item)
             if item.future is None or item.future.done():
                 continue
             if result is None:
@@ -744,15 +906,13 @@ class ConnectionRegistry:
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
         runtime = connection.server.runtime
         store = validation.active(runtime, params)
-        features = self._connections[connection].features
+        features = history_features(self._connections[connection].features)
         return await self.run_read(
             connection,
             lambda: history.history(
                 _observer_runtime(store),
                 params,
-                include_delivery_id={
-                    "delivery_id", "user_message_event", "user_message_delivery_id"
-                } <= features,
+                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= features,
                 backward_enabled="session_history_backward" in features,
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
@@ -767,11 +927,10 @@ class ConnectionRegistry:
         runtime = connection.server.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        store = runtime.opened.store
         return await self.run_read(
             connection,
             lambda: content.read(
-                store,
+                runtime.opened.store,
                 params.get("handle"),
                 offset=params.get("offset", 0),
                 limit=params.get("limit", content.MAX_CONTENT_READ),
@@ -780,32 +939,112 @@ class ConnectionRegistry:
         )
 
     async def read_catalog(self, connection: Any) -> object:
-        runtime = connection.server.runtime
-        return await self.run_read(connection, lambda: settings.catalog(runtime))
+        return await self.run_read(connection, lambda: settings.catalog(connection.server.runtime))
 
     async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
         runtime = connection.server.runtime
+        if runtime.opened is None:
+            raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
+        return await self.run_read(connection, lambda: settings.settings(runtime))
+
+    async def read_child_run_history(
+        self, connection: Any, params: dict[str, Any]
+    ) -> object:
+        if (
+            set(params) - {"session_id", "run_id", "before", "history_validator"}
+            or type(params.get("session_id")) is not str
+            or type(params.get("run_id")) is not str
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "session_id and run_id are required child history parameters",
+            )
+        runtime = connection.server.runtime
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
         return await self.run_read(
             connection,
-            lambda: settings.settings(runtime),
+            lambda: perform_child_history_read(
+                target,
+                params,
+                registry=self,
+                fidelity="session_history_fidelity" in features,
+            ),
             session_id=runtime.session_id,
         )
 
+    def _child_reader_for(
+        self, root_store: ConversationStore, run_id: str
+    ) -> ConversationStore:
+        parse_child_run_id(root_store.session_id, run_id)
+        segments = child_run_segments(root_store.session_id, run_id)
+        key = (root_store.session_id, run_id)
+        with self._child_reader_lock:
+            if self._child_reader is not None and self._child_reader[0] == key:
+                reader = self._child_reader[1]
+                reader.refresh()
+                return reader
+            if self._child_reader is not None:
+                self._child_reader[1].close()
+            with ExitStack() as cleanup:
+                directory_fd = root_store.directory_fd
+                components = tuple(
+                    component
+                    for segment in segments
+                    for component in ("agents", str(segment))
+                )
+                directory_fd = cleanup.enter_context(
+                    descend_directory(directory_fd, components)
+                )
+                try:
+                    verify_child_run_directory(directory_fd, run_id)
+                except (FileNotFoundError, OSError, ValueError) as exc:
+                    raise ProtocolError(
+                        ErrorDescriptor.CHILD_RUN_NOT_FOUND,
+                        "child run was not found",
+                    ) from exc
+            parent = root_store.session_dir
+            for segment in segments[:-1]:
+                parent = parent / "agents" / str(segment)
+            try:
+                reader = ConversationStore(
+                    parent / "agents",
+                    session_id=str(segments[-1]),
+                    _read_only=True,
+                    _observer_snapshot=True,
+                    _must_exist=True,
+                    _storage_lease=root_store._storage_lease,
+                )
+            except TranscriptLoadError as exc:
+                exc.session_id = root_store.session_id
+                raise
+            reader._child_history_reader = True
+            self._child_reader = (key, reader)
+            return reader
+
+    def close_child_reader(self) -> None:
+        with self._child_reader_lock:
+            if self._child_reader is not None:
+                self._child_reader[1].close()
+                self._child_reader = None
+
+    # merge-resolution: src/zeta/server/connections.py pr-lines ConnectionRegistry.read_status@9bb4d2bb8ef9 -> keep the shared status method after adding child history reads
     async def read_status(
         self, connection: Any, status: dict[str, Any], session_id: str | None
     ) -> object:
         features = self._connections[connection].features
         return await self.run_read(
             connection,
-            lambda: project_status(
-                status, served_turn_end="served_turn_end" in features
-            ),
+            lambda: project_status(status, served_turn_end="served_turn_end" in features),
             session_id=session_id,
         )
 
     async def aclose(self) -> None:
         self._closed = True
         states = tuple(self._connections.values())
+        await asyncio.to_thread(self.close_child_reader)
         self._reads.close()
         for state in states:
             if state.output is not None:
@@ -818,6 +1057,124 @@ class ConnectionRegistry:
         self._controller = None
 
 
+def _active_status_parts(
+    client: Any, loop: Any, fallback_config: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    runtime = client.server.runtime
+    transcript_index_failure = (
+        loop.transcript_index_failure(runtime.session_id)
+        if client.protocol_version != "1.0" and loop is not None
+        else None
+    )
+    project_context_health = (
+        (
+            loop.project_context_health.summary
+            if loop is not None and loop.project_context_health is not None
+            else "healthy"
+        )
+        if client.protocol_version != "1.0"
+        else None
+    )
+    status = {
+        "session": lifecycle.session_snapshot(client),
+        "state": (
+            "idle"
+            if client.server.control.unhealthy() or runtime.state is None
+            else runtime.state.status
+        ),
+        "explicit_finish": (
+            loop.explicit_finish
+            if loop is not None
+            else fallback_config.agents_explicit_finish
+        ),
+    }
+    suffix = {
+        "pending_approvals": [],
+        "usage": dict(runtime.usage),
+        **(
+            {"transcript_index_failure": transcript_index_failure}
+            if transcript_index_failure is not None
+            else {}
+        ),
+        **(
+            {"project_context_health": project_context_health}
+            if project_context_health is not None
+            else {}
+        ),
+        "store": runtime.opened.store,
+    }
+    slash_command = client.server.control.slash_lock.status()
+    if slash_command is not None:
+        suffix["slash_command"] = slash_command
+    return status, suffix
+
+
+def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, object]:
+    runtime = client.server.runtime
+    loop = runtime.loop
+    if loop is None and fallback_config is None:
+        raise RuntimeError("status fallback config was not resolved")
+    if runtime.opened is None:
+        status = {"session": None, "state": "idle", "explicit_finish": False}
+        suffix = {
+            "pending_approvals": [],
+            "usage": {},
+            "compaction_markers": 0,
+        }
+        session_id = None
+    else:
+        status, suffix = _active_status_parts(client, loop, fallback_config)
+        session_id = runtime.session_id
+    if client.protocol_version != "1.0":
+        status["max_agent_depth"] = (
+            loop.max_agent_depth
+            if loop is not None
+            else fallback_config.agents_max_depth
+        )
+    status.update(suffix)
+    return session_id, status
+
+def perform_child_history_read(
+    target: tuple[str | None, object],
+    params: dict[str, Any],
+    *,
+    registry: ConnectionRegistry,
+    fidelity: bool,
+) -> object:
+    root_store = target[1]
+    try:
+        parse_child_run_id(root_store.session_id, params["run_id"])
+    except ValueError as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child run id") from exc
+    try:
+        reader = registry._child_reader_for(root_store, params["run_id"])
+    except ObserverSnapshotChanged as exc:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "child history source changed during read",
+        ) from exc
+    except ProtocolError:
+        raise
+    except (FileNotFoundError, OSError) as exc:
+        raise ProtocolError(
+            ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
+        ) from exc
+    runtime = type(
+        "ObserverRuntime",
+        (),
+        {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
+    )()
+    history_params = {key: value for key, value in params.items() if key != "run_id"}
+    if "before" not in history_params:
+        history_params["before"] = None
+    return history.history(
+        runtime,
+        history_params,
+        backward_enabled=True,
+        fidelity=fidelity,
+    )
+
+
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
     status = dict(target)
     store = status.pop("store", None)
@@ -828,14 +1185,14 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
         outcome = None
         entry = store.last_turn_end() if store is not None else None
         if entry is not None:
-            outcome = {"turn_id": entry.data["turn_id"], "reason": entry.data["reason"]}
+            outcome = {
+                "turn_id": entry.data["turn_id"],
+                "reason": entry.data["reason"],
+            }
         status["last_turn_outcome"] = outcome
     return status
 
 
+
 def _observer_runtime(store: object) -> object:
-    return type(
-        "ObserverRuntime",
-        (),
-        {"opened": type("Opened", (), {"store": store})()},
-    )()
+    return type("ObserverRuntime", (), {"opened": type("Opened", (), {"store": store})()})()

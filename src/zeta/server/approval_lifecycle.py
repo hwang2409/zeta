@@ -29,6 +29,7 @@ from .protocol import (
     EventDescriptor,
     ProtocolError,
 )
+from .session_replay.rows import DELEGATED, WRITE_FAILED, RowFacts
 
 Admit = Callable[..., Admission]
 Offload = Callable[[Callable[[], object]], Awaitable[object]]
@@ -783,8 +784,9 @@ class ApprovalLifecycle:
                     "decision": "abort",
                     "reason": reason or "turn_canceled",
                 }
+                # no resolution row was written: the end is live-only (WRITE_FAILED)
                 finish = self._start_settlement(
-                    record, self._finish_record(record, synthetic)
+                    record, self._finish_record(record, synthetic, WRITE_FAILED)
                 )
                 try:
                     await approval_settlement.finish_despite_cancellation(
@@ -967,7 +969,7 @@ class ApprovalLifecycle:
         return True
 
     async def _finish_record(
-        self, record: ApprovalRecord, resolution: dict[str, str]
+        self, record: ApprovalRecord, resolution: dict[str, str], row: RowFacts | None = None
     ) -> None:
         current = self._state.records.get(record.target.key)
         if (
@@ -1018,8 +1020,10 @@ class ApprovalLifecycle:
                 if isinstance(record.target.key, tuple):
                     terminal = record.terminal
                     session_id = self._session_id()
+                    written = history_outcome is None and record.history_published
                     end_result = self._admit(
-                        EventDescriptor.APPROVAL_END, session_id, **payload
+                        EventDescriptor.APPROVAL_END, session_id,
+                        replay_row=DELEGATED if written else WRITE_FAILED, **payload,
                     )
                     terminal_result = (
                         self._admit(EventDescriptor.TOOL_END, session_id, **terminal[2])
@@ -1038,6 +1042,7 @@ class ApprovalLifecycle:
                             StreamEventType.TOOL_APPROVAL_END
                         ],
                         session_id=self._session_id(),
+                        replay_row=row,
                         **payload,
                     )
                     record = self._change(record, live_end=admission)

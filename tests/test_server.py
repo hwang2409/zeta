@@ -106,6 +106,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.foreground_events import ForegroundEventPublisher
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.empty_turn import DispatchProgress, empty_turn_error
 from zeta.server import ZetaServer
@@ -145,7 +146,11 @@ TIMEOUT = 30
 
 def _client_notifier(client: _Client):
     async def notify(
-        event: EventDescriptor, session_id: str | None = None, **fields: object
+        event: EventDescriptor,
+        session_id: str | None = None,
+        *,
+        replay_row: object = None,  # replay covers; this raw client has no stream
+        **fields: object,
     ) -> bool:
         return await client._write(
             client.codec.notification(event, session_id, **fields)
@@ -1639,6 +1644,123 @@ def _history_event_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello = (
+            await _request(
+                reader,
+                writer,
+                1,
+                "hello",
+                {"protocol_version": "1.1", "features": ["session_replay_seq"]},
+            )
+        )[-1]["result"]
+        assert "session_history_and_subscribe" in hello["capabilities"]["requests"]
+        session = (
+            await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]
+        result = (
+            await _request(
+                reader,
+                writer,
+                3,
+                "session_history_and_subscribe",
+                {"session_id": session["session_id"]},
+            )
+        )[-1]["result"]
+        assert result["replay"]["history_seq"] == 0
+        await server.control._notify(
+            EventDescriptor.TURN_START, session["session_id"], data={}
+        )
+        while True:
+            frame = await _read(reader)
+            if frame.get("method") != "event":
+                continue
+            event = frame["params"]
+            if event.get("event") == "turn_start" and "stream_id" in event:
+                break
+        assert event["stream_id"] == result["replay"]["stream_id"]
+        assert event["seq"] == 1
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_replay_releases_completed_frames_for_long_stream(
+    tmp_path: Path,
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        result = (await _request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))[-1]["result"]
+        assert result["replay"]["history_seq"] == 0
+        for sequence in range(1, 301):
+            await server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={})
+            while True:
+                frame = await _read(reader)
+                if frame.get("method") != "event":
+                    continue
+                event = frame["params"]
+                if event.get("event") == "turn_start" and "stream_id" in event:
+                    break
+            assert event["stream_id"] == result["replay"]["stream_id"]
+            assert event["seq"] == sequence
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_replay_join_admits_response_before_held_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = _Client._write_physical
+
+    async def gated(client: _Client, payload: bytes) -> bool:
+        if b'"id":3' in payload:
+            entered.set()
+            await await_or_fail(release.wait(), what="release gated response")
+        return await original(client, payload)
+
+    # test-contract: seam — gate the real transport writer without replacing the output owner.
+    monkeypatch.setattr(_Client, "_write_physical", gated)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1", "features": ["session_replay_seq"]})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        join = asyncio.create_task(_request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))
+        await await_or_fail(entered.wait(), what="join response write")
+        for _ in range(3):
+            await await_or_fail(server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={}), what="publish replay event")
+        release.set()
+        assert (await await_or_fail(join, what="join response"))[-1]["result"]["replay"]["history_seq"] == 0
+        events = [await await_or_fail(_event(reader, "turn_start"), what="replay event") for _ in range(3)]
+        assert [event["seq"] for event in events] == [1, 2, 3]
+    finally:
+        release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("decision", ["allow", "deny", "abort"])
 async def test_session_history_matches_live_approval_lifecycle(
     tmp_path: Path, decision: str
@@ -1783,6 +1905,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
     entries = Snapshot(
         (
             SimpleNamespace(
+                seq=0,
                 id="message-1",
                 type="message",
                 data={
@@ -1793,6 +1916,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
                 },
             ),
             SimpleNamespace(
+                seq=0,
                 id="message-2",
                 type="message",
                 data={
@@ -3524,12 +3648,9 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
     marker = tmp_path / "foreground-finished"
     release = tmp_path / "release-foreground"
     pid_path = tmp_path / "foreground-pid"
-    # Fork the waiter before writing the pid: an abort sent while the shell
-    # is still forking can miss the new child (macOS killpg race).
     command = (
-        f"{wait_for_path_command(release)} & "
         f"echo $$ > {shlex.quote(str(pid_path))} && "
-        f"wait $! && touch {shlex.quote(str(marker))}"
+        f"{wait_for_path_command(release)} && touch {shlex.quote(str(marker))}"
     )
     backend = BackgroundChildAndForegroundToolBackend(command)
     server = ZetaServer(
@@ -4518,7 +4639,8 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
 
     async def run_blocking(job: Callable[[], object]) -> object:
@@ -9245,6 +9367,9 @@ async def test_memory_command_parity_tui_and_serve() -> None:
     class Registry:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+            self.memory_transactions = SimpleNamespace(
+                read=lambda project_id: SimpleNamespace(format=1)
+            )
 
         def ensure_memory_supported(self, project_id: str) -> None:
             self.calls.append(("format", project_id))
@@ -12363,20 +12488,24 @@ async def test_config_changed_requires_live_config_changed_feature(
         server.runtime.loop.set_background_event_sink(prepared_events.append)
         await server.runtime.loop.refresh_live_config()
         assert len(prepared_events) == 1
-        notifications: list[str] = []
-        original_notify = server.control._notify
-
-        async def record_notify(event: str, *args: object, **kwargs: object) -> None:
-            notifications.append(event)
-            await original_notify(event, *args, **kwargs)
-
-        server.control._notify = record_notify
         await server.control._event(prepared_events[0], background=True)
-        await _request(reader, writer, 3, "status", {})
 
-        assert ("config_changed" in notifications) is negotiated
+        # Wire assertion: the one owner of the feature gate is the connection, so
+        # a controller that did not negotiate live_config_changed never receives
+        # the config_changed frame. Read every frame up to the status response and
+        # check the wire, not the internal _notify seam.
+        await _send(reader, writer, 3, "status", {})
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == 3, what="status response"
+        )
+        wire_events = [frame.get("params", {}).get("event") for frame in frames]
+        assert ("config_changed" in wire_events) is negotiated
         if negotiated:
-            config_event = await _event(reader, "config_changed")
+            config_event = next(
+                frame["params"]
+                for frame in frames
+                if frame.get("params", {}).get("event") == "config_changed"
+            )
             assert config_event["data"]["changes"]["agents"]["added"] == ["specialist"]
     finally:
         await close_serve(server, writer)
@@ -12576,7 +12705,8 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     policy_store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []
 
@@ -12649,7 +12779,8 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     policy_store = ConversationStore(tmp_path / "serve")
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []
 
@@ -12968,15 +13099,23 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     history_write_started = asyncio.Event()
+    history_cancelled = asyncio.Event()
+    history_calls = 0
     history_release = asyncio.Event()
     original_append = ConversationStore.append_approval_history_async
 
     async def fail_terminal_history(self, payload):
+        nonlocal history_calls
         if payload.get("event") == "approval_end":
+            history_calls += 1
             history_write_started.set()
             if failure == "oserror":
                 raise OSError("forced delegated history failure")
-            await asyncio.wait_for(history_release.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(history_release.wait(), timeout=10)
+            except asyncio.CancelledError:
+                history_cancelled.set()
+                raise
         return await original_append(self, payload)
 
     # test-contract: seam the durable store has no deterministic failure hook
@@ -13047,6 +13186,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 settlement = record.settlement
                 assert settlement is not None
                 settlement.cancel()
+                await asyncio.wait_for(history_cancelled.wait(), timeout=10)
             approval_owner = (
                 "approval_end",
                 approval["session_id"],
@@ -13061,6 +13201,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             key = (approval["agent_instance_id"], child_call.id)
             if settlement is not None:
                 await asyncio.wait_for(settlement, timeout=10)
+                assert history_calls == 1
                 status_frames = await _request(reader, writer, 5, "status")
                 frames.extend(status_frames)
                 assert status_frames[-1].get("result", {}).get("state") in {

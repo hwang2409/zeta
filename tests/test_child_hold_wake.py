@@ -134,18 +134,24 @@ class HeldTree:
         self.loop.session_metadata = self.context.metadata
         self.loop.account_context = self.context
         self.wakes = 0
+        self.wake_published = asyncio.Event()
         self.loop._background_owner.set_wake_callback(self._woke)
         self.child_ended: asyncio.Future[object] | None = None
 
     def _woke(self) -> None:
         self.wakes += 1
+        self.wake_published.set()
 
-    async def start_and_hold(self) -> None:
+    async def start_and_hold(self, *, wait_for_wake: bool = False) -> None:
         await _collect(self.loop.run_turn("start", origin=MessageOrigin.USER))
         self.child_ended = asyncio.ensure_future(
             asyncio.wait_for(self.loop._background_owner.wait(), 10)
         )
         await await_or_fail(self.backend.held.wait(), what="child hold")
+        if wait_for_wake:
+            await await_or_fail(
+                self.wake_published.wait(), what="hold wake publication"
+            )
         assert not self.child_ended.done(), "the child must hold, not fail"
 
     def holds(self, *, pending_only: bool = True) -> list[dict[str, object]]:
@@ -203,7 +209,7 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
     before = time.time()
     try:
-        await tree.start_and_hold()
+        await tree.start_and_hold(wait_for_wake=True)
         holds = tree.holds()
         assert len(holds) == 1, "a long hold must wake the parent once"
         hold = holds[0]

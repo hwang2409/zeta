@@ -126,14 +126,24 @@ def test_after_keys_name_the_first_match_after_the_mark(
     store: ConversationStore,
 ) -> None:
     mark = store.append_message(_user("before")).seq
-    store.append_message(_assistant("partial", state="failed"))
-    first = store.append_message(_assistant("one", state=ASSISTANT_RESPONSE_COMPLETED))
+    store.append_message(_assistant("anchor", state="synthetic"))
+    first = store.append_message(_assistant("one", state="failed"))
     store.append_message(_assistant("two", state=ASSISTANT_RESPONSE_COMPLETED))
+    skill = store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("skill")]),
+            MessageOrigin.SKILL_EXPANSION,
+        )
+    )
     user = store.append_message(_user("next"))
 
     assert store.recent_row_seq(AssistantResponseAfter(mark)) == first.seq
-    assert store.recent_row_seq(UserTurnMessageAfter(mark)) == user.seq
-    assert store.recent_row_seq(UserTurnMessageAfter(user.seq)) is None
+    assert store.recent_row_seq(UserTurnMessageAfter(mark, MessageOrigin.USER)) == user.seq
+    assert (
+        store.recent_row_seq(UserTurnMessageAfter(mark, MessageOrigin.SKILL_EXPANSION))
+        == skill.seq
+    )
+    assert store.recent_row_seq(UserTurnMessageAfter(user.seq, MessageOrigin.USER)) is None
 
 
 def test_window_floor_hides_older_rows(store: ConversationStore) -> None:
@@ -147,7 +157,10 @@ def test_window_floor_hides_older_rows(store: ConversationStore) -> None:
     assert store.row_id_at(old.seq) is None
     assert store.row_id_at(floor) == store.entries[floor - 1].id
     # Rows after the mark start below the floor, so the first match is unknown.
-    assert store.recent_row_seq(UserTurnMessageAfter(old.seq - 1)) is None
+    assert (
+        store.recent_row_seq(UserTurnMessageAfter(old.seq - 1, MessageOrigin.USER))
+        is None
+    )
 
 
 def test_reset_generation_counts_replacements_not_appends(
@@ -269,7 +282,7 @@ def test_scan_reads_raw_rows_without_decoding(
 
     assert store.recent_row_seq(ApprovalHistory("approval_end", "approval-raw")) == 1
     assert store.recent_row_seq(ToolResult("missing")) is None
-    assert store.recent_row_seq(UserTurnMessageAfter(0)) == 2
+    assert store.recent_row_seq(UserTurnMessageAfter(0, MessageOrigin.USER)) == 2
 
 
 def test_torn_tail_repair_of_a_rewritten_log_publishes_one_reset(

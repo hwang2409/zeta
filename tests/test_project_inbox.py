@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
@@ -37,17 +38,19 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     StreamEvent,
-    StreamEventType,
     TextContent,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
+from zeta.server.control import NotificationPresentation
 from zeta.server.event_contract import notification_wire_event
 from zeta.server.protocol import EventDescriptor
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.registry import ToolRegistry
-from zeta.tui.render import render_agent_notification
+from zeta.tui import theme
+from zeta.tui.transcript.transcript import TranscriptWidget
+from zeta.tui.transcript.transcript_presenter import TranscriptPresenter
 
 
 @pytest.fixture(autouse=True)
@@ -689,11 +692,9 @@ async def test_targeted_inbox_notification_stays_with_target_session(
         notices_a = session_a.store.agent_notifications()
         notices_b = session_b.store.agent_notifications()
         assert notices_a and notices_a[0].data["message_ids"] == [message_id]
-        assert "private body for session a" in str(notices_a[0].data["messages"])
-        assert "private body for session b" not in str(notices_a[0].data["messages"])
+        assert "messages" not in notices_a[0].data
         assert notices_b and notices_b[0].data["message_ids"] == [other_id]
-        assert "private body for session a" not in str(notices_b[0].data["messages"])
-        assert "private body for session b" in str(notices_b[0].data["messages"])
+        assert "messages" not in notices_b[0].data
     finally:
         await loop_a.close()
         await loop_b.close()
@@ -742,7 +743,7 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
         assert wakes == [True]
         assert notices[0].data["kind"] == "project_inbox"
         assert notices[0].data["message_ids"] == [message_id]
-        assert "information, not authorized work by default" in notices[0].data["text"]
+        assert "Project inbox wake" in notices[0].data["text"]
         await AgentLoop._check_project_inbox(loop)
         assert len(store.agent_notifications()) == 1
     finally:
@@ -1921,170 +1922,356 @@ async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
         await loop.close()
         store.close()
 
-class _P03aFlow:
-    def __init__(self, claims):
-        self.claims = claims
-        self.attempts = 0
 
-    async def produce(self, item):
-        self.attempts += 1
-        if self.attempts == 1:
-            raise RuntimeError("commit failed")
-        item.after_commit()
+def _raise_once_scanner_factory(loop, exc):
+    """Wrap the real scanner so its first full scan raises, then it recovers."""
+    real_new = loop._new_project_inbox_scanner
+    state = {"n": 0}
+
+    def new_scanner():
+        scanner = real_new()
+        real_scan = scanner.scan
+
+        def wrapped_scan():
+            state["n"] += 1
+            if state["n"] == 1:
+                raise exc
+            return real_scan()
+
+        scanner.scan = wrapped_scan
+        return scanner
+
+    return new_scanner
 
 
-class _P03aScanner:
-    def __init__(self, gate=None, error=None):
-        self.gate = gate
-        self.error = error
-        self._activation_sent_outcome = None
-        self.started = threading.Event()
-        self.polled = threading.Event()
-        self.polls = 0
-        self.claimed = []
-        self.session_id = "b" * 32
-        self.inbox = SimpleNamespace(
-            claim_wake=lambda project_id, ids: self.claimed.append((project_id, ids)),
-            list=lambda project_id, session_id: {"new": []},
+def _health_states(events):
+    return [
+        event.data["state"]
+        for event in events
+        if isinstance(event, StreamEvent)
+        and event.data.get("kind") == "project_inbox_health"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_p03a_failed_commit_retries_same_poll_before_rescan(
+    tmp_path, monkeypatch
+):
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="retry me",
+        body="body",
+    )
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
+
+    scan_calls = {"n": 0}
+    real_new = loop._new_project_inbox_scanner
+
+    def counting_scanner():
+        scanner = real_new()
+        real_scan = scanner.scan
+
+        def counting():
+            scan_calls["n"] += 1
+            return real_scan()
+
+        scanner.scan = counting
+        return scanner
+
+    # test-contract: seam inject a scanner that counts real scans at the runtime seam
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", counting_scanner)
+
+    attempts = {"n": 0}
+    holder: dict[str, bool] = {}
+    real_ensure = loop._ensure_step_delivery
+
+    async def ensure():
+        flow = await real_ensure()
+        if not holder:
+            holder["wrapped"] = True
+            real_produce = flow.produce
+
+            async def produce(item):
+                if item.kind == "inbox" and attempts["n"] == 0:
+                    attempts["n"] += 1
+                    raise RuntimeError("commit failed")
+                return await real_produce(item)
+
+            flow.produce = produce
+        return flow
+
+    # test-contract: seam fail the first inbox commit at the real delivery seam
+    monkeypatch.setattr(loop, "_ensure_step_delivery", ensure)
+    try:
+        try:
+            # base delivers inside activation and raises the failed commit here;
+            # the supervisor on this branch retains the poll and survives.
+            await loop.activate()
+        except RuntimeError:
+            pass
+        # one more signal: branch retries the retained poll; base rescans.
+        await loop._check_project_inbox()
+        notices = store.agent_notifications()
+        assert len(notices) == 1
+        assert notices[0].data["message_ids"] == [message_id]
+        # the identical poll is reused: the scanner never scans a second time.
+        assert scan_calls["n"] == 1
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_p03a_close_waits_for_blocked_scanner_worker(tmp_path, monkeypatch):
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="block",
+        body="body",
+    )
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
+
+    gate = threading.Event()
+    scanner_started = threading.Event()
+    scanner_finished = threading.Event()
+    scan_calls = {"n": 0}
+    real_new = loop._new_project_inbox_scanner
+
+    def blocking_scanner():
+        scanner = real_new()
+        real_scan = scanner.scan
+
+        def blocking():
+            scan_calls["n"] += 1
+            result = real_scan()
+            if scan_calls["n"] >= 2:
+                scanner_started.set()
+                gate.wait(timeout=10)
+                scanner_finished.set()
+            return result
+
+        scanner.scan = blocking
+        return scanner
+
+    # test-contract: seam inject a scanner whose second real scan blocks the worker
+    monkeypatch.setattr(loop, "_new_project_inbox_scanner", blocking_scanner)
+
+    release_event = asyncio.Event()
+    real_close_delivery = loop._close_delivery_resources
+
+    async def wrapped_close_delivery(**kwargs):
+        release_event.set()
+        return await real_close_delivery(**kwargs)
+
+    # test-contract: seam observe when close releases storage at the real release seam
+    monkeypatch.setattr(loop, "_close_delivery_resources", wrapped_close_delivery)
+
+    try:
+        await loop.activate()
+        loop.notify_project_inbox_publication()
+        await await_or_fail(
+            asyncio.to_thread(scanner_started.wait), what="second scan blocks"
         )
-
-    def scan(self):
-        if self.error is not None:
-            error, self.error = self.error, None
-            raise error
-        return (("m" * 32,), (), [{"id": "m" * 32}])
-
-    def scan_sent(self):
-        return ()
-
-    def poll(self):
-        self.polls += 1
-        self.started.set()
-        self.polled.set()
-        if self.gate is not None:
-            self.gate.wait(timeout=10)
-        return self.scan()
-
-
-async def _resolved(value):
-    return value
-
-
-@pytest.mark.asyncio
-async def test_p03a_failed_commit_retries_same_poll_before_rescan(tmp_path, monkeypatch):
-    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
-    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
-    scanner = _P03aScanner()
-    flow = _P03aFlow(scanner.claimed)
-    # test-contract: seam inject scanner and delivery at the runtime seam
-    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
-    # test-contract: seam inject real delivery flow at the runtime seam
-    monkeypatch.setattr(loop, "_ensure_step_delivery", lambda: _resolved(flow))
-    try:
-        await loop.activate()
-        # test-contract: seam observe injected scanner calls through the public activation path
-        # test-contract: seam observe injected scanner calls through the public activation path
-        assert scanner.polls == 1
-        scanner.polled.clear()
-        loop.notify_project_inbox_publication()
-        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="retry poll")
-        # test-contract: seam observe retry ordering through the injected scanner
-        # test-contract: seam observe retry ordering through the injected scanner
-        assert scanner.polls == 1
-        # test-contract: seam observe delivered ids through the injected scanner
-        assert scanner.claimed == [(project_b.project_id, ("m" * 32,))]
-        # test-contract: seam the same poll is retried after the failed commit
-        assert flow.attempts == 2
-    finally:
-        await loop.close()
-        store.close()
-
-
-@pytest.mark.asyncio
-async def test_p03a_close_drains_blocked_scanner_worker(tmp_path, monkeypatch):
-    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
-    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
-    release = threading.Event()
-    scanner = _P03aScanner(release)
-    # test-contract: seam inject scanner at the runtime seam
-    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
-    try:
-        activation = asyncio.create_task(loop.activate())
-        await await_or_fail(asyncio.to_thread(scanner.started.wait), what="scanner start")
         closing = asyncio.create_task(loop.close())
-        release.set()
+        # base releases storage while the scanner thread is still blocked;
+        # this branch parks close on the shielded worker and never releases yet.
+        released_while_blocked = False
+        for _ in range(2000):
+            if release_event.is_set():
+                released_while_blocked = not scanner_finished.is_set()
+                break
+            if closing.done():
+                break
+            await asyncio.sleep(0)
+        gate.set()
         await await_or_fail(closing, what="close drains scanner")
-        await await_or_fail(activation, what="activation")
-        # test-contract: seam close completes only after the blocked scanner is released
-        assert release.is_set()
+        assert not released_while_blocked
     finally:
-        release.set()
-        if not loop._closed:
-            await loop.close()
+        gate.set()
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_p03a_health_sink_failure_does_not_stop_polling(tmp_path, monkeypatch):
-    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+async def test_p03a_health_sink_failure_cannot_kill_the_owner(tmp_path, monkeypatch):
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="survive",
+        body="body",
+    )
     loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
-    scanner = _P03aScanner()
-    # test-contract: seam inject scanner at the runtime seam
-    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
-    loop.set_background_event_sink(lambda _event: (_ for _ in ()).throw(RuntimeError("sink")))
+    monkeypatch.setattr(
+        loop,
+        "_new_project_inbox_scanner",
+        _raise_once_scanner_factory(loop, ProjectRegistryError("registry")),
+    )
+
+    events: list[StreamEvent] = []
+
+    def throwing_sink(event):
+        events.append(event)
+        if event.data.get("kind") == "project_inbox_health" and (
+            event.data.get("state") == "degraded"
+        ):
+            raise RuntimeError("health sink down")
+
+    loop.set_background_event_sink(throwing_sink)
     try:
         await loop.activate()
-        scanner.polled.clear()
-        loop.notify_project_inbox_publication()
-        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="poll after sink failure")
-        # test-contract: seam observe continued polling through the public runtime
-        # test-contract: seam observe continued polling through the public runtime
-        assert scanner.polls == 2
+        await loop._check_project_inbox()
+        # the sole owner survives a throwing sink and still recovers and delivers.
+        assert _health_states(events) == ["degraded", "healthy"]
+        assert len(store.agent_notifications()) == 1
     finally:
         await loop.close()
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_p03a_registry_error_recovers_same_supervisor(tmp_path, monkeypatch):
-    home, registry, _project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+async def test_p03a_registry_error_recovers_on_the_same_owner(tmp_path, monkeypatch):
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="recover",
+        body="body",
+    )
     loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
-    scanner = _P03aScanner(error=ProjectRegistryError("registry"))
-    events = []
-    # test-contract: seam inject scanner at the runtime seam
-    monkeypatch.setattr(loop, "_new_project_inbox_scanner", lambda: scanner)
+    monkeypatch.setattr(
+        loop,
+        "_new_project_inbox_scanner",
+        _raise_once_scanner_factory(loop, ProjectRegistryError("registry")),
+    )
+
+    events: list[StreamEvent] = []
     loop.set_background_event_sink(events.append)
     try:
         await loop.activate()
-        scanner.polled.clear()
-        loop.notify_project_inbox_publication()
-        await await_or_fail(asyncio.to_thread(scanner.polled.wait), what="recovered poll")
-        states = [event.data["state"] for event in events if event.data.get("kind") == "project_inbox_health"]
-        # test-contract: seam inspect public background event projections
-        # test-contract: seam inspect public background event projections
-        assert states == ["degraded", "healthy"]
+        await loop._check_project_inbox()
+        assert _health_states(events) == ["degraded", "healthy"]
+        assert len(store.agent_notifications()) == 1
     finally:
         await loop.close()
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_p03a_status_backlog_has_no_count_cap():
-    loop = SimpleNamespace(_pending_sent_statuses={})
+async def test_p03a_status_backlog_survives_without_a_count_cap():
+    loop = SimpleNamespace(_pending_sent_statuses={}, _inbox_scanner=None)
     records = tuple(
-        {"id": f"{index:032x}", "status": "claimed", "reported": []}
+        {
+            "id": f"{index:032x}",
+            "status": "claimed",
+            "reported": [],
+            "title": f"msg {index}",
+            "to_project": "beta",
+            "to_project_name": "beta",
+            "claimer_session": "c" * 32,
+            "claimed_at": f"{index:04d}",
+        }
         for index in range(101)
     )
     await ProjectInboxNotificationMixin._record_sent_statuses(loop, records)
+    # base drops to its 100-row cap; p03a keeps every transition.
     assert len(loop._pending_sent_statuses) == 101
+    message = ProjectInboxNotificationMixin._project_inbox_status_message(loop)
+    assert message is not None
+    # building the notice does not discard the backlog; only a durable commit does.
+    assert len(loop._pending_sent_statuses) == 101
+    acked = tuple(loop._pending_sent_statuses)
+    ProjectInboxNotificationMixin._ack_project_inbox_statuses(loop, acked)
+    assert loop._pending_sent_statuses == {}
 
 
-def test_p03a_health_reaches_tui_and_serve_projection():
-    event = StreamEvent(
-        StreamEventType.AGENT_NOTIFICATION,
-        data={"kind": "project_inbox_health", "state": "degraded", "reason": "broken"},
+@pytest.mark.asyncio
+async def test_p03a_runtime_health_event_reaches_tui_and_serve(tmp_path, monkeypatch):
+    home, registry, project_a, project_b = await asyncio.to_thread(_projects, tmp_path)
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    await asyncio.to_thread(
+        inbox.send_user,
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="health",
+        body="body",
     )
-    rendered = render_agent_notification(event)
+    loop, _backend, store = _sender_loop(home, registry, project_b.project_id, "b" * 32)
+    monkeypatch.setattr(
+        loop,
+        "_new_project_inbox_scanner",
+        _raise_once_scanner_factory(loop, ProjectRegistryError("broken registry")),
+    )
+
+    events: list[StreamEvent] = []
+    loop.set_background_event_sink(events.append)
+    try:
+        await loop.activate()
+        health = next(
+            (
+                event
+                for event in events
+                if event.data.get("kind") == "project_inbox_health"
+            ),
+            None,
+        )
+        # base runs this far but never emits a health event for the owner.
+        assert health is not None
+        assert health.data["state"] == "degraded"
+        assert health.data["session_id"] == store.session_id
+    finally:
+        await loop.close()
+        store.close()
+
+    transcript = TranscriptWidget()
+    presenter = TranscriptPresenter(
+        transcript,
+        Console(file=io.StringIO(), width=80),
+        lambda: False,
+        lambda renderable: None,
+    )
+    rendered = presenter.render_event(health)
     assert rendered is not None
     assert "project inbox degraded" in str(rendered)
-    assert notification_wire_event("project_inbox_health", "1.2") is EventDescriptor.PROJECT_INBOX_HEALTH
+    assert rendered.style is theme.WARNING
+
+    sent: list[tuple] = []
+
+    async def send(event_name, session_id, **fields):
+        sent.append((event_name, session_id, fields))
+        return True
+
+    await NotificationPresentation().publish(
+        health.data["session_id"], health.data, "1.2", send
+    )
+    assert len(sent) == 1
+    event_name, session_id, fields = sent[0]
+    assert event_name is EventDescriptor.PROJECT_INBOX_HEALTH
+    assert session_id == store.session_id
+    assert fields["data"]["state"] == "degraded"
+    assert len(fields["data"].get("reason", "")) <= 200
+    # the legacy protocol keeps the health event on the shared notification wire.
+    assert (
+        notification_wire_event("project_inbox_health", "1.0")
+        is not EventDescriptor.PROJECT_INBOX_HEALTH
+    )

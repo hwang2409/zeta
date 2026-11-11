@@ -807,57 +807,24 @@ def test_resume_uses_project_snapshot_captured_before_execution(
     tmp_path: Path, recipe: str
 ) -> None:
     home, repository, manager, registry, project, session_id = _project_session(
-        tmp_path, recipe, "old memory"
+        tmp_path, recipe, "A_CAPTURED"
     )
-    before_update = registry.memory_snapshot(project.project_id)
-    registry.compare_and_swap_memory(
-        project.project_id,
-        expected_digest=before_update.digest,
-        updates={"brief.md": "current memory"},
+    captured, go, outcome, resume = _start_public_resume(
+        manager, registry, project, session_id, home=home, repo_root=repository
     )
-    projection = registry.project_context_projection(project.project_id)
-    expected = load_project_context(
-        cwd=repository,
-        repo_root=repository,
-        zeta_home=home,
-        catalog=SkillCatalog.empty(),
-        session_project=project,
-        cwd_project=project,
-        registry=registry,
-        project_projection=projection,
-    )
-
-    resume_registry = registry if recipe == "custom" else _UnavailableRegistry(None)
-    resumed = manager.open(session_id)
-    result: ResumedPrompt | None = None
-    failure: BaseException | None = None
     try:
-        result = resume_prompt(
-            resumed.metadata,
-            manager=manager,
-            store=resumed.store,
-            home=home,
-            repo_root=repository,
-            inbox_enabled=True,
-            session_project=project,
-            cwd_project=project,
-            registry=resume_registry,
-            project_projection=projection,
-        )
-    except BaseException as exc:  # noqa: BLE001 - asserted below
-        failure = exc
+        assert captured.wait(10), "resume did not capture project context"
+        _set_memory(registry, project.project_id, "B_LATER")
+        go.set()
+        resume.join(10)
     finally:
-        resumed.store.close()
+        go.set()
+        resume.join(10)
 
-    assert failure is None, f"{recipe} resume did not succeed: {failure}"
-    assert result is not None
-    assert "current memory" in result.context.system_prompt
-    assert "old memory" not in result.context.system_prompt
-    if recipe == "custom":
-        assert result.context.system_prompt.startswith("unknown-prefix\n")
-        assert result.context.system_prompt.endswith("\nunknown-suffix")
-    else:
-        assert result.context.system_prompt == expected.system_prompt
+    assert not resume.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], str), outcome
+    resumed_prompt = outcome[0]
+    assert "B_LATER" in resumed_prompt and "A_CAPTURED" not in resumed_prompt
 
 
 def _set_memory(registry: ProjectRegistry, project_id: str, text: str) -> None:
@@ -868,10 +835,8 @@ def _set_memory(registry: ProjectRegistry, project_id: str, text: str) -> None:
 
 
 def _hold_memory(registry: ProjectRegistry, project_id: str):
-    """Hold the real project memory authority (the root lock before p06)."""
+    """Hold the real project memory authority."""
 
-    if not hasattr(registry, "_project_lock"):
-        return registry._locked(write=True)
     return registry._project_lock(project_id, "memory", exclusive=True)
 
 
@@ -969,11 +934,7 @@ home, project_id, session_id, signals = sys.argv[1:5]
 signals = Path(signals)
 manager = SessionManager(Path(home))
 registry = ProjectRegistry(Path(home) / "projects")
-held = (
-    registry._project_lock(project_id, "memory", exclusive=True)
-    if hasattr(registry, "_project_lock")
-    else registry._locked(write=True)
-)
+held = registry._project_lock(project_id, "memory", exclusive=True)
 
 
 def wait(name):
@@ -989,9 +950,12 @@ with held:
     try:
         manager.read_metadata(session_id, lock_timeout=10)
     except Exception as exc:
-        (signals / "metadata-done").write_text(f"refused: {exc}")
+        status = f"refused: {exc}"
     else:
-        (signals / "metadata-done").write_text("read")
+        status = "read"
+    done = signals / "metadata-done.tmp"
+    done.write_text(status)
+    done.replace(signals / "metadata-done")
     wait("release")
 """
 
@@ -1036,5 +1000,5 @@ def test_p06_8_prompt_resume_process_progress(tmp_path: Path) -> None:
         if holder is not None:
             holder.wait(10)
     assert not resume.is_alive()
-    assert holder.returncode == 0
+    assert holder is not None and holder.returncode == 0
     _assert_resumed_with(manager, session_id, outcome)

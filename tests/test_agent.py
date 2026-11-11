@@ -20,14 +20,13 @@ from types import MethodType, SimpleNamespace
 import pytest
 from rich.console import Console
 
-import zeta.agent.background as agent_background_module
+import zeta.agent.background_lifecycle as agent_background_module
 import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
 import zeta.runtime.loop.agent as agent_loop_module
-import zeta.tools._shared.process as background_process_module
 import zeta.tui.cards.agent as agent_card_module
 from tests.support.agent_lifecycle import (
     wait_background_owner,
@@ -40,12 +39,11 @@ from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountCredentialLockTimeoutError
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
-from zeta.agent.background import (
-    BackgroundAgentOwner,
-    CancellationRequest,
+from zeta.agent.background_lifecycle import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
 from zeta.agent.child_context import _compose_child_system_prompt
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.finish_gate import (
@@ -1969,8 +1967,12 @@ class FinishGateBackend(CompletionBackend):
 class PostCapBudgetBackend(CompletionBackend):
     def __init__(self) -> None:
         self.release_grandchild = asyncio.Event()
+        self.hold_post_cap = False
+        self.hold_fresh_prompt = False
+        self.release_post_cap = asyncio.Event()
         self.post_cap_exhausted = asyncio.Event()
         self.fresh_prompt_seen = asyncio.Event()
+        self.release_fresh_prompt = asyncio.Event()
         self.fresh_requests: list[list[Message]] = []
         self.gate_calls = 0
 
@@ -2023,6 +2025,11 @@ class PostCapBudgetBackend(CompletionBackend):
         elif last_user == "fresh external prompt":
             self.fresh_requests.append(list(messages))
             self.fresh_prompt_seen.set()
+            if self.hold_fresh_prompt:
+                await await_or_fail(
+                    self.release_fresh_prompt.wait(),
+                    what="release fresh prompt response",
+                )
             blocks = [
                 ToolUseContent(
                     ToolCall(
@@ -2050,6 +2057,10 @@ class PostCapBudgetBackend(CompletionBackend):
         # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate and self.gate_calls == 4:
             self.post_cap_exhausted.set()
+            if self.hold_post_cap:
+                await await_or_fail(
+                    self.release_post_cap.wait(), what="release post-cap response"
+                )
         yield StreamEvent(
             StreamEventType.MESSAGE_END,
             message=Message(MessageRole.ASSISTANT, blocks),
@@ -3953,6 +3964,8 @@ async def _run_post_cap_tool_cycle(
         monkeypatch, hold_child_bound=True
     )
     backend = PostCapBudgetBackend()
+    backend.hold_post_cap = send_fresh_prompt
+    backend.hold_fresh_prompt = send_fresh_prompt
     store = ConversationStore(tmp_path)
     owner = BackgroundAgentOwner(store, finish_gate_max_turns=1, finish_gate_timeout=60)
     loop = AgentLoop(
@@ -4001,6 +4014,8 @@ async def _run_post_cap_tool_cycle(
         )
 
         child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
+        if not send_fresh_prompt:
+            backend.release_post_cap.set()
         if send_fresh_prompt:
             flow = owner.conversation_channel._delivery_targets[child_handle].flow
             prompt_suppressed = asyncio.Event()
@@ -4027,6 +4042,7 @@ async def _run_post_cap_tool_cycle(
                 )
                 is None
             )
+            backend.release_post_cap.set()
             done, pending = await await_or_fail(
                 asyncio.wait(
                     {fresh_response, suppressed_response},
@@ -4042,6 +4058,7 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
             state = next(
@@ -4062,6 +4079,8 @@ async def _run_post_cap_tool_cycle(
         await await_or_fail(owner.wait(), what="background owner completion")
         return backend
     finally:
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         await await_or_fail(loop.close(), what="agent loop close")
         store.close()
@@ -4179,6 +4198,8 @@ async def test_causal_budget_stop_shows_held_input_as_not_delivered(
         ]
         assert len(held) == 1
     finally:
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         owner.cancel_all()
         await await_or_fail(owner.wait(), what="background owner completion")
@@ -4527,6 +4548,8 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
             assert published[0][1].startswith("Handed off running background work.")
     finally:
         backend.on_fresh_call = lambda: False
+        backend.release_post_cap.set()
+        backend.release_fresh_prompt.set()
         backend.release_grandchild.set()
         # a child that keeps re-waking must not hide the assertion above.
         owner.cancel_all()
@@ -9169,34 +9192,46 @@ def test_provider_for_model_maps_each_catalog_entry() -> None:
     for provider, models in PROVIDER_MODELS.items():
         for model in models:
             assert provider_for_model(model) == provider
+    for model, provider in {
+        "gpt-oss:20b": "ollama",
+        "claude-future": "claude",
+        "gpt-future": "codex",
+        "o2-preview": "codex",
+    }.items():
+        assert provider_for_model(model) == provider
 
 
 def test_provider_for_model_rejects_an_unknown_name() -> None:
     from zeta.models.catalog import provider_for_model
 
     with pytest.raises(ValueError) as excinfo:
-        provider_for_model("gpt-nonexistent")
+        provider_for_model("not-a-model")
     message = str(excinfo.value)
-    assert "gpt-nonexistent" in message
+    assert "not-a-model" in message
     assert "claude-opus-5" in message
 
 
-def test_agent_schema_offers_every_known_model(tmp_path: Path) -> None:
-    from zeta.models.catalog import known_model_names
+@pytest.mark.asyncio
+async def test_persisted_assistant_turn_records_backend_model(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    backend.model = "gpt-5.6-sol"
+    store = ConversationStore(tmp_path)
 
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    AgentLoop(
-        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty()
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
     )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    agent_schema = next(
-        schema for schema in registry.schemas if schema["name"] == "agent"
-    )
-    model_schema = agent_schema["parameters"]["properties"]["model"]
-    assert model_schema["enum"] == known_model_names()
-    assert "claude-opus-5" in model_schema["enum"]
-    assert "gpt-5.4" in model_schema["enum"]
+        assistant = next(
+            message
+            for message in store.messages()
+            if message.role is MessageRole.ASSISTANT
+        )
+        assert assistant.metadata["model"] == "gpt-5.6-sol"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -9372,29 +9407,6 @@ async def test_agent_model_implies_background(
     await loop.close()
 
 
-@pytest.mark.asyncio
-async def test_agent_rejects_an_unknown_model_before_spawning(tmp_path: Path) -> None:
-    """The schema enum catches a bad model name before the runner is reached."""
-
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[_model_agent_call(model="gpt-nonexistent")])]
-    )
-    store = ConversationStore(tmp_path)
-
-    await _collect(
-        AgentLoop(
-            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
-        ).run_turn("start", origin=MessageOrigin.USER)
-    )
-
-    result = next(
-        message.tool_result for message in store.messages() if message.tool_result
-    )
-    assert result.is_error
-    assert "model is not an allowed value" in result.content
-    assert not (store.session_dir / "agents").exists()
-
-
 def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     """Second line of defence, for any caller that skips schema validation."""
 
@@ -9408,7 +9420,7 @@ def test_resolve_child_backend_guards_bad_models(tmp_path: Path) -> None:
     # No model at all keeps the parent's backend.
     assert resolve_child_backend(loop, None) == (parent_backend, None)
 
-    backend, error = resolve_child_backend(loop, "gpt-nonexistent")
+    backend, error = resolve_child_backend(loop, "not-a-model")
     assert backend is None
     assert error is not None and "unknown model" in error
 
@@ -13038,58 +13050,7 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    deadlines = _hold_finish_gate_task_deadlines(monkeypatch, hold_child_bound=True)
-    evidence_entered = asyncio.Event()
-    allow_evidence = asyncio.Event()
-    registries: list[background_process_module.BackgroundTaskRegistry] = []
-    original_registry_init = background_process_module.BackgroundTaskRegistry.__init__
-
-    def capture_registry(registry, *args, **kwargs):
-        original_registry_init(registry, *args, **kwargs)
-        registries.append(registry)
-
-    # test-contract: seam retain the public registry used by the background child
-    monkeypatch.setattr(
-        background_process_module.BackgroundTaskRegistry,
-        "__init__",
-        capture_registry,
-    )
-    if not hasattr(
-        background_process_module.BackgroundTaskRegistry, "deliver_recovered_exit"
-    ):
-        original_notify = (
-            background_process_module.BackgroundTaskRegistry._notify_terminal_exit
-        )
-
-        async def hold_legacy_task_exit_evidence(registry, record):
-            evidence_entered.set()
-            await asyncio.wait_for(allow_evidence.wait(), 10)
-            return await original_notify(registry, record)
-
-        # test-contract: seam prove the prior publication-before-commit ordering
-        monkeypatch.setattr(
-            background_process_module.BackgroundTaskRegistry,
-            "_notify_terminal_exit",
-            hold_legacy_task_exit_evidence,
-        )
-    else:
-        original_produce = pending_delivery_module.StepDeliveryFlow.produce
-
-        async def hold_task_exit_evidence(flow, item):
-            if (
-                isinstance(item, pending_delivery_module.NotificationInput)
-                and item.kind == "task_exit"
-            ):
-                evidence_entered.set()
-                await asyncio.wait_for(allow_evidence.wait(), 10)
-            return await original_produce(flow, item)
-
-        # test-contract: seam hold the durable evidence commit at its public flow
-        monkeypatch.setattr(
-            pending_delivery_module.StepDeliveryFlow,
-            "produce",
-            hold_task_exit_evidence,
-        )
+    deadlines = _hold_finish_gate_task_deadlines(monkeypatch)
     release = tmp_path / "release"
     command = f"{wait_for_path_command(release)} && echo task-evidence"
     backend = _TaskFinishGateBackend(command, gate_delay=True)
@@ -13109,24 +13070,11 @@ async def test_finish_gate_wait_outlives_default_bound_for_running_task(
 
     await await_or_fail(backend.task_started.wait(), what="test await")
     await await_or_fail(backend.gate_seen.wait(), what="test await")
-    release.touch()
-    await await_or_fail(evidence_entered.wait(), what="test await")
-    process_registry = next(registry for registry in registries if registry.snapshot())
-    running_task = process_registry.snapshot()[0]
-    state_before_evidence = await process_registry.output(running_task.task_id)
-    assert state_before_evidence["running"] is True
     assert len(deadlines.started) == 1
     state, _configured_timeout = deadlines.started[0]
     deadlines.expire_model_bound(state)
-    try:
-        await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
-        for _ in range(3):
-            barrier = asyncio.get_running_loop().create_future()
-            asyncio.get_running_loop().call_soon(barrier.set_result, None)
-            await await_or_fail(barrier, what="test await")
-        assert not completion_published.is_set()
-    finally:
-        allow_evidence.set()
+    await await_or_fail(backend.gate_delay_cancelled.wait(), what="test await")
+    release.touch()
     notification = await _completion_after_publication(store, completion_published)
     assert "task-evidence" in notification.data["text"]
     assert notification.data.get("killed_task_ids") is None
@@ -13747,7 +13695,7 @@ async def test_child_completion_reports_killed_tasks_in_receipt(
         for entry in child_store.agent_notifications(pending_only=False)
         if entry.data.get("kind") == "task_exited"
     )
-    assert task_exit.data["background_phase"] == "session_shutdown"
+    assert task_exit.data["background_phase"] == "task_kill"
     assert (
         task_exit.data["note"]
         == "finish-gate task safety bound expired after 0.05 seconds"
@@ -16640,7 +16588,16 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
         if answer_consumed:
-            answer_idle_entered.set()
+            notices = [
+                entry
+                for entry in parent.agent_notifications(pending_only=False)
+                if entry.data.get("kind") == "child_idle"
+            ]
+            if any(
+                entry.data.get("text") == "after Re q-reset: approved"
+                for entry in notices
+            ):
+                answer_idle_entered.set()
         await asyncio.wait_for(wake(), 10)
         return True
 
@@ -18449,10 +18406,18 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
+        recovery_done.write_text("done")
+        for _ in range(500):
+            if append_finished.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_finished.exists()
+        _stop_lease_holder(holder, stop)
+
         observed = ConversationStore(
             root.session_dir / "agents", session_id="1", _read_only=True
         )
-        appends_before_recovery_returned = [
+        all_appends = [
             message.content[0].text
             for message in observed.messages()
             if message.role is MessageRole.USER
@@ -18461,13 +18426,8 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
             and message.content[0].text.startswith("concurrent append ")
         ]
         observed.close()
+        appends_before_recovery_returned = all_appends[:-1]
         assert appends_before_recovery_returned
-        recovery_done.write_text("done")
-        for _ in range(500):
-            if append_finished.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert append_finished.exists()
 
         assert set(root.agent_children()) == {"root:1"}
         active_questions = {

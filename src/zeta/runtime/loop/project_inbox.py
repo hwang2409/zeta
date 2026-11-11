@@ -16,6 +16,7 @@ from ...project_inbox_sent import SentMessageTracker
 from ...project_inbox_sent.notifications import NEUTRAL_INBOX_TEXT
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import Message, StreamEvent, StreamEventType, harness_notice
+from ...storage_format import StorageFeature, feature_enabled
 
 _MAX_SENT_STATUS_LINES = 10
 
@@ -24,7 +25,6 @@ _MAX_SENT_STATUS_LINES = 10
 class _PollResult:
     message_ids: tuple[str, ...]
     sent: tuple[dict[str, Any], ...]
-    messages: tuple[dict[str, Any], ...]
 
 
 class ProjectInboxNotificationMixin:
@@ -131,7 +131,7 @@ class ProjectInboxNotificationMixin:
                         await asyncio.shield(worker)
                         raise
                     poll = _PollResult(
-                        tuple(result[0] or ()), tuple(result[1]), tuple(result[2])
+                        tuple(result[0] or ()), tuple(result[1])
                     )
                     self._pending_project_inbox_poll = poll
                 if health != "healthy":
@@ -183,6 +183,18 @@ class ProjectInboxNotificationMixin:
         await ProjectInboxNotificationMixin._record_sent_statuses(self, poll.sent)
         if not poll.message_ids:
             return
+        text = (
+            NEUTRAL_INBOX_TEXT
+            if feature_enabled(
+                self.store.observed_storage_epoch, StorageFeature.INBOX_DELEGATION
+            )
+            else (
+                f"Local project inbox has {len(poll.message_ids)} new message"
+                f"{'s' if len(poll.message_ids) != 1 else ''}; use inbox action list. "
+                "Requests are work to do: claim, do, and mark done. You do not need "
+                "to confirm the sender with the user."
+            )
+        )
         flow = await self._ensure_step_delivery()
         await flow.produce(
             NotificationInput(
@@ -190,10 +202,9 @@ class ProjectInboxNotificationMixin:
                 {
                     "project_id": self.tool_registry.project_id,
                     "message_ids": list(poll.message_ids),
-                    "messages": list(poll.messages),
                     "description": "project inbox",
                     "status": "new",
-                    "text": NEUTRAL_INBOX_TEXT,
+                    "text": text,
                 },
                 dedupe_key=self.tool_registry.project_id,
                 after_commit=lambda: scanner.inbox.claim_wake(
@@ -291,7 +302,7 @@ class ProjectInboxNotificationMixin:
             await ProjectInboxNotificationMixin._deliver_project_inbox_poll(
                 self,
                 scanner,
-                _PollResult(tuple(result[0] or ()), tuple(result[1]), tuple(result[2])),
+                _PollResult(tuple(result[0] or ()), tuple(result[1])),
             )
             return
         done.clear()

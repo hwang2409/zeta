@@ -272,6 +272,7 @@ async def run_login(
     verifier, challenge, state = build_pkce()
     callback_ready = asyncio.Event()
     receiver = _CallbackReceiver(state, provider.callback_path, callback_ready.set)
+    published = False
 
     async def handle_callback(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -357,10 +358,15 @@ async def run_login(
             publication_timeout_seconds,
             on_publication_commit,
         )
+        published = True
         return provider.token_handle(tokens)
     finally:
         server.close()
-        await server.wait_closed()
+        try:
+            await server.wait_closed()
+        except asyncio.CancelledError:
+            if not published:
+                raise
 
 
 __all__ = [

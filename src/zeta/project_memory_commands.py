@@ -21,8 +21,8 @@ class MemoryReconciler(Protocol):
 
 
 class MemoryRegistry(Protocol):
+    memory_transactions: object
     def ensure_memory_supported(self, project_id: str) -> None: ...
-    def memory_format(self, project_id: str) -> int: ...
     def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]: ...
     def undo_memory(
         self, project_id: str, *, expected_current: str | None = None
@@ -106,7 +106,7 @@ def run_memory_command(
     action = args.strip()
     format_one_usage = "usage: /memory [log|retry [receipt]|undo [version-id]|accept <file>|recovery <session-id> <quarantine-id> resume]"
     try:
-        memory_format = registry.memory_format(project_id)
+        memory_format = registry.memory_transactions.read(project_id).format
         usage = (
             format_one_usage
             if memory_format == 1

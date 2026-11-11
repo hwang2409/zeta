@@ -636,6 +636,10 @@ class SlashSession(Protocol):
 
     def slash_send(self, args: str) -> str | Awaitable[str]: ...
 
+    async def slash_remote(self, args: str) -> str: ...
+
+    async def slash_detach(self, args: str) -> str: ...
+
     def slash_tools(self, args: str) -> str: ...
 
     def slash_undo(self, args: str) -> str: ...
@@ -917,6 +921,7 @@ def create_slash_registry(
     skill_catalog: SkillCatalog,
     project_registry_state: ProjectRegistryState | None = None,
     surface: SlashSurface = SlashSurface.TUI,
+    include_tui_only: bool = False,
 ) -> SlashCommandRegistry:
     """Register shared builtins before custom commands and skills."""
 
@@ -1102,6 +1107,13 @@ def create_slash_registry(
             reason=native,
         )
     )
+    if include_tui_only:
+        registry.register(
+            safe("remote", _delegate("slash_remote"), "attach to a remote session", reason=native)
+        )
+        registry.register(
+            safe("detach", _delegate("slash_detach"), "return to the local session", reason=loop_owned)
+        )
     registry.register(
         safe(
             "help",
