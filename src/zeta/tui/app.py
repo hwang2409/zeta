@@ -329,7 +329,7 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        app_ref = weakref.ref(app)
+        app_ref = weakref.ref(self)
         self._finder_field = OverlayTextField(
             "TRANSCRIPT_FINDER",
             on_text_changed=lambda query: (

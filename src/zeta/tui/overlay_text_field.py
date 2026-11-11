@@ -50,8 +50,10 @@ class OverlayTextField:
 
     def __init__(self, name: str, on_text_changed: Callable[[str], None] | None = None) -> None:
         self.buffer = Buffer(name=name)
+        self._text_changed_handler = None
         if on_text_changed is not None:
-            self.buffer.on_text_changed += lambda _: on_text_changed(self.buffer.text)
+            self._text_changed_handler = lambda buffer: on_text_changed(buffer.text)
+            self.buffer.on_text_changed += self._text_changed_handler
         self.control = BufferControl(buffer=self.buffer)
         self.window = Window(
             self.control,
@@ -62,6 +64,11 @@ class OverlayTextField:
     @property
     def text(self) -> str:
         return self.buffer.text
+
+    def close(self) -> None:
+        if self._text_changed_handler is not None:
+            self.buffer.on_text_changed -= self._text_changed_handler
+            self._text_changed_handler = None
 
     def reset(self) -> None:
         self.buffer.reset()

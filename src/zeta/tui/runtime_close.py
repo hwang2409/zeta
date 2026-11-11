@@ -102,6 +102,8 @@ class RuntimeCloseMixin:
                 )
             )
         finally:
+            attempt(lambda: self._finder_field.close())
+            attempt(lambda: self._decisions_answer_field.close())
             self._workspace_snapshot_store = None
             attempt(lambda: self.loop.set_background_event_sink(None))
             attempt(lambda: self.loop.set_background_wake_callback(None))
