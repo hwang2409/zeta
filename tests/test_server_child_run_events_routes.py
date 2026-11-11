@@ -32,7 +32,7 @@ from zeta.server import ZetaServer
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
-FEATURES = ("child_run_history", "child_run_events")
+FEATURES = ("child_run_history", "child_run_events", "child_runs")
 TERMINAL = {"completed", "failed", "canceled"}
 
 
