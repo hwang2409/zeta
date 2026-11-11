@@ -13,6 +13,31 @@ class RemoteWireError(ValueError):
     pass
 
 
+class BoundedLineDecoder:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        self._buffer.extend(chunk)
+        if len(self._buffer) > MAX_FRAME_BYTES and b"\n" not in self._buffer:
+            raise RemoteWireError("remote frame is too large")
+        lines: list[bytes] = []
+        while b"\n" in self._buffer:
+            line, _, rest = self._buffer.partition(b"\n")
+            self._buffer[:] = rest
+            if len(line) > MAX_FRAME_BYTES:
+                raise RemoteWireError("remote frame is too large")
+            if line:
+                lines.append(bytes(line))
+        if len(self._buffer) > MAX_FRAME_BYTES:
+            raise RemoteWireError("remote frame is too large")
+        return lines
+
+    def finish(self) -> None:
+        if self._buffer:
+            raise RemoteWireError("unterminated remote frame")
+
+
 def decode_frame(raw: bytes | str) -> tuple[str, Mapping[str, object]]:
     data = raw.encode() if isinstance(raw, str) else raw
     if len(data) > MAX_FRAME_BYTES:

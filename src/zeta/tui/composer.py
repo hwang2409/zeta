@@ -804,9 +804,11 @@ class SubmissionMixin:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> None:
-        if self._remote_view is not None and not value.strip().startswith(("/detach", "/remote")):
-            self._print_system("remote view is read only; use /detach first")
-            return
+        if self._remote_view is not None:
+            command = value.strip().split(maxsplit=1)[0] if value.strip() else ""
+            if command not in {"/detach", "/remote"}:
+                self._print_system("remote view is read only; use /detach first")
+                return
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
         self._dismiss_model_picker()
@@ -821,9 +823,6 @@ class SubmissionMixin:
             task.add_done_callback(self._clear_active_task)
             return
         if text is None:
-            return
-        if self._remote_view is not None and not text.lstrip().startswith(("/detach", "/remote")):
-            self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()
@@ -855,9 +854,6 @@ class SubmissionMixin:
             await self._run_shell_passthrough(passthrough)
             return
         if text is None:
-            return
-        if self._remote_view is not None and not text.lstrip().startswith(("/detach", "/remote")):
-            self._print_system("remote view is read only; use /detach first")
             return
         draft_revision = self._draft.mark_submitted()
         paths, tokens, next_image_token = self._capture_pending_attachment_state()

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 MAX_QUEUE = 256
 
 
-def remote_bridge_command(mode: str, session_id: str | None = None) -> str:
+def remote_bridge_command(mode: str, session_id: str | None = None, remote_home: str = "~/.zeta") -> str:
     if mode not in {"list", "attach"}:
         raise ValueError("invalid bridge mode")
     args = ["__remote_bridge", mode]
@@ -23,8 +23,9 @@ def remote_bridge_command(mode: str, session_id: str | None = None) -> str:
             raise ValueError("invalid session id")
         args.append(session_id)
     bridge_args = " ".join(shlex.quote(arg) for arg in args)
-    return (f'if command -v zeta >/dev/null 2>&1; then exec zeta {bridge_args}; '
-            f'elif [ -x "$HOME/.local/bin/zeta" ]; then exec "$HOME/.local/bin/zeta" {bridge_args}; '
+    home = shlex.quote(remote_home)
+    return (f'if command -v zeta >/dev/null 2>&1; then ZETA_HOME={home} exec zeta {bridge_args}; '
+            f'elif [ -x "$HOME/.local/bin/zeta" ]; then ZETA_HOME={home} exec "$HOME/.local/bin/zeta" {bridge_args}; '
             "else exit 127; fi")
 
 
@@ -39,10 +40,9 @@ class RemoteTransport:
 
     def __init__(self, host: str, *, ssh: str = "ssh", max_queue: int = MAX_QUEUE,
                  callback: Callable[[TransportItem], None] | None = None) -> None:
-        if not host or any(c.isspace() or c in "/'\";\n\x00" for c in host):
-            raise ValueError("invalid remote host")
+        from .discovery import validate_host
+        validate_host(host)
         self.host, self.ssh = host, ssh
-        self.items: queue.Queue[TransportItem] = queue.Queue(maxsize=max_queue)
         self._input: queue.Queue[bytes | None] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -58,24 +58,10 @@ class RemoteTransport:
     def send(self, data: bytes) -> None:
         self._input.put_nowait(data)
 
-    def receive(self, timeout: float = 0.0) -> TransportItem | None:
-        try:
-            return self.items.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def close(self) -> None:
-        self._callback = None
-        self._stop.set()
-        with contextlib.suppress(queue.Full):
-            self._input.put_nowait(None)
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-
     async def close_async(self) -> None:
         self._callback = None
         self._stop.set()
-        with contextlib.suppress(queue.Full):
+        with contextlib.suppress(Exception):
             self._input.put_nowait(None)
         if self._thread is not None:
             await asyncio.to_thread(self._thread.join, 5)
@@ -84,8 +70,7 @@ class RemoteTransport:
         if self._callback is not None:
             self._callback(item)
         else:
-            with contextlib.suppress(queue.Full):
-                self.items.put_nowait(item)
+            return
 
     def _run(self, command: str) -> None:
         asyncio.run(self._main(command))
@@ -93,7 +78,7 @@ class RemoteTransport:
     async def _main(self, command: str) -> None:
         try:
             process = await asyncio.create_subprocess_exec(
-                self.ssh, self.host, command, stdin=asyncio.subprocess.PIPE,
+                self.ssh, "--", self.host, command, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
@@ -122,11 +107,13 @@ class RemoteTransport:
                    asyncio.create_task(read("stderr", process.stderr)),
                    asyncio.create_task(write())]
         waiter = asyncio.create_task(process.wait())
-        await asyncio.wait({waiter, *readers}, return_when=asyncio.FIRST_COMPLETED)
-        if self._stop.is_set() and process.returncode is None:
+        stop_waiter = asyncio.create_task(asyncio.to_thread(self._stop.wait))
+        done, _ = await asyncio.wait({waiter, *readers, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if process.returncode is None and (self._stop.is_set() or any(task in done for task in readers)):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
         await process.wait()
+        stop_waiter.cancel()
         for task in readers:
             task.cancel()
         await asyncio.gather(*readers, return_exceptions=True)

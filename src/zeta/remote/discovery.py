@@ -4,8 +4,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 MAX_ROWS = 128
+MAX_HOST_BYTES = 255
+MAX_PREFIX_BYTES = 128
+
+@dataclass(frozen=True, slots=True)
+class RemoteTarget:
+    name: str
+    host: str
+    remote_home: str = "~/.zeta"
 
 @dataclass(frozen=True, slots=True)
 class RemoteSession:
@@ -16,17 +25,28 @@ class RemoteSession:
     machine_id: str = ""
 
 
-def validate_host(value: str) -> str:
-    if not value or value != value.strip() or any(c.isspace() or c in "/'\";\n\x00" for c in value):
-        raise ValueError("invalid remote host")
+def _validate_component(value: str, label: str, limit: int) -> str:
+    encoded = value.encode("ascii", "strict")
+    if not 1 <= len(encoded) <= limit or not value[0].isalnum() or any(
+        not (char.isalnum() or char in "._-@") for char in value
+    ):
+        raise ValueError(f"invalid remote {label}")
     return value
+
+
+def validate_host(value: str) -> str:
+    return _validate_component(value, "host", MAX_HOST_BYTES)
+
+
+def validate_prefix(value: str) -> str:
+    return _validate_component(value, "session prefix", MAX_PREFIX_BYTES)
 
 
 def split_target(value: str) -> tuple[str, str | None]:
     host, sep, prefix = value.partition(":")
     validate_host(host)
-    if sep and (not prefix or any(c in prefix for c in "/\x00") or any(c.isspace() for c in prefix)):
-        raise ValueError("invalid remote session prefix")
+    if sep:
+        validate_prefix(prefix)
     return host, prefix if sep else None
 
 
@@ -35,20 +55,6 @@ def choose_session(rows: Iterable[RemoteSession], prefix: str) -> RemoteSession:
     if len(matches) != 1:
         raise ValueError("remote session prefix is not unique")
     return matches[0]
-
-
-def ssh_config_aliases(path: Path | None = None) -> tuple[str, ...]:
-    path = path or Path.home() / ".ssh" / "config"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return ()
-    result: list[str] = []
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].lower() == "host":
-            result.extend(alias for alias in parts[1:] if "*" not in alias and "?" not in alias and alias not in result)
-    return tuple(result)
 
 
 def configured_hosts(home: Path) -> tuple[str, ...]:
@@ -63,12 +69,19 @@ def configured_hosts(home: Path) -> tuple[str, ...]:
     values = data.get("remotes", {})
     if not isinstance(values, dict):
         return ()
-    hosts = values.get("hosts", values.keys())
-    if isinstance(hosts, dict):
-        hosts = hosts.keys()
-    if not isinstance(hosts, (list, tuple)):
-        return ()
-    return tuple(validate_host(str(host)) for host in hosts)[:MAX_ROWS]
+    targets: list[RemoteTarget] = []
+    for name, url in values.items():
+        if not isinstance(name, str) or not isinstance(url, str):
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme != "ssh" or not parsed.hostname or parsed.query or parsed.fragment:
+            continue
+        try:
+            host = validate_host(parsed.hostname)
+        except (UnicodeEncodeError, ValueError):
+            continue
+        targets.append(RemoteTarget(name, host, unquote(parsed.path) if parsed.path else "~/.zeta"))
+    return tuple(targets[:MAX_ROWS])
 
 
 def dedupe_rows(rows: Iterable[RemoteSession]) -> tuple[RemoteSession, ...]:
