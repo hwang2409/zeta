@@ -455,18 +455,6 @@ async def _cancel_process_wait(registry, owner, monkeypatch) -> None:
     await _cancel_at_gate(owner, install, name="process-wait")
 
 
-async def _cancel_reader_drain(registry, owner, monkeypatch) -> None:
-    original = owner._finish_output_drain.wait
-
-    async def install(hold):
-        async def wait():
-            await hold()
-            return await original()
-        monkeypatch.setattr(owner._finish_output_drain, "wait", wait)
-
-    await _cancel_at_gate(owner, install, name="reader-drain")
-
-
 async def _cancel_writer_close(registry, owner, monkeypatch) -> None:
     original = _OrderedLogWriter.close
 
@@ -574,7 +562,6 @@ async def _cancel_notice(registry, owner, monkeypatch) -> None:
 
 _CANCEL_ROW_HANDLERS = {
     "process-wait": _cancel_process_wait,
-    "reader-drain": _cancel_reader_drain,
     "ordered-writer-close": _cancel_writer_close,
     "archive": _cancel_archive,
     "persist": _cancel_persist,
@@ -810,6 +797,8 @@ async def test_background_task_owner_state_table(
 
         if row.startswith("cancel-"):
             if row == "cancel-reader-drain":
+                reader_drain_entered = asyncio.Event()
+                reader_drain_release = asyncio.Event()
                 read_blocked = asyncio.Event()
                 original_read_output = registry.background_tasks._read_output
 
@@ -821,10 +810,38 @@ async def test_background_task_owner_state_table(
                 monkeypatch.setattr(
                     registry.background_tasks, "_read_output", read_output
                 )
+
+                original_start = owner_module._BackgroundTaskOwner.start
+
+                def gated_start(self) -> None:
+                    original_wait = self._finish_output_drain.wait
+
+                    async def wait() -> bool:
+                        reader_drain_entered.set()
+                        await await_or_fail(
+                            reader_drain_release.wait(), what="reader-drain release"
+                        )
+                        return await original_wait()
+
+                    # test-contract: seam install the drain gate before the owner runs
+                    self._finish_output_drain.wait = wait
+                    return original_start(self)
+
+                monkeypatch.setattr(
+                    owner_module._BackgroundTaskOwner, "start", gated_start
+                )
             task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
             owner = registry.background_tasks._owners[task_id]
-            handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
-            await handler(registry, owner, monkeypatch)
+            if row == "cancel-reader-drain":
+                await _cancel_gate(
+                    owner,
+                    reader_drain_entered,
+                    reader_drain_release,
+                    name="reader-drain",
+                )
+            else:
+                handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
+                await handler(registry, owner, monkeypatch)
             status = await output_registered(task_id)
             assert status["running"] is False
             assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
