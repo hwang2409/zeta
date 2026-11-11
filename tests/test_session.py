@@ -1940,12 +1940,18 @@ async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
+async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> None:
     calls: list[str] = []
 
-    def load_catalog(provider: str) -> frozenset[str]:
+    def load_catalog(provider: str) -> frozenset[str] | None:
         calls.append(provider)
-        return frozenset({"claude-opus-4-7"})
+        return (
+            frozenset({"claude-opus-4-7"})
+            if len(calls) == 1
+            else None
+            if len(calls) == 2
+            else frozenset({"claude-new"})
+        )
 
     app = TUIApp(
         AgentLoop(
@@ -1966,6 +1972,14 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
     second = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-other")
+    await wait_until(lambda: len(calls) == 2)
+    third = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-new")
+    await wait_until(lambda: len(calls) == 3)
+    fourth = await create_slash_registry(
+        skill_catalog=SkillCatalog.empty()
+    ).dispatch_async(app, "/model claude-new")
 
     assert first == (
         "model: claude-new (model catalog unavailable for claude — using anyway)"
@@ -1973,7 +1987,12 @@ async def test_model_catalog_miss_warns_and_is_cached(tmp_path: Path) -> None:
     assert second == (
         "model: claude-other (model not found in claude catalog — using anyway)"
     )
-    assert calls == ["claude"]
+    assert third == (
+        "model: claude-new (model not found in claude catalog — using anyway)"
+    )
+    assert fourth == "model: claude-new"
+    assert calls == ["claude", "claude", "claude"]
+    await app.close()
 
 
 @pytest.mark.asyncio

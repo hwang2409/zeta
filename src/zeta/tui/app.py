@@ -430,11 +430,13 @@ class TUIApp(
 
     async def _load_model_catalog_in_background(self) -> None:
         try:
-            self._model_catalog = await asyncio.to_thread(
+            catalog = await asyncio.to_thread(
                 self._model_catalog_loader, self.provider
             )
-        except Exception:
-            self._model_catalog = None
+            if catalog is not None:
+                self._model_catalog = catalog
+        except Exception:  # noqa: S110 - catalog refresh must not affect the TUI
+            pass
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None

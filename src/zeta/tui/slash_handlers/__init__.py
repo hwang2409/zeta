@@ -460,8 +460,7 @@ class SlashHandlerMixin:
         """Pick a model from a card, or switch straight to a named one."""
 
         requested = args.strip()
-        if not self._model_catalog_loaded:
-            self._start_model_catalog_load()
+        self._start_model_catalog_load()
         busy = bool(self.active or self.pending_approvals)
         if not requested:
             if busy:
