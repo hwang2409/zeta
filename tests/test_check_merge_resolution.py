@@ -1034,7 +1034,7 @@ def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> Non
     (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 1\n\ndef added():\n    return 3\n")
     commit(r, "main")
     _set_origin_main(r)
     subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
@@ -1355,7 +1355,7 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 1\n\nadded = 2\n")
     commit(r, "main")
     _set_origin_main(r)
     subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
@@ -1371,7 +1371,9 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     group = hashlib.sha256(f"{name}=added = 2".encode()).hexdigest()[:12]
     assert printed.split("@", 1)[1].split(" ", 1)[0] == group
     body = tmp_path / "body"
-    body.write_text(f"{printed[:-8]}intentional\n")
+    body.write_text(
+        f"{printed[:-8]}intentional\nmerge-resolution: src/a.py constant added -> intentional\n"
+    )
     assert run(r, "--pr-body-file", str(body)).returncode == 0
     body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{digest} -> stale\n")
     assert run(r, "--pr-body-file", str(body)).returncode == 1
