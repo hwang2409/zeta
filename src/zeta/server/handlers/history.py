@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from typing import TypeVar
 
 from ...core.store._history_index import (
     InvalidHistoryPageRequest,
@@ -29,10 +28,9 @@ HISTORY_FIRST_PAGE_ENTRIES = 128
 _STABLE_HISTORY_ATTEMPTS = 16
 _cache_creation_lock = threading.Lock()
 _MISSING_VALIDATOR = object()
-_T = TypeVar("_T")
 
 
-def _stable_history_read(
+def _stable_history_read[_T](
     store: object, read: Callable[[], _T], *, has_end: bool
 ) -> _T:
     if has_end:
