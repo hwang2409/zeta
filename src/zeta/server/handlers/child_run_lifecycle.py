@@ -5,7 +5,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from ...core.child_runs import project_child_run_row, read_child_lifecycle
+from ...core.child_runs import (
+    project_child_run_row,
+    read_child_lifecycle,
+    run_row_identity,
+)
 from ...core.store._child_runs import child_run_segments
 
 BASELINE_ROW_RESERVE = 4_096
@@ -15,6 +19,7 @@ def started_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any:
     run_id = entry.data["run_id"]
     runs[run_id.rsplit(":", 1)[1]] = run_id
     marker = store.agent_children().get(run_id) or {}
+    session_id, parent_run_id = run_row_identity(run_id)
     row = project_child_run_row(
         {
             "handle": run_id,
@@ -28,8 +33,8 @@ def started_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any:
             "finished_at": None,
             "elapsed": 0.0,
         },
-        session_id=run_id.split(":", 1)[0],
-        parent_run_id=entry.data.get("parent_run_id"),
+        session_id=session_id,
+        parent_run_id=parent_run_id,
         accepts_follow_ups=marker.get("accepts_follow_ups") is True,
     )
     return replace(entry, data={**entry.data, "_row": row})
@@ -80,10 +85,11 @@ def ended_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any | None:
         lifecycle = getattr(lifecycle, "value", None)
     if not isinstance(lifecycle, dict) or lifecycle.get("finished_at") is None:
         return None
+    session_id, parent_run_id = run_row_identity(run_id)
     row = project_child_run_row(
         lifecycle,
-        session_id=run_id.split(":", 1)[0],
-        parent_run_id=run_id.rpartition(":")[0] or None,
+        session_id=session_id,
+        parent_run_id=parent_run_id,
         accepts_follow_ups=False,
     )
     return replace(entry, id=f"{entry.id}:child_ended", type="child_ended", data={"run_id": run_id, "_row": row})

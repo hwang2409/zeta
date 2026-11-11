@@ -171,11 +171,11 @@ def _capture_baseline(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> li
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_live_child_store_lookup_uses_only_the_loop_projection(
-    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with _serve(tmp_path, transport) as (server, _client, session_id, stores):
+    # the serve-loop store lookup is transport-independent, so run it once
+    async with _serve(tmp_path, "unix") as (server, _client, session_id, stores):
         child = _start_child(server, stores, f"{session_id}:1")
         await _lifecycle_applied(server)
 

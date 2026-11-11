@@ -42,13 +42,14 @@ def register_child_run_sink(sink: ChildRunSink) -> Callable[[], None]:
 def post_child_progress(store: ConversationStore, lifecycle: dict[str, Any]) -> None:
     """Post one semantic lifecycle change with the next revision to every sink."""
     global _revision
-    from .child_runs import project_child_run_row
+    from .child_runs import project_child_run_row, run_row_identity
 
     run_id = lifecycle.get("handle")
     if type(run_id) is not str:
         return
     run_id = str(lifecycle["handle"])
-    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=store.accepts_follow_ups)
+    session_id, parent_run_id = run_row_identity(run_id)
+    row = project_child_run_row(lifecycle, session_id=session_id, parent_run_id=parent_run_id, accepts_follow_ups=store.accepts_follow_ups)
     with _lock:
         _revision += 1
         # posted under the lock, so sinks see revisions in order
@@ -60,10 +61,11 @@ def publish_child_started(
     run_id: str, sequence: int, data: dict[str, Any], *, accepts_follow_ups: bool
 ) -> None:
     """Publish a durable start row installed in the immediate parent's store."""
-    from .child_runs import project_child_run_row
+    from .child_runs import project_child_run_row, run_row_identity
 
     run_id = str(data["run_id"])
-    row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=accepts_follow_ups)
+    session_id, parent_run_id = run_row_identity(run_id)
+    row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=session_id, parent_run_id=parent_run_id, accepts_follow_ups=accepts_follow_ups)
     with _lock:
         for sink in tuple(_sinks):
             sink("started", run_id, row, sequence, None)
@@ -72,7 +74,7 @@ def publish_child_started(
 def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -> None:
     """The one publisher of ``child_ended``: call it only after the immediate
     parent durably installed a new receipt for a run whose lifecycle is terminal."""
-    from .child_runs import project_child_run_row
+    from .child_runs import project_child_run_row, run_row_identity
 
     if not isinstance(lifecycle, dict):
         lifecycle = getattr(lifecycle, "value", None)
@@ -81,7 +83,8 @@ def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -
     if lifecycle.get("finished_at") is None:
         _LOGGER.error("child_ended for %s before its lifecycle is final", run_id)
         return
-    row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=False)
+    session_id, parent_run_id = run_row_identity(run_id)
+    row = project_child_run_row(lifecycle, session_id=session_id, parent_run_id=parent_run_id, accepts_follow_ups=False)
     with _lock:
         for sink in tuple(_sinks):
             sink("ended", run_id, row, receipt_sequence, None)

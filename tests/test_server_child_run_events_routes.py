@@ -305,6 +305,9 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         # 1. the parent discovers the run by its durable start row; 2. no end yet
         started = _lifecycle(before_end, "child_started", target)
         assert len(started) == 1, before_end
+        # the live start row carries the one-owner parent_run_id: null for a direct
+        # child, the parent run's id for a nested child
+        assert started[0]["child"]["parent_run_id"] == parent, started[0]
         if route.nested:
             child_started_at = before_end.index(started[0])
             agent_started_at = next(
@@ -339,6 +342,7 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         # 4. the row is terminal and its sequence is the immediate-parent receipt
         assert end["child"]["status"] == route.outcome, end
         assert "finished_at" in end["child"], end
+        assert end["child"]["parent_run_id"] == parent, end
         receipt_store = serve.store
         child_store = None
         if route.nested:
@@ -377,6 +381,10 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         [ended_row] = _lifecycle(history, "child_ended", target)
         assert ended_row["id"] == f"{receipt.id}:child_ended"
         assert ended_row["child"]["status"] == route.outcome
+        # both durable history rows carry the one-owner parent_run_id
+        [started_row] = _lifecycle(history, "child_started", target)
+        assert started_row["child"]["parent_run_id"] == parent, started_row
+        assert ended_row["child"]["parent_run_id"] == parent, ended_row
         after = await serve.drain(later)
         assert _lifecycle(after, "child_ended", target) == []
         assert all(event["seq"] == index for index, event in enumerate(after, 1)), after
@@ -387,6 +395,12 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         if route.nested:
             top_history = (await serve.join(later, None))["messages"]
             assert _lifecycle(top_history, "child_ended", target) == []
+        # a child_run_events join of the ended run the live projection no longer
+        # holds reads the fallback row from disk; it carries the same parent_run_id
+        fallback = await serve.observer()
+        fallback_child = (await serve.join(fallback, target))["child"]
+        assert fallback_child["run_id"] == target, fallback_child
+        assert fallback_child["parent_run_id"] == parent, fallback_child
     finally:
         unregister()
         backend.release_all()

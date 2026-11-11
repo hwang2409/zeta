@@ -24,7 +24,7 @@ from .child_lifecycle import select_legacy_child_lifecycle
 from .session_execution import execution_owner_state
 from .session_files import child_directory
 from .store import ConversationStore
-from .store._child_runs import parse_child_run_id
+from .store._child_runs import run_row_identity
 
 TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
@@ -392,11 +392,11 @@ def child_run_rows(
     rows: list[dict[str, StructuredContentValue]] = []
     for item in read_agent_status(store, running_handles=running_handles):
         run_id = str(item["handle"])
-        _, parent_run_id = parse_child_run_id(store.session_id, run_id)
+        session_id, parent_run_id = run_row_identity(run_id)
         marker = markers.get(run_id, {})
         row = project_child_run_row(
             item,
-            session_id=store.session_id,
+            session_id=session_id,
             parent_run_id=parent_run_id,
             accepts_follow_ups=marker.get("accepts_follow_ups") is True,
         )
