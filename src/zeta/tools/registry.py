@@ -25,7 +25,6 @@ from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
     ApprovalDecision,
-    ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalRule,
@@ -100,6 +99,7 @@ from ._validation import (
     validate_tool_result,
 )
 from ._web_clients import SessionWebClients
+from .approval_gate import ApprovalGate
 
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState

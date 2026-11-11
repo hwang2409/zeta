@@ -10,7 +10,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
     ApprovalDecision,
-    ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalRule,
@@ -35,6 +34,7 @@ from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
+from zeta.tools.approval_gate import ApprovalGate
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
