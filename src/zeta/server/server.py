@@ -194,6 +194,7 @@ class ZetaServer:
         runtime: ServerRuntime | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
+        prebound_socket: socket.socket | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -244,6 +245,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._prebound_socket = prebound_socket
         self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
@@ -275,10 +277,15 @@ class ZetaServer:
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
-            self._unix_listener = await _UnixSocketListener.start(
-                self.socket_path, self._accept
-            )
-            self._server = self._unix_listener.server
+            if self._prebound_socket is not None:
+                self._server = await asyncio.start_unix_server(
+                    self._accept, sock=self._prebound_socket, limit=MAX_FRAME_BYTES + 1
+                )
+            else:
+                self._unix_listener = await _UnixSocketListener.start(
+                    self.socket_path, self._accept
+                )
+                self._server = self._unix_listener.server
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1

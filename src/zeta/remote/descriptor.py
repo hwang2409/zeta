@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
+import socket
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +34,57 @@ def observer_socket_dir(directory: Path | None = None) -> Path:
     ):
         raise DescriptorError("observer socket directory has unsafe ownership, mode, or type")
     return directory
+
+
+def create_observer_socket(path: Path) -> socket.socket:
+    observer_socket_dir(path.parent)
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        path_stat = None
+    if path_stat is not None:
+        if not stat.S_ISSOCK(path_stat.st_mode):
+            raise DescriptorError(f"refusing to replace non-socket path: {path}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(str(path))
+        except OSError as exc:
+            if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+                raise DescriptorError(f"could not inspect socket: {path}") from exc
+        else:
+            raise DescriptorError(f"a server is already listening on {path}")
+        finally:
+            probe.close()
+        _unlink_if_owned(path, (path_stat.st_dev, path_stat.st_ino))
+    unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    identity: tuple[int, int] | None = None
+    try:
+        unix_socket.bind(str(path))
+        os.chmod(path, 0o600)
+        unix_socket.listen(socket.SOMAXCONN)
+        socket_stat = path.lstat()
+        identity = (socket_stat.st_dev, socket_stat.st_ino)
+        return unix_socket
+    except BaseException:
+        unix_socket.close()
+        if identity is not None:
+            _unlink_if_owned(path, identity)
+        raise
+
+
+def unlink_observer_socket(path: Path, identity: tuple[int, int]) -> None:
+    _unlink_if_owned(path, identity)
+
+
+def _unlink_if_owned(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    if (path_stat.st_dev, path_stat.st_ino) == identity:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
 
 
 def socket_path(home: Path, session_id: str) -> Path:

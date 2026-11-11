@@ -9,7 +9,14 @@ from typing import Any
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..server.runtime import ServerRuntime
 from ..server.server import ZetaServer
-from .descriptor import Descriptor, observer_socket_dir, publish, remove, socket_path
+from .descriptor import (
+    Descriptor,
+    create_observer_socket,
+    publish,
+    remove,
+    socket_path,
+    unlink_observer_socket,
+)
 
 
 class ObserverHost:
@@ -40,6 +47,7 @@ class ObserverHost:
         self.cwd = self.cwd[:256]
         self.socket = socket_path(home, session_id)
         self._server: ZetaServer | None = None
+        self._socket_identity: tuple[int, int] | None = None
         self._started = False
 
     async def start(self) -> None:
@@ -57,18 +65,25 @@ class ObserverHost:
                 project_dir=project_dir,
                 repo_root=repo_root,
             )
-        await asyncio.to_thread(observer_socket_dir)
+        observer_socket = await asyncio.to_thread(create_observer_socket, self.socket)
+        socket_stat = self.socket.lstat()
+        socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
+        self._socket_identity = socket_identity
         server = ZetaServer(
             home=self.home,
             socket_path=self.socket,
             runtime=self.runtime,
             foreground_event_publisher=self.publisher,
             max_role="observer",
+            prebound_socket=observer_socket,
         )
         try:
             await server.start()
         except BaseException:
             await server.close()
+            observer_socket.close()
+            await asyncio.to_thread(unlink_observer_socket, self.socket, socket_identity)
+            self._socket_identity = None
             raise
         self._server = server
         self._started = True
@@ -79,4 +94,7 @@ class ObserverHost:
         self._started = False
         if server is not None:
             await server.close()
+        if self._socket_identity is not None:
+            await asyncio.to_thread(unlink_observer_socket, self.socket, self._socket_identity)
+            self._socket_identity = None
         await asyncio.to_thread(remove, self.home, self.session_id)

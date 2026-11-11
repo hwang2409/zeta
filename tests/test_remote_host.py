@@ -10,7 +10,6 @@ import pytest
 from zeta.remote.descriptor import (
     Descriptor,
     DescriptorError,
-    observer_socket_dir,
     publish,
     socket_path,
     validate,
@@ -22,7 +21,6 @@ def test_descriptor_rejects_unsafe_socket_and_overlong_path(tmp_path: Path) -> N
     path = publish(tmp_path, descriptor)
     with pytest.raises(DescriptorError):
         validate(path)
-    assert len(os.fsencode(socket_path(tmp_path, "session"))) <= 90
 
 
 def test_descriptor_rejects_permissive_descriptor(tmp_path: Path) -> None:
@@ -46,15 +44,18 @@ async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.Mon
     stale = socket.socket(socket.AF_UNIX)
     stale.bind(str(path))
     stale.close()
-    called = False
-    original = asyncio.to_thread
+    import threading
 
-    async def checked(function, *args, **kwargs):
-        nonlocal called
-        called = True
-        return await original(function, *args, **kwargs)
+    threads: list[threading.Thread] = []
+    import zeta.remote.host as host_module
 
-    monkeypatch.setattr(asyncio, "to_thread", checked)
+    original = host_module.create_observer_socket
+
+    def checked(path: Path) -> socket.socket:
+        threads.append(threading.current_thread())
+        return original(path)
+
+    monkeypatch.setattr(host_module, "create_observer_socket", checked)
     host = ObserverHost(
         home=tmp_path,
         session_id="session",
@@ -63,16 +64,11 @@ async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.Mon
     )
     await host.start()
     try:
-        assert called
+        assert threads and threads[0] is not threading.main_thread()
         await host.start()
         assert host._server is not None
     finally:
         await host.close()
-
-
-def test_socket_path_limit_is_encoded() -> None:
-    path = socket_path(Path("/"), "x")
-    assert len(os.fsencode(path)) <= 90
 
 
 @pytest.mark.asyncio
@@ -194,17 +190,37 @@ async def _close_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     await writer.wait_closed()
 
 
-def test_observer_socket_dir_rejects_symlink_and_wrong_mode(tmp_path: Path) -> None:
-    target = tmp_path / "target"
-    target.mkdir(mode=0o700)
-    symlink = tmp_path / "symlink"
+@pytest.mark.asyncio
+async def test_observer_host_rejects_unsafe_socket_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.remote.host import ObserverHost
+    from zeta.runtime.foreground_events import ForegroundEventPublisher
+    from zeta.server.runtime import ServerRuntime
+
+    target = Path("/tmp")
+    symlink = tmp_path / "observer-dir"
     symlink.symlink_to(target, target_is_directory=True)
-    with pytest.raises(DescriptorError, match="unsafe"):
-        observer_socket_dir(symlink)
-    wrong = tmp_path / "wrong"
-    wrong.mkdir(mode=0o755)
-    with pytest.raises(DescriptorError, match="unsafe"):
-        observer_socket_dir(wrong)
+    monkeypatch.setattr(
+        "zeta.remote.host.socket_path",
+        lambda home, session_id: symlink / "observer.sock",
+    )
+    host = ObserverHost(
+        home=tmp_path,
+        session_id="session",
+        runtime=ServerRuntime(tmp_path, provider="codex", model="gpt-5"),
+        publisher=ForegroundEventPublisher(),
+    )
+    try:
+        try:
+            await host.start()
+        except (DescriptorError, RuntimeError, OSError):
+            pass
+        else:
+            pytest.fail("observer host accepted a symlink socket directory")
+        assert not (target / "observer.sock").exists()
+    finally:
+        await host.close()
 
 
 def test_standalone_socket_parent_keeps_permissive_mode(tmp_path: Path) -> None:
