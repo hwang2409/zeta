@@ -65,7 +65,7 @@ from zeta.tools._shared.background_output_archive import _BackgroundOutputArchiv
 from zeta.tools._shared.background_spawn import _group_exists, _terminate_process
 from zeta.tools._shared.background_task_types import TaskExitInput, _BackgroundRecord
 from zeta.tools._shared.process import BackgroundTaskRegistry
-from zeta.tui.render import format_status, render_event
+from zeta.tui.render import format_status, render_agent_notification, render_event
 
 
 def _python(*parts: str) -> str:
@@ -332,6 +332,90 @@ async def test_registry_close_persists_specific_kill_cause(
     finally:
         await asyncio.wait_for(tools.close(), 10)
         store.close()
+
+
+def _closed_session_kill_phase_and_line(
+    root_dir: Path, session_id: str
+) -> tuple[str, str]:
+    """Read the persisted kill phase and the rendered task receipt line.
+
+    Reopens the already-closed session so the assertions run against the
+    durable record and the real TUI render path, not in-memory state.
+    """
+    rows = json.loads((root_dir / session_id / "background_tasks.json").read_text())
+    phases = {row["terminal_phase"] for row in rows}
+    assert phases == {rows[0]["terminal_phase"]}, phases
+    reopened = ConversationStore(root_dir, session_id=session_id)
+    try:
+        receipts = [
+            entry
+            for entry in reopened.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert len(receipts) == 1, receipts
+        rendered = render_agent_notification(
+            StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=receipts[0].data)
+        )
+        assert rendered is not None
+        line = _renderable_plain(rendered).strip()
+    finally:
+        reopened.close()
+    return phases.pop(), line
+
+
+_SESSION_EXIT_LINE = "background tasks killed on session exit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["tui_exit", "serve_close", "finish_gate_kill"])
+async def test_session_close_kill_phase_by_surface(
+    tmp_path: Path, surface: str
+) -> None:
+    """Session close stores session_shutdown and renders the exit line.
+
+    ctrl-d, /new, and serve close all tear down through close_session ->
+    AgentLoop.close; #1193 regressed those paths to phase="task_kill", which
+    hid the session-exit line (render.py) and kept the wrong recovery phase.
+    The finish-gate case still kills tasks as task_kill and renders the plain
+    receipt, so this guards both phases through the public interfaces.
+    """
+    sleep_30 = _python("import time; time.sleep(30)")
+    if surface == "serve_close":
+        from zeta.server.runtime import ServerRuntime
+
+        runtime = ServerRuntime(tmp_path, provider="codex")
+        await runtime.create_session()
+        loop = runtime.loop
+        assert loop is not None
+        root_dir, session_id = loop.store.root_dir, loop.store.session_id
+        await loop.tool_registry.background_tasks.start(sleep_30, tmp_path)
+        await runtime.close()
+    else:
+        from zeta.runtime.cleanup import close_session
+
+        store = ConversationStore(tmp_path / "session")
+        loop = AgentLoop(
+            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        await loop.activate()
+        root_dir, session_id = store.root_dir, store.session_id
+        await loop.tool_registry.background_tasks.start(sleep_30, tmp_path)
+        if surface == "finish_gate_kill":
+            # The finish gate marks remaining tasks as an explicit kill before
+            # the loop closes; that must stay task_kill, not session_shutdown.
+            loop.tool_registry.background_tasks.begin_shutdown(
+                "finish-gate task safety bound expired", phase="task_kill"
+            )
+        await close_session(loop)
+
+    phase, line = _closed_session_kill_phase_and_line(root_dir, session_id)
+    if surface == "finish_gate_kill":
+        assert phase == "task_kill"
+        assert _SESSION_EXIT_LINE not in line
+        assert "exited" in line
+    else:
+        assert phase == "session_shutdown"
+        assert _SESSION_EXIT_LINE in line
 
 
 @pytest.mark.asyncio
