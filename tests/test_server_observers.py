@@ -33,7 +33,7 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer, approval_settlement
 from zeta.server.handlers import history as history_module
-from zeta.server.protocol import ApprovalDecision, EventDescriptor
+from zeta.server.protocol import EventDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -476,10 +476,11 @@ async def test_reconnect_baseline_keeps_durable_row_beside_settling_live_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Two durable foreground approvals survive a restart. Deciding one (D1) creates a
-    # live settling record while its decision persists; D2 stays durable-only. A
-    # reconnect baseline taken in that window must still list D2. The old rule
-    # ("the live rows if there are any, else the durable store") returned only D1.
+    # Two durable foreground approvals survive a restart. A controller approves one (D1)
+    # over the socket; its decision persists, so D1 is a live settling record while D2
+    # stays durable-only. In that window a second client's join baseline must still list
+    # BOTH D1 (with resolution_pending "approve") and D2. The old rule ("the live rows if
+    # there are any, else the durable store") returned only D1 and dropped D2.
     manager = SessionManager(tmp_path)
     opened = await asyncio.to_thread(
         lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
@@ -505,6 +506,7 @@ async def test_reconnect_baseline_keeps_durable_row_beside_settling_live_record(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     controller_reader, controller_writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
     try:
         await _request(
             controller_reader,
@@ -517,7 +519,7 @@ async def test_reconnect_baseline_keeps_durable_row_beside_settling_live_record(
             controller_reader, controller_writer, 2, "resume", {"session_id": session_id}
         )
 
-        # Hold D1 in its settling phase: block the durable persist so resolve_approval
+        # Hold D1 in its settling phase: block the durable persist so the approve handler
         # parks after it has created D1's live settling record but before it finishes.
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -529,18 +531,46 @@ async def test_reconnect_baseline_keeps_durable_row_beside_settling_live_record(
             return await real_persist(*args, **kwargs)
 
         monkeypatch.setattr(approval_settlement, "persist_durably", blocking_persist)
-        decide = asyncio.ensure_future(
-            server.control.resolve_approval(ApprovalDecision.APPROVE, call_one.id)
-        )
+
+        # Approve D1 over the real socket without reading the reply yet; the handler parks
+        # in the blocked persist while D1 settles.
+        await send(controller_reader, controller_writer, 3, "approve", {"request_id": call_one.id})
+        await await_or_fail(entered.wait(), what="settlement entered")
         try:
-            await await_or_fail(entered.wait(), what="settlement entered")
-            baseline, _ = await server.control.reconnect_baseline()
-            request_ids = {row["request_id"] for row in baseline}
-            assert request_ids == {call_one.id, call_two.id}
+            # A second client joins during the settling window. Its baseline must show D1
+            # settling (resolution_pending) alongside the still-durable D2.
+            observer_reader, observer_writer = await _observer(
+                server, 10, ["serve_observers", "session_replay_seq"]
+            )
+            observer_join = (
+                await _request(
+                    observer_reader,
+                    observer_writer,
+                    11,
+                    "session_history_and_subscribe",
+                    {"session_id": session_id},
+                )
+            )[-1]["result"]
+            rows = {
+                row["request_id"]: row
+                for row in observer_join["status"]["pending_approvals"]
+            }
+            assert set(rows) == {call_one.id, call_two.id}
+            assert rows[call_one.id].get("resolution_pending") == "approve"
         finally:
+            # Release the persist and read the approve reply off the controller socket,
+            # so a failed assertion above does not deadlock on the parked settlement.
             release.set()
-            await await_or_fail(decide, what="resolve D1")
+            await read_until(
+                controller_reader,
+                lambda frame: frame.get("id") == 3
+                and frame.get("result", {}).get("accepted") is True,
+                what="approve D1 reply",
+            )
     finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
         await close_serve(server, controller_writer)
 
 
