@@ -49,6 +49,7 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
@@ -103,11 +104,11 @@ from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import (
-    FinderControl,
     TranscriptPresenter,
     TranscriptWidget,
     stream_key,
@@ -173,6 +174,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    RemoteViewMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
     DecisionsMixin,
@@ -215,9 +217,15 @@ class TUIApp(
         project_eligible: bool | None = None,
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
+        observer_host: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
+        self.foreground_event_publisher = (
+            foreground_event_publisher or ForegroundEventPublisher()
+        )
+        self.observer_host = observer_host
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -311,6 +319,7 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
+            include_tui_only=True,
         )
         self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
@@ -322,17 +331,14 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._init_remote_view()
         self._history_finder = HistoryFinder(
             lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        self._finder_control = FinderControl(
-            lambda: app._active_finder.finder_state()
-        )
-        self._finder_prepare_task: asyncio.Task[None] | None = None
-        self._finder_rank_task: asyncio.Task[None] | None = None
+        self._init_finder_runtime()
         self._composer_restore_document: Document | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
@@ -346,6 +352,7 @@ class TUIApp(
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_snapshot = (
             lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
@@ -502,7 +509,6 @@ class TUIApp(
             decisions_answering=lambda: app._decisions_panel.mode == "answer",
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
-            on_decisions_input=lambda text: app._decisions_answer_input(text),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
@@ -511,7 +517,6 @@ class TUIApp(
             on_history_next=lambda buffer: app._history_next(buffer),
             finder_active=lambda: app._active_finder.finder_active,
             history_finder_active=lambda: app._history_finder.finder_active,
-            on_finder_input=lambda query: app._finder_input(query),
             on_finder_move=lambda delta: app._finder_move(delta),
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
@@ -578,7 +583,7 @@ class TUIApp(
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " › ")],
-            placeholder=[("class:placeholder", "type a message...")],
+            placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
             history=None,
             key_bindings=bindings,
             completer=ComposerCompleter(
@@ -620,12 +625,8 @@ class TUIApp(
         if self._agent_navigation.child_view_active:
             return self._agent_navigation.current_path
         return self.loop.store.session_dir
-
     def _viewed_transcript(self) -> TranscriptWidget:
-        if self._agent_navigation.child_view_active:
-            return self._agent_navigation.transcript_control.transcript
-        return self._transcript
-
+        return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
         self._prompt_history.reset_navigation()
         finder = self._active_finder
@@ -1057,7 +1058,7 @@ class TUIApp(
             value = await session.prompt_async(
                 [("class:prompt", " › ")],
                 bottom_toolbar=lambda: app._status_toolbar(),
-                placeholder=[("class:placeholder", "type a message...")],
+                placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
                 pre_run=insert_pending_tokens,
             )
         except EOFError:
@@ -1110,6 +1111,8 @@ class TUIApp(
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._active_finder.finder_active,
                 queued_messages=lambda: app.queued_messages,
+                decisions_answer_window=app._decisions_answer_field.window,
+                overlay_field_windows=(app._finder_field.window,),
             )
         ]
         self._agent_navigation.bind_layout(
@@ -1142,6 +1145,10 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None and (error := await observer_host.start_or_close()):
+                self.observer_host = None  # optional endpoint: never stops the TUI or a fork
+                self._handle_background_notice(f"remote observer unavailable: {error}")
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session

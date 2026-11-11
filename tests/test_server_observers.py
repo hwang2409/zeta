@@ -155,14 +155,14 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
     store = server.runtime.opened.store
     entered = threading.Event()
     release = threading.Event()
-    original_snapshot = store.active_branch_snapshot
+    original_page = store.history_index_page
 
-    def gated_snapshot() -> Any:
+    def gated_page(request: dict[str, object]) -> Any:
         entered.set()
         assert release.wait(TIMEOUT)
-        return original_snapshot()
+        return original_page(request)
 
-    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
+    monkeypatch.setattr(store, "history_index_page", gated_page)
     try:
         history = asyncio.create_task(
             _request(
@@ -264,6 +264,120 @@ async def test_observer_hello_has_no_controller_side_effects(
 
 async def _wait_thread(event: threading.Event) -> None:
     assert await asyncio.wait_for(asyncio.to_thread(event.wait, TIMEOUT), TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> None:
+    call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    legacy_observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["approval_reconnect"]},
+        )
+        session = (
+            await _request(
+                controller_reader,
+                controller_writer,
+                2,
+                "new_session",
+                {"provider": "codex"},
+            )
+        )[-1]["result"]["session"]
+        await _request(
+            controller_reader, controller_writer, 3, "send", {"text": "read it"}
+        )
+        approval = (
+            await read_until(
+                controller_reader,
+                lambda frame: frame.get("params", {}).get("event")
+                == "approval_request",
+                what="approval_request",
+            )
+        )[-1]["params"]
+
+        observer_reader, observer_writer = await _observer(
+            server,
+            10,
+            ["serve_observers", "approval_reconnect", "session_replay_seq"],
+        )
+        status = (await _request(observer_reader, observer_writer, 11, "status"))[-1][
+            "result"
+        ]
+        joined = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                12,
+                "session_history_and_subscribe",
+                {"session_id": session["session_id"]},
+            )
+        )[-1]["result"]
+        request_id = approval["request_id"]
+        assert [row["request_id"] for row in status["pending_approvals"]] == [
+            request_id
+        ]
+        assert [
+            row["request_id"] for row in joined["status"]["pending_approvals"]
+        ] == [request_id]
+
+        legacy_observer_reader, legacy_observer_writer = await _observer(
+            server, 20, ["serve_observers"]
+        )
+        legacy_status = (
+            await _request(legacy_observer_reader, legacy_observer_writer, 21, "status")
+        )[-1]["result"]
+        assert [
+            row["request_id"] for row in legacy_status["pending_approvals"]
+        ] == [request_id]
+
+        rejected = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                13,
+                "approve",
+                {"request_id": request_id},
+            )
+        )[-1]
+        assert rejected["error"]["code"] == -32008
+        await _request(
+            controller_reader,
+            controller_writer,
+            4,
+            "approve",
+            {"request_id": request_id},
+        )
+        ended = (
+            await read_until(
+                observer_reader,
+                lambda frame: frame.get("params", {}).get("event") == "approval_end",
+                what="approval_end",
+            )
+        )[-1]["params"]
+        assert ended["request_id"] == request_id
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
+        if legacy_observer_writer is not None:
+            legacy_observer_writer.close()
+            await legacy_observer_writer.wait_closed()
+        await close_serve(server, controller_writer)
 
 
 @pytest.mark.asyncio
@@ -406,18 +520,18 @@ async def test_controller_history_does_not_block_other_clients(
     release = threading.Event()
     ping_answered = threading.Event()
     answered_before_release: list[bool] = []
-    original_snapshot = store.active_branch_snapshot
+    original_page = store.history_index_page
 
-    def gated_snapshot() -> Any:
+    def gated_page(request: dict[str, object]) -> Any:
         entered.set()
         assert release.wait(TIMEOUT)
-        return original_snapshot()
+        return original_page(request)
 
     def bounded_release() -> None:
         answered_before_release.append(ping_answered.wait(0.5))
         release.set()
 
-    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
+    monkeypatch.setattr(store, "history_index_page", gated_page)
 
     async def ping_after_history_starts() -> None:
         await _wait_thread(entered)

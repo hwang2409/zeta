@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
     ReplayClient,
@@ -22,6 +22,7 @@ from zeta.protocol.types import (
     MessageOrigin,
     MessageRole,
     TextContent,
+    ToolCall,
     with_message_origin,
 )
 from zeta.server import ZetaServer
@@ -240,9 +241,16 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(entered.wait(), what="history read entered")
+        assert server.runtime.state is not None
+        server.runtime.state.turn_started()
         await _publish(server, session_id)
         release.set()
         response = await client.response(3)
+        assert response["result"]["status"] == {
+            "state": "idle",
+            "pending_approvals": [],
+            "pending_approvals_truncated": False,
+        }
         stream_id = response["result"]["replay"]["stream_id"]
         event = await client.event("turn_start")
         assert [classify(response), classify({"method": "event", "params": event})] == [
@@ -252,6 +260,48 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
         assert event["seq"] == 1
     finally:
         release.set()
+        if server.runtime.state is not None:
+            server.runtime.state.turn_finished()
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_limit_waits_for_a_free_slot(tmp_path: Path) -> None:
+    calls = [
+        ToolCall(f"call-{index}", "read", {"path": str(tmp_path / "missing")})
+        for index in range(65)
+    ]
+    backend = FakeBackend([ScriptedTurn(tool_calls=calls)])
+    server = replay_server(
+        tmp_path,
+        "unix",
+        lambda provider, model, home: (backend, model or "offline"),
+    )
+    await server.start()
+    client = await connect_replay(server, "unix")
+    await negotiate(client)
+    created = await client.request(2, "new_session", {"provider": "codex"})
+    session_id = created["result"]["session"]["session_id"]
+    try:
+        await client.send(3, "send", {"text": "read all files"})
+        admitted = [await client.event("approval_request") for _ in range(64)]
+        admitted_ids = {request["request_id"] for request in admitted}
+        assert {item["request_id"] for item in server.control.pending_approvals_now()} == admitted_ids
+
+        first_id = admitted[0]["request_id"]
+        denied = await client.request(4, "deny", {"request_id": first_id})
+        assert denied["result"]["accepted"] is True
+        next_request = await client.event("approval_request")
+        assert next_request["request_id"] not in admitted_ids
+        assert len(server.control.pending_approvals_now()) == 64
+
+        joined = await client.request(
+            5, "session_history_and_subscribe", {"session_id": session_id}
+        )
+        assert len(joined["result"]["status"]["pending_approvals"]) == 64
+        assert joined["result"]["status"]["pending_approvals_truncated"] is False
+    finally:
         await client.close()
         await server.close()
 

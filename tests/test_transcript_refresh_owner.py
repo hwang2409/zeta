@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import shutil
@@ -8,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.cli.main import build_parser
 from zeta.core.session import SessionManager, env_home
 from zeta.runtime.headless import run_headless
+from zeta.runtime.loop import AgentLoop
 
 
 def test_resume_with_registry_path_as_file_warns_once_without_unretrieved_task(
@@ -19,6 +22,26 @@ def test_resume_with_registry_path_as_file_warns_once_without_unretrieved_task(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    original_close = AgentLoop.close
+
+    async def close_after_refresh(self: AgentLoop, **kwargs: object) -> tuple[str, ...]:
+        # Let a pending transcript-index refresh reach its failure observation
+        # before close() cancels tracked tasks; otherwise py3.14 scheduling can
+        # cancel it before it logs, dropping the warning this test asserts.
+        refresh_tasks = [
+            task
+            for task in self._tracked_tasks
+            if task.get_coro().__qualname__.endswith("_observe_refresh")
+            and not task.done()
+        ]
+        if refresh_tasks:
+            await await_or_fail(
+                asyncio.gather(*refresh_tasks),
+                what="transcript refresh observation",
+            )
+        return await original_close(self, **kwargs)
+
+    monkeypatch.setattr(AgentLoop, "close", close_after_refresh)
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)

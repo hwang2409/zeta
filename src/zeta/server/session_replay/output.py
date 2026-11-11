@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from ..handlers import validation
+from ..handlers import lifecycle, validation
 from ..handlers.history import replay_history
-from ..protocol import EventDescriptor, FrameCodec, _Frame
+from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
 from . import (
     DROP,
     EVICT,
@@ -44,7 +44,9 @@ class ReplayOutput:
         fields: dict[str, object],
         covers: rows.Covers,
     ) -> None:
-        """Send a controller event to observers that joined its replay scope."""
+        """Send an event to observers that joined its replay scope."""
+        if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
+            return
         for observer in tuple(self._observers):
             if not self._feature_rejected(observer, event, required_feature, fields):
                 self._publish_replay(
@@ -191,8 +193,12 @@ class ReplayOutput:
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        store = validation.active(connection.server.runtime, {"session_id": scope.value})
-        self.replay.begin_join(connection, scope, store.reset_generation())
+        runtime = connection.server.runtime
+        store = validation.active(runtime, {"session_id": scope.value})
+        status = lifecycle.live_status_baseline(connection)
+        self.replay.begin_join(
+            connection, scope, store.reset_generation(), status
+        )
 
     def finish_replay_join(
         self,
@@ -448,7 +454,10 @@ class ReplayOutput:
         state.connection.writer.close()
 
     async def read_replay_history(
-        self, connection: Any, session_id: str
+        self,
+        connection: Any,
+        session_id: str,
+        history_validator: object | None = None,
     ) -> tuple[dict[str, object], int, str | None]:
         """Read the newest history page and its stable frontier row off-loop."""
         store = validation.active(connection.server.runtime, {"session_id": session_id})
@@ -463,6 +472,11 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                **(
+                    {"supplied_validator": history_validator}
+                    if history_validator is not None
+                    else {}
+                ),
             )
             return history, frontier_seq, frontier_row_id
 

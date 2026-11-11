@@ -260,11 +260,25 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     client = await _start_client(server)
+    observer_reader, observer_writer = await await_or_fail(
+        asyncio.open_unix_connection(str(server.socket_path)),
+        what="observer Unix socket connect",
+    )
+    observer = ServeClient(reader=observer_reader, writer=observer_writer)
     try:
         hello = await client.request(
             "hello",
             "hello",
             {"protocol_version": "1.2", "features": ["child_runs"]},
+        )
+        await observer.request(
+            "observer-hello",
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "observer",
+                "features": ["serve_observers", "child_runs"],
+            },
         )
         created = await client.request(
             "new", "new_session", {"provider": "codex"}
@@ -283,6 +297,16 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
             "child_run_list",
             {"session_id": session_id},
         )
+        observed = await observer.request(
+            "observer-list",
+            "child_run_list",
+            {"session_id": session_id},
+        )
+        observer_sent = await observer.request(
+            "observer-send-child",
+            "child_run_send",
+            {"session_id": session_id, "run_id": run_id, "text": "continue"},
+        )
         sent = await client.request(
             "send-child",
             "child_run_send",
@@ -293,6 +317,19 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
             "send": sent,
         }
         assert hello["result"]["capabilities"]["features"] == ["child_runs"]
+        assert observed["result"].keys() == listed["result"].keys()
+        assert [
+            {key: value for key, value in row.items() if key != "elapsed_seconds"}
+            for row in observed["result"]["runs"]
+        ] == [
+            {key: value for key, value in row.items() if key != "elapsed_seconds"}
+            for row in listed["result"]["runs"]
+        ]
+        assert observer_sent["error"] == {
+            "code": -32008,
+            "message": "method is unavailable to read-only observers",
+            "data": {"code": "observer_read_only", "method": "child_run_send"},
+        }
         [before] = listed["result"]["runs"]
         assert before["run_id"] == run_id
         assert before["session_id"] == session_id
@@ -318,5 +355,6 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         assert after["tool_count"] >= before["tool_count"]
     finally:
         backend.release_children.set()
+        await observer.close()
         await client.close()
         await server.close()
