@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -107,13 +106,6 @@ class RemoteViewState:
                 self.presenter.print_unit(rendered)
 
 
-def _remote_debug(message: str) -> None:
-    path = os.environ.get("ZETA_REMOTE_DEBUG")
-    if path:
-        with open(path, "a", encoding="utf-8") as stream:
-            stream.write(message + "\n")
-
-
 class RemoteViewMixin:
     def _composer_placeholder(self) -> str:
         return "view only · /detach to return" if self._remote_view is not None else "type a message..."
@@ -194,7 +186,6 @@ class RemoteViewMixin:
         self._next_image_token = next_image_token
 
     async def slash_remote(self, args: str) -> str:
-        _remote_debug(f"slash_remote args={args!r}")
         target = args.strip()
         client = self._remote_client()
         try:
@@ -211,11 +202,9 @@ class RemoteViewMixin:
             elif len(rows) == 1:
                 chosen = rows[0]
             else:
-                _remote_debug(f"picker rows={len(rows)}")
                 self._remote_picker = RemotePicker(tuple(rows))
                 self._remote_picker_unit = self._presenter.print_unit(self._remote_picker.render())
                 self._invalidate_prompt()
-                _remote_debug("picker printed and invalidated")
                 return ""
             await client.attach(chosen.host, chosen)
         except (RemoteWireError, ValueError) as exc:
