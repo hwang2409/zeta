@@ -231,8 +231,10 @@ def _parser_surface(parser: argparse.ArgumentParser) -> set[str]:
             if action.help != argparse.SUPPRESS:
                 surface.update(action.option_strings)
             if isinstance(action, argparse._SubParsersAction):
-                surface.update(action.choices)
-                for subparser in action.choices.values():
+                for name, subparser in action.choices.items():
+                    if subparser._defaults.get("_hidden", False):
+                        continue
+                    surface.add(name)
                     visit(subparser)
 
     visit(parser)
