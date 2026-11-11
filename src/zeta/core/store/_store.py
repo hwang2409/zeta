@@ -433,14 +433,6 @@ class ConversationStore(
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def set_todo_items(self, items: object) -> None:
-        """Replace the session todo list in one atomic state-file update."""
-        normalized = parse_todo_items(items)
-        with self._append_lock():
-            self._todo_items = [dict(item) for item in normalized]
-            self._todo_dismissed = False
-            self._write_session_state(self.bash_cwd, normalized)
-
     def _load_session_state(self) -> None:
         try:
             value = load_session_json(
