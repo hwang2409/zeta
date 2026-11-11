@@ -175,6 +175,23 @@ def session_snapshot(self) -> dict[str, object] | None:
     return snapshot
 
 
+def live_status_baseline(self) -> dict[str, object]:
+    runtime = self.server.runtime
+    control = self.server.control
+    pending, truncated = control.pending_approvals_now(
+        reconnect=True, include_truncated=True
+    )
+    return {
+        "state": (
+            "idle"
+            if control.unhealthy() or runtime.state is None
+            else "running" if control.turn_busy() else runtime.state.status
+        ),
+        "pending_approvals": pending,
+        "pending_approvals_truncated": truncated,
+    }
+
+
 async def status(
     self,
     *,
@@ -183,18 +200,15 @@ async def status(
 ) -> dict[str, object]:
     runtime = self.server.runtime
     session = session_snapshot(self)
-    reconnect = "approval_reconnect" in self.features and self.role != "observer"
-    if reconnect:
-        pending, truncated = self.server.control.pending_approvals_now(
-            reconnect=True, include_truncated=True
-        )
-    else:
-        pending = (
+    reconnect = "approval_reconnect" in self.features
+    baseline = live_status_baseline(self)
+    if not reconnect:
+        baseline["pending_approvals"] = (
             await self.server.control.pending_approvals()
             if self.role != "observer"
             else []
         )
-        truncated = False
+        baseline.pop("pending_approvals_truncated")
     loop = runtime.loop
     if loop is None and fallback_config is None:
         fallback_config = await asyncio.to_thread(runtime._config, None, None)
@@ -214,15 +228,7 @@ async def status(
     )
     status = {
         "session": session,
-        "state": (
-            "idle"
-            if self.server.control.unhealthy() or runtime.state is None
-            else (
-                "running"
-                if self.server.control.turn_busy()
-                else runtime.state.status
-            )
-        ),
+        "state": baseline["state"],
         "explicit_finish": (
             loop.explicit_finish
             if loop is not None
@@ -236,8 +242,12 @@ async def status(
             else fallback_config.agents_max_depth  # type: ignore[union-attr]
         )
     suffix = {
-        "pending_approvals": pending,
-        **({"pending_approvals_truncated": truncated} if reconnect else {}),
+        "pending_approvals": baseline["pending_approvals"],
+        **(
+            {"pending_approvals_truncated": baseline["pending_approvals_truncated"]}
+            if reconnect
+            else {}
+        ),
         "usage": dict(runtime.usage),
         **(
             {
