@@ -16,13 +16,6 @@ from tests.support.replay_transport import (
 )
 from zeta.core.agent_progress import post_child_progress
 from zeta.core.store import ConversationStore
-from zeta.server.protocol import (
-    CHILD_RUN_EVENTS_PREREQUISITES,
-    FEATURES,
-    EventDescriptor,
-    MethodDescriptor,
-)
-from zeta.server.session_replay.rows import CARRIED, LIVE, ROUTES
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -32,22 +25,44 @@ def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[Fake
     return FakeBackend([]), model or "offline"
 
 
-def test_child_run_events_prerequisites_are_derived_from_method_features() -> None:
-    assert CHILD_RUN_EVENTS_PREREQUISITES == frozenset(
-        descriptor.feature
-        for descriptor in MethodDescriptor
-        if descriptor.wire in {"session_history_and_subscribe", "child_run_history", "child_run_list"}
-        and descriptor.feature is not None
-    )
-    assert CHILD_RUN_EVENTS_PREREQUISITES <= set(FEATURES)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize(
+    "omitted",
+    ("session_replay_seq", "child_run_history", "child_runs"),
+)
+async def test_child_run_events_requires_every_prerequisite_over_both_transports(
+    tmp_path: Path, transport: Transport, omitted: str
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    client = await connect_replay(server, transport)
+    try:
+        features = {
+            "child_run_events",
+            "session_replay_seq",
+            "child_run_history",
+            "child_runs",
+        }
+        features.remove(omitted)
+        hello = await client.request(
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": sorted(features)},
+        )
+        capabilities = hello["result"]["capabilities"]
+        assert "child_run_events" not in capabilities["features"]
+        assert "child_run_events" not in capabilities["requests"]
 
-
-def test_child_lifecycle_routes_are_explicit() -> None:
-    assert ROUTES[(EventDescriptor.CHILD_STARTED, "")] is CARRIED
-    assert ROUTES[(EventDescriptor.CHILD_PROGRESS, "")] is LIVE
-    assert ROUTES[(EventDescriptor.CHILD_ENDED, "")] is CARRIED
-    assert ROUTES[(EventDescriptor.APPROVAL_REQUEST, "child")] is LIVE
-    assert ROUTES[(EventDescriptor.APPROVAL_END, "child")] is LIVE
+        reply = await client.request(
+            2,
+            "child_run_events",
+            {"session_id": "missing", "run_id": "missing:1"},
+        )
+        assert reply["error"]["code"] == -32601
+    finally:
+        await client.close()
+        await server.close()
 
 
 @pytest.mark.asyncio

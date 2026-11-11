@@ -32,6 +32,7 @@ from .handlers.projects import (
 )
 from .handlers.registry import dispatch as _dispatch_request
 from .protocol import (
+    CHILD_RUN_EVENTS_PREREQUISITES,
     FEATURES,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
@@ -625,6 +626,11 @@ class _Client:
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
+        if (
+            "child_run_events" in accepted
+            and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)
+        ):
+            accepted.remove("child_run_events")
         self.features = frozenset(accepted)
         assert self.server.connections is not None
         role = self.server.connections.negotiate_role(
