@@ -24,7 +24,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
-from zeta.core import agent_progress
+from zeta.core import agent_progress, child_runs
 from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
@@ -615,6 +615,12 @@ async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
 
         # bullet 2: an older start is found by paging, its current row by a one-run join
         counts.update(current=0, walks=0)
+
+        def reject_all_child_scan(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            pytest.fail("one-run join scanned every child")
+
+        monkeypatch.setattr(child_runs, "child_run_rows", reject_all_child_scan)
         page = await client.request(
             4, "child_run_events", {"session_id": session_id, "run_id": newer[0]}
         )
