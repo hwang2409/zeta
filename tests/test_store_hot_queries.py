@@ -33,7 +33,7 @@ def test_approval_index_rebuilds_non_v4_without_changing_authority(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
-    transcript = store.log_path.read_bytes()
+    transcript = store.path.read_bytes()
     sidecar = store.session_dir / "history-index.sqlite3"
     store.close()
 
@@ -49,7 +49,7 @@ def test_approval_index_rebuilds_non_v4_without_changing_authority(
 
     reopened = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
     assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
-    assert reopened.log_path.read_bytes() == transcript
+    assert reopened.path.read_bytes() == transcript
     with sqlite3.connect(sidecar) as connection:
         rebuilt = json.loads(
             connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
@@ -208,7 +208,7 @@ def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
 
     store._sync_log_without_waiting()
 
-    assert store._approval_states_from_indexes()[request.id][1] == "abort"
+    assert asyncio.run(store.approval_state(request.id))[1] == "abort"
 
 
 def test_compaction_marker_count_does_not_snapshot_payloads(
