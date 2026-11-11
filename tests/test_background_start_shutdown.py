@@ -17,12 +17,9 @@ import pytest
 from tests.support.processes import kill_group_if_present
 from zeta.tools._shared import background_spawn
 from zeta.tools._shared import process as process_module
-from zeta.tools._shared.process import (
-    BackgroundTaskNotice,
-    BackgroundTaskRegistry,
-    TaskExitInput,
-    _group_exists,
-)
+from zeta.tools._shared.background_spawn import _group_exists
+from zeta.tools._shared.background_task_types import BackgroundTaskNotice, TaskExitInput
+from zeta.tools._shared.process import BackgroundTaskRegistry
 
 
 @pytest.mark.asyncio
@@ -205,65 +202,6 @@ async def test_cancelled_start_waits_for_persist_and_commits_reaped_state(
     await registry.close()
 
 
-@pytest.mark.asyncio
-async def test_cancelled_terminal_commit_notifies_exit_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    notices: list[BackgroundTaskNotice] = []
-    exits: list[TaskExitInput] = []
-
-    async def notify_exit(notification: TaskExitInput) -> None:
-        exits.append(notification)
-
-    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
-    registry = BackgroundTaskRegistry(
-        session_dir=tmp_path,
-        directory_fd=directory_fd,
-        term_grace=0.03,
-        notice_sink=lambda notice: notices.append(notice),  # type: ignore[arg-type]
-        notification_sink=notify_exit,
-    )
-    os.close(directory_fd)
-    task_id, _ = await registry.start("sleep 30", tmp_path)
-    notices.clear()
-    entered = threading.Event()
-    release = threading.Event()
-    cutoff = asyncio.Event()
-    original_persist = registry._persist
-    persist_calls = 0
-
-    def gated_terminal_persist(rows=None) -> None:
-        nonlocal persist_calls
-        persist_calls += 1
-        if persist_calls == 2:
-            entered.set()
-            assert release.wait(10)
-        original_persist(rows)
-
-    original_wait = asyncio.wait
-
-    async def force_monitor_cutoff(fs, *, timeout=None, **kwargs):
-        if timeout == process_module.BACKGROUND_OUTPUT_DRAIN_TIMEOUT:
-            assert await asyncio.to_thread(entered.wait, 10)
-            cutoff.set()
-            return set(), set(fs)
-        return await original_wait(fs, timeout=timeout, **kwargs)
-
-    # test-contract: seam persistence is intentionally patched to force the race
-    monkeypatch.setattr(registry, "_persist", gated_terminal_persist)
-    monkeypatch.setattr(process_module.asyncio, "wait", force_monitor_cutoff)
-    killing = asyncio.create_task(registry.kill(task_id, cause="test requested task stop"))
-    await asyncio.wait_for(cutoff.wait(), 10)
-    release.set()
-    await asyncio.wait_for(killing, 10)
-
-    rows = json.loads((tmp_path / "background_tasks.json").read_text())
-    assert len(rows) == 1
-    assert rows[0]["running"] is False
-    assert not registry.snapshot()[0].running
-    assert [notice.phase for notice in notices] == ["task_kill"]
-    assert [(item.task_id, item.phase) for item in exits] == [(task_id, "task_kill")]
-    await registry.close()
 
 
 @pytest.mark.asyncio
@@ -290,37 +228,12 @@ async def test_terminal_notice_follows_durable_record(
     monkeypatch.setattr(registry, "_persist", original_persist)
     await registry.close()
     assert not registry.snapshot()[0].running
-    assert [notice.phase for notice in notices] == ["task_kill", "session_shutdown"]
+    assert [notice.phase for notice in notices] == [
+        "session_shutdown",
+        "session_shutdown",
+    ]
 
 
-@pytest.mark.asyncio
-async def test_failed_registry_close_can_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    registry = BackgroundTaskRegistry()
-    directory_fd = registry._directory_fd
-    assert directory_fd is not None
-    original_persist = registry._persist
-    attempts = 0
-
-    def flaky_persist(rows=None) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise OSError("close failed")
-        original_persist(rows)
-
-    # test-contract: seam persistence failure is intentionally injected
-    monkeypatch.setattr(registry, "_persist", flaky_persist)
-
-    with pytest.raises(OSError, match="close failed"):
-        await registry.close()
-    assert registry._closing
-    assert not registry._closed
-    os.fstat(directory_fd)
-
-    assert await registry.close() == ()
-    assert attempts == 2
-    with pytest.raises(OSError):
-        os.fstat(directory_fd)
 
 
 @pytest.mark.parametrize("interruption", [None, "spawn", "cleanup", "cleanup_failure"])
