@@ -15,7 +15,12 @@ from rich.text import Text
 
 from ...protocol.types import StreamEvent, StreamEventType
 from ...remote.client import RemoteSessionClient
-from ...remote.discovery import RemoteSession, choose_session, split_target
+from ...remote.discovery import (
+    RemoteSession,
+    choose_session,
+    configured_hosts,
+    split_target,
+)
 from ...remote.wire import RemoteWireError
 from .. import theme
 from ..checkpoints import render_replayed_message
@@ -191,7 +196,12 @@ class RemoteViewMixin:
         try:
             if target:
                 host, prefix = split_target(target)
-                rows = await client.discover((host,))
+                configured = configured_hosts(Path(self._zeta_home or Path.home() / ".zeta"))
+                configured_target = next(
+                    (item for item in configured if item.name == host or item.host == host),
+                    None,
+                )
+                rows = await client.discover((configured_target or host,))
             else:
                 rows = await client.discover()
                 host, prefix = None, None
