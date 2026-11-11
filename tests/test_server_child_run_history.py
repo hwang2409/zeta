@@ -692,9 +692,14 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
         append_thread.start()
         try:
             during = (await request(reader, writer, 4, "child_run_history", params))[-1]
-            assert during.get("error", {}).get("data") == {
-                "code": "stale_history_snapshot"
-            }, during
+            # a validatorless first page serves the last consistent snapshot
+            # instead of -32009; the active writer's torn row is never repaired.
+            assert "result" in during, during
+            assert [
+                row["content"][0]["text"]
+                for row in during["result"]["messages"]
+                if row["role"] == "assistant"
+            ] == ["complete"]
             assert prefix_bytes and transcript.read_bytes() == prefix_bytes[0]
         finally:
             release_append.set()
