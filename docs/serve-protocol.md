@@ -189,7 +189,7 @@ feature. Observer connections receive only methods with `read` access.
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
 | `run_work_list` | `1.0` | `run_work` | `controller_read` |
 | `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
-| `child_run_list` | `1.0` | `child_runs` | `controller_read` |
+| `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
 ## common JSON-RPC shapes
@@ -758,8 +758,8 @@ the current state.
 
 ### child runs (`child_runs` feature)
 
-`child_run_list` lets the controller inspect child runs owned by the active
-session. Params are `session_id` plus optional nonnegative `offset` and `limit`
+`child_run_list` lets a controller or observer inspect child runs owned by the
+active session. Params are `session_id` plus optional nonnegative `offset` and `limit`
 from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
 Each row contains `run_id`, the top-level `session_id`, nullable
 `parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
@@ -773,8 +773,9 @@ exposed.
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
 `{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
-`-32005`. Both methods return `-32601` unless `child_runs` was negotiated, and
-observers cannot call either method. This feature emits no event; clients call
+`-32005`. Both methods return `-32601` unless `child_runs` was negotiated.
+Observers can call `child_run_list`, but `child_run_send` returns the existing
+`-32008` `observer_read_only` error. This feature emits no event; clients call
 `child_run_list` again to read changes.
 
 ### `abort`
@@ -1845,7 +1846,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 | `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
-| `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
+| `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -1863,7 +1864,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
