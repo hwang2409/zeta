@@ -191,6 +191,64 @@ async def _close_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 
 @pytest.mark.asyncio
+async def test_attach_keeps_every_stdin_byte_when_socket_reader_is_slow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.remote.bridge import attach
+
+    path = socket_path(tmp_path, "session")
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    payload = bytes(range(256)) * (8 * 1024 * 1024 // 256)
+    received = bytearray()
+    peer_done = asyncio.get_running_loop().create_future()
+
+    async def slow_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            # Small reads keep the bridge's socket writes ahead of us, so drain() pauses.
+            while chunk := await reader.read(4096):
+                received.extend(chunk)
+        finally:
+            if not peer_done.done():
+                peer_done.set_result(None)
+            writer.close()
+
+    server = await asyncio.start_unix_server(slow_peer, path)
+    os.chmod(path, 0o600)
+    read_fd, write_fd = os.pipe()
+
+    class Stdin:
+        def fileno(self) -> int:
+            return read_fd
+
+    def feed_stdin() -> None:
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(write_fd, view):]
+        finally:
+            os.close(write_fd)
+
+    monkeypatch.setattr("sys.stdin", Stdin())
+    descriptor_path = publish(tmp_path, Descriptor(str(path), "session", os.getpid()))
+    feeder = asyncio.create_task(asyncio.to_thread(feed_stdin))
+    bridge = asyncio.create_task(attach(tmp_path, "session"))
+    try:
+        await asyncio.wait([peer_done], timeout=10)
+        assert bytes(received) == payload, (
+            f"bridge dropped stdin bytes under backpressure: {len(received)} of {len(payload)}"
+        )
+        assert await asyncio.wait_for(bridge, 10) == 0
+    finally:
+        bridge.cancel()
+        await asyncio.gather(bridge, return_exceptions=True)
+        os.close(read_fd)
+        await asyncio.wait_for(asyncio.gather(feeder, return_exceptions=True), 10)
+        descriptor_path.unlink(missing_ok=True)
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_observer_host_rejects_unsafe_socket_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -282,5 +340,90 @@ async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Pat
             await client.close()
         if host is not None:
             await host.close()
+        publisher.close()
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_runs_with_notice_when_observer_host_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from io import StringIO
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from rich.console import Console
+    from rich.text import Text
+
+    from tests.support.fake_backend import FakeBackend
+    from zeta.core.store import ConversationStore
+    from zeta.remote.host import ObserverHost
+    from zeta.runtime.foreground_events import ForegroundEventPublisher
+    from zeta.runtime.loop import AgentLoop
+    from zeta.server.runtime import ServerRuntime
+    from zeta.skills import SkillCatalog
+    from zeta.tui.app import FullScreenPromptSession, TUIApp
+    from zeta.tui.composer import build_key_bindings
+
+    symlink = tmp_path / "observer-dir"
+    symlink.symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(
+        "zeta.remote.host.socket_path", lambda home, session_id: symlink / "observer.sock"
+    )
+    runtime = ServerRuntime(tmp_path, provider="codex", model="gpt-5")
+    publisher = ForegroundEventPublisher()
+    host = ObserverHost(home=tmp_path, session_id="session", runtime=runtime, publisher=publisher)
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, width=200),
+        foreground_event_publisher=publisher,
+        observer_host=host,
+    )
+    prompt_ready = asyncio.Event()
+    run_full_screen = app._run_full_screen
+
+    async def run_full_screen_after_ready(*args: object) -> None:
+        prompt_ready.set()
+        await run_full_screen(*args)
+
+    app._run_full_screen = run_full_screen_after_ready  # type: ignore[method-assign]
+    try:
+        with create_pipe_input() as pipe:
+            session = FullScreenPromptSession(
+                input=pipe,
+                output=DummyOutput(),
+                key_bindings=build_key_bindings(
+                    on_history_previous=lambda _buffer: None,
+                    on_history_next=lambda _buffer: None,
+                    on_interrupt=app.abort_active,
+                    on_exit=app.request_exit,
+                ),
+                multiline=True,
+            )
+            running = asyncio.create_task(app.run(session))
+            try:
+                ready = asyncio.ensure_future(prompt_ready.wait())
+                await asyncio.wait([running, ready], timeout=10, return_when=asyncio.FIRST_COMPLETED)
+                ready.cancel()
+                stopped = running.exception() if running.done() else None
+                assert stopped is None, f"observer host failure stopped the TUI: {stopped!r}"
+                assert prompt_ready.is_set(), "TUI did not reach its prompt after observer host failure"
+                app.request_exit()
+                await asyncio.wait_for(running, 10)
+            finally:
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+        assert app.observer_host is None
+        transcript = "\n".join(Text.from_ansi(line).plain for line in app._transcript_lines)
+        assert "remote observer unavailable:" in transcript, transcript
+    finally:
+        await app.close()
+        await host.close()
         publisher.close()
         await runtime.close()

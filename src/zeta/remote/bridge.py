@@ -184,6 +184,8 @@ async def attach(home: Path, session_id: str) -> int:
         pending: asyncio.Future[bytes] = loop.create_future()
 
         def ready() -> None:
+            # One read per pending future: re-armed only after the chunk is written.
+            loop.remove_reader(fd)
             try:
                 chunk = os.read(fd, MAX_INPUT_BYTES + 1)
             except OSError as exc:
@@ -193,9 +195,9 @@ async def attach(home: Path, session_id: str) -> int:
                 if not pending.done():
                     pending.set_result(chunk)
 
-        loop.add_reader(fd, ready)
         try:
             while True:
+                loop.add_reader(fd, ready)
                 chunk = await pending
                 if not chunk:
                     return

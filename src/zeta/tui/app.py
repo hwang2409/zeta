@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import subprocess
 import time
@@ -1010,6 +1011,19 @@ class TUIApp(
             except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
             return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
         return run()
+    async def _start_observer_host(self) -> None:
+        # The observer endpoint is optional: a failure must never stop the TUI or a fork.
+        observer_host = getattr(self, "observer_host", None)
+        if observer_host is None:
+            return
+        try:
+            await observer_host.start()
+        except Exception as exc:  # noqa: BLE001 - reported as a notice
+            self.observer_host = None
+            with contextlib.suppress(Exception):
+                await observer_host.close()
+            self._handle_background_notice(f"remote observer unavailable: {exc}")
+
     def _print_system(self, output: str) -> None:
         self._print_unit(
             Text(
@@ -1147,11 +1161,9 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
-            observer_host = getattr(self, "observer_host", None)
-            if observer_host is not None:
-                await observer_host.start()
             if not resume_ui:
                 self._begin_startup_replay()
+            await self._start_observer_host()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
