@@ -130,7 +130,7 @@ async def test_child_run_events_returns_real_join_over_both_transports(
             "accepts_follow_ups": False,
             "turns_used": 0,
             "tool_count": 0,
-            "current_step": "",
+            "current_step": "starting",
             "started_at": "2026-01-01T00:00:00+00:00",
             "finished_at": None,
             "elapsed_seconds": elapsed,
