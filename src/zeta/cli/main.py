@@ -293,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command")
     bridge_parser = commands.add_parser("__remote_bridge", help=argparse.SUPPRESS)
+    bridge_parser.set_defaults(_hidden=True)
     bridge_parser.add_argument("bridge_action", choices=("list", "attach"))
     bridge_parser.add_argument("descriptor", nargs="?")
     login_parser = commands.add_parser("login", help="log in to an OAuth provider")
