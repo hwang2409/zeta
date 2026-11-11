@@ -1144,8 +1144,6 @@ class TUIApp(
         )
         try:
             await self._submissions.refresh_pending_approvals()
-            if self.pending_approvals:
-                self._present_pending_approvals()
             if not resume_ui:
                 self._begin_startup_replay()
             observer_host = getattr(self, "observer_host", None)
