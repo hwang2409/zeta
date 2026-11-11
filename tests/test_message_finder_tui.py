@@ -58,6 +58,7 @@ def _app_for_finder(
         transcript_control=SimpleNamespace(transcript=child),
     )
     app._active_finder = transcript
+    app._finder_field = OverlayTextField("TEST_FINDER")
     app._finder_prepare_task = None
     app._finder_rank_task = None
     app._invalidate_prompt = lambda: None
