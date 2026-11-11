@@ -104,6 +104,7 @@ from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
@@ -174,6 +175,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    RemoteViewMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
     DecisionsMixin,
@@ -318,6 +320,7 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
+            include_tui_only=True,
         )
         self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
@@ -329,6 +332,7 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._init_remote_view()
         self._history_finder = HistoryFinder(
             lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
@@ -353,6 +357,7 @@ class TUIApp(
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_snapshot = (
             lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
@@ -585,7 +590,7 @@ class TUIApp(
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " › ")],
-            placeholder=[("class:placeholder", "type a message...")],
+            placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
             history=None,
             key_bindings=bindings,
             completer=ComposerCompleter(
@@ -627,12 +632,8 @@ class TUIApp(
         if self._agent_navigation.child_view_active:
             return self._agent_navigation.current_path
         return self.loop.store.session_dir
-
     def _viewed_transcript(self) -> TranscriptWidget:
-        if self._agent_navigation.child_view_active:
-            return self._agent_navigation.transcript_control.transcript
-        return self._transcript
-
+        return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
         self._prompt_history.reset_navigation()
         finder = self._active_finder
@@ -1064,7 +1065,7 @@ class TUIApp(
             value = await session.prompt_async(
                 [("class:prompt", " › ")],
                 bottom_toolbar=lambda: app._status_toolbar(),
-                placeholder=[("class:placeholder", "type a message...")],
+                placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
                 pre_run=insert_pending_tokens,
             )
         except EOFError:
