@@ -1001,7 +1001,8 @@ class ConnectionRegistry(ReplayOutput):
                 item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0)}
             row = None
             if item is not None:
-                row = project_child_run_row(item, session_id=target[0], parent_run_id=params["run_id"].rpartition(":")[0] or None, accepts_follow_ups=False)
+                _, parent_run_id = parse_child_run_id(target[0], params["run_id"])
+                row = project_child_run_row(item, session_id=target[0], parent_run_id=parent_run_id, accepts_follow_ups=False)
             if row is None:
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result, row
