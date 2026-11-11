@@ -162,6 +162,12 @@ class HistoryIndex:
         return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
+    def _value_ordered(value: object) -> str:
+        # Approval-resolution data is read back and reserialized for a
+        # byte-identical transcript row, so its key order must be preserved.
+        return json.dumps(value, separators=(",", ":"))
+
+    @staticmethod
     def _row(entry: object) -> tuple[int, str, str | None, str, str, str]:
         if isinstance(entry, Mapping):
             value = entry
@@ -313,7 +319,7 @@ class HistoryIndex:
                     if active and entry_type == "approval_resolution":
                         connection.execute(
                             "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
-                            (data["request_id"], data["decision"], self._value(data)),
+                            (data["request_id"], data["decision"], self._value_ordered(data)),
                         )
                     if active and entry_type == "client_delivery" and isinstance(data.get("accepted_message"), dict):
                         connection.execute(
@@ -412,7 +418,7 @@ class HistoryIndex:
             if entry.type == "approval_resolution":
                 connection.execute(
                     "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
-                    (data["request_id"], data["decision"], self._value(data)),
+                    (data["request_id"], data["decision"], self._value_ordered(data)),
                 )
             accepted = data.get("accepted_message")
             if entry.type == "client_delivery" and isinstance(accepted, dict):

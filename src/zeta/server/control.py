@@ -871,7 +871,7 @@ class ServeControl:
     ) -> None:
         if self.server.connections is None:
             return
-        self._end_stale_approvals(session_id)
+        await self._end_stale_approvals(session_id)
         await self._notify(
             event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
             session_id,
@@ -906,7 +906,7 @@ class ServeControl:
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
-            self._end_stale_approvals(session_id)
+            await self._end_stale_approvals(session_id)
         if kind is StreamEventType.MESSAGE_UPDATE:
             delta = event.delta
             stream_kind = "assistant"
@@ -1116,8 +1116,8 @@ class ServeControl:
             ExternalEnd(key, session_id, data, suppress_write_errors)
         )
 
-    def _end_stale_approvals(self, session_id: str | None) -> None:
-        self._approvals._end_stale_approvals(session_id)
+    async def _end_stale_approvals(self, session_id: str | None) -> None:
+        await self._approvals._end_stale_approvals(session_id)
 
     async def _terminate_pending_approvals(
         self,

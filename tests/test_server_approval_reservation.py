@@ -421,7 +421,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
                 server.control.resolve_approval("approve", wire_id)
             )
             await _wait_thread_gate(gate)
-            assert policy.cleanup_delegated("child") is None
+            assert await policy.cleanup_delegated("child") is None
             gate.release.set()
             result = await asyncio.wait_for(approve, 10)
             assert result["decision"] == "approve"
@@ -722,7 +722,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
 
         # test-contract: seam records the settlement-owned durable write
         monkeypatch.setattr(store, "resolve_approval_async", record_writer)
-        assert abort() is None
+        assert await abort() is None
         await asyncio.sleep(0)
         await server.control.wait_for_approval_settlement()
 
@@ -1575,7 +1575,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         policy.register_delegated(late_request, late, child_instance_id="late-child")
         await server.control.wait_for_approval_settlement()
         assert (await late.approval_resolution(late_call.id))["decision"] == "abort"
-        policy.cleanup_delegated("late-child")
+        await policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
         await close_serve(server, writer)

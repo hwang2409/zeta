@@ -529,10 +529,7 @@ class ApprovalLifecycle:
         after_seq = 0
         while True:
             page = await foreground.pending_approval_page(after_seq)
-            pending.extend(
-                (request_id, ToolCall.from_dict(dict(tool_call)))
-                for request_id, tool_call in page.items
-            )
+            pending.extend((k, ToolCall.from_dict(dict(v))) for k, v in page.items)
             if page.next_seq is None:
                 break
             after_seq = page.next_seq
@@ -1223,6 +1220,26 @@ class ApprovalLifecycle:
         )
         if resolution is not None:
             await asyncio.shield(self._finish_record(record, resolution))
+
+    async def _end_stale_approvals(self, session_id: str | None) -> None:
+        del session_id
+        for stale in tuple(self._state.records.values()):
+            if stale.phase not in {"pending", "settling"} or stale.live_end is not None:
+                continue
+            data = await stale.target.store.approval_resolution(
+                stale.target.store_request_id
+            )
+            record = self._state.records.get(stale.target.key)
+            if data is None or record is None or record.token != stale.token:
+                continue
+            if record.live_end is not None:
+                continue
+            owner = record.publication_owner
+            if owner is not None and owner.done():
+                continue
+            task = self._start_settlement(record, self._finish_record(record, data))
+            if owner is None:
+                self._change(record, publication_owner=task)
 
     async def _terminate_approval_records(
         self,
