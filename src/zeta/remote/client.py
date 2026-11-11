@@ -88,7 +88,7 @@ class RemoteSessionClient:
         def admit(item: TransportItem) -> None:
             if done.done(): return
             if item.stream == "exit": done.set_result(item.data)
-            elif item.stream == "stderr": stderr.extend(item.data[:MAX_DIAGNOSTIC_BYTES])
+            elif item.stream == "stderr": stderr.extend(item.data[:MAX_DIAGNOSTIC_BYTES - len(stderr)])
             elif len(stdout) + len(item.data) > MAX_LIST_BYTES: done.set_exception(RemoteWireError("remote discovery is too large"))
             else: stdout.extend(item.data)
         transport = self._transport(target, lambda item: loop.call_soon_threadsafe(admit, item))
