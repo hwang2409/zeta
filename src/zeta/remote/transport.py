@@ -24,6 +24,9 @@ def remote_bridge_command(mode: str, session_id: str | None = None, remote_home:
         args.append(session_id)
     bridge_args = " ".join(shlex.quote(arg) for arg in args)
     home = shlex.quote(remote_home)
+    if remote_home == "~" or remote_home.startswith("~/"):
+        # quoting "~" stops the remote shell from expanding it, so spell it as "$HOME".
+        home = '"$HOME"' + shlex.quote(remote_home[1:])
     return (f'if command -v zeta >/dev/null 2>&1; then ZETA_HOME={home} exec zeta {bridge_args}; '
             f'elif [ -x "$HOME/.local/bin/zeta" ]; then ZETA_HOME={home} exec "$HOME/.local/bin/zeta" {bridge_args}; '
             "else exit 127; fi")

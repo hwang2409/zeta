@@ -150,15 +150,18 @@ class RemoteViewMixin:
         picker = self._remote_picker
         self.remote_picker_cancel()
         if picker is not None:
-            asyncio.create_task(self._attach_remote(picker.selected))
+            asyncio.create_task(self._open_remote(self._remote_client(), picker.selected))
 
-    async def _attach_remote(self, chosen: RemoteSession) -> None:
-        await self._remote_client().attach(chosen.host, chosen)
+    async def _open_remote(self, client: RemoteSessionClient, chosen: RemoteSession) -> None:
+        if self._remote_view is not None:
+            # a second attach must stop the old consumer and restore the saved composer first.
+            await self.slash_detach("")
+        await client.attach(chosen.host, chosen)
         self._save_remote_composer()
         state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
         self._remote_view = state
         self._agent_navigation.show_external_view(state.container, state.transcript)
-        self._remote_event_task = asyncio.create_task(self._consume_remote_events(state, self._remote_client()))
+        self._remote_event_task = asyncio.create_task(self._consume_remote_events(state, client))
         self._invalidate_prompt()
 
     def _remote_client(self) -> RemoteSessionClient:
@@ -216,15 +219,9 @@ class RemoteViewMixin:
                 self._remote_picker_unit = self._presenter.print_unit(self._remote_picker.render())
                 self._invalidate_prompt()
                 return ""
-            await client.attach(chosen.host, chosen)
+            await self._open_remote(client, chosen)
         except (RemoteWireError, ValueError) as exc:
             return str(exc)
-        self._save_remote_composer()
-        state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
-        self._remote_view = state
-        self._agent_navigation.show_external_view(state.container, state.transcript)
-        self._remote_event_task = asyncio.create_task(self._consume_remote_events(state, client))
-        self._invalidate_prompt()
         return ""
 
     async def _consume_remote_events(self, state: RemoteViewState, client: RemoteSessionClient) -> None:
