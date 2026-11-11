@@ -15,6 +15,8 @@ from ..core.approval import (
     PermissionSnapshot,
     SessionGrantChange,
     SessionGrantNotFound,
+)
+from ..core.permission_grants import (
     permission_snapshot,
     revoke_session_grants,
     session_grant_change,
