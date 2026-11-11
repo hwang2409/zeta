@@ -32,6 +32,7 @@ class ProjectInboxNotificationMixin:
 
     _inbox_scanner: ProjectInboxScanner | None = None
     _project_inbox_publication_event: asyncio.Event | None = None
+    _project_inbox_poll_done: asyncio.Event | None = None
     _project_inbox_owner_loop: asyncio.AbstractEventLoop | None = None
     _project_inbox_health_state: str = "healthy"
     tool_registry: Any
@@ -48,6 +49,7 @@ class ProjectInboxNotificationMixin:
         sent_outcome = self._inbox_scanner._activation_sent_outcome
         self._project_inbox_owner_loop = asyncio.get_running_loop()
         self._project_inbox_publication_event = asyncio.Event()
+        self._project_inbox_poll_done = asyncio.Event()
         self._project_inbox_poll_task = asyncio.create_task(
             self._project_inbox_supervisor()
         )
@@ -119,6 +121,10 @@ class ProjectInboxNotificationMixin:
                 raise
             except Exception as exc:  # noqa: BLE001 - supervisor must survive any sink
                 self._set_project_inbox_health("degraded", str(exc))
+            finally:
+                done = self._project_inbox_poll_done
+                if done is not None:
+                    done.set()
 
     async def _poll_project_inbox_once(self) -> None:
         scanner = self._inbox_scanner
@@ -215,9 +221,16 @@ class ProjectInboxNotificationMixin:
             reported = record.get("reported", [])
             if status == "done" and record.get("reply_id") is not None:
                 if self._inbox_scanner is not None:
-                    await asyncio.to_thread(
-                        self._inbox_scanner.mark_reported, iter((key,))
+                    worker = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._inbox_scanner.mark_reported, iter((key,))
+                        )
                     )
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(worker)
+                        raise
                 continue
             if isinstance(reported, list) and status not in reported:
                 pending[key] = record
@@ -291,6 +304,25 @@ class ProjectInboxNotificationMixin:
             )
         except (InboxError, OSError, ProjectRegistryError) as exc:
             self._set_project_inbox_health("degraded", str(exc))
+
+    async def _await_project_inbox_turn_start(self) -> None:
+        """Turn start only: signal a poll and wait briefly for it to finish.
+
+        The first model request then sees inbox state that was already on
+        disk (a cross-process send, a sent-status change). It never raises
+        into the turn: on timeout the turn goes on and the message arrives at
+        the next step boundary.
+        """
+        done = getattr(self, "_project_inbox_poll_done", None)
+        if done is None:
+            await self._check_project_inbox()
+            return
+        done.clear()
+        await self._check_project_inbox()
+        try:
+            await asyncio.wait_for(done.wait(), 2)
+        except TimeoutError:
+            pass
 
 
 def _bounded_text(value: object, limit: int) -> str:

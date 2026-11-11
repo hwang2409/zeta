@@ -369,6 +369,10 @@ async def test_publication_callback_only_signals_watcher_on_event_loop() -> None
         def __init__(self) -> None:
             self._project_inbox_owner_loop = asyncio.get_running_loop()
             self._project_inbox_publication_event = asyncio.Event()
+            # mid-turn, so the 2-second idle tick is suppressed and only the
+            # threadsafe signal drives a poll; the test then fails if the
+            # callback stops signalling the watcher.
+            self._turn_active = True
             self.calls: list[int] = []
             self.started = asyncio.Event()
             self.release = asyncio.Event()

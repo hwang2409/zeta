@@ -1016,7 +1016,9 @@ with the matching known kind. On protocol 1.2, `project_inbox_health` carries
 the project inbox poller state; its data has `kind` (`project_inbox_health`),
 `state` (`healthy` or `degraded`), `session_id`, and an optional `reason`
 (at most 200 characters, present only when degraded). It is live only: it is
-not persisted and is never replayed. Below 1.2 it rides `sub_agent_receipt`. `child_hold` is sent once per hold when a
+not persisted and is never replayed. Below 1.2 it rides `sub_agent_receipt`.
+
+`child_hold` is sent once per hold when a
 background child waits more than 15 minutes on a provider rate limit or a
 subscription limit; its data has `reason` (`rate_limit` or
 `subscription_limit`), `until` (ISO 8601), `provider`, `account` (string or

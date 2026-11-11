@@ -672,7 +672,7 @@ class AgentLoop(
         await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
-        await self._check_project_inbox()
+        await self._await_project_inbox_turn_start()
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None and not notification_turn:

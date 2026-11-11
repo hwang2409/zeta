@@ -53,6 +53,10 @@ def _install_poll_watcher(app) -> tuple[list[int], asyncio.Event]:
 
     # test-contract: seam count the supervisor's wake-driven inbox poll
     app.loop._poll_project_inbox_once = record_poll
+    # a real owner is mid-turn when the publication arrives, so the 2-second
+    # idle tick is suppressed and only the wake polls; the count then fails if
+    # the wake is removed and never flakes from a stray tick.
+    app.loop._turn_active = True
     return wakes, wake_event
 
 

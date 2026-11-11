@@ -21,9 +21,13 @@ from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 
 
-def _start_publication_watcher(loop) -> asyncio.Task[None]:
+def _start_publication_watcher(loop, *, turn_active: bool = False) -> asyncio.Task[None]:
     loop._project_inbox_owner_loop = asyncio.get_running_loop()
     loop._project_inbox_publication_event = asyncio.Event()
+    # test-contract: a real owner is mid-turn when an in-process publication
+    # arrives, so the supervisor's 2-second idle tick is suppressed; only the
+    # wake delivers. this lets the wake tests fail if the wake is removed.
+    loop._turn_active = turn_active
     return asyncio.create_task(loop._project_inbox_supervisor())
 
 
@@ -270,7 +274,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
 
         # test-contract: seam seal a second journal immediately before serve dismiss locks
         monkeypatch.setattr(AttentionReplies, "dismiss", dismiss_after_concurrent_seal)
-        watcher = _start_publication_watcher(loop)
+        watcher = _start_publication_watcher(loop, turn_active=True)
         dismissed = (
             await _request(
                 reader,
@@ -462,7 +466,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
 
         # test-contract: seam fail after recovery publishes but before the action completes
         monkeypatch.setattr(AttentionReplies, "_record", fail_target)
-        watcher = _start_publication_watcher(loop)
+        watcher = _start_publication_watcher(loop, turn_active=True)
         error = (
             await _request(
                 reader,
@@ -528,7 +532,7 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
 
         # test-contract: seam hold the real serve worker before durable publication
         monkeypatch.setattr(ProjectInbox, "send", blocked_send)
-        watcher = _start_publication_watcher(loop)
+        watcher = _start_publication_watcher(loop, turn_active=True)
         adapter = ServerSlashSession(server.runtime)
         replies = adapter._attention_replies(session_id)
         task = asyncio.create_task(

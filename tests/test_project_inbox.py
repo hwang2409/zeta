@@ -42,6 +42,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.server.connections import ConnectionRegistry
+from zeta.server.control import NotificationPresentation
 from zeta.server.event_contract import notification_wire_event
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.skills import SkillCatalog
@@ -2334,8 +2335,10 @@ async def test_p03a_runtime_health_event_reaches_tui_and_serve(tmp_path, monkeyp
     assert "project inbox degraded" in str(rendered)
     assert rendered.style is theme.WARNING
 
-    # the serve wire goes through real connection admission: a 1.2 controller
-    # receives the event only because EVENT_FEATURES names it (NO_FEATURE).
+    # the serve wire goes through the real notification presentation: the
+    # runtime event's own kind drives notification_wire_event, and a 1.2
+    # controller receives the frame only because EVENT_FEATURES names the
+    # descriptor. this is the runtime-event -> wire-event -> admission chain.
     class _HealthController:
         def __init__(self) -> None:
             self.codec = FrameCodec()
@@ -2355,19 +2358,20 @@ async def test_p03a_runtime_health_event_reaches_tui_and_serve(tmp_path, monkeyp
     connection = _HealthController()
     connections.register(connection)
     connections.negotiate_role(connection, "controller", "1.2", frozenset())
+
+    async def _send(event, session_id, **fields):
+        return await connections.publish_controller(event, session_id, **fields)
+
+    presentation = NotificationPresentation()
     try:
         hello = connection.codec.notification(
             EventDescriptor.ASSISTANT_DELTA, health.data["session_id"], delta="hello"
         )
         assert await connections.send(connection, hello)
         connection.frames.clear()
-        admitted = await connections.publish_controller(
-            EventDescriptor.PROJECT_INBOX_HEALTH,
-            health.data["session_id"],
-            data=health.data,
+        await presentation.publish(
+            health.data["session_id"], health.data, "1.2", _send
         )
-        # without the EVENT_FEATURES entry, admission fails closed and ships nothing.
-        assert admitted
         params = [json.loads(frame)["params"] for frame in connection.frames]
         health_params = [p for p in params if p.get("event") == "project_inbox_health"]
         assert len(health_params) == 1
