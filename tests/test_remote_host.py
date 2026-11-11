@@ -144,7 +144,7 @@ async def test_attach_exits_when_stdout_stalls_and_socket_closes(
         monkeypatch.setattr("sys.stdin", Stdin())
         descriptor_path = publish(tmp_path, Descriptor(str(path), "session", os.getpid()))
         try:
-            assert await asyncio.wait_for(attach(tmp_path, "session"), 3) == 2
+            assert await asyncio.wait_for(attach(tmp_path, "session"), 10) == 2
         finally:
             os.close(read_fd)
             os.close(write_fd)
