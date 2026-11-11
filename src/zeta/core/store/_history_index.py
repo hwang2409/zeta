@@ -757,7 +757,7 @@ class HistoryIndex:
             self._closed = True
 
 
-def _rebuild_history_index(store: ConversationStore) -> None:
+def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
     if store._read_only:
         observer = type(store)(
             store.root_dir,
@@ -769,9 +769,11 @@ def _rebuild_history_index(store: ConversationStore) -> None:
         try:
             with observer._append_lock(observer=True):
                 facts = observer._history_index_facts()
-                if store._history_index.catch_up_validated(facts, observer._entries):
-                    return
-                observer._sync_history_index(observer._entries)
+                if not store._history_index.catch_up_validated(
+                    facts, observer._entries
+                ):
+                    observer._sync_history_index(observer._entries)
+                return facts
         finally:
             observer.close()
         return
@@ -779,9 +781,9 @@ def _rebuild_history_index(store: ConversationStore) -> None:
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
-            if store._history_index.catch_up_validated(facts, store._entries):
-                return
-            store._sync_history_index(store._entries)
+            if not store._history_index.catch_up_validated(facts, store._entries):
+                store._sync_history_index(store._entries)
+            return facts
     finally:
         writer.close()
 
@@ -844,23 +846,32 @@ def _read_stable_approval(store: ConversationStore, query: object) -> object:
     index = store._history_index
     if index is None:
         raise HistoryIndexUnavailableError("history index is unavailable")
+    rebuilt_facts: dict[str, object] | None = None
+    physical_keys = ("st_dev", "st_ino", "byte_boundary")
     for attempt in range(_HISTORY_PAGE_ATTEMPTS):
         if not index.available:
-            _rebuild_history_index(store)
-        facts = store._history_index_facts()
+            rebuilt_facts = _rebuild_history_index(store)
+        facts = rebuilt_facts or store._history_index_facts()
+        rebuilt_facts = None
         try:
             result = query(index, facts)
         except (StaleHistorySnapshot, HistoryIndexUnavailableError) as exc:
-            if store._history_index_facts() != facts:
+            current = store._history_index_facts()
+            if any(current[key] != facts[key] for key in physical_keys):
                 raise StaleHistorySnapshot from exc
-            if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+            if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
                 raise
             index._mark_unavailable()
             continue
-        if store._history_index_facts() == facts:
+        current = store._history_index_facts()
+        if current == facts or (
+            store._read_only
+            and all(current[key] == facts[key] for key in physical_keys)
+        ):
             return result
         if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
             raise StaleHistorySnapshot
+        index._mark_unavailable()
     raise HistoryIndexUnavailableError("history index is unavailable")
 
 
