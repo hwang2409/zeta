@@ -16,7 +16,10 @@ from ..core.session import env_home
 from ..core.slash import effective_budget_for_model
 from ..models.catalog import provider_for_model
 from ..path_identity import same_physical_path
-from ..project_context.projection import ProjectContextProjection
+from ..project_context.projection import (
+    ProjectContextProjection,
+    compose_with_stable_projection,
+)
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -118,27 +121,41 @@ def _load_child_project_context(
     registry = loop.project_registry
     if projection is None and registry is not None:
         projection = registry.project_context_projection(loop.root_project_id)
-    session_project = projection.session_project if projection is not None else None
-    cwd_project = (
-        resolve_project_context_from_projects(discovery, projection.projects)
-        if projection is not None
-        else None
+    def compose(
+        current_projection: ProjectContextProjection | None,
+    ) -> ProjectContext:
+        session_project = (
+            current_projection.session_project
+            if current_projection is not None
+            else None
+        )
+        cwd_project = (
+            resolve_project_context_from_projects(
+                discovery, current_projection.projects
+            )
+            if current_projection is not None
+            else None
+        )
+        return load_project_context(
+            cwd=child_cwd,
+            repo_root=discovery.primary_root or discovery.cwd,
+            zeta_home=zeta_home,
+            catalog=(
+                child_registry.skill_catalog
+                if child_registry is not None
+                else loop.tool_registry.skill_catalog
+            ),
+            session_project=session_project,
+            cwd_project=cwd_project,
+            inbox_enabled=False,
+            registry=loop.tool_registry.project_registry_state,
+            project_projection=current_projection,
+        )
+
+    context, _ = compose_with_stable_projection(
+        registry, loop.root_project_id, projection, compose
     )
-    return load_project_context(
-        cwd=child_cwd,
-        repo_root=discovery.primary_root or discovery.cwd,
-        zeta_home=zeta_home,
-        catalog=(
-            child_registry.skill_catalog
-            if child_registry is not None
-            else loop.tool_registry.skill_catalog
-        ),
-        session_project=session_project,
-        cwd_project=cwd_project,
-        inbox_enabled=False,
-        registry=loop.tool_registry.project_registry_state,
-        project_projection=projection,
-    )
+    return context
 
 
 def _child_base_system_prompt(
@@ -164,6 +181,7 @@ def _child_base_system_prompt(
         else RuntimePrompt(loop.context_assembler.system_prompt, {})
     )
     prompt = runtime_prompt.system_prompt
+    health = projection.health if projection is not None else None
     if (
         projection is not None
         and isinstance(prompt, str)
@@ -175,6 +193,7 @@ def _child_base_system_prompt(
         projected_prompt = RuntimePrompt(
             projected.system_prompt, projected.prompt_components
         )
+        health = projected.health
         replacement = (
             owned_fragment(projected_prompt, "project_memory")
             if "project_memory" in projected.prompt_components
@@ -197,7 +216,7 @@ def _child_base_system_prompt(
         (),
         prompt_recipe="custom",
         prompt_components=components,
-        health=projection.health if projection is not None else None,
+        health=health,
     )
 
 

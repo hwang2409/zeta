@@ -32,6 +32,7 @@ from ..core.slash import (
     resolve_session_budget,
 )
 from ..models.catalog import REMOVED_PROVIDER_ERROR
+from ..project_context.projection import compose_with_stable_projection
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -421,16 +422,21 @@ class ServerRuntime:
         )
         if session_project is None and cwd_project is not None:
             session_project = cwd_project
-        context = load_project_context(
-            cwd=session_cwd,
-            repo_root=repo_root,
-            zeta_home=self.home,
-            catalog=skill_catalog,
-            session_project=session_project,
-            cwd_project=cwd_project,
-            inbox_enabled=config.inbox_enabled,
-            registry=self.manager.project_registry_state,
-            project_projection=projection,
+        context, projection = compose_with_stable_projection(
+            registry,
+            session_project.project_id if session_project is not None else None,
+            projection,
+            lambda current_projection: load_project_context(
+                cwd=session_cwd,
+                repo_root=repo_root,
+                zeta_home=self.home,
+                catalog=skill_catalog,
+                session_project=session_project,
+                cwd_project=cwd_project,
+                inbox_enabled=config.inbox_enabled,
+                registry=self.manager.project_registry_state,
+                project_projection=current_projection,
+            ),
         )
         return (
             config,
