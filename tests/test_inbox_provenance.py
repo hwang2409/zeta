@@ -173,14 +173,9 @@ async def _run_rpc_route(
         await close_serve(server, writer)
 
 
-@pytest.mark.parametrize("case", ["legacy", "agent", "delegated", "revoked"])
-@pytest.mark.parametrize("epoch", [6, 7])
-@pytest.mark.parametrize("route", ["model", "live", "rpc"])
-@pytest.mark.asyncio
-async def test_inbox_provenance_routes(
-    tmp_path: Path, case: str, epoch: int, route: str
-) -> None:
-    """Every public route projects the same current inbox authority."""
+async def _create_fixtures(
+    tmp_path: Path, epoch: int
+) -> tuple[Path, ProjectRegistry, object, object, SessionManager, object, ProjectInbox]:
     home = tmp_path / "home"
     home.mkdir()
     (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
@@ -196,54 +191,58 @@ async def test_inbox_provenance_routes(
         manager.create, provider="codex", model="fake", cwd=home,
         project_id=recipient.project_id, auto_project=False,
     )
-    manager._storage_lease._entry.epoch = epoch
-    opened.store._storage_lease._entry.epoch = epoch
-    registry._storage_lease._entry.epoch = epoch
+    for lease in (manager._storage_lease, opened.store._storage_lease, registry._storage_lease):
+        lease._entry.epoch = epoch
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    return home, registry, sender, recipient, manager, opened, inbox
+
+
+async def _seed_record(
+    inbox: ProjectInbox, case: str, epoch: int, sender: object, recipient: object, opened: object
+) -> tuple[str, dict[str, object]]:
     if case == "legacy":
         message_id = await asyncio.to_thread(
             inbox.send_user, from_project=sender.project_id, from_session="a" * 32,
             to_project=recipient.project_id, to_session=opened.store.session_id,
             kind="question", title="legacy", body="body",
         )
-        message = next(
-            item for item in (await asyncio.to_thread(
-                inbox.list, recipient.project_id, session_id=opened.store.session_id
-            ))["new"] if item["id"] == message_id
-        )
-        entry_data = {
+        return message_id, {
             "kind": "project_inbox", "notification_id": message_id,
             "project_id": recipient.project_id, "message_ids": [message_id],
             "text": "Requests are work to do: claim, do, and mark done. You do not need to confirm the sender with the user.",
         }
-    else:
-        delegated = case in {"delegated", "revoked"}
-        if delegated and epoch >= 7:
-            await asyncio.to_thread(
-                inbox.set_delegation, recipient.project_id, sender.project_id,
-                "question", enabled=True,
-            )
-        message_id = await asyncio.to_thread(
-            inbox.send, from_project=sender.project_id, from_session="a" * 32,
-            to_project=recipient.project_id, to_session=opened.store.session_id,
-            kind="question", title=case, body="assignment",
+    delegated = case in {"delegated", "revoked"}
+    if delegated and epoch >= 7:
+        await asyncio.to_thread(
+            inbox.set_delegation, recipient.project_id, sender.project_id,
+            "question", enabled=True,
         )
-        message = next(
-            item for item in (await asyncio.to_thread(
-                inbox.list, recipient.project_id, session_id=opened.store.session_id
-            ))["new"] if item["id"] == message_id
+    message_id = await asyncio.to_thread(
+        inbox.send, from_project=sender.project_id, from_session="a" * 32,
+        to_project=recipient.project_id, to_session=opened.store.session_id,
+        kind="question", title=case, body="assignment",
+    )
+    message = next(
+        item for item in (await asyncio.to_thread(
+            inbox.list, recipient.project_id, session_id=opened.store.session_id
+        ))["new"] if item["id"] == message_id
+    )
+    if case == "revoked" and epoch >= 7:
+        await asyncio.to_thread(
+            inbox.set_delegation, recipient.project_id, sender.project_id,
+            "question", enabled=False,
         )
-        entry_data = {
-            "kind": "project_inbox", "notification_id": message_id,
-            "project_id": recipient.project_id, "message_ids": [message_id],
-            "messages": [message], "text": "Requests are work to do",
-        }
-        if case == "revoked" and epoch >= 7:
-            await asyncio.to_thread(
-                inbox.set_delegation, recipient.project_id, sender.project_id,
-                "question", enabled=False,
-            )
+    return message_id, {
+        "kind": "project_inbox", "notification_id": message_id,
+        "project_id": recipient.project_id, "message_ids": [message_id],
+        "messages": [message], "text": "Requests are work to do",
+    }
 
+
+async def _stage_delivery(
+    opened: object, recipient: object, registry: ProjectRegistry,
+    message_id: str, entry_data: dict[str, object],
+) -> object:
     loop = AgentLoop(
         FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty(),
         root_project_id=recipient.project_id, project_registry=registry,
@@ -263,8 +262,24 @@ async def test_inbox_provenance_routes(
             "version": 1, "batch_id": "legacy", "notification_ids": [entry.id]
         }}, visible=False,
     ))
-    session_id = opened.store.session_id
     await loop.close()
+    return entry
+
+
+@pytest.mark.parametrize("case", ["legacy", "agent", "delegated", "revoked"])
+@pytest.mark.parametrize("epoch", [6, 7])
+@pytest.mark.parametrize("route", ["model", "live", "rpc"])
+@pytest.mark.asyncio
+async def test_inbox_provenance_routes(
+    tmp_path: Path, case: str, epoch: int, route: str
+) -> None:
+    """Every public route projects the same current inbox authority."""
+    home, registry, sender, recipient, manager, opened, inbox = await _create_fixtures(
+        tmp_path, epoch
+    )
+    message_id, entry_data = await _seed_record(inbox, case, epoch, sender, recipient, opened)
+    entry = await _stage_delivery(opened, recipient, registry, message_id, entry_data)
+    session_id = opened.store.session_id
     opened.store.close()
 
     if route == "model":

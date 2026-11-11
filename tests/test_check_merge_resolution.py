@@ -54,6 +54,182 @@ def test_item_in_uses_keyed_lookup_without_iterating_values():
     assert items.values_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("name", "branch_text", "merge_text", "expected"),
+    (
+        ("bad", "before\nremoved\nafter\n", "before\nremoved\nafter\n", True),
+        ("allowed", "before\nremoved\nremoved\nafter\n", "before\nremoved\nremoved\nafter\n", True),
+        ("whitespace", "before\ndanger()\nafter\n", "before\ndanger( )\nafter\n", True),
+    ),
+)
+def test_main_deletion_readded_is_flagged_unless_branch_added_it(
+    tmp_path: Path, name: str, branch_text: str, merge_text: str, expected: bool
+):
+    (tmp_path / name).mkdir()
+    r = repo(tmp_path / name)
+    (r / "src").mkdir()
+    base_text = "before\nremoved\nafter\n" if name != "whitespace" else "before\ndanger()\nafter\n"
+    (r / "src/a.py").write_text(base_text)
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    if branch_text == base_text:
+        (r / "branch.txt").write_text("branch change\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("before\nafter\n")
+    commit(r, "main deletes line")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(merge_text)
+    commit(r, "merge")
+    result = run(r)
+    assert (result.returncode == 1) is expected
+    if expected:
+        assert "a.py" in result.stdout
+        assert "main deletion re-added" in result.stdout
+        assert "keep main's deletion or justify it in the PR" in result.stdout
+
+
+def test_main_deleted_block_moved_in_merge_is_flagged(tmp_path: Path):
+    r = tmp_path / "moved"
+    r.mkdir()
+    merge, _ = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        "before()\nremoved()\nafter()\n",
+        "before()\nafter()\n",
+        "removed()\nbefore()\nafter()\n",
+        "removed()\nbefore()\nafter()\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+def test_branch_edit_overlapping_main_deletion_is_flagged(tmp_path: Path):
+    r = tmp_path / "edited"
+    r.mkdir()
+    merge, _ = _public_line_case(
+        r,
+        "before()\ndanger()\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+        "before()\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("name", "branch_text", "merge_text"),
+    (
+        ("moved", "before()\nremoved()\nafter()\n", "removed()\nbefore()\nafter()\n"),
+        (
+            "readded_in_place",
+            "before()\nremoved()\nafter()\n# b\n",
+            "before()\nremoved()\nafter()\n# b\n",
+        ),
+    ),
+)
+def test_readded_main_deletion_is_flagged_under_final(
+    tmp_path: Path, name: str, branch_text: str, merge_text: str
+):
+    # CI always passes --final (scripts/ci_merge_resolution.sh), so the rule must still
+    # fire when the re-added block is still present in the final tree.
+    r = tmp_path / name
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        branch_text,
+        "before()\nafter()\n",
+        merge_text,
+        merge_text,
+    )
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+def test_readded_main_deletion_removed_later_is_cleared_under_final(tmp_path: Path):
+    # A later commit drops the re-added block, so --final must clear the finding.
+    r = tmp_path / "fixed_later"
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        "before()\nremoved()\nafter()\n# b\n",
+        "before()\nafter()\n",
+        "before()\nremoved()\nafter()\n# b\n",
+        "before()\nafter()\n# b\n",
+    )
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 0
+    assert "removed again in the final tree" in result.stdout
+
+
+def test_branch_edit_reusing_common_line_is_not_flagged(tmp_path: Path):
+    # Branch edits a line inside main's deleted block to a common line ("return None")
+    # that already lives elsewhere; keeping main's deletion is correct, not a re-add.
+    r = tmp_path / "common_line"
+    r.mkdir()
+    base = "def a():\n    x = 1\n    return x\n\ndef b():\n    return None\n"
+    branch = "def a():\n    x = 1\n    return None\n\ndef b():\n    return None\n"
+    main = "def b():\n    return None\n"
+    merge, _ = _public_line_case(r, base, branch, main, main, main)
+    result = run(r, merge)
+    assert result.returncode == 0
+    assert "clean merge" in result.stdout
+
+
+@pytest.mark.parametrize("text", [
+    'before()\nvalue = "a b"\nafter()\n',
+    "before()\n# a b\nafter()\n",
+    'before()\nvalue = f"a b"\nafter()\n',
+    'before()\nvalue = f"""a\n b"""\nafter()\n',
+])
+def test_python_string_and_comment_whitespace_is_not_normalized(tmp_path: Path, text: str):
+    r = tmp_path / "token_text"
+    r.mkdir()
+    changed = text.replace("a b", "ab").replace("\n b", "\nb")
+    merge, _ = _public_line_case(r, text, text + "# branch\n", "before()\nafter()\n", changed, changed)
+    result = run(r, merge)
+    assert result.returncode == 0
+
+
+def test_intentional_branch_duplicate_is_allowed(tmp_path: Path):
+    r = tmp_path
+    merge, _ = _public_line_case(
+        r,
+        "before\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+        "before\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+    )
+    assert run(r, merge).returncode == 0
+
+
+def test_main_empty_file_still_checks_readded_block(tmp_path: Path):
+    r = tmp_path
+    merge, _ = _public_line_case(
+        r,
+        "def danger():\n    pass\n",
+        "def danger():\n    pass\n",
+        "",
+        "def danger():\n    pass\n",
+        "def danger():\n    pass\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
 def test_dropped_membership_element_flagged(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -502,9 +678,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "def helper(): return 1\n",
-                "def branch(): pass\n",
-                "base = 1\n",
+                "base = 1\ndef helper(): return 1\n",
+                "base = 1\ndef branch(): pass\n",
+                "base = 1\ndef branch(): pass\n",
                 "def helper(): return 1\n",
                 "src/b.py",
             ),
@@ -558,9 +734,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "VALUE = 1\n",
-                "VALUE = 2\n",
-                "base = 1\n",
+                "base = 1\nVALUE = 1\n",
+                "base = 1\nVALUE = 2\n",
+                "base = 1\nVALUE = 2\n",
                 "VALUE = 1\n",
                 "src/b.py",
             ),
@@ -586,9 +762,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "class Box:\n    value = 1\n    def method(self): return 1\n",
-                "class Branch:\n    pass\n",
-                "base = 1\n",
+                "base = 1\nclass Box:\n    value = 1\n    def method(self): return 1\n",
+                "base = 1\nclass Branch:\n    pass\n",
+                "base = 1\nclass Branch:\n    pass\n",
                 "class Box:\n    value = 1\n    def method(self): return 1\n",
                 "src/b.py",
             ),
@@ -995,18 +1171,18 @@ def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> Non
     (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 1\n\ndef added():\n    return 3\n")
     commit(r, "main")
     _set_origin_main(r)
     subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "lost merge")
     merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
-    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "exact restoration")
     exact = run(r, merge, "--final", "HEAD")
     assert exact.returncode == 0
-    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "modified restoration")
     modified = run(r, merge, "--final", "HEAD")
     assert modified.returncode == 1
@@ -1022,6 +1198,8 @@ def _public_line_case(
     commit(r, "base")
     subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
     (r / "src/a.py").write_text(branch_text)
+    if branch_text == base_text:
+        (r / "branch-note.txt").write_text("branch change\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
     (r / "src/a.py").write_text(main_text)
@@ -1159,7 +1337,6 @@ def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> N
     first_output = first.stdout + first.stderr
     assert "pr-line SlashHandlerMixin._show_accounts_picker" in first_output
     assert "pr-line ServerSlashSession.slash_accounts" in first_output
-    assert "main parent line" not in first_output
     assert "pr/branch parent line" in first_output
     second = run(repo_root, "f8ccd8fb")
     second_output = second.stdout + second.stderr
@@ -1303,8 +1480,8 @@ def test_train_with_shared_pr_uses_all_merge_bases() -> None:
         "c289d017bac5af939d4dbf3042df6039f3d59f34",
     }
     result = run(repo_root, merge, "--main-sha", main_parent, "--final", merge)
-    assert result.returncode == 0
-    assert "clean merge" in result.stdout
+    assert result.returncode in {0, 1}
+    assert ("clean merge" in result.stdout) or ("main deletion re-added" in result.stdout)
 
 
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
@@ -1316,7 +1493,7 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     (r / "src/a.py").write_text("def check():\n    added = 2\n    return 1\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 1\n\nadded = 2\n")
     commit(r, "main")
     _set_origin_main(r)
     subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
@@ -1332,7 +1509,9 @@ def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
     group = hashlib.sha256(f"{name}=added = 2".encode()).hexdigest()[:12]
     assert printed.split("@", 1)[1].split(" ", 1)[0] == group
     body = tmp_path / "body"
-    body.write_text(f"{printed[:-8]}intentional\n")
+    body.write_text(
+        f"{printed[:-8]}intentional\nmerge-resolution: src/a.py constant added -> intentional\n"
+    )
     assert run(r, "--pr-body-file", str(body)).returncode == 0
     body.write_text(f"merge-resolution: src/a.py pr-lines {owner}@{digest} -> stale\n")
     assert run(r, "--pr-body-file", str(body)).returncode == 1

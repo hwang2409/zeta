@@ -186,7 +186,9 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
-| `child_run_list` | `1.0` | `child_runs` | `controller_read` |
+| `run_work_list` | `1.0` | `run_work` | `controller_read` |
+| `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
+| `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
 ## common JSON-RPC shapes
@@ -758,8 +760,8 @@ the current state.
 
 ### child runs (`child_runs` feature)
 
-`child_run_list` lets the controller inspect child runs owned by the active
-session. Params are `session_id` plus optional nonnegative `offset` and `limit`
+`child_run_list` lets a controller or observer inspect child runs owned by the
+active session. Params are `session_id` plus optional nonnegative `offset` and `limit`
 from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
 Each row contains `run_id`, the top-level `session_id`, nullable
 `parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
@@ -773,8 +775,9 @@ exposed.
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
 `{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
-`-32005`. Both methods return `-32601` unless `child_runs` was negotiated, and
-observers cannot call either method. This feature emits no event; clients call
+`-32005`. Both methods return `-32601` unless `child_runs` was negotiated.
+Observers can call `child_run_list`, but `child_run_send` returns the existing
+`-32008` `observer_read_only` error. This feature emits no event; clients call
 `child_run_list` again to read changes.
 
 ### `abort`
@@ -834,6 +837,15 @@ work. The result contains `cleared`, the number of removed messages.
 {"jsonrpc":"2.0","id":9,"result":{"cleared":2}}
 ```
 
+### `run_work_list` and `background_task_cancel`
+
+Both methods require the negotiated `run_work` feature and an active session.
+`run_work_list` takes `session_id` and returns `tasks` and `todo` snapshots. Each task has `id`, `status`, `command`, `elapsed_seconds`, and `cancelable`; a known terminal code adds `exit_code`. Todo rows contain only `content` and `status`.
+
+Task status is one of `starting`, `running`, `stopping`, `exited`, `failed`, or `killed`. `starting` and `stopping` are lifecycle events; `exited` is a clean natural exit, `failed` is a known nonzero natural exit, and `killed` is a killed or terminated task. `cancelable` is true only for `starting`, `running`, and `stopping`.
+
+`background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`. These are live-only events, not replay rows; after reconnect, a replacement controller must call `run_work_list` to recover the current `tasks` and `todo` snapshots.
+
 ### `status`
 
 Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
@@ -859,8 +871,10 @@ With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
-or `abort`. Without the feature, the status shape and unbounded strict durable
-projection are unchanged.
+or `abort`. Read-only observers receive the same live baseline as the controller,
+but approval mutations still return `-32008`. Without the feature, the status
+shape and unbounded strict durable projection are unchanged, and observers
+receive the same rows as the controller.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
@@ -1271,6 +1285,8 @@ Event fields are:
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 | `replay_stream_ended` (feature `session_replay_seq`) | `event`, `session_id: string`, `stream_id: string`, `reason: "session_replaced"|"evicted"|"rejoined"` | none; never carries `seq` |
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
+| `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
+| `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1441,8 +1457,9 @@ error code and message. Provider status and origin remain internal.
   `status: {"state": "idle|running|tool", "pending_approvals": [...],
   "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
   `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
-  The status is captured at join start. Apply the joined status, then sequenced
-  events after it. Open approvals are the baseline request ids plus
+  The status is captured at join start. Controllers and read-only observers get
+  the same approval baseline. Apply the joined status, then sequenced events
+  after it. Open approvals are the baseline request ids plus
   `approval_request` ids in the joined page, minus `approval_end` ids in the
   joined page, then updated by the sequenced tail by id. A session admits at
   most 64 pending approvals across foreground and delegated tools. A 65th
@@ -1500,7 +1517,7 @@ error code and message. Provider status and origin remain internal.
   globally, evicting the largest scope first; a scope holds at most two waiting
   events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
   `session_history` and do not change the live stream.
-- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, `-32602` for malformed ids or parameters, and `-32009` with `stale_history_snapshot` for a changed snapshot.
+- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, and `-32602` for malformed ids or parameters. Only a continuation that supplies `before` with its `history_validator` returns `-32009` with `stale_history_snapshot`; a newest-page read (`before` omitted or null) retries a child transcript that moves during reader acquisition and serves a consistent snapshot instead.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
@@ -1828,7 +1845,8 @@ negotiate a feature sees the behavior from before the feature existed.
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
-| `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
+| `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
+| `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -1846,8 +1864,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `child_run_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated and `content_read` when both `serve_observers` and `content_read` are negotiated. `child_run_history` is available only when the `child_run_history` feature is negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` is available only when the `child_run_history` feature is negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

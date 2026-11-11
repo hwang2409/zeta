@@ -14,6 +14,7 @@ import time
 
 from prompt_toolkit.document import Document
 
+from ...tools._shared.run_work import task_elapsed_seconds, task_status
 from ..cards.tasks_panel import (
     OUTPUT_TAIL_BYTES,
     BackgroundTasksPanel,
@@ -205,19 +206,14 @@ class BackgroundTasksMixin:
         now = time.monotonic()
         lines = ["background tasks:"]
         for task in tasks:
-            if task.running:
-                status = "running"
-            elif task.terminal_phase in {"task_kill", "session_shutdown"}:
-                status = "killed"
-            elif task.exit_code is None:
-                status = "exited"
-            else:
+            status = task_status(task)
+            if status == "exited" and task.exit_code is not None:
                 status = f"exited {task.exit_code}"
-            if task.started_at is None:
-                runtime = "—"
-            else:
-                end = task.ended_at if task.ended_at is not None else now
-                runtime = format_runtime(max(0.0, end - task.started_at))
+            runtime = (
+                "—"
+                if task.started_at is None
+                else format_runtime(task_elapsed_seconds(task, now))
+            )
             command = " ".join(task.command.split())
             lines.append(
                 f"  {short_id(task.task_id)}  {status:<10} {runtime:>6}  {command}"

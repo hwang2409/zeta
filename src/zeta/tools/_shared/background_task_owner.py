@@ -306,6 +306,16 @@ class _BackgroundTaskOwner:
                 self.record.tui_presented = tui_presented
 
             await self.registry._commit_transition(rows, publish, None)
+            sink = self.registry._committed_transition_sink
+            if sink is not None:
+                sink(
+                    BackgroundTaskNotice(
+                        "background task stopping: " + self.record.command,
+                        self.record.task_id,
+                        "stopping",
+                        self.record.owner,
+                    )
+                )
             return process, True
 
     async def terminate(
