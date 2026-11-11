@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from prompt_toolkit.buffer import Buffer
+
+from ..overlay_text_field import OverlayTextField
+from .finder_overlay import FinderControl
 
 _RANK_BATCH_SIZE = 16
 
@@ -48,6 +52,22 @@ class FinderRuntimeTarget(Protocol):
 
 class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
+
+    def _init_finder_runtime(self) -> None:
+        app_ref = weakref.ref(self)
+        self._finder_field = OverlayTextField(
+            "TRANSCRIPT_FINDER",
+            on_text_changed=lambda query: (
+                target._finder_input(query)
+                if (target := app_ref()) is not None
+                else None
+            ),
+        )
+        self._finder_control = FinderControl(
+            lambda: app_ref()._active_finder.finder_state(), self._finder_field
+        )
+        self._finder_prepare_task: asyncio.Task[None] | None = None
+        self._finder_rank_task: asyncio.Task[None] | None = None
 
     def _finder_target(self) -> FinderRuntimeTarget:
         finder = getattr(self, "_active_finder", None)

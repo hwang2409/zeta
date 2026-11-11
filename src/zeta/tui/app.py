@@ -88,7 +88,6 @@ from .loop_errors import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
-from .overlay_text_field import OverlayTextField
 from .paste_runtime import PasteRuntime
 from .render import (
     render_markdown,
@@ -108,7 +107,6 @@ from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import (
-    FinderControl,
     TranscriptPresenter,
     TranscriptWidget,
     stream_key,
@@ -329,20 +327,7 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        app_ref = weakref.ref(self)
-        self._finder_field = OverlayTextField(
-            "TRANSCRIPT_FINDER",
-            on_text_changed=lambda query: (
-                target._finder_input(query)
-                if (target := app_ref()) is not None
-                else None
-            ),
-        )
-        self._finder_control = FinderControl(
-            lambda: app._active_finder.finder_state(), self._finder_field
-        )
-        self._finder_prepare_task: asyncio.Task[None] | None = None
-        self._finder_rank_task: asyncio.Task[None] | None = None
+        self._init_finder_runtime()
         self._composer_restore_document: Document | None = None
         self._status_card_open = False
         self._mcp_manager_open = False

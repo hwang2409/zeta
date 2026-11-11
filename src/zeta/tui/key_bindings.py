@@ -1006,14 +1006,8 @@ def build_key_bindings(
 
         @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
-            nonlocal finder_buffer
             event.current_buffer.cancel_completion()
-            if finder_buffer_is_default:
-                finder_buffer = event.current_buffer
-                if on_finder_input is not None:
-                    finder_buffer.on_text_changed += lambda _: on_finder_input(finder_buffer.text)
-            if not finder_buffer_is_default:
-                finder_buffer.reset()
+            finder_buffer.reset()
             on_finder_open()
 
     if on_finder_move is not None:
