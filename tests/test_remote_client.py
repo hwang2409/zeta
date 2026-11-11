@@ -14,15 +14,14 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import owned_app
-
 from zeta.core.checkpoints import ConversationEntry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
+    MessageOrigin,
     MessageRole,
     StreamEvent,
     StreamEventType,
-    MessageOrigin,
     TextContent,
     ToolCall,
     ToolResult,
@@ -33,9 +32,9 @@ from zeta.remote.client import RemoteSessionClient
 from zeta.remote.discovery import split_target, validate_host
 from zeta.remote.transport import RemoteTransport, TransportItem, remote_bridge_command
 from zeta.remote.wire import BoundedLineDecoder, RemoteWireError, decode_line
+from zeta.runtime.loop import AgentLoop
 from zeta.server import event_contract
 from zeta.server.handlers.history import replay_history
-from zeta.runtime.loop import AgentLoop
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.skills import SkillCatalog
 from zeta.tui.app import FullScreenPromptSession, TUIApp

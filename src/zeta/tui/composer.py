@@ -811,7 +811,7 @@ class SubmissionMixin:
         if self._remote_view is not None:
             command = value.strip().split(maxsplit=1)[0] if value.strip() else ""
             if command not in {"/detach", "/remote"}:
-                self._print_system("remote view is read only; use /detach first")
+                self._print_on_screen("remote view is read only; use /detach first")
                 return
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
