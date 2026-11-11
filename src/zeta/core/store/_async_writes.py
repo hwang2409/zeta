@@ -1063,6 +1063,7 @@ class AsyncDurableWritesMixin:
             _storage_lease=self._storage_lease,
             _execution_lease=self.execution_lease,
             _mutation_target=True,
+            _history_index=self._history_index,
         )
 
     def _drain_durable_writes_for_close(self: ConversationStore) -> bool:
