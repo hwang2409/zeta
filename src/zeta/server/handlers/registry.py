@@ -15,7 +15,9 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
-from . import child_runs, lifecycle, session, settings, validation
+from ..session_replay import join_history_and_subscribe
+from . import child_runs, lifecycle, path_completion, session, settings, validation
+from .run_work import cancel_background_task, list_run_work
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -128,8 +130,16 @@ async def session_history(client, request_id, params):
     return await client.connections.read_history(client, params)
 
 
+async def session_history_and_subscribe(client, request_id, params):
+    return await join_history_and_subscribe(client, params)
+
+
 async def content_read(client, request_id, params):
     return await client.connections.read_content(client, params)
+
+
+async def child_run_history(client, request_id, params):
+    return await client.connections.read_child_run_history(client, params)
 
 
 async def _mutable_store(client, params):
@@ -189,6 +199,15 @@ async def set_compaction(client, request_id, params):
 async def send_images(client, request_id, params):
     validation.active(client.server.runtime, params)
     return await client.server.control.deliveries.send_images(params, client.features)
+
+
+async def path_complete(client, request_id, params):
+    store = validation.active(client.server.runtime, params)
+    return await path_completion.complete(
+        params,
+        base_dir=store.cwd,
+        run_blocking=client.server.control._run_blocking,
+    )
 
 
 async def slash_list(client, request_id, params):
@@ -358,7 +377,9 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.REPAIR_TRANSCRIPT: repair_transcript,
     MethodDescriptor.SESSION_TREE: session_tree,
     MethodDescriptor.SESSION_HISTORY: session_history,
+    MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE: session_history_and_subscribe,
     MethodDescriptor.CONTENT_READ: content_read,
+    MethodDescriptor.CHILD_RUN_HISTORY: child_run_history,
     MethodDescriptor.SWITCH_BRANCH: switch_branch,
     MethodDescriptor.FORK_MESSAGE: fork_message,
     MethodDescriptor.MODEL_CATALOG: model_catalog,
@@ -366,6 +387,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SET_SETTINGS: set_settings,
     MethodDescriptor.SET_COMPACTION: set_compaction,
     MethodDescriptor.SEND_IMAGES: send_images,
+    MethodDescriptor.PATH_COMPLETE: path_complete,
     MethodDescriptor.SLASH_LIST: slash_list,
     MethodDescriptor.SLASH_RUN: slash_run,
     MethodDescriptor.ACCOUNT_LIST: account_list,
@@ -386,6 +408,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.DELIVERY_STATUS: delivery_status,
     MethodDescriptor.SESSION_GRANTS: session_grants_read,
     MethodDescriptor.REVOKE_SESSION_GRANTS: revoke_session_grants,
+    MethodDescriptor.RUN_WORK_LIST: list_run_work,
+    MethodDescriptor.BACKGROUND_TASK_CANCEL: cancel_background_task,
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
 }

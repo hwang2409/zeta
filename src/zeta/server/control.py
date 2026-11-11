@@ -6,7 +6,7 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from ..core.approval import (
@@ -15,11 +15,13 @@ from ..core.approval import (
     PermissionSnapshot,
     SessionGrantChange,
     SessionGrantNotFound,
+)
+from ..core.commands.slash_registry import SlashLock
+from ..core.permission_grants import (
     permission_snapshot,
     revoke_session_grants,
     session_grant_change,
 )
-from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -29,6 +31,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
@@ -53,6 +56,7 @@ from .protocol import (
     ProtocolError,
     bounded,
 )
+from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from .server import ZetaServer
@@ -75,6 +79,8 @@ class NotificationPresentation:
         notification: Mapping[str, object],
         protocol_version: str,
         send: NotificationSender,
+        *,
+        row_seq: int | None = None,
     ) -> None:
         notification_id = notification.get("notification_id")
         key = (
@@ -94,6 +100,7 @@ class NotificationPresentation:
                 event_name,
                 session_id,
                 data=event_contract.notification_payload(notification),
+                replay_row=RowFacts(seq=row_seq),
             )
         except FrameWriteCancelled as cancelled:
             if not cancelled.written and key is not None:
@@ -110,10 +117,17 @@ class NotificationPresentation:
 class ServeControl:
     """Own the active semantic lifetime independently of physical clients."""
 
-    def __init__(self, server: ZetaServer) -> None:
+    def __init__(
+        self,
+        server: ZetaServer,
+        foreground_event_publisher: ForegroundEventPublisher,
+    ) -> None:
         self.server = server
+        self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
+        self._turn_end_published = False
+        self._notification_turn_started = False
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -157,6 +171,16 @@ class ServeControl:
         allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
+        loop = self.server.runtime.loop
+        if (
+            self._turn_end_published
+            and loop is not None
+            and loop.notification_turn_state != "idle"
+        ):
+            notification_task = self._turn_task
+            loop.cancel_scheduled_notification_turn()
+            if notification_task is not None and not notification_task.done():
+                notification_task.cancel()
         self._turn_task = asyncio.create_task(
             self._run_turn(
                 text,
@@ -168,6 +192,10 @@ class ServeControl:
                 allow_assistant_reset=allow_assistant_reset,
             )
         )
+        connections = self.server.connections
+        session_id = self.server.runtime.session_id
+        if connections is not None and session_id is not None:
+            connections.close_deferred_replay_when_done(session_id, self._turn_task)
 
     def unhealthy(self) -> bool:
         return self._approvals.state.health is not None
@@ -195,12 +223,21 @@ class ServeControl:
         loop = self.server.runtime.loop
         return (
             self._session_swap_active
-            or (self._turn_task is not None and not self._turn_task.done())
+            or (
+                self._turn_task is not None
+                and not self._turn_task.done()
+                and (
+                    loop is None
+                    or loop.notification_turn_state == "idle"
+                    or self._notification_turn_started
+                    or not self._turn_end_published
+                )
+            )
             or (
                 self._turn_handoff_task is not None
                 and not self._turn_handoff_task.done()
+                and not self._turn_end_published
             )
-            or (loop is not None and loop.notification_turn_state != "idle")
         )
 
     async def require_idle(self) -> None:
@@ -211,7 +248,10 @@ class ServeControl:
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
-        if self.turn_busy():
+        if self.turn_busy() or (
+            self._turn_handoff_task is not None
+            and not self._turn_handoff_task.done()
+        ):
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
@@ -399,26 +439,41 @@ class ServeControl:
         features: frozenset[str],
         attachments: list[dict[str, object]] | None = None,
         delivery_id: str | None = None,
+        origin: MessageOrigin = MessageOrigin.USER,
     ) -> None:
-        """Echo an accepted user message so observers can rebuild the transcript."""
-        if "user_message_event" in features:
-            fields: dict[str, object] = {
-                "text": bounded(text, USER_MESSAGE_MAX_BYTES),
-                "mode": mode,
-                "attachments": attachments or [],
-            }
-            if (
-                delivery_id is not None
-                and {"delivery_id", "user_message_delivery_id"} <= features
-            ):
-                fields["delivery_id"] = delivery_id
-            await self._notify(
-                event_contract.AUXILIARY_WIRE_EVENTS[
-                    event_contract.AuxiliaryEvent.USER_MESSAGE
-                ],
-                self.server.runtime.session_id,
-                **fields,
-            )
+        """Echo an accepted user message so observers can rebuild the transcript.
+
+        Without a delivery id the row installs later in the turn, so ``origin``
+        (what the caller passes to ``start_turn``) and the mark find it.
+        """
+        fields: dict[str, object] = {
+            "text": bounded(text, USER_MESSAGE_MAX_BYTES),
+            "mode": mode,
+            "attachments": attachments or [],
+        }
+        if delivery_id is not None:
+            fields["delivery_id"] = delivery_id
+        await self._notify(
+            event_contract.AUXILIARY_WIRE_EVENTS[
+                event_contract.AuxiliaryEvent.USER_MESSAGE
+            ],
+            self.server.runtime.session_id,
+            replay_row=RowFacts(delivery_id=delivery_id)
+            if delivery_id is not None
+            else RowFacts(seq=self._row_mark(), origin=origin),
+            **fields,
+        )
+
+    def _row_mark(self) -> int | None:
+        """The newest resident row seq; a publish-first row installs after it."""
+        opened = self.server.runtime.opened
+        return None if opened is None else opened.store.active_branch_head_sequence()
+
+    def _close_deferred_replay(self, session_id: str | None) -> None:
+        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        connections = self.server.connections
+        if connections is not None and session_id is not None:
+            connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
         if self.closing:
@@ -566,38 +621,43 @@ class ServeControl:
         terminal_error: dict[str, object] | None = None
         agent_end: StreamEvent | None = None
         try:
-            async for event in loop.run_turn(
-                text,
-                origin=origin,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-                host_environment=None
-                if host_commands is None
-                else host_commands.environment,
-                host_instruction=""
-                if host_commands is None
-                else host_commands.instruction,
-                allow_assistant_reset=allow_assistant_reset,
-            ):
-                if pending_turn_end is not None:
-                    if event.type is StreamEventType.AGENT_END:
-                        terminal_events.append(pending_turn_end)
+            async with aclosing(
+                self.foreground_event_publisher.events(
+                    loop.run_turn(
+                        text,
+                        origin=origin,
+                        user_message=user_message,
+                        persist_user_message=persist_user_message,
+                        host_environment=None
+                        if host_commands is None
+                        else host_commands.environment,
+                        host_instruction=""
+                        if host_commands is None
+                        else host_commands.instruction,
+                        allow_assistant_reset=allow_assistant_reset,
+                    )
+                )
+            ) as event_stream:
+                async for event in event_stream:
+                    if pending_turn_end is not None:
+                        if event.type is StreamEventType.AGENT_END:
+                            terminal_events.append(pending_turn_end)
+                        else:
+                            await self._event(
+                                pending_turn_end,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                            )
+                        pending_turn_end = None
+                    if event.type is StreamEventType.TURN_END:
+                        pending_turn_end = event
+                    elif event.type is StreamEventType.ERROR:
+                        outcome = TurnOutcome.FAILED
+                        terminal_events.append(event)
+                    elif event.type is StreamEventType.AGENT_END:
+                        agent_end = event
                     else:
-                        await self._event(
-                            pending_turn_end,
-                            session_id=session_id,
-                            turn_id=turn_id,
-                        )
-                    pending_turn_end = None
-                if event.type is StreamEventType.TURN_END:
-                    pending_turn_end = event
-                elif event.type is StreamEventType.ERROR:
-                    outcome = TurnOutcome.FAILED
-                    terminal_events.append(event)
-                elif event.type is StreamEventType.AGENT_END:
-                    agent_end = event
-                else:
-                    await self._event(event, session_id=session_id, turn_id=turn_id)
+                        await self._event(event, session_id=session_id, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
@@ -610,12 +670,13 @@ class ServeControl:
                 terminal_events.clear()
                 terminal_error = None
                 agent_end = None
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
+                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -628,8 +689,8 @@ class ServeControl:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -643,6 +704,7 @@ class ServeControl:
             self._host_binding_required and host_commands is None
         ) or not loop.schedule_notification_turn():
             return
+        self._notification_turn_started = False
         self._turn_task = asyncio.create_task(
             self._run_notification_turn(
                 session_id, host_commands, turn_id=uuid.uuid4().hex
@@ -671,6 +733,7 @@ class ServeControl:
             session_id: str | None = None,
             background: bool = False,
         ) -> None:
+            nonlocal started
             if event.type in {StreamEventType.TURN_END, StreamEventType.ERROR}:
                 terminal_events.append(event)
             else:
@@ -680,11 +743,13 @@ class ServeControl:
                     background=background,
                     turn_id=turn_id,
                 )
+                if event.type is StreamEventType.TURN_START:
+                    # After _event publishes, update busy state before the caller settles.
+                    self._notification_turn_started = True
+                    started = True
+                    state.turn_started()
 
         try:
-            await asyncio.sleep(0.01)
-            state.turn_started()
-            started = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
@@ -716,19 +781,22 @@ class ServeControl:
                 and loop.notification_system_message() is not None
             ):
                 self._schedule_background_wake(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-                schedule_wake=agent_end is None,
-            )
+            self._notification_turn_started = False
+            if started:
+                self._close_deferred_replay(session_id)
+                await self.deliveries.finalize_turn(
+                    session_id,
+                    state,
+                    turn_id,
+                    outcome,
+                    schedule_wake=False,
+                )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            if outcome is TurnOutcome.COMPLETED:
-                self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            self._schedule_background_wake(session_id)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -783,6 +851,7 @@ class ServeControl:
         finally:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
+            self._close_deferred_replay(session_id)
             await self.deliveries.finalize_turn(
                 session_id,
                 state,
@@ -797,12 +866,7 @@ class ServeControl:
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None
     ) -> None:
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections is not None
-            else None
-        )
-        if controller is None or "live_config_changed" not in controller.features:
+        if self.server.connections is None:
             return
         self._end_stale_approvals(session_id)
         await self._notify(
@@ -871,7 +935,10 @@ class ServeControl:
                 )
             if event.message is not None:
                 await self._notify(
-                    wire_event, session_id, **event_contract.assistant_message(event)
+                    wire_event,
+                    session_id,
+                    replay_row=RowFacts(seq=self._row_mark()),
+                    **event_contract.assistant_message(event),
                 )
             return
         connections = getattr(self.server, "connections", None)
@@ -916,7 +983,9 @@ class ServeControl:
             ):
                 await self._notify(wire_event, session_id, _admitted=True, **fields)
                 return
-            await self._notify(wire_event, session_id, **fields)
+            await self._notify(
+                wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
+            )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
             await self._end_approval(
@@ -930,7 +999,11 @@ class ServeControl:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
-                session_id, event.data, self._protocol_version(), self._notify
+                session_id,
+                event.data,
+                self._protocol_version(),
+                self._notify,
+                row_seq=event.row_seq,
             )
             return
         if kind is StreamEventType.ERROR:
@@ -971,6 +1044,8 @@ class ServeControl:
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
         await self._notify(wire_event, session_id, data=dict(event.data))
+        if kind is StreamEventType.TURN_END:
+            self._turn_end_published = True
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor
@@ -991,18 +1066,29 @@ class ServeControl:
                 self._event(event, session_id=session_id, background=True)
             )
 
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
+        connections = self.server.connections
+        if connections is None:
+            return
+        def publish() -> None:
+            controller = connections.controller_metadata()
+            if not self.closing and controller is not None and "run_work" in controller.features:
+                if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
+                    awaitable = self._notify(EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields)
+                elif event is EventDescriptor.TODO_UPDATED:
+                    awaitable = self._notify(EventDescriptor.TODO_UPDATED, session_id, **fields)
+                else:
+                    raise ValueError(f"unsupported run-work event: {event.value}")
+                asyncio.create_task(awaitable)
+        try:
+            connections.loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
+
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
-        controller = (
-            self.server.connections.controller_metadata()
-            if self.server.connections
-            else None
-        )
-        if (
-            not self.closing
-            and controller is not None
-            and "memory_updated" in controller.features
-        ):
+        if not self.closing and self.server.connections is not None:
             asyncio.create_task(
                 self._notify(
                     event_contract.AUXILIARY_WIRE_EVENTS[

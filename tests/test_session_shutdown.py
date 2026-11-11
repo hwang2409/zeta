@@ -368,7 +368,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.support.fake_backend import FakeBackend
-    from zeta.agent.background import recover_agent_children
+    from zeta.agent.background_lifecycle import recover_agent_children
     from zeta.agent.pending_delivery import StepDeliveryFlow
     from zeta.protocol.types import ToolCall
     from zeta.tools.agent_send import send_to_run

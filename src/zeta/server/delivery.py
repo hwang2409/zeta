@@ -26,6 +26,7 @@ from ..protocol.types import (
 from . import event_contract
 from .handlers import validation
 from .protocol import ErrorDescriptor, ProtocolError
+from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -69,7 +70,9 @@ class DeliveryRequests:
             enabled="model_input_ids" in features,
         )
         if delivery_id is None:
-            await control.user_message(value.display_text, "send", features)
+            await control.user_message(
+                value.display_text, "send", features, origin=value.origin
+            )
             control.start_turn(
                 value.text,
                 origin=value.origin,
@@ -320,7 +323,7 @@ class DeliveryRequests:
                             event_contract.AuxiliaryEvent.DELIVERY_STATUS
                         ],
                         session_id,
-                        required_feature="session_history_fidelity",
+                        replay_row=RowFacts(seq=entry.seq),
                         **{key: value for key, value in row.items() if key != "event"},
                     )
         turn_reason = {
@@ -336,6 +339,7 @@ class DeliveryRequests:
             state.turn_finished()
         if control._turn_task is owner_task:
             control._turn_handoff_task = owner_task
+            control._turn_end_published = False
             control._turn_task = None
             control._turn_cancel_outcome = None
         if (

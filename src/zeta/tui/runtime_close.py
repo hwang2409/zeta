@@ -56,6 +56,7 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
+            attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             prepare_ui_session_change = getattr(
@@ -76,6 +77,7 @@ class RuntimeCloseMixin:
             close_child_sends = getattr(self, "_close_child_sends", None)
             if close_child_sends is not None:
                 await attempt_async(close_child_sends)
+            await attempt_async(self._close_remote_view)
             await attempt_async(self._agent_navigation.close)
             attempt(self._agent_navigation.unbind_layout)
             await attempt_async(self._cancel_mcp_wizard)
@@ -85,6 +87,9 @@ class RuntimeCloseMixin:
                 await self._draft.shutdown_pending()
             except Exception:  # noqa: BLE001, S110 - notice already reported
                 pass
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None:
+                await attempt_async(observer_host.close)
             if self._on_session_close is not None:
                 await attempt_async(self._on_session_close)
             await attempt_async(
@@ -103,6 +108,9 @@ class RuntimeCloseMixin:
         finally:
             self._workspace_snapshot_store = None
             attempt(lambda: self.loop.set_background_event_sink(None))
+            foreground_event_publisher = getattr(self, "foreground_event_publisher", None)
+            if foreground_event_publisher is not None:
+                attempt(foreground_event_publisher.close)
             attempt(lambda: self.loop.set_background_wake_callback(None))
             attempt(self._detach_ui_notice_sinks)
             attempt(lambda: self.loop.set_mcp_prompt_refresh(None))

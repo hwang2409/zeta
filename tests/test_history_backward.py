@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
@@ -27,12 +29,15 @@ pytest_plugins = ("tests.support.socket_fixtures",)
 
 def _entry(number: int) -> SimpleNamespace:
     return SimpleNamespace(
+        seq=0,
         id=f"message-{number}", type="message",
         data={"message": {"role": "user", "content": [{"type": "text", "text": "text"}]}},
     )
 
 
 class _HistoryStore:
+    repair_generation = None
+
     def __init__(self, entries: list[object]) -> None:
         self.entries = entries
         self._log_offset = len(entries)
@@ -46,8 +51,42 @@ def _runtime(store: object) -> SimpleNamespace:
     return SimpleNamespace(opened=SimpleNamespace(store=store))
 
 
+def _forward_history(store: _HistoryStore, offset: int) -> dict[str, object]:
+    projection = history_projection.history_projection(store)
+    return history.page_history(
+        projection,
+        offset,
+        include_delivery_id=False,
+        fidelity=False,
+        content_read=False,
+    )[0]
+
+
 def _backward_history(store: _HistoryStore, params: dict[str, object]) -> dict[str, object]:
-    return history.history(_runtime(store), params, backward_enabled=True)
+    if "before" not in params:
+        raise ProtocolError(protocol.ErrorDescriptor.INVALID_PARAMS, "missing before")
+    history._validate_history_params(params)
+    projection = history_projection.history_projection(store)
+    before = params["before"]
+    validator = params.get("history_validator")
+    end = len(projection.entry_groups) - 1
+    if before is None:
+        validator = {"end": end, "entry_id": history_projection._history_endpoint(projection, end)}
+        before = end + 1
+        first_page = True
+    else:
+        first_page = False
+    result, _expanded = history.page_history(
+        projection,
+        before,
+        include_delivery_id=False,
+        fidelity=False,
+        content_read=False,
+        backward=True,
+        validator=validator,
+        first_page=first_page,
+    )
+    return result
 
 
 @contextlib.asynccontextmanager
@@ -90,6 +129,72 @@ async def _history_request(reader: object, writer: object, request_id: int, sess
 
 
 @pytest.mark.asyncio
+async def test_real_store_history_uses_index_not_full_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_full_projection(*args: object, **kwargs: object) -> object:
+        raise AssertionError("real store history used the full projection")
+
+    monkeypatch.setattr(history, "history_projection", reject_full_projection)
+    async with _real_history_server(tmp_path, count=3) as (
+        reader,
+        writer,
+        session_id,
+        _server,
+    ):
+        result = await _history_request(reader, writer, 3, session_id, {"offset": 0})
+
+    assert [row["content"][0]["text"][:9] for row in result["messages"]] == [
+        "message-0",
+        "message-1",
+        "message-2",
+    ]
+
+
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+@pytest.mark.asyncio
+async def test_real_store_history_preserves_out_of_range_cursor_response(
+    tmp_path: Path, direction: str
+) -> None:
+    async with _real_history_server(tmp_path, count=3) as (
+        reader,
+        writer,
+        session_id,
+        _server,
+    ):
+        if direction == "forward":
+            response = (await request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id, "offset": 100},
+            ))[-1]
+            assert response == {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"messages": [], "next_offset": None},
+            }
+            return
+
+        newest = await _history_request(
+            reader, writer, 3, session_id, {"before": None}
+        )
+        response = (await request(
+            reader,
+            writer,
+            4,
+            "session_history",
+            {
+                "session_id": session_id,
+                "before": newest["history_validator"]["end"] + 1,
+                "history_validator": newest["history_validator"],
+            },
+        ))[-1]
+        assert response["error"]["code"] == protocol.ErrorDescriptor.INVALID_PARAMS.value[0]
+
+
+@pytest.mark.asyncio
 async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path) as (reader, writer, session_id, _server):
@@ -119,7 +224,7 @@ async def test_real_socket_backward_newest_page_and_walk(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_real_socket_backward_continuation_survives_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_real_socket_backward_continuation_survives_append_but_not_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
@@ -134,6 +239,81 @@ async def test_real_socket_backward_continuation_survives_append(tmp_path: Path,
             {"before": first["next_before"], "history_validator": first["history_validator"]},
         )
         assert "new" not in {row["content"][0]["text"] for row in page["messages"] if row["role"] == "user"}
+
+        transcript = server.runtime.opened.store.path
+        await request(reader, writer, 5, "new_session", {"provider": "codex"})
+        with transcript.open("ab") as stream:
+            stream.write(b'{"seq":"invalid"}\n')
+        diagnosis = (await request(
+            reader, writer, 7, "resume", {"session_id": session_id}
+        ))[-1]
+        assert diagnosis["error"]["data"]["code"] == "corrupt_transcript"
+        repaired = (await request(
+            reader,
+            writer,
+            8,
+            "repair_transcript",
+            {"session_id": session_id, "confirm": True},
+        ))[-1]
+        assert "error" not in repaired, repaired
+        resumed = (await request(
+            reader, writer, 9, "resume", {"session_id": session_id}
+        ))[-1]
+        assert "error" not in resumed, resumed
+        response = (await request(
+            reader,
+            writer,
+            10,
+            "session_history",
+            {
+                "session_id": session_id,
+                "before": first["next_before"],
+                "history_validator": first["history_validator"],
+            },
+        ))[-1]
+        assert response["error"]["code"] == -32009
+        assert response["error"]["data"] == {"code": "stale_history_snapshot"}
+
+
+@pytest.mark.asyncio
+async def test_real_socket_branch_during_read_is_stale_and_not_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-owner branch between g0 and g1 rejects the in-flight page."""
+    async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
+        old_first = await _history_request(reader, writer, 3, session_id, {"offset": 0})
+        index = server.runtime.opened.store._history_index
+        original_page = index.page
+        branch_ready = threading.Event()
+        release_page = threading.Event()
+
+        def page_during_branch(request: object, g0: object) -> object:
+            branch_ready.set()
+            assert release_page.wait(timeout=10)
+            return original_page(request, g0)
+
+        monkeypatch.setattr(index, "page", page_during_branch)
+        pending = asyncio.create_task(
+            request(reader, writer, 4, "session_history", {"session_id": session_id, "offset": 0})
+        )
+        def wait_for_page() -> None:
+            assert branch_ready.wait(10)
+
+        await await_or_fail(
+            asyncio.to_thread(wait_for_page), what="history index page"
+        )
+        server.runtime.opened.store.append_message_fork(
+            server.runtime.opened.store.active_branch_snapshot()[0].id
+        )
+        release_page.set()
+        response = (await await_or_fail(pending, what="history request"))[-1]
+        assert "error" in response, response
+        assert response["error"]["code"] == -32009
+        assert response["error"]["data"] == {"code": "stale_history_snapshot"}
+        fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
+        assert [row["id"] for row in fresh["messages"]] == [
+            old_first["messages"][0]["id"]
+        ]
 
 
 @pytest.mark.asyncio
@@ -217,6 +397,7 @@ def test_backward_rejects_cursor_past_stable_end_and_terminal_append() -> None:
     assert error.value.code == -32602
 
     store.entries.append(SimpleNamespace(
+        seq=0,
         id="approval-end", type="approval_history", data={"event": "approval_end"}
     ))
     store._log_offset += 1
@@ -254,6 +435,7 @@ def test_backward_frame_bound_and_oversized_group_marker(monkeypatch: pytest.Mon
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 4_000)
     group = SimpleNamespace(
+        seq=0,
         id="approval",
         type="approval_history",
         data={"event": "approval_request", "tool_call": {"arguments": {f"k{i}": "x" * 8000 for i in range(20)}}},
@@ -273,6 +455,7 @@ def test_backward_near_limit_continuation_keeps_atomic_group(monkeypatch: pytest
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 1_400)
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 1_400)
     atomic = SimpleNamespace(
+        seq=0,
         id="atomic",
         type="message",
         data={
@@ -307,9 +490,9 @@ def test_backward_does_not_replace_forward_cache_projection(
 ) -> None:
     monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", 4_000)
     store = _HistoryStore([_entry(i) for i in range(220)])
-    before = history.history(_runtime(store), {"offset": 0})
+    before = _forward_history(store, 0)
     backward = _backward_history(store, {"before": None})
-    after = history.history(_runtime(store), {"offset": 0})
+    after = _forward_history(store, 0)
     assert before == after
     assert backward["history_validator"]["end"] == 220
 
@@ -456,6 +639,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
+            seq=0,
             id="big", type="message",
             data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
         )
@@ -465,7 +649,7 @@ def test_backward_after_forward_cache_reprojects_for_real_cursor(
         offset: int | None = 0
         forward_ids: list[str] = []
         while offset is not None:
-            page = history.history(_runtime(store), {"offset": offset})
+            page = _forward_history(store, offset)
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             forward_ids.extend(row["id"] for row in page["messages"])
             offset = page["next_offset"]
@@ -491,6 +675,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
     monkeypatch.setattr(protocol, "MAX_FRAME_BYTES", 8_000)
     for size in range(6_700, 7_300):
         big = SimpleNamespace(
+            seq=0,
             id="big", type="message",
             data={"message": {"role": "user", "content": [{"type": "text", "text": "x" * size}]}},
         )
@@ -498,7 +683,7 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
         offset: int | None = 0
         seen: list[str] = []
         while offset is not None:
-            page = history.history(_runtime(store), {"offset": offset})
+            page = _forward_history(store, offset)
             assert page["messages"] or page["next_offset"] is None, (size, offset)
             payload = FrameCodec().response("\x00" * protocol.MAX_REQUEST_ID_BYTES, page)
             assert b'"error"' not in payload and len(payload) <= 8_000, size

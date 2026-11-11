@@ -994,6 +994,12 @@ def test_static_gate_rejects_committed_bypass_mutations(source: str) -> None:
 
 STRUCTURED_ERROR_FIXTURES = (
     (
+        ErrorDescriptor.STALE_EVENT_SEQUENCE,
+        "replay continuity was invalidated",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"replay continuity was invalidated","data":{"code":"stale_event_sequence"}}}\n',
+    ),
+    (
         ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
         "session history changed",
         None,
@@ -1004,6 +1010,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "content not found",
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"content not found","data":{"code":"content_not_found"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CHILD_RUN_NOT_FOUND,
+        "child run not found",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32012,"message":"child run not found","data":{"code":"child_run_not_found"}}}\n',
     ),
     (
         ErrorDescriptor.CORRUPT_TRANSCRIPT,

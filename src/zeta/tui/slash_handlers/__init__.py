@@ -166,25 +166,31 @@ class SlashHandlerMixin:
 
     @property
     def _picker_active(self) -> bool:
-        return self.accounts_picker_active or self.model_picker_active
+        return self.accounts_picker_active or self.model_picker_active or self.remote_picker_active
 
     def _picker_move(self, delta: int) -> None:
         if self.accounts_picker_active:
             self.accounts_picker_move(delta)
-        else:
+        elif self.model_picker_active:
             self.model_picker_move(delta)
+        else:
+            self.remote_picker_move(delta)
 
     def _picker_select(self) -> None:
         if self.accounts_picker_active:
             self.accounts_picker_select()
-        else:
+        elif self.model_picker_active:
             self.model_picker_select()
+        else:
+            self.remote_picker_select()
 
     def _picker_cancel(self) -> None:
         if self.accounts_picker_active:
             self.accounts_picker_cancel()
-        else:
+        elif self.model_picker_active:
             self.model_picker_cancel()
+        else:
+            self.remote_picker_cancel()
 
     @property
     def model_picker_active(self) -> bool:
@@ -454,8 +460,7 @@ class SlashHandlerMixin:
         """Pick a model from a card, or switch straight to a named one."""
 
         requested = args.strip()
-        if not self._model_catalog_loaded:
-            self._start_model_catalog_load()
+        self._start_model_catalog_load()
         busy = bool(self.active or self.pending_approvals)
         if not requested:
             if busy:

@@ -21,7 +21,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from ..providers.completion import CompletionControl, CompletionRun
-    from ..providers.transport import CloseFailureReporter, CloseOutcome
+    from ..runtime._async_close import CloseFailureReporter, CloseOutcome
 
 from ..media.images import (
     IMAGE_DEGRADATION_WARNING,
@@ -888,6 +888,8 @@ class StreamEvent:
     tool_result: ToolResult | None = None
     error: ErrorInfo | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    # seq of the committed history row this event presents; serve-internal, never sent
+    row_seq: int | None = None
 
     @property
     def kind(self) -> StreamEventType:

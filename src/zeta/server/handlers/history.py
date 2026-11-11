@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import threading
 
+from ...core.store._history_index import (
+    InvalidHistoryPageRequest,
+    StaleHistorySnapshot,
+)
 from ..protocol import MAX_REQUEST_ID_BYTES, ErrorDescriptor, FrameCodec, ProtocolError
 from ..runtime import ServerRuntime
 from .history_projection import (
     HistoryProjection,
     _cache,
-    _cache_creation_lock,
     _CachedProjection,
     _generation,
     _history_endpoint,
@@ -17,12 +20,62 @@ from .history_projection import (
     _history_group_fits,
     _publish_cache,
     history_projection,
+    history_projection_from_groups,
 )
 
-if TYPE_CHECKING:
-    from ...core.store import ConversationStore
-
 HISTORY_FIRST_PAGE_ENTRIES = 128
+_cache_creation_lock = threading.Lock()
+_MISSING_VALIDATOR = object()
+
+
+def history_validator(
+    expected: tuple[int, str | None, str | None] | None = None,
+    *,
+    supplied: object = _MISSING_VALIDATOR,
+) -> dict[str, object]:
+    emitted = (
+        {
+            "end": expected[0],
+            "entry_id": expected[1],
+            "repair_generation": expected[2],
+        }
+        if expected is not None
+        else None
+    )
+    if supplied is _MISSING_VALIDATOR:
+        assert emitted is not None
+        return emitted
+    if not isinstance(supplied, dict) or set(supplied) not in (
+        {"end", "entry_id"},
+        {"end", "entry_id", "repair_generation"},
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
+        )
+    if (
+        type(supplied.get("end")) is not int
+        or supplied["end"] < 0
+        or (
+            supplied.get("entry_id") is not None
+            and not isinstance(supplied.get("entry_id"), str)
+        )
+        or (
+            "repair_generation" in supplied
+            and supplied.get("repair_generation") is not None
+            and not isinstance(supplied.get("repair_generation"), str)
+        )
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
+        )
+    if emitted is None:
+        return dict(supplied)
+    if supplied != emitted:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
+    return emitted
 
 
 def _fit_history_groups(
@@ -104,6 +157,7 @@ def _fit_history_groups(
             projection.entry_index,
             tuple(cache_groups),
             tuple(cache_sizes),
+            projection.frontier,
         ),
     )
 
@@ -147,10 +201,11 @@ def _backward_page_history(
     fidelity: bool,
     content_read: bool,
     first_page: bool = False,
+    snapshot_checked: bool = False,
 ) -> tuple[dict[str, object], HistoryProjection]:
     end = len(projection.entry_groups) - 1
     stable_end = validator["end"]
-    if (
+    if not snapshot_checked and (
         not isinstance(stable_end, int)
         or stable_end > end
         or validator.get("entry_id") != _history_endpoint(projection, stable_end)
@@ -159,7 +214,8 @@ def _backward_page_history(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
             "session history changed; restart from the newest page",
         )
-    if before < 0 or before > stable_end + int(first_page):
+    cursor_end = end if snapshot_checked else stable_end
+    if before < 0 or before > cursor_end + int(first_page):
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "before must not exceed history end"
         )
@@ -216,11 +272,12 @@ def page_history(
     )
 
 
-def _publish_history_page(
-    store: ConversationStore,
+def _publish_projected_page(
+    store: object,
     generation: tuple[int, bytes],
     result: dict,
     expanded: HistoryProjection,
+    *,
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
@@ -250,7 +307,7 @@ def _publish_history_page(
     return result
 
 
-def _backward_history_request(
+def _backward_history_page(
     runtime: ServerRuntime,
     params: dict,
     *,
@@ -258,11 +315,9 @@ def _backward_history_request(
     fidelity: bool,
     content_read: bool,
     served_turn_end: bool,
-) -> dict:
+    supplied_validator: object = _MISSING_VALIDATOR,
+) -> tuple[dict, int, str | None]:
     before = params["before"]
-    validator = params.get("history_validator")
-    if before is None:
-        validator = {"end": 0, "entry_id": None}
     store = runtime.opened.store
     generation = _generation(store)
     projection = history_projection(
@@ -273,8 +328,15 @@ def _backward_history_request(
         served_turn_end=served_turn_end,
     )
     end = len(projection.entry_groups) - 1
+    validator = history_validator(
+        (end, _history_endpoint(projection, end), store.repair_generation),
+        supplied=(
+            supplied_validator
+            if supplied_validator is not _MISSING_VALIDATOR
+            else params.get("history_validator", _MISSING_VALIDATOR)
+        ),
+    )
     if before is None:
-        validator = {"end": end, "entry_id": _history_endpoint(projection, end)}
         cursor, first_page = end + 1, True
     else:
         cursor, first_page = before, False
@@ -288,19 +350,45 @@ def _backward_history_request(
         validator=validator,
         first_page=first_page,
     )
-    return _publish_history_page(
+    if _generation(store) != generation:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
+    return _publish_projected_page(
         store,
         generation,
         result,
         expanded,
-        include_delivery_id,
-        fidelity,
-        content_read,
-        served_turn_end,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    ), projection.frontier, projection.frontier_row_id
+
+
+def replay_history(
+    runtime: ServerRuntime,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+    supplied_validator: object = _MISSING_VALIDATOR,
+) -> tuple[dict, int, str | None]:
+    """Return the newest backward page and its stable frontier row."""
+    return _backward_history_page(
+        runtime,
+        {"before": None},
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+        supplied_validator=supplied_validator,
     )
 
 
-def _forward_history_request(
+def _projected_forward_history_request(
     runtime: ServerRuntime,
     params: dict,
     *,
@@ -325,16 +413,190 @@ def _forward_history_request(
         fidelity=fidelity,
         content_read=content_read,
     )
-    return _publish_history_page(
+    if _generation(store) != generation:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
+    return _publish_projected_page(
         store,
         generation,
         result,
         expanded,
-        include_delivery_id,
-        fidelity,
-        content_read,
-        served_turn_end,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
     )
+
+
+def _projected_backward_history_request(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> dict:
+    store = runtime.opened.store
+    generation = _generation(store)
+    projection = history_projection(
+        store,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )
+    before = params["before"]
+    end = len(projection.entry_groups) - 1
+    validator = history_validator(
+        (end, _history_endpoint(projection, end), store.repair_generation),
+        supplied=params.get("history_validator", _MISSING_VALIDATOR),
+    )
+    if before is None:
+        cursor, first_page = end + 1, True
+    else:
+        cursor, first_page = before, False
+    result, expanded = page_history(
+        projection,
+        cursor,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        backward=True,
+        validator=validator,
+        first_page=first_page,
+    )
+    if _generation(store) != generation:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        )
+    result["history_validator"] = validator
+    return _publish_projected_page(
+        store,
+        generation,
+        result,
+        expanded,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        served_turn_end=served_turn_end,
+    )
+
+
+def _backward_history_request(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> dict:
+    before = params["before"]
+    validator = params.get("history_validator")
+    requested_end = validator.get("end") if isinstance(validator, dict) else None
+    store = runtime.opened.store
+    read_page = getattr(store, "history_index_page", None)
+    try:
+        page = read_page(
+            {
+                "backward": True,
+                "before": before,
+                **({"end": requested_end} if before is not None else {}),
+            }
+        ) if read_page is not None else None
+    except InvalidHistoryPageRequest as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+    except StaleHistorySnapshot as exc:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        ) from exc
+    if page is None:
+        return _projected_backward_history_request(
+            runtime,
+            params,
+            include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
+            served_turn_end=served_turn_end,
+        )
+    validator = history_validator(
+        (page.total, page.endpoint, page.repair_generation),
+        supplied=(
+            _MISSING_VALIDATOR if before is None else params["history_validator"]
+        ),
+    )
+    projection = history_projection_from_groups(
+        page.groups, page.approval_calls, served_turn_end=served_turn_end
+    )
+    local_before = len(page.groups)
+    result, _expanded = _backward_page_history(
+        projection,
+        local_before,
+        validator,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+        first_page=before is None,
+        snapshot_checked=True,
+    )
+    boundary = result["next_before"]
+    result["next_before"] = page.start + boundary if boundary is not None else (
+        page.start if page.start > 0 else None
+    )
+    result["history_validator"] = validator
+    return result
+
+
+def _forward_history_request(
+    runtime: ServerRuntime,
+    params: dict,
+    *,
+    include_delivery_id: bool,
+    fidelity: bool,
+    content_read: bool,
+    served_turn_end: bool,
+) -> dict:
+    store = runtime.opened.store
+    read_page = getattr(store, "history_index_page", None)
+    offset = params.get("offset", 0)
+    try:
+        page = read_page({"offset": offset}) if read_page is not None else None
+    except InvalidHistoryPageRequest as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+    except StaleHistorySnapshot as exc:
+        raise ProtocolError(
+            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
+            "session history changed; restart from the newest page",
+        ) from exc
+    if page is None:
+        return _projected_forward_history_request(
+            runtime,
+            params,
+            include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
+            served_turn_end=served_turn_end,
+        )
+    projection = history_projection_from_groups(
+        page.groups, page.approval_calls, served_turn_end=served_turn_end
+    )
+    result, _expanded = page_history(
+        projection,
+        0,
+        include_delivery_id=include_delivery_id,
+        fidelity=fidelity,
+        content_read=content_read,
+    )
+    local_next = result["next_offset"]
+    consumed = len(page.groups) if local_next is None else local_next
+    next_offset = page.start + consumed
+    result["next_offset"] = next_offset if next_offset <= page.total else None
+    return result
 
 
 def _validate_history_params(params: dict) -> None:
@@ -355,19 +617,8 @@ def _validate_history_params(params: dict) -> None:
             ErrorDescriptor.INVALID_PARAMS,
             "history_validator is only valid for continuations",
         )
-    if before is not None and (
-        not isinstance(validator, dict)
-        or set(validator) != {"end", "entry_id"}
-        or type(validator.get("end")) is not int
-        or validator.get("end") < 0
-        or (
-            validator.get("entry_id") is not None
-            and not isinstance(validator.get("entry_id"), str)
-        )
-    ):
-        raise ProtocolError(
-            ErrorDescriptor.INVALID_PARAMS, "history_validator is invalid"
-        )
+    if before is not None:
+        history_validator(supplied=validator)
 
 
 def history(

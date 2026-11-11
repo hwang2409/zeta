@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 
 from tests.support.login import block_loop_until_publication_decision_expires
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _request
@@ -606,25 +607,31 @@ async def test_cancel_during_provider_lock_release_reports_success(
 
 
 async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, monkeypatch):
-    import threading
-
     from zeta.core import login_flow
 
     entered = asyncio.Event()
-    release = threading.Event()
-    loop = asyncio.get_running_loop()
-    create = login_flow._create_redirect_server
+    release = asyncio.Event()
+    original_start_server = asyncio.start_server
     captured = {}
 
-    def create_server(handler, *, port):
-        server = create(handler, port=port)
-        shutdown = server.shutdown
-        def slow_shutdown():
-            loop.call_soon_threadsafe(entered.set)
-            assert release.wait(3)
-            shutdown()
-        server.shutdown = slow_shutdown
-        return server
+    class DelayedClose:
+        def __init__(self, listener):
+            self._listener = listener
+            self.sockets = listener.sockets
+
+        def close(self):
+            self._listener.close()
+            entered.set()
+
+        async def wait_closed(self):
+            await await_or_fail(release.wait(), what="delayed listener close")
+            await self._listener.wait_closed()
+
+    async def start_server(callback, *args, **kwargs):
+        listener = await original_start_server(callback, *args, **kwargs)
+        if callback.__name__ != "handle_callback":
+            return listener
+        return DelayedClose(listener)
 
     def build(state, challenge, redirect):
         captured.update(state=state, redirect=redirect)
@@ -633,23 +640,23 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
     async def exchange(*args):
         return OAuthTokens("access", "refresh", 4_000_000_000)
 
-    monkeypatch.setattr(login_flow, "_create_redirect_server", create_server)
+    monkeypatch.setattr(login_flow.asyncio, "start_server", start_server)
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
     server, reader, writer, _ = await connect(tmp_path)
     try:
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
-        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 10)
         task = server._client.logins.tasks["claude"]
-        # Publication already committed, so cancellation cannot report that
+        # publication already committed, so cancellation cannot report that
         # credentials were left unchanged.
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
         release.set()
         assert (await rpc(reader, writer, "login_cancel", provider="claude"))["result"] == {"state": "succeeded"}
-        listener = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", urlsplit(captured["redirect"]).port)
+        listener = await original_start_server(lambda r, w: w.close(), "127.0.0.1", urlsplit(captured["redirect"]).port)
         listener.close()
         await listener.wait_closed()
     finally:

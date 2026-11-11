@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background_owner import BackgroundAgentOwner
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent

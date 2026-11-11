@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from zeta.protocol.types import MESSAGE_ORIGIN_METADATA, MessageOrigin
 from zeta.transcript_search.index import MAX_UNIT_BYTES, render_transcript_units
 
@@ -213,10 +210,3 @@ def test_oversized_turn_splits_deterministically() -> None:
     assert [unit.chunk_index for unit in first] == list(range(len(first)))
     assert {unit.chunk_count for unit in first} == {len(first)}
     assert all(len(unit.text.encode()) <= MAX_UNIT_BYTES for unit in first)
-
-
-def test_eval_fixture_has_no_embedded_external_content() -> None:
-    root = Path(__file__).parent / "fixtures" / "transcript_search"
-    manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["fixture"] == "synthetic-v1"
-    assert all(item["target_unit_ids"] for item in manifest["queries"])

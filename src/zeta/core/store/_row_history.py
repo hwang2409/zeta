@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -9,13 +10,17 @@ from typing import TYPE_CHECKING, Any, Literal
 from ...protocol.types import (
     ASSISTANT_RESPONSE_ABORTED,
     ASSISTANT_RESPONSE_COMPLETED,
+    ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
     MESSAGE_ORIGIN_METADATA,
     MessageOrigin,
 )
+from ...storage_format import reject_unknown_keys
+from ._async_writes import _AppendTurnEndCommand
 from ._client_delivery import CLIENT_DELIVERY_METADATA
 
 if TYPE_CHECKING:
+    from ..checkpoints import ConversationEntry
     from ._store import ConversationStore
 
 
@@ -61,16 +66,17 @@ class DeliveredMessage:
 
 @dataclass(frozen=True, slots=True)
 class AssistantResponseAfter:
-    """The first completed or aborted assistant reply after ``seq``."""
+    """The first completed, aborted, or failed assistant reply after ``seq``."""
 
     seq: int
 
 
 @dataclass(frozen=True, slots=True)
 class UserTurnMessageAfter:
-    """The first user-authored message after ``seq``."""
+    """The first user-role message with ``origin`` after ``seq``."""
 
     seq: int
+    origin: MessageOrigin
 
 
 type RecentRowKey = (
@@ -110,11 +116,11 @@ def _predicate(key: RecentRowKey) -> tuple[str, Callable[[dict[str, Any]], bool]
             )
         case AssistantResponseAfter():
             return "message", _is_assistant_response
-        case UserTurnMessageAfter():
+        case UserTurnMessageAfter(_seq, origin):
             return "message", lambda data: (
                 data["message"].get("role") == "user"
                 and _metadata(data["message"]).get(MESSAGE_ORIGIN_METADATA)
-                == MessageOrigin.USER.value
+                == origin.value
             )
     raise TypeError(f"unknown recent row key: {key!r}")
 
@@ -127,7 +133,37 @@ def _is_assistant_response(data: dict[str, Any]) -> bool:
     return metadata.get(ASSISTANT_RESPONSE_STATE) in {
         ASSISTANT_RESPONSE_COMPLETED,
         ASSISTANT_RESPONSE_ABORTED,
+        ASSISTANT_RESPONSE_FAILED,
     } and not metadata.get("compaction_summary")
+
+
+TurnEndReason = Literal["completed", "user_stop", "error", "disconnect"]
+_TURN_END_REASONS = {"completed", "user_stop", "error", "disconnect"}
+_TURN_ID = re.compile(r"[0-9a-f]{32}").fullmatch
+
+
+def validate_turn_end_data(data: Mapping[str, object]) -> None:
+    reject_unknown_keys(data, "turn_history")
+    turn_id = data.get("turn_id")
+    if (
+        not isinstance(turn_id, str)
+        or _TURN_ID(turn_id) is None
+        or data.get("reason") not in _TURN_END_REASONS
+    ):
+        raise ValueError("invalid turn end")
+
+
+class TurnHistoryMixin:
+    def last_turn_end(self: ConversationStore) -> ConversationEntry | None:
+        entry = self._active_last_turn_end
+        return self._snapshot_entry(entry) if entry is not None else None
+
+    async def append_turn_end_async(
+        self: ConversationStore, turn_id: str, reason: TurnEndReason
+    ) -> None:
+        data = {"turn_id": turn_id, "reason": reason}
+        validate_turn_end_data(data)
+        await self._commit_storage_command(_AppendTurnEndCommand(data=data))
 
 
 class RecentRowsMixin:

@@ -49,6 +49,7 @@ from ..protocol.types import (
     ThinkingContent,
     assistant_text,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
@@ -103,6 +104,7 @@ from .slash_handlers.decisions_panel import DecisionsMixin
 from .slash_handlers.fork_view import ForkViewMixin
 from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
+from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
@@ -173,6 +175,7 @@ class TUIApp(
     ComposerAttachmentMixin,
     CommandRuntimeMixin,
     SlashHandlerMixin,
+    RemoteViewMixin,
     MCPManagerMixin,
     BackgroundTasksMixin,
     DecisionsMixin,
@@ -215,9 +218,15 @@ class TUIApp(
         project_eligible: bool | None = None,
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
+        foreground_event_publisher: ForegroundEventPublisher | None = None,
+        observer_host: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
+        self.foreground_event_publisher = (
+            foreground_event_publisher or ForegroundEventPublisher()
+        )
+        self.observer_host = observer_host
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -264,6 +273,7 @@ class TUIApp(
         self._spinner_reset = asyncio.Event()
         self._stream_invalidation_handle: asyncio.TimerHandle | None = None
         self._stream_invalidation_pending = False
+        self._background_invalidation_handle: asyncio.TimerHandle | None = None
         self._abort_requested = False
         self._macro_receipts = deque()
         self._last_passthrough: str = ""
@@ -310,6 +320,7 @@ class TUIApp(
             project_dir=repo_root,
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
+            include_tui_only=True,
         )
         self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
@@ -321,6 +332,7 @@ class TUIApp(
         self._active_session: PromptSession[str] | None = None
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
+        self._init_remote_view()
         self._history_finder = HistoryFinder(
             lambda: app._prompt_history.snapshot(app._viewed_session_path()),
             on_accept=lambda: app._clear_pending_attachments(),
@@ -345,6 +357,7 @@ class TUIApp(
         self._status_restore_text = ""
         self._status_restore_cursor = 0
         self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_snapshot = (
             lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
@@ -417,11 +430,13 @@ class TUIApp(
 
     async def _load_model_catalog_in_background(self) -> None:
         try:
-            self._model_catalog = await asyncio.to_thread(
+            catalog = await asyncio.to_thread(
                 self._model_catalog_loader, self.provider
             )
-        except Exception:
-            self._model_catalog = None
+            if catalog is not None:
+                self._model_catalog = catalog
+        except Exception:  # noqa: S110 - catalog refresh must not affect the TUI
+            pass
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
@@ -575,7 +590,7 @@ class TUIApp(
         )
         session = FullScreenPromptSession(
             message=[("class:prompt", " › ")],
-            placeholder=[("class:placeholder", "type a message...")],
+            placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
             history=None,
             key_bindings=bindings,
             completer=ComposerCompleter(
@@ -617,12 +632,8 @@ class TUIApp(
         if self._agent_navigation.child_view_active:
             return self._agent_navigation.current_path
         return self.loop.store.session_dir
-
     def _viewed_transcript(self) -> TranscriptWidget:
-        if self._agent_navigation.child_view_active:
-            return self._agent_navigation.transcript_control.transcript
-        return self._transcript
-
+        return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
         self._prompt_history.reset_navigation()
         finder = self._active_finder
@@ -826,14 +837,17 @@ class TUIApp(
         """Render child progress while keeping completion notices at turn boundaries."""
         self._refresh_decisions_for_event(event)
         if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
-            self._print_unit(self._presenter.render_event(event))
-            self._invalidate_stream_prompt()
+            rendered = self._presenter.render_event(event)
+            if rendered is not None:
+                self._print_unit(rendered)
+                self._invalidate_background_prompt()
             return
         if event.type in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
         }:
             self._handle_tool_event(event)
+            self._finish_background_invalidation()
             return
         if event.data.get("agent_instance_id") is not None:
             return
@@ -844,8 +858,12 @@ class TUIApp(
         }:
             if event.type is StreamEventType.TOOL_EXECUTION_START:
                 self._agent_navigation.request_refresh()
-            self._presenter.handle_tool_event(event, aborted=False)
-            self._invalidate_stream_prompt()
+            presentation = self._presenter.handle_tool_event(event, aborted=False)
+            if presentation is not None and presentation.visible_output:
+                if event.type is StreamEventType.TOOL_EXECUTION_END:
+                    self._finish_background_invalidation()
+                else:
+                    self._invalidate_background_prompt()
 
     def _schedule_background_wake(self) -> None:
         if self._closed:
@@ -1047,7 +1065,7 @@ class TUIApp(
             value = await session.prompt_async(
                 [("class:prompt", " › ")],
                 bottom_toolbar=lambda: app._status_toolbar(),
-                placeholder=[("class:placeholder", "type a message...")],
+                placeholder=lambda: [("class:placeholder", app._composer_placeholder())],
                 pre_run=insert_pending_tokens,
             )
         except EOFError:
@@ -1132,6 +1150,10 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None and (error := await observer_host.start_or_close()):
+                self.observer_host = None  # optional endpoint: never stops the TUI or a fork
+                self._handle_background_notice(f"remote observer unavailable: {error}")
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
@@ -1188,6 +1210,7 @@ class TUIApp(
                 # Suspending for a discussion fork keeps the runtime's work
                 # alive: do not cancel the turn or drop the session reference.
                 if self._suspending_for_fork:
+                    self._cancel_background_invalidation()
                     try:
                         await self._draft.flush_pending()
                     except Exception:  # noqa: S110 - notice already reported
