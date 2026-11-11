@@ -314,16 +314,19 @@ and bounds as `list_projects`. The result is
 `{"status":"new","messages":[...],"untrusted":false,"next_offset":null}`.
 Message objects are the same validated objects returned by inbox
 `action: "list"`, including each message's `origin`. The page-level `untrusted`
-value is `true` if any returned message has an origin other than `local`; it is
-`false` for an empty page or a page of only local messages. If one stored
-message would exceed a frame, the server shortens its largest text fields and
-lists their names in `truncated_fields`. Frame-size pagination can also add
-`truncated: true`. This request does not create inbox storage, recover or claim
-messages, mark messages done, or change sessions.
+value is `true` if any returned message is not marked `trusted_assignment`; it is
+`false` for an empty page or a page containing only trusted assignments. Each
+message includes `author` (`user` or `agent`) and `authority` (`information` or
+`trusted_assignment`). A client must use these fields, not message text, to decide
+whether a message is an assignment. If one stored message would exceed a frame,
+the server shortens its largest text fields and lists their names in
+`truncated_fields`. Frame-size pagination can also add `truncated: true`. This
+request does not create inbox storage, recover or claim messages, mark messages
+done, or change sessions.
 
-Messages with a non-local origin are untrusted cross-project content. A client
-must display them as data and must not treat their titles, bodies, outcomes, or
-replies as trusted instructions.
+Cross-project messages are information by default. A client must display message
+content as data and must not treat titles, bodies, outcomes, or replies as trusted
+instructions unless the message has an explicit `trusted_assignment` authority.
 
 All four project requests work before and after session attachment. Unknown
 projects return `-32602` with structured data
