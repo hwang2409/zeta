@@ -854,19 +854,22 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
     backend = None
     try:
         if route.live:
-            mark_canceled = ConversationStore.mark_agent_canceled
+            mark_canceled = ConversationStore.mark_agent_canceled_async
             skipped: list[str] = []
 
-            def cleanup_did_not_finalize(self: Any, parent_tool_call_id: str) -> None:
-                # the runner's cancel cleanup leaves the lifecycle running (as when its
-                # terminal fence refuses); only the receipt owner can finalize it now
+            async def cleanup_did_not_finalize(self: Any, parent_tool_call_id: str) -> None:
+                # the runner's cancel cleanup finalizes through the async storage
+                # command; refuse it once (as when its terminal fence refuses) so
+                # only the receipt owner's synchronous finalize can make the
+                # lifecycle terminal before the receipt installs. the receipt owner
+                # uses the sync mark_agent_canceled, which this seam never touches.
                 if parent_tool_call_id == "agent-1" and not skipped:
                     skipped.append(parent_tool_call_id)
                     return
-                mark_canceled(self, parent_tool_call_id)
+                await mark_canceled(self, parent_tool_call_id)
 
             # test-contract: seam the runner's cancel cleanup does not finalize the lifecycle
-            monkeypatch.setattr(ConversationStore, "mark_agent_canceled", cleanup_did_not_finalize)
+            monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", cleanup_did_not_finalize)
             backend = Actors(
                 {
                     "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
