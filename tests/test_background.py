@@ -1197,15 +1197,22 @@ async def test_background_task_owner_state_table(
             original_commit = registry.background_tasks._commit_transition
             cancelled = False
 
+            published = asyncio.Event()
+
             async def cancel_after_publish(rows, publish, notice):
                 nonlocal cancelled, observer
-                await original_commit(rows, publish, notice)
+
+                def publish_and_mark():
+                    publish()
+                    published.set()
+
+                observer = asyncio.create_task(observe_sink_admission())
+                await original_commit(rows, publish_and_mark, notice)
                 if (
                     not cancelled
                     and any(item["task_id"] == task_id and not item["running"] for item in rows)
                 ):
                     cancelled = True
-                    observer = asyncio.create_task(observe_sink_admission())
                     assert owner.lifecycle is not None
                     owner.lifecycle.cancel()
 
@@ -1218,7 +1225,7 @@ async def test_background_task_owner_state_table(
                 receipts.append(item)
 
             async def observe_sink_admission():
-                await asyncio.sleep(0)
+                await published.wait()
                 assert len(receipts) == 1
 
             # test-contract: seam force cancellation at the terminal publication boundary.
