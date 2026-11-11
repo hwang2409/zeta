@@ -86,7 +86,7 @@ class RemoteSessionClient:
             try:
                 value = json.loads(line)
                 if not isinstance(value, dict) or value.get("kind") != "session": continue
-                allowed = {"kind", "session_id", "name", "state", "machine_id", "socket", "pid"}
+                allowed = {"kind", "session_id", "name", "state", "machine_id", "socket", "pid", "cwd", "provider", "model"}
                 if any(key not in allowed for key in value): raise RemoteWireError("invalid remote session row")
                 session_id = validate_host(str(value["session_id"]))
                 rows.append(RemoteSession(display, session_id, str(value.get("name", "")), value.get("state"), str(value.get("machine_id", ""))))
