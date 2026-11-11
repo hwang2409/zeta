@@ -3393,6 +3393,7 @@ resident.on_entries_installed = installed
 import asyncio
 pending = asyncio.run(resident.pending_approval_page())
 resident.refresh()
+resident.refresh()
 print(json.dumps({
     "observed": observed,
     "pending": [item[0] for item in pending.items],
