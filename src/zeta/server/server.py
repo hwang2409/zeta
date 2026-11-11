@@ -266,6 +266,19 @@ class ZetaServer:
                 event, session_id=self.runtime.session_id, turn_id=None
             )
 
+    async def _close_foreground_events(self) -> None:
+        # a borrowed publisher belongs to the TUI and outlives this server
+        if self._foreground_event_publisher is None:
+            self.foreground_event_publisher.close()
+            return
+        subscription, self._foreground_subscription = self._foreground_subscription, None
+        if subscription is not None:
+            self._foreground_event_publisher.unsubscribe(subscription)
+        task, self._foreground_task = self._foreground_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     @property
     def address(self) -> str:
         if self.port is not None:
@@ -327,7 +340,7 @@ class ZetaServer:
                 try:
                     await self.control.close()
                 finally:
-                    self.foreground_event_publisher.close()
+                    await self._close_foreground_events()
                 try:
                     if not self._borrowed:
                         await self.runtime.close()
@@ -349,13 +362,6 @@ class ZetaServer:
                         self._server.close()
                         await self._server.wait_closed()
                 finally:
-                    if self._foreground_subscription is not None:
-                        self._foreground_subscription.close()
-                        self._foreground_subscription = None
-                    if self._foreground_task is not None:
-                        self._foreground_task.cancel()
-                        await asyncio.gather(self._foreground_task, return_exceptions=True)
-                        self._foreground_task = None
                     self._server = None
                     self._unix_listener = None
 

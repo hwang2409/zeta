@@ -237,3 +237,50 @@ def test_descriptor_rejects_overlong_socket_before_probe(tmp_path: Path) -> None
     path = publish(tmp_path, descriptor)
     with pytest.raises(DescriptorError, match="too long|invalid"):
         validate(path)
+
+
+@pytest.mark.asyncio
+async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Path) -> None:
+    """A host close (fork suspend) must not close the TUI's publisher, so a
+    restarted host still streams foreground events to new observers."""
+    from tests.support.fake_backend import FakeBackend
+    from tests.support.owned import await_or_fail
+    from tests.support.replay_transport import ReplayClient, negotiate
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.remote.host import ObserverHost
+    from zeta.runtime.foreground_events import ForegroundEventPublisher
+    from zeta.server.runtime import ServerRuntime
+
+    runtime = ServerRuntime(
+        tmp_path,
+        provider="codex",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    publisher = ForegroundEventPublisher()
+    host: ObserverHost | None = None
+    client: ReplayClient | None = None
+    try:
+        session_id = (await runtime.create_session(provider="codex")).session_id
+        host = ObserverHost(home=tmp_path, session_id=session_id, runtime=runtime, publisher=publisher)
+        await host.start()
+        await host.close()
+        await host.start()
+        reader, writer = await asyncio.open_unix_connection(str(host.socket))
+        client = ReplayClient(reader, writer, False)
+        await negotiate(client, observer=True)
+        joined = await client.request(2, "session_history_and_subscribe", {"session_id": session_id})
+        assert "error" not in joined, joined
+
+        async def source():
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="live after restart")
+
+        assert [event.delta async for event in publisher.events(source())] == ["live after restart"]
+        event = await await_or_fail(client.event("assistant_delta"), what="observer live event")
+        assert event["delta"] == "live after restart"
+    finally:
+        if client is not None:
+            await client.close()
+        if host is not None:
+            await host.close()
+        publisher.close()
+        await runtime.close()
