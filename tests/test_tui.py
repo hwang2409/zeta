@@ -6492,7 +6492,7 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
         pipe.send_text("\r")  # Enter accepts and closes the finder.
         await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:

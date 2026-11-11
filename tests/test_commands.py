@@ -626,7 +626,7 @@ async def test_message_finder_cancels_completion_before_up_navigation(
         session.app.key_processor.process_keys()
         assert session.app.current_buffer.text == "/r"
         session.app.exit()
-        await task
+        await asyncio.wait_for(task, timeout=10)
 
 
 async def test_custom_command_becomes_the_model_user_message(
