@@ -568,6 +568,8 @@ def full_screen_content(
     finder_window: AnyContainer | None = None,
     finder_active: Callable[[], bool] | None = None,
     queued_messages: Callable[[], Sequence[str]] = tuple,
+    decisions_answer_window: AnyContainer | None = None,
+    overlay_field_windows: Sequence[AnyContainer] = (),
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -648,7 +650,12 @@ def full_screen_content(
             Window(width=CONTENT_MARGIN, char=" "),
         ]
     )
-    content = HSplit([transcript_content, bottom])
+    content_rows = [transcript_content, bottom]
+    if decisions_answer_window is not None:
+        # A zero-height home in the layout so the hidden answer buffer is
+        # focusable; the panel itself renders the visible answer line.
+        content_rows.append(decisions_answer_window)
+    content = HSplit(content_rows)
     if agent_navigation is not None:
         agent_navigation.bind_transcript_layout(content, transcript)
     floats = [command_menu_float(composer.menu_top)]
@@ -659,5 +666,7 @@ def full_screen_content(
     if decisions_window is not None and decisions_active is not None:
         floats.append(status_card_float(decisions_window, decisions_active))
     if finder_window is not None and finder_active is not None:
+        if overlay_field_windows:
+            finder_window = HSplit([to_container(finder_window), *overlay_field_windows])
         floats.append(finder_float(finder_window, finder_active))
     return FloatContainer(content, floats=floats)
