@@ -58,7 +58,7 @@ def test_item_in_uses_keyed_lookup_without_iterating_values():
     ("name", "branch_text", "merge_text", "expected"),
     (
         ("bad", "before\nremoved\nafter\n", "before\nremoved\nafter\n", True),
-        ("allowed", "before\nremoved\nremoved\nafter\n", "before\nremoved\nremoved\nafter\n", False),
+        ("allowed", "before\nremoved\nremoved\nafter\n", "before\nremoved\nremoved\nafter\n", True),
         ("whitespace", "before\ndanger()\nafter\n", "before\ndanger( )\nafter\n", True),
     ),
 )
@@ -128,14 +128,44 @@ def test_branch_edit_overlapping_main_deletion_is_flagged(tmp_path: Path):
 @pytest.mark.parametrize("text", [
     'before()\nvalue = "a b"\nafter()\n',
     "before()\n# a b\nafter()\n",
+    'before()\nvalue = f"a b"\nafter()\n',
+    'before()\nvalue = f"""a\n b"""\nafter()\n',
 ])
 def test_python_string_and_comment_whitespace_is_not_normalized(tmp_path: Path, text: str):
     r = tmp_path / "token_text"
     r.mkdir()
-    changed = text.replace("a b", "ab")
+    changed = text.replace("a b", "ab").replace("\n b", "\nb")
     merge, _ = _public_line_case(r, text, text + "# branch\n", "before()\nafter()\n", changed, changed)
     result = run(r, merge)
     assert result.returncode == 0
+
+
+def test_intentional_branch_duplicate_is_allowed(tmp_path: Path):
+    r = tmp_path
+    merge, _ = _public_line_case(
+        r,
+        "before\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+        "before\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+        "before\nremoved\nremoved\nafter\n",
+    )
+    assert run(r, merge).returncode == 0
+
+
+def test_main_empty_file_still_checks_readded_block(tmp_path: Path):
+    r = tmp_path
+    merge, _ = _public_line_case(
+        r,
+        "def danger():\n    pass\n",
+        "def danger():\n    pass\n",
+        "",
+        "def danger():\n    pass\n",
+        "def danger():\n    pass\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
 
 
 def test_dropped_membership_element_flagged(tmp_path: Path):

@@ -1178,13 +1178,18 @@ def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[st
 
 def _normalized_python_lines(source: str) -> list[str]:
     lines = [[] for _ in source.splitlines()]
+    preserved = {tokenize.STRING, tokenize.COMMENT}
+    for name in ("FSTRING_MIDDLE", "TSTRING_MIDDLE"):
+        token_type = getattr(tokenize, name, None)
+        if token_type is not None:
+            preserved.add(token_type)
     try:
         tokens = tokenize.generate_tokens(io.StringIO(source).readline)
         for token in tokens:
             if token.type in {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.INDENT,
                               tokenize.DEDENT, tokenize.NEWLINE, tokenize.NL}:
                 continue
-            text = token.string if token.type in {tokenize.STRING, tokenize.COMMENT} else "".join(token.string.split())
+            text = token.string if token.type in preserved else "".join(token.string.split())
             parts = text.splitlines(keepends=True) or [text]
             for offset, part in enumerate(parts):
                 line_index = token.start[0] - 1 + offset
@@ -1264,36 +1269,32 @@ def _removed_line_findings(
                 Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
             )
     for start, end in deleted:
-        if any(
-            replacement_start < end and start < replacement_end
-            for replacement_start, replacement_end, _replacement in replacements
-        ):
-            continue
         sequence = base[start:end]
-        merge_index = _find_sequence(merge, sequence)
-        if merge_index is None:
-            continue
         expected = (
             _count_sequence(main, sequence)
             + _count_sequence(branch, sequence)
             - _count_sequence(base, sequence)
         )
-        if _count_sequence(branch, sequence) > _count_sequence(base, sequence) and _count_sequence(
-            merge, sequence
-        ) <= _count_sequence(branch, sequence):
-            continue
         if _count_sequence(merge, sequence) <= expected:
             continue
-        findings.append(
-            Item(path, "main-deleted-line", main_range, start + 1, merge_lines[merge_index])
-        )
+        merge_index = _find_sequence(merge, sequence)
+        if merge_index is not None:
+            findings.append(
+                Item(path, "main-deleted-line", main_range, start + 1, merge_lines[merge_index])
+            )
     return findings
 
 
 def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: dict) -> list[Item]:
     texts = [sources.get((revision, path)) for revision in revisions]
-    if any(text is None or not text for text in texts[:3]) or texts[3] is None:
+    if texts[0] is None or texts[3] is None:
         return []
+    findings = _removed_line_findings(
+        path, texts[0], texts[1] or "", texts[2] or "", texts[3],
+        f"{revisions[0]}..{revisions[1]}",
+    )
+    if any(text is None or not text for text in texts[:3]):
+        return findings
     path_items = [
         {key: item for key, item in parsed[revision].items() if item.path == path}
         for revision in revisions
@@ -1303,9 +1304,7 @@ def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: 
         _owner_translation(path_items[1], path_items[2]),
         _owner_translation(path_items[3], path_items[2]),
     )
-    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps) + _removed_line_findings(
-        path, texts[0], texts[1], texts[2], texts[3], f"{revisions[0]}..{revisions[1]}"
-    )
+    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps) + findings
 
 
 def _parse_merge_data(commit: str, main: str, branch: str, args):
@@ -1325,6 +1324,7 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
         finding
         for path in all_paths
         for finding in _path_line_findings(path, revisions, sources, parsed)
+        if not (args.final and finding.kind == "main-deleted-line")
     ]
     return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
 
