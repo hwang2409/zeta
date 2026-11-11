@@ -99,7 +99,7 @@ def test_main_deleted_block_moved_in_merge_is_flagged(tmp_path: Path):
     merge, _ = _public_line_case(
         r,
         "before()\nremoved()\nafter()\n",
-        "before()\nremoved()\nafter()\n# branch\n",
+        "before()\nremoved()\nafter()\n",
         "before()\nafter()\n",
         "removed()\nbefore()\nafter()\n",
         "removed()\nbefore()\nafter()\n",
@@ -1106,6 +1106,8 @@ def _public_line_case(
     commit(r, "base")
     subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
     (r / "src/a.py").write_text(branch_text)
+    if branch_text == base_text:
+        (r / "branch-note.txt").write_text("branch change\n")
     commit(r, "branch")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
     (r / "src/a.py").write_text(main_text)

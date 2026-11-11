@@ -1211,21 +1211,6 @@ def _deleted_intervals(base: list[str], main: list[str]) -> list[tuple[int, int]
     ]
 
 
-def _branch_insertions(
-    base: list[str], branch: list[str], deleted: list[tuple[int, int]]
-) -> Counter[str]:
-    inserted: Counter[str] = Counter()
-    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-        None, base, branch, autojunk=False
-    ).get_opcodes():
-        if tag != "insert":
-            continue
-        if any(start < old_start < end for start, end in deleted):
-            continue
-        inserted.update(branch[new_start:new_end])
-    return inserted
-
-
 def _branch_replacements(
     base: list[str], branch: list[str], deleted: list[tuple[int, int]]
 ) -> list[tuple[int, int, list[str]]]:
@@ -1250,6 +1235,16 @@ def _find_sequence(lines: list[str], sequence: list[str]) -> int | None:
     return None
 
 
+def _count_sequence(lines: list[str], sequence: list[str]) -> int:
+    if not sequence:
+        return 0
+    width = len(sequence)
+    return sum(
+        lines[index : index + width] == sequence
+        for index in range(len(lines) - width + 1)
+    )
+
+
 def _removed_line_findings(
     path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
     main_range: str,
@@ -1260,13 +1255,7 @@ def _removed_line_findings(
     merge_lines = merge_text.splitlines()
     merge = _normalized_lines(path, merge_text)
     deleted = _deleted_intervals(base, main)
-    inserted = _branch_insertions(base, branch, deleted)
     replacements = _branch_replacements(base, branch, deleted)
-    branch_has_replacements = any(
-        tag in {"delete", "replace"}
-        for tag, *_ in difflib.SequenceMatcher(None, base, branch, autojunk=False).get_opcodes()
-    )
-    branch_counts = Counter(branch)
     findings = []
     for base_index, _old_end, replacement in replacements:
         merge_index = _find_sequence(merge, replacement)
@@ -1275,8 +1264,6 @@ def _removed_line_findings(
                 Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
             )
     for start, end in deleted:
-        if branch_has_replacements:
-            continue
         if any(
             replacement_start < end and start < replacement_end
             for replacement_start, replacement_end, _replacement in replacements
@@ -1286,9 +1273,16 @@ def _removed_line_findings(
         merge_index = _find_sequence(merge, sequence)
         if merge_index is None:
             continue
-        if all(inserted[value] for value in sequence) and all(
-            branch_counts[value] >= merge.count(value) for value in set(sequence)
-        ):
+        expected = (
+            _count_sequence(main, sequence)
+            + _count_sequence(branch, sequence)
+            - _count_sequence(base, sequence)
+        )
+        if _count_sequence(branch, sequence) > _count_sequence(base, sequence) and _count_sequence(
+            merge, sequence
+        ) <= _count_sequence(branch, sequence):
+            continue
+        if _count_sequence(merge, sequence) <= expected:
             continue
         findings.append(
             Item(path, "main-deleted-line", main_range, start + 1, merge_lines[merge_index])
