@@ -9212,6 +9212,29 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persisted_assistant_turn_records_backend_model(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    backend.model = "gpt-5.6-sol"
+    store = ConversationStore(tmp_path)
+
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        assistant = next(
+            message
+            for message in store.messages()
+            if message.role is MessageRole.ASSISTANT
+        )
+        assert assistant.metadata["model"] == "gpt-5.6-sol"
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_without_a_model_still_inherits_the_parent_backend(
     tmp_path: Path,
 ) -> None:
