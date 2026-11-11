@@ -223,6 +223,8 @@ class EventDescriptor(StrEnum):
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     REPLAY_STREAM_ENDED = "replay_stream_ended"
     CONFIG_CHANGED = "config_changed"
+    BACKGROUND_TASK_UPDATED = "background_task_updated"
+    TODO_UPDATED = "todo_updated"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -260,6 +262,7 @@ FEATURES = (
     "path_completion",
     "child_runs",
     "delivery_session_guard",
+    "run_work",
 )
 
 
@@ -344,6 +347,13 @@ class MethodDescriptor(Enum):
         "session_grants",
         Access.SESSION_MUTATION,
     )
+    RUN_WORK_LIST = ("run_work_list", None, "run_work", Access.CONTROLLER_READ)
+    BACKGROUND_TASK_CANCEL = (
+        "background_task_cancel",
+        None,
+        "run_work",
+        Access.SESSION_MUTATION,
+    )
     CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.CONTROLLER_READ)
     CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
 
@@ -373,6 +383,11 @@ class MethodDescriptor(Enum):
         ]
         return sorted(methods) if role == "observer" else methods
 
+
+EVENT_ACCESS = {
+    EventDescriptor.BACKGROUND_TASK_UPDATED: Access.CONTROLLER_READ,
+    EventDescriptor.TODO_UPDATED: Access.CONTROLLER_READ,
+}
 
 
 _LOGIN_METHODS = frozenset(
