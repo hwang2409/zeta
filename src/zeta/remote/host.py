@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 from pathlib import Path
 from typing import Any
 
@@ -50,9 +51,8 @@ class ObserverHost:
         self._socket_identity: tuple[int, int] | None = None
         self._started = False
 
-    async def start(self) -> None:
-        if self._started:
-            return
+    def _prepare(self) -> tuple[socket.socket, tuple[int, int]]:
+        # Off the TUI loop: the borrowed runtime opens a SessionManager and the socket setup probes.
         if self.runtime is None:
             opened, loop, policy, project_dir, repo_root = self._runtime_args
             if not all(value is not None for value in (opened, loop, policy, project_dir, repo_root)):
@@ -65,22 +65,27 @@ class ObserverHost:
                 project_dir=project_dir,
                 repo_root=repo_root,
             )
-        observer_socket = await asyncio.to_thread(create_observer_socket, self.socket)
-        socket_stat = self.socket.lstat()
-        socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
+        return create_observer_socket(self.socket)
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        observer_socket, socket_identity = await asyncio.to_thread(self._prepare)
         self._socket_identity = socket_identity
-        server = ZetaServer(
-            home=self.home,
-            socket_path=self.socket,
-            runtime=self.runtime,
-            foreground_event_publisher=self.publisher,
-            max_role="observer",
-            prebound_socket=observer_socket,
-        )
+        server: ZetaServer | None = None
         try:
+            server = ZetaServer(
+                home=self.home,
+                socket_path=self.socket,
+                runtime=self.runtime,
+                foreground_event_publisher=self.publisher,
+                max_role="observer",
+                prebound_socket=observer_socket,
+            )
             await server.start()
         except BaseException:
-            await server.close()
+            if server is not None:
+                await server.close()
             observer_socket.close()
             await asyncio.to_thread(unlink_observer_socket, self.socket, socket_identity)
             self._socket_identity = None

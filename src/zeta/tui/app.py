@@ -1018,7 +1018,7 @@ class TUIApp(
             return
         try:
             await observer_host.start()
-        except Exception as exc:  # noqa: BLE001 - reported as a notice
+        except Exception as exc:
             self.observer_host = None
             with contextlib.suppress(Exception):
                 await observer_host.close()

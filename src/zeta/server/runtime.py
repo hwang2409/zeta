@@ -223,6 +223,10 @@ class ServerRuntime:
         self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
+        self._init_sinks()
+
+    def _init_sinks(self) -> None:
+        # Shared with borrowed(): every sink and reaper field starts unset in both.
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
@@ -297,11 +301,7 @@ class ServerRuntime:
         runtime.backend_factory = None
         runtime.manager = SessionManager(runtime.home, owner_surface="serve")
         runtime._project_registry_probed = True
-        runtime._background_event_sink = None
-        runtime._background_wake_sink = None
-        runtime._approval_control_binder = None
-        runtime._memory_notice_sink = None
-        runtime._setup_reapers = set()
+        runtime._init_sinks()
         runtime._state = SessionState(
             opened=opened,
             loop=loop,

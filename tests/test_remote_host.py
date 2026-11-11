@@ -16,7 +16,7 @@ from zeta.remote.descriptor import (
 )
 
 
-def test_descriptor_rejects_unsafe_socket_and_overlong_path(tmp_path: Path) -> None:
+def test_descriptor_rejects_missing_socket(tmp_path: Path) -> None:
     descriptor = Descriptor(str(tmp_path / "missing.sock"), "session", os.getpid())
     path = publish(tmp_path, descriptor)
     with pytest.raises(DescriptorError):
@@ -51,7 +51,7 @@ async def test_stale_probe_runs_off_loop(tmp_path: Path, monkeypatch: pytest.Mon
 
     original = host_module.create_observer_socket
 
-    def checked(path: Path) -> socket.socket:
+    def checked(path: Path) -> tuple[socket.socket, tuple[int, int]]:
         threads.append(threading.current_thread())
         return original(path)
 
@@ -240,7 +240,7 @@ async def test_attach_keeps_every_stdin_byte_when_socket_reader_is_slow(
         assert await asyncio.wait_for(bridge, 10) == 0
     finally:
         bridge.cancel()
-        await asyncio.gather(bridge, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(bridge, return_exceptions=True), 10)
         os.close(read_fd)
         await asyncio.wait_for(asyncio.gather(feeder, return_exceptions=True), 10)
         descriptor_path.unlink(missing_ok=True)
@@ -281,7 +281,7 @@ async def test_observer_host_rejects_unsafe_socket_directory(
         await host.close()
 
 
-def test_standalone_socket_parent_keeps_permissive_mode(tmp_path: Path) -> None:
+def test_standalone_socket_parent_is_tightened_to_owner_only(tmp_path: Path) -> None:
     from zeta.server.server import _UnixSocketListener
 
     parent = tmp_path / "ordinary"
@@ -356,6 +356,7 @@ async def test_tui_runs_with_notice_when_observer_host_start_fails(
     from rich.text import Text
 
     from tests.support.fake_backend import FakeBackend
+    from tests.support.owned import await_or_fail
     from zeta.core.store import ConversationStore
     from zeta.remote.host import ObserverHost
     from zeta.runtime.foreground_events import ForegroundEventPublisher
@@ -408,17 +409,16 @@ async def test_tui_runs_with_notice_when_observer_host_start_fails(
             )
             running = asyncio.create_task(app.run(session))
             try:
-                ready = asyncio.ensure_future(prompt_ready.wait())
-                await asyncio.wait([running, ready], timeout=10, return_when=asyncio.FIRST_COMPLETED)
-                ready.cancel()
+                running.add_done_callback(lambda _task: prompt_ready.set())
+                await await_or_fail(prompt_ready.wait(), what="TUI prompt or run end")
                 stopped = running.exception() if running.done() else None
                 assert stopped is None, f"observer host failure stopped the TUI: {stopped!r}"
-                assert prompt_ready.is_set(), "TUI did not reach its prompt after observer host failure"
+                assert not running.done(), "TUI ended before its prompt after observer host failure"
                 app.request_exit()
                 await asyncio.wait_for(running, 10)
             finally:
                 running.cancel()
-                await asyncio.gather(running, return_exceptions=True)
+                await asyncio.wait_for(asyncio.gather(running, return_exceptions=True), 10)
         assert app.observer_host is None
         transcript = "\n".join(Text.from_ansi(line).plain for line in app._transcript_lines)
         assert "remote observer unavailable:" in transcript, transcript

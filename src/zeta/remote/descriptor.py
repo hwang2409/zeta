@@ -36,7 +36,7 @@ def observer_socket_dir(directory: Path | None = None) -> Path:
     return directory
 
 
-def create_observer_socket(path: Path) -> socket.socket:
+def create_observer_socket(path: Path) -> tuple[socket.socket, tuple[int, int]]:
     observer_socket_dir(path.parent)
     try:
         path_stat = path.lstat()
@@ -65,7 +65,7 @@ def create_observer_socket(path: Path) -> socket.socket:
         unix_socket.listen(socket.SOMAXCONN)
         socket_stat = path.lstat()
         identity = (socket_stat.st_dev, socket_stat.st_ino)
-        return unix_socket
+        return unix_socket, identity
     except BaseException:
         unix_socket.close()
         if identity is not None:
