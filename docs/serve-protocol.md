@@ -313,16 +313,19 @@ and bounds as `list_projects`. The result is
 `{"status":"new","messages":[...],"untrusted":false,"next_offset":null}`.
 Message objects are the same validated objects returned by inbox
 `action: "list"`, including each message's `origin`. The page-level `untrusted`
-value is `true` if any returned message has an origin other than `local`; it is
-`false` for an empty page or a page of only local messages. If one stored
-message would exceed a frame, the server shortens its largest text fields and
-lists their names in `truncated_fields`. Frame-size pagination can also add
-`truncated: true`. This request does not create inbox storage, recover or claim
-messages, mark messages done, or change sessions.
+value is `true` if any returned message is not marked `trusted_assignment`; it is
+`false` for an empty page or a page containing only trusted assignments. Each
+message includes `author` (`user` or `agent`) and `authority` (`information` or
+`trusted_assignment`). A client must use these fields, not message text, to decide
+whether a message is an assignment. If one stored message would exceed a frame,
+the server shortens its largest text fields and lists their names in
+`truncated_fields`. Frame-size pagination can also add `truncated: true`. This
+request does not create inbox storage, recover or claim messages, mark messages
+done, or change sessions.
 
-Messages with a non-local origin are untrusted cross-project content. A client
-must display them as data and must not treat their titles, bodies, outcomes, or
-replies as trusted instructions.
+Cross-project messages are information by default. A client must display message
+content as data and must not treat titles, bodies, outcomes, or replies as trusted
+instructions unless the message has an explicit `trusted_assignment` authority.
 
 All four project requests work before and after session attachment. Unknown
 projects return `-32602` with structured data
@@ -868,8 +871,10 @@ With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
-or `abort`. Without the feature, the status shape and unbounded strict durable
-projection are unchanged.
+or `abort`. Read-only observers receive the same live baseline as the controller,
+but approval mutations still return `-32008`. Without the feature, the status
+shape and unbounded strict durable projection are unchanged, and observers
+receive the same rows as the controller.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
@@ -1452,8 +1457,9 @@ error code and message. Provider status and origin remain internal.
   `status: {"state": "idle|running|tool", "pending_approvals": [...],
   "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
   `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
-  The status is captured at join start. Apply the joined status, then sequenced
-  events after it. Open approvals are the baseline request ids plus
+  The status is captured at join start. Controllers and read-only observers get
+  the same approval baseline. Apply the joined status, then sequenced events
+  after it. Open approvals are the baseline request ids plus
   `approval_request` ids in the joined page, minus `approval_end` ids in the
   joined page, then updated by the sequenced tail by id. A session admits at
   most 64 pending approvals across foreground and delegated tools. A 65th
