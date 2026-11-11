@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from types import SimpleNamespace
 
+from ...core.store import ObserverSnapshotChanged
 from ...core.store._history_index import (
     InvalidHistoryPageRequest,
     StaleHistorySnapshot,
@@ -31,19 +33,52 @@ _MISSING_VALIDATOR = object()
 
 
 def _stable_history_read[T](
-    store: object, read: Callable[[], T], *, has_end: bool
+    produce: Callable[[bool], object], read: Callable[[object], T], *, has_end: bool
 ) -> T:
+    """Build one page from a store snapshot that does not move during the read.
+
+    ``produce(final)`` returns the store to read from. For the child route it
+    refreshes an observer reader and can raise ``ObserverSnapshotChanged`` when
+    the child transcript moves mid-refresh; a continuation (``has_end``) surfaces
+    that move as the documented ``-32009`` stale error. A newest-page read
+    retries acquisition and generation drift off-loop a bounded number of times,
+    and its final attempt (``produce(True)``) returns a consistent snapshot to
+    serve instead of raising.
+    """
     if has_end:
-        return read()
+        return read(produce(False))
     for attempt in range(_STABLE_HISTORY_ATTEMPTS):
+        final = attempt == _STABLE_HISTORY_ATTEMPTS - 1
+        try:
+            store = produce(final)
+        except ObserverSnapshotChanged:
+            if final:
+                raise
+            continue
         generation = _generation(store)
-        result = read()
-        if (
-            generation == _generation(store)
-            or attempt == _STABLE_HISTORY_ATTEMPTS - 1
-        ):
+        result = read(store)
+        if generation == _generation(store) or final:
             return result
     raise AssertionError("unreachable")
+
+
+def child_history(
+    produce_reader: Callable[[bool], object], params: dict, *, fidelity: bool
+) -> dict:
+    """Serve one child history page from a stable observer snapshot.
+
+    ``produce_reader(final)`` refreshes and returns the child reader store; the
+    shared stable-read owner retries a validator-less page and serves a
+    consistent snapshot, so only an end-bound continuation can return ``-32009``.
+    """
+
+    def read(reader: object) -> dict:
+        runtime = SimpleNamespace(opened=SimpleNamespace(store=reader))
+        return history(runtime, params, backward_enabled=True, fidelity=fidelity)
+
+    return _stable_history_read(
+        produce_reader, read, has_end=params["before"] is not None
+    )
 
 
 def history_validator(
@@ -412,8 +447,8 @@ def replay_history(
     """Return the newest backward page and its stable frontier row."""
     store = runtime.opened.store
     return _stable_history_read(
-        store,
-        lambda: _backward_history_page(
+        lambda _final: store,
+        lambda _store: _backward_history_page(
             runtime,
             {"before": None},
             include_delivery_id=include_delivery_id,
@@ -668,8 +703,8 @@ def history(
     if "before" in params:
         _validate_history_params(params)
         return _stable_history_read(
-            runtime.opened.store,
-            lambda: _backward_history_request(
+            lambda _final: runtime.opened.store,
+            lambda _store: _backward_history_request(
                 runtime,
                 params,
                 include_delivery_id=include_delivery_id,
@@ -689,8 +724,8 @@ def history(
             ErrorDescriptor.INVALID_PARAMS, "offset must be a nonnegative integer"
         )
     return _stable_history_read(
-        runtime.opened.store,
-        lambda: _forward_history_request(
+        lambda _final: runtime.opened.store,
+        lambda _store: _forward_history_request(
             runtime,
             params,
             include_delivery_id=include_delivery_id,

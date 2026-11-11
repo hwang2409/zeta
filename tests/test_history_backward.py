@@ -13,6 +13,7 @@ from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
+from zeta.core.store import ConversationStore, ObserverSnapshotChanged
 from zeta.core.store._history_index import HistoryIndexUnavailableError
 from zeta.protocol.types import (
     Message,
@@ -104,7 +105,7 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
     try:
         await request(
             reader, writer, 1, "hello",
-            {"protocol_version": "1.2", "features": ["session_history_backward"]},
+            {"protocol_version": "1.2", "features": ["session_history_backward", "child_run_history"]},
         )
         session = (await request(
             reader, writer, 2, "new_session", {"provider": "codex"}
@@ -283,6 +284,7 @@ async def test_real_socket_backward_continuation_survives_append_but_not_repair(
         ("indexed", {"before": None}),
         ("projected-backward", {"before": None}),
         ("projected-forward", {}),
+        ("child", {"before": None}),
     ],
 )
 async def test_real_socket_validatorless_history_retries_concurrent_append(
@@ -296,6 +298,56 @@ async def test_real_socket_validatorless_history_retries_concurrent_append(
         page_ready = threading.Event()
         release_page = threading.Event()
         calls = 0
+
+        if route == "child":
+            child = ConversationStore(
+                store.session_dir / "agents",
+                session_id="1",
+                _storage_lease=store._storage_lease,
+            )
+            child.start_agent_lifecycle(
+                handle=f"{session_id}:1",
+                started_at="2026-01-01T00:00:00+00:00",
+                depth=1,
+                agent_type="worker",
+                description="child",
+            )
+            child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child-0")]))
+            child.close()
+            warm = (await request(
+                reader, writer, 3, "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            ))[-1]
+            assert "result" in warm, warm
+            # a real child append races the next reader acquisition; the forced
+            # refresh failure stands in for the stat race the append causes.
+            followup = ConversationStore(
+                store.session_dir / "agents",
+                session_id="1",
+                _storage_lease=store._storage_lease,
+            )
+            followup.append_message(Message(MessageRole.ASSISTANT, [TextContent("child-1")]))
+            followup.close()
+            cached = server.connections._child_reader[1]
+            real_refresh = cached.refresh
+
+            def racing_refresh() -> None:
+                nonlocal calls
+                calls += 1
+                if calls < 2:
+                    raise ObserverSnapshotChanged("child transcript moved during acquisition")
+                return real_refresh()
+
+            monkeypatch.setattr(cached, "refresh", racing_refresh)
+            response = (await request(
+                reader, writer, 4, "child_run_history",
+                {"session_id": session_id, "run_id": f"{session_id}:1"},
+            ))[-1]
+            assert "result" in response, response
+            assert calls >= 2
+            texts = [row["content"][0]["text"] for row in response["result"]["messages"]]
+            assert texts[-1] == "child-1"
+            return
 
         if route == "indexed":
             index = store._history_index
