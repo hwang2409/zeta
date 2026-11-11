@@ -54,6 +54,125 @@ def _rendered_text(data: dict[str, object]) -> str:
     return rendered.plain
 
 
+async def _run_model_route(
+    manager: SessionManager,
+    session_id: str,
+    recipient_project_id: str,
+    registry: ProjectRegistry,
+    epoch: int,
+    case: str,
+) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    resumed = await asyncio.to_thread(manager.open, session_id)
+    resumed_loop = AgentLoop(
+        backend, resumed.store, skill_catalog=SkillCatalog.empty(),
+        root_project_id=recipient_project_id, project_registry=registry,
+    )
+    try:
+        await resumed_loop.activate()
+        events = [event async for event in resumed_loop.run_turn(
+            "resume", origin=MessageOrigin.USER
+        )]
+        notification = next(event for event in events if event.type is StreamEventType.AGENT_NOTIFICATION)
+        delivered = next(
+            message_ for message_ in backend.calls[0][0]
+            if "zeta.step_delivery" in message_.metadata
+        )
+        model_text = "\n".join(
+            block.text for message_ in backend.calls[0][0]
+            for block in message_.content if isinstance(block, TextContent)
+        )
+        text = notification.data["text"]
+        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
+        assert expected in text
+        assert text in model_text
+        if epoch >= 7:
+            assert "trusted_assignment" not in model_text
+            if case in {"delegated", "revoked"}:
+                metadata_text = json.dumps(delivered.metadata["notifications"])
+                assert all(
+                    marker not in metadata_text
+                    for marker in ('"author":', '"authority":', "trusted_assignment")
+                )
+    finally:
+        await resumed_loop.close()
+        resumed.store.close()
+
+
+async def _run_live_route(
+    manager: SessionManager,
+    session_id: str,
+    recipient_project_id: str,
+    registry: ProjectRegistry,
+    entry: object,
+    epoch: int,
+) -> None:
+    resumed = await asyncio.to_thread(manager.open, session_id)
+    live_loop = AgentLoop(
+        FakeBackend([]), resumed.store, skill_catalog=SkillCatalog.empty(),
+        root_project_id=recipient_project_id, project_registry=registry,
+    )
+    try:
+        await live_loop.activate()
+        event = live_loop._delivery_publication_events(
+            DeliveryPublications((entry,), None)
+        )[0]
+        rendered = _rendered_text(event.data)
+        served = await _serve_payload(event.data)
+        assert served["text"] == rendered
+        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
+        assert expected in rendered
+        if epoch >= 7:
+            assert "trusted_assignment" not in rendered
+    finally:
+        await live_loop.close()
+        resumed.store.close()
+
+
+async def _run_rpc_route(
+    tmp_path: Path,
+    home: Path,
+    registry: ProjectRegistry,
+    manager: SessionManager,
+    recipient_project_id: str,
+    message_id: str,
+    session_id: str,
+    case: str,
+    epoch: int,
+) -> None:
+    registry._storage_lease.close()
+    manager._storage_lease.close()
+    (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
+    server = _server(tmp_path)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects"])
+        result = (await _request(
+            reader, writer, 2, "project_inbox",
+            {"project_id": recipient_project_id},
+        ))[-1]["result"]
+        row = next(item for item in result["messages"] if item["id"] == message_id)
+        if epoch < 7:
+            assert "authority" not in row
+            assert "author" not in row
+            assert result["untrusted"] is False
+        else:
+            expected_authority = "trusted_assignment" if case in {"delegated", "legacy"} else "information"
+            assert row["authority"] == expected_authority
+            assert row["author"] == ("user" if case == "legacy" else "agent")
+            assert result["untrusted"] is (expected_authority != "trusted_assignment")
+        if epoch >= 7 and case in {"delegated", "revoked"}:
+            live_inbox = ProjectInbox(
+                server.runtime.manager.project_registry, sessions_root=home / "sessions"
+            )
+            claimed = await asyncio.to_thread(
+                live_inbox.claim, recipient_project_id, message_id, session_id
+            )
+            assert (claimed is not None) is (case == "delegated")
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.parametrize("case", ["legacy", "agent", "delegated", "revoked"])
 @pytest.mark.parametrize("epoch", [6, 7])
 @pytest.mark.parametrize("route", ["model", "live", "rpc"])
@@ -149,87 +268,19 @@ async def test_inbox_provenance_routes(
     opened.store.close()
 
     if route == "model":
-        backend = FakeBackend([ScriptedTurn([TextContent("done")])])
-        resumed = await asyncio.to_thread(manager.open, session_id)
-        resumed_loop = AgentLoop(
-            backend, resumed.store, skill_catalog=SkillCatalog.empty(),
-            root_project_id=recipient.project_id, project_registry=registry,
+        await _run_model_route(
+            manager, session_id, recipient.project_id, registry, epoch, case
         )
-        try:
-            await resumed_loop.activate()
-            events = [event async for event in resumed_loop.run_turn(
-                "resume", origin=MessageOrigin.USER
-            )]
-            notification = next(event for event in events if event.type is StreamEventType.AGENT_NOTIFICATION)
-            model_text = "\n".join(
-                block.text for message_ in backend.calls[0][0]
-                for block in message_.content if isinstance(block, TextContent)
-            )
-            text = notification.data["text"]
-            expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-            assert expected in text
-            assert text in model_text
-            if epoch >= 7:
-                assert "trusted_assignment" not in model_text
-        finally:
-            await resumed_loop.close()
-            resumed.store.close()
         return
-
     if route == "live":
-        resumed = await asyncio.to_thread(manager.open, session_id)
-        live_loop = AgentLoop(
-            FakeBackend([]), resumed.store, skill_catalog=SkillCatalog.empty(),
-            root_project_id=recipient.project_id, project_registry=registry,
+        await _run_live_route(
+            manager, session_id, recipient.project_id, registry, entry, epoch
         )
-        try:
-            await live_loop.activate()
-            event = live_loop._delivery_publication_events(
-                DeliveryPublications((entry,), None)
-            )[0]
-            rendered = _rendered_text(event.data)
-            served = await _serve_payload(event.data)
-            assert served["text"] == rendered
-            expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-            assert expected in rendered
-            if epoch >= 7:
-                assert "trusted_assignment" not in rendered
-        finally:
-            await live_loop.close()
-            resumed.store.close()
         return
-
-    registry._storage_lease.close()
-    manager._storage_lease.close()
-    (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
-    server = _server(tmp_path)
-    reader, writer = await _connect(server)
-    try:
-        await _hello(reader, writer, ["projects"])
-        result = (await _request(
-            reader, writer, 2, "project_inbox",
-            {"project_id": recipient.project_id},
-        ))[-1]["result"]
-        row = next(item for item in result["messages"] if item["id"] == message_id)
-        if epoch < 7:
-            assert "authority" not in row
-            assert "author" not in row
-            assert result["untrusted"] is False
-        else:
-            expected_authority = "trusted_assignment" if case in {"delegated", "legacy"} else "information"
-            assert row["authority"] == expected_authority
-            assert row["author"] == ("user" if case == "legacy" else "agent")
-            assert result["untrusted"] is (expected_authority != "trusted_assignment")
-        if epoch >= 7 and case in {"delegated", "revoked"}:
-            live_inbox = ProjectInbox(
-                server.runtime.manager.project_registry, sessions_root=home / "sessions"
-            )
-            claimed = await asyncio.to_thread(
-                live_inbox.claim, recipient.project_id, message_id, session_id
-            )
-            assert (claimed is not None) is (case == "delegated")
-    finally:
-        await close_serve(server, writer)
+    await _run_rpc_route(
+        tmp_path, home, registry, manager, recipient.project_id, message_id,
+        session_id, case, epoch,
+    )
 
 
 def test_legacy_and_missing_origin_fail_closed(tmp_path: Path) -> None:
