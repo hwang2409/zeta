@@ -144,46 +144,43 @@ def _notification_registry(
 async def test_shutdown_snapshot_does_not_block_live_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    loop = asyncio.get_running_loop()
+    loop_thread_id = threading.get_ident()
     snapshot_started = threading.Event()
     release_snapshot = threading.Event()
-    during_snapshot_ticks: list[int] = []
+    loop_proved_live = asyncio.Event()
+    snapshot_thread_id: int | None = None
     snapshot_calls = 0
 
     def slow_snapshot(root_pids: Sequence[int]) -> dict[int, dict[int, str]]:
-        nonlocal snapshot_calls
+        nonlocal snapshot_calls, snapshot_thread_id
         snapshot_calls += 1
         if snapshot_calls == 1:
+            snapshot_thread_id = threading.get_ident()
             snapshot_started.set()
-            threading.Timer(0.1, lambda: during_snapshot_ticks.append(ticks)).start()
-            release_snapshot.wait(0.3)
+
+            async def prove_loop_live() -> None:
+                loop_proved_live.set()
+
+            asyncio.run_coroutine_threadsafe(prove_loop_live(), loop).result(
+                timeout=10
+            )
+            assert release_snapshot.wait(timeout=10), "snapshot release timed out"
         return {} if root_pids is None else {pid: {} for pid in root_pids}
 
     monkeypatch.setattr(spawn_module, "_snapshot_descendants_sync", slow_snapshot)
     registry = BackgroundTaskRegistry(term_grace=0.01)
     await registry.start("sleep 30", tmp_path)
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while True:
-            if snapshot_started.is_set():
-                ticks += 1
-            await asyncio.sleep(0.01)
-
-    ticking = asyncio.create_task(ticker())
     closing = asyncio.create_task(registry.close())
     try:
-        await asyncio.to_thread(snapshot_started.wait, 1)
-        await asyncio.sleep(0.05)
+        assert await asyncio.to_thread(snapshot_started.wait, 10)
+        await asyncio.wait_for(loop_proved_live.wait(), 10)
+        assert snapshot_thread_id != loop_thread_id
         release_snapshot.set()
-        await closing
-        await asyncio.sleep(0.2)
-        assert during_snapshot_ticks and during_snapshot_ticks[0] > 0
+        await asyncio.wait_for(closing, 10)
     finally:
         release_snapshot.set()
-        ticking.cancel()
-        await asyncio.gather(ticking, return_exceptions=True)
-        await asyncio.gather(closing, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
