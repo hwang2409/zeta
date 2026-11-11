@@ -246,6 +246,19 @@ class ServeControl:
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
 
+    def require_no_session_swap(self) -> None:
+        """Reject a replay join while a session swap/recovery is in progress.
+
+        Synchronous and swap-only: an ordinary active turn still allows joins.
+        There is no await between this check and ``begin_replay_join``, so the
+        event loop closes the recovery-visibility window.
+        """
+        if self._session_swap_active:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY,
+                "session replacement is in progress; retry the join",
+            )
+
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
         if self.turn_busy() or (

@@ -49,6 +49,10 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 ErrorDescriptor.NO_ACTIVE_SESSION,
                 "session is not active",
             )
+        # Reject a join while a session swap/recovery is replacing the runtime,
+        # so a client cannot observe mid-recovery state. Swap-only: active turns
+        # still join. No await before begin_replay_join keeps this atomic.
+        client.server.control.require_no_session_swap()
         connections.begin_replay_join(client, ReplayScopeId.top(session_id))
         read = await connections.read_replay_history(
             client, session_id, params.get("history_validator")
