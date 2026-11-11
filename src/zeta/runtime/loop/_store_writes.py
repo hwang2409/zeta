@@ -25,6 +25,12 @@ if TYPE_CHECKING:
     from .agent import AgentLoop
 
 
+# Close waits at most this long for a queued transcript refresh before it
+# cancels the refresh and continues shutdown, so a stalled refresh never hangs
+# close.
+TRANSCRIPT_REFRESH_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
 async def _observe_refresh(refresh: Coroutine[object, object, None]) -> None:
     try:
         await refresh
@@ -119,7 +125,7 @@ class StoreWriteMixin:
         except RuntimeError:
             return
         receipts = self.store.take_persisted_appends()
-        self._create_task(
+        task = self._create_task(
             _observe_refresh(
                 refresh_transcript_index(
                     registry,
@@ -130,6 +136,27 @@ class StoreWriteMixin:
                 )
             )
         )
+        self._transcript_refresh_tasks.add(task)
+        task.add_done_callback(self._transcript_refresh_tasks.discard)
+
+    async def _drain_transcript_refreshes(self: AgentLoop) -> None:
+        """Finish queued transcript refreshes before close cancels tracked tasks.
+
+        A one-shot session ends right after its last turn; cancelling the queued
+        refresh would keep that turn out of transcript search until the next turn
+        or a manual rebuild. A refresh failure is already warned inside the
+        refresh, so draining it never fails close; a bound keeps close from
+        hanging if the refresh stalls.
+        """
+        tasks = tuple(self._transcript_refresh_tasks)
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(
+            tasks, timeout=TRANSCRIPT_REFRESH_SHUTDOWN_TIMEOUT_SECONDS
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _append_turn_message(
         self: AgentLoop,
