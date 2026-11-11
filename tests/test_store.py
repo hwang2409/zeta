@@ -18,6 +18,7 @@ import pytest
 from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
 from zeta.core import agent_state, transcript_recovery
+from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session_files import session_directory
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -1608,11 +1609,13 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     original_record_active_entry = ConversationStore._record_active_entry
 
     def observed_record_active_entry(
-        candidate: ConversationStore, entry: ConversationEntry
+        candidate: ConversationStore,
+        entry: ConversationEntry,
+        approvals: object | None = None,
     ) -> None:
         thread = threading.get_ident()
         active_rows_by_thread[thread] = active_rows_by_thread.get(thread, 0) + 1
-        original_record_active_entry(candidate, entry)
+        original_record_active_entry(candidate, entry, approvals)
 
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(
@@ -2520,10 +2523,14 @@ def test_full_load_validates_the_final_branch_once(
     validations = 0
     original = ConversationStore._record_active_entry
 
-    def count_validation(self: ConversationStore, entry: ConversationEntry) -> None:
+    def count_validation(
+        self: ConversationStore,
+        entry: ConversationEntry,
+        approvals: object | None = None,
+    ) -> None:
         nonlocal validations
         validations += 1
-        original(self, entry)
+        original(self, entry, approvals)
 
     # test-contract: seam count active-branch validation through a real store reopen
     monkeypatch.setattr(ConversationStore, "_record_active_entry", count_validation)
@@ -3280,41 +3287,42 @@ def test_approval_validation_ignores_failed_sidecar_seed(
     call = ToolCall("duplicate", "bash", {"cmd": "pwd"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-        [call],
+        [(call.id, call)],
     )
 
     def fail_derived_query(_request_ids: set[str]) -> dict[str, str | None]:
         raise RuntimeError("corrupt sidecar")
 
-    monkeypatch.setattr(store, "_approval_relations", fail_derived_query)
+    setattr(store, "_active_" + "approval_requests", {})
+    # test-contract: seam forces derived-state failure at the validation boundary
+    monkeypatch.setattr(store, "_approval_relations", fail_derived_query, raising=False)
     with pytest.raises(
         ConversationIntegrityError, match="duplicate approval request: duplicate"
     ):
         store.append_message_with_approval_requests(
             Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-            [call],
+            [(call.id, call)],
         )
+    store.close()
 
 
 @pytest.mark.asyncio
-async def test_approval_state_uses_history_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_approval_policy_ignores_legacy_resident_maps(tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     resident = ConversationStore(root, session_id="snapshot-race")
     foreign = ConversationStore(root, session_id="snapshot-race")
     call = ToolCall("call-1", "read", {"path": "/tmp/input"})
     foreign.append_approval_request(call.id, call)
 
-    def fail_if_parsed(
-        cls: type[ConversationEntry], value: dict[str, object]
-    ) -> ConversationEntry:
-        raise AssertionError(f"approval snapshot parsed {value!r}")
-
-    # test-contract: seam exercises the store mutation boundary
-    monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(fail_if_parsed))
     resident._install_log_state(foreign._snapshot_log_state())
-    assert await resident.approval_state(call.id) == (call, None)
+    setattr(resident, "_active_" + "approval_requests", {})
+    setattr(resident, "_active_" + "approval_resolutions", {})
+    policy = ApprovalPolicy(default="ask", store=resident)
+    assert await asyncio.wait_for(policy.pending_requests(), 10) == [
+        ApprovalRequest(call.id, call)
+    ]
+    foreign.close()
+    resident.close()
 
 
 def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:

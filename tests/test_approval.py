@@ -174,15 +174,15 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert (await first_policy.pending_requests()) == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(first_policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not pending_task.done()
     pending_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await pending_task
+        await asyncio.wait_for(pending_task, 10)
 
     restarted_store = ConversationStore(tmp_path, session_id="session")
     restarted_policy = ApprovalPolicy(default="ask", store=restarted_store)
-    pending = (await restarted_policy.pending_requests())
+    pending = (await asyncio.wait_for(restarted_policy.pending_requests(), 10))
 
     assert pending == [ApprovalRequest(call.id, call)]
     assert restarted_store.entries[-1].type == "message"
@@ -202,7 +202,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is False
     assert result["content"][0]["text"] == "approved"
     assert executed == ["approved"]
-    assert (await restarted_policy.pending_requests()) == []
+    assert (await asyncio.wait_for(restarted_policy.pending_requests(), 10)) == []
 
 
 @pytest.mark.asyncio
@@ -231,11 +231,11 @@ skill_catalog=SkillCatalog.empty(),
     )
 
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert (await policy.pending_requests()) == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     assert policy.deny(call.id)
 
-    result = await task
+    result = await asyncio.wait_for(task, 10)
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution denied"
 
@@ -301,14 +301,14 @@ skill_catalog=SkillCatalog.empty(),
     )
 
     await asyncio.wait_for(approval_published.wait(), timeout=10)
-    assert (await policy.pending_requests()) == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
     events = await asyncio.wait_for(task, timeout=10)
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
     assert results == [ToolResult(call.id, "tool execution canceled", True)]
-    assert (await policy.pending_requests()) == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     assert events[-1].type.value == "agent_end"
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,
@@ -525,8 +525,8 @@ skill_catalog=SkillCatalog.empty(),
         result = await registry.execute(call)
 
         assert result["isError"] is True
-        assert (await policy.pending_requests()) == []
-        assert (await store.approval_state(call.id))[1] == "abort"
+        assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
+        assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "abort"
 
 
 @pytest.mark.asyncio
@@ -574,14 +574,14 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert (await policy.pending_requests()) == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     signal.abort()
 
     result = await asyncio.wait_for(task, timeout=10)
     assert result["isError"] is False
     assert result["content"][0]["text"] == "ran"
-    assert (await store.approval_state(call.id))[1] == "allow"
+    assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "allow"
     assert executed == ["ran"]
 
 
@@ -612,7 +612,7 @@ skill_catalog=SkillCatalog.empty(),
     ) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()
+        await asyncio.wait_for(abort_signal.wait(), 10)
         observed_cancellation.set()
         return "canceled"
 
@@ -634,7 +634,7 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert (await policy.pending_requests()) == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
     await asyncio.wait_for(started.wait(), timeout=10)
@@ -646,7 +646,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is False
     assert result["content"][0]["text"] == "canceled"
     assert observed_cancellation.is_set()
-    assert (await store.approval_state(call.id))[1] == "allow"
+    assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "allow"
 
 
 @pytest.mark.asyncio
@@ -795,7 +795,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
         event.type is StreamEventType.TOOL_APPROVAL_START
         for event in approval_events
     )
-    assert {request.request_id for request in (await policy.pending_requests())} == {
+    assert {request.request_id for request in (await asyncio.wait_for(policy.pending_requests(), 10))} == {
         call.id for call in calls
     }
 
@@ -812,7 +812,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
         "tool execution canceled",
     ]
     assert all(result is not None and result.is_error for result in results)
-    assert (await policy.pending_requests()) == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
 
 
 @pytest.mark.asyncio
@@ -860,7 +860,7 @@ skill_catalog=SkillCatalog.empty(),
     await asyncio.wait_for(approval_claimed.wait(), timeout=10)
     assert not task.done()
     assert executed == []
-    assert (await changed_policy.pending_requests())
+    assert (await asyncio.wait_for(changed_policy.pending_requests(), 10))
 
     assert changed_policy.approve(call.id)
     result = await asyncio.wait_for(task, timeout=10)

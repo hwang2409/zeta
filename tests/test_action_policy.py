@@ -694,7 +694,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     )
     pending: list[ApprovalRequest] = []
     for _ in range(100):
-        pending = (await policy.pending_requests())
+        pending = (await asyncio.wait_for(policy.pending_requests(), 10))
         if pending:
             break
         await asyncio.sleep(0.01)
@@ -706,7 +706,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     )
     assert approval_record["approval_facts"] == {"action": "start"}
     assert policy.approve(call.id)
-    await events_task
+    await asyncio.wait_for(events_task, 10)
     assert executed == ["pytest"]
 
 

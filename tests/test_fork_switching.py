@@ -464,7 +464,7 @@ async def test_live_approval_handle_survives_refresh_and_submission(
         await asyncio.wait_for(turn, timeout=5)
 
         expected = "deny" if verb == "deny" else "allow"
-        assert (await store.approval_state(call.id))[1] == expected
+        assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == expected
         assert executed == ([] if verb == "deny" else [{}])
         assert not controller.pending_approvals
         assert not app._approval_units

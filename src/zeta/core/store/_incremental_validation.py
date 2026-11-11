@@ -172,9 +172,12 @@ class IncrementalValidationMixin:
         staged._active_last_turn_end = self._active_last_turn_end
         staged._task_notification_ids = set(self._task_notification_ids)
         staged._sent_message_receipts = list(self._sent_message_receipts)
+        touched_approvals = _ApprovalValidationOverlay.touched(entries)
         try:
             approvals = _ApprovalValidationOverlay(
-                self._approval_relations(_ApprovalValidationOverlay.touched(entries))
+                self._approval_relations(touched_approvals)
+                if touched_approvals
+                else None
             )
         except Exception:  # noqa: BLE001 -- derived state cannot validate authority
             return False

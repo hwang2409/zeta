@@ -2652,19 +2652,19 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
     )
 
     async def stalled_dispatch(*args, **kwargs):
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         yield  # pragma: no cover
 
     monkeypatch.setattr(agent_loop_module, "dispatch_tool_calls", stalled_dispatch)
     task = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await assistant_persisted.wait()
+    await asyncio.wait_for(assistant_persisted.wait(), 10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
-    assert (await policy.pending_requests()) == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     messages = [
         message for message in store.messages() if message.tool_result is not None
     ]
@@ -2717,7 +2717,7 @@ async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
     with pytest.raises(GeneratorExit):
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert (await policy.pending_requests()) == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     receipts = [
         message for message in store.messages() if message.tool_result is not None
     ]
@@ -5766,7 +5766,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
     )
     try:
         await asyncio.wait_for(registered.wait(), timeout=10)
-        pending = (await policy.pending_requests())
+        pending = (await asyncio.wait_for(policy.pending_requests(), 10))
         # test-contract: durability both delegated approvals are published before resolution.
         assert len(pending) == 2
         assert {request.child_instance_id for request in pending} == {
@@ -5777,7 +5777,7 @@ async def test_parallel_delegated_approvals_resolve_by_child_instance(
         assert policy.approve(allow.key)
         assert policy.deny(deny.key)
         await asyncio.wait_for(task, timeout=30)
-        assert (await policy.pending_requests()) == []
+        assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     finally:
         task.cancel()
         await await_or_fail(
@@ -6926,15 +6926,16 @@ async def test_delegated_approvals_use_child_instance_keys(tmp_path: Path) -> No
             capability=_approval_capability(call_b.name, call_b.arguments),
         )
     )
-    while len((await policy.pending_requests())) < 2:
-        await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        while len((await asyncio.wait_for(policy.pending_requests(), 10))) < 2:
+            await asyncio.sleep(0)
 
-    pending = {request.key for request in (await policy.pending_requests())}
+    pending = {request.key for request in (await asyncio.wait_for(policy.pending_requests(), 10))}
     assert pending == {("child-a", "same-request"), ("child-b", "same-request")}
     assert policy.approve(("child-a", "same-request"))
     assert policy.deny(("child-b", "same-request"))
-    assert await task_a == ApprovalDecision.ALLOW
-    assert await task_b == ApprovalDecision.DENY
+    assert await asyncio.wait_for(task_a, 10) == ApprovalDecision.ALLOW
+    assert await asyncio.wait_for(task_b, 10) == ApprovalDecision.DENY
     child_a_signal.abort()
     child_b_signal.abort()
 
@@ -7246,12 +7247,13 @@ async def test_child_approval_cleanup_removes_pending_requests(tmp_path: Path) -
             capability=_approval_capability(call.name, call.arguments),
         )
     )
-    while not (await policy.pending_requests()):
-        await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        while not (await asyncio.wait_for(policy.pending_requests(), 10)):
+            await asyncio.sleep(0)
 
     await child_policy.cleanup()
-    assert await task == ApprovalDecision.DENY
-    assert (await policy.pending_requests()) == []
+    assert await asyncio.wait_for(task, 10) == ApprovalDecision.DENY
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     signal.abort()
 
 
@@ -7297,14 +7299,15 @@ async def test_child_policy_inherits_scoped_rules_and_delegates_prompts(
             call, signal, capability=_approval_capability(call.name, call.arguments)
         )
     )
-    while not (await policy.pending_requests()):
-        await asyncio.sleep(0)
+    async with asyncio.timeout(10):
+        while not (await asyncio.wait_for(policy.pending_requests(), 10)):
+            await asyncio.sleep(0)
 
-    assert [request.key for request in (await policy.pending_requests())] == [
+    assert [request.key for request in (await asyncio.wait_for(policy.pending_requests(), 10))] == [
         ("child-1", "pending")
     ]
     assert policy.approve(("child-1", "pending"))
-    assert await task is ApprovalDecision.ALLOW
+    assert await asyncio.wait_for(task, 10) is ApprovalDecision.ALLOW
     signal.abort()
 
 
@@ -8362,10 +8365,10 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
     ).run_turn("start", origin=MessageOrigin.USER):
         events.append(event)
         if event.type is StreamEventType.TOOL_APPROVAL_START:
-            assert [request.tool_call.id for request in (await policy.pending_requests())] == [
+            assert [request.tool_call.id for request in (await asyncio.wait_for(policy.pending_requests(), 10))] == [
                 child_call.id
             ]
-            assert (await policy.pending_requests())[0].label == "task research: bash"
+            assert (await asyncio.wait_for(policy.pending_requests(), 10))[0].label == "task research: bash"
             assert all(
                 message.tool_result is None
                 or message.tool_result.tool_call_id != child_call.id
@@ -8374,7 +8377,7 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
             policy.deny(child_call.id)
 
     assert any(event.type is StreamEventType.TOOL_APPROVAL_END for event in events)
-    assert not (await policy.pending_requests())
+    assert not (await asyncio.wait_for(policy.pending_requests(), 10))
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
@@ -8436,7 +8439,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
     await asyncio.wait_for(registered.wait(), timeout=10)
-    pending = (await policy.pending_requests())
+    pending = (await asyncio.wait_for(policy.pending_requests(), 10))
     # test-contract: durability the grandchild approval is published before resolution.
     assert len(pending) == 1
     request = pending[0]

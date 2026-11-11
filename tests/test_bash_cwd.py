@@ -144,15 +144,16 @@ async def test_delegated_shell_approval_uses_persisted_bash_cwd(
             {"command": "pwd", "cwd": "child"},
         )
         execution = asyncio.create_task(registry.execute(call))
-        while not (await parent_policy.pending_requests()):
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while not (await asyncio.wait_for(parent_policy.pending_requests(), 10)):
+                await asyncio.sleep(0)
 
-        request = (await parent_policy.pending_requests())[0]
+        request = (await asyncio.wait_for(parent_policy.pending_requests(), 10))[0]
         assert parent_policy.approve(request.key)
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
         if tool_name == "run_background":
             task_id = result["structuredContent"]["task_id"]
-            await registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
             result = await registry.execute(
                 ToolCall("background-output", "task_output", {"task_id": task_id})
             )

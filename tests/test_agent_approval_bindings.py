@@ -63,7 +63,7 @@ async def _approve_after_registration(
         waiting.set()
     await asyncio.wait_for(registered.wait(), timeout=10)
     key = (child_instance_id, request_id)
-    assert key in {request.key for request in (await parent_policy.pending_requests())}, (
+    assert key in {request.key for request in (await asyncio.wait_for(parent_policy.pending_requests(), 10))}, (
         "delegated approval was not published"
     )
     assert parent_policy.approve(key)
@@ -376,10 +376,10 @@ async def test_parent_and_child_approval_decision_paths(
             registry.execute(call, _lifecycle_sink=publish_approval_state)
         )
         await asyncio.wait_for(approval_started.wait(), timeout=10)
-        assert (await decision_store.pending_approval_page()).items
+        assert (await asyncio.wait_for(decision_store.pending_approval_page(), 10)).items
         assert not execution.done()
         registry.abort()
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
 
     if outcome != "cancel":
         result = await registry.execute(call)
@@ -427,7 +427,7 @@ async def test_bound_edit_abort_arbitration_preserves_winner(
         "edit",
         {"path": str(target), "old_string": "before", "new_string": "after"},
     )
-    await _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
 
     if abort_winner == "allow":
         original_resolve = child_store.resolve_approval
@@ -472,7 +472,7 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     decision = await child.authorize(call, AbortSignal(), capability=_capability(call))
 
     assert decision is ApprovalDecision.DENY
-    assert (await parent.pending_requests()) == []
+    assert (await asyncio.wait_for(parent.pending_requests(), 10)) == []
     assert child.denial_reason(call.id) == (
         "approval binding unavailable; submit a new tool request"
     )
@@ -514,7 +514,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
         {"path": str(alias / "victim.txt"), "content": "PWN"},
     )
 
-    await _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     publication_attempted = asyncio.Event()
@@ -526,7 +526,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
         publication_attempted.set()
 
         async def publish() -> None:
-            await release_publication.wait()
+            await asyncio.wait_for(release_publication.wait(), 10)
             register_delegated(*args, **kwargs)  # type: ignore[arg-type]
             registered.set()
 
@@ -550,16 +550,16 @@ async def test_write_uses_binding_captured_before_persisted_request(
         await asyncio.wait_for(waiting.wait(), timeout=10)
         assert not approval.done()
         release_publication.set()
-        await approval
-        result = await execution
+        await asyncio.wait_for(approval, 10)
+        result = await asyncio.wait_for(execution, 10)
     finally:
         release_publication.set()
         if not approval.done():
             approval.cancel()
-            await asyncio.gather(approval, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(approval, return_exceptions=True), 10)
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False
@@ -598,23 +598,26 @@ async def _assert_shell_uses_displayed_cwd(
     arguments = {"command": "touch marker.txt", "cwd": str(alias)}
     call = ToolCall(f"{tool_name}-swap", tool_name, arguments)
 
-    await _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_after_registration(
-            parent_policy, registered, f"{tool_name}-swap", call.id
+        await asyncio.wait_for(
+            _approve_after_registration(
+                parent_policy, registered, f"{tool_name}-swap", call.id
+            ),
+            10,
         )
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
         if tool_name == "run_background" and result["isError"] is False:
             task_id = result["structuredContent"]["task_id"]
-            await registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False
@@ -665,7 +668,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
         "bash",
         {"command": "touch marker.txt", "cwd": str(approved_cwd)},
     )
-    await _persist_prepared_request(first_registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(first_registry, child_store, call), 10)
     await first_registry.close()
 
     restarted_policy = ChildApprovalPolicy(
@@ -686,7 +689,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
     finally:
         await restarted_registry.close()
 
-    assert (await parent_policy.pending_requests()) == []
+    assert (await asyncio.wait_for(parent_policy.pending_requests(), 10)) == []
     assert result["isError"] is True
     assert result["content"][0]["text"] == (
         "tool execution denied: approval binding unavailable; "
@@ -763,7 +766,7 @@ async def test_canceled_execution_discards_its_approval_binding(
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
 
@@ -870,18 +873,20 @@ async def _execute_after_manual_approval(
         child_cwd, session_store=child_store, skill_catalog=SkillCatalog.empty()
     )
     registry.set_approval_policy(child_policy)
-    await _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     mutate()
     monkeypatch = pytest.MonkeyPatch()
     registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_after_registration(parent_policy, registered, call.id, call.id)
-        return await execution
+        await asyncio.wait_for(
+            _approve_after_registration(parent_policy, registered, call.id, call.id), 10
+        )
+        return await asyncio.wait_for(execution, 10)
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
         monkeypatch.undo()
 
@@ -969,12 +974,12 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
         alias.unlink()
         alias.symlink_to(evil, target_is_directory=True)
         release.set()
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
     finally:
         release.set()
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False
