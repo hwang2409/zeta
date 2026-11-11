@@ -1435,8 +1435,9 @@ error code and message. Provider status and origin remain internal.
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
   active `session_id` and atomically returns the newest bounded history page,
-  `status: {"state": "idle|running", "pending_approvals": [...],
-  "pending_approvals_truncated": false}`, and
+  `status: {"state": "idle|running|tool", "pending_approvals": [...],
+  "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
+  `status.state` shape, and
   `replay: {"stream_id": "...", "history_seq": 0}`. The status is captured at
   join start. Apply the joined status, then sequenced events after it. Open
   approvals are the baseline request ids plus `approval_request` ids in the
