@@ -6547,7 +6547,7 @@ async def test_finder_cancel_keys_close_in_vi_and_emacs() -> None:
     with create_pipe_input() as pipe:
         session = make_session(pipe, EditingMode.VI)
         task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: session.app.is_running)
         session.app.full_screen = True
 
         pipe.send_text("\x06")  # Ctrl-F opens the finder.
@@ -6585,7 +6585,7 @@ async def test_finder_cancel_keys_close_in_vi_and_emacs() -> None:
     with create_pipe_input() as pipe:
         session = make_session(pipe, EditingMode.EMACS)
         task = asyncio.create_task(session.prompt_async(" > "))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: session.app.is_running)
         session.app.full_screen = True
 
         open_finder()
