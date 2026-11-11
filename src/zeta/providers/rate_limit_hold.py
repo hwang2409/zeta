@@ -50,6 +50,10 @@ def subscription_limit_wait(resets_at: float, now: float) -> float:
     return max(resets_at - now, SUBSCRIPTION_LIMIT_MIN_PROBE_SECONDS)
 
 
+class ForegroundChildHeld(Exception):
+    """A foreground child hit a hold too long to block its caller; its text is the receipt."""
+
+
 def foreground_hold_abandoned(data: Mapping[str, Any]) -> bool:
     """A foreground child cannot block its caller on a hold this long; it stops instead."""
     return (
