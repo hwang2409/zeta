@@ -256,6 +256,7 @@ class ZetaServer:
             self.runtime.set_approval_control_binder(self.control.bind_policy)
             self.runtime.set_background_event_sink(self.control._publish_background_event)
             self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
+            self.runtime.set_run_work_event_sink(self.control._publish_run_work_event)
             self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
 
     async def _publish_foreground_events(self) -> None:

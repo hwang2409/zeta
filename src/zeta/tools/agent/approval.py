@@ -64,6 +64,12 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     def bind_store(self, store: ConversationStore) -> None:
         del store
 
+    async def acquire_approval_slot(self) -> bool:
+        return await self.parent.acquire_approval_slot()
+
+    def release_approval_slot(self) -> None:
+        self.parent.release_approval_slot()
+
     def register_delegated(
         self,
         request: ApprovalRequest,
