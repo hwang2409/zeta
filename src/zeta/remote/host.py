@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import socket
 from pathlib import Path
@@ -93,6 +94,16 @@ class ObserverHost:
         self._server = server
         self._started = True
         await asyncio.to_thread(publish, self.home, Descriptor(str(self.socket), self.session_id, os.getpid(), self.name, self.cwd, self.provider, self.model))
+
+    async def start_or_close(self) -> str | None:
+        """Start, or close whatever started and return the reason; the endpoint is optional."""
+        try:
+            await self.start()
+        except Exception as exc:  # noqa: BLE001 - any start failure becomes a TUI notice
+            with contextlib.suppress(Exception):
+                await self.close()
+            return str(exc) or type(exc).__name__
+        return None
 
     async def close(self) -> None:
         server, self._server = self._server, None
