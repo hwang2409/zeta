@@ -1010,6 +1010,21 @@ def build_key_bindings(
             finder_buffer.reset()
             on_finder_open()
 
+    if on_finder_input is not None and finder_buffer_is_default:
+
+        @bindings.add(Keys.Any, filter=finder_mode, eager=True)
+        def finder_input(event: KeyPressEvent) -> None:
+            if event.data:
+                finder_buffer.insert_text(event.data)
+                on_finder_input(finder_buffer.text)
+
+        @bindings.add("backspace", filter=finder_mode, eager=True)
+        @bindings.add("c-h", filter=finder_mode, eager=True)
+        def finder_backspace(event: KeyPressEvent) -> None:
+            del event
+            finder_buffer.delete_before_cursor()
+            on_finder_input(finder_buffer.text)
+
     if on_finder_move is not None:
 
         @bindings.add(
