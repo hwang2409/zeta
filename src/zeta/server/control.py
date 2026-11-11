@@ -54,6 +54,7 @@ from .protocol import (
     EventDescriptor,
     FrameWriteCancelled,
     ProtocolError,
+    bound_reconnect_approvals,
     bounded,
 )
 from .session_replay.rows import RowFacts
@@ -298,18 +299,20 @@ class ServeControl:
         return await self._approvals.pending_approvals()
 
     async def reconnect_baseline(self) -> tuple[list[dict[str, object]], bool]:
-        """Pending approvals a reconnecting client sees: the loop-owned live records,
-        else the durable store projection so a resumed idle session (no in-memory
-        records yet) still re-presents open approvals. Bounds the store fallback to the
-        same 64 the live projection uses."""
+        """Pending approvals a reconnecting client sees: the loop-owned live records
+        merged with the durable store projection, keyed by request_id so a live row
+        wins on overlap (keeping its resolution_pending). The durable projection covers
+        a resumed idle session with no in-memory records yet, and also any approval that
+        is only durable while another is settling live. Bounds the merged rows the same
+        way the live projection does."""
 
-        live, truncated = self._approvals.pending_approvals_now(
+        live, _ = self._approvals.pending_approvals_now(
             reconnect=True, include_truncated=True
         )
-        if live:
-            return live, truncated
         durable = await self._approvals.pending_approvals()
-        return durable[:64], len(durable) > 64
+        seen = {row["request_id"] for row in live}
+        merged = live + [row for row in durable if row["request_id"] not in seen]
+        return bound_reconnect_approvals(merged)
 
     def clear_approvals(self) -> None:
         self._approvals.clear_approvals()
