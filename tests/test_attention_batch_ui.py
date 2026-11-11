@@ -412,6 +412,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
 @pytest.mark.asyncio
 async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = SessionManager(tmp_path)
     project = await asyncio.to_thread(
@@ -435,12 +436,23 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
         wake_event.set()
 
     app.loop._check_project_inbox = record_wake
+
+    # Force the real race deterministically: the second decision's stage runs in
+    # a worker thread that is descheduled (blocked) until escape is pressed, so
+    # the escape flush must wait for it. The gate is set only after escape.
+    original_stage = AttentionReplies.stage
+    escape_pressed = threading.Event()
+
+    def gated_stage(self, attention_id, *args, **kwargs):
+        if attention_id == records[1].id:
+            assert escape_pressed.wait(10), "escape gate was not released"
+        return original_stage(self, attention_id, *args, **kwargs)
+
+    monkeypatch.setattr(AttentionReplies, "stage", gated_stage)
     try:
-        _press(app, "1")
-        await asyncio.sleep(0)
+        # Dismiss the non-decision answer first and let it resolve, so the FIFO
+        # order (dismiss before the gated stage) cannot deadlock.
         _press(app, "j")
-        await asyncio.sleep(0)
-        _press(app, "1")
         await asyncio.sleep(0)
         _press(app, "j")
         await asyncio.sleep(0)
@@ -454,7 +466,20 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
             ),
             10,
         )
+        _press(app, "k")
+        await asyncio.sleep(0)
+        _press(app, "k")
+        await asyncio.sleep(0)
+        _press(app, "k")
+        await asyncio.sleep(0)
+        _press(app, "1")
+        await asyncio.sleep(0)
+        _press(app, "j")
+        await asyncio.sleep(0)
+        _press(app, "1")
+        await asyncio.sleep(0)
         _press(app, "escape")
+        escape_pressed.set()
         await asyncio.wait_for(
             asyncio.to_thread(
                 _wait_for_records,

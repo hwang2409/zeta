@@ -180,6 +180,8 @@ class DecisionsMixin:
         self._decisions_restore_cursor = 0
         self._decisions_answer_buffer = ""
         self._decisions_switching = False
+        self._decisions_ops_lock = asyncio.Lock()
+        self._decisions_flush_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def _home(self) -> Path:
@@ -393,7 +395,12 @@ class DecisionsMixin:
         )
 
     async def _run_attention_operation(self, operation, *args, **kwargs):
-        return await asyncio.to_thread(operation, *args, **kwargs)
+        # FIFO owner: key-press tasks (stage, dismiss) and the escape flush each
+        # run in a worker thread, ordered only by a non-FIFO flock. Serialize
+        # them in task-creation order so the flush sees every reply a key press
+        # staged before escape. asyncio.Lock wakes waiters in FIFO order.
+        async with self._decisions_ops_lock:
+            return await asyncio.to_thread(operation, *args, **kwargs)
 
     def open_decisions_panel(self) -> asyncio.Task[None]:
         return asyncio.create_task(self._open_decisions_panel())
@@ -421,7 +428,9 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_open = False
-        asyncio.create_task(self._flush_staged_decisions())
+        flush_task = asyncio.create_task(self._flush_staged_decisions())
+        self._decisions_flush_tasks.add(flush_task)
+        flush_task.add_done_callback(self._decisions_flush_tasks.discard)
         self._decisions_panel.exit_answer()
         session = self._active_session
         if isinstance(session, FullScreenPromptSession):
