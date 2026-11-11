@@ -9245,6 +9245,29 @@ def test_provider_for_model_rejects_an_unknown_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persisted_assistant_turn_records_backend_model(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    backend.model = "gpt-5.6-sol"
+    store = ConversationStore(tmp_path)
+
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        assistant = next(
+            message
+            for message in store.messages()
+            if message.role is MessageRole.ASSISTANT
+        )
+        assert assistant.metadata["model"] == "gpt-5.6-sol"
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_without_a_model_still_inherits_the_parent_backend(
     tmp_path: Path,
 ) -> None:
@@ -18416,10 +18439,18 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
+        recovery_done.write_text("done")
+        for _ in range(500):
+            if append_finished.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_finished.exists()
+        _stop_lease_holder(holder, stop)
+
         observed = ConversationStore(
             root.session_dir / "agents", session_id="1", _read_only=True
         )
-        appends_before_recovery_returned = [
+        all_appends = [
             message.content[0].text
             for message in observed.messages()
             if message.role is MessageRole.USER
@@ -18428,13 +18459,8 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
             and message.content[0].text.startswith("concurrent append ")
         ]
         observed.close()
+        appends_before_recovery_returned = all_appends[:-1]
         assert appends_before_recovery_returned
-        recovery_done.write_text("done")
-        for _ in range(500):
-            if append_finished.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert append_finished.exists()
 
         assert set(root.agent_children()) == {"root:1"}
         active_questions = {

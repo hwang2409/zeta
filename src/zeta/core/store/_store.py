@@ -226,8 +226,8 @@ class ConversationStore(
             self._collect_persisted_appends = _collect_persisted_appends
             self._persisted_appends: list[PersistedAppend] = []
             self._persisted_appends_unverified = False
-            # Task-exit task ids for O(1) append_task_notification dedupe (task ids
-            # are unique and exit once, so this mirrors the active-branch scan).
+            # Task-exit task ids from all durable history. Acknowledgement and
+            # compaction do not make a task eligible for a second exit receipt.
             self._task_notification_ids: set[str] = set()
             self._sent_message_receipts: list[tuple[str, str]] = []
             self._todo_items: list[TodoItem] = []
@@ -432,14 +432,6 @@ class ConversationStore(
         with self._append_lock():
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
-
-    def set_todo_items(self, items: object) -> None:
-        """Replace the session todo list in one atomic state-file update."""
-        normalized = parse_todo_items(items)
-        with self._append_lock():
-            self._todo_items = [dict(item) for item in normalized]
-            self._todo_dismissed = False
-            self._write_session_state(self.bash_cwd, normalized)
 
     def _load_session_state(self) -> None:
         try:

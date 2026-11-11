@@ -122,6 +122,7 @@ class PendingReplayJoin:
     scope: ReplayScopeId
     stream_id: str
     reset_generation: int
+    status: dict[str, object]
     frames: list[HeldFrame] = field(default_factory=list)
     frontier: Frontier | None = None
     stale: bool = False
@@ -304,6 +305,7 @@ class SessionReplay:
         connection: Any,
         scope: ReplayScopeId,
         reset_generation: int,
+        status: dict[str, object],
     ) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(
@@ -311,6 +313,7 @@ class SessionReplay:
             scope,
             secrets.token_urlsafe(9),
             reset_generation,
+            status,
         )
         self._next_sequences[connection] = 1
         self._pending[connection] = pending
@@ -349,6 +352,7 @@ class SessionReplay:
         pending.frontier = frontier
         return {
             **history_snapshot,
+            "status": pending.status,
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 
