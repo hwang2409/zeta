@@ -23,6 +23,7 @@ _OLD_ZETA_MARKERS = (b"command not found", b"invalid choice: '__remote_bridge'",
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
 MAX_LIST_BYTES = 1024 * 1024
 MAX_ROW_BYTES = 8192
+MAX_ERROR_CHARS = 200
 _ROW_FIELDS = ("session_id", "name", "state", "machine_id")
 # the overflow item tells the consumer that _admit dropped the stream.
 _OVERFLOW = TransportItem("overflow", b"")
@@ -31,6 +32,12 @@ _OVERFLOW = TransportItem("overflow", b"")
 def _check_compatible(status: bytes, diagnostics: bytes, display: str) -> None:
     if status == b"127" or any(marker in diagnostics for marker in _OLD_ZETA_MARKERS):
         raise RemoteWireError(COMPATIBILITY_MESSAGE.replace("HOST", display))
+
+
+def _ssh_failure(status: bytes, diagnostics: bytes, display: str) -> RemoteWireError:
+    lines = [line.strip() for line in diagnostics.decode("utf-8", "replace").splitlines() if line.strip()]
+    reason = lines[-1][:MAX_ERROR_CHARS] if lines else f"exit status {status.decode('ascii', 'replace')}"
+    return RemoteWireError(f"ssh to {display} failed: {reason}")
 
 
 def _session_row(line: bytes, display: str) -> RemoteSession | None:
@@ -59,15 +66,20 @@ class RemoteSessionClient:
         self._generation = 0
         self._targets: dict[str, RemoteTarget] = {}
 
-    async def discover(self, hosts: tuple[str | RemoteTarget, ...] | None = None) -> tuple[RemoteSession, ...]:
+    async def discover(
+        self, hosts: tuple[str | RemoteTarget, ...] | None = None
+    ) -> tuple[tuple[RemoteSession, ...], tuple[str, ...]]:
+        """Return the sessions found and one error line per host that failed."""
         targets = hosts or configured_hosts(self.home)
         results = await asyncio.gather(*(self._list(target) for target in targets), return_exceptions=True)
         rows = [row for result in results if not isinstance(result, BaseException) for row in result]
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if not rows and failures:
-            if isinstance(failures[0], RemoteWireError): raise failures[0]
-            raise RemoteWireError("remote discovery failed") from failures[0]
-        return dedupe_rows(rows)
+        errors = tuple(
+            str(result) if isinstance(result, RemoteWireError) else "remote discovery failed"
+            for result in results if isinstance(result, BaseException)
+        )
+        if not rows and errors:
+            raise RemoteWireError("\n".join(errors))
+        return dedupe_rows(rows), errors
 
     def _target(self, value: str | RemoteTarget) -> RemoteTarget:
         if isinstance(value, RemoteTarget):
@@ -96,8 +108,10 @@ class RemoteSessionClient:
         try: status = await done
         finally: await transport.close_async()
         _check_compatible(status, bytes(stderr), target.name)
-        rows = (_session_row(line, target.name) for line in bytes(stdout).splitlines())
-        return tuple(row for row in rows if row is not None)
+        rows = tuple(row for line in bytes(stdout).splitlines() if (row := _session_row(line, target.name)) is not None)
+        if status != b"0" and not rows:
+            raise _ssh_failure(status, bytes(stderr), target.name)
+        return rows
 
     async def attach(self, host: str, session: RemoteSession | str) -> None:
         name, prefix = split_target(host)
@@ -137,9 +151,10 @@ class RemoteSessionClient:
                     for line in decoder.feed(item.data):
                         for event in decode_line(line): await events.put(event)
             _check_compatible(item.data, bytes(diagnostics), display)
+            if item.data != b"0": raise _ssh_failure(item.data, bytes(diagnostics), display)
             await events.put("disconnected")
-        except RemoteWireError as exc:
-            await events.put("fatal: " + str(exc))
+        except Exception as exc:  # noqa: BLE001 - every failure must end the view with a visible reason
+            await events.put("fatal: " + (str(exc) or type(exc).__name__))
             if self.transport is not None: await self.transport.close_async()
 
     async def next_event(self) -> StreamEvent | str:

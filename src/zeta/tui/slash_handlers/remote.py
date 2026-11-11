@@ -215,10 +215,12 @@ class RemoteViewMixin:
                     (item for item in configured if item.name == host or item.host == host),
                     None,
                 )
-                rows = await client.discover((configured_target or host,))
+                rows, errors = await client.discover((configured_target or host,))
             else:
-                rows = await client.discover()
+                rows, errors = await client.discover()
                 host, prefix = None, None
+            for error in errors:
+                self._print_system(error)
             if not rows:
                 return "no remote sessions found"
             if prefix is not None:

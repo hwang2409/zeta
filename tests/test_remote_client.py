@@ -20,11 +20,11 @@ from zeta.protocol.types import (
 )
 from zeta.remote.client import RemoteSessionClient
 from zeta.remote.discovery import split_target, validate_host
-from zeta.remote.transport import TransportItem, remote_bridge_command
-from zeta.remote.wire import BoundedLineDecoder, RemoteWireError
+from zeta.remote.transport import RemoteTransport, TransportItem, remote_bridge_command
+from zeta.remote.wire import BoundedLineDecoder, RemoteWireError, decode_line
 from zeta.server import event_contract
 from zeta.server.protocol import EventDescriptor, FrameCodec
-from zeta.tui.slash_handlers.remote import RemoteViewMixin
+from zeta.tui.slash_handlers.remote import RemoteViewMixin, RemoteViewState
 
 
 def test_remote_target_and_shell_validation() -> None:
@@ -48,6 +48,9 @@ def test_remote_line_decoder_bounds_frames_split_across_chunks() -> None:
         BoundedLineDecoder().feed(b"x" * (256 * 1024 + 1))
     with pytest.raises(RemoteWireError):
         BoundedLineDecoder().feed(b"x" * (256 * 1024 + 1) + b"\n")
+    # a deeply nested frame fits the size bound but overflows the json parser's recursion.
+    with pytest.raises(RemoteWireError):
+        decode_line(b"[" * 100_000 + b"]" * 100_000)
 
 
 def _scripted_transport(attach_lines: list[bytes], *, exit_after: bool = True):
@@ -174,7 +177,7 @@ async def test_configured_remote_keeps_ssh_user_and_port(tmp_path: Path) -> None
         seen.append((host, kwargs.get("port")))
         return base(host, **kwargs)
 
-    rows = await RemoteSessionClient(tmp_path, transport_factory=factory).discover()
+    rows, _ = await RemoteSessionClient(tmp_path, transport_factory=factory).discover()
     assert [row.host for row in rows] == ["laptop", "laptop"]
     assert seen == [("henry@laptop", 2222)], f"ssh target lost the URL's user or port: {seen}"
 
@@ -192,7 +195,51 @@ def _remote_app(tmp_path: Path, transport) -> RemoteViewMixin:
         def _invalidate_prompt(self) -> None:
             return None
 
-    return App()
+        def _print_system(self, output: str) -> None:
+            self.system_lines.append(output)
+
+    app = App()
+    app.system_lines = []
+    return app
+
+
+def _fake_ssh(tmp_path: Path) -> str:
+    """An ssh that lists one session on host "good" and fails like a missing key on any other host."""
+    fake = tmp_path / "ssh"
+    fake.write_text(
+        '#!/bin/sh\n'
+        'while [ "$1" != "--" ]; do shift; done\n'
+        'if [ "$2" = good ]; then echo \'{"kind":"session","session_id":"abc123","name":"a","state":"idle"}\'; exit 0; fi\n'
+        'echo "debug1: some earlier line" >&2\n'
+        'echo "Permission denied (publickey)." >&2\n'
+        'exit 255\n'
+    )
+    fake.chmod(0o755)
+    return str(fake)
+
+
+@pytest.mark.asyncio
+async def test_ssh_failure_is_reported_not_shown_as_no_sessions(tmp_path: Path) -> None:
+    client = RemoteSessionClient(tmp_path, ssh=_fake_ssh(tmp_path))
+    with pytest.raises(RemoteWireError, match=r"^ssh to laptop failed: Permission denied \(publickey\)\.$"):
+        await client.discover(("laptop",))
+    rows, errors = await client.discover(("good", "laptop"))
+    assert [row.session_id for row in rows] == ["abc123"]
+    assert errors == ("ssh to laptop failed: Permission denied (publickey).",)
+
+
+@pytest.mark.asyncio
+async def test_attach_ssh_failure_ends_the_view_with_the_ssh_error(tmp_path: Path) -> None:
+    app = _remote_app(tmp_path, RemoteTransport)
+    app._remote_session_client.ssh = _fake_ssh(tmp_path)
+    try:
+        await app._remote_client().attach("laptop", "abc123")
+        app._remote_view = state = RemoteViewState.create(app, "laptop", "abc123", "")
+        await asyncio.wait_for(app._consume_remote_events(state, app._remote_client()), 10)
+        assert "ssh to laptop failed: Permission denied (publickey)." in state.transcript.render(120), "attach ended without the ssh error"
+        assert state.disconnected
+    finally:
+        await app.slash_detach("")
 
 
 @pytest.mark.asyncio

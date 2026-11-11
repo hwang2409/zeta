@@ -55,7 +55,7 @@ def decode_line(raw: bytes) -> tuple[StreamEvent, ...]:
         raise RemoteWireError("remote frame is too large")
     try:
         frame = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise RemoteWireError("invalid remote frame") from exc
     if not isinstance(frame, dict):
         raise RemoteWireError("invalid remote frame")
