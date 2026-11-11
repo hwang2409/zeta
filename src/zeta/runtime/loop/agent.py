@@ -497,7 +497,6 @@ class AgentLoop(
                 await asyncio.gather(*watchers, return_exceptions=True)
             if cancel_background and self.agent_depth == 0:
                 await self._background_owner.wait()
-            await self._close_project_inbox_supervisor()
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks

@@ -33,6 +33,7 @@ class ProjectInboxNotificationMixin:
     _inbox_scanner: ProjectInboxScanner | None = None
     _project_inbox_publication_event: asyncio.Event | None = None
     _project_inbox_owner_loop: asyncio.AbstractEventLoop | None = None
+    _project_inbox_health_state: str = "healthy"
     tool_registry: Any
     store: Any
     agent_depth: int
@@ -47,7 +48,6 @@ class ProjectInboxNotificationMixin:
         sent_outcome = self._inbox_scanner._activation_sent_outcome
         self._project_inbox_owner_loop = asyncio.get_running_loop()
         self._project_inbox_publication_event = asyncio.Event()
-        self._project_inbox_poll_done = asyncio.Event()
         self._project_inbox_poll_task = asyncio.create_task(
             self._project_inbox_supervisor()
         )
@@ -102,15 +102,10 @@ class ProjectInboxNotificationMixin:
         except RuntimeError:
             pass
 
-    async def _watch_project_inbox(self) -> None:
-        """Compatibility entry point for callers that owned the old watcher."""
-        await self._project_inbox_supervisor()
-
     async def _project_inbox_supervisor(self) -> None:
         event = self._project_inbox_publication_event
         if event is None:
             return
-        health = "healthy"
         while True:
             try:
                 await asyncio.wait_for(event.wait(), timeout=2)
@@ -119,47 +114,36 @@ class ProjectInboxNotificationMixin:
                 if getattr(self, "_turn_active", False):
                     continue
             try:
-                scanner = self._inbox_scanner
-                if scanner is None:
-                    continue
-                poll = getattr(self, "_pending_project_inbox_poll", None)
-                if poll is None:
-                    worker = asyncio.create_task(asyncio.to_thread(scanner.poll))
-                    try:
-                        result = await asyncio.shield(worker)
-                    except asyncio.CancelledError:
-                        await asyncio.shield(worker)
-                        raise
-                    poll = _PollResult(
-                        tuple(result[0] or ()), tuple(result[1])
-                    )
-                    self._pending_project_inbox_poll = poll
-                if health != "healthy":
-                    health = "healthy"
-                    self._publish_project_inbox_health(health)
-                await self._deliver_project_inbox_poll(scanner, poll)
-                self._pending_project_inbox_poll = None
+                await self._poll_project_inbox_once()
             except asyncio.CancelledError:
                 raise
-            except (InboxError, OSError, ProjectRegistryError) as exc:
-                if health != "degraded":
-                    health = "degraded"
-                    self._publish_project_inbox_health(health, str(exc))
-            except Exception as exc:  # noqa: BLE001 - supervisor must survive sinks
-                if health != "degraded":
-                    health = "degraded"
-                    self._publish_project_inbox_health(health, str(exc))
-            finally:
-                done = getattr(self, "_project_inbox_poll_done", None)
-                if done is not None:
-                    done.set()
+            except Exception as exc:  # noqa: BLE001 - supervisor must survive any sink
+                self._set_project_inbox_health("degraded", str(exc))
 
-    async def _close_project_inbox_supervisor(self) -> None:
-        task = getattr(self, "_project_inbox_poll_task", None)
-        if task is None or task.done():
+    async def _poll_project_inbox_once(self) -> None:
+        scanner = self._inbox_scanner
+        if scanner is None:
+            scanner = self._new_project_inbox_scanner()
+            self._inbox_scanner = scanner
+        poll = getattr(self, "_pending_project_inbox_poll", None)
+        if poll is None:
+            worker = asyncio.create_task(asyncio.to_thread(scanner.poll))
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await asyncio.shield(worker)
+                raise
+            poll = _PollResult(tuple(result[0] or ()), tuple(result[1]))
+            self._pending_project_inbox_poll = poll
+        await self._deliver_project_inbox_poll(scanner, poll)
+        self._pending_project_inbox_poll = None
+        self._set_project_inbox_health("healthy")
+
+    def _set_project_inbox_health(self, state: str, reason: str | None = None) -> None:
+        if getattr(self, "_project_inbox_health_state", "healthy") == state:
             return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        self._project_inbox_health_state = state
+        self._publish_project_inbox_health(state, reason)
 
     def _publish_project_inbox_health(self, state: str, reason: str | None = None) -> None:
         publish = getattr(self, "_publish_background_event", None)
@@ -281,19 +265,20 @@ class ProjectInboxNotificationMixin:
         for status in statuses:
             pending.pop(status, None)
 
-    async def _check_project_inbox(self, *, periodic: bool = False) -> None:
-        """Signal the sole supervisor and wait for its current poll."""
+    async def _check_project_inbox(self) -> None:
+        """Signal the sole supervisor to poll; poll once if none runs yet."""
         if (
             "inbox" not in self.tool_registry.registered_names
             or self.tool_registry.project_registry is None
             or self.tool_registry.project_id is None
             or self.agent_depth > 0
-            or (periodic and self._turn_active)
         ):
             return
         event = getattr(self, "_project_inbox_publication_event", None)
-        done = getattr(self, "_project_inbox_poll_done", None)
-        if event is None or done is None:
+        if event is not None:
+            event.set()
+            return
+        try:
             scanner = self._inbox_scanner
             if scanner is None:
                 scanner = self._new_project_inbox_scanner()
@@ -304,10 +289,8 @@ class ProjectInboxNotificationMixin:
                 scanner,
                 _PollResult(tuple(result[0] or ()), tuple(result[1])),
             )
-            return
-        done.clear()
-        event.set()
-        await asyncio.wait_for(done.wait(), timeout=10)
+        except (InboxError, OSError, ProjectRegistryError) as exc:
+            self._set_project_inbox_health("degraded", str(exc))
 
 
 def _bounded_text(value: object, limit: int) -> str:

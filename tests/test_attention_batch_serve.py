@@ -24,13 +24,36 @@ from zeta.server.slash_commands import ServerSlashSession
 def _start_publication_watcher(loop) -> asyncio.Task[None]:
     loop._project_inbox_owner_loop = asyncio.get_running_loop()
     loop._project_inbox_publication_event = asyncio.Event()
-    return asyncio.create_task(loop._watch_project_inbox())
+    return asyncio.create_task(loop._project_inbox_supervisor())
 
 
 async def _stop_publication_watcher(watcher: asyncio.Task[None]) -> None:
     watcher.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(watcher, 10)
+
+
+async def _await_inbox_notice(store, *, what: str) -> list:
+    """Wait for the supervisor to deliver at least one durable inbox notice."""
+    async with asyncio.timeout(10):
+        while not store.agent_notifications():
+            # test-contract: latency poll the delivered durable inbox notice
+            await asyncio.sleep(0.02)
+    return store.agent_notifications()
+
+
+def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> str:
+    """Put one durable inbox message in the owner's own project inbox."""
+    inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
+    return inbox.send(
+        from_project=project_id,
+        from_session="f" * 32,
+        to_project=project_id,
+        to_session=session_id,
+        kind="info",
+        title="seeded",
+        body="deliver on the next poll",
+    )
 
 
 @pytest.mark.asyncio
@@ -240,18 +263,13 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
 
         loop = server.runtime.loop
         assert loop is not None
-        checks = 0
-        checked = asyncio.Event()
-
-        async def count_check(*, periodic: bool = False) -> None:
-            nonlocal checks
-            checks += 1
-            checked.set()
+        loop.tool_registry.project_id = project_id
+        seeded = await asyncio.to_thread(
+            _seed_inbox, registry, tmp_path, project_id, session_id
+        )
 
         # test-contract: seam seal a second journal immediately before serve dismiss locks
         monkeypatch.setattr(AttentionReplies, "dismiss", dismiss_after_concurrent_seal)
-        # test-contract: seam count the real serve adapter's inbox checks
-        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         watcher = _start_publication_watcher(loop)
         dismissed = (
             await _request(
@@ -266,8 +284,12 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
             )
         )[-1]["result"]
         assert dismissed["text"] == f"dismissed {dismissible.id}"
-        await await_or_fail(checked.wait(), what="serve owner inbox check")
-        assert checks == 1
+        # the dismiss publishes in-process, waking the owner's supervisor to
+        # deliver the pending inbox message as one durable notification.
+        notices = await _await_inbox_notice(
+            opened.store, what="serve owner inbox delivery"
+        )
+        assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
@@ -384,14 +406,6 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
 
         loop = server.runtime.loop
         assert loop is not None
-        checks = 0
-
-        async def count_check(*, periodic: bool = False) -> None:
-            nonlocal checks
-            checks += 1
-
-        # test-contract: seam count inbox admission through the real serve adapter
-        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         payload = json.dumps([{"id": invalid.id, "reply": "   "}])
         error = (
             await _request(
@@ -405,7 +419,6 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
 
         assert "reply must be nonempty and within the size limit" in error["message"]
         assert store.get(sealed.id).status == "open"
-        assert checks == 0
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
@@ -442,18 +455,13 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
 
         loop = server.runtime.loop
         assert loop is not None
-        checks = 0
-        checked = asyncio.Event()
-
-        async def count_check(*, periodic: bool = False) -> None:
-            nonlocal checks
-            checks += 1
-            checked.set()
+        loop.tool_registry.project_id = project_id
+        seeded = await asyncio.to_thread(
+            _seed_inbox, registry, tmp_path, project_id, session_id
+        )
 
         # test-contract: seam fail after recovery publishes but before the action completes
         monkeypatch.setattr(AttentionReplies, "_record", fail_target)
-        # test-contract: seam count publisher-driven admission after the operation error
-        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         watcher = _start_publication_watcher(loop)
         error = (
             await _request(
@@ -469,8 +477,12 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         )[-1]["error"]
 
         assert "unexpected operation failure" in error["message"]
-        await await_or_fail(checked.wait(), what="serve recovery inbox check")
-        assert checks == 1
+        # the sealed-journal recovery still publishes in-process, so the owner's
+        # supervisor wakes and delivers the pending inbox even though the op failed.
+        notices = await _await_inbox_notice(
+            opened.store, what="serve recovery inbox delivery"
+        )
+        assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)
@@ -509,17 +521,13 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
             finally:
                 worker_done.set()
 
-        checks: list[bool] = []
-        real_check = loop._check_project_inbox
-
-        async def count_check(*, periodic: bool = False) -> None:
-            checks.append(periodic)
-            await real_check(periodic=periodic)
+        loop.tool_registry.project_id = project_id
+        seeded = await asyncio.to_thread(
+            _seed_inbox, registry, tmp_path, project_id, session_id
+        )
 
         # test-contract: seam hold the real serve worker before durable publication
         monkeypatch.setattr(ProjectInbox, "send", blocked_send)
-        # test-contract: seam count admission owned by the project-inbox watcher
-        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         watcher = _start_publication_watcher(loop)
         adapter = ServerSlashSession(server.runtime)
         replies = adapter._attention_replies(session_id)
@@ -534,18 +542,18 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
-        assert checks == []
+        # the publication has not completed, so nothing has woken the supervisor.
+        assert opened.store.agent_notifications() == []
         release.set()
         assert await await_or_fail(
             asyncio.to_thread(worker_done.wait, 10), what="serve worker finish"
         )
-        for _ in range(10):
-            if checks:
-                break
-            await asyncio.sleep(0)
-        assert checks.count(False) == 1, (
-            "cancelled serve adapter lost its late publication check"
+        # the late durable publication still wakes the owner's supervisor, which
+        # delivers the pending inbox even though the adapter task was cancelled.
+        notices = await _await_inbox_notice(
+            opened.store, what="cancelled serve adapter late delivery"
         )
+        assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
         release.set()
         if watcher is not None:
@@ -569,23 +577,11 @@ async def test_cross_process_style_send_uses_existing_two_second_poll(
             await asyncio.to_thread(registry.create_project, "poll send", "test")
         ).project_id
         loop.tool_registry.project_id = project_id
-        periodic_check = asyncio.Event()
-        calls: list[bool] = []
-        real_check = loop._check_project_inbox
-
-        async def count_check(*, periodic: bool = False) -> None:
-            calls.append(periodic)
-            await real_check(periodic=periodic)
-            if periodic:
-                periodic_check.set()
-
-        # test-contract: seam identify the existing idle watcher's periodic check
-        monkeypatch.setattr(loop, "_check_project_inbox", count_check)
         watcher = _start_publication_watcher(loop)
         separate_inbox = ProjectInbox(
             registry, sessions_root=tmp_path / "home" / "sessions"
         )
-        await asyncio.to_thread(
+        seeded = await asyncio.to_thread(
             separate_inbox.send,
             from_project=project_id,
             from_session="f" * 32,
@@ -595,8 +591,12 @@ async def test_cross_process_style_send_uses_existing_two_second_poll(
             title="cross-process style",
             body="no in-process callback",
         )
-        await await_or_fail(periodic_check.wait(), what="two-second inbox poll")
-        assert calls == [True]
+        # no in-process callback fires, so only the supervisor's 2-second timeout
+        # poll finds the cross-process message and delivers it.
+        notices = await _await_inbox_notice(
+            loop.store, what="two-second inbox poll"
+        )
+        assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
         if watcher is not None:
             await _stop_publication_watcher(watcher)

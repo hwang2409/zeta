@@ -1012,7 +1012,11 @@ kind. On protocol 1.2, `sub_agent_receipt` carries agent completion notification
 and unknown future kinds; `task_exit_notification`,
 `project_inbox_notification`, `child_question`, `child_question_withdrawn`,
 `child_idle`, and `child_hold` carry their durable notification `data` object
-with the matching known kind. `child_hold` is sent once per hold when a
+with the matching known kind. On protocol 1.2, `project_inbox_health` carries
+the project inbox poller state; its data has `kind` (`project_inbox_health`),
+`state` (`healthy` or `degraded`), `session_id`, and an optional `reason`
+(at most 200 characters, present only when degraded). It is live only: it is
+not persisted and is never replayed. Below 1.2 it rides `sub_agent_receipt`. `child_hold` is sent once per hold when a
 background child waits more than 15 minutes on a provider rate limit or a
 subscription limit; its data has `reason` (`rate_limit` or
 `subscription_limit`), `until` (ISO 8601), `provider`, `account` (string or
@@ -1271,6 +1275,7 @@ Event fields are:
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_notification` | `event`, `data: object` | `session_id` |
+| `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
