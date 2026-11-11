@@ -1967,6 +1967,7 @@ class FinishGateBackend(CompletionBackend):
 class PostCapBudgetBackend(CompletionBackend):
     def __init__(self) -> None:
         self.release_grandchild = asyncio.Event()
+        self.grandchild_completed = asyncio.Event()
         self.hold_post_cap = False
         self.hold_fresh_prompt = False
         self.release_post_cap = asyncio.Event()
@@ -2019,6 +2020,7 @@ class PostCapBudgetBackend(CompletionBackend):
             blocks = [ToolUseContent(grandchild)]
         elif last_user == "grandchild prompt":
             await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
+            self.grandchild_completed.set()
             blocks = [TextContent("grandchild complete")]
         elif last_user.startswith("edge prompt"):
             blocks = [TextContent("edge complete")]
@@ -4066,7 +4068,9 @@ async def _run_post_cap_tool_cycle(
             # the test holds the nested agent and child bound; release both once
             # the fresh turn has entered, before allowing its response to close.
             backend.release_grandchild.set()
-            deadlines.expire_child_bound(child_state)
+            await await_or_fail(
+                backend.grandchild_completed.wait(), what="grandchild completion"
+            )
             backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
