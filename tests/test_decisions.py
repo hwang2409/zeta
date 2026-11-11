@@ -593,10 +593,10 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
         assert calls == 1
         assert "decisions unavailable: TimeoutError" in rendered and "1 attention item" not in rendered
 
-        # Restore the real seam before releasing the hung scan: a poll tick or
-        # panel open that scans after the hung scan ends must not transiently
-        # time out and flip the status back to "unavailable" (the shortened seam
-        # was only needed to force the hung scan over the timeout).
+        # The shortened seam was only needed to force the one hung scan over the
+        # timeout; a poll tick or panel open that scans after the hung scan ends
+        # must not transiently time out and flip the status back to "unavailable".
+        # test-contract: seam restored so post-release scans use the real timeout
         monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", real_scan_timeout)
         recovered.clear()
         release.set()
