@@ -237,6 +237,29 @@ def _project_history_group(
     return group, _history_group_body_size(codec, group)
 
 
+def history_projection_from_groups(
+    groups: tuple[tuple[Any, ...], ...],
+    approval_calls: Mapping[str, object],
+    *,
+    served_turn_end: bool,
+) -> HistoryProjection:
+    groups = tuple(
+        tuple(
+            entry for entry in group
+            if served_turn_end or getattr(entry, "type", None) != "turn_end"
+        )
+        for group in groups
+    )
+    entry_index = {
+        entry.id: entry for group in groups for entry in group if hasattr(entry, "id")
+    }
+    return HistoryProjection(
+        (*groups, ()),
+        MappingProxyType(dict(approval_calls)),
+        MappingProxyType(entry_index),
+    )
+
+
 def history_projection(
     store: ConversationStore,
     *,

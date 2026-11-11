@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -68,6 +69,7 @@ from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
     RepairTarget,
+    recovery_status,
     repair_target_for_session_dir,
 )
 from ._approval_display import ApprovalAuditRequest, normalize_approval_requests
@@ -76,6 +78,7 @@ from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
+from ._history_index import HistoryIndex, HistoryIndexError, HistoryPageStoreMixin
 from ._incremental_validation import (
     IncrementalValidationMixin,
     validate_approval_reason,
@@ -91,11 +94,10 @@ from ._pending_prompts import (
     PendingPromptsClosedError,  # noqa: F401 - re-exported by store facade
     PendingPromptStoreMixin,
 )
-from ._row_history import RecentRowsMixin
+from ._row_history import RecentRowsMixin, TurnHistoryMixin
 from ._session_state import SessionStatePersistenceMixin
 from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
-from ._turn_history import TurnHistoryMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
@@ -112,6 +114,7 @@ class ConversationStore(
     ClientDeliveryMixin,
     StartupFactsMixin,
     ConversationLogMixin,
+    HistoryPageStoreMixin,
     ObserverSnapshotMixin,
     IncrementalValidationMixin,
     NotificationStateMixin,
@@ -145,6 +148,7 @@ class ConversationStore(
         _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
+        _history_index: HistoryIndex | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
         self.root_dir = Path(session_dir or default_home / "sessions")
@@ -184,6 +188,7 @@ class ConversationStore(
                 self.session_dir, self.session_id
             )
             self._last_repair_result: RepairResult | None = None
+            self._repair_generation: str | None = None
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
@@ -209,6 +214,8 @@ class ConversationStore(
                         fcntl.flock(root_fd, fcntl.LOCK_UN)
             self.path = self.session_dir / "conversation.jsonl"
             self.state_path = self.session_dir / "session_state.json"
+            self._history_index = _history_index
+            self._history_index_owner = _history_index is None
             self.agent_lifecycle_path = self.session_dir / "agent_lifecycle.json"
             self.lock_path = self.session_dir / ".lock"
             self.cwd = str(cwd or Path.cwd())
@@ -242,6 +249,8 @@ class ConversationStore(
                     else:
                         self._load()
                     self._load_session_state()
+                    self._refresh_repair_generation()
+                    self._initialize_history_index(observer=True)
                 else:
                     self._runtime_lease = self._open_execution_lease(
                         self.directory_fd,
@@ -256,6 +265,8 @@ class ConversationStore(
                         self._strict_snapshot_sync = True
                     with self._append_lock(deadline=_lock_deadline):
                         self._load_session_state()
+                        self._refresh_repair_generation()
+                        self._initialize_history_index(observer=False)
                     self._strict_snapshot_sync = False
                 self._release_lease = weakref.finalize(
                     self,
@@ -268,6 +279,91 @@ class ConversationStore(
             storage_ownership.pop_all()
         if not _read_only and not _mutation_target:
             register_conversation_target(self)
+
+    def _refresh_repair_generation(self) -> None:
+        record = recovery_status(self.directory_fd, self._repair_target).latest_committed
+        self._repair_generation = record.quarantine_id if record is not None else None
+
+    def _initialize_history_index(self, *, observer: bool) -> None:
+        if self._history_index is None:
+            self._history_index = HistoryIndex(
+                self.session_dir, self.directory_fd, observer=observer
+            )
+        if not self._history_index_owner or observer:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._history_index._mark_unavailable()
+            return
+        try:
+            self._sync_history_index(self.active_branch_snapshot())
+        except (OSError, HistoryIndexError):
+            self._history_index._mark_unavailable()
+
+    def _history_index_facts(self) -> dict[str, object]:
+        stat = os.stat(
+            "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
+        )
+        last = self._entries[-1] if self._entries else None
+        return {
+            "st_dev": stat.st_dev,
+            "st_ino": stat.st_ino,
+            "byte_boundary": stat.st_size,
+            "last_seq": last.seq if last else 0,
+            "last_id": last.id if last else None,
+            "last_parent": last.parent_id if last else None,
+            "prefix_digest": self._entry_prefix_digest.hex(),
+            "repair_generation": self._repair_generation,
+        }
+
+    def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:
+        if self._history_index is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._history_index.sync_validated(self._history_index_facts(), entries)
+        else:
+            self._history_index._mark_unavailable()
+
+    def _apply_history_index_entries(
+        self,
+        entries: tuple[ConversationEntry, ...],
+        *,
+        leave_stale_on_loop: bool = False,
+    ) -> None:
+        if self._history_index is None or not entries:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            if not leave_stale_on_loop:
+                self._history_index._mark_unavailable()
+            return
+        if not self._history_index.available:
+            self._sync_history_index(self.active_branch_snapshot())
+        digest = self._entry_prefix_digest
+        for entry in entries:
+            digest = self._next_entry_prefix_digest(
+                digest, encode_json(entry.to_dict()) + b"\n"
+            )
+        facts = self._history_index_facts()
+        last = entries[-1]
+        facts.update(
+            last_seq=last.seq,
+            last_id=last.id,
+            last_parent=last.parent_id,
+            prefix_digest=digest.hex(),
+        )
+        try:
+            self._history_index.apply_committed(facts, entries)
+        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
+            self._history_index._mark_unavailable()
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -622,6 +718,7 @@ class ConversationStore(
             del self._entries[-len(entries) :]
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
         self._write_bytes(encoded)
+        self._apply_history_index_entries(tuple(entries))
         for entry in entries:
             self._entries.append(entry)
             self._record_entry_prefix(entry)
@@ -681,6 +778,9 @@ class ConversationStore(
         finally:
             self._write_deadline = previous_deadline
         linear = not self._entries or entry.parent_id == self._entries[-1].id
+        self._apply_history_index_entries(
+            (entry,), leave_stale_on_loop=not linear
+        )
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -691,6 +791,7 @@ class ConversationStore(
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries()
             self._rebuild_incremental_validation_state()
+            self._sync_history_index(self.active_branch_snapshot())
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
