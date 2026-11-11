@@ -758,6 +758,23 @@ class HistoryIndex:
 
 
 def _rebuild_history_index(store: ConversationStore) -> None:
+    if store._read_only:
+        observer = type(store)(
+            store.root_dir,
+            session_id=store.session_id,
+            _must_exist=True,
+            _read_only=True,
+            _history_index=store._history_index,
+        )
+        try:
+            with observer._append_lock(observer=True):
+                facts = observer._history_index_facts()
+                if store._history_index.catch_up_validated(facts, observer._entries):
+                    return
+                observer._sync_history_index(observer._entries)
+        finally:
+            observer.close()
+        return
     writer = store._new_persistent_durable_writer()
     try:
         with writer._append_lock():
