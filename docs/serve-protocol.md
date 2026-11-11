@@ -868,8 +868,10 @@ With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
-or `abort`. Without the feature, the status shape and unbounded strict durable
-projection are unchanged.
+or `abort`. Read-only observers receive the same live baseline as the controller,
+but approval mutations still return `-32008`. Without the feature, the status
+shape and unbounded strict durable projection are unchanged, and observers
+receive the same rows as the controller.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
@@ -1466,8 +1468,9 @@ error code and message. Provider status and origin remain internal.
   `status: {"state": "idle|running|tool", "pending_approvals": [...],
   "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
   `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
-  The status is captured at join start. Apply the joined status, then sequenced
-  events after it. Open approvals are the baseline request ids plus
+  The status is captured at join start. Controllers and read-only observers get
+  the same approval baseline. Apply the joined status, then sequenced events
+  after it. Open approvals are the baseline request ids plus
   `approval_request` ids in the joined page, minus `approval_end` ids in the
   joined page, then updated by the sequenced tail by id. A session admits at
   most 64 pending approvals across foreground and delegated tools. A 65th
@@ -1525,7 +1528,7 @@ error code and message. Provider status and origin remain internal.
   globally, evicting the largest scope first; a scope holds at most two waiting
   events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
   `session_history` and do not change the live stream.
-- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, `-32602` for malformed ids or parameters, and `-32009` with `stale_history_snapshot` for a changed snapshot.
+- `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, and `-32602` for malformed ids or parameters. Only a continuation that supplies `before` with its `history_validator` returns `-32009` with `stale_history_snapshot`; a newest-page read (`before` omitted or null) retries a child transcript that moves during reader acquisition and serves a consistent snapshot instead.
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns

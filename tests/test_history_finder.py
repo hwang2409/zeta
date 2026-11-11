@@ -9,6 +9,7 @@ import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.transcript import FinderControl
 from zeta.tui.transcript.finder_runtime import FinderRuntimeTarget
@@ -185,7 +186,7 @@ async def test_accept_and_cancel_preserve_draft() -> None:
 async def test_empty_history_renders_empty_state() -> None:
     finder = _finder(SessionPromptHistory(), "missing")
     await _open(finder, Buffer())
-    content = FinderControl(finder.finder_state).create_content(80, 20)
+    content = FinderControl(finder.finder_state, OverlayTextField("TEST_FINDER")).create_content(80, 20)
     rendered = "".join(
         fragment[1]
         for line in range(content.line_count)
