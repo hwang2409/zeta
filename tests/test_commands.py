@@ -63,6 +63,7 @@ from zeta.tui.composer import (
     SlashCompleter,
     build_key_bindings,
 )
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.render import render_approval_card, render_event
 
 
@@ -581,6 +582,7 @@ async def test_message_finder_cancels_completion_before_up_navigation(
 
     async with owned_app() as owner:
         pipe = owner.enter_context(create_pipe_input())
+        finder_field = OverlayTextField("TEST_FINDER")
         session = FullScreenPromptSession(
             input=pipe,
             output=Vt100_Output(
@@ -594,8 +596,8 @@ async def test_message_finder_cancels_completion_before_up_navigation(
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
                 finder_active=lambda: finder_active,
-                on_finder_input=lambda _value: None,
                 on_finder_cancel=cancel_finder,
+                finder_buffer=finder_field.buffer,
             ),
             completer=SlashCompleter(
                 create_slash_registry(zeta_home=tmp_path / "home", project_dir=tmp_path, skill_catalog=SkillCatalog.empty())

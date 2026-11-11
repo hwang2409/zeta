@@ -42,6 +42,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import HSplit, Layout
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
@@ -130,6 +131,7 @@ from zeta.tui.composer import (
     build_key_bindings,
     parse_input,
 )
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
 
 
@@ -6424,6 +6426,7 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
 
 
 def test_transcript_navigation_bindings_are_full_screen_only() -> None:
+    finder_field = OverlayTextField("TEST_FINDER")
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
         on_history_next=lambda _buffer: None,
@@ -6431,7 +6434,7 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
         on_exit=lambda: None,
         on_finder_open=lambda: None,
         finder_active=lambda: False,
-        on_finder_input=lambda _value: None,
+        finder_buffer=finder_field.buffer,
         search_active=lambda: False,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
@@ -6456,12 +6459,14 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
     def open_finder() -> None:
         nonlocal active
         active = True
+        session.app.layout.focus(finder_field.window)
 
     def accept() -> None:
         nonlocal active, accepts
         active = False
         accepts += 1
 
+    finder_field = OverlayTextField("TEST_FINDER", on_text_changed=values.append)
     with create_pipe_input() as pipe:
         session = PromptSession(
             input=pipe,
@@ -6473,11 +6478,15 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
                 finder_active=lambda: active,
-                on_finder_input=values.append,
                 on_finder_move=moves.append,
                 on_finder_accept=accept,
                 on_finder_cancel=lambda: None,
+                finder_buffer=finder_field.buffer,
             ),
+        )
+        session.app.layout = Layout(
+            HSplit([session.app.layout.container, finder_field.window]),
+            focused_element=session.default_buffer,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)

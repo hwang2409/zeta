@@ -149,7 +149,7 @@ class FinderControl(UIControl):
         if state.title is not None:
             lines.append([(f"bold {theme.ACCENT}", state.title)])
         # Query field.
-        lines.extend(self._field.lines(content_width, prefix="❯ "))
+        lines.extend(self._field.lines(content_width, prefix="❯ ", enter="accept"))
         lines.append([(theme.DIM, "─" * content_width)])
         # Result rows.
         if not state.rows:
@@ -177,7 +177,7 @@ class FinderControl(UIControl):
         if state.title == "history":
             lines.append([(theme.DIM, "─" * content_width)])
             lines.append(
-                [(theme.DIM, "enter insert · esc cancel · ctrl+n/p move · ctrl+r older")]
+                [(theme.DIM, "ctrl+n/p move · ctrl+r older")]
             )
         return lines
 

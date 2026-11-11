@@ -74,6 +74,7 @@ class FinderRuntimeMixin:
         return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
+        self._finder_field.reset(notify=False)
         self._active_finder = self._viewed_transcript()
         finder = self._active_finder
         session = getattr(self, "_active_session", None)
@@ -96,7 +97,7 @@ class FinderRuntimeMixin:
                 session.layout.focus(field.window)
             except ValueError:
                 pass
-            field.buffer.set_document(buffer.document, bypass_readonly=True)
+            field.set_document(buffer.document, notify=False)
         request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
 
@@ -194,6 +195,7 @@ class FinderRuntimeMixin:
         if finder.finder_accept():
             self._cancel_finder_workers()
             self._active_finder = self._viewed_transcript()
+        self._finder_field.reset(notify=False)
         self._restore_composer_focus()
         self._invalidate_prompt()
 
@@ -201,6 +203,7 @@ class FinderRuntimeMixin:
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
+        self._finder_field.reset(notify=False)
         self._restore_composer_focus()
         self._invalidate_prompt()
 
