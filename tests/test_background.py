@@ -459,17 +459,6 @@ async def _cancel_process_wait(registry, owner, monkeypatch) -> None:
 
 
 async def _cancel_reader_drain(registry, owner, monkeypatch) -> None:
-    process = owner.process
-    assert process is not None and process.stdout is not None
-    read_blocked = asyncio.Event()
-    original_read = process.stdout.read
-
-    async def read(size=-1):
-        await asyncio.wait_for(read_blocked.wait(), 10)
-        return await original_read(size)
-
-    # Keep the reader pending so the drain race takes the gated branch.
-    monkeypatch.setattr(process.stdout, "read", read)
     original = owner._finish_output_drain.wait
 
     async def install(hold):
@@ -823,6 +812,18 @@ async def test_background_task_owner_state_table(
             return
 
         if row.startswith("cancel-"):
+            if row == "cancel-reader-drain":
+                read_blocked = asyncio.Event()
+                original_read_output = registry.background_tasks._read_output
+
+                async def read_output(*args):
+                    await asyncio.wait_for(read_blocked.wait(), 10)
+                    return await original_read_output(*args)
+
+                # Keep the reader pending so the drain race takes the gated branch.
+                monkeypatch.setattr(
+                    registry.background_tasks, "_read_output", read_output
+                )
             task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
             owner = registry.background_tasks._owners[task_id]
             handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
