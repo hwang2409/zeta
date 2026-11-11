@@ -925,7 +925,7 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
-        return self._shape_history_result(connection, result)
+        return self._strip_restart_reason(connection, result)
 
     async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
         if set(params) - {"handle", "offset", "limit"}:
@@ -980,11 +980,6 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
-        return self._shape_history_result(connection, result)
-
-    def _shape_history_result(self, connection: Any, result: object) -> object:
-        """Strip ``server_restarted`` from projected approval rows for a legacy
-        connection. One output seam for session and child-run history pages."""
         return self._strip_restart_reason(connection, result)
 
     def _child_reader_for(

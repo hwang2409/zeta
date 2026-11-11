@@ -107,7 +107,7 @@ def bootstrap_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> Non
 
     The child tree is repaired post-order: a resumed child is canceled and is
     never re-presented, so its unresolved approvals are stale and are aborted,
-    and the immediate-parent delegated end is written. The resumed session's own
+    and the delegated end is written on the root session history. The resumed session's own
     foreground approvals are NOT touched here: the runtime re-presents every
     durable unresolved foreground request from the store
     (``_pending_approvals_projection`` in server/approval_lifecycle.py), so they
@@ -140,9 +140,11 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     root = loop.store
     notification = loop._background_owner.notification_store
     # The whole recovered tree shares the root writer lease, so one observed
-    # home epoch (from the session manager) selects every restart reason. Every
-    # production loop reaching recovery has a manager (set in compose_runtime).
-    home_epoch = loop.manager.observed_storage_epoch
+    # home epoch (from the session manager) selects every restart reason. A loop
+    # built without a manager (test builders) aborts reasonlessly, which is the
+    # safe old behavior.
+    manager = getattr(loop, "manager", None)
+    home_epoch = manager.observed_storage_epoch if manager is not None else 0
 
     stop_recovery = threading.Event()
 

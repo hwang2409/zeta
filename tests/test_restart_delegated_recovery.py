@@ -11,22 +11,66 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.serve_close import close_serve
+from tests.support.server_client import request
+from tests.support.sockets import short_socket_path as _socket_path
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
-from zeta.server.runtime import ServerRuntime
+from zeta.server import ZetaServer
 from zeta.storage_format import FEATURE_EPOCHS, StorageFeature
+
+pytest_plugins = ("tests.support.socket_fixtures",)
 
 _RESTART_EPOCH = FEATURE_EPOCHS[StorageFeature.APPROVAL_RESTART_REASON]
 
 
-def _runtime(home: Path, cwd: Path) -> ServerRuntime:
-    return ServerRuntime(
-        home,
-        cwd=cwd,
+async def _restart_and_read_ends(
+    home: Path, cwd: Path, session_id: str
+) -> tuple[list[dict], dict]:
+    """Drive restart over the real ``zeta serve`` socket and read the root
+    approval ends back from ``session_history``.
+
+    The ``resume`` RPC runs the same recovery a crash-restart runs; reading the
+    ends back over the wire proves the delegated end landed on the root session
+    history, not an intermediate child store.
+    """
+    server = ZetaServer(
         provider="codex",
+        home=home,
+        socket_path=_socket_path(cwd),
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
     )
+    await server.start()
+    writer = None
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
+        await request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": ["session_replay_seq", "approval_restart_reason"],
+            },
+        )
+        resumed = (
+            await request(reader, writer, 2, "resume", {"session_id": session_id})
+        )[-1]
+        history = (
+            await request(
+                reader, writer, 3, "session_history", {"session_id": session_id}
+            )
+        )[-1]["result"]
+        ends = [
+            row for row in history["messages"] if row.get("event") == "approval_end"
+        ]
+        return ends, resumed
+    finally:
+        if writer is not None:
+            await close_serve(server, writer)
+        await server.close()
 
 
 def _open_root_child(
@@ -172,25 +216,6 @@ def _seed_grandchild(home: Path, cwd: Path) -> str:
     return session_id
 
 
-async def _resume_and_close(home: Path, cwd: Path, session_id: str) -> None:
-    runtime = _runtime(home, cwd)
-    await runtime.resume_session(session_id)
-    await runtime.close()
-
-
-def _parent_ends(home: Path, session_id: str) -> list[dict]:
-    store = SessionManager(home).open(session_id).store
-    try:
-        return [
-            entry.data
-            for entry in store.replay()
-            if entry.type == "approval_history"
-            and entry.data.get("event") == "approval_end"
-        ]
-    finally:
-        store.close()
-
-
 def _resolution_at(
     home: Path, session_id: str, agents_rel: str, request_id: str
 ) -> dict | None:
@@ -217,11 +242,10 @@ async def test_restart_recovery_repairs_delegated_child_and_parent_end(
     home = tmp_path / "home"
     session_id = await asyncio.to_thread(_seed_delegated, home, tmp_path)
 
-    await _resume_and_close(home, tmp_path, session_id)
+    ends, _resumed = await _restart_and_read_ends(home, tmp_path, session_id)
 
     # Fails on base: before this change recovery never resolved the child approval
     # nor wrote the parent end, so both assertions below are empty/None.
-    ends = await asyncio.to_thread(_parent_ends, home, session_id)
     assert len(ends) == 1
     assert ends[0]["request_id"] == "wire-c"
     assert ends[0]["data"]["decision"] == "abort"
@@ -241,8 +265,9 @@ class _EndCase:
 
 def _check_grandchild(ends: list[dict], resolution: object) -> None:
     grand = [e for e in ends if e["request_id"] == "wire-g"]
-    # Fails on current head (74e71775): the grandchild end was repaired against
-    # the intermediate child store, so the root end was never written.
+    # Fails on the old base (74e71775): the grandchild end was repaired against
+    # the intermediate child store, so the root session history never got it and
+    # session_history over the socket returns no wire-g end.
     assert len(grand) == 1, f"root grandchild end rows: {grand}"
     assert grand[0]["data"]["decision"] == "abort"
     assert grand[0]["data"]["reason"] == "server_restarted"
@@ -280,9 +305,8 @@ async def test_restart_recovery_delegated_end_states(
     home = tmp_path / "home"
     session_id = await asyncio.to_thread(case.seed, home, tmp_path)
 
-    await _resume_and_close(home, tmp_path, session_id)
+    ends, _resumed = await _restart_and_read_ends(home, tmp_path, session_id)
 
-    ends = await asyncio.to_thread(_parent_ends, home, session_id)
     resolution = (
         await asyncio.to_thread(
             _resolution_at, home, session_id, "agents/0/agents", "req-g"
@@ -304,12 +328,7 @@ async def test_restart_recovery_low_epoch_writes_reasonless_parent_end(
         _seed_delegated, home, tmp_path, _RESTART_EPOCH - 1
     )
 
-    runtime = _runtime(home, tmp_path)
-    await runtime.resume_session(session_id)
-    assert runtime.loop.manager.observed_storage_epoch == _RESTART_EPOCH - 1
-    await runtime.close()
-
-    ends = await asyncio.to_thread(_parent_ends, home, session_id)
+    ends, _resumed = await _restart_and_read_ends(home, tmp_path, session_id)
     assert len(ends) == 1
     assert ends[0]["data"]["decision"] == "abort"
     assert "reason" not in ends[0]["data"]
