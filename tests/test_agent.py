@@ -4014,6 +4014,11 @@ async def _run_post_cap_tool_cycle(
         )
 
         child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
+        child_state = next(
+            state
+            for state, _configured_timeout in deadlines.started
+            if deadlines._wakes[id(state)][1] == child_handle
+        )
         if not send_fresh_prompt:
             backend.release_post_cap.set()
         if send_fresh_prompt:
@@ -4058,15 +4063,14 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            # the test holds the nested agent and child bound; release both once
+            # the fresh turn has entered, before allowing its response to close.
+            backend.release_grandchild.set()
+            deadlines.expire_child_bound(child_state)
             backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
-            state = next(
-                state
-                for state, _configured_timeout in deadlines.started
-                if deadlines._wakes[id(state)][1] == child_handle
-            )
-            deadlines.expire_child_bound(state)
+            deadlines.expire_child_bound(child_state)
         await await_or_fail(
             terminal_published.wait(),
             what=(
