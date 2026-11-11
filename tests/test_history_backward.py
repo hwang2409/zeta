@@ -13,6 +13,7 @@ from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
+from zeta.core.store._history_index import HistoryIndexUnavailableError
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -276,10 +277,63 @@ async def test_real_socket_backward_continuation_survives_append_but_not_repair(
 
 
 @pytest.mark.asyncio
-async def test_real_socket_branch_during_read_is_stale_and_not_cached(
+async def test_real_socket_newest_page_falls_back_after_concurrent_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A same-owner branch between g0 and g1 rejects the in-flight page."""
+    async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
+        index = server.runtime.opened.store._history_index
+        page_ready = threading.Event()
+        release_page = threading.Event()
+
+        def page_after_append(request: object, g0: object) -> object:
+            page_ready.set()
+            assert release_page.wait(timeout=10)
+            raise HistoryIndexUnavailableError("forced derived-state failure")
+
+        monkeypatch.setattr(index, "page", page_after_append)
+        pending = asyncio.create_task(
+            request(
+                reader,
+                writer,
+                3,
+                "session_history",
+                {"session_id": session_id, "before": None},
+            )
+        )
+
+        def wait_for_page() -> None:
+            assert page_ready.wait(10)
+
+        response = None
+        try:
+            await await_or_fail(
+                asyncio.to_thread(wait_for_page), what="history index page"
+            )
+            server.runtime.opened.store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("concurrent")]),
+                    MessageOrigin.USER,
+                )
+            )
+            release_page.set()
+            response = (await await_or_fail(pending, what="history request"))[-1]
+        finally:
+            release_page.set()
+            if not pending.done():
+                pending.cancel()
+            await await_or_fail(
+                asyncio.gather(pending, return_exceptions=True),
+                what="history request cleanup",
+            )
+        assert "result" in response, response
+        assert response["result"]["messages"][-1]["content"][0]["text"] == "concurrent"
+
+
+@pytest.mark.asyncio
+async def test_real_socket_branch_during_read_returns_current_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-owner branch between g0 and g1 falls back to current history."""
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         old_first = await _history_request(reader, writer, 3, session_id, {"offset": 0})
         index = server.runtime.opened.store._history_index
@@ -307,9 +361,10 @@ async def test_real_socket_branch_during_read_is_stale_and_not_cached(
         )
         release_page.set()
         response = (await await_or_fail(pending, what="history request"))[-1]
-        assert "error" in response, response
-        assert response["error"]["code"] == -32009
-        assert response["error"]["data"] == {"code": "stale_history_snapshot"}
+        assert "error" not in response, response
+        assert [row["id"] for row in response["result"]["messages"]] == [
+            old_first["messages"][0]["id"]
+        ]
         fresh = await _history_request(reader, writer, 5, session_id, {"offset": 0})
         assert [row["id"] for row in fresh["messages"]] == [
             old_first["messages"][0]["id"]
