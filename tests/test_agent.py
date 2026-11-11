@@ -1967,6 +1967,7 @@ class FinishGateBackend(CompletionBackend):
 class PostCapBudgetBackend(CompletionBackend):
     def __init__(self) -> None:
         self.release_grandchild = asyncio.Event()
+        self.grandchild_completed = asyncio.Event()
         self.hold_post_cap = False
         self.hold_fresh_prompt = False
         self.release_post_cap = asyncio.Event()
@@ -2019,6 +2020,7 @@ class PostCapBudgetBackend(CompletionBackend):
             blocks = [ToolUseContent(grandchild)]
         elif last_user == "grandchild prompt":
             await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
+            self.grandchild_completed.set()
             blocks = [TextContent("grandchild complete")]
         elif last_user.startswith("edge prompt"):
             blocks = [TextContent("edge complete")]
@@ -4014,6 +4016,11 @@ async def _run_post_cap_tool_cycle(
         )
 
         child_handle = max(store.agent_children(), key=lambda handle: handle.count(":"))
+        child_state = next(
+            state
+            for state, _configured_timeout in deadlines.started
+            if deadlines._wakes[id(state)][1] == child_handle
+        )
         if not send_fresh_prompt:
             backend.release_post_cap.set()
         if send_fresh_prompt:
@@ -4058,15 +4065,23 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            # Release the grandchild and await its completion BEFORE releasing
+            # the fresh response, so the test never waits on terminal publication
+            # while it still holds the grandchild. The finish gate waits on the
+            # owned grandchild with the child deadline held at infinity, and the
+            # test awaits terminal publication; releasing the grandchild first
+            # breaks that cycle by construction. This test does NOT cover the
+            # finish-gate wait-with-owned-child branch; production bounds that
+            # wait by the child/task deadlines (finish_gate.py:363-396,
+            # background_owner.py:42-69).
+            backend.release_grandchild.set()
+            await await_or_fail(
+                backend.grandchild_completed.wait(), what="grandchild completion"
+            )
             backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
-            state = next(
-                state
-                for state, _configured_timeout in deadlines.started
-                if deadlines._wakes[id(state)][1] == child_handle
-            )
-            deadlines.expire_child_bound(state)
+            deadlines.expire_child_bound(child_state)
         await await_or_fail(
             terminal_published.wait(),
             what=(
