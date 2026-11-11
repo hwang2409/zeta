@@ -1,9 +1,15 @@
-"""Durable restart recovery for unresolved approvals (one owner).
+"""Durable restart recovery for approvals a resumed runtime will not re-present.
 
-Startup invariant: when this runs no live runtime exists yet, so every durable
-unresolved approval is stale and must be closed. There is no live-pending set to
-exclude; a future path that reconstructs live waits before recovery must change
-that ordering deliberately.
+Rule (lead decision, 2026-11-11): abort every durable unresolved approval that
+the resumed runtime does NOT re-present, and only those.
+
+- The resumed session's own foreground requests ARE re-presented: the serve join
+  baseline and the TUI both rebuild the pending set from the store
+  (``_pending_approvals_projection`` in ``server/approval_lifecycle.py``, read at
+  ``server/handlers/lifecycle.py`` before any join). Recovery leaves them open.
+- A delegated child is canceled on resume and is never re-presented, so its
+  unresolved approvals are stale: recovery aborts them and writes the missing
+  immediate-parent delegated end.
 
 One ``restart_abort_reason(home_epoch)`` selector picks the reason for every
 store in a recovered tree. All stores share the root writer lease, so they share

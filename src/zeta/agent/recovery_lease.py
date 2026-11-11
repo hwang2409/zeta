@@ -104,16 +104,17 @@ def acquire_recovery_subtree(
 def bootstrap_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> None:
     """Repair restart state before the opened store reaches the event loop.
 
-    Durable restart recovery runs here, before the store is visible to serve
-    joins or the TUI: the root session's own unresolved approvals are aborted,
-    and the child tree is repaired post-order (child resolution, then the
-    immediate-parent delegated end).
+    The child tree is repaired post-order: a resumed child is canceled and is
+    never re-presented, so its unresolved approvals are stale and are aborted,
+    and the immediate-parent delegated end is written. The resumed session's own
+    foreground approvals are NOT touched here: the runtime re-presents every
+    durable unresolved foreground request from the store
+    (``_pending_approvals_projection`` in server/approval_lifecycle.py), so they
+    stay open and answerable after resume.
     """
 
-    from ..runtime.approval_recovery import recover_store_approvals
     from .background_lifecycle import recover_agent_children
 
-    recover_store_approvals(loop.store, home_epoch)
     recover_agent_children(loop, home_epoch)
     loop._children_recovered = True
 
