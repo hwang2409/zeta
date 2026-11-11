@@ -10,7 +10,7 @@ from typing import Any
 
 from ..handlers import validation
 from ..handlers.history import replay_history
-from ..protocol import EventDescriptor, FrameCodec, _Frame
+from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
 from . import (
     DROP,
     EVICT,
@@ -45,7 +45,9 @@ class ReplayOutput:
         covers: rows.Covers,
         replay_row: rows.RowFacts | None = None,
     ) -> None:
-        """Send a controller event to observers that joined its replay scope."""
+        """Send an event to observers that joined its replay scope."""
+        if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
+            return
         for observer in tuple(self._observers):
             if not self._feature_rejected(observer, event, required_feature, fields):
                 self._publish_replay(

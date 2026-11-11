@@ -102,6 +102,8 @@ EVENT_FEATURES = {
     EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
     EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
     EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
+    EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
+    EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
