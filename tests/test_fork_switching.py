@@ -470,7 +470,7 @@ async def test_live_approval_handle_survives_refresh_and_submission(
         assert not app._approval_units
         assert bool(policy.always_allow) == (verb == "always")
     finally:
-        await app.close()
+        await asyncio.wait_for(app.close(), 10)
         await asyncio.gather(submission, return_exceptions=True)
 
 

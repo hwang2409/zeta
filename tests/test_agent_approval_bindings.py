@@ -742,7 +742,7 @@ async def test_canceled_execution_discards_its_approval_binding(
             capability=capability,
         )
         binding_created.set()
-        await never_release.wait()
+        await asyncio.wait_for(never_release.wait(), 10)
         return decision
 
     monkeypatch.setattr(child_policy, "authorize", pause_after_binding)
@@ -754,7 +754,7 @@ async def test_canceled_execution_discards_its_approval_binding(
         assert len(child_policy._execution_bindings) == 1
         execution.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await execution
+            await asyncio.wait_for(execution, 10)
         assert child_policy._execution_bindings == {}
 
         monkeypatch.setattr(child_policy, "authorize", original_authorize)
@@ -962,7 +962,7 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
         )
         assert execution_token in child_policy._execution_bindings
         authorized.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return decision
 
     monkeypatch.setattr(child_policy, "authorize", pause_after_binding)
