@@ -5239,7 +5239,7 @@ def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
         recommendation=None,
         status="open",
     )
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
 
     rendered = _render_overlay_at_80(panel.render_lines())
@@ -6426,7 +6426,6 @@ def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None
 
 
 def test_transcript_navigation_bindings_are_full_screen_only() -> None:
-    finder_field = OverlayTextField("TEST_FINDER")
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
         on_history_next=lambda _buffer: None,
@@ -6434,7 +6433,6 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
         on_exit=lambda: None,
         on_finder_open=lambda: None,
         finder_active=lambda: False,
-        finder_buffer=finder_field.buffer,
         search_active=lambda: False,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
@@ -6481,7 +6479,6 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
                 on_finder_move=moves.append,
                 on_finder_accept=accept,
                 on_finder_cancel=lambda: None,
-                finder_buffer=finder_field.buffer,
             ),
         )
         session.app.layout = Layout(

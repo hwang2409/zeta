@@ -80,10 +80,7 @@ class FinderRuntimeMixin:
         session = getattr(self, "_active_session", None)
         field = getattr(self, "_finder_field", None)
         if session is not None and field is not None:
-            try:
-                session.layout.focus(field.window)
-            except ValueError:
-                pass
+            field.focus(session.layout)
         request = finder.open_finder()
         self._start_finder_preparation(request)
 
@@ -93,10 +90,7 @@ class FinderRuntimeMixin:
         session = getattr(self, "_active_session", None)
         field = getattr(self, "_finder_field", None)
         if session is not None and field is not None:
-            try:
-                session.layout.focus(field.window)
-            except ValueError:
-                pass
+            field.focus(session.layout)
             field.set_document(buffer.document, notify=False)
         request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
@@ -196,7 +190,7 @@ class FinderRuntimeMixin:
             self._cancel_finder_workers()
             self._active_finder = self._viewed_transcript()
             self._finder_field.reset(notify=False)
-        self._restore_composer_focus()
+            self._restore_composer_focus()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:

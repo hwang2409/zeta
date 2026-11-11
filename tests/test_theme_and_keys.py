@@ -28,7 +28,6 @@ from zeta.tui.key_bindings import (
     parse_key_spec,
     resolve_keybindings,
 )
-from zeta.tui.overlay_text_field import OverlayTextField
 
 
 @pytest.fixture(autouse=True)
@@ -82,14 +81,12 @@ def test_history_search_is_a_remappable_action() -> None:
 
 
 def test_history_search_binds_the_remapped_key() -> None:
-    finder_field = OverlayTextField("TEST_FINDER")
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
         on_history_next=lambda _buffer: None,
         on_interrupt=lambda: None,
         on_exit=lambda: None,
         on_history_finder_open=lambda _buffer: None,
-        finder_buffer=finder_field.buffer,
         key_remap={"history-search": "f4"},
     )
     assert _binding_keys(bindings, "open_history_finder") == {("f4",)}

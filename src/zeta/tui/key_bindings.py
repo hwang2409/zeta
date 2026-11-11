@@ -334,7 +334,6 @@ def build_key_bindings(
     on_finder_accept: Callable[[], None] | None = None,
     on_finder_cancel: Callable[[], None] | None = None,
     on_finder_toggle_preview: Callable[[], None] | None = None,
-    finder_buffer: Buffer | None = None,
     search_active: Callable[[], bool] | None = None,
     on_search_next: Callable[[], None] | None = None,
     on_search_previous: Callable[[], None] | None = None,
@@ -389,10 +388,6 @@ def build_key_bindings(
     history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
     suppress_history_detach = False
-    if (
-        on_finder_open is not None or on_history_finder_open is not None
-    ) and finder_buffer is None:
-        raise ValueError("finder callbacks require the shared overlay field buffer")
 
     def track_history_buffer(buffer: Buffer) -> None:
         nonlocal history_navigation_active, history_navigation_buffer

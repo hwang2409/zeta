@@ -9056,7 +9056,7 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child.agent_lifecycle()
     assert lifecycle is not None
-    assert lifecycle["final_result"] == result.content, f"stored={lifecycle['final_result']!r}\nresult={result.content!r}"
+    assert lifecycle["final_result"] == result.content
     assert lifecycle["final_result_is_receipt"] is True
     assert result.content.endswith("error=true · canceled=false")
 

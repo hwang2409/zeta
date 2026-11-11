@@ -509,7 +509,6 @@ class TUIApp(
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
             on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
-            finder_buffer=app._finder_field.buffer,
             search_active=lambda: app._viewed_transcript().search_active,
             on_search_next=lambda: app._viewed_transcript().next_search_match(),
             on_search_previous=lambda: app._viewed_transcript().previous_search_match(),
@@ -1104,7 +1103,8 @@ class TUIApp(
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._active_finder.finder_active,
                 queued_messages=lambda: app.queued_messages,
-                overlay_field_windows=(app._decisions_answer_field.window, app._finder_field.window),
+                decisions_answer_window=app._decisions_answer_field.window,
+                overlay_field_windows=(app._finder_field.window,),
             )
         ]
         self._agent_navigation.bind_layout(

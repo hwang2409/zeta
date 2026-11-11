@@ -15,9 +15,7 @@ import threading
 import weakref
 from pathlib import Path
 
-from prompt_toolkit.application.current import get_app
 from prompt_toolkit.document import Document
-from prompt_toolkit.key_binding.vi_state import InputMode
 
 from ...attention_records import Broken, broken_record_refusal
 from ...protocol.types import StreamEvent, StreamEventType
@@ -173,8 +171,8 @@ class DecisionsMixin:
         panel_ref = weakref.ref(self)
         self._decisions_answer_field = OverlayTextField(
             "DECISIONS_ANSWER",
-            on_text_changed=lambda text: (
-                target._decisions_answer_input(text)
+            on_text_changed=lambda _text: (
+                target._decisions_answer_input()
                 if (target := panel_ref()) is not None
                 else None
             ),
@@ -492,12 +490,7 @@ class DecisionsMixin:
             self._decisions_answer_field.reset()
             session = self._active_session
             if isinstance(session, FullScreenPromptSession):
-                try:
-                    session.layout.focus(self._decisions_answer_field.window)
-                except ValueError:
-                    pass
-                if get_app().editing_mode.name == "VI":
-                    get_app().vi_state.input_mode = InputMode.INSERT
+                self._decisions_answer_field.focus(session.layout)
         elif key == "enter":
             self._discuss_selected()
             return
@@ -510,17 +503,23 @@ class DecisionsMixin:
 
     def _decisions_answer_key(self, key: str) -> None:
         if key == "escape":
-            self._decisions_panel.exit_answer()
+            self._exit_decisions_answer()
         elif key == "enter":
             text = self._decisions_answer_field.text.strip()
             if text:
                 self._deliver_quick_answer(text)
                 return
-            self._decisions_panel.exit_answer()
+            self._exit_decisions_answer()
         self._refresh_decisions_panel(keep_offset=True)
 
-    def _decisions_answer_input(self, text: str) -> None:
-        del text
+    def _exit_decisions_answer(self) -> None:
+        """Leave answer mode and return focus to the panel list."""
+        self._decisions_panel.exit_answer()
+        session = self._active_session
+        if isinstance(session, FullScreenPromptSession):
+            session.layout.focus(self._decisions_panel_window)
+
+    def _decisions_answer_input(self) -> None:
         if self._decisions_panel.mode != "answer":
             return
         self._refresh_decisions_panel(keep_offset=True)
@@ -568,7 +567,7 @@ class DecisionsMixin:
             self.request_decisions_refresh()
             self._refresh_decisions_panel()
 
-        self._decisions_panel.exit_answer()
+        self._exit_decisions_answer()
         asyncio.create_task(run())
 
     def _dismiss_selected(self) -> None:

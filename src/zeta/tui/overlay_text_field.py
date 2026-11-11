@@ -9,7 +9,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding.vi_state import InputMode
-from prompt_toolkit.layout import Dimension
+from prompt_toolkit.layout import Dimension, Layout
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.utils import get_cwidth
@@ -77,6 +77,16 @@ class OverlayTextField:
     @property
     def text(self) -> str:
         return self.buffer.text
+
+    def focus(self, layout: Layout) -> None:
+        """Focus this field's window and start in vi insert mode when editing in VI."""
+        try:
+            layout.focus(self.window)
+        except ValueError:
+            return
+        app = get_app()
+        if app.editing_mode is EditingMode.VI:
+            app.vi_state.input_mode = InputMode.INSERT
 
     def close(self) -> None:
         if self._text_changed_handler is not None:

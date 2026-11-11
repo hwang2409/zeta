@@ -72,12 +72,12 @@ def _option_lines(index: int, text: str, width: int) -> list[FragmentLine]:
 class DecisionsPanel:
     """Interactive state for the open-decisions list and the answer field."""
 
-    def __init__(self, answer_field: OverlayTextField | None = None) -> None:
+    def __init__(self, answer_field: OverlayTextField) -> None:
         self._items: tuple[DecisionItem, ...] = ()
         self._staged: dict[str, str] = {}
         self._selected_id: str | None = None
         self._mode: str = "list"
-        self.answer_field = answer_field or OverlayTextField("DECISIONS_ANSWER")
+        self.answer_field = answer_field
 
     # -- snapshot ingestion -------------------------------------------------
 
@@ -142,9 +142,6 @@ class DecisionsPanel:
         self._mode = "answer"
         self.answer_field.reset()
         return True
-
-    def set_answer(self, text: str) -> None:
-        self.answer_field.set_text(text)
 
     def exit_answer(self) -> None:
         self._mode = "list"
