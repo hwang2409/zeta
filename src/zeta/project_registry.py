@@ -31,6 +31,7 @@ from .core.session_files import (
     reference_publication,
 )
 from .locking import format_lock
+from .memory.transaction import MemoryTransactions
 from .project_context.projection import (
     ProjectContextProjectionMixin,
 )
@@ -226,6 +227,7 @@ class ProjectRegistry(
             if root is not None
             else Path.home() / ".zeta" / "projects"
         )
+        self.memory_transactions = MemoryTransactions(self)
         with format_lock():
             self._storage_lease = open_writer(self.root.parent)
         self._release_storage_lease = weakref.finalize(

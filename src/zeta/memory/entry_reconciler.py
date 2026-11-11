@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from zeta.oauth import ProviderLoginRequiredError
-from zeta.project_errors import ProjectRegistryError
+from zeta.project_errors import ProjectRegistryError, UnsupportedMemoryFormatError
 from zeta.providers.completion import CompletionRetryBudget
 
 from .entry_request import (
@@ -759,7 +759,12 @@ async def reconcile_entry_range(
     usage: dict[str, int] = {}
     budget = CompletionRetryBudget()
     for attempt in range(cas_retries):
-        snapshot = await asyncio.to_thread(registry._entry_memory_state, project_id)
+        projection = await asyncio.to_thread(
+            registry.memory_transactions.read, project_id
+        )
+        if projection.format != 2:
+            raise UnsupportedMemoryFormatError("project uses legacy memory format")
+        snapshot = projection.snapshot
         request = _prepare_request(
             transcript,
             snapshot.state,

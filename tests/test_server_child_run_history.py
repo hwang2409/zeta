@@ -95,6 +95,95 @@ async def test_child_history_is_available_to_negotiated_observer(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_history_validator_contract_is_shared_by_all_serve_history_methods(
+    tmp_path: Path,
+) -> None:
+    server, reader, writer, session_id = await _open(
+        tmp_path,
+        [
+            "child_run_history",
+            "session_history_backward",
+            "session_replay_seq",
+        ],
+    )
+    server.runtime.opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("parent")])
+    )
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
+    child.close()
+    methods = (
+        ("session_history", {"session_id": session_id, "before": None}),
+        (
+            "child_run_history",
+            {"session_id": session_id, "run_id": f"{session_id}:1"},
+        ),
+        ("session_history_and_subscribe", {"session_id": session_id}),
+    )
+    request_id = 3
+    try:
+        for method, newest_params in methods:
+            newest = (
+                await request(reader, writer, request_id, method, newest_params)
+            )[-1]
+            request_id += 1
+            assert "result" in newest, (method, newest)
+            validator = newest["result"]["history_validator"]
+            assert set(validator) == {"end", "entry_id", "repair_generation"}
+
+            continuation = {
+                **newest_params,
+                "before": validator["end"],
+                "history_validator": validator,
+            }
+            accepted = (
+                await request(reader, writer, request_id, method, continuation)
+            )[-1]
+            request_id += 1
+            assert "result" in accepted, (method, accepted)
+            assert set(accepted["result"]["history_validator"]) == {
+                "end",
+                "entry_id",
+                "repair_generation",
+            }
+
+            continuation["history_validator"] = {
+                "end": validator["end"],
+                "entry_id": validator["entry_id"],
+            }
+            stale = (
+                await request(reader, writer, request_id, method, continuation)
+            )[-1]
+            request_id += 1
+            assert stale["error"]["code"] == -32009, (method, stale)
+            assert stale["error"]["data"]["code"] == "stale_history_snapshot"
+
+            restarted = (
+                await request(reader, writer, request_id, method, newest_params)
+            )[-1]
+            request_id += 1
+            assert "result" in restarted, (method, restarted)
+            assert set(restarted["result"]["history_validator"]) == {
+                "end",
+                "entry_id",
+                "repair_generation",
+            }
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_child_history_requires_negotiated_feature_and_valid_run_id(
     tmp_path: Path,
 ) -> None:
