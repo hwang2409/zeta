@@ -93,6 +93,7 @@ class BackgroundTaskRegistry:
         self.stdin_drain_timeout = stdin_drain_timeout
         self.command_niceness = command_niceness
         self._notice_sink = notice_sink
+        self._committed_transition_sink: Callable[[BackgroundTaskNotice], None] | None = None
         self._notification_sink = notification_sink
         self._notification_exists = notification_exists or (lambda _task_id: False)
         self._pending_recovery: dict[str, TaskExitInput] = {}
@@ -173,6 +174,12 @@ class BackgroundTaskRegistry:
         self, sink: Callable[[BackgroundTaskNoticeSinkValue], None] | None
     ) -> None:
         self._notice_sink = sink
+
+    def set_committed_transition_sink(
+        self, sink: Callable[[BackgroundTaskNotice], None] | None
+    ) -> None:
+        """Attach an observer for transitions after their durable commit."""
+        self._committed_transition_sink = sink
 
     def set_notification_exists(self, lookup: Callable[[str], bool]) -> None:
         self._notification_exists = lookup
@@ -824,6 +831,7 @@ class BackgroundTaskRegistry:
             await asyncio.wait_for(writer.wait_closed(), timeout=self.term_grace)
         except (asyncio.TimeoutError, BrokenPipeError, ConnectionError, OSError):
             pass
+
 
     async def _close_stdin(self, record: _BackgroundRecord) -> None:
         lock = record.stdin_lock
