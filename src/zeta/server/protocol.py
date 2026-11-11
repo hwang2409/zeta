@@ -355,7 +355,7 @@ class MethodDescriptor(Enum):
         "run_work",
         Access.SESSION_MUTATION,
     )
-    CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.CONTROLLER_READ)
+    CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.READ)
     CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
 
     def __init__(
