@@ -52,9 +52,11 @@ def parse_child_run_id(parent_session_id: str, run_id: str) -> tuple[int, str | 
 
 def run_row_identity(run_id: str) -> tuple[str, str | None]:
     """The one owner of a child-run row's identity: its top-level session id and
-    its parent run id (null for a direct child, whose parent is the session)."""
+    its parent run id (null for a direct child, whose parent is the session).
+    Lenient by design: it derives, never validates. Callers that need a validated
+    id call ``parse_child_run_id`` at the trust boundary first."""
     session_id = run_id.split(":", 1)[0]
-    _, parent_run_id = parse_child_run_id(session_id, run_id)
+    parent_run_id = run_id.rpartition(":")[0] if run_id.count(":") > 1 else None
     return session_id, parent_run_id
 
 
