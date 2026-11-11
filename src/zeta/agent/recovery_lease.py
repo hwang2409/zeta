@@ -17,6 +17,7 @@ class AgentLoopForRecovery(Protocol):
     store: ConversationStore
     _background_owner: Any
     _children_recovered: bool
+    manager: Any
 
     def _canceled_agent_result(
         self, tool_call_id: str, **kwargs: Any
@@ -139,11 +140,9 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     root = loop.store
     notification = loop._background_owner.notification_store
     # The whole recovered tree shares the root writer lease, so one observed
-    # home epoch (from the session manager) selects every restart reason.
-    manager = getattr(loop, "manager", None)
-    # No manager here (a rare detached path) means no observed epoch; fall back to
-    # a reasonless abort, which every reader accepts.
-    home_epoch = manager.observed_storage_epoch if manager is not None else 0
+    # home epoch (from the session manager) selects every restart reason. Every
+    # production loop reaching recovery has a manager (set in compose_runtime).
+    home_epoch = loop.manager.observed_storage_epoch
 
     stop_recovery = threading.Event()
 

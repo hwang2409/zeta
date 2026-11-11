@@ -176,16 +176,18 @@ async def test_join_during_restart_recovery_cannot_see_pre_recovery_store(
 
 
 @pytest.mark.asyncio
-async def test_join_baseline_represents_foreground_and_hides_aborted_delegated(
+async def test_status_represents_foreground_after_restart_and_join_shows_aborted_delegated(
     tmp_path: Path,
 ) -> None:
-    """Proof (2): the first join after recovery re-presents the durable foreground
-    root request (open and answerable over the wire), while the delegated child
-    request is already a durable restart abort end and never appears as pending.
+    """Proof (2): after recovery the first ``status`` RPC re-presents the durable
+    foreground root request (open and answerable over the wire), while the
+    delegated child request never appears as pending.
 
     This is the serve-side guarantee behind deviation A: recovery aborts only the
     approvals a resumed runtime will NOT re-present. A foreground request that was
-    durable-unresolved but missing from the baseline would be a real bug.
+    durable-unresolved but missing from the re-presented set would be a real bug.
+    The delegated abort end over the wire is proven by the mid-recovery join test
+    above; this test asserts only the foreground re-presentation and answerability.
     """
     home = tmp_path / "home"
     session_id = await asyncio.to_thread(
@@ -237,14 +239,9 @@ async def test_join_baseline_represents_foreground_and_hides_aborted_delegated(
         )[-1]["result"]
 
         rows = joined["messages"]
-        dele_ends = [
-            r
-            for r in rows
-            if r.get("event") == "approval_end" and r.get("request_id") == "wire-c"
-        ]
-        assert len(dele_ends) == 1
-        assert dele_ends[0]["data"] == {"decision": "abort", "reason": "server_restarted"}
-        # The foreground request is still open: no end row for it in the baseline.
+        # The delegated request is not pending (asserted via `status` above) and
+        # its abort end over the wire is proven by the mid-recovery join test; here
+        # we assert only that the baseline keeps the foreground request open.
         assert not [
             r
             for r in rows

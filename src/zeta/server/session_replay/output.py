@@ -498,15 +498,26 @@ class ReplayOutput:
 
         result = await self.run_read(connection, read)
         assert isinstance(result, tuple)
-        if "approval_restart_reason" in self._connections[connection].features:
-            return result
         history, *rest = result
-        rows = history.get("messages") if isinstance(history, dict) else None
-        if isinstance(rows, list):
-            shaped = event_contract.shape_approval_history_rows(
-                rows, include_restart_reason=False
-            )
-            if shaped is not rows:
-                history = {**history, "messages": shaped}
-                return (history, *rest)
-        return result
+        shaped = self._strip_restart_reason(connection, history)
+        if shaped is history:
+            return result
+        return (shaped, *rest)
+
+    def _strip_restart_reason(self, connection: Any, history: object) -> object:
+        """Strip ``server_restarted`` from projected approval rows for a legacy
+        connection (no ``approval_restart_reason`` feature). One output seam for
+        every history page; returns the same object when nothing is stripped."""
+        if "approval_restart_reason" in self._connections[connection].features:
+            return history
+        if not isinstance(history, dict):
+            return history
+        rows = history.get("messages")
+        if not isinstance(rows, list):
+            return history
+        shaped = event_contract.shape_approval_history_rows(
+            rows, include_restart_reason=False
+        )
+        if shaped is rows:
+            return history
+        return {**history, "messages": shaped}

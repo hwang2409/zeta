@@ -3,13 +3,14 @@
 Rule (lead decision, 2026-11-11): abort every durable unresolved approval that
 the resumed runtime does NOT re-present, and only those.
 
-- The resumed session's own foreground requests ARE re-presented: the serve join
-  baseline and the TUI both rebuild the pending set from the store
+- The resumed session's own foreground requests ARE re-presented: the serve
+  ``status`` RPC and the TUI both rebuild the pending set from the store
   (``_pending_approvals_projection`` in ``server/approval_lifecycle.py``, read at
   ``server/handlers/lifecycle.py`` before any join). Recovery leaves them open.
 - A delegated child is canceled on resume and is never re-presented, so its
   unresolved approvals are stale: recovery aborts them and writes the missing
-  immediate-parent delegated end.
+  delegated end on the root session history (serve writes every delegated
+  approval row to the root store at any depth).
 
 One ``restart_abort_reason(home_epoch)`` selector picks the reason for every
 store in a recovered tree. All stores share the root writer lease, so they share
@@ -36,20 +37,22 @@ def recover_store_approvals(store: ConversationStore, home_epoch: int) -> None:
 
 
 def repair_delegated_child(
-    parent_store: ConversationStore,
+    history_store: ConversationStore,
     child_store: ConversationStore,
     child_instance_id: str,
     home_epoch: int,
 ) -> None:
-    """Close a child's unresolved approvals and project any missing parent end.
+    """Close a child's unresolved approvals and project any missing end.
 
-    Post-order: the caller recurses into deeper children first, so a child's
-    authoritative resolution exists before its immediate parent is repaired. The
-    parent end carries the child's actual durable decision; a user ``allow`` or
-    ``deny`` is never rewritten to a restart abort.
+    ``history_store`` is the root session store: serve writes every delegated
+    approval row there, at any depth, keyed by the child's own
+    ``agent_instance_id``. Post-order: the caller recurses into deeper children
+    first, so a child's authoritative resolution exists before its delegated end
+    is projected. The end carries the child's actual durable decision; a user
+    ``allow`` or ``deny`` is never rewritten to a restart abort.
     """
     recover_store_approvals(child_store, home_epoch)
-    for wire_id, tool_call in parent_store.delegated_unmatched_requests(
+    for wire_id, tool_call in history_store.delegated_unmatched_requests(
         child_instance_id
     ):
         store_request_id = tool_call.get("id")
@@ -60,7 +63,7 @@ def repair_delegated_child(
         resolution = child_store.approval_resolution_data(store_request_id)
         if resolution is None:
             continue
-        parent_store.append_approval_history_end_if_absent(
+        history_store.append_approval_history_end_if_absent(
             _end_payload(wire_id, tool_call, resolution)
         )
 

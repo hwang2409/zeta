@@ -2283,13 +2283,8 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     if case == "external_end" and is_resolution and not entered.is_set():
                         # test-contract: prove the settlement task owns the gated await
                         gate_owner = asyncio.current_task()
-                        # Defensive: the external approval_end route may remove the
-                        # record while this durable commit runs. A single-shot gate
-                        # plus .get() keeps a second resolution commit from a
-                        # KeyError hang (regression: run 42943685995).
-                        record = server.control._approvals.state.records.get("call-1")
-                        if record is not None:
-                            assert gate_owner is record.settlement
+                        record = server.control._approvals.state.records["call-1"]
+                        assert gate_owner is record.settlement
                         # test-contract: gate after the real durable operation commits
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")

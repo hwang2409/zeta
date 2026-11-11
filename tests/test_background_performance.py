@@ -133,7 +133,7 @@ def test_nested_recovery_uses_indexed_tool_result_lookup() -> None:
             self.finished.append(marker_key)
 
     store = Store()
-    _recover_nested_children(store, store, {}, WRITER_EPOCH)  # type: ignore[arg-type]
+    _recover_nested_children(store, store, store, {}, WRITER_EPOCH)  # type: ignore[arg-type]
 
     assert store.messages_calls == 0
     assert store.tool_result_calls == len(tool_calls)

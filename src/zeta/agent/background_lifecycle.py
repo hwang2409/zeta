@@ -183,11 +183,17 @@ def _recovered_completion_input(
 
 def _recover_nested_children(
     store: ConversationStore,
+    history_store: ConversationStore,
     notification_store: ConversationStore,
     recovery_stores: dict[Path, ConversationStore],
     home_epoch: int,
 ) -> None:
-    """Cancel descendants left behind when an ancestor session exits."""
+    """Cancel descendants left behind when an ancestor session exits.
+
+    ``history_store`` is the root session store. Serve writes every delegated
+    ``approval_history`` row (at any depth) to that one store, so the delegated
+    end for a grandchild is repaired there, not against the intermediate parent.
+    """
 
     from ..runtime.approval_recovery import repair_delegated_child
 
@@ -205,15 +211,16 @@ def _recover_nested_children(
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
+                    history_store,
                     notification_store,
                     recovery_stores,
                     home_epoch,
                 )
                 # Post-order: the child's own approvals are closed and any
-                # missing immediate-parent delegated end is written before this
-                # marker is cleaned up.
+                # missing delegated end is written on the root session history
+                # before this marker is cleaned up.
                 repair_delegated_child(
-                    store, child_store, child_instance_id, home_epoch
+                    history_store, child_store, child_instance_id, home_epoch
                 )
             existing_result = store.tool_result(tool_call.id) is not None
             notification_status: str | None = None
@@ -374,6 +381,7 @@ def _recover_agent_children(
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
+                    loop.store,
                     notification_store,
                     recovery_stores,
                     home_epoch,

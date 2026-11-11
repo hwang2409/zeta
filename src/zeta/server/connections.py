@@ -985,18 +985,7 @@ class ConnectionRegistry(ReplayOutput):
     def _shape_history_result(self, connection: Any, result: object) -> object:
         """Strip ``server_restarted`` from projected approval rows for a legacy
         connection. One output seam for session and child-run history pages."""
-        include = "approval_restart_reason" in self._connections[connection].features
-        if include or not isinstance(result, dict):
-            return result
-        rows = result.get("messages")
-        if not isinstance(rows, list):
-            return result
-        shaped = event_contract.shape_approval_history_rows(
-            rows, include_restart_reason=False
-        )
-        if shaped is rows:
-            return result
-        return {**result, "messages": shaped}
+        return self._strip_restart_reason(connection, result)
 
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str
