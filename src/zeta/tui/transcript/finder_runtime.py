@@ -195,7 +195,7 @@ class FinderRuntimeMixin:
         if finder.finder_accept():
             self._cancel_finder_workers()
             self._active_finder = self._viewed_transcript()
-        self._finder_field.reset(notify=False)
+            self._finder_field.reset(notify=False)
         self._restore_composer_focus()
         self._invalidate_prompt()
 
