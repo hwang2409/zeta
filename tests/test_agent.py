@@ -11493,7 +11493,21 @@ async def test_consume_run_finalizes_once_finish_gate_admits_terminal(
 
     from zeta.agent import runner as agent_runner
 
-    child_store = ConversationStore(tmp_path, session_id="run")
+    parent_store = ConversationStore(tmp_path / "parent")
+    owner = BackgroundAgentOwner(parent_store)
+    # publish_not_delivered surfaces held-back input on the root transcript, so
+    # the child's owner must have the root flow registered under None.
+    owner.conversation_channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(parent_store)
+    )
+    child_store = ConversationStore(parent_store.session_dir / "agents", session_id="1")
+    child_store.start_agent_lifecycle(
+        handle="root:1",
+        started_at="2026-09-08T00:00:00+00:00",
+        depth=1,
+        agent_type="run",
+        description="worker",
+    )
     gate_state = FinishGateState()
     calls = 0
 
@@ -11523,6 +11537,8 @@ async def test_consume_run_finalizes_once_finish_gate_admits_terminal(
     child_loop = AgentLoop(
         FakeBackend([]),
         child_store,
+        agent_instance_id="root:1",
+        background_owner=owner,
         skill_catalog=SkillCatalog.empty(),
     )
     try:
@@ -11540,9 +11556,10 @@ async def test_consume_run_finalizes_once_finish_gate_admits_terminal(
         outcome_text = _TERMINAL_OUTCOME_RESULTS[outcome]["content"][0]["text"]
         assert outcome_text in str(result["content"][0]["text"])
 
+        # publish_not_delivered surfaces held-back input on the root transcript.
         not_delivered = [
             entry
-            for entry in child_store.agent_notifications(pending_only=False)
+            for entry in parent_store.agent_notifications(pending_only=False)
             if entry.data.get("display_only") is True
             and "not delivered" in str(entry.data.get("text", "")).lower()
         ]
@@ -11552,6 +11569,7 @@ async def test_consume_run_finalizes_once_finish_gate_admits_terminal(
     finally:
         await child_loop.close()
         child_store.close()
+        parent_store.close()
 
 
 @pytest.mark.asyncio
