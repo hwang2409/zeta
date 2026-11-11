@@ -18383,10 +18383,18 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
 
         loop = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
         await loop.activate()
+        recovery_done.write_text("done")
+        for _ in range(500):
+            if append_finished.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert append_finished.exists()
+        _stop_lease_holder(holder, stop)
+
         observed = ConversationStore(
             root.session_dir / "agents", session_id="1", _read_only=True
         )
-        appends_before_recovery_returned = [
+        all_appends = [
             message.content[0].text
             for message in observed.messages()
             if message.role is MessageRole.USER
@@ -18395,13 +18403,8 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
             and message.content[0].text.startswith("concurrent append ")
         ]
         observed.close()
+        appends_before_recovery_returned = all_appends[:-1]
         assert appends_before_recovery_returned
-        recovery_done.write_text("done")
-        for _ in range(500):
-            if append_finished.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert append_finished.exists()
 
         assert set(root.agent_children()) == {"root:1"}
         active_questions = {
