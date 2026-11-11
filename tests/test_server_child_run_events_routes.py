@@ -105,17 +105,32 @@ class Serve:
         return client
 
     async def join(self, client: ReplayClient, parent: str | None) -> dict[str, Any]:
-        """Join the scope where ``parent``'s children report: the top or one run."""
-        if parent is None:
-            reply = await client.request(
-                self.request_id(), "session_history_and_subscribe", {"session_id": self.session_id}
-            )
-        else:
+        """Join the scope where ``parent``'s children report: the top or one run.
+
+        A background child's follow-up turn can append durable rows while the top
+        scope join reads history off-loop, so ``session_history_and_subscribe``
+        answers -32009 ``stale_history_snapshot``; a real client re-joins and the
+        finite follow-up turn settles. A ``child_run_events`` -32009 is
+        ``stale_event_sequence`` and stays a hard error.
+        """
+        if parent is not None:
             reply = await client.request(
                 self.request_id(), "child_run_events", {"session_id": self.session_id, "run_id": parent}
             )
-        assert "error" not in reply, reply
-        return reply["result"]
+            assert "error" not in reply, reply
+            return reply["result"]
+        for _ in range(200):
+            reply = await client.request(
+                self.request_id(), "session_history_and_subscribe", {"session_id": self.session_id}
+            )
+            if "error" not in reply:
+                return reply["result"]
+            error = reply["error"]
+            assert (
+                error["code"] == -32009
+                and error.get("data", {}).get("code") == "stale_history_snapshot"
+            ), reply
+        raise AssertionError("history snapshot never settled")
 
     async def drain(self, client: ReplayClient) -> list[dict[str, Any]]:
         """Every event the client received before a later status response."""

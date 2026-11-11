@@ -593,7 +593,11 @@ async def _join_newest_settled(serve: Serve, client: ReplayClient) -> dict[str, 
         )
         if "error" not in response:
             return response["result"]
-        assert response["error"]["code"] == -32009, response
+        error = response["error"]
+        assert (
+            error["code"] == -32009
+            and error.get("data", {}).get("code") == "stale_history_snapshot"
+        ), response
     raise AssertionError("history snapshot never settled")
 
 
