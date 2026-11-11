@@ -223,6 +223,10 @@ class ServerRuntime:
         self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
+        self._init_sinks()
+
+    def _init_sinks(self) -> None:
+        # Shared with borrowed(): every sink and reaper field starts unset in both.
         self._background_event_sink: SessionEventSink | None = None
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
@@ -269,6 +273,43 @@ class ServerRuntime:
             **credential_kwargs,
         )
         return backend
+
+    @classmethod
+    def borrowed(
+        cls,
+        *,
+        home: Path,
+        opened: OpenedSession,
+        loop: AgentLoop,
+        policy: ApprovalPolicy,
+        project_dir: Path,
+        repo_root: Path,
+    ) -> ServerRuntime:
+        runtime = cls.__new__(cls)
+        runtime.home = Path(home).expanduser().resolve()
+        runtime.cwd = Path.cwd().resolve()
+        runtime._server_provider = opened.metadata.provider
+        runtime._server_model = opened.metadata.model
+        runtime._server_tools = None
+        runtime._server_disallowed_tools = None
+        runtime._require_tools = False
+        runtime._allow_hooks = None
+        runtime._auto_memory = None
+        runtime._cli_yolo = None
+        runtime._max_turns = None
+        runtime._test_scripted_provider = False
+        runtime.backend_factory = None
+        runtime.manager = SessionManager(runtime.home, owner_surface="serve")
+        runtime._project_registry_probed = True
+        runtime._init_sinks()
+        runtime._state = SessionState(
+            opened=opened,
+            loop=loop,
+            policy=policy,
+            project_dir=project_dir,
+            repo_root=repo_root,
+        )
+        return runtime
 
     @property
     def opened(self) -> OpenedSession | None:

@@ -217,12 +217,14 @@ class TUIApp(
         resumed: bool = False,
         on_session_close: Callable[[], Awaitable[None]] | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
+        observer_host: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
         self.foreground_event_publisher = (
             foreground_event_publisher or ForegroundEventPublisher()
         )
+        self.observer_host = observer_host
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -1147,6 +1149,10 @@ class TUIApp(
         try:
             if not resume_ui:
                 self._begin_startup_replay()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None and (error := await observer_host.start_or_close()):
+                self.observer_host = None  # optional endpoint: never stops the TUI or a fork
+                self._handle_background_notice(f"remote observer unavailable: {error}")
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
