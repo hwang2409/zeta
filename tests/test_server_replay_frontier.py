@@ -23,7 +23,6 @@ from tests.support.replay_transport import (
     ReplayClient,
     Transport,
     connect_replay,
-    join_session_history_settled,
     negotiate,
     replay_server,
 )
@@ -586,9 +585,11 @@ async def _run_scenario(tmp_path: Path, transport: Transport, name: str) -> tupl
         await serve.join(serve.observer)
         await scenario.run(serve, backend)
         later = await serve.client()
-        history = (
-            await join_session_history_settled(later, serve.request_id, serve.session_id)
-        )["messages"]
+        reply = await later.request(
+            serve.request_id(), "session_history_and_subscribe", {"session_id": serve.session_id}
+        )
+        assert "error" not in reply, reply
+        history = reply["result"]["messages"]
     except BaseException:
         if isinstance(backend, BlockingBackend):
             backend.release.set()

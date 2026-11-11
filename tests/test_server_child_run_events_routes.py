@@ -21,7 +21,6 @@ from tests.support.replay_transport import (
     ReplayClient,
     Transport,
     connect_replay,
-    join_session_history_settled,
     negotiate,
     replay_server,
 )
@@ -106,21 +105,15 @@ class Serve:
         return client
 
     async def join(self, client: ReplayClient, parent: str | None) -> dict[str, Any]:
-        """Join the scope where ``parent``'s children report: the top or one run.
-
-        A background child's follow-up turn can append durable rows while the top
-        scope join reads history off-loop, so ``session_history_and_subscribe``
-        answers -32009 ``stale_history_snapshot``; a real client re-joins and the
-        finite follow-up turn settles. A ``child_run_events`` -32009 is
-        ``stale_event_sequence`` and stays a hard error.
-        """
-        if parent is not None:
-            reply = await client.request(
-                self.request_id(), "child_run_events", {"session_id": self.session_id, "run_id": parent}
-            )
-            assert "error" not in reply, reply
-            return reply["result"]
-        return await join_session_history_settled(client, self.request_id, self.session_id)
+        """Join the scope where ``parent``'s children report: the top or one run."""
+        method, params = (
+            ("child_run_events", {"session_id": self.session_id, "run_id": parent})
+            if parent is not None
+            else ("session_history_and_subscribe", {"session_id": self.session_id})
+        )
+        reply = await client.request(self.request_id(), method, params)
+        assert "error" not in reply, reply
+        return reply["result"]
 
     async def drain(self, client: ReplayClient) -> list[dict[str, Any]]:
         """Every event the client received before a later status response."""
@@ -781,6 +774,89 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
             assert not target_file.exists()
             assert tool_ends[0]["tool_result"]["is_error"] is True, tool_ends
     finally:
+        backend.release_all()
+        await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_late_delegated_approval_end_after_the_run_ends_holds_the_child_stream(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated ``approval_end`` admitted after the target run already ended must
+    not end the child stream with ``session_replaced``: an ended run's rows are frozen
+    and cannot renumber. This forces deny -> the target's ``child_ended`` (its store is
+    popped) -> the late ``approval_end`` admit, the ordering that races in the
+    round-trip test above.
+    """
+    from zeta.server.approval_lifecycle import ApprovalLifecycle
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = ApprovalLifecycle._append_delegated_history
+
+    async def gated(self: Any, record: Any, payload: Any) -> Any:
+        # test-contract: hold the delegated copy's approval_end until the run has ended.
+        # persist_durably has already woken the target's tool, so the run proceeds while
+        # this settlement waits; holding it does not block the run from ending.
+        if isinstance(record.target.key, tuple):
+            entered.set()
+            await await_or_fail(release.wait(), what="release delegated approval_end")
+        return await original(self, record, payload)
+
+    monkeypatch.setattr(ApprovalLifecycle, "_append_delegated_history", gated)  # test-contract: seam force the late delegated approval_end to admit after the run ends
+
+    target_file = tmp_path / "approved.txt"
+    write = ToolCall("call-write", "write", {"path": str(target_file), "content": "written"})
+    scripts = {
+        "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
+        "child-work": [ScriptedTurn(tool_calls=[_agent("agent-2", "grand-work", False)]), _text("child done")],
+        "grand-work": [ScriptedTurn(tool_calls=[write]), _text("target done")],
+    }
+    backend = Actors(scripts, gate={"child-work", "grand-work"})
+    serve = await _open(tmp_path, transport, backend)
+    try:
+        session_id = serve.session_id
+        direct = f"{session_id}:1"
+        target = f"{direct}:1"
+        top = await serve.observer()
+        await serve.join(top, None)
+        await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
+        await await_or_fail(backend.entered["child-work"].wait(), what="direct child started")
+        # the direct child's scope is where the target run's child_ended reports
+        parent = await serve.observer()
+        await serve.join(parent, direct)
+        backend.release["child-work"].set()
+        await await_or_fail(backend.entered["grand-work"].wait(), what="nested child started")
+        child = await serve.observer()
+        joined = await child.request(
+            serve.request_id(), "child_run_events", {"session_id": session_id, "run_id": target}
+        )
+        assert joined.get("result", {}).get("child", {}).get("run_id") == target, joined
+        child_stream = joined["result"]["replay"]["stream_id"]
+        backend.release_all()
+
+        parent_events = await _until(parent, "approval_request")
+        request_id = parent_events[-1]["request_id"]
+        # deny persists the decision and wakes the target's tool, then holds the delegated
+        # approval_end at its history write; send without awaiting so the run can end first
+        deny_id = serve.request_id()
+        await serve.controller.send(deny_id, "deny", {"request_id": request_id})
+        await await_or_fail(entered.wait(), what="delegated approval_end reached its write")
+        # the target run ends and its store is popped before the held approval_end admits
+        await _until(parent, "child_ended", target)
+        release.set()
+        settled = await serve.controller.response(deny_id)
+        assert "error" not in settled, settled
+        await await_or_fail(top.event("agent_end"), what="session settles")
+
+        child_events = await serve.drain(child)
+        stream_ended = [e for e in child_events if e["event"] == "replay_stream_ended"]
+        ends = [e for e in child_events if e["event"] == "approval_end" and e["request_id"] == request_id]
+        # the ended run's rows are frozen, so the late approval_end holds the stream
+        assert stream_ended == [], child_events
+        assert [e["stream_id"] for e in ends] == [child_stream], child_events
+    finally:
+        release.set()
         backend.release_all()
         await _close(serve)
 

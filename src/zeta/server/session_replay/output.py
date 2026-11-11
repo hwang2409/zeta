@@ -230,8 +230,13 @@ class ReplayOutput:
         """Check a generation change against the stream or pending join."""
         generation = self.replay.reset_generation(connection)
         store = self._replay_store(scope)
-        if generation is None or store is None:
-            return generation is None
+        if generation is None:
+            return True
+        if store is None:
+            # the child scope's store is gone only because the run ended; an ended
+            # run's rows are frozen and cannot renumber, so the stream holds until it
+            # ends. a replaced or evicted scope is invalidated directly, not here.
+            return scope.kind == "child"
         current = store.reset_generation()
         if current == generation:
             return True
