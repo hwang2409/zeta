@@ -634,8 +634,7 @@ class TUIApp(
             return self._agent_navigation.current_path
         return self.loop.store.session_dir
     def _viewed_transcript(self) -> TranscriptWidget:
-        navigation = self._agent_navigation
-        return getattr(navigation, "viewed_transcript", None) or (navigation.transcript_control.transcript if getattr(navigation, "child_view_active", False) else self._transcript)
+        return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
         self._prompt_history.reset_navigation()
         finder = self._active_finder
