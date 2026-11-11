@@ -280,6 +280,14 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         )
         if entry is not None:
             self._send(_ApprovalLifecycle(entry.submission, "approval_start", call))
+            # The display cache is refreshed off-loop when the pipeline handles
+            # the lifecycle message, but the host presents synchronously now.
+            # Seed the fresh request so it shows at once; the refresh reconciles.
+            if all(str(request.key) != call.id for request in self._pending_approvals):
+                self._pending_approvals = (
+                    *self._pending_approvals,
+                    ApprovalRequest(call.id, call),
+                )
 
     def notify_approval_finished(self, call: ToolCall) -> None:
         owner = self._approval_owners.get(call.id)

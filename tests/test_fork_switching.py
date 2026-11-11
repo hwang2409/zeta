@@ -29,6 +29,10 @@ from zeta.tui.slash_handlers.fork_view import ForkContext, ForkViewMixin
 # -- request_open_fork / request_return_to_main keep the main turn alive -----
 
 
+async def _noop_refresh_pending() -> None:
+    return None
+
+
 def test_request_open_fork_suspends_without_aborting_the_turn() -> None:
     aborts: list[str] = []
     app = SimpleNamespace(
@@ -217,6 +221,9 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         app._input_loop_active = False
         app._startup_presented = True
         app._startup_submissions = []
+        app._submissions = SimpleNamespace(
+            refresh_pending_approvals=_noop_refresh_pending
+        )
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
         app._rebuild_transcript_async = rebuild
@@ -257,6 +264,9 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
         app = object.__new__(TUIApp)
         app._paste_runtime = PasteRuntime(weakref.proxy(app))
         app._startup_submissions = []
+        app._submissions = SimpleNamespace(
+            refresh_pending_approvals=_noop_refresh_pending
+        )
         at_restore: list[tuple[object, int]] = []
 
         class Watchdog:
@@ -371,6 +381,9 @@ def test_fork_suspend_continues_after_failed_draft_save(
         app._open_fork_target = "fork-1"
         app._input_loop_active = False
         app._startup_submissions = []
+        app._submissions = SimpleNamespace(
+            refresh_pending_approvals=_noop_refresh_pending
+        )
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
         app._prepare_prompt = lambda *, resume_ui: nothing()
