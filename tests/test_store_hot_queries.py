@@ -48,8 +48,11 @@ def test_approval_index_rebuilds_non_v4_without_changing_authority(
         )
 
     reopened = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
-    assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
-    assert reopened.path.read_bytes() == transcript
+    try:
+        assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
+        assert reopened.path.read_bytes() == transcript
+    finally:
+        reopened.close()
     with sqlite3.connect(sidecar) as connection:
         rebuilt = json.loads(
             connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
