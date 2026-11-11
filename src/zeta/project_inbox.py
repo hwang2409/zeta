@@ -24,7 +24,7 @@ from .core.session_files import (
     child_directory,
     open_session_file,
 )
-from .project_errors import ProjectNotFoundError
+from .project_errors import ProjectNotFoundError, ProjectRegistryBusyError
 from .project_inbox_provenance import decorate, delegation_enabled
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
 from .project_inbox_sent.scanner import ProjectInboxScanner  # noqa: F401
@@ -67,6 +67,13 @@ _LOGGED_INVALID: OrderedDict[
 
 class InboxError(ValueError):
     """An inbox operation or stored message was rejected."""
+
+
+class InboxBusyError(InboxError):
+    """A storage lock was held past the wait deadline; the caller may retry."""
+
+    kind = "inbox_busy"
+    retryable = True
 
 
 class _InboxNotFound(FileNotFoundError):
@@ -112,6 +119,8 @@ def _storage_errors() -> Iterator[None]:
         yield
     except InboxError:
         raise
+    except ProjectRegistryBusyError as exc:
+        raise InboxBusyError("inbox is busy; retry") from exc
     except (OSError, ProjectRegistryError, SessionError) as exc:
         raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -662,6 +671,8 @@ class ProjectInbox:
         try:
             with self._lock(target.project_id, exclusive=False) as project_fd:
                 return read(project_fd)
+        except ProjectRegistryBusyError as exc:
+            raise InboxBusyError("inbox is busy; retry") from exc
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -700,6 +711,8 @@ class ProjectInbox:
         try:
             with self._lock(target_project, exclusive=False) as project_fd:
                 return read(project_fd)
+        except ProjectRegistryBusyError as exc:
+            raise InboxBusyError("inbox is busy; retry") from exc
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 

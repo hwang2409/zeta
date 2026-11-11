@@ -9,6 +9,7 @@ from typing import Any
 
 from ...project_inbox import (
     KINDS,
+    InboxBusyError,
     InboxError,
     ProjectInbox,
 )
@@ -275,6 +276,8 @@ async def _inbox(
 ) -> StructuredToolResult:
     try:
         return await asyncio.to_thread(_run_inbox, registry, arguments)
+    except InboxBusyError as exc:
+        return _error(str(exc), kind=exc.kind)
     except (
         ProjectRegistryError,
         OSError,
