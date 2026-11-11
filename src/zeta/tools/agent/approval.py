@@ -265,6 +265,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         *,
         execution_token: str | None = None,
         capability: ApprovalCapability,
+        on_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> ApprovalDecision | None:
         state = await self.child_store.approval_state(tool_call.id)
         if state is not None:
@@ -324,6 +325,12 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             self.child_store,
             child_instance_id=self.child_instance_id,
         )
+
+        # Request is persisted and registered for serve; publish approval_start
+        # only now so a client reading pending on that event sees this request.
+        if on_pending is not None:
+            await on_pending()
+
         async def current() -> tuple[bool, ApprovalDecision | None]:
             state = await self.child_store.approval_state(tool_call.id)
             if state is None or state[1] is None:

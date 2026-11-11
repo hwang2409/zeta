@@ -1087,6 +1087,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         *,
         persist_request: bool = True,
         capability: ApprovalCapability,
+        on_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> ApprovalDecision | None:
         store = self._require_store()
         state = await store.approval_state(tool_call.id)
@@ -1128,6 +1129,12 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     None,
                 )
             self._notify_pending_changed()
+
+        # The approval request is now persisted (or captured as ephemeral) and
+        # readable through pending_requests; publish approval_start only now so a
+        # serve client reading pending on that event always sees this request.
+        if on_pending is not None:
+            await on_pending()
 
         async def current() -> tuple[bool, ApprovalDecision | None]:
             ephemeral = self._ephemeral.get(tool_call.id)
@@ -1224,10 +1231,20 @@ class ApprovalGate:
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             slot_acquired = False
-            if approval_started:
+            published = False
+
+            async def publish_pending() -> None:
+                # The gate owns the approval_start order: authorize calls this
+                # back once the request is persisted, so approval_start is never
+                # published before pending_requests can read the request.
+                nonlocal slot_acquired, published
+                if not approval_started or published:
+                    return
+                published = True
                 slot_acquired = await self.policy.acquire_approval_slot()
                 if lifecycle is not None:
                     lifecycle("approval_start")
+
             try:
                 authorize = self.policy.authorize
                 parameters = inspect.signature(authorize).parameters
@@ -1238,13 +1255,18 @@ class ApprovalGate:
                     kwargs["execution_token"] = execution_token
                 if capability is not None and "capability" in parameters:
                     kwargs["capability"] = capability
+                if "on_pending" in parameters:
+                    kwargs["on_pending"] = publish_pending
+                else:
+                    # Legacy authorize without the callback: keep the old order.
+                    await publish_pending()
                 decision = await authorize(tool_call, signal, **kwargs)
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(
                     tool_call.id, f"approval failed: {exc}", True
                 ), execution_signal
             finally:
-                if approval_started:
+                if published:
                     if lifecycle is not None:
                         lifecycle("approval_end")
                     if slot_acquired:
