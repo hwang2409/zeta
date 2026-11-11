@@ -32,6 +32,8 @@ def _runtime(store: object) -> SimpleNamespace:
 
 
 class _HistoryStore:
+    repair_generation = None
+
     def __init__(self, entries: list[object]) -> None:
         self.entries = entries
         self._log_offset = len(entries)
