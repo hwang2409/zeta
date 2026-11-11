@@ -883,7 +883,14 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 f"session id prefix must be at least {min_prefix_length} characters"
             )
         if len(matches) > 1:
-            candidates = tuple(match[:8] for match in matches[:8])
+            def unique_prefix(match: str) -> str:
+                for length in range(8, len(match) + 1):
+                    prefix = match[:length]
+                    if sum(name.startswith(prefix) for name in candidates) == 1:
+                        return prefix
+                return match
+
+            candidates = tuple(unique_prefix(match) for match in matches[:8])
             shown = ", ".join(candidates)
             if len(matches) > 8:
                 shown += ", …"

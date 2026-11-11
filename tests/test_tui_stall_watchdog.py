@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import multiprocessing
 import queue
@@ -48,13 +49,14 @@ def _append_records(path: str, attempts: int, result) -> None:
     result.put(errors)
 
 
-async def test_blocked_loop_writes_one_record_with_blocking_stack(
-    tmp_path: Path,
+async def test_blocked_loop_records_gc_across_probe_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "tui-stalls.jsonl"
     probe_ready = threading.Event()
     release_probe = threading.Event()
     loop_blocked = threading.Event()
+    sampled = threading.Event()
     release_loop: queue.SimpleQueue[None] = queue.SimpleQueue()
     record_written = threading.Event()
     clock_values = iter((0.0, 0.05, 0.05))
@@ -66,12 +68,18 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
 
     def after_sample() -> None:
         if loop_blocked.is_set():
-            release_loop.put(None)
+            sampled.set()
 
     def block_loop() -> None:
         # SimpleQueue.get waits in C, so block_loop stays the innermost Python
         # frame; stack trimming keeps only Zeta, stdlib and innermost frames.
         loop_blocked.set()
+        if not sampled.wait(timeout=10):
+            raise TimeoutError("stall sample was not signaled")
+        watchdog._gc_callback("stop", {"generation": 2, "collected": 1, "uncollectable": 0})
+        watchdog._gc_callback("start", {"generation": 2})
+        watchdog._gc_callback("stop", {"generation": 2, "collected": 1, "uncollectable": 0})
+        release_loop.put(None)
         try:
             release_loop.get(timeout=10)
         except queue.Empty:
@@ -96,6 +104,7 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
 
     # test-contract: seam no public watchdog-record publication event exists
     watchdog._append_record = append_and_signal  # type: ignore[method-assign]
+    watchdog._gc_callback("start", {"generation": 2})
     watchdog.start(asyncio.get_running_loop())
     try:
         assert await asyncio.to_thread(probe_ready.wait, 10)
@@ -113,11 +122,22 @@ async def test_blocked_loop_writes_one_record_with_blocking_stack(
     assert records[0]["start_time"] == "2026-01-02T03:04:05Z"
     assert records[0]["duration_ms"] == 50
     assert records[0]["session_id"] == "session-123"
-    assert any(
-        frame["function"] == "block_loop"
-        for stack in records[0]["stacks"]
-        for frame in stack["frames"]
-    )
+    assert records[0]["gc"]["ms"] > 0
+    assert records[0]["gc"]["ms"] <= records[0]["duration_ms"]
+    assert records[0]["gc"]["by_gen"]["2"] > 0
+    assert records[0]["gc"]["count"] == 2
+    assert len(watchdog._gc_totals) == 7
+    failed = TUIStallWatchdog(tmp_path / "failed.jsonl", session_id="failed")
+    callbacks_before = tuple(gc.callbacks)
+
+    def fail_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("injected start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="injected start failure"):
+        failed.start(asyncio.get_running_loop())
+    assert tuple(gc.callbacks) == callbacks_before
+    monkeypatch.undo()
 
 
 @pytest.mark.asyncio
@@ -179,6 +199,8 @@ def test_idle_executor_worker_has_no_busy_samples(tmp_path: Path) -> None:
     assert record["other_threads"][0]["name"] == "idle-executor_0"
     assert record["other_threads"][0]["busy_samples"] == 0
     assert record["other_threads"][0]["stacks"][0]["idle"] is True
+    assert record["gc"]["ms"] == 0
+    assert record["gc"]["count"] == 0
 
 
 def test_cpu_bound_worker_is_recorded_during_loop_starvation(

@@ -17,6 +17,7 @@ from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
+from ..runtime.foreground_events import ForegroundEventPublisher
 from ..storage_format import drain_releases, pending_releases
 from . import (
     accounts,
@@ -239,7 +240,8 @@ class ZetaServer:
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
-        self.control = ServeControl(self)
+        self.foreground_event_publisher = ForegroundEventPublisher()
+        self.control = ServeControl(self, self.foreground_event_publisher)
         self.runtime.set_approval_control_binder(self.control.bind_policy)
         self.runtime.set_background_event_sink(self.control._publish_background_event)
         self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
@@ -294,7 +296,10 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             try:
-                await self.control.close()
+                try:
+                    await self.control.close()
+                finally:
+                    self.foreground_event_publisher.close()
                 try:
                     await self.runtime.close()
                 finally:
