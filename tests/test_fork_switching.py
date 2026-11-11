@@ -13,6 +13,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.foreground_events import ForegroundEventPublisher
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -674,6 +675,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
 
     monkeypatch.setattr("zeta.tui.runtime_close.close_session", close_session)
     app = ClosingApp()
+    app.foreground_event_publisher = ForegroundEventPublisher()
     app._init_runtime_close()
     app.loop = Loop()
     app._terminal_restored = False
