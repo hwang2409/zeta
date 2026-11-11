@@ -405,9 +405,20 @@ def resume_prompt(
         registry=registry,
     )
     projection = project_projection
+    capture = manager.project_registry if projection is not None else None
 
     def compose(current: SessionMetadata) -> PromptComposition:
-        return compose_with(current, projection=projection)
+        # Re-read project memory with no session shape lock held; a change since
+        # the last capture is a changed composition input, so compose again.
+        nonlocal projection
+        while True:
+            composition = compose_with(current, projection=projection)
+            if capture is None:
+                return composition
+            fresh = capture.project_context_projection(current.project_id)
+            if fresh == projection:
+                return composition
+            projection = fresh
 
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)
