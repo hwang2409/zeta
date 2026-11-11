@@ -1176,60 +1176,122 @@ def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[st
     return changed, all_paths
 
 
-def _normalize_line(path: str, line: str) -> str:
-    if not path.endswith(".py"):
-        return " ".join(line.split())
+def _normalized_python_lines(source: str) -> list[str]:
+    lines = [[] for _ in source.splitlines()]
     try:
-        tokens = tokenize.generate_tokens(io.StringIO(line).readline)
-        return "".join(
-            token.string if token.type == tokenize.STRING else token.string.replace(" ", "").replace("\t", "")
-            for token in tokens
-            if token.type not in {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NEWLINE, tokenize.NL}
-        )
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for token in tokens:
+            if token.type in {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.INDENT,
+                              tokenize.DEDENT, tokenize.NEWLINE, tokenize.NL}:
+                continue
+            text = token.string if token.type in {tokenize.STRING, tokenize.COMMENT} else "".join(token.string.split())
+            parts = text.splitlines(keepends=True) or [text]
+            for offset, part in enumerate(parts):
+                line_index = token.start[0] - 1 + offset
+                if line_index < len(lines):
+                    lines[line_index].append(part.rstrip("\r\n"))
     except (IndentationError, SyntaxError, tokenize.TokenError):
-        return line.replace(" ", "").replace("\t", "")
+        return ["".join(line.split()) for line in source.splitlines()]
+    return ["".join(line) for line in lines]
 
 
-def _equal_base_lines(base: list[str], side: list[str]) -> dict[int, int]:
-    return {
-        old_index: new_index
-        for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
-            None, base, side, autojunk=False
+def _normalized_lines(path: str, source: str) -> list[str]:
+    return _normalized_python_lines(source) if path.endswith(".py") else [
+        " ".join(line.split()) for line in source.splitlines()
+    ]
+
+
+def _deleted_intervals(base: list[str], main: list[str]) -> list[tuple[int, int]]:
+    return [
+        (old_start, old_end)
+        for tag, old_start, old_end, _new_start, _new_end in difflib.SequenceMatcher(
+            None, base, main, autojunk=False
         ).get_opcodes()
-        if tag == "equal"
-        for old_index, new_index in zip(range(old_start, old_end), range(new_start, new_end))
-    }
+        if tag in {"delete", "replace"} and old_start < old_end
+    ]
+
+
+def _branch_insertions(
+    base: list[str], branch: list[str], deleted: list[tuple[int, int]]
+) -> Counter[str]:
+    inserted: Counter[str] = Counter()
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        None, base, branch, autojunk=False
+    ).get_opcodes():
+        if tag != "insert":
+            continue
+        if any(start < old_start < end for start, end in deleted):
+            continue
+        inserted.update(branch[new_start:new_end])
+    return inserted
+
+
+def _branch_replacements(
+    base: list[str], branch: list[str], deleted: list[tuple[int, int]]
+) -> list[tuple[int, int, list[str]]]:
+    replacements = []
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        None, base, branch, autojunk=False
+    ).get_opcodes():
+        if tag == "replace" and any(
+            old_start < end and start < old_end for start, end in deleted
+        ):
+            replacements.append((old_start, old_end, branch[new_start:new_end]))
+    return replacements
+
+
+def _find_sequence(lines: list[str], sequence: list[str]) -> int | None:
+    if not sequence:
+        return None
+    width = len(sequence)
+    for index in range(len(lines) - width + 1):
+        if lines[index : index + width] == sequence:
+            return index
+    return None
 
 
 def _removed_line_findings(
     path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
     main_range: str,
 ) -> list[Item]:
-    base = [_normalize_line(path, line) for line in base_text.splitlines()]
-    main = [_normalize_line(path, line) for line in main_text.splitlines()]
-    branch_lines = branch_text.splitlines()
-    branch = [_normalize_line(path, line) for line in branch_lines]
+    base = _normalized_lines(path, base_text)
+    main = _normalized_lines(path, main_text)
+    branch = _normalized_lines(path, branch_text)
     merge_lines = merge_text.splitlines()
-    merge = [_normalize_line(path, line) for line in merge_lines]
-    branch_equal = _equal_base_lines(base, branch)
-    merge_equal = _equal_base_lines(base, merge)
-    main_equal = _equal_base_lines(base, main)
-    branch_added = {
-        branch[index]
-        for tag, _old_start, _old_end, new_start, new_end in difflib.SequenceMatcher(
-            None, base, branch, autojunk=False
-        ).get_opcodes()
-        if tag in {"insert", "replace"}
-        for index in range(new_start, new_end)
-    }
+    merge = _normalized_lines(path, merge_text)
+    deleted = _deleted_intervals(base, main)
+    inserted = _branch_insertions(base, branch, deleted)
+    replacements = _branch_replacements(base, branch, deleted)
+    branch_has_replacements = any(
+        tag in {"delete", "replace"}
+        for tag, *_ in difflib.SequenceMatcher(None, base, branch, autojunk=False).get_opcodes()
+    )
+    branch_counts = Counter(branch)
     findings = []
-    for base_index, merge_index in merge_equal.items():
-        if base_index not in branch_equal or base[base_index] in branch_added:
+    for base_index, _old_end, replacement in replacements:
+        merge_index = _find_sequence(merge, replacement)
+        if merge_index is not None:
+            findings.append(
+                Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
+            )
+    for start, end in deleted:
+        if branch_has_replacements:
             continue
-        if base_index in main_equal:
+        if any(
+            replacement_start < end and start < replacement_end
+            for replacement_start, replacement_end, _replacement in replacements
+        ):
+            continue
+        sequence = base[start:end]
+        merge_index = _find_sequence(merge, sequence)
+        if merge_index is None:
+            continue
+        if all(inserted[value] for value in sequence) and all(
+            branch_counts[value] >= merge.count(value) for value in set(sequence)
+        ):
             continue
         findings.append(
-            Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
+            Item(path, "main-deleted-line", main_range, start + 1, merge_lines[merge_index])
         )
     return findings
 

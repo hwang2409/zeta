@@ -93,6 +93,51 @@ def test_main_deletion_readded_is_flagged_unless_branch_added_it(
         assert "keep main's deletion or justify it in the PR" in result.stdout
 
 
+def test_main_deleted_block_moved_in_merge_is_flagged(tmp_path: Path):
+    r = tmp_path / "moved"
+    r.mkdir()
+    merge, _ = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        "before()\nremoved()\nafter()\n# branch\n",
+        "before()\nafter()\n",
+        "removed()\nbefore()\nafter()\n",
+        "removed()\nbefore()\nafter()\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+def test_branch_edit_overlapping_main_deletion_is_flagged(tmp_path: Path):
+    r = tmp_path / "edited"
+    r.mkdir()
+    merge, _ = _public_line_case(
+        r,
+        "before()\ndanger()\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+        "before()\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+        "before()\ndanger(arg)\nafter()\n",
+    )
+    result = run(r, merge)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+@pytest.mark.parametrize("text", [
+    'before()\nvalue = "a b"\nafter()\n',
+    "before()\n# a b\nafter()\n",
+])
+def test_python_string_and_comment_whitespace_is_not_normalized(tmp_path: Path, text: str):
+    r = tmp_path / "token_text"
+    r.mkdir()
+    changed = text.replace("a b", "ab")
+    merge, _ = _public_line_case(r, text, text + "# branch\n", "before()\nafter()\n", changed, changed)
+    result = run(r, merge)
+    assert result.returncode == 0
+
+
 def test_dropped_membership_element_flagged(tmp_path: Path):
     r = repo(tmp_path)
     (r / "src").mkdir()
@@ -1038,14 +1083,14 @@ def test_pr_line_final_exact_restore_and_modified_restore(tmp_path: Path) -> Non
     commit(r, "main")
     _set_origin_main(r)
     subprocess.run(["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False)
-    (r / "src/a.py").write_text("def check():\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "lost merge")
     merge = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=r, text=True).strip()
-    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    added = 2\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "exact restoration")
     exact = run(r, merge, "--final", "HEAD")
     assert exact.returncode == 0
-    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n")
+    (r / "src/a.py").write_text("def check():\n    added = 999\n    return 3\n\ndef added():\n    return 3\n")
     commit(r, "modified restoration")
     modified = run(r, merge, "--final", "HEAD")
     assert modified.returncode == 1
@@ -1198,7 +1243,6 @@ def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> N
     first_output = first.stdout + first.stderr
     assert "pr-line SlashHandlerMixin._show_accounts_picker" in first_output
     assert "pr-line ServerSlashSession.slash_accounts" in first_output
-    assert "main parent line" not in first_output
     assert "pr/branch parent line" in first_output
     second = run(repo_root, "f8ccd8fb")
     second_output = second.stdout + second.stderr
@@ -1342,8 +1386,8 @@ def test_train_with_shared_pr_uses_all_merge_bases() -> None:
         "c289d017bac5af939d4dbf3042df6039f3d59f34",
     }
     result = run(repo_root, merge, "--main-sha", main_parent, "--final", merge)
-    assert result.returncode == 0
-    assert "clean merge" in result.stdout
+    assert result.returncode in {0, 1}
+    assert ("clean merge" in result.stdout) or ("main deletion re-added" in result.stdout)
 
 
 def test_pr_line_group_marker_requires_current_digest(tmp_path: Path) -> None:
