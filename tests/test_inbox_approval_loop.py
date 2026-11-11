@@ -121,7 +121,7 @@ async def test_name_grant_sends_first_inbox_call_through_real_turn(tmp_path: Pat
             _turn(loop, lambda call: policy.deny(call.id)), 30
         )
         assert prompts == [], "configured name grant asked for approval"
-        assert "send-beta" not in store.approval_states()
+        assert await store.approval_state("send-beta") is None
         assert [call.arguments["project"] for call in _persisted_calls(store, "send-beta")] == [
             beta.project_id
         ]
@@ -432,10 +432,10 @@ async def test_depth_two_worker_has_no_inbox_so_child_grants_never_apply(tmp_pat
         grandchild_dir = Path(nested["child_session_path"])
         grandchild = ConversationStore(grandchild_dir.parent, session_id=grandchild_dir.name)
         try:
-            assert grandchild.approval_states() == {}
+            assert (await grandchild.pending_approval_page()).items == ()
         finally:
             grandchild.close()
-        assert policy.pending_requests() == []
+        assert await policy.pending_requests() == []
         inbox = ProjectInbox(projects, sessions_root=home / "sessions")
         assert (await asyncio.to_thread(inbox.list, beta.project_id))["new"] == []
     finally:

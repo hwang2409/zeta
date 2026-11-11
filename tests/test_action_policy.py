@@ -636,14 +636,18 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     policy = ApprovalPolicy(default="ask", store=store)
     registry = _registry(tmp_path, approval_policy=policy)
 
-    request = registry.prepare_approval(
-        ToolCall("call-1", "task", {"action": "start", "command": "pytest"})
+    request = asyncio.run(
+        registry.prepare_approval(
+            ToolCall("call-1", "task", {"action": "start", "command": "pytest"})
+        )
     )
 
     assert request is not None
     assert (
-        registry.prepare_approval(
-            ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+        asyncio.run(
+            registry.prepare_approval(
+                ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+            )
         )
         is None
     )
@@ -690,7 +694,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     )
     pending: list[ApprovalRequest] = []
     for _ in range(100):
-        pending = policy.pending_requests()
+        pending = (await policy.pending_requests())
         if pending:
             break
         await asyncio.sleep(0.01)
@@ -738,7 +742,7 @@ def test_resumed_subjectless_action_argument_uses_registry_capability(
         },
     )
 
-    pending = policy.pending_requests()
+    pending = asyncio.run(policy.pending_requests())
     assert pending == [ApprovalRequest(call.id, call, action=None)]
     assert policy.remember_allow(pending[0]) == ApprovalRule("inbox")
     assert policy.always_allow == {ApprovalRule("inbox")}

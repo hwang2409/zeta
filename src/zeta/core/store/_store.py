@@ -1135,11 +1135,25 @@ class ConversationStore(
         reason: str | None = None,
     ) -> ConversationEntry | None:
         branch = self.replay()
-        states = self._approval_states_from_branch(branch)
-        state = states.get(request_id)
-        if state is None or state[1] is not None:
-            return None
-        request_entry = self._request_entry(branch, request_id)
+        try:
+            indexed_state = self._approval_index_state(request_id)
+        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
+            states = self._approval_states_from_branch(branch)
+            state = states.get(request_id)
+            if state is None or state[1] is not None:
+                return None
+            request_entry = self._request_entry(branch, request_id)
+        else:
+            if indexed_state is None or indexed_state.decision is not None:
+                return None
+            request_entry = next(
+                (
+                    entry
+                    for entry in branch
+                    if entry.id == indexed_state.request_entry_id
+                ),
+                None,
+            )
         if request_entry is None:
             return None
         active_ids = {entry.id for entry in branch}

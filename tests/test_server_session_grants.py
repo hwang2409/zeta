@@ -803,7 +803,7 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
         assert [item["request_id"] for item in status_result["pending_approvals"]] == [
             "call-2"
         ]
-        assert server.runtime.opened.store.approval_resolution_data("call-2") is None
+        assert await server.runtime.opened.store.approval_resolution("call-2") is None
 
         observer_denied = await observer_request(
             11,
@@ -2522,7 +2522,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             if case == "cancel_history":
                 await await_or_fail(committed.wait(), what="approval settlement commit")
                 record = server.control._approvals.state.records["call-1"]
-                resolution = record.target.store.approval_resolution_data("call-1")
+                resolution = await record.target.store.approval_resolution("call-1")
                 assert resolution is not None
                 competing = asyncio.create_task(
                     server.control._approvals._finish_record(record, resolution)
@@ -2643,7 +2643,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 all_frames.extend(snapshot_frames)
                 assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
                 assert server.runtime.opened is not None
-                resolution = server.runtime.opened.store.approval_resolution_data(
+                resolution = await server.runtime.opened.store.approval_resolution(
                     "call-1"
                 )
                 assert resolution is not None

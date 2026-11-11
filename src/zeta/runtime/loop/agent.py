@@ -427,12 +427,9 @@ class AgentLoop(
             execution_context=execution_context,
         )
 
-    def prepare_resume_pending_tool(self, request_id: str) -> bool:
+    def prepare_resume_pending_tool(self, tool_call: ToolCall) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
-        state = self.store.approval_state_resident(request_id)
-        if state is None or state[1] is None:
-            return False
-        if self._existing_tool_result(state[0].id) is not None:
+        if self._existing_tool_result(tool_call.id) is not None:
             return False
         self.tool_registry.start_batch()
         return True
@@ -577,7 +574,7 @@ class AgentLoop(
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
         await self._ensure_mcp_servers()
-        state = self.store.approval_state_resident(request_id)
+        state = await self.store.approval_state(request_id)
         if state is None or state[1] is None:
             return None
         tool_call = state[0]
@@ -613,7 +610,7 @@ class AgentLoop(
                 _lifecycle_sink=lifecycle,
             )
         except asyncio.CancelledError:
-            result = self.finalize_canceled(request_id)
+            result = self.finalize_canceled(tool_call)
             if event_sink is not None and result is not None:
                 event_sink(
                     StreamEvent(
@@ -627,7 +624,7 @@ class AgentLoop(
             result = ToolResult(tool_call.id, str(exc), is_error=True)
         result = _validated_tool_result(result, tool_call.id)
         if result.is_canceled:
-            result = self.finalize_canceled(request_id)
+            result = self.finalize_canceled(tool_call)
         else:
             result = self._finalize_tool_results([tool_call], [result])[0]
         if event_sink is not None and result is not None:
@@ -639,12 +636,8 @@ class AgentLoop(
                 )
             )
         return result
-    def finalize_canceled(self, request_id: str) -> ToolResult | None:
+    def finalize_canceled(self, tool_call: ToolCall) -> ToolResult | None:
         """Persist one canceled result for a durable approval request."""
-        state = self.store.approval_state_resident(request_id)
-        if state is None:
-            return None
-        tool_call = state[0]
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing
@@ -1094,7 +1087,7 @@ class AgentLoop(
             for tool_call in calls:
                 if tool_call.id in preparation_errors or not self.plan_mode_allows(tool_call):
                     continue
-                request = self.tool_registry.prepare_approval(tool_call)
+                request = await self.tool_registry.prepare_approval(tool_call)
                 if request is not None:
                     approval_requests.append(request.audit_record())
             await self._append_turn_message_with_approvals(
@@ -1207,7 +1200,7 @@ class AgentLoop(
                 # The assistant message is already durable, so finalization prevents
                 # an unpaired tool call whether cancellation precedes or follows dispatch.
                 for call in calls:
-                    self.tool_registry.abort_approval(call)
+                    await self.tool_registry.abort_approval(call)
                 self._finalize_tool_results(calls, [None] * len(calls))
                 raise
             finally:

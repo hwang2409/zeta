@@ -1862,7 +1862,7 @@ async def test_session_history_records_controller_disconnect_approval_abort(
         else:
             pytest.fail("controller was not released after disconnect")
         assert server.runtime.policy is not None
-        assert not server.runtime.policy.pending_requests()
+        assert not (await server.runtime.policy.pending_requests())
 
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         hello = await _request(
@@ -4264,7 +4264,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
     await writer.wait_closed()
     await asyncio.sleep(0.05)
     assert server.runtime.policy is not None
-    assert server.runtime.policy.pending_requests() == []
+    assert (await server.runtime.policy.pending_requests()) == []
     await server.close()
 
 
@@ -5242,7 +5242,7 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         if not agent_ended:
             await _event(reader, "agent_end")
         assert server.runtime.policy is not None
-        assert server.runtime.policy.pending_requests() == []
+        assert (await server.runtime.policy.pending_requests()) == []
         request_id = 6
         async with asyncio.timeout(TIMEOUT):
             while True:

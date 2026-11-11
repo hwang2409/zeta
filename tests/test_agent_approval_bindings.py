@@ -38,12 +38,12 @@ def _capability(call: ToolCall) -> ResolvedCapability:
     )
 
 
-def _persist_prepared_request(
+async def _persist_prepared_request(
     registry: ToolRegistry,
     child_store: ConversationStore,
     call: ToolCall,
 ) -> None:
-    request = registry.prepare_approval(call)
+    request = await registry.prepare_approval(call)
     assert request is not None
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -63,7 +63,7 @@ async def _approve_after_registration(
         waiting.set()
     await asyncio.wait_for(registered.wait(), timeout=10)
     key = (child_instance_id, request_id)
-    assert key in {request.key for request in parent_policy.pending_requests()}, (
+    assert key in {request.key for request in (await parent_policy.pending_requests())}, (
         "delegated approval was not published"
     )
     assert parent_policy.approve(key)
@@ -294,11 +294,11 @@ def test_child_abort_fails_closed_when_capability_cannot_be_resolved(
     registry.register("echo", lambda arguments: "must not run")
     registry.set_approval_policy(child_policy)
     call = ToolCall("unresolved-child-call", "echo", {})
-    _persist_prepared_request(registry, child_store, call)
+    asyncio.run(_persist_prepared_request(registry, child_store, call))
     registry._tools.pop(call.name)
 
-    assert registry.abort_approval(call) is None
-    assert child_store.approval_states()[call.id][1] == "abort"
+    assert asyncio.run(registry.abort_approval(call)) is None
+    assert asyncio.run(child_store.approval_state(call.id))[1] == "abort"
 
 
 @pytest.mark.asyncio
@@ -340,7 +340,7 @@ async def test_parent_and_child_approval_decision_paths(
     registry.register("echo", lambda arguments: executed.append("ran") or "ran")
     registry.set_approval_policy(policy)
     call = ToolCall(f"{outcome}-{policy_kind}", "echo", {})
-    request = registry.prepare_approval(call)
+    request = await registry.prepare_approval(call)
     assert request is not None
     decision_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -350,7 +350,7 @@ async def test_parent_and_child_approval_decision_paths(
     if outcome in {"allow", "deny"}:
         assert decision_store.resolve_approval(call.id, outcome)
     elif outcome == "abort":
-        assert registry.abort_approval(call) is None
+        assert await registry.abort_approval(call) is None
     elif outcome == "winner":
         original_resolve = decision_store.resolve_approval
 
@@ -376,7 +376,7 @@ async def test_parent_and_child_approval_decision_paths(
             registry.execute(call, _lifecycle_sink=publish_approval_state)
         )
         await asyncio.wait_for(approval_started.wait(), timeout=10)
-        assert decision_store.pending_approvals()
+        assert (await decision_store.pending_approval_page()).items
         assert not execution.done()
         registry.abort()
         result = await execution
@@ -427,7 +427,7 @@ async def test_bound_edit_abort_arbitration_preserves_winner(
         "edit",
         {"path": str(target), "old_string": "before", "new_string": "after"},
     )
-    _persist_prepared_request(registry, child_store, call)
+    await _persist_prepared_request(registry, child_store, call)
 
     if abort_winner == "allow":
         original_resolve = child_store.resolve_approval
@@ -472,7 +472,7 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     decision = await child.authorize(call, AbortSignal(), capability=_capability(call))
 
     assert decision is ApprovalDecision.DENY
-    assert parent.pending_requests() == []
+    assert (await parent.pending_requests()) == []
     assert child.denial_reason(call.id) == (
         "approval binding unavailable; submit a new tool request"
     )
@@ -514,7 +514,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
         {"path": str(alias / "victim.txt"), "content": "PWN"},
     )
 
-    _persist_prepared_request(registry, child_store, call)
+    await _persist_prepared_request(registry, child_store, call)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     publication_attempted = asyncio.Event()
@@ -598,7 +598,7 @@ async def _assert_shell_uses_displayed_cwd(
     arguments = {"command": "touch marker.txt", "cwd": str(alias)}
     call = ToolCall(f"{tool_name}-swap", tool_name, arguments)
 
-    _persist_prepared_request(registry, child_store, call)
+    await _persist_prepared_request(registry, child_store, call)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     registered = _observe_delegated_registration(parent_policy, monkeypatch)
@@ -665,7 +665,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
         "bash",
         {"command": "touch marker.txt", "cwd": str(approved_cwd)},
     )
-    _persist_prepared_request(first_registry, child_store, call)
+    await _persist_prepared_request(first_registry, child_store, call)
     await first_registry.close()
 
     restarted_policy = ChildApprovalPolicy(
@@ -686,7 +686,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
     finally:
         await restarted_registry.close()
 
-    assert parent_policy.pending_requests() == []
+    assert (await parent_policy.pending_requests()) == []
     assert result["isError"] is True
     assert result["content"][0]["text"] == (
         "tool execution denied: approval binding unavailable; "
@@ -870,7 +870,7 @@ async def _execute_after_manual_approval(
         child_cwd, session_store=child_store, skill_catalog=SkillCatalog.empty()
     )
     registry.set_approval_policy(child_policy)
-    _persist_prepared_request(registry, child_store, call)
+    await _persist_prepared_request(registry, child_store, call)
     mutate()
     monkeypatch = pytest.MonkeyPatch()
     registered = _observe_delegated_registration(parent_policy, monkeypatch)

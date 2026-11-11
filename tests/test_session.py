@@ -2767,7 +2767,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 
     assert call.name in app.console.file.getvalue()  # card shows the tool name
     await app._handle_prompt_value(f"/approve {call.id}")
-    assert app.loop.store.pending_approvals() == []
+    assert (await app.loop.store.pending_approval_page()).items == ()
 
 
 @pytest.mark.asyncio
@@ -2937,7 +2937,7 @@ async def test_cancel_honors_approval_won_by_other_writer(
     process.join(timeout=2)
     writer.close()
     await wait_until(lambda: app._submissions.active_submission_id is None)
-    decision = opened.store.approval_states()[call.id][1]
+    decision = (await opened.store.approval_state(call.id))[1]
     await app._submissions.close()
 
     assert not process.is_alive()
@@ -3508,7 +3508,9 @@ def test_resume_reemits_pending_approval_state(tmp_path: Path) -> None:
     opened.store.close()
     resumed = manager.open(session_id)
 
-    assert resumed.store.pending_approvals() == [(call.id, call)]
+    assert asyncio.run(resumed.store.pending_approval_page()).items == (
+        (call.id, call.to_dict()),
+    )
 
 
 def test_future_metadata_version_is_rejected(

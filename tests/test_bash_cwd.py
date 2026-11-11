@@ -144,10 +144,10 @@ async def test_delegated_shell_approval_uses_persisted_bash_cwd(
             {"command": "pwd", "cwd": "child"},
         )
         execution = asyncio.create_task(registry.execute(call))
-        while not parent_policy.pending_requests():
+        while not (await parent_policy.pending_requests()):
             await asyncio.sleep(0)
 
-        request = parent_policy.pending_requests()[0]
+        request = (await parent_policy.pending_requests())[0]
         assert parent_policy.approve(request.key)
         result = await execution
         if tool_name == "run_background":

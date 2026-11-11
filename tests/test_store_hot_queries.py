@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
+import json
 import multiprocessing
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,44 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
+
+
+@pytest.mark.parametrize("old_version", [3, 999])
+def test_approval_index_rebuilds_non_v4_without_changing_authority(
+    tmp_path: Path, old_version: int
+) -> None:
+    store = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
+    call = ToolCall(f"call-{old_version}", "bash", {"cmd": "pwd"})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [call],
+    )
+    transcript = store.log_path.read_bytes()
+    sidecar = store.session_dir / "history-index.sqlite3"
+    store.close()
+
+    with sqlite3.connect(sidecar) as connection:
+        facts = json.loads(
+            connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
+        )
+        facts["schema_version"] = old_version
+        connection.execute(
+            "UPDATE meta SET value=? WHERE key='facts'",
+            (json.dumps(facts, separators=(",", ":"), sort_keys=True),),
+        )
+
+    reopened = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
+    assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
+    assert reopened.log_path.read_bytes() == transcript
+    with sqlite3.connect(sidecar) as connection:
+        rebuilt = json.loads(
+            connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
+        )
+        assert rebuilt["schema_version"] == 4
+        assert connection.execute(
+            "SELECT request_entry_id FROM active_approval_requests WHERE request_id=?",
+            (call.id,),
+        ).fetchone()
 
 
 def _unexpected_history_scan(*_args: object, **_kwargs: object) -> object:
@@ -70,11 +111,10 @@ def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -
     assert store.resolve_approval(resolved.id, "deny")
     store.replay = _unexpected_history_scan  # type: ignore[method-assign]
 
-    assert store.pending_approvals() == [(pending.id, pending)]
-    assert store.approval_states() == {
-        pending.id: (pending, None),
-        resolved.id: (resolved, "deny"),
-    }
+    page = asyncio.run(store.pending_approval_page())
+    assert page.items == [(pending.id, pending.to_dict())]
+    assert asyncio.run(store.approval_state(pending.id)) == (pending, None)
+    assert asyncio.run(store.approval_state(resolved.id)) == (resolved, "deny")
 
 
 def test_pending_approvals_sees_external_append(tmp_path: Path) -> None:
@@ -85,10 +125,10 @@ def test_pending_approvals_sees_external_append(tmp_path: Path) -> None:
 
     writer.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(request)]),
-        [(request.id, request)],
+        [(request.id, request.to_dict())],
     )
 
-    assert reader.pending_approvals() == [(request.id, request)]
+    assert asyncio.run(reader.pending_approval_page()).items == ((request.id, request.to_dict()),)
 
 
 def test_pending_approvals_does_not_wait_for_held_lock_when_unchanged(
@@ -107,7 +147,7 @@ def test_pending_approvals_does_not_wait_for_held_lock_when_unchanged(
     try:
         assert ready.wait(timeout=2)
         reader._append_lock = _unexpected_history_scan  # type: ignore[method-assign]
-        assert reader.pending_approvals() == []
+        assert asyncio.run(reader.pending_approval_page()).items == ()
     finally:
         release.set()
         process.join(timeout=2)
@@ -132,14 +172,14 @@ def test_pending_approvals_does_not_block_on_writer_mid_append(
     try:
         assert ready.wait(timeout=2)
         reader._load = _unexpected_history_scan  # type: ignore[method-assign]
-        assert reader.pending_approvals() == []
+        assert asyncio.run(reader.pending_approval_page()).items == ()
     finally:
         release.set()
         process.join(timeout=2)
     assert process.exitcode == 0
     del reader._load
     request = ToolCall("mid-append", "read", {"path": "README.md"})
-    assert reader.pending_approvals() == [(request.id, request)]
+    assert asyncio.run(reader.pending_approval_page()).items == ((request.id, request.to_dict()),)
 
 
 def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
@@ -150,7 +190,7 @@ def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
     request = ToolCall("rewrite", "read", {"path": "README.md"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(request)]),
-        [(request.id, request)],
+        [(request.id, request.to_dict())],
     )
     assert store.resolve_approval(request.id, "allow")
     original_stat = store.path.stat()
@@ -242,7 +282,11 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
     store = ConversationStore(root, session_id="parity")
 
     def assert_parity(operation: str) -> None:
-        indexed_pending = store.pending_approvals()
+        indexed_page = asyncio.run(store.pending_approval_page())
+        indexed_pending = [
+            (request_id, ToolCall.from_dict(dict(tool_call)))
+            for request_id, tool_call in indexed_page.items
+        ]
         branch = store.replay()
         approval_states = store._approval_states_from_branch(branch)
         expected_pending = [
@@ -251,7 +295,10 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
             if decision is None
         ]
         assert indexed_pending == expected_pending, operation
-        assert store.approval_states() == approval_states, operation
+        assert {
+            request_id: asyncio.run(store.approval_state(request_id))
+            for request_id in approval_states
+        } == approval_states, operation
 
         notifications = {
             entry.id: entry for entry in branch if entry.type == "notification"

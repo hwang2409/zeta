@@ -54,6 +54,7 @@ class InvalidHistoryPageRequest(HistoryIndexError):
 
 @dataclass(frozen=True, slots=True)
 class IndexedApprovalState:
+    request_entry_id: str
     tool_call: Mapping[str, object]
     decision: str | None
 
@@ -224,7 +225,7 @@ class HistoryIndex:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS active_approval_requests ("
             "request_id TEXT PRIMARY KEY, request_seq INTEGER NOT NULL, "
-            "tool_call BLOB NOT NULL)"
+            "request_entry_id TEXT NOT NULL, tool_call BLOB NOT NULL)"
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS active_approval_resolutions ("
@@ -302,8 +303,8 @@ class HistoryIndex:
                                 (approval["request_id"], self._value(approval["tool_call"])),
                             )
                             connection.execute(
-                                "INSERT INTO active_approval_requests(request_id,request_seq,tool_call) VALUES(?,?,?)",
-                                (approval["request_id"], seq, self._value(approval["tool_call"])),
+                                "INSERT INTO active_approval_requests(request_id,request_seq,request_entry_id,tool_call) VALUES(?,?,?,?)",
+                                (approval["request_id"], seq, entry_id, self._value(approval["tool_call"])),
                             )
                     if active and entry_type == "approval_resolution":
                         connection.execute(
@@ -396,8 +397,13 @@ class HistoryIndex:
                         (approval["request_id"], self._value(approval["tool_call"])),
                     )
                     connection.execute(
-                        "INSERT INTO active_approval_requests(request_id,request_seq,tool_call) VALUES(?,?,?)",
-                        (approval["request_id"], entry.seq, self._value(approval["tool_call"])),
+                        "INSERT INTO active_approval_requests(request_id,request_seq,request_entry_id,tool_call) VALUES(?,?,?,?)",
+                        (
+                            approval["request_id"],
+                            entry.seq,
+                            entry.id,
+                            self._value(approval["tool_call"]),
+                        ),
                     )
             if entry.type == "approval_resolution":
                 connection.execute(
@@ -680,17 +686,17 @@ class HistoryIndex:
     ) -> IndexedApprovalState | None:
         rows = self._approval_query(
             facts,
-            "SELECT r.tool_call,s.decision FROM active_approval_requests r "
+            "SELECT r.request_entry_id,r.tool_call,s.decision FROM active_approval_requests r "
             "LEFT JOIN active_approval_resolutions s USING(request_id) "
             "WHERE r.request_id=?",
             (request_id,),
         )
         if not rows:
             return None
-        tool_call, decision = rows[0]
-        return IndexedApprovalState(json.loads(tool_call), decision)
+        request_entry_id, tool_call, decision = rows[0]
+        return IndexedApprovalState(request_entry_id, json.loads(tool_call), decision)
 
-    def approval_resolution_data(
+    def approval_resolution(
         self, facts: object, request_id: str
     ) -> IndexedApprovalResolution | None:
         rows = self._approval_query(
@@ -842,52 +848,6 @@ def _read_stable_approval(store: ConversationStore, query: object) -> object:
 
 
 class HistoryPageStoreMixin:
-    def approval_state_resident(
-        self, request_id: str
-    ) -> tuple[ToolCall, str | None] | None:
-        state: tuple[ToolCall, str | None] | None = None
-        for entry in self._active_branch():
-            if entry.type == "message":
-                for request in entry.data.get("approval_requests", ()):
-                    if request.get("request_id") == request_id:
-                        state = (ToolCall.from_dict(request["tool_call"]), None)
-            elif (
-                entry.type == "approval_resolution"
-                and entry.data.get("request_id") == request_id
-                and state is not None
-            ):
-                state = (state[0], entry.data["decision"])
-        return state
-
-    def approval_resolution_resident(
-        self, request_id: str
-    ) -> dict[str, str] | None:
-        for entry in reversed(self._active_branch()):
-            if (
-                entry.type == "approval_resolution"
-                and entry.data.get("request_id") == request_id
-            ):
-                return dict(entry.data)
-        return None
-
-    def pending_approval_items_resident(self) -> list[tuple[str, ToolCall]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for entry in self._active_branch():
-            if entry.type == "message":
-                for request in entry.data.get("approval_requests", ()):
-                    states[request["request_id"]] = (
-                        ToolCall.from_dict(request["tool_call"]), None
-                    )
-            elif entry.type == "approval_resolution":
-                request_id = entry.data.get("request_id")
-                if request_id in states:
-                    states[request_id] = (states[request_id][0], entry.data["decision"])
-        return [
-            (request_id, state[0])
-            for request_id, state in states.items()
-            if state[1] is None
-        ]
-
     @property
     def repair_generation(self: ConversationStore) -> str | None:
         return self._repair_generation
@@ -910,7 +870,7 @@ class HistoryPageStoreMixin:
         result = await self._to_thread_store(
             lambda: _read_stable_approval(
                 self,
-                lambda index, facts: index.approval_resolution_data(facts, request_id),
+                lambda index, facts: index.approval_resolution(facts, request_id),
             )
         )
         return None if result is None else result.data
@@ -927,7 +887,21 @@ class HistoryPageStoreMixin:
             )
         )
 
+    def _approval_index_state(self, request_id: str) -> IndexedApprovalState | None:
+        if not self._derived_update_inline_allowed():
+            raise HistoryIndexUnavailableError("approval index query requires off-loop work")
+        index = self._history_index
+        if index is None or not index.available:
+            raise HistoryIndexUnavailableError("history index is unavailable")
+        facts = self._history_index_facts()
+        result = index.approval_state(facts, request_id)
+        if self._history_index_facts() != facts:
+            raise StaleHistorySnapshot
+        return result
+
     def _approval_relations(self, request_ids: set[str]) -> dict[str, str | None]:
+        if not self._derived_update_inline_allowed():
+            raise HistoryIndexUnavailableError("approval index query requires off-loop work")
         index = self._history_index
         if index is None or not index.available:
             raise HistoryIndexUnavailableError("history index is unavailable")

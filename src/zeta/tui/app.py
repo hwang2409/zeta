@@ -1145,6 +1145,7 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
+            await self._submissions.refresh_pending_approvals()
             if not resume_ui:
                 self._begin_startup_replay()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)

@@ -3273,7 +3273,31 @@ def test_incremental_tail_payload_validation_matches_full_load(
     assert not incremental_accepted
 
 
-def test_approval_states_snapshot_uses_resident_indexes(
+def test_approval_validation_ignores_failed_sidecar_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("duplicate", "bash", {"cmd": "pwd"})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [call],
+    )
+
+    def fail_derived_query(_request_ids: set[str]) -> dict[str, str | None]:
+        raise RuntimeError("corrupt sidecar")
+
+    monkeypatch.setattr(store, "_approval_relations", fail_derived_query)
+    with pytest.raises(
+        ConversationIntegrityError, match="duplicate approval request: duplicate"
+    ):
+        store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [call],
+        )
+
+
+@pytest.mark.asyncio
+async def test_approval_state_uses_history_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "sessions"
@@ -3290,7 +3314,7 @@ def test_approval_states_snapshot_uses_resident_indexes(
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationEntry, "from_dict", classmethod(fail_if_parsed))
     resident._install_log_state(foreign._snapshot_log_state())
-    assert resident.approval_states_snapshot() == {call.id: (call, None)}
+    assert await resident.approval_state(call.id) == (call, None)
 
 
 def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:
@@ -3308,7 +3332,8 @@ def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None
             future.result()
 
 
-def test_approval_resolution_data_never_mutates_resident_store_off_owner(
+@pytest.mark.asyncio
+async def test_approval_resolution_never_mutates_resident_store_off_owner(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -3316,8 +3341,7 @@ def test_approval_resolution_data_never_mutates_resident_store_off_owner(
     store.append_approval_request(call.id, call)
     store.bind_owner_thread()
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        assert executor.submit(store.approval_resolution_data, call.id).result() is None
+    assert await store.approval_resolution(call.id) is None
 
 
 def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
@@ -3361,11 +3385,12 @@ def installed(delta):
 
 
 resident.on_entries_installed = installed
-pending = resident.pending_approvals()
+import asyncio
+pending = asyncio.run(resident.pending_approval_page())
 resident.refresh()
 print(json.dumps({
     "observed": observed,
-    "pending": [item[0] for item in pending],
+    "pending": [item[0] for item in pending.items],
     "last_text": resident.messages()[-1].content[0].text,
 }))
 '''.strip()

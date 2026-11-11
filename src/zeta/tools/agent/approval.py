@@ -226,13 +226,13 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self.child_store.resolve_approval(tool_call.id, ApprovalDecision.DENY.value)
         return ApprovalDecision.DENY
 
-    def prepare(
+    async def prepare(
         self,
         tool_call: ToolCall,
         *,
         capability: ApprovalCapability,
     ) -> ApprovalRequest | None:
-        state = self.child_store.approval_state_resident(tool_call.id)
+        state = await self.child_store.approval_state(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -245,8 +245,8 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             self._deny_unavailable_binding(tool_call)
         return request
 
-    def durable_decision(self, request_id: str) -> str | None:
-        state = self.child_store.approval_state_resident(request_id)
+    async def durable_decision(self, request_id: str) -> str | None:
+        state = await self.child_store.approval_state(request_id)
         return None if state is None else state[1]
 
     def denial_reason(self, request_id: str) -> str | None:
@@ -260,7 +260,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         execution_token: str | None = None,
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
-        state = self.child_store.approval_state_resident(tool_call.id)
+        state = await self.child_store.approval_state(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -318,8 +318,8 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             self.child_store,
             child_instance_id=self.child_instance_id,
         )
-        def current() -> tuple[bool, ApprovalDecision | None]:
-            state = self.child_store.approval_state_resident(tool_call.id)
+        async def current() -> tuple[bool, ApprovalDecision | None]:
+            state = await self.child_store.approval_state(tool_call.id)
             if state is None or state[1] is None:
                 return False, None
             if state[1] == ApprovalDecision.ALLOW.value:
@@ -382,7 +382,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
             reason=reason,
         )
 
-    def abort_or_winner(
+    async def abort_or_winner(
         self,
         request_id: str,
         *,
@@ -397,7 +397,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self.child_store.resolve_approval(
             request_id, "abort", reason="child_cleanup"
         )
-        state = self.child_store.approval_state_resident(request_id)
+        state = await self.child_store.approval_state(request_id)
         decision = _approval_decision(state[1] if state is not None else None)
         if decision is ApprovalDecision.ALLOW and state is not None:
             if execution_token is None:
@@ -417,13 +417,13 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
     ) -> ApprovalDecision | None:
         admitted = self._request_serve_abort(request_id)
         if admitted is None:
-            return self.abort_or_winner(
+            return await self.abort_or_winner(
                 request_id,
                 execution_token=execution_token,
                 capability=capability,
             )
         resolution = await asyncio.shield(admitted)
-        state = self.child_store.approval_state_resident(request_id)
+        state = await self.child_store.approval_state(request_id)
         decision = _approval_decision(
             resolution["decision"] if resolution is not None else None
         )

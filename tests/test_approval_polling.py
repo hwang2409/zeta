@@ -125,8 +125,8 @@ class _Harness:
     def resolve(self, decision: str) -> bool:
         return self.store.resolve_approval(self.call.id, decision)
 
-    def decision(self) -> str | None:
-        state = self.store.approval_states().get(self.call.id)
+    async def decision(self) -> str | None:
+        state = await self.store.approval_state(self.call.id)
         return None if state is None else state[1]
 
     def persist(self) -> None:
@@ -225,7 +225,7 @@ async def test_authorize_polling_interleavings(
             monkeypatch.setattr(harness.policy, "_resolve_abort_or_winner", reject_abort)
             signal.abort()
             assert await harness.authorize(signal) is ApprovalDecision.ALLOW
-            assert harness.decision() == "allow"
+            assert await harness.decision() == "allow"
             harness.assert_allow_binding_transferred_once()
             assert not signal.wait_entered.is_set()
             return
@@ -233,10 +233,10 @@ async def test_authorize_polling_interleavings(
         if case == "abort_already_set":
             signal.abort()
             assert await harness.authorize(signal) is None
-            assert harness.decision() == "abort"
+            assert await harness.decision() == "abort"
             harness.assert_pending_binding_cleared()
             if kind == "nested":
-                assert harness.store.approval_resolution_data(harness.call.id) == {
+                assert await harness.store.approval_resolution(harness.call.id) == {
                     "request_id": harness.call.id,
                     "decision": "abort",
                     "reason": "child_cleanup",
@@ -262,12 +262,12 @@ async def test_authorize_polling_interleavings(
         if case == "abort_before_winner":
             signal.abort()
             assert await await_or_fail(task, what="aborted approval") is None
-            assert harness.decision() == "abort"
+            assert await harness.decision() == "abort"
             harness.assert_pending_binding_cleared()
         elif case == "winner_before_abort":
             signal.abort()
             assert await await_or_fail(task, what="concurrent approval winner") is ApprovalDecision.ALLOW
-            assert harness.decision() == "allow"
+            assert await harness.decision() == "allow"
             harness.assert_allow_binding_transferred_once()
         elif case == "winner_after_tick":
             assert harness.resolve("allow")
@@ -278,7 +278,7 @@ async def test_authorize_polling_interleavings(
             signal.abort()
             tick.released.set()
             assert await await_or_fail(task, what="simultaneous abort and tick") is ApprovalDecision.ALLOW
-            assert harness.decision() == "allow"
+            assert await harness.decision() == "allow"
             harness.assert_allow_binding_transferred_once()
         elif case in {"duplicate_same", "duplicate_conflicting"}:
             assert harness.resolve("allow")
@@ -286,7 +286,7 @@ async def test_authorize_polling_interleavings(
             assert not harness.resolve(second)
             tick.released.set()
             assert await await_or_fail(task, what="duplicate approval resolution") is ApprovalDecision.ALLOW
-            assert harness.decision() == "allow"
+            assert await harness.decision() == "allow"
             harness.assert_allow_binding_transferred_once()
         elif case == "cancel_wait":
             task.cancel()
@@ -294,7 +294,7 @@ async def test_authorize_polling_interleavings(
                 await await_or_fail(task, what="canceled approval wait")
             await await_or_fail(signal.wait_finished.wait(), what="canceled abort waiter")
             await await_or_fail(tick.finished.wait(), what="canceled poll tick")
-            assert harness.decision() is None
+            assert await harness.decision() is None
         elif case == "cancel_drain":
             assert isinstance(signal, _SlowCancelSignal)
             tick.released.set()
@@ -305,7 +305,7 @@ async def test_authorize_polling_interleavings(
                 await await_or_fail(task, what="canceled approval drain")
             await await_or_fail(signal.wait_finished.wait(), what="drained abort waiter")
             await await_or_fail(tick.finished.wait(), what="completed poll tick")
-            assert harness.decision() is None
+            assert await harness.decision() is None
         elif case == "cancel_serve_admission":
             control = _AdmissionControl()
             harness.root.bind_serve_control(control)
@@ -326,7 +326,7 @@ async def test_authorize_polling_interleavings(
                 assert harness.root.cleanup_delegated("innermost") is None
                 tick.released.set()
                 assert await await_or_fail(task, what="removed delegation") is ApprovalDecision.DENY
-                assert harness.root.pending_requests() == []
+                assert (await harness.root.pending_requests()) == []
                 harness.assert_pending_binding_cleared()
             else:
                 assert harness.resolve("deny")

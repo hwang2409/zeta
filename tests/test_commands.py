@@ -1701,8 +1701,8 @@ async def test_inline_shell_denial_prevents_later_commands(tmp_path: Path) -> No
         )
         owner.task(task)
         await asyncio.wait_for(approval_started.wait(), timeout=10)
-        assert policy.pending_requests(), "inline shell approval did not appear"
-        assert policy.deny(policy.pending_requests()[0].key)
+        assert (await policy.pending_requests()), "inline shell approval did not appear"
+        assert policy.deny((await policy.pending_requests())[0].key)
         output = await task
 
         assert output == ("[inline shell failed: denied]", "[inline shell failed: denied]")

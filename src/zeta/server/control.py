@@ -500,10 +500,15 @@ class ServeControl:
             Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
+        state = (
+            await loop.store.approval_state(core_key)
+            if isinstance(core_key, str)
+            else None
+        )
         if (
             not self.turn_busy()
-            and isinstance(core_key, str)
-            and loop.prepare_resume_pending_tool(core_key)
+            and state is not None
+            and loop.prepare_resume_pending_tool(state[0])
         ):
             host_commands = self._active_host_commands
             if self.server.runtime.state is not None:

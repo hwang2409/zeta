@@ -73,6 +73,7 @@ class SubmissionPipeline:
         self._consumer: asyncio.Task[None] | None = None
         self._entries: dict[int, _Entry] = {}
         self._approval_owners: dict[str | tuple[str, str], Submission] = {}
+        self._pending_approvals: tuple[ApprovalRequest, ...] = ()
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
@@ -93,6 +94,7 @@ class SubmissionPipeline:
             ),
         )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._durable_tool_calls: dict[str, ToolCall] = {}
         # Running slash dispatches by submission id; each holds or awaits the
         # session slash lock, so the consumer stays free for aborts and approvals.
         self._slash_tasks: dict[int, asyncio.Task[Any]] = {}
@@ -177,7 +179,7 @@ class SubmissionPipeline:
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
         policy = self._host._approval_policy
-        return () if policy is None else tuple(policy.pending_requests_for_display())
+        return self._pending_approvals
 
     def submit(
         self,
@@ -391,6 +393,7 @@ class SubmissionPipeline:
             return message
 
     async def _consume(self) -> None:
+        await self.refresh_pending_approvals()
         while not self._shutting_down:
             try:
                 message = self._next_message()
@@ -418,7 +421,7 @@ class SubmissionPipeline:
                 elif isinstance(message, _DurableToolDone):
                     self._on_durable_tool_done(message)
                 elif isinstance(message, _ApprovalLifecycle):
-                    self._on_approval_lifecycle(message)
+                    await self._on_approval_lifecycle(message)
                 elif isinstance(message, _ApprovalAction):
                     await self._on_approval_action(message)
                 elif isinstance(message, _AbortAction):
@@ -953,7 +956,9 @@ class SubmissionPipeline:
             ):
                 entry.completion.set_result(None)
 
-    def _on_approval_lifecycle(self, message: _ApprovalLifecycle) -> None:
+    async def _on_approval_lifecycle(
+        self, message: _ApprovalLifecycle
+    ) -> None:
         entry = self._entry_for(message.submission)
         if entry is None:
             return
@@ -961,6 +966,8 @@ class SubmissionPipeline:
             self._approval_owners[message.call.id] = entry.submission
             if entry.state is SubmissionState.PREPROCESSING:
                 entry.state = SubmissionState.AWAITING_APPROVAL
+            await self.refresh_pending_approvals()
+            self._host._present_pending_approvals()
             return
         self._approval_owners = {
             key: owner
@@ -969,12 +976,23 @@ class SubmissionPipeline:
         }
         if entry.state is SubmissionState.AWAITING_APPROVAL:
             entry.state = SubmissionState.PREPROCESSING
+        await self.refresh_pending_approvals()
+        self._host._present_pending_approvals()
+
+    async def refresh_pending_approvals(self) -> None:
+        policy = self._host._approval_policy
+        self._pending_approvals = (
+            ()
+            if policy is None
+            else tuple(await policy.pending_requests_for_display())
+        )
 
     async def _on_approval_action(self, message: _ApprovalAction) -> None:
         policy = self._host._approval_policy
         if policy is None:
             self._ack_action(message)
             return
+        await self.refresh_pending_approvals()
         request = self._find_request(message.requested_key)
         if request is None:
             self._host._print_system("approval · no matching request")
@@ -984,7 +1002,7 @@ class SubmissionPipeline:
         durable = (
             owner is None
             and isinstance(request.key, str)
-            and self._host.loop.store.approval_state_resident(request.request_id)
+            and await self._host.loop.store.approval_state(request.request_id)
             == (request.tool_call, None)
         )
         if message.decision is ApprovalDecision.ALLOW:
@@ -1009,10 +1027,11 @@ class SubmissionPipeline:
                 entry.denied = True
                 entry.state = SubmissionState.DENIED
         self._host._print_system(f"approval · {verb} {request.key}")
+        await self.refresh_pending_approvals()
         self._host._present_pending_approvals()
         self._host._invalidate_prompt()
         if durable and self._host.loop.prepare_resume_pending_tool(
-            request.request_id
+            request.tool_call
         ):
             task = asyncio.create_task(
                 self._host.loop.resume_pending_tool(
@@ -1022,6 +1041,7 @@ class SubmissionPipeline:
                 )
             )
             self._durable_tasks[request.request_id] = task
+            self._durable_tool_calls[request.request_id] = request.tool_call
             task.add_done_callback(
                 lambda completed, request_id=request.request_id: self._send(
                     _DurableToolDone(request_id, completed)
@@ -1048,7 +1068,8 @@ class SubmissionPipeline:
             self._host.loop.abort()
             if self._host._approval_policy is not None:
                 self._host._approval_policy.abort(request_id)
-            self._host.loop.finalize_canceled(request_id)
+            tool_call = self._durable_tool_calls[request_id]
+            self._host.loop.finalize_canceled(tool_call)
             if not task.done():
                 task.cancel()
             self._host._invalidate_prompt()
@@ -1069,6 +1090,7 @@ class SubmissionPipeline:
         if self._durable_tasks.get(message.request_id) is not message.task:
             return
         self._durable_tasks.pop(message.request_id)
+        self._durable_tool_calls.pop(message.request_id, None)
         if message.task.cancelled():
             return
         try:
@@ -1149,13 +1171,13 @@ class SubmissionPipeline:
             return
         # Cancellation is a decision: use the strict pending view and record a
         # canceled result only when this abort actually won.
-        for request in policy.pending_requests():
+        for request in self._pending_approvals:
             if self._approval_owners.get(request.key) is not entry.submission:
                 continue
             if not policy.abort(request.key):
                 continue
             if entry is self._provider_entry and isinstance(request.key, str):
-                self._host.loop.finalize_canceled(request.key)
+                self._host.loop.finalize_canceled(request.tool_call)
 
     def _cancel_or_restore(self, entry: _Entry) -> None:
         if entry.undo_requested:
