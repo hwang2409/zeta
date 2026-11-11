@@ -6,11 +6,13 @@ import argparse
 import ast
 import difflib
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections import Counter
 from dataclasses import dataclass
 
@@ -1074,6 +1076,13 @@ def _element_findings(
 def _render_finding(
     finding: Item, main_items: dict, branch_items: dict, merge_items: dict
 ) -> None:
+    if finding.kind == "main-deleted-line":
+        print(
+            f"{finding.path}: main deletion re-added ({finding.name}, "
+            f"main parent line {finding.line}); line {finding.value!r} is present in the merge"
+        )
+        print("  fix: keep main's deletion or justify it in the PR")
+        return
     key = item_key(finding)
     branch_item = branch_items.get(key)
     merged = merge_items.get(key)
@@ -1167,10 +1176,154 @@ def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[st
     return changed, all_paths
 
 
-def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: dict) -> list[Item]:
+def _normalized_python_lines(source: str) -> list[str]:
+    lines = [[] for _ in source.splitlines()]
+    preserved = {tokenize.STRING, tokenize.COMMENT}
+    for name in ("FSTRING_MIDDLE", "TSTRING_MIDDLE"):
+        token_type = getattr(tokenize, name, None)
+        if token_type is not None:
+            preserved.add(token_type)
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for token in tokens:
+            if token.type in {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.INDENT,
+                              tokenize.DEDENT, tokenize.NEWLINE, tokenize.NL}:
+                continue
+            text = token.string if token.type in preserved else "".join(token.string.split())
+            parts = text.splitlines(keepends=True) or [text]
+            for offset, part in enumerate(parts):
+                line_index = token.start[0] - 1 + offset
+                if line_index < len(lines):
+                    lines[line_index].append(part.rstrip("\r\n"))
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return ["".join(line.split()) for line in source.splitlines()]
+    return ["".join(line) for line in lines]
+
+
+def _normalized_lines(path: str, source: str) -> list[str]:
+    return _normalized_python_lines(source) if path.endswith(".py") else [
+        " ".join(line.split()) for line in source.splitlines()
+    ]
+
+
+def _deleted_intervals(base: list[str], main: list[str]) -> list[tuple[int, int]]:
+    return [
+        (old_start, old_end)
+        for tag, old_start, old_end, _new_start, _new_end in difflib.SequenceMatcher(
+            None, base, main, autojunk=False
+        ).get_opcodes()
+        if tag in {"delete", "replace"} and old_start < old_end
+    ]
+
+
+def _branch_replacements(
+    base: list[str], branch: list[str], deleted: list[tuple[int, int]]
+) -> list[tuple[int, int, list[str]]]:
+    replacements = []
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+        None, base, branch, autojunk=False
+    ).get_opcodes():
+        if tag == "replace" and any(
+            old_start < end and start < old_end for start, end in deleted
+        ):
+            replacements.append((old_start, old_end, branch[new_start:new_end]))
+    return replacements
+
+
+def _find_sequence(lines: list[str], sequence: list[str]) -> int | None:
+    if not sequence:
+        return None
+    width = len(sequence)
+    for index in range(len(lines) - width + 1):
+        if lines[index : index + width] == sequence:
+            return index
+    return None
+
+
+def _count_sequence(lines: list[str], sequence: list[str]) -> int:
+    if not sequence:
+        return 0
+    width = len(sequence)
+    return sum(
+        lines[index : index + width] == sequence
+        for index in range(len(lines) - width + 1)
+    )
+
+
+def _removed_line_findings(
+    path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
+    main_range: str, final_text: str | None = None,
+) -> list[Item]:
+    base = _normalized_lines(path, base_text)
+    main = _normalized_lines(path, main_text)
+    branch = _normalized_lines(path, branch_text)
+    merge_lines = merge_text.splitlines()
+    merge = _normalized_lines(path, merge_text)
+    final = _normalized_lines(path, final_text) if final_text is not None else None
+    deleted = _deleted_intervals(base, main)
+    replacements = _branch_replacements(base, branch, deleted)
+    findings = []
+    for base_index, _old_end, replacement in replacements:
+        # One overlapping copy of the branch's edited line may legitimately survive the
+        # deletion, so count the extra copies rather than any match (the "- 1" is that copy).
+        expected = max(
+            0,
+            _count_sequence(main, replacement)
+            + _count_sequence(branch, replacement)
+            - _count_sequence(base, replacement)
+            - 1,
+        )
+        if _count_sequence(merge, replacement) <= expected:
+            continue
+        if final is not None and _count_sequence(final, replacement) <= expected:
+            _report_fixed_later(path, replacement)
+            continue
+        merge_index = _find_sequence(merge, replacement)
+        if merge_index is not None:
+            findings.append(
+                Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
+            )
+    for start, end in deleted:
+        sequence = base[start:end]
+        expected = max(
+            0,
+            _count_sequence(main, sequence)
+            + _count_sequence(branch, sequence)
+            - _count_sequence(base, sequence),
+        )
+        if _count_sequence(merge, sequence) <= expected:
+            continue
+        if final is not None and _count_sequence(final, sequence) <= expected:
+            _report_fixed_later(path, sequence)
+            continue
+        merge_index = _find_sequence(merge, sequence)
+        if merge_index is not None:
+            findings.append(
+                Item(path, "main-deleted-line", main_range, start + 1, merge_lines[merge_index])
+            )
+    return findings
+
+
+def _report_fixed_later(path: str, sequence: list[str]) -> None:
+    print(
+        f"info: {path}: main-deleted-line: re-added block {sequence[0]!r} "
+        f"removed again in the final tree"
+    )
+
+
+def _path_line_findings(
+    path: str, revisions: list[str], sources: dict, parsed: dict,
+    final_text: str | None = None,
+) -> list[Item]:
     texts = [sources.get((revision, path)) for revision in revisions]
-    if any(text is None or not text for text in texts[:3]) or texts[3] is None:
+    if texts[0] is None or texts[3] is None:
         return []
+    findings = _removed_line_findings(
+        path, texts[0], texts[1] or "", texts[2] or "", texts[3],
+        f"{revisions[0]}..{revisions[1]}", final_text,
+    )
+    if any(text is None or not text for text in texts[:3]):
+        return findings
     path_items = [
         {key: item for key, item in parsed[revision].items() if item.path == path}
         for revision in revisions
@@ -1180,7 +1333,7 @@ def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: 
         _owner_translation(path_items[1], path_items[2]),
         _owner_translation(path_items[3], path_items[2]),
     )
-    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps)
+    return _pr_line_items(path, texts[0], texts[2], texts[1], texts[3], maps) + findings
 
 
 def _parse_merge_data(commit: str, main: str, branch: str, args):
@@ -1196,10 +1349,15 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
     parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
     if error:
         return text, changed, all_paths, parsed, unresolved, error, revisions, []
+    final_sources = (
+        load_sources([args.final], all_paths) if args.final else {}
+    )
     line_findings = [
         finding
         for path in all_paths
-        for finding in _path_line_findings(path, revisions, sources, parsed)
+        for finding in _path_line_findings(
+            path, revisions, sources, parsed, final_sources.get((args.final, path))
+        )
     ]
     return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
 

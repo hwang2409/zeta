@@ -871,8 +871,10 @@ With the negotiated `approval_reconnect` feature, `pending_approvals` is the
 server's live projection and is limited to 64 entries. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
-or `abort`. Without the feature, the status shape and unbounded strict durable
-projection are unchanged.
+or `abort`. Read-only observers receive the same live baseline as the controller,
+but approval mutations still return `-32008`. Without the feature, the status
+shape and unbounded strict durable projection are unchanged, and observers
+receive the same rows as the controller.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
@@ -1455,8 +1457,9 @@ error code and message. Provider status and origin remain internal.
   `status: {"state": "idle|running|tool", "pending_approvals": [...],
   "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
   `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
-  The status is captured at join start. Apply the joined status, then sequenced
-  events after it. Open approvals are the baseline request ids plus
+  The status is captured at join start. Controllers and read-only observers get
+  the same approval baseline. Apply the joined status, then sequenced events
+  after it. Open approvals are the baseline request ids plus
   `approval_request` ids in the joined page, minus `approval_end` ids in the
   joined page, then updated by the sequenced tail by id. A session admits at
   most 64 pending approvals across foreground and delegated tools. A 65th
