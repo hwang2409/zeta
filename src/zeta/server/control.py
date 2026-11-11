@@ -6,7 +6,7 @@ import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from ..core.approval import (
@@ -15,11 +15,13 @@ from ..core.approval import (
     PermissionSnapshot,
     SessionGrantChange,
     SessionGrantNotFound,
+)
+from ..core.commands.slash_registry import SlashLock
+from ..core.permission_grants import (
     permission_snapshot,
     revoke_session_grants,
     session_grant_change,
 )
-from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
@@ -29,6 +31,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..runtime.foreground_events import ForegroundEventPublisher
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
@@ -114,8 +117,13 @@ class NotificationPresentation:
 class ServeControl:
     """Own the active semantic lifetime independently of physical clients."""
 
-    def __init__(self, server: ZetaServer) -> None:
+    def __init__(
+        self,
+        server: ZetaServer,
+        foreground_event_publisher: ForegroundEventPublisher,
+    ) -> None:
         self.server = server
+        self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
@@ -613,38 +621,43 @@ class ServeControl:
         terminal_error: dict[str, object] | None = None
         agent_end: StreamEvent | None = None
         try:
-            async for event in loop.run_turn(
-                text,
-                origin=origin,
-                user_message=user_message,
-                persist_user_message=persist_user_message,
-                host_environment=None
-                if host_commands is None
-                else host_commands.environment,
-                host_instruction=""
-                if host_commands is None
-                else host_commands.instruction,
-                allow_assistant_reset=allow_assistant_reset,
-            ):
-                if pending_turn_end is not None:
-                    if event.type is StreamEventType.AGENT_END:
-                        terminal_events.append(pending_turn_end)
+            async with aclosing(
+                self.foreground_event_publisher.events(
+                    loop.run_turn(
+                        text,
+                        origin=origin,
+                        user_message=user_message,
+                        persist_user_message=persist_user_message,
+                        host_environment=None
+                        if host_commands is None
+                        else host_commands.environment,
+                        host_instruction=""
+                        if host_commands is None
+                        else host_commands.instruction,
+                        allow_assistant_reset=allow_assistant_reset,
+                    )
+                )
+            ) as event_stream:
+                async for event in event_stream:
+                    if pending_turn_end is not None:
+                        if event.type is StreamEventType.AGENT_END:
+                            terminal_events.append(pending_turn_end)
+                        else:
+                            await self._event(
+                                pending_turn_end,
+                                session_id=session_id,
+                                turn_id=turn_id,
+                            )
+                        pending_turn_end = None
+                    if event.type is StreamEventType.TURN_END:
+                        pending_turn_end = event
+                    elif event.type is StreamEventType.ERROR:
+                        outcome = TurnOutcome.FAILED
+                        terminal_events.append(event)
+                    elif event.type is StreamEventType.AGENT_END:
+                        agent_end = event
                     else:
-                        await self._event(
-                            pending_turn_end,
-                            session_id=session_id,
-                            turn_id=turn_id,
-                        )
-                    pending_turn_end = None
-                if event.type is StreamEventType.TURN_END:
-                    pending_turn_end = event
-                elif event.type is StreamEventType.ERROR:
-                    outcome = TurnOutcome.FAILED
-                    terminal_events.append(event)
-                elif event.type is StreamEventType.AGENT_END:
-                    agent_end = event
-                else:
-                    await self._event(event, session_id=session_id, turn_id=turn_id)
+                        await self._event(event, session_id=session_id, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
@@ -1052,6 +1065,26 @@ class ServeControl:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
             )
+
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
+        connections = self.server.connections
+        if connections is None:
+            return
+        def publish() -> None:
+            controller = connections.controller_metadata()
+            if not self.closing and controller is not None and "run_work" in controller.features:
+                if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
+                    awaitable = self._notify(EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields)
+                elif event is EventDescriptor.TODO_UPDATED:
+                    awaitable = self._notify(EventDescriptor.TODO_UPDATED, session_id, **fields)
+                else:
+                    raise ValueError(f"unsupported run-work event: {event.value}")
+                asyncio.create_task(awaitable)
+        try:
+            connections.loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
 
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""

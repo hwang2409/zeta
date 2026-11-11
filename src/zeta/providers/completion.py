@@ -78,7 +78,6 @@ class AttemptSignal:
 
 
 
-
 def _first_provider_error(*errors: BaseException | None) -> BaseException | None:
     for error in errors:
         current = error

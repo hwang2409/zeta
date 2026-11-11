@@ -491,6 +491,12 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
     """Build the status footer and pad it to the composer's content width."""
     terminal_width = terminal_width or get_app().output.get_size().columns
     width = composer_content_width(terminal_width)
+    if app._remote_view is not None:
+        state = app._remote_view
+        text = f"remote · {state.host} · {state.session_id[:8]}"
+        if state.disconnected:
+            text += " · disconnected"
+        return [("class:status-bar", text.ljust(width)[:width])]
     usage = dict(app._usage)
     usage.setdefault(
         "cache_read_input_tokens",

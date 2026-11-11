@@ -134,18 +134,24 @@ class HeldTree:
         self.loop.session_metadata = self.context.metadata
         self.loop.account_context = self.context
         self.wakes = 0
+        self.wake_published = asyncio.Event()
         self.loop._background_owner.set_wake_callback(self._woke)
         self.child_ended: asyncio.Future[object] | None = None
 
     def _woke(self) -> None:
         self.wakes += 1
+        self.wake_published.set()
 
-    async def start_and_hold(self) -> None:
+    async def start_and_hold(self, *, wait_for_wake: bool = False) -> None:
         await _collect(self.loop.run_turn("start", origin=MessageOrigin.USER))
         self.child_ended = asyncio.ensure_future(
             asyncio.wait_for(self.loop._background_owner.wait(), 10)
         )
         await await_or_fail(self.backend.held.wait(), what="child hold")
+        if wait_for_wake:
+            await await_or_fail(
+                self.wake_published.wait(), what="hold wake publication"
+            )
         assert not self.child_ended.done(), "the child must hold, not fail"
 
     def holds(self, *, pending_only: bool = True) -> list[dict[str, object]]:
@@ -203,7 +209,7 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
     before = time.time()
     try:
-        await tree.start_and_hold()
+        await tree.start_and_hold(wait_for_wake=True)
         holds = tree.holds()
         assert len(holds) == 1, "a long hold must wake the parent once"
         hold = holds[0]
@@ -306,22 +312,35 @@ async def test_new_hold_after_response_wakes_again_and_uses_current_pin() -> Non
 
 
 @pytest.mark.asyncio
-async def test_foreground_child_hold_does_not_wake_parent(tmp_path: Path) -> None:
+async def test_foreground_child_abandons_long_hold_at_once(tmp_path: Path) -> None:
+    # a foreground caller is blocked on the child; a long hold must not hang it.
     backend = HeldChildBackend(
         [_rate_limited(LONG_RETRY_AFTER)], parent_turns=1, background=False
     )
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
-    run = asyncio.create_task(
-        _collect(tree.loop.run_turn("start", origin=MessageOrigin.USER))
-    )
     try:
-        await await_or_fail(tree.backend.held.wait(), what="foreground child hold")
-        assert tree.holds() == []
-        backend.release.set()
-        await await_or_fail(run, what="foreground child end")
+        events = await await_or_fail(
+            _collect(tree.loop.run_turn("start", origin=MessageOrigin.USER)),
+            what="foreground parent turn",
+        )
     finally:
         await tree.close()
-    assert tree.holds(pending_only=False) == []
+
+    assert backend.waits == [], "a foreground child must not wait out a long hold"
+    assert tree.holds(pending_only=False) == [], "a foreground hold never wakes the parent"
+    terminal = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_call is not None
+        and event.tool_call.name == "agent"
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error, "the abandoned child reports a failed receipt"
+    text = terminal.tool_result.content
+    assert "foreground child not run" in text
+    assert "held by a rate limit" in text
+    assert "codex" in text
 
 
 @pytest.mark.asyncio

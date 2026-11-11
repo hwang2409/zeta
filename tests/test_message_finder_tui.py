@@ -56,6 +56,7 @@ def _app_for_finder(
     app._agent_navigation = SimpleNamespace(
         child_view_active=child is not None,
         transcript_control=SimpleNamespace(transcript=child),
+        viewed_transcript=child or transcript,
     )
     app._active_finder = transcript
     app._finder_field = OverlayTextField("TEST_FINDER")
@@ -511,6 +512,7 @@ async def test_switching_from_child_to_root_cancels_stale_finder_work(
     root.create_content(80, 5)
     app = _app_for_finder(root, child=child)
     app._agent_navigation = navigation
+    navigation._main_transcript_widget = root
     navigation._on_view_change = app._finder_cancel
 
     app._finder_open()

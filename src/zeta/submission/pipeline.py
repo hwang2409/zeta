@@ -487,7 +487,14 @@ class SubmissionPipeline:
         if entry is None:
             return
         entry.child_task = None
-        task = message.task
+        try:
+            await self._settle_slash(entry, message.task)
+        finally:
+            # the command finished after the keypress that started it was drawn; nothing else
+            # repaints an idle screen, so its output would wait for the next key.
+            self._host._invalidate_prompt()
+
+    async def _settle_slash(self, entry: _Entry, task: asyncio.Task[Any]) -> None:
         if task.cancelled() or entry.state is SubmissionState.CANCELED:
             self._cancel_or_restore(entry)
             return

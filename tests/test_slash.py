@@ -736,9 +736,9 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_paths() -> None:
     class Registry:
-        def memory_format(self, project_id: str) -> int:
-            assert project_id == "project"
-            return 1
+        memory_transactions = SimpleNamespace(
+            read=lambda project_id: SimpleNamespace(format=1)
+        )
 
         def undo_memory(
             self, project_id: str, *, expected_current: str | None = None
@@ -973,8 +973,9 @@ async def test_tui_current_session_repair_updates_live_memory_owner(
 @pytest.mark.asyncio
 async def test_memory_recovery_pause_resume_uses_shared_command_path() -> None:
     class Registry:
-        def memory_format(self, project_id: str) -> int:
-            return 1
+        memory_transactions = SimpleNamespace(
+            read=lambda project_id: SimpleNamespace(format=1)
+        )
 
         def memory_log(self, project_id: str, *, limit: int = 100) -> list[dict[str, object]]:
             return []

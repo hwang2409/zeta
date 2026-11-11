@@ -28,12 +28,20 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
     """Validate and atomically join a client's session history stream."""
     connections = client.server.connections
     try:
-        if set(params) != {"session_id"} or not isinstance(
-            params.get("session_id"), str
-        ) or not params["session_id"]:
+        if (
+            set(params) - {"session_id", "before", "history_validator"}
+            or not isinstance(params.get("session_id"), str)
+            or not params["session_id"]
+            or ("before" in params and params["before"] is None)
+            or (
+                "before" in params
+                and (type(params["before"]) is not int or params["before"] < 0)
+            )
+            or ("before" in params) != ("history_validator" in params)
+        ):
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
-                "session_history_and_subscribe requires session_id",
+                "session_history_and_subscribe requires session_id and a complete cursor",
             )
         session_id = params["session_id"]
         if client.server.runtime.session_id != session_id:
@@ -42,7 +50,9 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 "session is not active",
             )
         connections.begin_replay_join(client, ReplayScopeId.top(session_id))
-        read = await connections.read_replay_history(client, session_id)
+        read = await connections.read_replay_history(
+            client, session_id, params.get("history_validator")
+        )
         return connections.finish_replay_join(client, *read)
     except BaseException:
         connections.invalidate_replay_connection(client, reason="rejoined")
@@ -112,6 +122,7 @@ class PendingReplayJoin:
     scope: ReplayScopeId
     stream_id: str
     reset_generation: int
+    status: dict[str, object]
     frames: list[HeldFrame] = field(default_factory=list)
     frontier: Frontier | None = None
     stale: bool = False
@@ -294,6 +305,7 @@ class SessionReplay:
         connection: Any,
         scope: ReplayScopeId,
         reset_generation: int,
+        status: dict[str, object],
     ) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(
@@ -301,6 +313,7 @@ class SessionReplay:
             scope,
             secrets.token_urlsafe(9),
             reset_generation,
+            status,
         )
         self._next_sequences[connection] = 1
         self._pending[connection] = pending
@@ -339,6 +352,7 @@ class SessionReplay:
         pending.frontier = frontier
         return {
             **history_snapshot,
+            "status": pending.status,
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 

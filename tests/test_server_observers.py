@@ -155,14 +155,14 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
     store = server.runtime.opened.store
     entered = threading.Event()
     release = threading.Event()
-    original_snapshot = store.active_branch_snapshot
+    original_page = store.history_index_page
 
-    def gated_snapshot() -> Any:
+    def gated_page(request: dict[str, object]) -> Any:
         entered.set()
         assert release.wait(TIMEOUT)
-        return original_snapshot()
+        return original_page(request)
 
-    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
+    monkeypatch.setattr(store, "history_index_page", gated_page)
     try:
         history = asyncio.create_task(
             _request(
@@ -406,18 +406,18 @@ async def test_controller_history_does_not_block_other_clients(
     release = threading.Event()
     ping_answered = threading.Event()
     answered_before_release: list[bool] = []
-    original_snapshot = store.active_branch_snapshot
+    original_page = store.history_index_page
 
-    def gated_snapshot() -> Any:
+    def gated_page(request: dict[str, object]) -> Any:
         entered.set()
         assert release.wait(TIMEOUT)
-        return original_snapshot()
+        return original_page(request)
 
     def bounded_release() -> None:
         answered_before_release.append(ping_answered.wait(0.5))
         release.set()
 
-    monkeypatch.setattr(store, "active_branch_snapshot", gated_snapshot)
+    monkeypatch.setattr(store, "history_index_page", gated_page)
 
     async def ping_after_history_starts() -> None:
         await _wait_thread(entered)

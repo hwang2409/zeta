@@ -230,6 +230,29 @@ def _project_history_group(
     return group, _history_group_body_size(codec, group)
 
 
+def history_projection_from_groups(
+    groups: tuple[tuple[Any, ...], ...],
+    approval_calls: Mapping[str, object],
+    *,
+    served_turn_end: bool,
+) -> HistoryProjection:
+    groups = tuple(
+        tuple(
+            entry for entry in group
+            if served_turn_end or getattr(entry, "type", None) != "turn_end"
+        )
+        for group in groups
+    )
+    entry_index = {
+        entry.id: entry for group in groups for entry in group if hasattr(entry, "id")
+    }
+    return HistoryProjection(
+        (*groups, ()),
+        MappingProxyType(dict(approval_calls)),
+        MappingProxyType(entry_index),
+    )
+
+
 def history_projection(
     store: ConversationStore,
     *,
@@ -250,13 +273,10 @@ def history_projection(
     if cached is not None and cached.generation == generation:
         return cached.projection
 
-    # The store is loop-owned, but its validated snapshots are read here by the
-    # serve worker. Retry if an append publishes a newer generation mid-copy.
-    while True:
-        generation = _generation(store)
-        branch = store.active_branch_snapshot()
-        if generation == _generation(store):
-            break
+    # The store is loop-owned; the serve worker reads its validated snapshot.
+    generation = _generation(store)
+    branch = store.active_branch_snapshot()
+    stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}
     accepted_messages: dict[str, dict[str, object]] = {}
@@ -312,6 +332,9 @@ def history_projection(
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
     )
+    if stable_generation is None:
+        return built
+    generation = stable_generation
     with _cache_creation_lock:
         cached = _cache(
             store,

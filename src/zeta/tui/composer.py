@@ -9,6 +9,7 @@ import platform  # noqa: F401 - tests patch the module for paste behavior
 import shutil  # noqa: F401 - tests patch the module for paste behavior
 import subprocess  # noqa: F401 - tests patch the module for paste behavior
 from collections.abc import Mapping
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -240,87 +241,90 @@ class TurnConsumerMixin:
                     abort_signal=turn_abort_signal,
                 )
             )
-            async for event in events:
-                if notification and event.type is StreamEventType.ERROR:
-                    notification_failure = NotificationFailure(
-                        event.error or ErrorInfo("backend_error", "notification turn failed"),
-                        event.data,
-                    )
-                elif (
-                    notification
-                    and event.type is StreamEventType.MESSAGE_END
-                    and event.data.get("stop_reason") == "refusal"
-                ):
-                    notification_failure = NotificationFailure(
-                        ErrorInfo("refusal", "provider refused the notification turn")
-                    )
-                self._update_usage(event)
-                self._usage_tracker.record(event.type, self.model)
-                self._prepare_stream_event(event)
-                stop_after_tool = self._handle_tool_event(event)
-                if self.verbose:
-                    self._print(
-                        Text(
-                            json.dumps(event.to_dict(), sort_keys=True), style=theme.DIM
+            async with aclosing(
+                self.foreground_event_publisher.events(events)
+            ) as event_stream:
+                async for event in event_stream:
+                    if notification and event.type is StreamEventType.ERROR:
+                        notification_failure = NotificationFailure(
+                            event.error or ErrorInfo("backend_error", "notification turn failed"),
+                            event.data,
                         )
-                    )
-                if event.type is StreamEventType.MESSAGE_UPDATE:
-                    self._consume_text(event)
-                    self._invalidate_stream_prompt()
-                    continue
-                if event.type is StreamEventType.TURN_START:
-                    self._todo_widget.turn_boundary()
-                    self._spinner_frame = 0
-                    self._spinner_reset.set()
-                    self._streaming = True
-                elif event.type is StreamEventType.COMPACTION_START:
-                    self._loop_state = "compacting"
-                elif event.type is StreamEventType.COMPACTION_END:
-                    self._loop_state = "streaming"
-                elif event.type is StreamEventType.MESSAGE_END:
-                    self._finish_message(event)
-                    self._streaming = False
-                    self._finish_stream_invalidation()
-                elif event.type is StreamEventType.AGENT_END:
-                    self._reset_stream_state()
-                    self._loop_state = "idle"
-                    if not turn_failed:
-                        self._failed_turn = None
-                    if not self._turn_had_visible_output and not notification:
-                        self._print_unit(Text("no response", style=theme.CHROME))
-                        self._turn_had_visible_output = True
-                if event.type not in {
-                    StreamEventType.TOOL_APPROVAL_START,
-                    StreamEventType.TOOL_APPROVAL_END,
-                    StreamEventType.TOOL_EXECUTION_UPDATE,
-                    StreamEventType.TOOL_EXECUTION_END,
-                    StreamEventType.TOOL_EXECUTION_START,
-                }:
-                    rendered = render_event(event)
-                    if rendered is not None:
-                        self._turn_had_visible_output |= (
-                            event.type is StreamEventType.MESSAGE_END
-                            and bool(event.data.get("truncated"))
+                    elif (
+                        notification
+                        and event.type is StreamEventType.MESSAGE_END
+                        and event.data.get("stop_reason") == "refusal"
+                    ):
+                        notification_failure = NotificationFailure(
+                            ErrorInfo("refusal", "provider refused the notification turn")
                         )
-                        if event.type in {
-                            StreamEventType.AGENT_END,
-                            StreamEventType.ERROR,
-                            StreamEventType.AGENT_NOTIFICATION,
-                        }:
-                            turn_failed |= await self._print_special_event(
-                                event,
-                                rendered,
-                                suppress_errors=suppress_errors or notification,
-                                user_text=user_text,
-                                retry_message=retry_message,
+                    self._update_usage(event)
+                    self._usage_tracker.record(event.type, self.model)
+                    self._prepare_stream_event(event)
+                    stop_after_tool = self._handle_tool_event(event)
+                    if self.verbose:
+                        self._print(
+                            Text(
+                                json.dumps(event.to_dict(), sort_keys=True), style=theme.DIM
                             )
-                        else:
-                            self._print(rendered)
-                if event.type is StreamEventType.ACCOUNT_LIMIT:
-                    self._handle_account_limit(event)
-                self._invalidate_prompt()
-                if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
-                    break
+                        )
+                    if event.type is StreamEventType.MESSAGE_UPDATE:
+                        self._consume_text(event)
+                        self._invalidate_stream_prompt()
+                        continue
+                    if event.type is StreamEventType.TURN_START:
+                        self._todo_widget.turn_boundary()
+                        self._spinner_frame = 0
+                        self._spinner_reset.set()
+                        self._streaming = True
+                    elif event.type is StreamEventType.COMPACTION_START:
+                        self._loop_state = "compacting"
+                    elif event.type is StreamEventType.COMPACTION_END:
+                        self._loop_state = "streaming"
+                    elif event.type is StreamEventType.MESSAGE_END:
+                        self._finish_message(event)
+                        self._streaming = False
+                        self._finish_stream_invalidation()
+                    elif event.type is StreamEventType.AGENT_END:
+                        self._reset_stream_state()
+                        self._loop_state = "idle"
+                        if not turn_failed:
+                            self._failed_turn = None
+                        if not self._turn_had_visible_output and not notification:
+                            self._print_unit(Text("no response", style=theme.CHROME))
+                            self._turn_had_visible_output = True
+                    if event.type not in {
+                        StreamEventType.TOOL_APPROVAL_START,
+                        StreamEventType.TOOL_APPROVAL_END,
+                        StreamEventType.TOOL_EXECUTION_UPDATE,
+                        StreamEventType.TOOL_EXECUTION_END,
+                        StreamEventType.TOOL_EXECUTION_START,
+                    }:
+                        rendered = render_event(event)
+                        if rendered is not None:
+                            self._turn_had_visible_output |= (
+                                event.type is StreamEventType.MESSAGE_END
+                                and bool(event.data.get("truncated"))
+                            )
+                            if event.type in {
+                                StreamEventType.AGENT_END,
+                                StreamEventType.ERROR,
+                                StreamEventType.AGENT_NOTIFICATION,
+                            }:
+                                turn_failed |= await self._print_special_event(
+                                    event,
+                                    rendered,
+                                    suppress_errors=suppress_errors or notification,
+                                    user_text=user_text,
+                                    retry_message=retry_message,
+                                )
+                            else:
+                                self._print(rendered)
+                    if event.type is StreamEventType.ACCOUNT_LIMIT:
+                        self._handle_account_limit(event)
+                    self._invalidate_prompt()
+                    if event.type is StreamEventType.TOOL_EXECUTION_END and stop_after_tool:
+                        break
         except asyncio.CancelledError:
             self._flush_stream_kind(preserve_inline=True)
             self._presenter.reset_assistant_unit()
@@ -804,6 +808,11 @@ class SubmissionMixin:
         return await self.loop.slash_mcp_prompt(name, arguments)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> None:
+        if self._remote_view is not None:
+            command = value.strip().split(maxsplit=1)[0] if value.strip() else ""
+            if command not in {"/detach", "/remote"}:
+                self._print_on_screen("remote view is read only; use /detach first")
+                return
         # Any submission retires an open model picker: its card would otherwise
         # linger with keys that no longer do anything.
         self._dismiss_model_picker()
