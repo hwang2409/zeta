@@ -3285,7 +3285,7 @@ def test_approval_validation_ignores_failed_sidecar_seed(
 ) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall("duplicate", "bash", {"cmd": "pwd"})
-    store.append_message_with_approval_requests(
+    first = store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
         [(call.id, call)],
     )
@@ -3299,10 +3299,7 @@ def test_approval_validation_ignores_failed_sidecar_seed(
     with pytest.raises(
         ConversationIntegrityError, match="duplicate approval request: duplicate"
     ):
-        store.append_message_with_approval_requests(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-            [(call.id, call)],
-        )
+        store.append_many([("message", first.data)])
     store.close()
 
 
@@ -3406,11 +3403,12 @@ print(json.dumps({
 
     completed = subprocess.run(
         [sys.executable, str(script), str(tmp_path)],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=5,
     )
+    assert completed.returncode == 0, completed.stderr
 
     result = json.loads(completed.stdout)
     assert result["pending"] == ["call-1"]
