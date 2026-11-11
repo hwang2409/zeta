@@ -1,6 +1,5 @@
 """Composition root for the full-screen zeta terminal UI."""
 from __future__ import annotations
-
 import asyncio
 import shlex
 import subprocess
@@ -13,7 +12,6 @@ from shutil import (
     get_terminal_size,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.get_terminal_size
 )
 from typing import Any
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import get_app, run_in_terminal
 from prompt_toolkit.document import Document
@@ -23,7 +21,6 @@ from rich.cells import cell_len
 from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
-
 from ..config.settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
@@ -117,7 +114,6 @@ from .transcript import (
 from .transcript.finder_runtime import FinderRuntimeMixin
 from .transcript.history_finder import HistoryFinder
 from .user import displayed_user_text
-
 
 def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
     if cell_len(line) <= width:
