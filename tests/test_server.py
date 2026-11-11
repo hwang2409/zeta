@@ -106,6 +106,7 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import OllamaBackend
+from zeta.runtime.foreground_events import ForegroundEventPublisher
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.empty_turn import DispatchProgress, empty_turn_error
 from zeta.server import ZetaServer
@@ -4638,7 +4639,8 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
 
     async def run_blocking(job: Callable[[], object]) -> object:
@@ -9365,6 +9367,9 @@ async def test_memory_command_parity_tui_and_serve() -> None:
     class Registry:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+            self.memory_transactions = SimpleNamespace(
+                read=lambda project_id: SimpleNamespace(format=1)
+            )
 
         def ensure_memory_supported(self, project_id: str) -> None:
             self.calls.append(("format", project_id))
@@ -12700,7 +12705,8 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     policy_store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []
 
@@ -12773,7 +12779,8 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     policy_store = ConversationStore(tmp_path / "serve")
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None))
+        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []
 

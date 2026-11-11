@@ -104,6 +104,7 @@ class RuntimeCloseMixin:
         finally:
             self._workspace_snapshot_store = None
             attempt(lambda: self.loop.set_background_event_sink(None))
+            attempt(self.foreground_event_publisher.close)
             attempt(lambda: self.loop.set_background_wake_callback(None))
             attempt(self._detach_ui_notice_sinks)
             attempt(lambda: self.loop.set_mcp_prompt_refresh(None))
