@@ -29,7 +29,7 @@ from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.skills import SkillCatalog
-from zeta.storage_format import FEATURE_EPOCHS, StorageFeature, advance
+from zeta.storage_format import P06_FEATURE_EPOCH, advance
 from zeta.tui.app import TUIApp
 
 
@@ -304,10 +304,7 @@ def test_p06_3_identity_and_domain_publications_do_not_serialize(
 
 def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
-    # The named authority turns on at the project-locks epoch, not at WRITER_EPOCH;
-    # drive the split off that feature epoch so a later WRITER_EPOCH bump is inert.
-    named = FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]
-    for epoch in range(named - 1):
+    for epoch in range(P06_FEATURE_EPOCH - 1):
         advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
     legacy = ProjectRegistry(home / "projects")
     old_project = legacy.create_project("old", "old")
@@ -316,7 +313,7 @@ def test_p06_4_epoch_selects_legacy_then_named_authority(tmp_path: Path) -> None
     assert not (home / "projects" / old_project.project_id / ".memory.lock").exists()
 
     del legacy
-    advance(home, expected_epoch=named - 1, target_epoch=named)
+    advance(home, expected_epoch=P06_FEATURE_EPOCH - 1, target_epoch=P06_FEATURE_EPOCH)
     current = ProjectRegistry(home / "projects")
     current.load_memory(old_project.project_id)
     assert (home / "projects" / old_project.project_id / ".memory.lock").is_file()
