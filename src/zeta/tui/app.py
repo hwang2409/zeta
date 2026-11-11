@@ -442,9 +442,6 @@ class TUIApp(
             self._model_catalog_task = None
             self.refresh_model_picker()
 
-    def _composer_placeholder(self) -> str:
-        return "view only · /detach to return" if self._remote_view is not None else "type a message..."
-
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
         style = self._prompt_styles.get(focused)
