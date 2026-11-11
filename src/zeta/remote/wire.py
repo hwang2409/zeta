@@ -1,13 +1,22 @@
-"""Strict decoding of observer serve frames into existing stream events."""
+"""Tolerant decoding of observer serve frames into existing stream events.
+
+Only size and frame-shape errors are fatal. Unknown event names, unknown keys,
+and payloads this client cannot read are skipped, so a newer remote zeta never
+breaks an older viewer.
+"""
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
+from functools import cache
 
-from ..protocol.types import StreamEvent, StreamEventType
+from ..protocol.types import Message, StreamEvent, StreamEventType
 
 MAX_FRAME_BYTES = 256 * 1024
-MAX_LINE_BYTES = MAX_FRAME_BYTES + 1
+MAX_HISTORY_ROWS = 4096
+HISTORY_REQUEST_ID = 2
+_EVENT_KEYS = ("message", "delta", "tool_call", "tool_result", "error", "data")
+
 
 class RemoteWireError(ValueError):
     pass
@@ -19,8 +28,6 @@ class BoundedLineDecoder:
 
     def feed(self, chunk: bytes) -> list[bytes]:
         self._buffer.extend(chunk)
-        if len(self._buffer) > MAX_FRAME_BYTES and b"\n" not in self._buffer:
-            raise RemoteWireError("remote frame is too large")
         lines: list[bytes] = []
         while b"\n" in self._buffer:
             line, _, rest = self._buffer.partition(b"\n")
@@ -33,107 +40,62 @@ class BoundedLineDecoder:
             raise RemoteWireError("remote frame is too large")
         return lines
 
-    def finish(self) -> None:
-        if self._buffer:
-            raise RemoteWireError("unterminated remote frame")
+
+@cache
+def _renderable_events() -> dict[str, StreamEventType]:
+    # lazy: importing zeta.server adds ~100 ms to every TUI start.
+    from ..server.event_contract import STREAM_EVENT_WIRE_EVENTS
+
+    return {wire.value: kind for kind, wire in STREAM_EVENT_WIRE_EVENTS.items()}
 
 
-def decode_frame(raw: bytes | str) -> tuple[str, Mapping[str, object]]:
-    data = raw.encode() if isinstance(raw, str) else raw
-    if len(data) > MAX_FRAME_BYTES:
+def decode_line(raw: bytes) -> tuple[StreamEvent, ...]:
+    """Return the renderable events in one serve frame; raise only on a bad frame."""
+    if len(raw) > MAX_FRAME_BYTES:
         raise RemoteWireError("remote frame is too large")
     try:
-        value = json.loads(data)
+        frame = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RemoteWireError("invalid remote frame") from exc
-    if not isinstance(value, dict) or value.get("method") != "event":
+    if not isinstance(frame, dict):
         raise RemoteWireError("invalid remote frame")
-    if "jsonrpc" in value and value.get("jsonrpc") != "2.0":
-        raise RemoteWireError("invalid remote frame")
-    if not isinstance(value.get("params"), dict):
-        raise RemoteWireError("unsupported remote frame")
-    params = value["params"]
-    event = params.get("event", params.get("type"))
-    if not isinstance(event, str):
-        raise RemoteWireError("remote frame has no event")
-    if "event" not in params:
-        params = dict(params)
-        params["event"] = event
-    return event, params
+    if frame.get("id") == HISTORY_REQUEST_ID and isinstance(frame.get("result"), dict):
+        return history_events(frame["result"])
+    params = frame.get("params")
+    if frame.get("method") != "event" or not isinstance(params, dict):
+        return ()
+    event = _event(params)
+    return () if event is None else (event,)
+
+
+def _event(params: Mapping[str, object]) -> StreamEvent | None:
+    kind = _renderable_events().get(str(params.get("event")))
+    if kind is None:
+        return None
+    if kind is StreamEventType.MESSAGE_UPDATE and params.get("kind", "assistant") != "assistant":
+        return None
+    value: dict[str, object] = {key: params[key] for key in _EVENT_KEYS if key in params}
+    if kind is StreamEventType.TOOL_EXECUTION_UPDATE and "output" in params:
+        value["delta"] = params["output"]
+    if not isinstance(value.get("data", {}), dict):
+        return None
+    try:
+        return StreamEvent.from_dict({**value, "type": kind.value})
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def history_events(result: Mapping[str, object]) -> tuple[StreamEvent, ...]:
     messages = result.get("messages")
-    if not isinstance(messages, list) or len(messages) > 4096:
+    if not isinstance(messages, list) or len(messages) > MAX_HISTORY_ROWS:
         raise RemoteWireError("invalid remote history")
     events: list[StreamEvent] = []
     for row in messages:
-        if not isinstance(row, dict) or any(
-            key not in {"id", "role", "content", "tool_result", "metadata", "event", "data"}
-            for key in row
-        ):
-            raise RemoteWireError("invalid remote history row")
-        if not isinstance(row.get("role"), str) or not isinstance(row.get("content"), list):
-            raise RemoteWireError("invalid remote history row")
         try:
-            from ..protocol.types import Message
-            message = Message.from_dict({key: row[key] for key in ("role", "content", "tool_result", "metadata") if key in row})
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RemoteWireError("invalid remote history row") from exc
+            message = Message.from_dict(
+                {key: row[key] for key in ("role", "content", "tool_result", "metadata") if key in row}
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
         events.append(StreamEvent(StreamEventType.MESSAGE_END, message=message, data={"remote_history": True}))
     return tuple(events)
-
-
-def decode_event(raw: bytes | str) -> StreamEvent:
-    name, params = decode_frame(raw)
-    aliases = {
-        "assistant_delta": StreamEventType.MESSAGE_UPDATE,
-        "assistant_message": StreamEventType.MESSAGE_END,
-        "tool_start": StreamEventType.TOOL_EXECUTION_START,
-        "tool_output": StreamEventType.TOOL_EXECUTION_UPDATE,
-        "tool_end": StreamEventType.TOOL_EXECUTION_END,
-        "approval_request": StreamEventType.TOOL_APPROVAL_START,
-        "approval_end": StreamEventType.TOOL_APPROVAL_END,
-        "sub_agent_receipt": StreamEventType.AGENT_NOTIFICATION,
-        "usage": StreamEventType.AGENT_NOTIFICATION,
-        "served_turn_end": StreamEventType.TURN_END,
-    }
-    try:
-        kind = aliases[name] if name in aliases else StreamEventType(name)
-    except ValueError as exc:
-        raise RemoteWireError("unknown remote event") from exc
-    if any(
-        key not in (
-            "event", "type", "session_id", "data", "delta", "kind", "message",
-            "content", "tool_call", "tool_result", "error", "row_seq", "usage",
-            "stream_id", "seq",
-        )
-        for key in params
-    ):
-        raise RemoteWireError("unknown remote event field")
-    value = {key: item for key, item in params.items() if key != "session_id"}
-    value["type"] = kind.value
-    if "data" not in value:
-        value["data"] = {}
-    if not isinstance(value["data"], dict):
-        raise RemoteWireError("invalid remote event data")
-    try:
-        return StreamEvent.from_dict(value)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RemoteWireError("invalid remote event payload") from exc
-
-
-def decode_lines(chunks: Iterator[bytes]) -> Iterator[StreamEvent]:
-    buffer = b""
-    for chunk in chunks:
-        buffer += chunk
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            if len(line) > MAX_FRAME_BYTES:
-                raise RemoteWireError("remote frame is too large")
-            if line:
-                yield decode_event(line)
-        if len(buffer) > MAX_FRAME_BYTES:
-            raise RemoteWireError("unterminated remote frame is too large")
-    if buffer:
-        raise RemoteWireError("unterminated remote frame")

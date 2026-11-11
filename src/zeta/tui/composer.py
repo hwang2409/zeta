@@ -818,9 +818,6 @@ class SubmissionMixin:
         self._dismiss_model_picker()
         text, steer, passthrough = parse_submission(value)
         if passthrough is not None:
-            if self._remote_view is not None:
-                self._print_system("remote view is read only; use /detach first")
-                return
             self._draft.mark_submitted()
             task = asyncio.create_task(self._run_shell_passthrough(passthrough))
             self._active_task = task
@@ -851,9 +848,6 @@ class SubmissionMixin:
             return
         text, steer, passthrough = parse_submission(value)
         if passthrough is not None:
-            if self._remote_view is not None:
-                self._print_system("remote view is read only; use /detach first")
-                return
             self._draft.mark_submitted()
             await self._run_shell_passthrough(passthrough)
             return

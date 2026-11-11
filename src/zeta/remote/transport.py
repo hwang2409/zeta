@@ -19,7 +19,7 @@ def remote_bridge_command(mode: str, session_id: str | None = None, remote_home:
         raise ValueError("invalid bridge mode")
     args = ["__remote_bridge", mode]
     if session_id is not None:
-        if session_id != session_id.strip() or any(c in session_id for c in ":/;'\"\\n\x00"):
+        if session_id != session_id.strip() or any(c in session_id for c in ":/;'\"\n\x00"):
             raise ValueError("invalid session id")
         args.append(session_id)
     bridge_args = " ".join(shlex.quote(arg) for arg in args)
@@ -41,11 +41,11 @@ class TransportItem:
 class RemoteTransport:
     """run ssh and bridge io in a private thread and loop."""
 
-    def __init__(self, host: str, *, ssh: str = "ssh", max_queue: int = MAX_QUEUE,
+    def __init__(self, host: str, *, ssh: str = "ssh", port: int | None = None, max_queue: int = MAX_QUEUE,
                  callback: Callable[[TransportItem], None] | None = None) -> None:
         from .discovery import validate_host
         validate_host(host)
-        self.host, self.ssh = host, ssh
+        self.host, self.ssh, self.port = host, ssh, port
         self._input: queue.Queue[bytes | None] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -80,13 +80,17 @@ class RemoteTransport:
 
     async def _main(self, command: str) -> None:
         try:
+            # BatchMode: never prompt inside the TUI; ConnectTimeout: a sleeping host fails fast.
             process = await asyncio.create_subprocess_exec(
-                self.ssh, "--", self.host, command, stdin=asyncio.subprocess.PIPE,
+                self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                *(["-p", str(self.port)] if self.port else []), "--", self.host, command,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
-            self._publish(TransportItem("exit", str(exc).encode()))
+            self._publish(TransportItem("stderr", str(exc).encode()))
+            self._publish(TransportItem("exit", b"255"))
             return
         self._process = process
 
@@ -117,6 +121,8 @@ class RemoteTransport:
                 os.killpg(process.pid, signal.SIGTERM)
         await process.wait()
         stop_waiter.cancel()
+        # process.wait() can return before the pipes close; let the readers drain briefly.
+        await asyncio.wait(readers[:2], timeout=1)
         for task in readers:
             task.cancel()
         await asyncio.gather(*readers, return_exceptions=True)

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 from ..protocol.types import StreamEvent
@@ -17,147 +16,131 @@ from .discovery import (
     validate_host,
 )
 from .transport import RemoteTransport, TransportItem, remote_bridge_command
-from .wire import BoundedLineDecoder, RemoteWireError, decode_event, history_events
+from .wire import HISTORY_REQUEST_ID, BoundedLineDecoder, RemoteWireError, decode_line
 
 COMPATIBILITY_MESSAGE = "remote zeta is missing or too old. update ~/me/fun/zeta on HOST, then run: cd ~/me/fun/zeta && uv tool install --editable ."
+_OLD_ZETA_MARKERS = (b"command not found", b"invalid choice: '__remote_bridge'", b"unknown bridge_version")
+MAX_DIAGNOSTIC_BYTES = 64 * 1024
+MAX_LIST_BYTES = 1024 * 1024
+MAX_ROW_BYTES = 8192
+_ROW_FIELDS = ("session_id", "name", "state", "machine_id")
+# the overflow item tells the consumer that _admit dropped the stream.
+_OVERFLOW = TransportItem("overflow", b"")
 
-@dataclass(frozen=True, slots=True)
-class RemoteView:
-    host: str
-    session_id: str
-    session_name: str
-    replay_seq: int = 0
+
+def _check_compatible(status: bytes, diagnostics: bytes, display: str) -> None:
+    if status == b"127" or any(marker in diagnostics for marker in _OLD_ZETA_MARKERS):
+        raise RemoteWireError(COMPATIBILITY_MESSAGE.replace("HOST", display))
+
+
+def _session_row(line: bytes, display: str) -> RemoteSession | None:
+    if len(line) > MAX_ROW_BYTES:
+        raise RemoteWireError("remote session row is too large")
+    try:
+        value = json.loads(line)
+        if not isinstance(value, dict) or value.get("kind") != "session":
+            return None
+        session_id, name, state, machine_id = (value.get(key) for key in _ROW_FIELDS)
+        return RemoteSession(
+            display, validate_host(str(session_id)), str(name or ""),
+            state if isinstance(state, str) else None, str(machine_id or ""),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+
 
 class RemoteSessionClient:
     def __init__(self, home: Path, *, ssh: str = "ssh", transport_factory: Callable[..., RemoteTransport] = RemoteTransport) -> None:
         self.home, self.ssh, self._transport_factory = home, ssh, transport_factory
         self.transport: RemoteTransport | None = None
-        self.view: RemoteView | None = None
         self._queue: asyncio.Queue[TransportItem] | None = None
         self._events: asyncio.Queue[StreamEvent | str] | None = None
         self._event_task: asyncio.Task[None] | None = None
         self._generation = 0
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._targets: dict[str, tuple[str, str]] = {}
+        self._targets: dict[str, RemoteTarget] = {}
 
-    async def discover(self, hosts: tuple[str, ...] | None = None) -> tuple[RemoteSession, ...]:
+    async def discover(self, hosts: tuple[str | RemoteTarget, ...] | None = None) -> tuple[RemoteSession, ...]:
         targets = hosts or configured_hosts(self.home)
         results = await asyncio.gather(*(self._list(target) for target in targets), return_exceptions=True)
-        rows: list[RemoteSession] = []
-        failures: list[BaseException] = []
-        for result in results:
-            if isinstance(result, BaseException): failures.append(result)
-            else: rows.extend(result)
+        rows = [row for result in results if not isinstance(result, BaseException) for row in result]
+        failures = [result for result in results if isinstance(result, BaseException)]
         if not rows and failures:
-            first = failures[0]
-            if isinstance(first, RemoteWireError): raise first
-            raise RemoteWireError("remote discovery failed") from first
+            if isinstance(failures[0], RemoteWireError): raise failures[0]
+            raise RemoteWireError("remote discovery failed") from failures[0]
         return dedupe_rows(rows)
 
-    async def _list(self, target: str | RemoteTarget) -> tuple[RemoteSession, ...]:
-        if isinstance(target, RemoteTarget):
-            host, remote_home, display = target.host, target.remote_home, target.name
-            self._targets[display] = (host, remote_home)
-        else:
-            host, prefix = split_target(target)
-            if prefix is not None: raise ValueError("discovery target cannot include a session prefix")
-            remote_home, display = "~/.zeta", host
-        loop = asyncio.get_running_loop()
-        done: asyncio.Future[tuple[bytes, bytes, int]] = loop.create_future()
-        stdout, stderr = bytearray(), bytearray()
-        def callback(item: TransportItem) -> None:
-            def admit() -> None:
-                if done.done(): return
-                if item.stream == "stdout":
-                    stdout.extend(item.data)
-                    if len(stdout) > 1024 * 1024: done.set_exception(RemoteWireError("remote discovery is too large"))
-                elif item.stream == "stderr": stderr.extend(item.data)
-                elif item.stream == "exit": done.set_result((bytes(stdout), bytes(stderr), int(item.data or b"2")))
-            loop.call_soon_threadsafe(admit)
-        transport = self._transport_factory(host, ssh=self.ssh, callback=callback)
-        transport.start(remote_bridge_command("list", remote_home=remote_home))
-        try: out, diagnostics, status = await done
-        finally: await transport.close_async()
-        if status == 127 or b"command not found" in diagnostics or b"invalid choice: '__remote_bridge'" in diagnostics or b"unknown bridge_version" in diagnostics:
-            raise RemoteWireError(COMPATIBILITY_MESSAGE.replace("HOST", display))
-        rows: list[RemoteSession] = []
-        for line in out.splitlines():
-            if len(line) > 8192: raise RemoteWireError("remote session row is too large")
-            try:
-                value = json.loads(line)
-                if not isinstance(value, dict) or value.get("kind") != "session": continue
-                allowed = {"kind", "session_id", "name", "state", "machine_id", "socket", "pid", "cwd", "provider", "model"}
-                if any(key not in allowed for key in value): raise RemoteWireError("invalid remote session row")
-                session_id = validate_host(str(value["session_id"]))
-                rows.append(RemoteSession(display, session_id, str(value.get("name", "")), value.get("state"), str(value.get("machine_id", ""))))
-            except RemoteWireError: raise
-            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError): continue
-        return tuple(rows)
+    def _target(self, value: str | RemoteTarget) -> RemoteTarget:
+        if isinstance(value, RemoteTarget):
+            self._targets[value.name] = value
+            return value
+        return self._targets.get(value) or RemoteTarget(value, validate_host(value))
 
-    async def attach(self, host: str, session: RemoteSession | str, *, replay_seq: int = 0) -> RemoteView:
-        host, prefix = split_target(host)
-        remote_home = "~/.zeta"
-        if host in self._targets:
-            host, remote_home = self._targets[host]
-        session_id = session.session_id if isinstance(session, RemoteSession) else session
-        validate_host(session_id)
+    def _transport(self, target: RemoteTarget, callback: Callable[[TransportItem], None]) -> RemoteTransport:
+        return self._transport_factory(target.host, ssh=self.ssh, port=target.port, callback=callback)
+
+    async def _list(self, value: str | RemoteTarget) -> tuple[RemoteSession, ...]:
+        if isinstance(value, str) and split_target(value)[1] is not None:
+            raise ValueError("discovery target cannot include a session prefix")
+        target = self._target(value)
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[bytes] = loop.create_future()
+        stdout, stderr = bytearray(), bytearray()
+        def admit(item: TransportItem) -> None:
+            if done.done(): return
+            if item.stream == "exit": done.set_result(item.data)
+            elif item.stream == "stderr": stderr.extend(item.data[:MAX_DIAGNOSTIC_BYTES])
+            elif len(stdout) + len(item.data) > MAX_LIST_BYTES: done.set_exception(RemoteWireError("remote discovery is too large"))
+            else: stdout.extend(item.data)
+        transport = self._transport(target, lambda item: loop.call_soon_threadsafe(admit, item))
+        transport.start(remote_bridge_command("list", remote_home=target.remote_home))
+        try: status = await done
+        finally: await transport.close_async()
+        _check_compatible(status, bytes(stderr), target.name)
+        rows = (_session_row(line, target.name) for line in bytes(stdout).splitlines())
+        return tuple(row for row in rows if row is not None)
+
+    async def attach(self, host: str, session: RemoteSession | str) -> None:
+        name, prefix = split_target(host)
+        target = self._target(name)
+        session_id = validate_host(session.session_id if isinstance(session, RemoteSession) else session)
         if prefix is not None and session_id != prefix: raise ValueError("attach requires a selected session")
         await self.detach()
-        self._loop = asyncio.get_running_loop(); self._generation += 1; generation = self._generation
+        loop = asyncio.get_running_loop(); self._generation += 1; generation = self._generation
         self._queue = asyncio.Queue(maxsize=256); self._events = asyncio.Queue(maxsize=256)
-        def callback(item: TransportItem) -> None:
-            if self._loop is not None: self._loop.call_soon_threadsafe(self._admit, generation, item)
-        transport = self._transport_factory(host, ssh=self.ssh, callback=callback)
-        transport.start(remote_bridge_command("attach", session_id, remote_home))
-        transport.send((json.dumps({"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol_version":"1.1","role":"observer","features":["session_replay_seq","serve_observers"]}}, separators=(",", ":")) + "\n").encode())
-        transport.send((json.dumps({"jsonrpc":"2.0","id":2,"method":"session_history_and_subscribe","params":{"session_id":session_id}}, separators=(",", ":")) + "\n").encode())
-        self.transport = transport; self.view = RemoteView(host, session_id, session.name if isinstance(session, RemoteSession) else session_id, replay_seq)
-        self._event_task = asyncio.create_task(self._consume(generation))
-        return self.view
+        transport = self._transport(target, lambda item: loop.call_soon_threadsafe(self._admit, generation, item))
+        transport.start(remote_bridge_command("attach", session_id, target.remote_home))
+        for request in (
+            {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"protocol_version": "1.1", "role": "observer", "features": ["session_replay_seq", "serve_observers"]}},
+            {"jsonrpc": "2.0", "id": HISTORY_REQUEST_ID, "method": "session_history_and_subscribe", "params": {"session_id": session_id}},
+        ):
+            transport.send((json.dumps(request, separators=(",", ":")) + "\n").encode())
+        self.transport = transport
+        self._event_task = asyncio.create_task(self._consume(self._queue, self._events, target.name))
 
     def _admit(self, generation: int, item: TransportItem) -> None:
         if generation != self._generation or self._queue is None: return
         try: self._queue.put_nowait(item)
         except asyncio.QueueFull:
+            # the consumer is behind; drop the backlog and end the link instead of growing without bound.
+            while not self._queue.empty(): self._queue.get_nowait()
+            self._queue.put_nowait(_OVERFLOW)
             self._queue = None
-            if self._events is not None: self._events.put_nowait("fatal: remote stream overflow")
-            if self.transport is not None: asyncio.create_task(self.transport.close_async())
 
-    async def _consume(self, generation: int) -> None:
-        queue = self._queue
-        if queue is None: return
+    async def _consume(self, queue: asyncio.Queue[TransportItem], events: asyncio.Queue[StreamEvent | str], display: str) -> None:
         decoder = BoundedLineDecoder()
         diagnostics = bytearray()
-        while generation == self._generation:
-            item = await queue.get()
-            if item.stream == "exit":
-                if self._events is not None:
-                    status = int(item.data or b"2")
-                    if status == 127 or b"command not found" in diagnostics or b"invalid choice: '__remote_bridge'" in diagnostics or b"unknown bridge_version" in diagnostics:
-                        await self._events.put("fatal: " + COMPATIBILITY_MESSAGE.replace("HOST", self.view.host if self.view else "HOST"))
-                    else:
-                        await self._events.put("disconnected")
-                return
-            if item.stream == "stderr":
-                diagnostics.extend(item.data)
-                continue
-            if item.stream != "stdout": continue
-            try:
-                lines = decoder.feed(item.data)
-                for line in lines:
-                    frame = json.loads(line)
-                    if isinstance(frame, dict) and frame.get("id") == 2 and isinstance(frame.get("result"), dict):
-                        events = history_events(frame["result"])
-                    elif isinstance(frame, dict) and frame.get("method") == "event":
-                        if isinstance(frame.get("params"), dict) and frame["params"].get("event") == "usage": continue
-                        events = (decode_event(line),)
-                    else: continue
-                    if self._events is not None:
-                        for event in events: await self._events.put(event)
-            except (ValueError, TypeError, RemoteWireError, json.JSONDecodeError) as exc:
-                if self._events is not None: await self._events.put("fatal: " + str(exc))
-                if self.transport is not None: await self.transport.close_async()
-                return
+        try:
+            while (item := await queue.get()).stream != "exit":
+                if item is _OVERFLOW: raise RemoteWireError("remote stream overflow")
+                if item.stream == "stderr": diagnostics.extend(item.data[:MAX_DIAGNOSTIC_BYTES - len(diagnostics)])
+                else:
+                    for line in decoder.feed(item.data):
+                        for event in decode_line(line): await events.put(event)
+            _check_compatible(item.data, bytes(diagnostics), display)
+            await events.put("disconnected")
+        except RemoteWireError as exc:
+            await events.put("fatal: " + str(exc))
+            if self.transport is not None: await self.transport.close_async()
 
     async def next_event(self) -> StreamEvent | str:
         if self._events is None: raise RuntimeError("no remote attachment")
@@ -166,6 +149,6 @@ class RemoteSessionClient:
     async def detach(self) -> None:
         self._generation += 1
         task, transport = self._event_task, self.transport
-        self._event_task = self._queue = None; self._events = None; self.transport = self.view = None
+        self._event_task = self._queue = self._events = self.transport = None
         if task is not None: task.cancel(); await asyncio.gather(task, return_exceptions=True)
         if transport is not None: await transport.close_async()

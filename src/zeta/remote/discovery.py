@@ -15,6 +15,7 @@ class RemoteTarget:
     name: str
     host: str
     remote_home: str = "~/.zeta"
+    port: int | None = None
 
 @dataclass(frozen=True, slots=True)
 class RemoteSession:
@@ -77,10 +78,12 @@ def configured_hosts(home: Path) -> tuple[str, ...]:
         if parsed.scheme != "ssh" or not parsed.hostname or parsed.query or parsed.fragment:
             continue
         try:
-            host = validate_host(parsed.hostname)
-        except (UnicodeEncodeError, ValueError):
+            # keep the URL's user and port, like remote_sync's netloc; ssh takes the port as -p.
+            host = validate_host(f"{parsed.username}@{parsed.hostname}" if parsed.username else parsed.hostname)
+            port = parsed.port
+        except ValueError:
             continue
-        targets.append(RemoteTarget(name, host, unquote(parsed.path) if parsed.path else "~/.zeta"))
+        targets.append(RemoteTarget(name, host, unquote(parsed.path) if parsed.path else "~/.zeta", port))
     return tuple(targets[:MAX_ROWS])
 
 

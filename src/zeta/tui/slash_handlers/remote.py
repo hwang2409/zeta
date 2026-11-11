@@ -119,12 +119,16 @@ class RemoteViewMixin:
         self._remote_view = None
         self._remote_session_client = None
         self._remote_event_task = None
+        self._remote_select_task = None
         self._remote_picker = None
         self._remote_picker_unit = None
         self._remote_saved_composer = None
 
     async def _close_remote_view(self) -> None:
         self.remote_picker_cancel()
+        if self._remote_select_task is not None:
+            self._remote_select_task.cancel()
+            await asyncio.gather(self._remote_select_task, return_exceptions=True)
         await self.slash_detach("")
         self._remote_session_client = None
 
@@ -150,7 +154,13 @@ class RemoteViewMixin:
         picker = self._remote_picker
         self.remote_picker_cancel()
         if picker is not None:
-            asyncio.create_task(self._open_remote(self._remote_client(), picker.selected))
+            self._remote_select_task = asyncio.create_task(self._select_remote(picker.selected))
+
+    async def _select_remote(self, chosen: RemoteSession) -> None:
+        try:
+            await self._open_remote(self._remote_client(), chosen)
+        except (RemoteWireError, ValueError) as exc:
+            self._print_system(str(exc))
 
     async def _open_remote(self, client: RemoteSessionClient, chosen: RemoteSession) -> None:
         if self._remote_view is not None:
@@ -228,12 +238,12 @@ class RemoteViewMixin:
         while self._remote_view is state:
             event = await client.next_event()
             if isinstance(event, str):
-                if event == "disconnected":
-                    state.show_disconnected()
+                # the client sends a string only when the link has ended.
+                if event.startswith("fatal: "):
+                    state.presenter.print_unit(Text(event.removeprefix("fatal: "), style=theme.ERROR))
+                state.show_disconnected()
                 self._invalidate_prompt()
-                if event == "disconnected":
-                    return
-                continue
+                return
             state.render(event)
             self._invalidate_prompt()
 
