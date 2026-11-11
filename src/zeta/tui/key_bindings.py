@@ -393,8 +393,14 @@ def build_key_bindings(
     history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
     suppress_history_detach = False
+    finder_buffer_is_default = finder_buffer is None
+    decisions_buffer_is_default = decisions_buffer is None
     finder_buffer = finder_buffer or Buffer(name="TRANSCRIPT_FINDER")
     decisions_buffer = decisions_buffer or Buffer(name="DECISIONS_ANSWER")
+    if on_finder_input is not None and not finder_buffer_is_default:
+        finder_buffer.on_text_changed += lambda _: on_finder_input(finder_buffer.text)
+    if on_decisions_input is not None and decisions_buffer_is_default:
+        decisions_buffer.on_text_changed += lambda _: on_decisions_input(decisions_buffer.text)
 
     def track_history_buffer(buffer: Buffer) -> None:
         nonlocal history_navigation_active, history_navigation_buffer
@@ -1000,8 +1006,14 @@ def build_key_bindings(
 
         @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
+            nonlocal finder_buffer
             event.current_buffer.cancel_completion()
-            finder_buffer.reset()
+            if finder_buffer_is_default:
+                finder_buffer = event.current_buffer
+                if on_finder_input is not None:
+                    finder_buffer.on_text_changed += lambda _: on_finder_input(finder_buffer.text)
+            if not finder_buffer_is_default:
+                finder_buffer.reset()
             on_finder_open()
 
     if on_finder_move is not None:

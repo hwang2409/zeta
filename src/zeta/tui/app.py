@@ -329,8 +329,14 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
+        app_ref = weakref.ref(app)
         self._finder_field = OverlayTextField(
-            "TRANSCRIPT_FINDER", on_text_changed=lambda query: app._finder_input(query)
+            "TRANSCRIPT_FINDER",
+            on_text_changed=lambda query: (
+                target._finder_input(query)
+                if (target := app_ref()) is not None
+                else None
+            ),
         )
         self._finder_control = FinderControl(
             lambda: app._active_finder.finder_state(), self._finder_field

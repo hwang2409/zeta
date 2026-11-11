@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from pathlib import Path
 
 from prompt_toolkit.application.current import get_app
@@ -169,8 +170,14 @@ class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
     def _init_decisions_panel(self) -> None:
+        panel_ref = weakref.ref(self)
         self._decisions_answer_field = OverlayTextField(
-            "DECISIONS_ANSWER", on_text_changed=lambda text: self._decisions_answer_input(text)
+            "DECISIONS_ANSWER",
+            on_text_changed=lambda text: (
+                target._decisions_answer_input(text)
+                if (target := panel_ref()) is not None
+                else None
+            ),
         )
         self._decisions_panel = DecisionsPanel(self._decisions_answer_field)
         self._decisions_panel_control = OverlayControl()
