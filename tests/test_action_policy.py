@@ -770,7 +770,7 @@ def test_child_action_approval_uses_resolved_capability(tmp_path: Path) -> None:
         binding=ApprovalBinding.CWD,
     )
 
-    request = child.prepare(call, capability=capability)
+    request = asyncio.run(child.prepare(call, capability=capability))
 
     assert request is not None
     assert request.action == capability.action

@@ -333,8 +333,6 @@ class ConversationStore(
     def _apply_history_index_entries(
         self,
         entries: tuple[ConversationEntry, ...],
-        *,
-        leave_stale_on_loop: bool = False,
     ) -> None:
         if self._history_index is None or not entries:
             return
@@ -343,8 +341,7 @@ class ConversationStore(
         except RuntimeError:
             pass
         else:
-            if not leave_stale_on_loop:
-                self._history_index._mark_unavailable()
+            self._history_index._mark_unavailable()
             return
         if not self._history_index.available:
             self._sync_history_index(self._entries)
@@ -789,19 +786,31 @@ class ConversationStore(
         # Reject with the same payload and relation validators used while loading
         # before any authoritative bytes reach disk.
         self._validate_entry_payload(entry)
+        linear = not self._entries or entry.parent_id == self._entries[-1].id
         touched = _ApprovalValidationOverlay.touched([entry])
         if touched or entry.type == "approval_request":
-            self._approval_overlay_for_write([entry]).record(entry)
+            if linear:
+                self._approval_overlay_for_write([entry]).record(entry)
+            else:
+                # A fork re-selects the active branch, so the active-branch
+                # index cannot seed a sibling branch. Validate the whole
+                # candidate branch before any bytes reach disk.
+                self._entries.append(entry)
+                try:
+                    self._validate_entries()
+                finally:
+                    self._entries.pop()
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
             self._write_line(entry.to_dict())
         finally:
             self._write_deadline = previous_deadline
-        linear = not self._entries or entry.parent_id == self._entries[-1].id
-        self._apply_history_index_entries(
-            (entry,), leave_stale_on_loop=not linear
-        )
+        if linear:
+            self._apply_history_index_entries((entry,))
+        # A fork is rebuilt by _sync_history_index below: skipping the
+        # incremental apply leaves the stored boundary behind, so the sync
+        # detects the non-contiguous tail and fully rebuilds the active branch.
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -1175,50 +1184,6 @@ class ConversationStore(
         if reason is not None:
             data["reason"] = reason
         return self._append_row_unlocked("approval_resolution", data, parent_id)
-
-    @staticmethod
-    def _request_entry(
-        branch: list[ConversationEntry],
-        request_id: str,
-    ) -> ConversationEntry | None:
-        for entry in branch:
-            if entry.type == "message":
-                for request in entry.data.get("approval_requests", []):
-                    if request["request_id"] == request_id:
-                        return entry
-        return None
-
-    @staticmethod
-    def _approval_request_entries(
-        entries: Iterable[ConversationEntry],
-    ) -> dict[str, ConversationEntry]:
-        return {
-            request["request_id"]: entry
-            for entry in entries
-            if entry.type == "message"
-            for request in entry.data.get("approval_requests", [])
-        }
-
-    @staticmethod
-    def _approval_states_from_branch(
-        branch: list[ConversationEntry],
-    ) -> dict[str, tuple[ToolCall, str | None]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for entry in branch:
-            if entry.type == "message":
-                requests = entry.data.get("approval_requests", [])
-                for request in requests:
-                    request_id = request["request_id"]
-                    states[request_id] = (
-                        ToolCall.from_dict(request["tool_call"]),
-                        None,
-                    )
-            elif entry.type == "approval_resolution":
-                request_id = entry.data["request_id"]
-                if request_id in states:
-                    tool_call, _ = states[request_id]
-                    states[request_id] = (tool_call, entry.data["decision"])
-        return states
 
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self._active_branch())

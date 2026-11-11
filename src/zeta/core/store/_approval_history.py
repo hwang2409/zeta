@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ...protocol.types import ToolCall
@@ -69,3 +69,47 @@ class ApprovalHistoryStoreMixin:
         return await self._commit_storage_command(
             _AppendApprovalHistoryCommand(payload=payload)
         )
+
+    @staticmethod
+    def _request_entry(
+        branch: list[ConversationEntry],
+        request_id: str,
+    ) -> ConversationEntry | None:
+        for entry in branch:
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    if request["request_id"] == request_id:
+                        return entry
+        return None
+
+    @staticmethod
+    def _approval_request_entries(
+        entries: Iterable[ConversationEntry],
+    ) -> dict[str, ConversationEntry]:
+        return {
+            request["request_id"]: entry
+            for entry in entries
+            if entry.type == "message"
+            for request in entry.data.get("approval_requests", [])
+        }
+
+    @staticmethod
+    def _approval_states_from_branch(
+        branch: list[ConversationEntry],
+    ) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for entry in branch:
+            if entry.type == "message":
+                requests = entry.data.get("approval_requests", [])
+                for request in requests:
+                    request_id = request["request_id"]
+                    states[request_id] = (
+                        ToolCall.from_dict(request["tool_call"]),
+                        None,
+                    )
+            elif entry.type == "approval_resolution":
+                request_id = entry.data["request_id"]
+                if request_id in states:
+                    tool_call, _ = states[request_id]
+                    states[request_id] = (tool_call, entry.data["decision"])
+        return states

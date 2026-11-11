@@ -883,6 +883,7 @@ class HistoryPageStoreMixin:
     async def approval_state(
         self, request_id: str
     ) -> tuple[ToolCall, str | None] | None:
+        self._sync_log_without_waiting()
         result = await self._to_thread_store(
             lambda: _read_stable_approval(
                 self, lambda index, facts: index.approval_state(facts, request_id)
@@ -895,6 +896,7 @@ class HistoryPageStoreMixin:
         )
 
     async def approval_resolution(self, request_id: str) -> Mapping[str, str] | None:
+        self._sync_log_without_waiting()
         result = await self._to_thread_store(
             lambda: _read_stable_approval(
                 self,
@@ -906,6 +908,7 @@ class HistoryPageStoreMixin:
     async def pending_approval_page(
         self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
     ) -> IndexedPendingApprovalPage:
+        self._sync_log_without_waiting()
         return await self._to_thread_store(
             lambda: _read_stable_approval(
                 self,
