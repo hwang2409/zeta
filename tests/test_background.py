@@ -1194,55 +1194,47 @@ async def test_background_task_owner_state_table(
         if row == "terminal-notify-follows-publish":
             task_id = await start_registered(_python("print('done')"))
             owner = registry.background_tasks._owners[task_id]
-            original_commit = registry.background_tasks._commit_transition
-            cancelled = False
-
-            published = asyncio.Event()
-
-            async def cancel_after_publish(rows, publish, notice):
-                nonlocal cancelled, observer
-
-                def publish_and_mark():
-                    publish()
-                    published.set()
-
-                observer = asyncio.create_task(observe_sink_admission())
-                await original_commit(rows, publish_and_mark, notice)
-                if (
-                    not cancelled
-                    and any(item["task_id"] == task_id and not item["running"] for item in rows)
-                ):
-                    cancelled = True
-                    assert owner.lifecycle is not None
-                    owner.lifecycle.cancel()
-
+            competitor: asyncio.Task[object] | None = None
             receipts: list[TaskExitInput] = []
-            observer: asyncio.Task[None] | None = None
 
             async def receipt(item):
                 # test-contract: seam prove durable publication precedes notification sink.
                 assert registry.background_tasks._records[task_id].running is False
                 receipts.append(item)
+                await flow.produce(_task_notification(item))
 
-            async def observe_sink_admission():
-                await published.wait()
-                assert len(receipts) == 1
+            def notice(_notice):
+                nonlocal competitor
+                competitor = asyncio.create_task(
+                    flow.produce(
+                        pending_delivery_module.NotificationInput(
+                            "task_exit",
+                            {
+                                "task_id": "competing-task",
+                                "headline": "competing task",
+                                "exit_code": 0,
+                                "output_tail": "",
+                                "background_owner": "run_background",
+                                "background_phase": "natural_exit",
+                            },
+                            dedupe_key="competing-task",
+                        )
+                    )
+                )
 
-            # test-contract: seam force cancellation at the terminal publication boundary.
-            monkeypatch.setattr(registry.background_tasks, "_commit_transition", cancel_after_publish)
-            # test-contract: seam observe the legacy notification sink ordering.
+            # test-contract: seam schedule a competing public producer from the synchronous notice callback.
+            registry.background_tasks.set_notice_sink(notice)
+            # test-contract: seam observe the notification sink ordering.
             monkeypatch.setattr(registry.background_tasks, "_notification_sink", receipt)
-            with pytest.raises(asyncio.CancelledError):
-                await await_or_fail(owner.wait(), what="terminal ordering cancellation")
-            # test-contract: seam cancellation occurred after terminal publication.
-            assert cancelled
-            rows = json.loads((store.session_dir / "background_tasks.json").read_text())
-            # test-contract: durability terminal row is published before the sink.
-            assert rows[0]["running"] is False
+            await await_or_fail(owner.wait(), what="terminal ordering")
             assert owner.record.running is False
             assert len(receipts) == 1
-            if observer is not None:
-                await await_or_fail(observer, what="terminal sink observer")
+            assert competitor is not None
+            await await_or_fail(competitor, what="competing notification producer")
+            notifications = store.agent_notifications(pending_only=False)
+            task_ids = [entry.data["task_id"] for entry in notifications]
+            assert task_ids.count(task_id) == 1
+            assert task_ids.index(task_id) < task_ids.index("competing-task")
             return
 
         if row == "persist-failure-retries-same-candidate":
