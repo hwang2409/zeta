@@ -312,22 +312,35 @@ async def test_new_hold_after_response_wakes_again_and_uses_current_pin() -> Non
 
 
 @pytest.mark.asyncio
-async def test_foreground_child_hold_does_not_wake_parent(tmp_path: Path) -> None:
+async def test_foreground_child_abandons_long_hold_at_once(tmp_path: Path) -> None:
+    # a foreground caller is blocked on the child; a long hold must not hang it.
     backend = HeldChildBackend(
         [_rate_limited(LONG_RETRY_AFTER)], parent_turns=1, background=False
     )
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
-    run = asyncio.create_task(
-        _collect(tree.loop.run_turn("start", origin=MessageOrigin.USER))
-    )
     try:
-        await await_or_fail(tree.backend.held.wait(), what="foreground child hold")
-        assert tree.holds() == []
-        backend.release.set()
-        await await_or_fail(run, what="foreground child end")
+        events = await await_or_fail(
+            _collect(tree.loop.run_turn("start", origin=MessageOrigin.USER)),
+            what="foreground parent turn",
+        )
     finally:
         await tree.close()
-    assert tree.holds(pending_only=False) == []
+
+    assert backend.waits == [], "a foreground child must not wait out a long hold"
+    assert tree.holds(pending_only=False) == [], "a foreground hold never wakes the parent"
+    terminal = next(
+        event
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END
+        and event.tool_call is not None
+        and event.tool_call.name == "agent"
+    )
+    assert terminal.tool_result is not None
+    assert terminal.tool_result.is_error, "the abandoned child reports a failed receipt"
+    text = terminal.tool_result.content
+    assert "foreground child not run" in text
+    assert "held by a rate limit" in text
+    assert "codex" in text
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from ..core.session import (
 )
 from ..core.slash import resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
+from ..project_context.projection import compose_with_stable_projection
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
@@ -436,18 +437,23 @@ def _create_app_with_root(
         model = config.model
         skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=home, project_dir=repo_root)
-        project_context = _app.load_project_context(
-            cwd=effective_cwd,
-            repo_root=repo_root,
-            zeta_home=home,
-            system_override=system_prompt_override,
-            system_append=system_prompt_append,
-            catalog=skill_catalog,
-            session_project=session_project,
-            cwd_project=cwd_project,
-            inbox_enabled=config.inbox_enabled,
-            registry=manager.project_registry_state,
-            project_projection=projection,
+        project_context, projection = compose_with_stable_projection(
+            registry,
+            session_project.project_id if session_project is not None else None,
+            projection,
+            lambda current_projection: _app.load_project_context(
+                cwd=effective_cwd,
+                repo_root=repo_root,
+                zeta_home=home,
+                system_override=system_prompt_override,
+                system_append=system_prompt_append,
+                catalog=skill_catalog,
+                session_project=session_project,
+                cwd_project=cwd_project,
+                inbox_enabled=config.inbox_enabled,
+                registry=manager.project_registry_state,
+                project_projection=current_projection,
+            ),
         )
     recency: _SessionRecency | None = None
     pending_override = None
@@ -626,6 +632,25 @@ def _create_app_with_root(
         startup_alerts = (
             "system prompt overridden for this session; prompt cache will rebuild",
         )
+    from ..remote.host import ObserverHost
+    from ..runtime.foreground_events import ForegroundEventPublisher
+    foreground_event_publisher = ForegroundEventPublisher()
+    observer_host = None
+    if not ephemeral:
+        observer_host = ObserverHost(
+            home=home,
+            session_id=metadata.session_id,
+            opened=opened,
+            loop=loop,
+            policy=approval_policy,
+            project_dir=project_dir,
+            repo_root=repo_root,
+            publisher=foreground_event_publisher,
+            name=metadata.name,
+            cwd=str(metadata.cwd),
+            provider=metadata.provider,
+            model=metadata.model,
+        )
     app = _app.TUIApp(
         loop,
         provider=provider,
@@ -651,6 +676,8 @@ def _create_app_with_root(
         project_eligible=discovery.eligible and discovery.primary_root is not None,
         resumed=resuming,
         on_session_close=recency.flush,
+        foreground_event_publisher=foreground_event_publisher,
+        observer_host=observer_host,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system

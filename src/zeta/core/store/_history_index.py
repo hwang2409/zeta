@@ -802,30 +802,25 @@ def _read_stable_page(
     store: ConversationStore,
     index: HistoryIndex,
     request: Mapping[str, object],
-) -> IndexedHistoryPage:
-    for attempt in range(_HISTORY_PAGE_ATTEMPTS):
-        if not index.available:
-            _rebuild_history_index(store)
-        facts = store._history_index_facts()
+) -> IndexedHistoryPage | None:
+    attempts = _HISTORY_PAGE_ATTEMPTS if "end" in request else 1
+    for attempt in range(attempts):
         try:
+            if not index.available:
+                _rebuild_history_index(store)
+            facts = store._history_index_facts()
             page = index.page(request, facts)
-        except StaleHistorySnapshot:
-            if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                raise
-            index._mark_unavailable()
-            continue
-        except HistoryIndexUnavailableError as exc:
-            if store._history_index_facts() != facts:
-                raise StaleHistorySnapshot from exc
-            if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                raise
+        except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+            if store._read_only or attempt == attempts - 1:
+                return None
             index._mark_unavailable()
             continue
         if store._history_index_facts() == facts:
             return page
-        if "end" in request or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-            raise StaleHistorySnapshot
-    raise HistoryIndexUnavailableError("history index is unavailable")
+        if store._read_only or attempt == attempts - 1:
+            return None
+        index._mark_unavailable()
+    return None
 
 
 def _overlay_resident_entries(
@@ -973,6 +968,5 @@ class HistoryPageStoreMixin:
             return None
         if index is None or (self._read_only and not index.available):
             return None
-        return _overlay_resident_entries(
-            self, _read_stable_page(self, index, request)
-        )
+        page = _read_stable_page(self, index, request)
+        return _overlay_resident_entries(self, page) if page is not None else None

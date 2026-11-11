@@ -702,6 +702,7 @@ def test_tui_close_failure_still_runs_later_cleanup(
     app.stop_decisions_poll = lambda: async_cleanup("poll")
     app._close_finder_workers = fail_finder
     app._close_approval_labels = lambda: async_cleanup("approval labels")
+    app._close_remote_view = lambda: async_cleanup("remote view")
     async def close_navigation() -> None:
         cleaned.append("navigation close")
 

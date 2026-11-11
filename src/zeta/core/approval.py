@@ -25,6 +25,7 @@ from .abort import AbortSignal
 from .store import ConversationStore
 
 PRECEDENCE = ("deny", "ask", "allow", "default")
+PENDING_APPROVAL_LIMIT = 64
 
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
@@ -389,6 +390,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
         self._pending_changed: Callable[[], None] | None = None
+        self._approval_slots = asyncio.Semaphore(PENDING_APPROVAL_LIMIT)
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
@@ -400,6 +402,15 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     def _notify_pending_changed(self) -> None:
         if self._pending_changed is not None:
             self._pending_changed()
+
+    async def acquire_approval_slot(self) -> bool:
+        if self._serve_control is None:
+            return False
+        await self._approval_slots.acquire()
+        return True
+
+    def release_approval_slot(self) -> None:
+        self._approval_slots.release()
 
     def bind_serve_control(self, control: _ServeApprovalControl) -> None:
         """Permanently route this serve policy's delegated lifetime to control."""
@@ -1195,8 +1206,11 @@ class ApprovalGate:
                 await self.policy.durable_decision(tool_call.id) is None
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
-            if approval_started and lifecycle is not None:
-                lifecycle("approval_start")
+            slot_acquired = False
+            if approval_started:
+                slot_acquired = await self.policy.acquire_approval_slot()
+                if lifecycle is not None:
+                    lifecycle("approval_start")
             try:
                 authorize = self.policy.authorize
                 parameters = inspect.signature(authorize).parameters
@@ -1213,8 +1227,11 @@ class ApprovalGate:
                     tool_call.id, f"approval failed: {exc}", True
                 ), execution_signal
             finally:
-                if approval_started and lifecycle is not None:
-                    lifecycle("approval_end")
+                if approval_started:
+                    if lifecycle is not None:
+                        lifecycle("approval_end")
+                    if slot_acquired:
+                        self.policy.release_approval_slot()
             if decision is None:
                 return canceled_result(tool_call.id), execution_signal
             if signal.is_set():
@@ -1257,42 +1274,3 @@ class ApprovalGate:
         if signal.is_set() and execution_signal is signal:
             return canceled_result(tool_call.id), execution_signal
         return None, execution_signal
-
-
-def permission_snapshot(policy: ApprovalPolicy) -> PermissionSnapshot:
-    """Return a canonical projection of the active approval policy."""
-
-    return PermissionSnapshot(
-        default=policy.default,
-        precedence=PRECEDENCE,
-        deny=tuple(sorted(map(str, policy.always_deny))),
-        ask=tuple(sorted(map(str, policy.always_ask))),
-        allow=tuple(sorted(map(str, policy.always_allow))),
-        session_grants=tuple(sorted(map(str, policy.session_allow))),
-    )
-
-
-def revoke_session_grants(
-    policy: ApprovalPolicy, *, exact: str | None = None, clear: bool = False
-) -> SessionGrantChange:
-    """Remove only existing session grants; never parse input into authority."""
-
-    if (exact is None and not clear) or (exact is not None and clear):
-        raise ValueError("choose exactly one session grant operation")
-    if clear:
-        removed = tuple(sorted(map(str, policy.clear_session_allow())))
-        return SessionGrantChange("clear", removed, permission_snapshot(policy))
-    rule = next((rule for rule in policy.session_allow if str(rule) == exact), None)
-    if rule is None:
-        assert exact is not None
-        raise SessionGrantNotFound(exact)
-    policy.revoke_session_allow(rule)
-    return SessionGrantChange("revoke", (str(rule),), permission_snapshot(policy))
-
-
-def session_grant_change(
-    policy: ApprovalPolicy,
-    change: Literal["grant", "reset"],
-    changed: tuple[str, ...] = (),
-) -> SessionGrantChange:
-    return SessionGrantChange(change, changed, permission_snapshot(policy))
