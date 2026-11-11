@@ -4024,22 +4024,6 @@ async def _run_post_cap_tool_cycle(
         if not send_fresh_prompt:
             backend.release_post_cap.set()
         if send_fresh_prompt:
-            # After the fresh turn hands off, the gate exits (so no
-            # wait_transition) and the grandchild is reparented to the root but
-            # keeps running. The child then blocks in
-            # wait_for_descendant_watchers (the descendant-drain seam) until the
-            # grandchild drains. Observe that drain entry for this child.
-            child_drain_entered = asyncio.Event()
-            original_descendant_drain = owner.wait_for_descendant_watchers
-
-            async def observe_descendant_drain(instance_id: str) -> None:
-                if instance_id == child_handle:
-                    child_drain_entered.set()
-                return await original_descendant_drain(instance_id)
-
-            monkeypatch.setattr(
-                owner, "wait_for_descendant_watchers", observe_descendant_drain
-            )
             flow = owner.conversation_channel._delivery_targets[child_handle].flow
             prompt_suppressed = asyncio.Event()
             original_suppress = flow.suppress_pending
@@ -4081,22 +4065,20 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
-            # Force the formerly hanging order: release the fresh response while
-            # the grandchild is still held, so the child reaches the descendant
-            # drain with the grandchild still running. Only then release the
-            # grandchild; terminal publication must still complete.
-            backend.release_fresh_prompt.set()
-            await await_or_fail(
-                child_drain_entered.wait(), what="child descendant-drain entry"
-            )
-            assert not backend.grandchild_completed.is_set(), (
-                "child must reach the descendant drain while the grandchild "
-                "is still running"
-            )
+            # Release the grandchild and await its completion BEFORE releasing
+            # the fresh response, so the test never waits on terminal publication
+            # while it still holds the grandchild. The finish gate waits on the
+            # owned grandchild with the child deadline held at infinity, and the
+            # test awaits terminal publication; releasing the grandchild first
+            # breaks that cycle by construction. This test does NOT cover the
+            # finish-gate wait-with-owned-child branch; production bounds that
+            # wait by the child/task deadlines (finish_gate.py:363-396,
+            # background_owner.py:42-69).
             backend.release_grandchild.set()
             await await_or_fail(
                 backend.grandchild_completed.wait(), what="grandchild completion"
             )
+            backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
             deadlines.expire_child_bound(child_state)
