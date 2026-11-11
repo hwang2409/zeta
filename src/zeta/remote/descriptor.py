@@ -18,6 +18,22 @@ class DescriptorError(ValueError):
     pass
 
 
+def observer_socket_dir(directory: Path | None = None) -> Path:
+    directory = directory or Path(f"/tmp/zeta-{os.getuid()}")
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+    except OSError as exc:
+        raise DescriptorError("observer socket directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise DescriptorError("observer socket directory has unsafe ownership, mode, or type")
+    return directory
+
+
 def socket_path(home: Path, session_id: str) -> Path:
     digest = hashlib.sha256(f"{home.resolve()}\0{session_id}".encode()).hexdigest()[:32]
     path = Path(f"/tmp/zeta-{os.getuid()}") / f"{digest}.sock"

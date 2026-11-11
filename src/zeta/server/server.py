@@ -85,7 +85,7 @@ class _UnixSocketListener:
         path: Path,
         accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
     ) -> _UnixSocketListener:
-        await asyncio.to_thread(cls._prepare_parent, path)
+        cls._prepare_parent(path)
         lock_fd = os.open(
             f"{path}.lock",
             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -97,7 +97,7 @@ class _UnixSocketListener:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError(f"a server is already listening on {path}") from exc
-            await asyncio.to_thread(cls._prepare_path, path)
+            cls._prepare_path(path)
             unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             identity: tuple[int, int] | None = None
             try:
@@ -128,17 +128,13 @@ class _UnixSocketListener:
 
     @staticmethod
     def _prepare_parent(path: Path) -> None:
-        directory = path.parent
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        parent_stat = directory.lstat()
-        tmp = Path("/tmp").resolve()
-        is_system_tmp = directory == Path("/tmp") or directory.resolve() == tmp
-        if (not is_system_tmp and (
-                not stat.S_ISDIR(parent_stat.st_mode)
-                or parent_stat.st_uid != os.getuid()
-                or stat.S_IMODE(parent_stat.st_mode) != 0o700
-        )):
-            raise RuntimeError(f"unsafe observer socket directory: {directory}")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            parent_stat = path.parent.stat()
+            if parent_stat.st_uid == os.getuid():
+                os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
 
     @classmethod
     def _prepare_path(cls, path: Path) -> None:

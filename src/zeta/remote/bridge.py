@@ -136,13 +136,34 @@ def list_descriptors(home: Path, out: TextIO = sys.stdout) -> int:
     return 0
 
 
-async def _copy(reader: asyncio.StreamReader, write) -> None:
-    while True:
-        chunk = await reader.read(65536)
-        if not chunk:
-            break
-        write(chunk)
-        await asyncio.to_thread(sys.stdout.flush)
+async def _write_stdout(data: bytes) -> None:
+    fd = sys.stdout.buffer.fileno()
+    loop = asyncio.get_running_loop()
+    offset = 0
+    ready = loop.create_future()
+
+    def writable() -> None:
+        if not ready.done():
+            ready.set_result(None)
+
+    os.set_blocking(fd, False)
+    try:
+        while offset < len(data):
+            try:
+                offset += os.write(fd, data[offset:])
+            except BlockingIOError:
+                loop.add_writer(fd, writable)
+                try:
+                    try:
+                        await asyncio.wait_for(ready, 1)
+                    except TimeoutError as exc:
+                        raise BrokenPipeError("stdout is not draining") from exc
+                finally:
+                    loop.remove_writer(fd)
+                ready = loop.create_future()
+    finally:
+        if not ready.done():
+            ready.cancel()
 
 
 async def attach(home: Path, session_id: str) -> int:
@@ -193,8 +214,7 @@ async def attach(home: Path, session_id: str) -> int:
             chunk = await reader.read(MAX_INPUT_BYTES)
             if not chunk:
                 return
-            await asyncio.to_thread(sys.stdout.buffer.write, chunk)
-            await asyncio.to_thread(sys.stdout.buffer.flush)
+            await _write_stdout(chunk)
 
     try:
         tasks = [asyncio.create_task(stdin_to_socket()), asyncio.create_task(socket_to_stdout())]

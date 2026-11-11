@@ -9,7 +9,7 @@ from typing import Any
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..server.runtime import ServerRuntime
 from ..server.server import ZetaServer
-from .descriptor import Descriptor, publish, remove, socket_path
+from .descriptor import Descriptor, observer_socket_dir, publish, remove, socket_path
 
 
 class ObserverHost:
@@ -57,6 +57,7 @@ class ObserverHost:
                 project_dir=project_dir,
                 repo_root=repo_root,
             )
+        await asyncio.to_thread(observer_socket_dir)
         server = ZetaServer(
             home=self.home,
             socket_path=self.socket,
