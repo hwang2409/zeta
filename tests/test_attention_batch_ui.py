@@ -441,14 +441,29 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     # a worker thread that is descheduled (blocked) until escape is pressed, so
     # the escape flush must wait for it. The gate is set only after escape.
     original_stage = AttentionReplies.stage
+    original_flush = AttentionReplies.flush
     escape_pressed = threading.Event()
+    flush_done = threading.Event()
 
     def gated_stage(self, attention_id, *args, **kwargs):
         if attention_id == records[1].id:
             assert escape_pressed.wait(10), "escape gate was not released"
+            # Fixed code queues the flush behind the ops lock, so it cannot
+            # finish until this gated stage releases: the wait times out and the
+            # stage runs first (FIFO). Base code has no lock, so the flush runs
+            # ahead and sets flush_done, releasing the gate immediately and
+            # resolving records[1] before the deadline -> the test fails on base.
+            flush_done.wait(0.5)
         return original_stage(self, attention_id, *args, **kwargs)
 
+    def tracked_flush(self, *args, **kwargs):
+        try:
+            return original_flush(self, *args, **kwargs)
+        finally:
+            flush_done.set()
+
     monkeypatch.setattr(AttentionReplies, "stage", gated_stage)
+    monkeypatch.setattr(AttentionReplies, "flush", tracked_flush)
     try:
         # Dismiss the non-decision answer first and let it resolve, so the FIFO
         # order (dismiss before the gated stage) cannot deadlock.
