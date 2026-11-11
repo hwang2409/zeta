@@ -1198,7 +1198,7 @@ async def test_background_task_owner_state_table(
             cancelled = False
 
             async def cancel_after_publish(rows, publish, notice):
-                nonlocal cancelled
+                nonlocal cancelled, observer
                 await original_commit(rows, publish, notice)
                 if (
                     not cancelled
