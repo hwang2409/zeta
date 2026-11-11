@@ -977,7 +977,7 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     def _child_reader_for(
-        self, root_store: ConversationStore, run_id: str
+        self, root_store: ConversationStore, run_id: str, *, allow_stale: bool = False
     ) -> ConversationStore:
         parse_child_run_id(root_store.session_id, run_id)
         segments = child_run_segments(root_store.session_id, run_id)
@@ -985,7 +985,8 @@ class ConnectionRegistry(ReplayOutput):
         with self._child_reader_lock:
             if self._child_reader is not None and self._child_reader[0] == key:
                 reader = self._child_reader[1]
-                reader.refresh()
+                if not allow_stale:
+                    reader.refresh()
                 return reader
             if self._child_reader is not None:
                 self._child_reader[1].close()
@@ -1147,33 +1148,26 @@ def perform_child_history_read(
         parse_child_run_id(root_store.session_id, params["run_id"])
     except ValueError as exc:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid child run id") from exc
+    history_params = {key: value for key, value in params.items() if key != "run_id"}
+    history_params.setdefault("before", None)
+
+    def produce(final: bool) -> object:
+        try:
+            return registry._child_reader_for(
+                root_store, params["run_id"], allow_stale=final
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise ProtocolError(
+                ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
+            ) from exc
+
     try:
-        reader = registry._child_reader_for(root_store, params["run_id"])
+        return history.child_history(produce, history_params, fidelity=fidelity)
     except ObserverSnapshotChanged as exc:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
             "child history source changed during read",
         ) from exc
-    except ProtocolError:
-        raise
-    except (FileNotFoundError, OSError) as exc:
-        raise ProtocolError(
-            ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found"
-        ) from exc
-    runtime = type(
-        "ObserverRuntime",
-        (),
-        {"session_id": target[0], "opened": type("Opened", (), {"store": reader})()},
-    )()
-    history_params = {key: value for key, value in params.items() if key != "run_id"}
-    if "before" not in history_params:
-        history_params["before"] = None
-    return history.history(
-        runtime,
-        history_params,
-        backward_enabled=True,
-        fidelity=fidelity,
-    )
 
 
 def project_status(target: object, *, served_turn_end: bool = False) -> dict[str, Any]:
