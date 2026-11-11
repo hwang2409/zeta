@@ -471,7 +471,9 @@ async def test_live_approval_handle_survives_refresh_and_submission(
         assert bool(policy.always_allow) == (verb == "always")
     finally:
         await asyncio.wait_for(app.close(), 10)
-        await asyncio.gather(submission, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(submission, return_exceptions=True), 10
+        )
 
 
 def test_visible_approval_card_is_removed_when_request_ends() -> None:
