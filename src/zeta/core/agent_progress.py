@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import logging
 import threading
-import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,11 +18,10 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _lock = threading.Lock()
 _lifecycles: dict[Path, dict[str, Any]] = {}
-# serve's lifecycle projection sinks: sink(kind, run_id, row, number), where kind is
-# "progress" (number = revision), "started" or "ended" (number = parent row seq)
-ChildRunSink = Callable[[str, str, dict[str, object], int], None]
+# serve's lifecycle projection sinks: sink(kind, run_id, row, number, store), where
+# kind is "progress" (number = revision), "started" or "ended" (number = parent row seq)
+ChildRunSink = Callable[[str, str, dict[str, object], int, object | None], None]
 _sinks: list[ChildRunSink] = []
-_live_stores: dict[str, weakref.ref[ConversationStore]] = {}
 # process-local lifecycle freshness; never persisted or compared across processes
 _revision = 0
 
@@ -41,13 +39,6 @@ def register_child_run_sink(sink: ChildRunSink) -> Callable[[], None]:
     return unregister
 
 
-def live_child_store(run_id: str) -> ConversationStore | None:
-    """The store of a child this process runs, by public run id."""
-    with _lock:
-        ref = _live_stores.get(run_id)
-    return None if ref is None else ref()
-
-
 def post_child_progress(store: ConversationStore, lifecycle: dict[str, Any]) -> None:
     """Post one semantic lifecycle change with the next revision to every sink."""
     global _revision
@@ -59,11 +50,10 @@ def post_child_progress(store: ConversationStore, lifecycle: dict[str, Any]) -> 
     run_id = str(lifecycle["handle"])
     row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=store.accepts_follow_ups)
     with _lock:
-        _live_stores[run_id] = weakref.ref(store)
         _revision += 1
         # posted under the lock, so sinks see revisions in order
         for sink in tuple(_sinks):
-            sink("progress", run_id, row, _revision)
+            sink("progress", run_id, row, _revision, store)
 
 
 def publish_child_started(
@@ -76,7 +66,7 @@ def publish_child_started(
     row = project_child_run_row({"handle": run_id, "description": data.get("task"), "agent_type": data.get("name") or "general", "state": "running", "turns_used": 0, "tool_calls": 0, "current_step": "starting", "started_at": data.get("started_at"), "finished_at": None, "elapsed": 0.0}, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=accepts_follow_ups)
     with _lock:
         for sink in tuple(_sinks):
-            sink("started", run_id, row, sequence)
+            sink("started", run_id, row, sequence, None)
 
 
 def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -> None:
@@ -94,7 +84,7 @@ def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -
     row = project_child_run_row(lifecycle, session_id=run_id.split(":", 1)[0], parent_run_id=run_id.rpartition(":")[0] if run_id.count(":") > 1 else None, accepts_follow_ups=False)
     with _lock:
         for sink in tuple(_sinks):
-            sink("ended", run_id, row, receipt_sequence)
+            sink("ended", run_id, row, receipt_sequence, None)
 
 
 def publish_live_agent_lifecycle(path: Path, lifecycle: dict[str, Any]) -> None:
@@ -135,7 +125,3 @@ def remove_live_agent_lifecycle(path: str | Path) -> None:
     resolved = Path(path).resolve()
     with _lock:
         _lifecycles.pop(resolved, None)
-        for run_id, ref in tuple(_live_stores.items()):
-            store = ref()
-            if store is None or store.agent_lifecycle_path.resolve() == resolved:
-                del _live_stores[run_id]

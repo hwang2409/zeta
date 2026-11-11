@@ -9,6 +9,7 @@ Replay itself keeps no per-run state.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from ..protocol import EventDescriptor
@@ -32,16 +33,33 @@ class ChildRunProjection:
         self._output = output
         # run_id -> (row, revision, start row sequence)
         self._rows: dict[str, tuple[dict[str, object], int, int | None]] = {}
+        self._stores: dict[str, weakref.ReferenceType[object]] = {}
 
-    def sink(self, kind: str, run_id: str, row: dict[str, object], number: int) -> None:
+    def sink(
+        self,
+        kind: str,
+        run_id: str,
+        row: dict[str, object],
+        number: int,
+        store: object | None,
+    ) -> None:
         """Called by the lifecycle owner on any thread; applied in order on the loop."""
         try:
-            self._loop.call_soon_threadsafe(self._apply, kind, run_id, row, number)
+            self._loop.call_soon_threadsafe(
+                self._apply, kind, run_id, row, number, store
+            )
         except RuntimeError:
             if not self._loop.is_closed():
                 raise
 
-    def _apply(self, kind: str, run_id: str, row: dict[str, object], number: int) -> None:
+    def _apply(
+        self,
+        kind: str,
+        run_id: str,
+        row: dict[str, object],
+        number: int,
+        store: object | None,
+    ) -> None:
         session_id = str(row["session_id"])
         current = self._rows.get(run_id)
         if kind == "progress":
@@ -49,6 +67,8 @@ class ChildRunProjection:
                 return
             sequence = None if current is None else current[2]
             self._rows[run_id] = (row, number, sequence)
+            if store is not None:
+                self._stores[run_id] = weakref.ref(store)
             self._output.publish_child_lifecycle(
                 EventDescriptor.CHILD_PROGRESS,
                 parent_scope(row),
@@ -63,6 +83,7 @@ class ChildRunProjection:
             event = EventDescriptor.CHILD_STARTED
         else:
             self._rows.pop(run_id, None)
+            self._stores.pop(run_id, None)
             event = EventDescriptor.CHILD_ENDED
         self._output.publish_child_lifecycle(
             event,
@@ -71,6 +92,10 @@ class ChildRunProjection:
             {"run_id": run_id, "sequence": number, "child": row},
             number,
         )
+
+    def live_store(self, run_id: str) -> object | None:
+        ref = self._stores.get(run_id)
+        return None if ref is None else ref()
 
     def current(self, run_id: str) -> tuple[dict[str, object], int] | None:
         state = self._rows.get(run_id)

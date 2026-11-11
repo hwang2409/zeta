@@ -172,6 +172,34 @@ def _capture_baseline(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> li
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_live_child_store_lookup_uses_only_the_loop_projection(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _serve(tmp_path, transport) as (server, _client, session_id, stores):
+        child = _start_child(server, stores, f"{session_id}:1")
+        await _lifecycle_applied(server)
+
+        class RejectLock:
+            def __enter__(self) -> None:
+                pytest.fail("serve-loop child lookup took the producer lock")
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+        assert server.connections is not None
+        with monkeypatch.context() as lock_patch:
+            # test-contract: seam reject the producer lock during a serve-loop lookup
+            lock_patch.setattr(agent_progress, "_lock", RejectLock())
+            assert (
+                server.connections._replay_store(
+                    ReplayScopeId.child(f"{session_id}:1")
+                )
+                is child
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
