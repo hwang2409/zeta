@@ -1011,7 +1011,10 @@ class AutoMemoryReconciler:
     ) -> tuple[int, float, float] | None:
         """Return the newest unseen completed turn and its profile delays."""
         try:
-            snapshot = self.registry._entry_memory_state(self.project_id)
+            projection = self.registry.memory_transactions.read(self.project_id)
+            if projection.format != 2:
+                return None
+            snapshot = projection.snapshot
         except UnsupportedMemoryFormatError:
             return None
         profile = snapshot.state.schema.profile

@@ -527,7 +527,10 @@ class EntryProjectViews:
 
     def show(self, request_id: str | int, project: Project) -> dict[str, object]:
         sessions = self.runtime.manager.list_sessions_read_only()
-        snapshot = self.registry._entry_memory_state(project.project_id)
+        projection = self.registry.memory_transactions.read(project.project_id)
+        if projection.format != 2:
+            raise ProjectRegistryError("project uses legacy memory format")
+        snapshot = projection.snapshot
         kinds = kind_views(snapshot.state)
         result: dict[str, object] = {
             "project": self._project_metadata(project, sessions),

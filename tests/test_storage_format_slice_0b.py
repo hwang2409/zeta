@@ -550,15 +550,17 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
     )
 
     class ProjectRegistryStub:
+        memory_transactions: object
+
+        def __init__(self) -> None:
+            self.memory_transactions = self
+
         def find_or_create_for_directory(self, _root: Path) -> object:
             project_calls.append(threading.get_ident())
             return project
 
-        def memory_format(self, _project_id: str) -> int:
-            return 1
-
-        def load_memory(self, _project_id: str) -> list[object]:
-            return []
+        def read(self, _project_id: str) -> object:
+            return SimpleNamespace(mirror_files=dict)
 
     async def persist(*_args: object) -> None:
         return None
@@ -683,7 +685,7 @@ async def test_tui_project_dispatch_reads_storage_off_loop(
     assert output is not None
     assert output.startswith(f"project: {project.name} ({project.project_id})\n")
     assert f"root: {project_root}\n" in output
-    assert len(read_threads) >= 3
+    assert len(read_threads) == 2
     assert all(thread_id != loop_thread for thread_id in read_threads)
 
 

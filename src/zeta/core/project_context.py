@@ -51,7 +51,6 @@ from ..project_context.projection import (
     ProjectContextHealth,
     ProjectContextProjection,
 )
-from ..project_errors import UnsupportedMemoryFormatError
 from ..project_memory_history import MemoryContextEntry
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
@@ -391,13 +390,9 @@ def project_command_view(
         return ProjectCommandView(
             None, "unassociated (run /project init to associate this directory)"
         )
-    if registry.memory_format(project.project_id) == 2:
-        memory = ", ".join(registry._entry_memory_mirrors(project.project_id)) or "none"
-    else:
-        memory = (
-            ", ".join(name for name, _ in registry.load_memory(project.project_id))
-            or "none"
-        )
+    memory = ", ".join(
+        registry.memory_transactions.read(project.project_id).mirror_files()
+    ) or "none"
     return ProjectCommandView(
         project,
         f"project: {project.name} ({project.project_id})\n"
@@ -992,26 +987,24 @@ def load_project_context(
                                 "omitted the memory block"
                             )
                     else:
-                        try:
-                            context_entries = (
-                                project_projection.memory
-                                if project_projection is not None
-                                else available_registry.load_memory_for_context(
-                                    project.project_id
-                                )
-                            )
-                        except UnsupportedMemoryFormatError:
-                            assert available_registry is not None
-                            snapshot = available_registry._entry_memory_state_for_context(
-                                project.project_id
-                            )
+                        memory_projection = (
+                            available_registry.memory_transactions.read(project.project_id)
+                            if project_projection is None
+                            else None
+                        )
+                        if memory_projection is not None and memory_projection.format == 2:
                             entry_projection = render_entry_memory(
-                                snapshot.state,
+                                memory_projection.snapshot.state,
                                 now=utc_now(),
                                 byte_cap=min(MEMORY_PROMPT_BYTE_CAP, budget_for_memory),
                             )
                             memory_block = entry_projection.block
                         else:
+                            context_entries = (
+                                project_projection.memory
+                                if project_projection is not None
+                                else memory_projection.memory
+                            )
                             memory_block, admitted, skipped_memory = (
                                 budget_memory_block(
                                     home,
