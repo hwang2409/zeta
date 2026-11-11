@@ -42,9 +42,9 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
-    # Restart recovery records the "server_restarted" abort reason at or above this
-    # epoch; below it, recovery writes a reasonless abort that old readers accept.
-    StorageFeature.APPROVAL_RESTART_REASON: WRITER_EPOCH,
+    # APPROVAL_RESTART_REASON must be a fixed int literal (test_storage_feature_epochs
+    # forbids referencing WRITER_EPOCH here). Recheck main+1 at the final merge.
+    StorageFeature.APPROVAL_RESTART_REASON: 7,
 }
 
 

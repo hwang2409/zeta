@@ -91,7 +91,12 @@ def test_writer_epoch_token_checker_ignores_strings_and_comments() -> None:
 def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, case):
     opened = _session(tmp_path)
     opened.store.close()
-    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
+    # Simulate a writer one epoch newer than the home created above, so the test
+    # stays correct across WRITER_EPOCH bumps (an older-epoch home must survive a
+    # newer writer).
+    monkeypatch.setattr(
+        storage_format, "WRITER_EPOCH", storage_format.WRITER_EPOCH + 1
+    )
 
     if case == "repair":
         # the real conversation-store constructor repairs a torn tail.
