@@ -30,9 +30,9 @@ _cache_creation_lock = threading.Lock()
 _MISSING_VALIDATOR = object()
 
 
-def _stable_history_read[_T](
-    store: object, read: Callable[[], _T], *, has_end: bool
-) -> _T:
+def _stable_history_read[T](
+    store: object, read: Callable[[], T], *, has_end: bool
+) -> T:
     if has_end:
         return read()
     for attempt in range(_STABLE_HISTORY_ATTEMPTS):
