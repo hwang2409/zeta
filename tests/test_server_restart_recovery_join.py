@@ -128,7 +128,7 @@ async def test_join_during_restart_recovery_cannot_see_pre_recovery_store(
             )
         )[-1]
         assert "result" not in mid, f"join saw the store mid-recovery: {mid!r}"
-        assert mid["error"]["message"] == "session is not active"
+        assert mid["error"]["message"] == "server has no active session"
 
         release.set()
         resumed = (await asyncio.wait_for(resume, 10))[-1]
