@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import gc
 import json
 import logging
 import os
@@ -74,6 +75,10 @@ class TUIStallWatchdog:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._logging_failure_reported = False
+        self._gc_callback_installed = False
+        self._gc_started: tuple[float, int] | None = None
+        self._gc_totals = (0.0, 0, 0, 0, 0.0, 0.0, 0.0)
+        self._gc_probe_start = (self._gc_totals, self._gc_started, time.perf_counter())
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start probing. Call this method from the loop thread."""
@@ -88,11 +93,19 @@ class TUIStallWatchdog:
             daemon=True,
         )
         self._thread.start()
+        gc.callbacks.append(self._gc_callback)
+        self._gc_callback_installed = True
 
     async def close(self) -> None:
         """Stop the daemon thread without blocking the event loop."""
 
         self._stop.set()
+        if self._gc_callback_installed:
+            try:
+                gc.callbacks.remove(self._gc_callback)
+            except ValueError:
+                pass
+            self._gc_callback_installed = False
         thread = self._thread
         if thread is not None:
             deadline = asyncio.get_running_loop().time() + 0.2
@@ -115,6 +128,8 @@ class TUIStallWatchdog:
             return
         while not self._stop.is_set():
             answered = threading.Event()
+            self._gc_probe_start = (self._gc_totals, self._gc_started, time.perf_counter())
+            gc_probe_start = self._gc_probe_start
             started_monotonic = self._clock()
             started_utc = self._utc_now()
             if self._before_probe is not None:
@@ -144,6 +159,7 @@ class TUIStallWatchdog:
                 stacks,
                 other_threads,
                 observed_thread_count,
+                gc_probe_start,
             )
             if self._stop.wait(self.probe_interval):
                 return
@@ -158,8 +174,14 @@ class TUIStallWatchdog:
             dict[tuple[tuple[str, int, str], ...], list[int]],
         ],
         observed_thread_count: int,
+        gc_probe_start: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ] | None = None,
     ) -> None:
         duration = self._clock() - started_monotonic
+        gc_totals = self._gc_totals
+        gc_started = self._gc_started
+        gc_end = time.perf_counter()
         if duration < self.stall_threshold:
             return
         try:
@@ -170,6 +192,8 @@ class TUIStallWatchdog:
                     stacks,
                     other_threads,
                     observed_thread_count,
+                    gc_probe_start,
+                    (gc_totals, gc_started, gc_end),
                 )
             )
         except Exception:
@@ -224,6 +248,12 @@ class TUIStallWatchdog:
             dict[tuple[tuple[str, int, str], ...], list[int]],
         ],
         observed_thread_count: int,
+        gc_probe_start: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ] | None = None,
+        gc_probe_end: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ] | None = None,
     ) -> dict[str, Any]:
         ordered = sorted(stacks.items(), key=lambda item: (-item[1][0], item[1][1]))
         threads = []
@@ -261,6 +291,9 @@ class TUIStallWatchdog:
             )
         )
         retained_threads = threads[:_MAX_RETAINED_THREADS]
+        if gc_probe_end is None:
+            gc_probe_end = (self._gc_totals, self._gc_started, time.perf_counter())
+        gc_record = self._gc_record(gc_probe_start or self._gc_probe_start, gc_probe_end, duration)
         return {
             "start_time": started.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "duration_ms": round(max(0.0, duration) * 1000, 3),
@@ -277,6 +310,80 @@ class TUIStallWatchdog:
                 0,
                 observed_thread_count - len(retained_threads),
             ),
+            "gc": gc_record,
+        }
+
+    def _gc_callback(self, phase: str, info: dict[str, Any]) -> None:
+        try:
+            if phase == "start":
+                if self._gc_started is None:
+                    self._gc_started = (time.perf_counter(), info.get("generation", 0))
+                return
+            if phase != "stop":
+                return
+            started = self._gc_started
+            self._gc_started = None
+            if started is None:
+                return
+            milliseconds = max(0.0, time.perf_counter() - started[0]) * 1000
+            generation = started[1]
+            totals = self._gc_totals
+            by_generation = [*totals[4:]]
+            if 0 <= generation < len(by_generation):
+                by_generation[generation] += milliseconds
+            self._gc_totals = (
+                totals[0] + milliseconds,
+                totals[1] + 1,
+                totals[2] + info.get("collected", 0),
+                totals[3] + info.get("uncollectable", 0),
+                *by_generation,
+            )
+        except BaseException:  # noqa: BLE001 - diagnostics must never affect garbage collection
+            return
+
+    def _gc_record(
+        self,
+        probe_start: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ],
+        probe_end: tuple[
+            tuple[float, int, int, int, float, float, float], tuple[float, int] | None, float
+        ],
+        duration: float,
+    ) -> dict[str, Any]:
+        totals_at_probe, started_at_probe, probe_time = probe_start
+        totals, started_at_end, end_time = probe_end
+        delta = [current - previous for current, previous in zip(totals, totals_at_probe)]
+        if started_at_probe is not None and started_at_end != started_at_probe:
+            generation = started_at_probe[1]
+            elapsed_before_probe = max(0.0, probe_time - started_at_probe[0]) * 1000
+            delta[0] -= elapsed_before_probe
+            if 0 <= generation < 3:
+                delta[4 + generation] -= elapsed_before_probe
+        in_progress_ms = 0.0
+        if started_at_end is not None:
+            generation = started_at_end[1]
+            in_progress_ms = max(
+                0.0, end_time - max(started_at_end[0], probe_time)
+            ) * 1000
+            delta[0] += in_progress_ms
+            if 0 <= generation < 3:
+                delta[4 + generation] += in_progress_ms
+        duration_ms = max(0.0, duration) * 1000
+        gc_by_generation = {
+            str(generation): round(min(max(milliseconds, 0.0), duration_ms), 3)
+            for generation, milliseconds in enumerate(delta[4:])
+            if milliseconds > 0
+        }
+        return {
+            "ms": round(min(max(delta[0], 0.0), duration_ms), 3),
+            "by_gen": gc_by_generation,
+            "count": delta[1],
+            "collected": delta[2],
+            "uncollectable": delta[3],
+            "in_progress_ms": round(min(max(in_progress_ms, 0.0), duration_ms), 3),
+            "freeze_count": gc.get_freeze_count(),
+            "counts": gc.get_count(),
         }
 
     def _append_record(self, record: dict[str, Any]) -> None:

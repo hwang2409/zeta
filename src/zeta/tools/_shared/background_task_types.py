@@ -54,6 +54,7 @@ class _BackgroundRecord:
     log_path: str | None = None
     remove_log_on_archive: bool = False
     notify_on_exit: bool = True
+    receipt_pending: bool = False
     tui_presented: bool = False
     owner: str = "run_background"
     terminal_phase: Literal["natural_exit", "task_kill", "session_shutdown"] | None = (

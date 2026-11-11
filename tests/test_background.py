@@ -38,7 +38,7 @@ from tests.support.processes import (
     wait_for_path_command,
     wait_pid_exited,
 )
-from zeta.agent.background import BackgroundAgentOwner
+from zeta.agent.background_owner import BackgroundAgentOwner
 from zeta.agent.receipt import receipt_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import ContextAssembler
@@ -556,19 +556,6 @@ async def _cancel_evidence(registry, owner, monkeypatch) -> None:
     await _cancel_at_gate(owner, install, name="evidence")
 
 
-async def _cancel_install(registry, owner, monkeypatch) -> None:
-    original = owner._deliver_exit
-
-    async def install(hold):
-        async def deliver(item):
-            await hold()
-            return await original(item)
-        # test-contract: seam gate the install predecessor at the owner await
-        monkeypatch.setattr(owner, "_deliver_exit", deliver)
-
-    await _cancel_at_gate(owner, install, name="install")
-
-
 async def _cancel_notice(registry, owner, monkeypatch) -> None:
     entered = asyncio.Event()
     owner_registry = registry.background_tasks
@@ -595,7 +582,6 @@ _CANCEL_ROW_HANDLERS = {
     "archive": _cancel_archive,
     "persist": _cancel_persist,
     "evidence-submit": _cancel_evidence,
-    "install": _cancel_install,
     "notice": _cancel_notice,
 }
 
@@ -638,7 +624,7 @@ async def _cancel_close_at(
         "1-natural-exit-wins-kill-race",
         "2-agent-kill-wins",
         "3-external-cause",
-        "4-exit-evidence-precedes-not-running",
+        "terminal-notify-follows-publish",
         "natural-exit-success",
         "persist-failure-retries-same-candidate",
         "duplicate-input",
@@ -654,14 +640,12 @@ async def _cancel_close_at(
         "cancel-archive",
         "cancel-persist",
         "cancel-evidence-submit",
-        "cancel-install",
         "cancel-notice",
         "cancel-close-snapshot",
         "cancel-close-finish-owners",
         "cancel-close-terminate",
         "cancel-close-wait-until-durable",
         "cancel-close-aggregate-notice",
-        "cancel-close-release-receipts",
         "cancel-close-coordinator",
         "archive-failure-recovers-once",
         "restart-durable-terminal-notify-true",
@@ -782,13 +766,6 @@ async def test_background_task_owner_state_table(
                         await await_or_fail(release.wait(), what="durable release")
                         return await original()
                     monkeypatch.setattr(owner, "wait_until_durable", durable)
-                elif row == "cancel-close-release-receipts":
-                    original = owner.release_close_receipt
-                    async def receipt():
-                        entered.set()
-                        await await_or_fail(release.wait(), what="receipt release")
-                        return await original()
-                    monkeypatch.setattr(owner, "release_close_receipt", receipt)
                 else:
                     original = registry.background_tasks._notice
                     def notice(value):
@@ -1214,48 +1191,50 @@ async def test_background_task_owner_state_table(
             assert len(store.agent_notifications(pending_only=False)) == 1
             return
 
-        if row == "4-exit-evidence-precedes-not-running":
-            from tests.test_agent import (
-                _completion_after_publication,
-                _start_task_gate,
-                _TaskFinishGateBackend,
-            )
+        if row == "terminal-notify-follows-publish":
+            task_id = await start_registered(_python("print('done')"))
+            owner = registry.background_tasks._owners[task_id]
+            competitor: asyncio.Task[object] | None = None
+            receipts: list[TaskExitInput] = []
 
-            backend = _TaskFinishGateBackend(
-                _python("import time; time.sleep(30)"), action="kill"
-            )
-            gate_store, gate_loop, run, completion_published = await _start_task_gate(
-                tmp_path / "finish-gate", backend
-            )
-            try:
-                await asyncio.wait_for(run, 10)
-                completion = await _completion_after_publication(
-                    gate_store, completion_published
-                )
-                child_path = Path(completion.data["child_session_path"])
-                child_store = ConversationStore(
-                    child_path.parent, session_id=child_path.name
-                )
-                try:
-                    task_receipts = [
-                        entry
-                        for entry in child_store.agent_notifications(
-                            pending_only=False
+            async def receipt(item):
+                # test-contract: seam prove durable publication precedes notification sink.
+                assert registry.background_tasks._records[task_id].running is False
+                receipts.append(item)
+                await flow.produce(_task_notification(item))
+
+            def notice(_notice):
+                nonlocal competitor
+                competitor = asyncio.create_task(
+                    flow.produce(
+                        pending_delivery_module.NotificationInput(
+                            "task_exit",
+                            {
+                                "task_id": "competing-task",
+                                "headline": "competing task",
+                                "exit_code": 0,
+                                "output_tail": "",
+                                "background_owner": "run_background",
+                                "background_phase": "natural_exit",
+                            },
+                            dedupe_key="competing-task",
                         )
-                        if entry.data.get("kind") == "task_exited"
-                    ]
-                    assert len(task_receipts) == 1
-                    rows = json.loads(
-                        (child_store.session_dir / "background_tasks.json").read_text()
                     )
-                    assert len(rows) == 1
-                    assert rows[0]["running"] is False
-                    assert task_receipts[0].data["background_phase"] == rows[0]["terminal_phase"]
-                finally:
-                    child_store.close()
-            finally:
-                await gate_loop.close()
-                gate_store.close()
+                )
+
+            # test-contract: seam schedule a competing public producer from the synchronous notice callback.
+            registry.background_tasks.set_notice_sink(notice)
+            # test-contract: seam observe the notification sink ordering.
+            monkeypatch.setattr(registry.background_tasks, "_notification_sink", receipt)
+            await await_or_fail(owner.wait(), what="terminal ordering")
+            assert owner.record.running is False
+            assert len(receipts) == 1
+            assert competitor is not None
+            await await_or_fail(competitor, what="competing notification producer")
+            notifications = store.agent_notifications(pending_only=False)
+            task_ids = [entry.data["task_id"] for entry in notifications]
+            assert task_ids.count(task_id) == 1
+            assert task_ids.index(task_id) < task_ids.index("competing-task")
             return
 
         if row == "persist-failure-retries-same-candidate":
@@ -1597,7 +1576,7 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
         ]
         assert len(receipts) == 1
         assert archived_rows[0]["notify_on_exit"] is True
-        assert "receipt_pending" not in archived_rows[0]
+        assert archived_rows[0]["receipt_pending"] is True
         assert archived_rows[0]["note"] == f"{cause}; {_ARCHIVE_NOTE}"
         assert archived_rows[0]["terminal_phase"] == "task_kill"
         assert archived_rows[0]["tui_presented"] is True
@@ -1608,7 +1587,7 @@ async def test_task_exit_recovers_original_receipt_after_store_closes(
         rows = json.loads(
             (resumed_store.session_dir / "background_tasks.json").read_text()
         )
-        assert "receipt_pending" not in rows[0]
+        assert rows[0]["receipt_pending"] is False
     finally:
         await loop.close()
         resumed_store.close()

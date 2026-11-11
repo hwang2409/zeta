@@ -43,7 +43,8 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
 from . import child_context as _child_context
-from .background import CancellationRequest, finish_background_child
+from .background_lifecycle import finish_background_child
+from .background_owner import CancellationRequest
 from .child_context import (
     _child_base_system_prompt,
     _child_model_and_budget,
@@ -293,7 +294,10 @@ async def consume_child(
                 delivering_prompt_id,
             )
             if gate_result.outcome == "task_safety_expired":
-                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
+                child_loop.tool_registry.background_tasks.begin_shutdown(
+                    f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds",
+                    phase="task_kill",
+                )
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
@@ -332,6 +336,8 @@ async def consume_child(
             "no_progress_loop",
         }:
             return recoverable_error_result(terminal_result, failure_message, *failure_error)
+        if failure_error is not None and failure_error[0] == "empty_turn":
+            return clean_no_output(f"agent error: {failure_message}")
         return terminal_result(state="failed", text=f"agent error: {failure_message}")
     if final_message is None:
         return clean_no_output("agent error: child ended without a final response")

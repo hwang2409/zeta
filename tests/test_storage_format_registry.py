@@ -28,7 +28,7 @@ from zeta.core.store._approval_display import (
 )
 from zeta.core.store._child_runs import validate_child_run_started_data
 from zeta.core.store._client_delivery import validate_client_delivery_data
-from zeta.core.store._turn_history import validate_turn_end_data
+from zeta.core.store._row_history import validate_turn_end_data
 from zeta.core.store._validation import (
     validate_child_idle_notification_data,
     validate_terminal_transition_data,

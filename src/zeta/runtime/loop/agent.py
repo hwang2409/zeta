@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from ...agent import recovery_lease
-from ...agent.background import BackgroundAgentOwner
+from ...agent.background_owner import BackgroundAgentOwner
 from ...agent.budget import (
     DEFAULT_MAX_AGENT_DEPTH,
     HARD_MAX_AGENT_DEPTH,
@@ -442,7 +442,9 @@ class AgentLoop(
     ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
-            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
+            self.tool_registry.background_tasks.begin_shutdown(
+                background_task_cause, phase="task_kill"
+            )
             killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
@@ -484,7 +486,7 @@ class AgentLoop(
         try:
             if cancel_background and self.agent_depth == 0:
                 self.tool_registry.background_tasks.begin_shutdown(
-                    background_task_cause
+                    background_task_cause, phase="task_kill"
                 )
                 self._background_owner.cancel_all()
             elif cancel_background:

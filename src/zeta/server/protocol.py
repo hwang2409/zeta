@@ -60,10 +60,16 @@ class ErrorDescriptor(Enum):
         "stale_history_snapshot",
         "session history snapshot is stale",
     )
+    STALE_EVENT_SEQUENCE = (
+        -32009,
+        "stale_event_sequence",
+        "replay continuity was invalidated",
+    )
     DELIVERY_ID_EVICTED = (-32010, None, "delivery ID details were evicted")
     CONTROLLER_OUTPUT_OVERFLOW = (-32011, None, "controller output overflow")
     OBSERVER_OUTPUT_OVERFLOW = (-32011, None, "observer output overflow")
     CONTENT_NOT_FOUND = (-32012, "content_not_found", "content handle was not found")
+    CHILD_RUN_NOT_FOUND = (-32012, "child_run_not_found", "child run was not found")
     TRANSCRIPT_REPAIR_REQUIRES_UPGRADE = (
         -32013,
         "transcript_repair_requires_upgrade",
@@ -215,6 +221,7 @@ class EventDescriptor(StrEnum):
     USAGE = "usage"
     USER_MESSAGE = "user_message"
     SESSION_GRANTS_CHANGED = "session_grants_changed"
+    REPLAY_STREAM_ENDED = "replay_stream_ended"
     CONFIG_CHANGED = "config_changed"
 
 
@@ -245,6 +252,8 @@ FEATURES = (
     "session_history_backward",
     "session_host_commands",
     "session_history_fidelity",
+    "session_replay_seq",
+"child_run_history",
     "served_turn_end",
     "content_read",
     "session_grants",
@@ -279,6 +288,13 @@ class MethodDescriptor(Enum):
     REPAIR_TRANSCRIPT = ("repair_transcript", "1.1", None, Access.SESSION_MUTATION)
     SESSION_TREE = ("session_tree", "1.1", None, Access.READ)
     SESSION_HISTORY = ("session_history", "1.1", None, Access.READ)
+    SESSION_HISTORY_AND_SUBSCRIBE = (
+        "session_history_and_subscribe",
+        "1.1",
+        "session_replay_seq",
+        Access.READ,
+    )
+    CHILD_RUN_HISTORY = ("child_run_history", "1.1", "child_run_history", Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
     SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
     FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
@@ -389,12 +405,7 @@ _ERGONOMICS_METHODS = frozenset(
 )
 _PROJECT_METHODS = frozenset(
     MethodDescriptor[name]
-    for name in (
-        "LIST_PROJECTS",
-        "PROJECT_SHOW",
-        "PROJECT_MEMORY_LOG",
-        "PROJECT_INBOX",
-    )
+    for name in ("LIST_PROJECTS", "PROJECT_SHOW", "PROJECT_MEMORY_LOG", "PROJECT_INBOX")
 )
 
 
@@ -402,7 +413,6 @@ MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
-
 
 
 def hello_result(
@@ -628,8 +638,6 @@ def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
         f"{descriptor.wire} requires the negotiated {descriptor.feature} feature",
     )
     return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
-
-
 
 
 class FrameCodec:

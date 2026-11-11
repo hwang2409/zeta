@@ -1,7 +1,23 @@
 import json
 from pathlib import Path
 
-from zeta.tui.models import load_model_catalog
+import pytest
+
+from zeta.tui.models import _model_names_from_payload, load_model_catalog
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        ({"data": [{"id": "claude-new"}, {"id": 3}, "raw"]}, frozenset({"claude-new", "raw"})),
+        ({"models": [{"name": "llama:latest"}, {"name": None}]}, frozenset({"llama:latest"})),
+        ({"data": [{"id": {}}]}, frozenset()),
+        ([], None),
+        ({"data": "bad"}, None),
+    ],
+)
+def test_model_catalog_payload_parsing_is_tolerant(payload, expected) -> None:
+    assert _model_names_from_payload(payload) == expected
 
 
 def test_codex_catalog_reads_models_cache(tmp_path: Path, monkeypatch) -> None:

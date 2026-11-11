@@ -63,6 +63,9 @@ class HistoryProjection:
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
+    # seq and stable id of the newest active-branch row this projection includes
+    frontier: int = 0
+    frontier_row_id: str | None = None
 
 
 @dataclass
@@ -227,6 +230,29 @@ def _project_history_group(
     return group, _history_group_body_size(codec, group)
 
 
+def history_projection_from_groups(
+    groups: tuple[tuple[Any, ...], ...],
+    approval_calls: Mapping[str, object],
+    *,
+    served_turn_end: bool,
+) -> HistoryProjection:
+    groups = tuple(
+        tuple(
+            entry for entry in group
+            if served_turn_end or getattr(entry, "type", None) != "turn_end"
+        )
+        for group in groups
+    )
+    entry_index = {
+        entry.id: entry for group in groups for entry in group if hasattr(entry, "id")
+    }
+    return HistoryProjection(
+        (*groups, ()),
+        MappingProxyType(dict(approval_calls)),
+        MappingProxyType(entry_index),
+    )
+
+
 def history_projection(
     store: ConversationStore,
     *,
@@ -306,6 +332,8 @@ def history_projection(
         tuple(tuple(group) for group in entries),
         MappingProxyType(approval_calls),
         MappingProxyType(entry_index),
+        frontier=branch[-1].seq if branch else 0,
+        frontier_row_id=branch[-1].id if branch else None,
     )
     with _cache_creation_lock:
         cached = _cache(
