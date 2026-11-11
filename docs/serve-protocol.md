@@ -865,7 +865,11 @@ unhealthy because approval persistence failed, `state` remains `"idle"` and
 separate error and does not change the unhealthy status behavior.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the
-server's live projection and is limited to 64 entries. The result also contains
+server's live projection and is limited to 64 entries. When the loop holds no
+live approval records yet, for example a session resumed after a serve restart,
+this baseline falls back to the same durable store projection the feature-less
+status uses, so an approval persisted before the restart stays visible (still
+bounded to 64). The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Read-only observers receive the same live baseline as the controller,
