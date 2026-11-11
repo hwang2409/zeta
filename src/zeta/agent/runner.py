@@ -294,7 +294,10 @@ async def consume_child(
                 delivering_prompt_id,
             )
             if gate_result.outcome == "task_safety_expired":
-                child_loop.tool_registry.background_tasks.begin_shutdown(f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds")
+                child_loop.tool_registry.background_tasks.begin_shutdown(
+                    f"finish-gate task safety bound expired after {child_loop._background_owner.finish_gate_task_timeout:g} seconds",
+                    phase="task_kill",
+                )
             if finish_gate_state is not None:
                 finish_gate_state.terminal_admitted = True
             if gate_result.handoff is not None:
@@ -1254,13 +1257,12 @@ async def run_agent_tool(
                 )[0],
             )
         )
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            while not close_task.done():
-                try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    continue
-            close_task.result()
-            raise
+        cancelled = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError()

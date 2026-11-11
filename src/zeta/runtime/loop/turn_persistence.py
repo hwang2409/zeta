@@ -56,11 +56,15 @@ class TurnPersistenceMixin:
             stop_reason=self._turn_stop_reason,
             output_tokens=self._turn_output_tokens,
         )
+        metadata = dict(annotated.metadata)
+        model = getattr(self.backend, "model", None)
+        if model:
+            metadata["model"] = model
         account_context = getattr(self, "account_context", None)
         if account_context is not None and account_context.active_provider is not None:
-            metadata = dict(annotated.metadata)
             metadata["account_provider"] = account_context.active_provider
             metadata["account_switch_sequence"] = account_context.switch_sequence
+        if metadata != annotated.metadata:
             annotated = Message(
                 annotated.role,
                 annotated.content,

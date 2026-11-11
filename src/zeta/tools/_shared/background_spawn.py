@@ -168,6 +168,7 @@ async def _terminate_processes(
     term_grace: float,
     *,
     finish: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None,
+    after_signal: Callable[[], None] | None = None,
 ) -> None:
     """Terminate processes and descendants without trusting reused pids."""
     if not processes:
@@ -181,6 +182,8 @@ async def _terminate_processes(
     for process in processes:
         _signal_group(process, signal.SIGTERM)
         _signal_pids(descendants.get(process.pid, {}), signal.SIGTERM)
+    if after_signal is not None:
+        after_signal()
     try:
         await snapshot(
             asyncio.wait_for(
