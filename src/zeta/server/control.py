@@ -16,12 +16,12 @@ from ..core.approval import (
     SessionGrantChange,
     SessionGrantNotFound,
 )
+from ..core.commands.slash_registry import SlashLock
 from ..core.permission_grants import (
     permission_snapshot,
     revoke_session_grants,
     session_grant_change,
 )
-from ..core.commands.slash_registry import SlashLock
 from ..core.store import ConversationStore
 from ..protocol.types import (
     ErrorInfo,
