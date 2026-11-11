@@ -10,6 +10,7 @@ import pytest
 from zeta.remote.descriptor import (
     Descriptor,
     DescriptorError,
+    observer_socket_dir,
     publish,
     socket_path,
     validate,
@@ -107,6 +108,62 @@ async def _probe_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 
 
 @pytest.mark.asyncio
+async def test_attach_exits_when_stdout_stalls_and_socket_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.remote.bridge import attach
+
+    path = socket_path(tmp_path, "session")
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    output_read, output_write = os.pipe()
+    os.set_blocking(output_write, False)
+    try:
+        while True:
+            try:
+                os.write(output_write, b"x" * 65536)
+            except BlockingIOError:
+                break
+
+        class Buffer:
+            def fileno(self) -> int:
+                return output_write
+
+        class Stdout:
+            buffer = Buffer()
+
+        monkeypatch.setattr("sys.stdout", Stdout())
+        server = await asyncio.start_unix_server(
+            lambda reader, writer: _stalled_stdout_peer(reader, writer), path
+        )
+        read_fd, write_fd = os.pipe()
+
+        class Stdin:
+            def fileno(self) -> int:
+                return read_fd
+
+        monkeypatch.setattr("sys.stdin", Stdin())
+        descriptor_path = publish(tmp_path, Descriptor(str(path), "session", os.getpid()))
+        try:
+            assert await asyncio.wait_for(attach(tmp_path, "session"), 3) == 2
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+            descriptor_path.unlink(missing_ok=True)
+            server.close()
+            await server.wait_closed()
+    finally:
+        os.close(output_read)
+        os.close(output_write)
+
+
+async def _stalled_stdout_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    writer.write(b"x" * 65536)
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_attach_exits_when_socket_closes_with_stdin_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from zeta.remote.bridge import attach
 
@@ -137,19 +194,26 @@ async def _close_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     await writer.wait_closed()
 
 
-def test_socket_parent_rejects_symlink_and_wrong_mode(tmp_path: Path) -> None:
-    from zeta.server.server import _UnixSocketListener
-
-    symlink = tmp_path / "symlink"
+def test_observer_socket_dir_rejects_symlink_and_wrong_mode(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir(mode=0o700)
+    symlink = tmp_path / "symlink"
     symlink.symlink_to(target, target_is_directory=True)
-    with pytest.raises(RuntimeError, match="unsafe"):
-        _UnixSocketListener._prepare_parent(symlink / "socket")
+    with pytest.raises(DescriptorError, match="unsafe"):
+        observer_socket_dir(symlink)
     wrong = tmp_path / "wrong"
     wrong.mkdir(mode=0o755)
-    with pytest.raises(RuntimeError, match="unsafe"):
-        _UnixSocketListener._prepare_parent(wrong / "socket")
+    with pytest.raises(DescriptorError, match="unsafe"):
+        observer_socket_dir(wrong)
+
+
+def test_standalone_socket_parent_keeps_permissive_mode(tmp_path: Path) -> None:
+    from zeta.server.server import _UnixSocketListener
+
+    parent = tmp_path / "ordinary"
+    parent.mkdir(mode=0o755)
+    _UnixSocketListener._prepare_parent(parent / "socket")
+    assert (parent.stat().st_mode & 0o777) == 0o700
 
 
 def test_descriptor_rejects_overlong_socket_before_probe(tmp_path: Path) -> None:
