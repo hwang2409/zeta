@@ -1437,19 +1437,21 @@ error code and message. Provider status and origin remain internal.
   active `session_id` and atomically returns the newest bounded history page,
   `status: {"state": "idle|running|tool", "pending_approvals": [...],
   "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
-  `status.state` shape, and
-  `replay: {"stream_id": "...", "history_seq": 0}`. The status is captured at
-  join start. Apply the joined status, then sequenced events after it. Open
-  approvals are the baseline request ids plus `approval_request` ids in the
-  joined page, minus `approval_end` ids in the joined page, then updated by the
-  sequenced tail by id. A session admits at most 64 pending approvals across
-  foreground and delegated tools. A 65th request waits until one admitted
-  request resolves; it is never denied or dropped. Therefore
-  `pending_approvals_truncated` is retained for parser compatibility but is
-  always `false`. Events admitted after the join carry that opaque stream id and
-  monotonically increasing `seq`, starting at 1. Apart from `status` and
-  `replay`, the result has the same shape as `session_history` with `before:
-  null` (`messages`, `next_before`, `history_validator`). Negotiating
+  `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
+  The status is captured at join start. Apply the joined status, then sequenced
+  events after it. Open approvals are the baseline request ids plus
+  `approval_request` ids in the joined page, minus `approval_end` ids in the
+  joined page, then updated by the sequenced tail by id. A session admits at
+  most 64 pending approvals across foreground and delegated tools. A 65th
+  request waits until one admitted request resolves; it is never denied or
+  dropped. Therefore `pending_approvals_truncated` is retained for parser
+  compatibility but is always `false`. Events admitted after the join carry
+  that opaque stream id and monotonically increasing `seq`, starting at 1.
+  Apart from `status` and `replay`, the result has the same shape as
+  `session_history` with `before: null` (`messages`, `next_before`,
+  `history_validator`). A client can include a previous `before` and
+  `history_validator` when it rejoins; the server validates that cursor, then
+  still returns the newest page for the new stream. Negotiating
   `session_replay_seq` also gives the connection the semantics of
   `session_history_fidelity`, `session_history_backward`, and
   `user_message_event`, for the join result, later `session_history` pages, and
@@ -1500,13 +1502,18 @@ error code and message. Provider status and origin remain internal.
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
   `next_before` plus a fixed `history_validator`; continuations use `before` and
-  return complete groups strictly below it in chronological order. Appends are
-  safe, but a branch change returns `-32009` with
+  return complete groups strictly below it in chronological order. The validator
+  has `end`, `entry_id`, and nullable `repair_generation` fields for
+  `session_history`, `child_run_history`, and `session_history_and_subscribe`.
+  An old two-field validator gets one `-32009` with `stale_history_snapshot`; the
+  client restarts from the newest page and then receives the three-field shape.
+  Appends are safe, but a branch change or transcript repair returns `-32009` with
   `stale_history_snapshot`. Backward and forward walks share source groups,
   but response-local truncation can differ because their envelopes differ.
   Example request: `{ "session_id": "abc", "before": null }`; the reply has
   `messages`, `next_before`, and `history_validator: { "end": 12,
-  "entry_id": "..." }`. A continuation supplies both `before` and that
+  "entry_id": "...", "repair_generation": null }`. A continuation supplies
+  both `before` and that
   validator. `before` and `history_validator` without the feature, mixed with
   `offset`, or malformed values return `-32602`; a changed validator returns
   `-32009` with data code `stale_history_snapshot`. The cursor counts the same

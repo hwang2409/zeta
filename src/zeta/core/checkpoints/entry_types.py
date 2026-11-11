@@ -157,7 +157,7 @@ def _approval_history(_context: EntryValidationContext, entry: Any) -> None:
 
 
 def _turn_end(_context: EntryValidationContext, entry: Any) -> None:
-    from ..store._turn_history import validate_turn_end_data
+    from ..store._row_history import validate_turn_end_data
 
     validate_turn_end_data(entry.data)
 
