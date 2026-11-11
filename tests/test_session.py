@@ -2913,9 +2913,9 @@ async def test_cancel_honors_approval_won_by_other_writer(
     finalized: list[str] = []
     finalize_canceled = app.loop.finalize_canceled
 
-    def record_finalize_canceled(request_id: str) -> ToolResult | None:
-        finalized.append(request_id)
-        return finalize_canceled(request_id)
+    def record_finalize_canceled(tool_call: ToolCall) -> ToolResult | None:
+        finalized.append(tool_call.id)
+        return finalize_canceled(tool_call)
 
     monkeypatch.setattr(app.loop, "finalize_canceled", record_finalize_canceled)
     submission = app._submissions.submit("start")
@@ -3111,7 +3111,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
     )
     policy.approve(call.id)
 
-    assert loop.prepare_resume_pending_tool(call.id)
+    assert loop.prepare_resume_pending_tool(call)
     loop.abort()
     result = await loop.resume_pending_tool(call.id, prepared=True)
 
@@ -3130,8 +3130,8 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
         [(call.id, call)],
     )
 
-    first = loop.finalize_canceled(call.id)
-    second = loop.finalize_canceled(call.id)
+    first = loop.finalize_canceled(call)
+    second = loop.finalize_canceled(call)
 
     results = [
         message.tool_result
@@ -3161,7 +3161,7 @@ def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
         )
     )
 
-    result = loop.finalize_canceled(call.id)
+    result = loop.finalize_canceled(call)
     results = [
         message.tool_result
         for message in opened.store.messages()

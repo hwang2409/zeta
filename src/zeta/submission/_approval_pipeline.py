@@ -42,11 +42,42 @@ class ApprovalPipelineMixin:
 
     async def refresh_pending_approvals(self) -> None:
         policy = self._host._approval_policy
-        self._pending_approvals = (
+        if policy is not None:
+            policy.set_pending_changed_hook(self._request_pending_refresh)
+        started = self._pending_change_seq
+        pending = (
             ()
             if policy is None
             else tuple(await policy.pending_requests_for_display())
         )
+        # Never let a result overtaken by a newer change replace the cache.
+        if started >= self._pending_applied_seq:
+            self._pending_approvals = pending
+            self._pending_applied_seq = started
+
+    def _request_pending_refresh(self) -> None:
+        """Schedule one off-loop refresh; coalesce bursts into a single rerun.
+
+        The hook only schedules: it bumps a change counter and, when no refresh
+        is in flight, starts one. A change that arrives while a refresh runs sets
+        the counter again, so the drain loop reruns exactly once more.
+        """
+        self._pending_change_seq += 1
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._pending_refresh_task is None or self._pending_refresh_task.done():
+            self._pending_refresh_task = loop.create_task(
+                self._drain_pending_refresh()
+            )
+
+    async def _drain_pending_refresh(self) -> None:
+        applied = self._pending_applied_seq
+        while self._pending_change_seq != applied:
+            applied = self._pending_change_seq
+            await self.refresh_pending_approvals()
+            self._host._present_pending_approvals()
 
     async def _on_approval_action(self, message: _ApprovalAction) -> None:
         policy = self._host._approval_policy

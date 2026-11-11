@@ -75,6 +75,9 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._entries: dict[int, _Entry] = {}
         self._approval_owners: dict[str | tuple[str, str], Submission] = {}
         self._pending_approvals: tuple[ApprovalRequest, ...] = ()
+        self._pending_change_seq = 0
+        self._pending_applied_seq = -1
+        self._pending_refresh_task: asyncio.Task[None] | None = None
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
@@ -103,6 +106,8 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._deferred: deque[_Message] = deque()
         self._closed = False
         self._shutting_down = False
+        if host._approval_policy is not None:
+            host._approval_policy.set_pending_changed_hook(self._request_pending_refresh)
 
     @property
     def provider_task(self) -> asyncio.Task[NotificationOutcome] | None:
@@ -280,14 +285,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         )
         if entry is not None:
             self._send(_ApprovalLifecycle(entry.submission, "approval_start", call))
-            # The display cache is refreshed off-loop when the pipeline handles
-            # the lifecycle message, but the host presents synchronously now.
-            # Seed the fresh request so it shows at once; the refresh reconciles.
-            if all(str(request.key) != call.id for request in self._pending_approvals):
-                self._pending_approvals = (
-                    *self._pending_approvals,
-                    ApprovalRequest(call.id, call),
-                )
 
     def notify_approval_finished(self, call: ToolCall) -> None:
         owner = self._approval_owners.get(call.id)
@@ -304,6 +301,10 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._closed = True
         self._shutting_down = True
         self._notification_retry.close()
+        if self._pending_refresh_task is not None and not self._pending_refresh_task.done():
+            self._pending_refresh_task.cancel()
+        if self._host._approval_policy is not None:
+            self._host._approval_policy.set_pending_changed_hook(None)
         for entry in self._entries.values():
             if entry.signal is not None:
                 entry.signal.abort()
