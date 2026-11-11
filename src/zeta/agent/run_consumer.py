@@ -193,6 +193,40 @@ async def consume_run(
                     safety_task.cancel()
                     await asyncio.gather(safety_task, return_exceptions=True)
                     safety_task = None
+            finish_gate_state = kwargs["finish_gate_state"]
+            if (
+                isinstance(finish_gate_state, FinishGateState)
+                and finish_gate_state.terminal_admitted
+            ):
+                # The finish gate owns whether the run is over. Once it admits a
+                # terminal (completed / handed_off / task_safety_expired), the gate
+                # has already run its own bounded post-cap loop to that terminal, so
+                # run_consumer must not start another model turn: delivering a late
+                # pending edge here re-runs the finished segment (duplicate provider
+                # spend) and, with an unexpired child bound, never ends. Settle the
+                # queue durably; input that arrived after the terminal decision is
+                # reported, not silently lost or re-delivered.
+                if (await flow.admit_terminal("segment_end")).pending:
+                    from ..runtime.loop.empty_turn import not_delivered_text
+
+                    await child_loop._background_owner.conversation_channel.publish_not_delivered(
+                        child_loop,
+                        not_delivered_text(
+                            "the agent run ended at the finish gate",
+                            waits_for_input=False,
+                        ),
+                    )
+                terminal_result = _finalize_result(
+                    result,
+                    segment_reports=segment_reports,
+                    receipt_components=receipt_components,
+                    delivered_follow_up=delivered_follow_up,
+                    child_store=child_store,
+                    child_turns=child_turns,
+                    tool_call_id=tool_call_id,
+                    max_receipt_bytes=max_receipt_bytes,
+                )
+                return terminal_result
             if flow.has_pending_edge:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 flow.reset_stalled_episode()

@@ -1975,6 +1975,7 @@ class PostCapBudgetBackend(CompletionBackend):
         self.release_fresh_prompt = asyncio.Event()
         self.fresh_requests: list[list[Message]] = []
         self.gate_calls = 0
+        self.handoff_turns = 0
 
     @owned_completion
     async def complete(
@@ -2024,6 +2025,7 @@ class PostCapBudgetBackend(CompletionBackend):
             blocks = [TextContent("edge complete")]
         elif last_user == "fresh external prompt":
             self.fresh_requests.append(list(messages))
+            self.handoff_turns += 1
             self.fresh_prompt_seen.set()
             if self.hold_fresh_prompt:
                 await await_or_fail(
@@ -4058,6 +4060,15 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            # Force the late-edge order deterministically. While the handoff turn
+            # is held, arm a notification edge on the child so it is pending the
+            # instant the finish gate admits the handoff terminal. Unfixed,
+            # run_consumer then runs another model turn for that edge (duplicate
+            # provider spend) before finalizing; the fix finalizes at once.
+            await owner.conversation_channel.produce_to(
+                child_handle, _task_exit_input("late-edge")
+            )
+            assert flow.has_pending_edge
             backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
@@ -4105,6 +4116,10 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
         tmp_path, monkeypatch, send_fresh_prompt=True
     )
     assert backend.fresh_prompt_seen.is_set()
+    # The fresh prompt is handled by exactly one model turn. A late pending edge
+    # arriving at/after the finish-gate handoff terminal must not re-run the
+    # finished segment (that is the duplicate provider spend and the hang).
+    assert backend.handoff_turns == 1
 
 
 
@@ -11431,6 +11446,112 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     assert terminal.closed_empty
     with pytest.raises(PendingPromptsClosedError):
         await asyncio.to_thread(child_store.append_pending_prompt, "after failure")
+
+
+_TERMINAL_OUTCOME_RESULTS = {
+    "handed_off": {
+        "content": [{"type": "text", "text": "Handed off running background work."}],
+        "isError": False,
+        "structuredContent": {"status": "completed"},
+    },
+    "completed": {
+        "content": [{"type": "text", "text": "root complete"}],
+        "isError": False,
+        "structuredContent": {"status": "completed"},
+    },
+    "task_safety_expired": {
+        "content": [
+            {"type": "text", "text": "running background tasks were killed."}
+        ],
+        "isError": False,
+        "structuredContent": {"status": "completed"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "outcome", ["handed_off", "completed", "task_safety_expired"]
+)
+@pytest.mark.parametrize("late_input", ["none", "consumed_prompt", "new_message"])
+@pytest.mark.asyncio
+async def test_consume_run_finalizes_once_finish_gate_admits_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    late_input: str,
+) -> None:
+    """The finish-gate terminal is the single owner of "the run is over".
+
+    The finish gate runs its own bounded post-cap loop to a terminal (handed off,
+    completed, or task safety expired) and sets ``terminal_admitted``. A pending
+    edge that reaches ``consume_run`` after that terminal must not start another
+    model turn: delivering it re-runs the finished segment -- duplicate provider
+    spend -- and, with an unexpired child bound, the run never ends. The edge can
+    be a stale edge left by an already-consumed prompt, or a genuinely new message;
+    new durable input is reported, never silently dropped or re-delivered.
+    """
+
+    from zeta.agent import runner as agent_runner
+
+    child_store = ConversationStore(tmp_path, session_id="run")
+    gate_state = FinishGateState()
+    calls = 0
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        nonlocal calls
+        calls += 1
+        flow = await child_loop._ensure_step_delivery()
+        if calls == 1:
+            gate_state.terminal_admitted = True
+            if late_input == "new_message":
+                await flow.produce(_task_exit_input("late-edge"))
+            elif late_input == "consumed_prompt":
+                await asyncio.to_thread(child_store.append_pending_prompt, "consumed")
+                await flow.prepare_request("terminal_fallback", [], None)
+                await flow.acknowledge_active()
+        else:
+            # Reached only on the buggy path, where consume_run delivers a late
+            # edge after the terminal. Drain it so the run ends and the test can
+            # assert the exact (too-high) turn count instead of hanging.
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+            if prepared.has_active_delivery:
+                await flow.acknowledge_active()
+        return dict(_TERMINAL_OUTCOME_RESULTS[outcome])
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await agent_runner.consume_run(
+            child_loop,
+            "initial",
+            child_store=child_store,
+            finish_gate_state=gate_state,
+        )
+
+        # The gate's terminal is the one and only model turn consume_run drives.
+        assert calls == 1
+        assert result["isError"] is False
+        # Finalization carries this terminal's text into the child's receipt.
+        outcome_text = _TERMINAL_OUTCOME_RESULTS[outcome]["content"][0]["text"]
+        assert outcome_text in str(result["content"][0]["text"])
+
+        not_delivered = [
+            entry
+            for entry in child_store.agent_notifications(pending_only=False)
+            if entry.data.get("display_only") is True
+            and "not delivered" in str(entry.data.get("text", "")).lower()
+        ]
+        # Genuinely new durable input is surfaced; a stale edge from an
+        # already-consumed prompt has nothing to report.
+        assert len(not_delivered) == (1 if late_input == "new_message" else 0)
+    finally:
+        await child_loop.close()
+        child_store.close()
 
 
 @pytest.mark.asyncio
