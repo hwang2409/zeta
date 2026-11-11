@@ -7169,8 +7169,10 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
         child_cwd=child_cwd,
     )
     call = ToolCall("write-request", "write", {"path": "src/file.py", "content": "x"})
-    request = child_policy.prepare(
-        call, capability=_approval_capability(call.name, call.arguments)
+    request = asyncio.run(
+        child_policy.prepare(
+            call, capability=_approval_capability(call.name, call.arguments)
+        )
     )
 
     assert request is not None
@@ -7215,8 +7217,10 @@ def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
         ),
     )
     for call in calls:
-        request = child_policy.prepare(
-            call, capability=_approval_capability(call.name, call.arguments)
+        request = asyncio.run(
+            child_policy.prepare(
+                call, capability=_approval_capability(call.name, call.arguments)
+            )
         )
         assert request is not None
         assert request.effective_cwd == str(shell_cwd)
@@ -7282,7 +7286,7 @@ async def test_child_policy_inherits_scoped_rules_and_delegates_prompts(
     )
     prepared_call = ToolCall("ok", "bash", {"command": "git status"})
     assert (
-        child_policy.prepare(
+        await child_policy.prepare(
             prepared_call,
             capability=_approval_capability(
                 prepared_call.name, prepared_call.arguments

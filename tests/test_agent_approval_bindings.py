@@ -127,7 +127,7 @@ def test_path_approval_display_is_canonical_binding_target(
         tool_name,
         {"path": str(requested)},
     )
-    request = child.prepare(call, capability=_capability(call))
+    request = asyncio.run(child.prepare(call, capability=_capability(call)))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -160,7 +160,7 @@ def test_shell_approval_display_is_canonical_binding_cwd(
         {"command": "pwd", "cwd": str(alias)},
     )
 
-    request = child.prepare(call, capability=_capability(call))
+    request = asyncio.run(child.prepare(call, capability=_capability(call)))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -468,7 +468,7 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     )
     call = ToolCall("capture-failed", "write", {"path": "credentials"})
 
-    assert child.prepare(call, capability=_capability(call)) is None
+    assert await child.prepare(call, capability=_capability(call)) is None
     decision = await child.authorize(call, AbortSignal(), capability=_capability(call))
 
     assert decision is ApprovalDecision.DENY
@@ -782,7 +782,7 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
         parent_policy, child_store, "child", "race", child_cwd=tmp_path
     )
     call = ToolCall("race", "bash", {"command": "echo safe"})
-    request = child_policy.prepare(call, capability=_capability(call))
+    request = await child_policy.prepare(call, capability=_capability(call))
     assert request is not None
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),

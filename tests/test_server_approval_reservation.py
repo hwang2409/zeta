@@ -407,8 +407,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     gate.install(monkeypatch)
     try:
         if cleanup_first:
-            cleanup = policy.cleanup_delegated("child")
-            assert cleanup is not None
+            cleanup = asyncio.ensure_future(policy.cleanup_delegated("child"))
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
                 await server.control.resolve_approval("approve", wire_id)
@@ -769,7 +768,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             call
         )
         if child is not None:
-            request = authorizer.prepare(call, capability=capability)
+            request = await authorizer.prepare(call, capability=capability)
             assert request is not None
             child.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
