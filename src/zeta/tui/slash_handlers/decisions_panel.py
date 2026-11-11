@@ -169,7 +169,9 @@ class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
     def _init_decisions_panel(self) -> None:
-        self._decisions_answer_field = OverlayTextField("DECISIONS_ANSWER")
+        self._decisions_answer_field = OverlayTextField(
+            "DECISIONS_ANSWER", on_text_changed=lambda text: self._decisions_answer_input(text)
+        )
         self._decisions_panel = DecisionsPanel(self._decisions_answer_field)
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False

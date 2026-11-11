@@ -97,7 +97,7 @@ def _list_window(selected: int, count: int, height: int) -> int:
 class FinderControl(UIControl):
     """Paint the finder overlay from the transcript's live finder state."""
 
-    def __init__(self, get_state: Callable[[], FinderState | None], field: OverlayTextField | None = None) -> None:
+    def __init__(self, get_state: Callable[[], FinderState | None], field: OverlayTextField) -> None:
         self._get_state = get_state
         self._field = field
         self._lines: list[list[tuple[str, str]]] = []
@@ -149,16 +149,7 @@ class FinderControl(UIControl):
         if state.title is not None:
             lines.append([(f"bold {theme.ACCENT}", state.title)])
         # Query field.
-        if self._field is None:
-            lines.append(
-                [
-                    (theme.ACCENT, "❯ "),
-                    (theme.BODY, _truncate(state.query, content_width - 3)),
-                    (f"bold {theme.ACCENT}", "▌"),
-                ]
-            )
-        else:
-            lines.extend(self._field.lines(content_width, prefix="❯ "))
+        lines.extend(self._field.lines(content_width, prefix="❯ "))
         lines.append([(theme.DIM, "─" * content_width)])
         # Result rows.
         if not state.rows:

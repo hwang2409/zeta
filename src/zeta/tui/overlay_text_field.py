@@ -12,6 +12,8 @@ from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.utils import get_cwidth
 
+from collections.abc import Callable
+
 from . import theme
 
 _MAX_LINES = 4
@@ -21,28 +23,35 @@ def _cells(text: str) -> int:
     return sum(max(0, get_cwidth(character)) for character in text)
 
 
-def _wrap(text: str, width: int) -> list[str]:
+def _wrap(text: str, width: int) -> list[tuple[str, int, int]]:
     width = max(1, width)
-    lines: list[str] = []
+    lines: list[tuple[str, int, int]] = []
+    offset = 0
     for source in text.split("\n"):
         if not source:
-            lines.append("")
-            continue
-        line = ""
-        for character in source:
-            if _cells(line + character) >= width:
-                lines.append(line)
-                line = ""
-            line += character
-        lines.append(line)
-    return lines or [""]
+            lines.append(("", offset, offset))
+        else:
+            line = ""
+            start = offset
+            for character in source:
+                if line and _cells(line + character) > width:
+                    lines.append((line, start, offset))
+                    line = ""
+                    start = offset
+                line += character
+                offset += 1
+            lines.append((line, start, offset))
+        offset += 1
+    return lines or [("", 0, 0)]
 
 
 class OverlayTextField:
     """A bounded Buffer shared by overlay rendering and prompt-toolkit input."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, on_text_changed: Callable[[str], None] | None = None) -> None:
         self.buffer = Buffer(name=name)
+        if on_text_changed is not None:
+            self.buffer.on_text_changed += lambda _: on_text_changed(self.buffer.text)
         self.control = BufferControl(buffer=self.buffer)
         self.window = Window(
             self.control,
@@ -63,13 +72,14 @@ class OverlayTextField:
     def lines(self, width: int, *, prefix: str = "❯ ") -> list[list[tuple[str, str]]]:
         available = max(1, width - _cells(prefix))
         wrapped = _wrap(self.text, available)
-        if len(wrapped) > _MAX_LINES:
-            wrapped = wrapped[-_MAX_LINES:]
         cursor = self.buffer.cursor_position
-        before = self.text[:cursor]
-        cursor_line = len(before.split("\n")) - 1
-        cursor_column = _cells(before.rsplit("\n", 1)[-1])
-        first_line = max(0, cursor_line - len(wrapped) + 1)
+        cursor_line = next(
+            (index for index, (_, start, end) in enumerate(wrapped) if start <= cursor <= end),
+            len(wrapped) - 1,
+        )
+        cursor_column = _cells(self.text[wrapped[cursor_line][1] : cursor])
+        first_line = max(0, cursor_line - _MAX_LINES + 1)
+        visible = wrapped[first_line : first_line + _MAX_LINES]
         vim = None
         try:
             app = get_app()
@@ -78,7 +88,7 @@ class OverlayTextField:
         except RuntimeError:
             vim = None
         result: list[list[tuple[str, str]]] = []
-        for index, line in enumerate(wrapped):
+        for index, (line, start, end) in enumerate(visible):
             absolute = first_line + index
             marker = "▌" if absolute == cursor_line else ""
             if marker:

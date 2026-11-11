@@ -174,13 +174,20 @@ class FinderRuntimeMixin:
         if finder.finder_accept():
             self._cancel_finder_workers()
             self._active_finder = self._viewed_transcript()
+        self._restore_composer_focus()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
+        self._restore_composer_focus()
         self._invalidate_prompt()
+
+    def _restore_composer_focus(self) -> None:
+        session = getattr(self, "_active_session", None)
+        if session is not None:
+            session.layout.focus(session.default_buffer)
 
     async def _prepare_ui_session_change(self) -> None:
         """Close work scoped to a UI session before replacing or removing it."""

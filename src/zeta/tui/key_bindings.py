@@ -776,19 +776,6 @@ def build_key_bindings(
             del event
             on_decisions_key("enter")
 
-        @bindings.add("backspace", filter=decisions_answer_mode, eager=True)
-        def decisions_answer_backspace(event: KeyPressEvent) -> None:
-            event.current_buffer.delete_before_cursor()
-            on_decisions_input(event.current_buffer.text)
-
-    if on_decisions_input is not None:
-
-        @bindings.add(Keys.Any, filter=decisions_answer_mode, eager=True)
-        def decisions_answer_input(event: KeyPressEvent) -> None:
-            if event.data:
-                event.current_buffer.insert_text(event.data)
-                on_decisions_input(event.current_buffer.text)
-
     native_escape = next(
         binding
         for binding in load_vi_bindings().bindings
@@ -1028,21 +1015,6 @@ def build_key_bindings(
             del event
             on_finder_move(1)
 
-    if on_finder_input is not None:
-
-        @bindings.add(Keys.Any, filter=finder_mode, eager=True)
-        def finder_input(event: KeyPressEvent) -> None:
-            if event.data:
-                finder_buffer.insert_text(event.data)
-                on_finder_input(finder_buffer.text)
-
-        @bindings.add("backspace", filter=finder_mode, eager=True)
-        @bindings.add("c-h", filter=finder_mode, eager=True)
-        def finder_backspace(event: KeyPressEvent) -> None:
-            del event
-            finder_buffer.delete_before_cursor()
-            on_finder_input(finder_buffer.text)
-
     if on_finder_move is not None:
 
         @bindings.add("down", filter=finder_mode, eager=True)
@@ -1073,6 +1045,13 @@ def build_key_bindings(
         @bindings.add("c-c", filter=finder_mode, eager=True)
         @bindings.add("c-g", filter=finder_mode, eager=True)
         def finder_cancel(event: KeyPressEvent) -> None:
+            if (
+                get_app().editing_mode is EditingMode.VI
+                and get_app().vi_state.input_mode is InputMode.INSERT
+                and event.key_sequence[0].key == Keys.ESCAPE
+            ):
+                get_app().vi_state.input_mode = InputMode.NAVIGATION
+                return
             del event
             finder_buffer.reset()
             on_finder_cancel()

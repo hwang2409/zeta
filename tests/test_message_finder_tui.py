@@ -21,6 +21,7 @@ from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
 from zeta.tui.theme import RICH_THEME
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.history_finder import HistoryFinder
 from zeta.tui.transcript.message_finder import Role
@@ -163,7 +164,7 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     app._finder_open()
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
-    initial_content = FinderControl(transcript.finder_state).create_content(80, 20)
+    initial_content = FinderControl(transcript.finder_state, OverlayTextField("TEST_FINDER")).create_content(80, 20)
     initial_paint = "".join(
         fragment[1]
         for line_index in range(initial_content.line_count)
@@ -176,7 +177,7 @@ async def test_newest_candidates_publish_before_older_render_finishes() -> None:
     assert partial_states
     assert partial_states[0][0] == "new candidate 39"
     assert ui_thread not in render_threads
-    content = FinderControl(transcript.finder_state).create_content(80, 20)
+    content = FinderControl(transcript.finder_state, OverlayTextField("TEST_FINDER")).create_content(80, 20)
     painted = "".join(
         fragment[1]
         for line_index in range(content.line_count)
@@ -344,7 +345,7 @@ def test_selected_finder_row_uses_valid_prompt_toolkit_styles() -> None:
     state = transcript.finder_state()
     assert state is not None and state.rows
 
-    content = FinderControl(lambda: state).create_content(80, 20)
+    content = FinderControl(lambda: state, OverlayTextField("TEST_FINDER")).create_content(80, 20)
 
     _assert_fragment_styles_parse(content)
     selected_styles = {

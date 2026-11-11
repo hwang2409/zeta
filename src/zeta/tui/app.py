@@ -329,7 +329,9 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        self._finder_field = OverlayTextField("TRANSCRIPT_FINDER")
+        self._finder_field = OverlayTextField(
+            "TRANSCRIPT_FINDER", on_text_changed=lambda query: app._finder_input(query)
+        )
         self._finder_control = FinderControl(
             lambda: app._active_finder.finder_state(), self._finder_field
         )
