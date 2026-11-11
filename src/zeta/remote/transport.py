@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import queue
 import shlex
+import signal
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -63,6 +65,7 @@ class RemoteTransport:
             return None
 
     def close(self) -> None:
+        self._callback = None
         self._stop.set()
         with contextlib.suppress(queue.Full):
             self._input.put_nowait(None)
@@ -70,6 +73,7 @@ class RemoteTransport:
             self._thread.join(timeout=5)
 
     async def close_async(self) -> None:
+        self._callback = None
         self._stop.set()
         with contextlib.suppress(queue.Full):
             self._input.put_nowait(None)
@@ -91,6 +95,7 @@ class RemoteTransport:
             process = await asyncio.create_subprocess_exec(
                 self.ssh, self.host, command, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError as exc:
             self._publish(TransportItem("exit", str(exc).encode()))
@@ -119,7 +124,8 @@ class RemoteTransport:
         waiter = asyncio.create_task(process.wait())
         await asyncio.wait({waiter, *readers}, return_when=asyncio.FIRST_COMPLETED)
         if self._stop.is_set() and process.returncode is None:
-            process.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
         await process.wait()
         for task in readers:
             task.cancel()

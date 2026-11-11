@@ -107,6 +107,19 @@ class RemoteViewState:
 
 
 class RemoteViewMixin:
+    def _init_remote_view(self) -> None:
+        self._remote_view = None
+        self._remote_session_client = None
+        self._remote_event_task = None
+        self._remote_picker = None
+        self._remote_picker_unit = None
+        self._remote_saved_composer = None
+
+    async def _close_remote_view(self) -> None:
+        self.remote_picker_cancel()
+        await self.slash_detach("")
+        self._remote_session_client = None
+
     @property
     def remote_picker_active(self) -> bool:
         return self._remote_picker is not None
