@@ -147,10 +147,9 @@ def background_notice(
 
     message: str | None
     if isinstance(notice, BackgroundTaskNotice):
-        # Starts have a tool card, natural exits have a durable notification,
-        # and explicit kills have a task_kill card. The structured phase keeps
-        # this decision independent of user-controlled command text.
-        message = None
+        # Starts have a tool card and natural exits have a durable notification.
+        # Kills keep the cause in the tool card but also need the lifecycle notice.
+        message = notice.message if notice.phase == "task_kill" else None
     elif isinstance(notice, BackgroundTaskShutdownNotice) and notice.tasks:
         # Shutdown task exits and macro cancellations have durable receipts.
         message = None
