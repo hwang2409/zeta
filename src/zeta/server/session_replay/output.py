@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from .. import event_contract
 from ..handlers import validation
 from ..handlers.history import replay_history
 from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
@@ -497,4 +498,15 @@ class ReplayOutput:
 
         result = await self.run_read(connection, read)
         assert isinstance(result, tuple)
+        if "approval_restart_reason" in self._connections[connection].features:
+            return result
+        history, *rest = result
+        rows = history.get("messages") if isinstance(history, dict) else None
+        if isinstance(rows, list):
+            shaped = event_contract.shape_approval_history_rows(
+                rows, include_restart_reason=False
+            )
+            if shaped is not rows:
+                history = {**history, "messages": shaped}
+                return (history, *rest)
         return result

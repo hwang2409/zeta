@@ -2280,11 +2280,16 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
                     result = await original_commit(store, command)
-                    if case == "external_end" and is_resolution:
+                    if case == "external_end" and is_resolution and not entered.is_set():
                         # test-contract: prove the settlement task owns the gated await
                         gate_owner = asyncio.current_task()
-                        record = server.control._approvals.state.records["call-1"]
-                        assert gate_owner is record.settlement
+                        # Defensive: the external approval_end route may remove the
+                        # record while this durable commit runs. A single-shot gate
+                        # plus .get() keeps a second resolution commit from a
+                        # KeyError hang (regression: run 42943685995).
+                        record = server.control._approvals.state.records.get("call-1")
+                        if record is not None:
+                            assert gate_owner is record.settlement
                         # test-contract: gate after the real durable operation commits
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
@@ -2850,6 +2855,28 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             else:
                 await frames_until("turn_end")
             assert not server.control._approvals.state.records
+            if case == "external_end":
+                # The external approval_end arrived during the durable commit: the
+                # owner must write exactly one durable end and emit exactly one
+                # approval_end on the wire.
+                assert server.runtime.opened is not None
+                durable_ends = [
+                    entry
+                    for entry in server.runtime.opened.store.replay()
+                    if entry.type == "approval_resolution"
+                    and entry.data.get("request_id") == "call-1"
+                ]
+                assert len(durable_ends) == 1, (
+                    f"external_end wrote {len(durable_ends)} durable ends"
+                )
+                wire_ends = [
+                    frame
+                    for frame in observed
+                    if frame.get("params", {}).get("event") == "approval_end"
+                ]
+                assert len(wire_ends) == 1, (
+                    f"external_end emitted {len(wire_ends)} approval_end frames"
+                )
     finally:
         release.set() if "release" in locals() else None
         if "release_competing" in locals():
