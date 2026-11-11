@@ -1434,13 +1434,24 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
-  active `session_id` and atomically returns the newest bounded history page plus
-  `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
-  join carry that opaque stream id and monotonically increasing `seq`, starting
-  at 1. The result has the same shape as `session_history` with `before: null`
-  (`messages`, `next_before`, `history_validator`). A client can include a
-  previous `before` and `history_validator` when it rejoins; the server validates
-  that cursor, then still returns the newest page for the new stream. Negotiating
+  active `session_id` and atomically returns the newest bounded history page,
+  `status: {"state": "idle|running|tool", "pending_approvals": [...],
+  "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
+  `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
+  The status is captured at join start. Apply the joined status, then sequenced
+  events after it. Open approvals are the baseline request ids plus
+  `approval_request` ids in the joined page, minus `approval_end` ids in the
+  joined page, then updated by the sequenced tail by id. A session admits at
+  most 64 pending approvals across foreground and delegated tools. A 65th
+  request waits until one admitted request resolves; it is never denied or
+  dropped. Therefore `pending_approvals_truncated` is retained for parser
+  compatibility but is always `false`. Events admitted after the join carry
+  that opaque stream id and monotonically increasing `seq`, starting at 1.
+  Apart from `status` and `replay`, the result has the same shape as
+  `session_history` with `before: null` (`messages`, `next_before`,
+  `history_validator`). A client can include a previous `before` and
+  `history_validator` when it rejoins; the server validates that cursor, then
+  still returns the newest page for the new stream. Negotiating
   `session_replay_seq` also gives the connection the semantics of
   `session_history_fidelity`, `session_history_backward`, and
   `user_message_event`, for the join result, later `session_history` pages, and

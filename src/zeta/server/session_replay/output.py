@@ -191,8 +191,27 @@ class ReplayOutput:
 
     def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         self.invalidate_replay_connection(connection, reason="rejoined")
-        store = validation.active(connection.server.runtime, {"session_id": scope.value})
-        self.replay.begin_join(connection, scope, store.reset_generation())
+        runtime = connection.server.runtime
+        store = validation.active(runtime, {"session_id": scope.value})
+        control = connection.server.control
+        state = self._connections[connection]
+        pending = (
+            []
+            if state.role == "observer"
+            else control.pending_approvals_now(reconnect=True)
+        )
+        status = {
+            "state": (
+                "idle"
+                if control.unhealthy() or runtime.state is None
+                else "running" if control.turn_busy() else runtime.state.status
+            ),
+            "pending_approvals": pending,
+            "pending_approvals_truncated": False,
+        }
+        self.replay.begin_join(
+            connection, scope, store.reset_generation(), status
+        )
 
     def finish_replay_join(
         self,
