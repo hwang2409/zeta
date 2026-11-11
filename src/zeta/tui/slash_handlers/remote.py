@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,7 @@ from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
 
-from ...protocol.types import StreamEvent, StreamEventType
+from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...remote.client import RemoteSessionClient
 from ...remote.discovery import (
     RemoteSession,
@@ -25,6 +25,7 @@ from ...remote.wire import RemoteWireError
 from .. import theme
 from ..checkpoints import render_replayed_message
 from ..transcript import TranscriptPresenter, TranscriptWidget
+from ..user import displayed_user_text, user_message
 
 
 @dataclass
@@ -58,6 +59,8 @@ class RemoteViewState:
     banner: Window
     container: HSplit
     disconnected: bool = False
+    # history tool results name their call by id; keep the calls so the card shows the tool name.
+    tool_calls: dict[str, ToolCall] = field(default_factory=dict)
 
     @classmethod
     def create(cls, app: Any, host: str, session_id: str, name: str) -> RemoteViewState:
@@ -93,8 +96,8 @@ class RemoteViewState:
                 render_replayed_message(
                     event.message, presenter=self.presenter,
                     print_user=lambda message: self.presenter.print_user(
-                        Text(message.content[0].text if message.content else "", style=theme.BODY)
-                    ), print_unit=self.presenter.print_unit, tool_calls={},
+                        user_message(Text(displayed_user_text(message), style=theme.BODY))
+                    ), print_unit=self.presenter.print_unit, tool_calls=self.tool_calls,
                     replay_tool_starts=True, replay_tool_results=True,
                 )
         elif event.type is StreamEventType.MESSAGE_UPDATE:
@@ -123,6 +126,7 @@ class RemoteViewMixin:
         self._remote_select_task = None
         self._remote_picker = None
         self._remote_picker_unit = None
+        self._remote_picker_transcript = None
         self._remote_saved_composer = None
 
     async def _close_remote_view(self) -> None:
@@ -133,6 +137,13 @@ class RemoteViewMixin:
         await self.slash_detach("")
         self._remote_session_client = None
 
+    def _screen_presenter(self) -> TranscriptPresenter:
+        """the transcript the user sees: the remote view hides the local one."""
+        return self._remote_view.presenter if self._remote_view is not None else self._presenter
+
+    def _print_on_screen(self, text: str) -> None:
+        self._screen_presenter().print_unit(Text(f"system · {text}", style=theme.CHROME))
+
     @property
     def remote_picker_active(self) -> bool:
         return self._remote_picker is not None
@@ -141,14 +152,14 @@ class RemoteViewMixin:
         if self._remote_picker is not None:
             self._remote_picker.move(delta)
             if self._remote_picker_unit is not None:
-                self._remote_picker_unit.value = self._remote_picker.render()
+                self._remote_picker_transcript.replace(self._remote_picker_unit, self._remote_picker.render())
             self._invalidate_prompt()
 
     def remote_picker_cancel(self) -> None:
         self._remote_picker = None
         if self._remote_picker_unit is not None:
-            self._presenter.transcript.remove(self._remote_picker_unit)
-        self._remote_picker_unit = None
+            self._remote_picker_transcript.remove(self._remote_picker_unit)
+        self._remote_picker_unit = self._remote_picker_transcript = None
         self._invalidate_prompt()
 
     def remote_picker_select(self) -> None:
@@ -161,7 +172,8 @@ class RemoteViewMixin:
         try:
             await self._open_remote(self._remote_client(), chosen)
         except (RemoteWireError, ValueError) as exc:
-            self._print_system(str(exc))
+            self._print_on_screen(str(exc))
+            self._invalidate_prompt()
 
     async def _open_remote(self, client: RemoteSessionClient, chosen: RemoteSession) -> None:
         if self._remote_view is not None:
@@ -220,21 +232,30 @@ class RemoteViewMixin:
                 rows, errors = await client.discover()
                 host, prefix = None, None
             for error in errors:
-                self._print_system(error)
+                self._print_on_screen(error)
             if not rows:
-                return "no remote sessions found"
+                return self._remote_result("no remote sessions found")
             if prefix is not None:
                 chosen = choose_session(rows, prefix)
             elif len(rows) == 1:
                 chosen = rows[0]
             else:
                 self._remote_picker = RemotePicker(tuple(rows))
-                self._remote_picker_unit = self._presenter.print_unit(self._remote_picker.render())
+                presenter = self._screen_presenter()
+                self._remote_picker_unit = presenter.print_unit(self._remote_picker.render())
+                self._remote_picker_transcript = presenter.transcript
                 self._invalidate_prompt()
                 return ""
             await self._open_remote(client, chosen)
         except (RemoteWireError, ValueError) as exc:
-            return str(exc)
+            return self._remote_result(str(exc))
+        return ""
+
+    def _remote_result(self, text: str) -> str:
+        # the slash result prints to the local transcript; while attached, print it on screen instead.
+        if self._remote_view is None:
+            return text
+        self._print_on_screen(text)
         return ""
 
     async def _consume_remote_events(self, state: RemoteViewState, client: RemoteSessionClient) -> None:
