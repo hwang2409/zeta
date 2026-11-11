@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from ...core.store import ConversationStore
 
 ENTITLEMENT_ERROR_CODES = {"auth_error", "model_not_found", "permission_denied"}
-_HISTORY_PROJECTION_ATTEMPTS = 16
 
 
 def _failed_turn_history(message: Mapping[str, object]) -> dict[str, object] | None:
@@ -274,15 +273,10 @@ def history_projection(
     if cached is not None and cached.generation == generation:
         return cached.projection
 
-    # The store is loop-owned, but its validated snapshots are read here by the
-    # serve worker. Keep retries bounded while the owner appends.
-    stable_generation = None
-    for _ in range(_HISTORY_PROJECTION_ATTEMPTS):
-        generation = _generation(store)
-        branch = store.active_branch_snapshot()
-        if generation == _generation(store):
-            stable_generation = generation
-            break
+    # The store is loop-owned; the serve worker reads its validated snapshot.
+    generation = _generation(store)
+    branch = store.active_branch_snapshot()
+    stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}
     accepted_messages: dict[str, dict[str, object]] = {}

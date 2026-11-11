@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
+from typing import TypeVar
 
 from ...core.store._history_index import (
     InvalidHistoryPageRequest,
@@ -24,8 +26,26 @@ from .history_projection import (
 )
 
 HISTORY_FIRST_PAGE_ENTRIES = 128
+_STABLE_HISTORY_ATTEMPTS = 16
 _cache_creation_lock = threading.Lock()
 _MISSING_VALIDATOR = object()
+_T = TypeVar("_T")
+
+
+def _stable_history_read(
+    store: object, read: Callable[[], _T], *, has_end: bool
+) -> _T:
+    if has_end:
+        return read()
+    for attempt in range(_STABLE_HISTORY_ATTEMPTS):
+        generation = _generation(store)
+        result = read()
+        if (
+            generation == _generation(store)
+            or attempt == _STABLE_HISTORY_ATTEMPTS - 1
+        ):
+            return result
+    raise AssertionError("unreachable")
 
 
 def history_validator(
@@ -392,14 +412,19 @@ def replay_history(
     supplied_validator: object = _MISSING_VALIDATOR,
 ) -> tuple[dict, int, str | None]:
     """Return the newest backward page and its stable frontier row."""
-    return _backward_history_page(
-        runtime,
-        {"before": None},
-        include_delivery_id=include_delivery_id,
-        fidelity=fidelity,
-        content_read=content_read,
-        served_turn_end=served_turn_end,
-        supplied_validator=supplied_validator,
+    store = runtime.opened.store
+    return _stable_history_read(
+        store,
+        lambda: _backward_history_page(
+            runtime,
+            {"before": None},
+            include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
+            served_turn_end=served_turn_end,
+            supplied_validator=supplied_validator,
+        ),
+        has_end=supplied_validator is not _MISSING_VALIDATOR,
     )
 
 
@@ -644,13 +669,17 @@ def history(
         )
     if "before" in params:
         _validate_history_params(params)
-        return _backward_history_request(
-            runtime,
-            params,
-            include_delivery_id=include_delivery_id,
-            fidelity=fidelity,
-            content_read=content_read,
-            served_turn_end=served_turn_end,
+        return _stable_history_read(
+            runtime.opened.store,
+            lambda: _backward_history_request(
+                runtime,
+                params,
+                include_delivery_id=include_delivery_id,
+                fidelity=fidelity,
+                content_read=content_read,
+                served_turn_end=served_turn_end,
+            ),
+            has_end=params["before"] is not None,
         )
     if backward_keys.intersection(params):
         raise ProtocolError(
@@ -661,11 +690,15 @@ def history(
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "offset must be a nonnegative integer"
         )
-    return _forward_history_request(
-        runtime,
-        params,
-        include_delivery_id=include_delivery_id,
-        fidelity=fidelity,
-        content_read=content_read,
-        served_turn_end=served_turn_end,
+    return _stable_history_read(
+        runtime.opened.store,
+        lambda: _forward_history_request(
+            runtime,
+            params,
+            include_delivery_id=include_delivery_id,
+            fidelity=fidelity,
+            content_read=content_read,
+            served_turn_end=served_turn_end,
+        ),
+        has_end=False,
     )

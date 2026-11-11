@@ -612,20 +612,21 @@ def _read_stable_page(
     index: HistoryIndex,
     request: Mapping[str, object],
 ) -> IndexedHistoryPage | None:
-    for attempt in range(_HISTORY_PAGE_ATTEMPTS):
+    attempts = _HISTORY_PAGE_ATTEMPTS if "end" in request else 1
+    for attempt in range(attempts):
         try:
             if not index.available:
                 _rebuild_history_index(store)
             facts = store._history_index_facts()
             page = index.page(request, facts)
         except (StaleHistorySnapshot, HistoryIndexUnavailableError):
-            if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+            if store._read_only or attempt == attempts - 1:
                 return None
             index._mark_unavailable()
             continue
         if store._history_index_facts() == facts:
             return page
-        if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+        if store._read_only or attempt == attempts - 1:
             return None
         index._mark_unavailable()
     return None

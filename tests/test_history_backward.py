@@ -277,27 +277,58 @@ async def test_real_socket_backward_continuation_survives_append_but_not_repair(
 
 
 @pytest.mark.asyncio
-async def test_real_socket_newest_page_falls_back_after_concurrent_append(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("route", "history_params"),
+    [
+        ("indexed", {"before": None}),
+        ("projected-backward", {"before": None}),
+        ("projected-forward", {}),
+    ],
+)
+async def test_real_socket_validatorless_history_retries_concurrent_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    history_params: dict[str, object],
 ) -> None:
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
-        index = server.runtime.opened.store._history_index
+        store = server.runtime.opened.store
         page_ready = threading.Event()
         release_page = threading.Event()
+        calls = 0
 
-        def page_after_append(request: object, g0: object) -> object:
-            page_ready.set()
-            assert release_page.wait(timeout=10)
-            raise HistoryIndexUnavailableError("forced derived-state failure")
+        if route == "indexed":
+            index = store._history_index
 
-        monkeypatch.setattr(index, "page", page_after_append)
+            def page_after_append(request: object, g0: object) -> object:
+                nonlocal calls
+                calls += 1
+                page_ready.set()
+                assert release_page.wait(timeout=10)
+                raise HistoryIndexUnavailableError("forced derived-state failure")
+
+            monkeypatch.setattr(index, "page", page_after_append)
+        else:
+            monkeypatch.setattr(store, "history_index_page", lambda request: None)
+            original_page_history = history.page_history
+
+            def page_after_append(*args: object, **kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                if not page_ready.is_set():
+                    page_ready.set()
+                    assert release_page.wait(timeout=10)
+                return original_page_history(*args, **kwargs)
+
+            monkeypatch.setattr(history, "page_history", page_after_append)
+
         pending = asyncio.create_task(
             request(
                 reader,
                 writer,
                 3,
                 "session_history",
-                {"session_id": session_id, "before": None},
+                {"session_id": session_id, **history_params},
             )
         )
 
@@ -307,9 +338,9 @@ async def test_real_socket_newest_page_falls_back_after_concurrent_append(
         response = None
         try:
             await await_or_fail(
-                asyncio.to_thread(wait_for_page), what="history index page"
+                asyncio.to_thread(wait_for_page), what="history page"
             )
-            server.runtime.opened.store.append_message(
+            store.append_message(
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent("concurrent")]),
                     MessageOrigin.USER,
@@ -326,7 +357,9 @@ async def test_real_socket_newest_page_falls_back_after_concurrent_append(
                 what="history request cleanup",
             )
         assert "result" in response, response
-        assert response["result"]["messages"][-1]["content"][0]["text"] == "concurrent"
+        assert calls >= 2
+        if route != "projected-forward":
+            assert response["result"]["messages"][-1]["content"][0]["text"] == "concurrent"
 
 
 @pytest.mark.asyncio
