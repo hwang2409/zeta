@@ -23,6 +23,7 @@ from tests.support.replay_transport import (
     ReplayClient,
     Transport,
     connect_replay,
+    join_session_history_settled,
     negotiate,
     replay_server,
 )
@@ -577,30 +578,6 @@ def _case_id(case: tuple[Route, str]) -> str:
     return f"{event.value}-{variant or 'any'}-{scenario}"
 
 
-async def _join_newest_settled(serve: Serve, client: ReplayClient) -> dict[str, Any]:
-    """Join the newest history page once the session has settled.
-
-    A background child's completion wakes its parent for a follow-up turn, whose
-    durable rows land just after ``sub_agent_receipt``. When the joiner's off-loop
-    history read overlaps one of those appends, ``session_history_and_subscribe``
-    answers -32009 ``stale_history_snapshot`` ("restart from the newest page"): the
-    designed signal a real client acts on by re-joining. The follow-up turn is
-    finite, so the re-join settles.
-    """
-    for _ in range(200):
-        response = await client.request(
-            serve.request_id(), "session_history_and_subscribe", {"session_id": serve.session_id}
-        )
-        if "error" not in response:
-            return response["result"]
-        error = response["error"]
-        assert (
-            error["code"] == -32009
-            and error.get("data", {}).get("code") == "stale_history_snapshot"
-        ), response
-    raise AssertionError("history snapshot never settled")
-
-
 async def _run_scenario(tmp_path: Path, transport: Transport, name: str) -> tuple[Serve, list[dict[str, Any]]]:
     scenario = SCENARIOS[name]
     backend = scenario.backend(tmp_path)
@@ -609,7 +586,9 @@ async def _run_scenario(tmp_path: Path, transport: Transport, name: str) -> tupl
         await serve.join(serve.observer)
         await scenario.run(serve, backend)
         later = await serve.client()
-        history = (await _join_newest_settled(serve, later))["messages"]
+        history = (
+            await join_session_history_settled(later, serve.request_id, serve.session_id)
+        )["messages"]
     except BaseException:
         if isinstance(backend, BlockingBackend):
             backend.release.set()

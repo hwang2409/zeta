@@ -170,6 +170,31 @@ class ReplayClient:
             await self.writer.wait_closed()
 
 
+async def join_session_history_settled(
+    client: ReplayClient, request_id: Callable[[], int], session_id: str
+) -> dict[str, Any]:
+    """Join the newest ``session_history_and_subscribe`` page once it settles.
+
+    A background child's follow-up turn appends durable rows while the joiner's
+    off-loop history read runs, so the method answers -32009
+    ``stale_history_snapshot`` ("restart from the newest page"): the signal a real
+    client acts on by re-joining. The follow-up turn is finite, so a re-join
+    settles. Any other error, including a -32009 ``stale_event_sequence``, fails.
+    """
+    for _ in range(200):
+        reply = await client.request(
+            request_id(), "session_history_and_subscribe", {"session_id": session_id}
+        )
+        if "error" not in reply:
+            return reply["result"]
+        error = reply["error"]
+        assert (
+            error["code"] == -32009
+            and error.get("data", {}).get("code") == "stale_history_snapshot"
+        ), reply
+    raise AssertionError("session history snapshot never settled")
+
+
 async def connect_replay(server: ZetaServer, transport: Transport) -> ReplayClient:
     if transport == "unix":
         if server.connections is None:

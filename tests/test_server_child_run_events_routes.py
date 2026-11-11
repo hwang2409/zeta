@@ -21,6 +21,7 @@ from tests.support.replay_transport import (
     ReplayClient,
     Transport,
     connect_replay,
+    join_session_history_settled,
     negotiate,
     replay_server,
 )
@@ -119,18 +120,7 @@ class Serve:
             )
             assert "error" not in reply, reply
             return reply["result"]
-        for _ in range(200):
-            reply = await client.request(
-                self.request_id(), "session_history_and_subscribe", {"session_id": self.session_id}
-            )
-            if "error" not in reply:
-                return reply["result"]
-            error = reply["error"]
-            assert (
-                error["code"] == -32009
-                and error.get("data", {}).get("code") == "stale_history_snapshot"
-            ), reply
-        raise AssertionError("history snapshot never settled")
+        return await join_session_history_settled(client, self.request_id, self.session_id)
 
     async def drain(self, client: ReplayClient) -> list[dict[str, Any]]:
         """Every event the client received before a later status response."""
