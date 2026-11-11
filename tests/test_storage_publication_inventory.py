@@ -79,6 +79,7 @@ _RAW_DELETION = {
     ("accounts/store.py", "_delete_publication_pending", "unlink"),
     ("accounts/store.py", "_unlink_legacy_file", "unlink"),
     ("remote/descriptor.py", "remove", "unlink"),
+    ("remote/descriptor.py", "_unlink_if_owned", "unlink"),
     ("core/checkpoints/workspace.py", "_current_tree_sha", "unlink"),
     ("core/checkpoints/workspace.py", "_materialise_tree", "unlink"),
     ("core/checkpoints/workspace.py", "_prune_stale_entries", "unlink"),
