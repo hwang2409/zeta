@@ -59,9 +59,10 @@ def test_close_indexes_queued_transcript_refresh(
     real_observe = _store_writes._observe_refresh
 
     async def gated_observe(refresh: object) -> None:
-        await gate.wait()
+        await asyncio.wait_for(gate.wait(), 10)
         await real_observe(refresh)  # type: ignore[arg-type]
 
+    # test-contract: seam hold the real refresh behind a gate to remove the scheduling race
     monkeypatch.setattr(_store_writes, "_observe_refresh", gated_observe)
     real_drain = getattr(AgentLoop, "_drain_transcript_refreshes", None)
     if real_drain is not None:
@@ -70,6 +71,7 @@ def test_close_indexes_queued_transcript_refresh(
             gate.set()
             await real_drain(self)
 
+        # test-contract: seam release the gate only when the fix's drain step runs
         monkeypatch.setattr(AgentLoop, "_drain_transcript_refreshes", drain_then_release)
 
     args = build_parser().parse_args(["--provider", "codex"])
