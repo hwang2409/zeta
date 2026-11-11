@@ -2,28 +2,43 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
+from tests.support.fake_backend import FakeBackend
+from tests.support.owned import owned_app
+
 from zeta.core.checkpoints import ConversationEntry
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageRole,
     StreamEvent,
     StreamEventType,
+    MessageOrigin,
     TextContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
+    with_message_origin,
 )
 from zeta.remote.client import RemoteSessionClient
 from zeta.remote.discovery import split_target, validate_host
 from zeta.remote.transport import RemoteTransport, TransportItem, remote_bridge_command
 from zeta.remote.wire import BoundedLineDecoder, RemoteWireError, decode_line
 from zeta.server import event_contract
+from zeta.server.handlers.history import replay_history
+from zeta.runtime.loop import AgentLoop
 from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.skills import SkillCatalog
+from zeta.tui.app import FullScreenPromptSession, TUIApp
 from zeta.tui.slash_handlers.remote import RemoteViewMixin, RemoteViewState
 
 
@@ -182,6 +197,26 @@ async def test_configured_remote_keeps_ssh_user_and_port(tmp_path: Path) -> None
     assert seen == [("henry@laptop", 2222)], f"ssh target lost the URL's user or port: {seen}"
 
 
+def test_attach_history_replays_prompt_text_and_named_tool_card(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("call-1", "bash", {"command": "echo streamed-line-1"})
+    store.append_message(with_message_origin(
+        Message(MessageRole.USER, [TextContent("hello remote")]), MessageOrigin.USER))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("running a command now."), ToolUseContent(call)]))
+    store.append_message(Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult("call-1", "streamed-line-1")))
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("after the tool.")]))
+    # the rows the host's serve sends for session_history_and_subscribe.
+    result, _, _ = replay_history(SimpleNamespace(opened=SimpleNamespace(store=store)), include_delivery_id=False,
+                                  fidelity=True, content_read=False, served_turn_end=False)
+    frame = json.dumps({"jsonrpc": "2.0", "id": 2, "result": result}).encode()
+    state = RemoteViewState.create(SimpleNamespace(console=Console()), "home", "abc123", "")
+    for event in decode_line(frame):
+        state.render(event)
+    rendered = re.sub(r"\x1b\[[0-9;]*m", "", state.transcript.render(120))
+    for expected in ("hello remote", "running a command now.", "bash echo streamed-line-1", "streamed-line-1", "after the tool."):
+        assert expected in rendered, f"attach history lost {expected!r}:\n{rendered}"
+
+
 def _remote_app(tmp_path: Path, transport) -> RemoteViewMixin:
     class App(RemoteViewMixin):
         def __init__(self) -> None:
@@ -226,6 +261,28 @@ async def test_ssh_failure_is_reported_not_shown_as_no_sessions(tmp_path: Path) 
     rows, errors = await client.discover(("good", "laptop"))
     assert [row.session_id for row in rows] == ["abc123"]
     assert errors == ("ssh to laptop failed: Permission denied (publickey).",)
+
+
+@pytest.mark.asyncio
+async def test_failed_remote_command_output_is_repainted_without_a_keypress(tmp_path: Path) -> None:
+    # the slash command finishes after its enter key was drawn; the screen must repaint its output.
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
+        provider="codex", model="offline", zeta_home=tmp_path, console=Console(file=StringIO()),
+    )
+    async with owned_app(app):
+        app._remote_session_client = RemoteSessionClient(tmp_path, ssh=_fake_ssh(tmp_path))
+        with create_pipe_input() as pipe:
+            app._active_session = FullScreenPromptSession(input=pipe, output=DummyOutput(), multiline=True)
+            painted: list[str] = []
+            app._invalidate_prompt = lambda: painted.append(app._transcript.render(120))  # type: ignore[method-assign]
+            app._submit_input("/remote bad")
+            pipeline = app._submissions
+            while pipeline._slash_tasks or (pipeline._consumer is not None and not pipeline._consumer.done()):
+                pending = [task for task in (pipeline._consumer, *pipeline._slash_tasks.values()) if task is not None]
+                await asyncio.wait_for(asyncio.gather(*map(asyncio.shield, pending), return_exceptions=True), 10)
+            assert "ssh to bad failed" in app._transcript.render(120), "the command did not report the ssh failure"
+            assert painted and "ssh to bad failed" in painted[-1], "the ssh failure was printed but never repainted"
 
 
 @pytest.mark.asyncio

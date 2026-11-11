@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,7 @@ from rich.console import Group
 from rich.panel import Panel
 from rich.text import Text
 
-from ...protocol.types import StreamEvent, StreamEventType
+from ...protocol.types import StreamEvent, StreamEventType, ToolCall
 from ...remote.client import RemoteSessionClient
 from ...remote.discovery import (
     RemoteSession,
@@ -25,6 +25,7 @@ from ...remote.wire import RemoteWireError
 from .. import theme
 from ..checkpoints import render_replayed_message
 from ..transcript import TranscriptPresenter, TranscriptWidget
+from ..user import displayed_user_text, user_message
 
 
 @dataclass
@@ -58,6 +59,8 @@ class RemoteViewState:
     banner: Window
     container: HSplit
     disconnected: bool = False
+    # history tool results name their call by id; keep the calls so the card shows the tool name.
+    tool_calls: dict[str, ToolCall] = field(default_factory=dict)
 
     @classmethod
     def create(cls, app: Any, host: str, session_id: str, name: str) -> RemoteViewState:
@@ -93,8 +96,8 @@ class RemoteViewState:
                 render_replayed_message(
                     event.message, presenter=self.presenter,
                     print_user=lambda message: self.presenter.print_user(
-                        Text(message.content[0].text if message.content else "", style=theme.BODY)
-                    ), print_unit=self.presenter.print_unit, tool_calls={},
+                        user_message(Text(displayed_user_text(message), style=theme.BODY))
+                    ), print_unit=self.presenter.print_unit, tool_calls=self.tool_calls,
                     replay_tool_starts=True, replay_tool_results=True,
                 )
         elif event.type is StreamEventType.MESSAGE_UPDATE:

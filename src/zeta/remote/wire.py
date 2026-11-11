@@ -93,7 +93,8 @@ def history_events(result: Mapping[str, object]) -> tuple[StreamEvent, ...]:
     for row in messages:
         try:
             message = Message.from_dict(
-                {key: row[key] for key in ("role", "content", "tool_result", "metadata") if key in row}
+                # the server sends "tool_result": null on every non-tool row; Message rejects a null.
+                {key: row[key] for key in ("role", "content", "tool_result", "metadata") if row.get(key) is not None}
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
