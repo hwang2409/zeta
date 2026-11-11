@@ -109,7 +109,6 @@ from .slash_handlers.tasks_panel import BackgroundTasksMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import (
-    FinderControl,
     TranscriptPresenter,
     TranscriptWidget,
     stream_key,
@@ -339,11 +338,7 @@ class TUIApp(
         )
         self._active_finder = self._transcript
         self._status_card = OverlayControl()
-        self._finder_control = FinderControl(
-            lambda: app._active_finder.finder_state()
-        )
-        self._finder_prepare_task: asyncio.Task[None] | None = None
-        self._finder_rank_task: asyncio.Task[None] | None = None
+        self._init_finder_runtime()
         self._composer_restore_document: Document | None = None
         self._status_card_open = False
         self._mcp_manager_open = False
@@ -514,7 +509,6 @@ class TUIApp(
             decisions_answering=lambda: app._decisions_panel.mode == "answer",
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
-            on_decisions_input=lambda text: app._decisions_answer_input(text),
             on_page_up=self._transcript.page_up,
             on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
@@ -523,7 +517,6 @@ class TUIApp(
             on_history_next=lambda buffer: app._history_next(buffer),
             finder_active=lambda: app._active_finder.finder_active,
             history_finder_active=lambda: app._history_finder.finder_active,
-            on_finder_input=lambda query: app._finder_input(query),
             on_finder_move=lambda delta: app._finder_move(delta),
             on_finder_accept=lambda: app._finder_accept(),
             on_finder_cancel=lambda: app._finder_cancel(),
@@ -1118,6 +1111,8 @@ class TUIApp(
                 finder_window=self._finder_control.window(),
                 finder_active=lambda: app._active_finder.finder_active,
                 queued_messages=lambda: app.queued_messages,
+                decisions_answer_window=app._decisions_answer_field.window,
+                overlay_field_windows=(app._finder_field.window,),
             )
         ]
         self._agent_navigation.bind_layout(
