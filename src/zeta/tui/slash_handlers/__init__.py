@@ -238,7 +238,7 @@ class SlashHandlerMixin:
             if context is None:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
-        if self.active or self.pending_approvals:
+        if self.active or await self.approval_pending_now():
             return (
                 "accounts unavailable: cannot switch while a turn or approval is active"
             )
@@ -461,7 +461,7 @@ class SlashHandlerMixin:
 
         requested = args.strip()
         self._start_model_catalog_load()
-        busy = bool(self.active or self.pending_approvals)
+        busy = self.active or await self.approval_pending_now()
         if not requested:
             if busy:
                 return (

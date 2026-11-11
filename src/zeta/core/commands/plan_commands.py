@@ -14,6 +14,8 @@ class PlanModeSession(Protocol):
     active: bool
     pending_approvals: object
 
+    def approval_pending_now(self) -> Awaitable[bool]: ...
+
     def set_plan_mode(self, enabled: bool) -> Awaitable[None] | None: ...
 
     def invalidate_prompt(self) -> None: ...
@@ -35,7 +37,7 @@ async def run_plan_command(
         return await _set_plan_mode(session, True)
     if normalized == "toggle":
         return await _set_plan_mode(session, not session.plan_mode)
-    if session.active or session.pending_approvals:
+    if session.active or await session.approval_pending_now():
         return (
             "plan mode unchanged: cannot change plan mode while a turn or "
             "approval is active"
@@ -58,7 +60,7 @@ async def run_implement_command(
         return "implement unchanged: /implement does not accept arguments"
     if not session.plan_mode:
         return "implement unavailable: plan mode is off"
-    if session.active or session.pending_approvals:
+    if session.active or await session.approval_pending_now():
         return (
             "implement unavailable: cannot leave plan mode while a turn or "
             "approval is active"
@@ -74,7 +76,7 @@ async def run_implement_command(
 async def _set_plan_mode(session: PlanModeSession, enabled: bool) -> str:
     if enabled == session.plan_mode:
         return f"plan mode: {'on' if enabled else 'off'}"
-    if session.active or session.pending_approvals:
+    if session.active or await session.approval_pending_now():
         return (
             "plan mode unchanged: cannot change plan mode while a turn or "
             "approval is active"
