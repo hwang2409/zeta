@@ -3251,16 +3251,19 @@ async def test_background_task_stays_running_for_detached_group_member(
 ) -> None:
     ready = tmp_path / "detached-ready"
     terminated = tmp_path / "detached-terminated"
+    # The handler sleeps before writing so the kill must honour the full term
+    # grace for the detached member. Without that grace the member is SIGKILLed
+    # mid-handler and `terminated` is never written (the CI flake).
     child = (
         "import os,pathlib,signal,time; "
         f"ready=pathlib.Path({str(ready)!r}); "
         f"terminated=pathlib.Path({str(terminated)!r}); "
         "signal.signal(signal.SIGTERM, lambda *_: "
-        "(terminated.write_text(str(os.getpid())), exit())[1]); "
+        "(time.sleep(3.0), terminated.write_text(str(os.getpid())), os._exit(0))); "
         "ready.write_text(str(os.getpid())); "
         "time.sleep(300)"
     )
-    tasks = BackgroundTaskRegistry()
+    tasks = BackgroundTaskRegistry(term_grace=10.0)
     task_id, pid = await tasks.start(
         _python(
             "import subprocess,sys; "
