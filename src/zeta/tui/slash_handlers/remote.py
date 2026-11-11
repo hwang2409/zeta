@@ -86,19 +86,20 @@ class RemoteViewState:
     def render(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
             self.presenter.reset_assistant_message()
-        elif event.type is StreamEventType.MESSAGE_END and event.message is not None:
-            render_replayed_message(
-                event.message, presenter=self.presenter,
-                print_user=lambda message: self.presenter.print_user(
-                    Text(message.content[0].text if message.content else "", style=theme.BODY)
-                ), print_unit=self.presenter.print_unit, tool_calls={},
-                replay_tool_starts=True, replay_tool_results=True,
-            )
+        elif event.type is StreamEventType.MESSAGE_END:
+            # live text arrives as deltas; the server can send a live assistant_message after the
+            # next message's deltas, so only history rows are rendered from the message itself.
+            if event.data.get("remote_history") and event.message is not None:
+                render_replayed_message(
+                    event.message, presenter=self.presenter,
+                    print_user=lambda message: self.presenter.print_user(
+                        Text(message.content[0].text if message.content else "", style=theme.BODY)
+                    ), print_unit=self.presenter.print_unit, tool_calls={},
+                    replay_tool_starts=True, replay_tool_results=True,
+                )
         elif event.type is StreamEventType.MESSAGE_UPDATE:
             if event.delta:
                 self.presenter.append_assistant(event.delta)
-        elif event.type is StreamEventType.MESSAGE_END:
-            self.presenter.finish_assistant_message(self.presenter.render_event(event))
         elif event.type in {
             StreamEventType.TOOL_EXECUTION_START,
             StreamEventType.TOOL_EXECUTION_UPDATE,
