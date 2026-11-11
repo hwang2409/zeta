@@ -25,7 +25,7 @@ from tests.support.replay_transport import (
     replay_server,
 )
 from zeta.core import agent_progress
-from zeta.core.agent_progress import publish_child_ended, remove_live_agent_lifecycle
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolResult
 from zeta.server import ZetaServer
@@ -391,7 +391,9 @@ async def test_64_maximal_lifecycle_frames_fit_the_scope_byte_cap(
         for index in range(SCOPE_RECORDS):
             run_id = prefix + "9" * (256 - len(prefix) - 2) + f"{index + 10}"
             assert len(run_id.encode()) == 256
-            publish_child_ended(run_id, 2**62 + index, _maximal_lifecycle(run_id))
+            agent_progress.publish_child_ended(
+                run_id, 2**62 + index, _maximal_lifecycle(run_id)
+            )
         await _lifecycle_applied(server)
         await await_or_fail(held.wait(), what="first lifecycle frame write")
         charged = replay._scopes[scope]
@@ -668,4 +670,3 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
         for store in restarted:
             store.close()
         await second.close()
-
