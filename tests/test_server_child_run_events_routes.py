@@ -158,7 +158,15 @@ class EndProbe:
     session_dir: Path
     ended: list[tuple[str, int, dict[str, Any]]] = field(default_factory=list)
 
-    def sink(self, kind: str, run_id: str, row: dict[str, object], number: int) -> None:
+    def sink(
+        self,
+        kind: str,
+        run_id: str,
+        row: dict[str, object],
+        number: int,
+        store: object | None,
+    ) -> None:
+        del store
         if kind == "ended":
             durable = load_session_json(_lifecycle_path(self.session_dir, run_id))
             self.ended.append((run_id, number, durable))
