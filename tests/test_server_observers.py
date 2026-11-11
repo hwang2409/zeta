@@ -18,6 +18,7 @@ from tests.support.serve_close import close_serve
 from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import TIMEOUT, _connect, _read, _request
+from zeta.core.session import SessionManager
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -26,6 +27,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolUseContent,
     with_message_origin,
 )
 from zeta.server import ZetaServer
@@ -377,6 +379,96 @@ async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> 
         if legacy_observer_writer is not None:
             legacy_observer_writer.close()
             await legacy_observer_writer.wait_closed()
+        await close_serve(server, controller_writer)
+
+
+@pytest.mark.asyncio
+async def test_join_baseline_represents_durable_approval_after_restart(
+    tmp_path: Path,
+) -> None:
+    # A durable foreground approval persisted before a serve restart must appear in the
+    # join baseline for a resumed idle session, not only in the status RPC. The loop owns
+    # no in-memory approval records until a turn resumes, so the baseline falls back to the
+    # durable store the same way status does.
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("resumed-call", "read", {"path": str(target)})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        provider="codex",
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["session_replay_seq"]},
+        )
+        await _request(
+            controller_reader, controller_writer, 2, "resume", {"session_id": session_id}
+        )
+        # The loop re-presents nothing on resume, so the in-memory projection is empty.
+        assert server.control.pending_approvals_now(reconnect=True) == []
+        controller_join = (
+            await _request(
+                controller_reader,
+                controller_writer,
+                3,
+                "session_history_and_subscribe",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+        assert [
+            row["request_id"]
+            for row in controller_join["status"]["pending_approvals"]
+        ] == [call.id]
+
+        observer_reader, observer_writer = await _observer(
+            server, 10, ["serve_observers", "session_replay_seq"]
+        )
+        observer_join = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                11,
+                "session_history_and_subscribe",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+        assert [
+            row["request_id"]
+            for row in observer_join["status"]["pending_approvals"]
+        ] == [call.id]
+        rejected = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                12,
+                "approve",
+                {"request_id": call.id},
+            )
+        )[-1]
+        assert rejected["error"]["code"] == -32008
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
         await close_serve(server, controller_writer)
 
 

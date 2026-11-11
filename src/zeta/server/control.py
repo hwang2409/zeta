@@ -297,6 +297,9 @@ class ServeControl:
     async def pending_approvals(self) -> list[dict[str, object]]:
         return await self._approvals.pending_approvals()
 
+    async def reconnect_baseline(self) -> tuple[list[dict[str, object]], bool]:
+        return await self._approvals.reconnect_baseline()
+
     def clear_approvals(self) -> None:
         self._approvals.clear_approvals()
 

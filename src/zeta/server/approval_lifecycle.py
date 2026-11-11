@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 
 APPROVAL_SETTLEMENT_CLOSE_TIMEOUT = FRAME_CANCEL_GRACE
 
+RECONNECT_APPROVAL_BOUND = 64
+
+
+def _bound_reconnect(
+    rows: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], bool]:
+    """Bound a reconnect approval projection to the wire limit, flagging truncation."""
+
+    return rows[:RECONNECT_APPROVAL_BOUND], len(rows) > RECONNECT_APPROVAL_BOUND
+
 
 ApprovalKey = str | tuple[str, str]
 
@@ -444,9 +454,19 @@ class ApprovalLifecycle:
         ]
         if not reconnect:
             return visible
-        truncated = len(visible) > 64
-        bounded = visible[:64]
+        bounded, truncated = _bound_reconnect(visible)
         return (bounded, truncated) if include_truncated else bounded
+
+    async def reconnect_baseline(self) -> tuple[list[dict[str, object]], bool]:
+        """Pending approvals a reconnecting client sees: live loop records, else the
+        durable store so a resumed idle session still re-presents open approvals."""
+
+        live, truncated = self.pending_approvals_now(
+            reconnect=True, include_truncated=True
+        )
+        if live:
+            return live, truncated
+        return _bound_reconnect(await self._pending_approvals_projection())
 
     @staticmethod
     def _resolution_pending(record: ApprovalRecord) -> str:

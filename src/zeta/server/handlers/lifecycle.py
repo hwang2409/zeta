@@ -175,12 +175,10 @@ def session_snapshot(self) -> dict[str, object] | None:
     return snapshot
 
 
-def live_status_baseline(self) -> dict[str, object]:
+async def live_status_baseline(self) -> dict[str, object]:
     runtime = self.server.runtime
     control = self.server.control
-    pending, truncated = control.pending_approvals_now(
-        reconnect=True, include_truncated=True
-    )
+    pending, truncated = await control.reconnect_baseline()
     return {
         "state": (
             "idle"
@@ -201,7 +199,7 @@ async def status(
     runtime = self.server.runtime
     session = session_snapshot(self)
     reconnect = "approval_reconnect" in self.features
-    baseline = live_status_baseline(self)
+    baseline = await live_status_baseline(self)
     if reconnect:
         pending_approvals = baseline["pending_approvals"]
         pending_approvals_truncated = baseline["pending_approvals_truncated"]
