@@ -33,7 +33,11 @@ from ..protocol.types import (
     assistant_text,
     is_owned_completion_backend,
 )
-from ..providers.rate_limit_hold import rate_limit_hold_text
+from ..providers.rate_limit_hold import (
+    foreground_hold_abandoned,
+    foreground_hold_text,
+    rate_limit_hold_text,
+)
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
@@ -84,6 +88,12 @@ _compose_child_system_prompt = _child_context._compose_child_system_prompt
 
 logger = logging.getLogger(__name__)
 _EMPTY_METADATA: Mapping[str, object] = MappingProxyType({})
+
+
+class _ForegroundChildHeld(Exception):
+    """A foreground child hit a hold too long to block its caller; its text is the receipt."""
+
+
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
 
@@ -154,6 +164,10 @@ async def consume_child(
                 update_step(status)
                 publish(status)
             elif await hold_wake.observe(event):
+                if not background and foreground_hold_abandoned(event.data):
+                    # a foreground caller is blocked on this child; a days-long
+                    # hold would hang it, so stop now with a named receipt.
+                    raise _ForegroundChildHeld(foreground_hold_text(event.data))
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
                 publish(status)
@@ -328,6 +342,8 @@ async def consume_child(
                 final_message = fallback_message
     except asyncio.CancelledError:
         raise
+    except _ForegroundChildHeld as held:
+        return terminal_result(state="failed", text=str(held))
     except Exception as exc:  # noqa: BLE001 - child failures become receipts
         failure_message = error_message(exc)
     if failure_message is not None:

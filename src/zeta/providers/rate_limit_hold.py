@@ -50,6 +50,28 @@ def subscription_limit_wait(resets_at: float, now: float) -> float:
     return max(resets_at - now, SUBSCRIPTION_LIMIT_MIN_PROBE_SECONDS)
 
 
+def foreground_hold_abandoned(data: Mapping[str, Any]) -> bool:
+    """A foreground child cannot block its caller on a hold this long; it stops instead."""
+    return (
+        data.get("limit") == "subscription"
+        or float(data["retry_after"]) > LONG_HOLD_WAKE_SECONDS
+    )
+
+
+def foreground_hold_text(data: Mapping[str, Any]) -> str:
+    """Tell a blocked caller why a foreground child stopped rather than wait out a hold."""
+
+    until = datetime.fromtimestamp(data["until"]).astimezone()
+    today = datetime.now().astimezone().date()
+    stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
+    who = data.get("account") or data["provider"]
+    kind = "subscription limit" if data.get("limit") == "subscription" else "rate limit"
+    return (
+        f"foreground child not run: {who} is held by a {kind} until {stamp}. "
+        "Start it in the background to wait the hold out, or switch account or log in."
+    )
+
+
 def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
     """Describe a rate-limit hold event as local wall time plus the next probe."""
 
