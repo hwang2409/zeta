@@ -678,16 +678,13 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "def helper(): return 1\n",
-                "def branch(): pass\n",
-                "base = 1\n",
+                "base = 1\ndef helper(): return 1\n",
+                "base = 1\ndef branch(): pass\n",
+                "base = 1\ndef branch(): pass\n",
                 "def helper(): return 1\n",
                 "src/b.py",
             ),
-            # The merge reverted src/a.py to the base line "base = 1" that both main and the
-            # branch removed, and the final head keeps it, so it is a real re-added deletion
-            # (exit 1) on top of the helper move that is cleared (moved/restored later).
-            1,
+            0,
             "moved/restored later: src/b.py",
         )
     if case == "restored in place":
@@ -737,15 +734,13 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "VALUE = 1\n",
-                "VALUE = 2\n",
-                "base = 1\n",
+                "base = 1\nVALUE = 1\n",
+                "base = 1\nVALUE = 2\n",
+                "base = 1\nVALUE = 2\n",
                 "VALUE = 1\n",
                 "src/b.py",
             ),
-            # Merge reverted src/a.py to "base = 1" (removed by both sides) and the final head
-            # keeps it: a real re-added deletion (exit 1) alongside the cleared constant move.
-            1,
+            0,
             "moved/restored later: src/b.py",
         )
     if case == "constant duplicate final":
@@ -767,15 +762,13 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
         return (
             *_final_loss(
                 r,
-                "class Box:\n    value = 1\n    def method(self): return 1\n",
-                "class Branch:\n    pass\n",
-                "base = 1\n",
+                "base = 1\nclass Box:\n    value = 1\n    def method(self): return 1\n",
+                "base = 1\nclass Branch:\n    pass\n",
+                "base = 1\nclass Branch:\n    pass\n",
                 "class Box:\n    value = 1\n    def method(self): return 1\n",
                 "src/b.py",
             ),
-            # Merge reverted src/a.py to "base = 1" (removed by both sides) and the final head
-            # keeps it: a real re-added deletion (exit 1) alongside the cleared class move.
-            1,
+            0,
             "moved/restored later: src/b.py",
         )
     if case == "element same-named collection moved":
@@ -864,14 +857,14 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
     ("case", "expected", "needle"),
     [
         ("unrelated same-name def", 1, "def helper"),
-        ("true move", 1, "moved/restored later: src/b.py"),
+        ("true move", 0, "moved/restored later: src/b.py"),
         ("restored in place", 0, "moved/restored later: src/a.py"),
         ("element unrelated", 1, "TARGET"),
         ("element restored", 0, "moved/restored later: src/a.py"),
         ("constant different value", 1, "VALUE"),
-        ("constant moved same value", 1, "moved/restored later: src/b.py"),
+        ("constant moved same value", 0, "moved/restored later: src/b.py"),
         ("constant duplicate final", 1, "VALUE"),
-        ("class moved with member", 1, "moved/restored later: src/b.py"),
+        ("class moved with member", 0, "moved/restored later: src/b.py"),
         ("element same-named collection moved", 0, "moved/restored later: src/b.py"),
         ("duplicate final collection", 1, "TARGET"),
         ("dispatch restored", 0, "moved/restored later: src/a.py"),
