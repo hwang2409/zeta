@@ -17,14 +17,17 @@ import pytest
 
 from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
-from zeta.core import agent_state
+from zeta.core import agent_state, transcript_recovery
+from zeta.core.session_files import session_directory
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationEntry,
     ConversationIntegrityError,
     ConversationStore,
+    TranscriptLoadError,
     _async_writes,
 )
+from zeta.core.store._history_index import HistoryIndexUnavailableError
 from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
@@ -55,6 +58,201 @@ def test_every_notification_kind_has_a_validator() -> None:
     assert set(NOTIFICATION_VALIDATORS) == set(NOTIFICATION_KINDS) == set(payloads)
     for kind in NOTIFICATION_KINDS:
         validate_notification_data(payloads[kind])
+
+
+def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index")
+    try:
+        for value in range(3):
+            store.append_message(message(MessageRole.USER, str(value)))
+        index = store._history_index
+        assert index is not None
+        page = index.page({"offset": 0}, store._history_index_facts())
+        assert page.groups[2][-1].seq == 3
+        writer = store._new_persistent_durable_writer()
+        try:
+            assert writer._history_index is index
+        finally:
+            writer.close()
+    finally:
+        store.close()
+    reopened = ConversationStore(tmp_path, session_id="history-index")
+    try:
+        page = reopened._history_index.page(
+            {"offset": 0}, reopened._history_index_facts()
+        )
+        assert [
+            entry.data["message"]["content"][0]["text"]
+            for group in page.groups
+            for entry in group
+        ] == ["0", "1", "2"]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_append_defers_sqlite_to_an_off_loop_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-loop")
+    index = store._history_index
+    assert index is not None
+
+    called = False
+
+    def reject_loop_sqlite(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        called = True
+        raise AssertionError("sqlite ran on the event-loop thread")
+
+    monkeypatch.setattr(index, "apply_committed", reject_loop_sqlite)
+    index._available = True
+    try:
+        store.append_many([("warning", {"message": "committed"})])
+        assert not called
+        assert not index.available
+        await asyncio.to_thread(store._sync_history_index, store._entries)
+        assert index.available
+    finally:
+        store.close()
+
+
+def test_history_index_failure_never_turns_a_committed_append_into_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-failure")
+    index = store._history_index
+    assert index is not None
+
+    def fail_after_transcript(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("forced derived index failure")
+
+    monkeypatch.setattr(index, "apply_committed", fail_after_transcript)
+    try:
+        committed = store.append_many([("warning", {"message": "committed"})])
+        assert len(committed) == 1
+    finally:
+        store.close()
+
+    reopened = ConversationStore(tmp_path, session_id="history-index-failure")
+    try:
+        assert [entry.data.get("message") for entry in reopened.entries].count("committed") == 1
+    finally:
+        reopened.close()
+
+
+def test_corrupt_history_index_never_blocks_a_valid_transcript_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    store.append_many([("warning", {"message": "authority"})])
+    index_path = store.session_dir / "history-index.sqlite3"
+    store.close()
+    index_path.write_bytes(b"not sqlite")
+
+    reopened = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    try:
+        assert reopened.entries[-1].data["message"] == "authority"
+        assert reopened._history_index.available
+    finally:
+        reopened.close()
+
+    index_path.write_bytes(b"not sqlite")
+    # test-contract: seam forces a derived rebuild failure through real store open
+    monkeypatch.setattr(
+        "zeta.core.store._history_index.HistoryIndex._rebuild",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("forced rebuild failure")),
+    )
+    unavailable = ConversationStore(tmp_path, session_id="history-index-corrupt")
+    try:
+        assert unavailable.entries[-1].data["message"] == "authority"
+        with pytest.raises(HistoryIndexUnavailableError):
+            unavailable._history_index.page(
+                {"offset": 0}, unavailable._history_index_facts()
+            )
+    finally:
+        unavailable.close()
+
+
+def test_history_index_rejects_a_repaired_transcript_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = ConversationStore(root, session_id="history-repair")
+    store.append_many([("warning", {"message": "retained"})])
+    facts = store._history_index_facts()
+    store.close()
+    transcript = root / "history-repair" / "conversation.jsonl"
+    transcript.write_bytes(transcript.read_bytes() + b'{"seq":"invalid"}\\n')
+    with pytest.raises(TranscriptLoadError) as raised:
+        refused = ConversationStore(root, session_id="history-repair", _read_only=True)
+        refused.close()
+    source_facts = raised.value._source_facts
+    with session_directory(root, "history-repair") as (_, directory_fd):
+        transcript_recovery.repair_transcript(
+            directory_fd,
+            transcript_recovery.RepairTarget("history-repair"),
+            source_facts,
+            strict_reopen=lambda: None,
+            memory_review_required=False,
+        )
+    repaired = ConversationStore(root, session_id="history-repair")
+    try:
+        assert repaired._history_index is not None
+        with pytest.raises(RuntimeError) as raised:
+            repaired._history_index.page({"after": 0}, facts)
+        assert raised.value.__class__.__name__ == "StaleHistorySnapshot"
+    finally:
+        repaired.close()
+
+
+def test_history_index_close_waits_for_an_inflight_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path, session_id="history-index-close")
+    try:
+        index = store._history_index
+        assert index is not None
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        facts = store._history_index_facts()
+
+        class Result:
+            def __init__(self, rows: list[object]) -> None:
+                self.rows = rows
+
+            def fetchone(self) -> object:
+                return self.rows[0] if self.rows else None
+
+            def fetchall(self) -> list[object]:
+                return self.rows
+
+        class BlockedConnection:
+            def execute(self, sql: str, *args: object) -> Result:
+                if "FROM entries" in sql:
+                    return Result([])
+                entered.set()
+                assert release.wait(timeout=10)
+                return Result([(json.dumps(facts),)])
+
+            def close(self) -> None:
+                return None
+
+        # test-contract: seam pauses the real leaf operation to prove close ordering.
+        monkeypatch.setattr(index, "_connection", lambda write: BlockedConnection())
+        page = threading.Thread(
+            target=lambda: index.page({"after": 0}, facts), daemon=True
+        )
+        page.start()
+        assert entered.wait(timeout=10)
+        closer = threading.Thread(target=lambda: (index.close(), closed.set()), daemon=True)
+        closer.start()
+        assert not closed.is_set()
+        release.set()
+        page.join(timeout=10)
+        closer.join(timeout=10)
+        assert closed.is_set()
+    finally:
+        store.close()
 
 
 def test_persistent_detached_writer_retains_home_lease(tmp_path: Path) -> None:

@@ -450,7 +450,10 @@ class ReplayOutput:
         state.connection.writer.close()
 
     async def read_replay_history(
-        self, connection: Any, session_id: str
+        self,
+        connection: Any,
+        session_id: str,
+        history_validator: object | None = None,
     ) -> tuple[dict[str, object], int, str | None]:
         """Read the newest history page and its stable frontier row off-loop."""
         store = validation.active(connection.server.runtime, {"session_id": session_id})
@@ -465,6 +468,11 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                **(
+                    {"supplied_validator": history_validator}
+                    if history_validator is not None
+                    else {}
+                ),
             )
             return history, frontier_seq, frontier_row_id
 

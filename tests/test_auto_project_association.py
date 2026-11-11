@@ -155,26 +155,34 @@ def test_resumed_session_keeps_association_and_child_inherits(tmp_path: Path) ->
     assert len(m.project_registry.list_projects()) == 1
 
 
-def test_project_tool_inspects_auto_associated_memory(tmp_path: Path) -> None:
+def test_project_tool_bounds_legacy_memory(tmp_path: Path) -> None:
     root = repo(tmp_path)
     m = manager(tmp_path)
-    opened = m.create(provider="codex", model="test", cwd=root)
+    project = m.project_registry.create_project("legacy", "scope")
+    m.project_registry.initialize_memory(project.project_id)
     tools = ToolRegistry(
         cwd=str(root),
-        project_id=opened.metadata.project_id,
+        project_id=project.project_id,
         project_registry=m.project_registry,
         skill_catalog=SkillCatalog.empty(),
     )
     tools.project_registry_state = m.project_registry_state
+    for name in ("brief.md", "state.md", "backlog.md", "changelog.md", "decisions.md"):
+        m.project_registry.update_memory(project.project_id, {name: "x" * 20_000})
     # Registration is the public capability boundary; invoke the async handler directly.
     from zeta.tools.project import _inspect_project
 
-    result = asyncio.run(_inspect_project(tools, {"action": "inspect"}))
-    assert result["isError"] is False
-    assert (
-        result["structuredContent"]["project"]["project_id"]
-        == opened.metadata.project_id
-    )
+    try:
+        result = asyncio.run(_inspect_project(tools, {"action": "inspect"}))
+        assert result["isError"] is False
+        assert (
+            result["structuredContent"]["project"]["project_id"]
+            == project.project_id
+        )
+        memory = result["structuredContent"]["memory"]
+        assert sum(len(content.encode()) for content in memory.values()) <= 64 * 1024
+    finally:
+        asyncio.run(tools.close())
 
 
 async def test_project_slash_show_and_init(tmp_path: Path) -> None:
