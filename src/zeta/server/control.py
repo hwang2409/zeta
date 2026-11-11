@@ -298,7 +298,18 @@ class ServeControl:
         return await self._approvals.pending_approvals()
 
     async def reconnect_baseline(self) -> tuple[list[dict[str, object]], bool]:
-        return await self._approvals.reconnect_baseline()
+        """Pending approvals a reconnecting client sees: the loop-owned live records,
+        else the durable store projection so a resumed idle session (no in-memory
+        records yet) still re-presents open approvals. Bounds the store fallback to the
+        same 64 the live projection uses."""
+
+        live, truncated = self._approvals.pending_approvals_now(
+            reconnect=True, include_truncated=True
+        )
+        if live:
+            return live, truncated
+        durable = await self._approvals.pending_approvals()
+        return durable[:64], len(durable) > 64
 
     def clear_approvals(self) -> None:
         self._approvals.clear_approvals()
