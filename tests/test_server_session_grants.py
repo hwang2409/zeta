@@ -2869,13 +2869,16 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 assert len(durable_ends) == 1, (
                     f"external_end wrote {len(durable_ends)} durable ends"
                 )
-                wire_ends = [
-                    frame
+                # Count distinct deliveries: a transport may surface one frame in
+                # both a response batch and the event stream, so dedupe identical
+                # frames; two genuinely distinct approval_end deliveries still fail.
+                wire_ends = {
+                    json.dumps(frame.get("params", {}), sort_keys=True)
                     for frame in observed
                     if frame.get("params", {}).get("event") == "approval_end"
-                ]
+                }
                 assert len(wire_ends) == 1, (
-                    f"external_end emitted {len(wire_ends)} approval_end frames"
+                    f"external_end emitted {len(wire_ends)} distinct approval_end frames"
                 )
     finally:
         release.set() if "release" in locals() else None

@@ -140,7 +140,9 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
     # The whole recovered tree shares the root writer lease, so one observed
     # home epoch (from the session manager) selects every restart reason.
     manager = getattr(loop, "manager", None)
-    home_epoch = manager.observed_storage_epoch
+    # No manager here (a rare detached path) means no observed epoch; fall back to
+    # a reasonless abort, which every reader accepts.
+    home_epoch = manager.observed_storage_epoch if manager is not None else 0
 
     stop_recovery = threading.Event()
 
