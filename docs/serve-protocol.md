@@ -869,7 +869,8 @@ server's live projection and is limited to 64 entries. The result also contains
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Read-only observers receive the same live baseline as the controller,
 but approval mutations still return `-32008`. Without the feature, the status
-shape and unbounded strict durable projection are unchanged.
+shape and unbounded strict durable projection are unchanged, and observers
+receive the same rows as the controller.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn

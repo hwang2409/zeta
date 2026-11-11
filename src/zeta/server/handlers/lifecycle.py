@@ -202,13 +202,12 @@ async def status(
     session = session_snapshot(self)
     reconnect = "approval_reconnect" in self.features
     baseline = live_status_baseline(self)
-    if not reconnect:
-        baseline["pending_approvals"] = (
-            await self.server.control.pending_approvals()
-            if self.role != "observer"
-            else []
-        )
-        baseline.pop("pending_approvals_truncated")
+    if reconnect:
+        pending_approvals = baseline["pending_approvals"]
+        pending_approvals_truncated = baseline["pending_approvals_truncated"]
+    else:
+        pending_approvals = await self.server.control.pending_approvals()
+        pending_approvals_truncated = None
     loop = runtime.loop
     if loop is None and fallback_config is None:
         fallback_config = await asyncio.to_thread(runtime._config, None, None)
@@ -242,9 +241,9 @@ async def status(
             else fallback_config.agents_max_depth  # type: ignore[union-attr]
         )
     suffix = {
-        "pending_approvals": baseline["pending_approvals"],
+        "pending_approvals": pending_approvals,
         **(
-            {"pending_approvals_truncated": baseline["pending_approvals_truncated"]}
+            {"pending_approvals_truncated": pending_approvals_truncated}
             if reconnect
             else {}
         ),

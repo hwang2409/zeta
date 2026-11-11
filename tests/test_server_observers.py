@@ -280,6 +280,7 @@ async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> 
     )
     controller_reader, controller_writer = await _connect(server)
     observer_writer: asyncio.StreamWriter | None = None
+    legacy_observer_writer: asyncio.StreamWriter | None = None
     try:
         await _request(
             controller_reader,
@@ -334,6 +335,16 @@ async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> 
             row["request_id"] for row in joined["status"]["pending_approvals"]
         ] == [request_id]
 
+        legacy_observer_reader, legacy_observer_writer = await _observer(
+            server, 20, ["serve_observers"]
+        )
+        legacy_status = (
+            await _request(legacy_observer_reader, legacy_observer_writer, 21, "status")
+        )[-1]["result"]
+        assert [
+            row["request_id"] for row in legacy_status["pending_approvals"]
+        ] == [request_id]
+
         rejected = (
             await _request(
                 observer_reader,
@@ -363,6 +374,9 @@ async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> 
         if observer_writer is not None:
             observer_writer.close()
             await observer_writer.wait_closed()
+        if legacy_observer_writer is not None:
+            legacy_observer_writer.close()
+            await legacy_observer_writer.wait_closed()
         await close_serve(server, controller_writer)
 
 
