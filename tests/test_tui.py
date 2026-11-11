@@ -8963,7 +8963,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_steps = 0
     gated_once = False
 
-    def gated_recovery(loop: AgentLoop, **kwargs: object) -> object:
+    def gated_recovery(loop: AgentLoop, home_epoch: int, **kwargs: object) -> object:
         nonlocal gated_once, recovery_steps
         children_before = len(loop.store.agent_children())
         should_stop = kwargs.get("should_stop")
@@ -8982,7 +8982,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
                     time.sleep(0.01)
             return bool(should_stop and should_stop())
 
-        recover_agent_children(loop, should_stop=observed_stop)
+        recover_agent_children(loop, home_epoch, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
 
     # test-contract: seam recovery must stop while the TUI is shutting down.

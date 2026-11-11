@@ -185,8 +185,11 @@ def _recover_nested_children(
     store: ConversationStore,
     notification_store: ConversationStore,
     recovery_stores: dict[Path, ConversationStore],
+    home_epoch: int,
 ) -> None:
     """Cancel descendants left behind when an ancestor session exits."""
+
+    from ..runtime.approval_recovery import repair_delegated_child
 
     child_markers = store.agent_children()
     if not child_markers:
@@ -195,12 +198,22 @@ def _recover_nested_children(
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_store = recovery_stores.get(child_path)
+        child_instance_id = marker.get(
+            "child_instance_id", f"{store.session_id}:{child_path.name}"
+        )
         with nullcontext():
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
                     notification_store,
                     recovery_stores,
+                    home_epoch,
+                )
+                # Post-order: the child's own approvals are closed and any
+                # missing immediate-parent delegated end is written before this
+                # marker is cleaned up.
+                repair_delegated_child(
+                    store, child_store, child_instance_id, home_epoch
                 )
             existing_result = store.tool_result(tool_call.id) is not None
             notification_status: str | None = None
@@ -324,13 +337,14 @@ def _recover_completion_notification(
         dict(fallback.data) if fallback is not None else None,
     )
 
-def recover_agent_children(loop: AgentLoopForRecovery) -> None:
+def recover_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
-    _recover_agent_children(loop)
+    _recover_agent_children(loop, home_epoch)
 
 def _recover_agent_children(
     loop: AgentLoopForRecovery,
+    home_epoch: int,
     *,
     should_stop: Callable[[], bool] | None = None,
 ) -> None:
@@ -362,6 +376,14 @@ def _recover_agent_children(
                     child_store,
                     notification_store,
                     recovery_stores,
+                    home_epoch,
+                )
+                # Close this child's own approvals and write any missing
+                # delegated end on the root store before marker cleanup.
+                from ..runtime.approval_recovery import repair_delegated_child
+
+                repair_delegated_child(
+                    loop.store, child_store, child_instance_id, home_epoch
                 )
             if marker.get("background"):
                 terminal = child_store.agent_lifecycle() if child_store else None

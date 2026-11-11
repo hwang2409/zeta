@@ -101,12 +101,20 @@ def acquire_recovery_subtree(
     )
 
 
-def bootstrap_agent_children(loop: AgentLoopForRecovery) -> None:
-    """Repair restart state before the opened store reaches the event loop."""
+def bootstrap_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> None:
+    """Repair restart state before the opened store reaches the event loop.
 
+    Durable restart recovery runs here, before the store is visible to serve
+    joins or the TUI: the root session's own unresolved approvals are aborted,
+    and the child tree is repaired post-order (child resolution, then the
+    immediate-parent delegated end).
+    """
+
+    from ..runtime.approval_recovery import recover_store_approvals
     from .background_lifecycle import recover_agent_children
 
-    recover_agent_children(loop)
+    recover_store_approvals(loop.store, home_epoch)
+    recover_agent_children(loop, home_epoch)
     loop._children_recovered = True
 
 
@@ -129,6 +137,10 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
 
     root = loop.store
     notification = loop._background_owner.notification_store
+    # The whole recovered tree shares the root writer lease, so one observed
+    # home epoch (from the session manager) selects every restart reason.
+    manager = getattr(loop, "manager", None)
+    home_epoch = manager.observed_storage_epoch
 
     stop_recovery = threading.Event()
 
@@ -145,6 +157,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             if notification is root:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_root),
+                    home_epoch,
                     should_stop=stop_recovery.is_set,
                 )
             with ConversationStore(
@@ -156,6 +169,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             ) as worker_notification:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification),
+                    home_epoch,
                     should_stop=stop_recovery.is_set,
                 )
 

@@ -101,6 +101,7 @@ from zeta.runtime.prompt import RuntimePrompt
 from zeta.runtime.tool_setup import select_tool_registry
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
+from zeta.storage_format import WRITER_EPOCH
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -20996,7 +20997,7 @@ async def test_completion_recovery_is_durable_for_every_recipient(
 
     async def recover(store: ConversationStore) -> None:
         task = asyncio.create_task(
-            asyncio.to_thread(recover_agent_children, recovery_loop(store))
+            asyncio.to_thread(recover_agent_children, recovery_loop(store), WRITER_EPOCH)
         )
         if scenario == "concurrent live publisher":
             try:
@@ -21091,7 +21092,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     child.close()
     owner = BackgroundAgentOwner(parent)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
-    await asyncio.to_thread(recover_agent_children, loop)
+    await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
     notices = [
         item
         for item in parent.agent_notifications(pending_only=False)
@@ -21099,7 +21100,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     ]
     assert len(notices) == 1
     assert notices[0].data["summary"] == "recovered"
-    await asyncio.to_thread(recover_agent_children, loop)
+    await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
     assert (
         len(
             [

@@ -1,0 +1,78 @@
+"""Durable restart recovery for unresolved approvals (one owner).
+
+Startup invariant: when this runs no live runtime exists yet, so every durable
+unresolved approval is stale and must be closed. There is no live-pending set to
+exclude; a future path that reconstructs live waits before recovery must change
+that ordering deliberately.
+
+One ``restart_abort_reason(home_epoch)`` selector picks the reason for every
+store in a recovered tree. All stores share the root writer lease, so they share
+one observed home epoch.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from ..core.store import ConversationStore
+from ..storage_format import restart_abort_reason
+
+
+def recover_store_approvals(store: ConversationStore, home_epoch: int) -> None:
+    """Abort this store's own unresolved approvals, idempotently.
+
+    Already-resolved requests are a no-op: ``resolve_approval`` checks the state
+    under the append lock, so a repeated restart writes nothing.
+    """
+    reason = restart_abort_reason(home_epoch)
+    for request_id, _tool_call in store.pending_approvals():
+        store.resolve_approval(request_id, "abort", reason=reason)
+
+
+def repair_delegated_child(
+    parent_store: ConversationStore,
+    child_store: ConversationStore,
+    child_instance_id: str,
+    home_epoch: int,
+) -> None:
+    """Close a child's unresolved approvals and project any missing parent end.
+
+    Post-order: the caller recurses into deeper children first, so a child's
+    authoritative resolution exists before its immediate parent is repaired. The
+    parent end carries the child's actual durable decision; a user ``allow`` or
+    ``deny`` is never rewritten to a restart abort.
+    """
+    recover_store_approvals(child_store, home_epoch)
+    for wire_id, tool_call in parent_store.delegated_unmatched_requests(
+        child_instance_id
+    ):
+        store_request_id = tool_call.get("id")
+        if not isinstance(store_request_id, str):
+            continue
+        # Reread the authoritative child resolution. A false resolve result (for
+        # example another owner committed first) is never a reason to skip this.
+        resolution = child_store.approval_resolution_data(store_request_id)
+        if resolution is None:
+            continue
+        parent_store.append_approval_history_end_if_absent(
+            _end_payload(wire_id, tool_call, resolution)
+        )
+
+
+def _end_payload(
+    wire_id: str, tool_call: Mapping[str, object], resolution: Mapping[str, str]
+) -> dict[str, object]:
+    data: dict[str, object] = {"decision": resolution["decision"]}
+    if "reason" in resolution:
+        data["reason"] = resolution["reason"]
+    payload: dict[str, object] = {
+        "request_id": wire_id,
+        "tool_call": dict(tool_call),
+        "data": data,
+    }
+    if "reason" in data:
+        payload["reason"] = data["reason"]
+    return payload
+
+
+__all__ = ["recover_store_approvals", "repair_delegated_child"]
