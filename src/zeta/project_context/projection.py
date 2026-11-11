@@ -13,7 +13,7 @@ from ..project_memory_history import MemoryContextEntry
 from ..project_schema import MAX_PROJECTS, PROJECT_ID_PATTERN
 
 if TYPE_CHECKING:
-    from ..project_registry import Project
+    from ..project_registry import Project, ProjectRegistry
 
 _T = TypeVar("_T")
 
@@ -68,6 +68,24 @@ def _health(
     source: str | None = None,
 ) -> ProjectContextHealth:
     return ProjectContextHealth(code, project_id, source, _HEALTH_MESSAGES[code])
+
+
+def compose_with_stable_projection[T](
+    registry: ProjectRegistry | None,
+    project_id: str | None,
+    projection: ProjectContextProjection | None,
+    compose: Callable[[ProjectContextProjection | None], T],
+) -> tuple[T, ProjectContextProjection | None]:
+    """Compose only after two consecutive project projections match."""
+
+    while True:
+        composition = compose(projection)
+        if registry is None or projection is None:
+            return composition, projection
+        fresh = registry.project_context_projection(project_id)
+        if fresh == projection:
+            return composition, projection
+        projection = fresh
 
 
 class ProjectContextProjectionMixin:
@@ -202,4 +220,5 @@ __all__ = [
     "ProjectContextHealth",
     "ProjectContextProjection",
     "ProjectContextProjectionMixin",
+    "compose_with_stable_projection",
 ]
