@@ -61,7 +61,7 @@ async def _serve(
     stores: list[ConversationStore] = []
     try:
         hello = await negotiate(
-            client, extra=("child_run_history", "child_run_events"), protocol_version="1.2"
+            client, extra=("child_run_history", "child_run_events", "child_runs"), protocol_version="1.2"
         )
         assert "child_run_events" in hello["result"]["capabilities"]["features"]
         created = await client.request(2, "new_session", {"provider": "codex"})
@@ -224,6 +224,55 @@ async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
+async def test_pending_progress_from_63_busy_children_converges_to_one_baseline(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with _serve(tmp_path, transport) as (server, client, session_id, stores):
+        children = [
+            _start_child(server, stores, f"{session_id}:{index}")
+            for index in range(1, BUSY_CHILDREN + 1)
+        ]
+        await _lifecycle_applied(server)
+        entered, release = _gate_history_read(server, monkeypatch)
+
+        await client.send(
+            3, "session_history_and_subscribe", {"session_id": session_id}
+        )
+        await await_or_fail(entered.wait(), what="join history read held")
+        for index, child in enumerate(children, 1):
+            child.update_agent_lifecycle(current_step=f"pending-{index}")
+        await _lifecycle_applied(server)
+        release.set()
+
+        joined = await client.response(3)
+        assert "error" not in joined, joined
+        baseline = {
+            row["run_id"]: row
+            for row in joined["result"]["messages"]
+            if row.get("event") == "child_progress"
+        }
+        assert len(baseline) == BUSY_CHILDREN
+        selected = children[-1]
+        selected_run = selected.agent_handle()
+        selected.update_agent_lifecycle(current_step="after-join")
+        await _lifecycle_applied(server)
+
+        event = await client.event("child_progress")
+        assert (
+            event["run_id"],
+            event["seq"],
+            event["revision"],
+            event["child"]["current_step"],
+        ) == (
+            selected_run,
+            1,
+            baseline[selected_run]["revision"] + 1,
+            "after-join",
+        ), "pending progress escaped the admission baseline"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
 async def test_64_small_frames_join_and_65th_is_stale_while_child_scope_stays_gap_free(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -236,7 +285,7 @@ async def test_64_small_frames_join_and_65th_is_stale_while_child_scope_stays_ga
             await negotiate(
                 observer,
                 observer=True,
-                extra=("child_run_history", "child_run_events"),
+                extra=("child_run_history", "child_run_events", "child_runs"),
                 protocol_version="1.2",
             )
             child_join = await observer.request(
@@ -457,7 +506,7 @@ async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
                 await negotiate(
                     observer,
                     observer=True,
-                    extra=("child_run_history", "child_run_events"),
+                    extra=("child_run_history", "child_run_events", "child_runs"),
                     protocol_version="1.2",
                 )
                 await observer.send(3, "child_run_events", {"session_id": session_id, "run_id": run_id})
@@ -636,7 +685,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
         client = await connect_replay(second, transport)
         try:
             await negotiate(
-                client, extra=("child_run_history", "child_run_events"), protocol_version="1.2"
+                client, extra=("child_run_history", "child_run_events", "child_runs"), protocol_version="1.2"
             )
             resumed = await client.request(2, "resume", {"session_id": session_id})
             assert "error" not in resumed, resumed

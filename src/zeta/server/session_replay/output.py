@@ -385,6 +385,8 @@ class ReplayOutput:
             scope = self._member_scope(connection, session_id, fields, replay_row)
             if scope is None:
                 return False
+        if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(connection):
+            return True
         if covers is not None and not self._frontier_holds(connection, scope):
             if self.replay.is_pending(connection):
                 self.replay.mark_pending_stale(connection)
