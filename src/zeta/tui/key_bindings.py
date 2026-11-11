@@ -15,6 +15,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.cursor_shapes import CursorShape, CursorShapeConfig
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
 from prompt_toolkit.filters import (
     Condition,
@@ -322,6 +323,7 @@ def build_key_bindings(
     decisions_answering: Callable[[], bool] | None = None,
     on_decisions_open: Callable[[], None] | None = None,
     on_decisions_key: Callable[[str], None] | None = None,
+    on_decisions_input: Callable[[str], None] | None = None,
     on_page_up: Callable[[], None] | None = None,
     on_page_down: Callable[[], None] | None = None,
     on_finder_open: Callable[[], None] | None = None,
@@ -330,6 +332,7 @@ def build_key_bindings(
     on_history_finder_open: Callable[[Buffer], None] | None = None,
     finder_active: Callable[[], bool] | None = None,
     history_finder_active: Callable[[], bool] | None = None,
+    on_finder_input: Callable[[str], None] | None = None,
     on_finder_move: Callable[[int], None] | None = None,
     on_finder_accept: Callable[[], None] | None = None,
     on_finder_cancel: Callable[[], None] | None = None,
@@ -388,6 +391,7 @@ def build_key_bindings(
     history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
     suppress_history_detach = False
+    finder_buffer = Buffer(name="TRANSCRIPT_FINDER")
 
     def track_history_buffer(buffer: Buffer) -> None:
         nonlocal history_navigation_active, history_navigation_buffer
@@ -529,6 +533,10 @@ def build_key_bindings(
     )
     def open_history_finder(event: KeyPressEvent) -> None:
         event.current_buffer.cancel_completion()
+        finder_buffer.set_document(
+            Document(event.current_buffer.text, len(event.current_buffer.text)),
+            bypass_readonly=True,
+        )
         if on_history_finder_open is not None and get_app().full_screen:
             on_history_finder_open(event.current_buffer)
 
@@ -749,14 +757,6 @@ def build_key_bindings(
 
         @bindings.add(Keys.Escape, filter=decisions_panel_mode, eager=True)
         def decisions_escape(event: KeyPressEvent) -> None:
-            if (
-                decisions_answering is not None
-                and decisions_answering()
-                and get_app().editing_mode is EditingMode.VI
-                and get_app().vi_state.input_mode is InputMode.INSERT
-            ):
-                get_app().vi_state.input_mode = InputMode.NAVIGATION
-                return
             del event
             on_decisions_key("escape")
 
@@ -764,6 +764,18 @@ def build_key_bindings(
         def decisions_answer_submit(event: KeyPressEvent) -> None:
             del event
             on_decisions_key("enter")
+
+        @bindings.add("backspace", filter=decisions_answer_mode, eager=True)
+        def decisions_answer_backspace(event: KeyPressEvent) -> None:
+            del event
+            on_decisions_key("backspace")
+
+    if on_decisions_input is not None:
+
+        @bindings.add(Keys.Any, filter=decisions_answer_mode, eager=True)
+        def decisions_answer_input(event: KeyPressEvent) -> None:
+            if event.data:
+                on_decisions_input(event.data)
 
     native_escape = next(
         binding
@@ -990,6 +1002,7 @@ def build_key_bindings(
         @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
             event.current_buffer.cancel_completion()
+            finder_buffer.reset()
             on_finder_open()
 
     if on_finder_move is not None:
@@ -1002,6 +1015,21 @@ def build_key_bindings(
         def history_finder_older(event: KeyPressEvent) -> None:
             del event
             on_finder_move(1)
+
+    if on_finder_input is not None:
+
+        @bindings.add(Keys.Any, filter=finder_mode, eager=True)
+        def finder_input(event: KeyPressEvent) -> None:
+            if event.data:
+                finder_buffer.insert_text(event.data)
+                on_finder_input(finder_buffer.text)
+
+        @bindings.add("backspace", filter=finder_mode, eager=True)
+        @bindings.add("c-h", filter=finder_mode, eager=True)
+        def finder_backspace(event: KeyPressEvent) -> None:
+            del event
+            finder_buffer.delete_before_cursor()
+            on_finder_input(finder_buffer.text)
 
     if on_finder_move is not None:
 
@@ -1024,6 +1052,7 @@ def build_key_bindings(
         @bindings.add("enter", filter=finder_mode, eager=True)
         def finder_accept(event: KeyPressEvent) -> None:
             del event
+            finder_buffer.reset()
             on_finder_accept()
 
     if on_finder_cancel is not None:
@@ -1032,14 +1061,8 @@ def build_key_bindings(
         @bindings.add("c-c", filter=finder_mode, eager=True)
         @bindings.add("c-g", filter=finder_mode, eager=True)
         def finder_cancel(event: KeyPressEvent) -> None:
-            if (
-                get_app().editing_mode is EditingMode.VI
-                and get_app().vi_state.input_mode is InputMode.INSERT
-                and event.key_sequence[0].key == Keys.ESCAPE
-            ):
-                get_app().vi_state.input_mode = InputMode.NAVIGATION
-                return
             del event
+            finder_buffer.reset()
             on_finder_cancel()
 
     if on_finder_toggle_preview is not None:

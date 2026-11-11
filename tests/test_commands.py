@@ -594,6 +594,7 @@ async def test_message_finder_cancels_completion_before_up_navigation(
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
                 finder_active=lambda: finder_active,
+                on_finder_input=lambda _value: None,
                 on_finder_cancel=cancel_finder,
             ),
             completer=SlashCompleter(
@@ -625,7 +626,7 @@ async def test_message_finder_cancels_completion_before_up_navigation(
         session.app.key_processor.process_keys()
         assert session.app.current_buffer.text == "/r"
         session.app.exit()
-        await asyncio.wait_for(task, timeout=10)
+        await task
 
 
 async def test_custom_command_becomes_the_model_user_message(

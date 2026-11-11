@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import weakref
 from pathlib import Path
 
 from prompt_toolkit.document import Document
@@ -26,7 +25,6 @@ from ...runtime.project_registry_state import (
 from ..cards.decisions import DecisionsPanel
 from ..composer import FullScreenPromptSession
 from ..overlay import OverlayControl
-from ..overlay_text_field import OverlayTextField
 
 # The scan touches the filesystem (a directory flock per session plus its
 # attention records); a few-second cadence keeps the status-bar count fresh
@@ -168,16 +166,7 @@ class DecisionsMixin:
     """Serve the interactive decisions popup and its status-bar count."""
 
     def _init_decisions_panel(self) -> None:
-        panel_ref = weakref.ref(self)
-        self._decisions_answer_field = OverlayTextField(
-            "DECISIONS_ANSWER",
-            on_text_changed=lambda _text: (
-                target._decisions_answer_input()
-                if (target := panel_ref()) is not None
-                else None
-            ),
-        )
-        self._decisions_panel = DecisionsPanel(self._decisions_answer_field)
+        self._decisions_panel = DecisionsPanel()
         self._decisions_panel_control = OverlayControl()
         self._decisions_panel_open = False
         self._decisions_count = 0
@@ -189,6 +178,7 @@ class DecisionsMixin:
         self._decisions_stopping = False
         self._decisions_restore_text = ""
         self._decisions_restore_cursor = 0
+        self._decisions_answer_buffer = ""
         self._decisions_switching = False
 
     @property
@@ -487,10 +477,7 @@ class DecisionsMixin:
             return
         elif key == "a":
             panel.enter_answer()
-            self._decisions_answer_field.reset()
-            session = self._active_session
-            if isinstance(session, FullScreenPromptSession):
-                self._decisions_answer_field.focus(session.layout)
+            self._decisions_answer_buffer = ""
         elif key == "enter":
             self._discuss_selected()
             return
@@ -503,25 +490,23 @@ class DecisionsMixin:
 
     def _decisions_answer_key(self, key: str) -> None:
         if key == "escape":
-            self._exit_decisions_answer()
+            self._decisions_panel.exit_answer()
         elif key == "enter":
-            text = self._decisions_answer_field.text.strip()
+            text = self._decisions_answer_buffer.strip()
             if text:
                 self._deliver_quick_answer(text)
                 return
-            self._exit_decisions_answer()
+            self._decisions_panel.exit_answer()
+        elif key == "backspace":
+            self._decisions_answer_buffer = self._decisions_answer_buffer[:-1]
+            self._decisions_panel.set_answer(self._decisions_answer_buffer)
         self._refresh_decisions_panel(keep_offset=True)
 
-    def _exit_decisions_answer(self) -> None:
-        """Leave answer mode and return focus to the panel list."""
-        self._decisions_panel.exit_answer()
-        session = self._active_session
-        if isinstance(session, FullScreenPromptSession):
-            session.layout.focus(self._decisions_panel_window)
-
-    def _decisions_answer_input(self) -> None:
+    def _decisions_answer_input(self, text: str) -> None:
         if self._decisions_panel.mode != "answer":
             return
+        self._decisions_answer_buffer += text
+        self._decisions_panel.set_answer(self._decisions_answer_buffer)
         self._refresh_decisions_panel(keep_offset=True)
 
     def _refresh_decisions_panel(self, *, keep_offset: bool = False) -> None:
@@ -567,7 +552,7 @@ class DecisionsMixin:
             self.request_decisions_refresh()
             self._refresh_decisions_panel()
 
-        self._exit_decisions_answer()
+        self._decisions_panel.exit_answer()
         asyncio.create_task(run())
 
     def _dismiss_selected(self) -> None:

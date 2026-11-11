@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import weakref
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from prompt_toolkit.buffer import Buffer
-
-from ..overlay_text_field import OverlayTextField
-from .finder_overlay import FinderControl
 
 _RANK_BATCH_SIZE = 16
 
@@ -53,45 +49,19 @@ class FinderRuntimeTarget(Protocol):
 class FinderRuntimeMixin:
     """Keep finder preparation responsive and fuzzy ranking off the UI loop."""
 
-    def _init_finder_runtime(self) -> None:
-        app_ref = weakref.ref(self)
-        self._finder_field = OverlayTextField(
-            "TRANSCRIPT_FINDER",
-            on_text_changed=lambda query: (
-                target._finder_input(query)
-                if (target := app_ref()) is not None
-                else None
-            ),
-        )
-        self._finder_control = FinderControl(
-            lambda: app_ref()._active_finder.finder_state(), self._finder_field
-        )
-        self._finder_prepare_task: asyncio.Task[None] | None = None
-        self._finder_rank_task: asyncio.Task[None] | None = None
-
     def _finder_target(self) -> FinderRuntimeTarget:
         finder = getattr(self, "_active_finder", None)
         return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
-        self._finder_field.reset(notify=False)
         self._active_finder = self._viewed_transcript()
         finder = self._active_finder
-        session = getattr(self, "_active_session", None)
-        field = getattr(self, "_finder_field", None)
-        if session is not None and field is not None:
-            field.focus(session.layout)
         request = finder.open_finder()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
         self._active_finder = self._history_finder
         finder = self._history_finder
-        session = getattr(self, "_active_session", None)
-        field = getattr(self, "_finder_field", None)
-        if session is not None and field is not None:
-            field.focus(session.layout)
-            field.set_document(buffer.document, notify=False)
         request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
 
@@ -189,22 +159,13 @@ class FinderRuntimeMixin:
         if finder.finder_accept():
             self._cancel_finder_workers()
             self._active_finder = self._viewed_transcript()
-            self._finder_field.reset(notify=False)
-            self._restore_composer_focus()
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
-        self._finder_field.reset(notify=False)
-        self._restore_composer_focus()
         self._invalidate_prompt()
-
-    def _restore_composer_focus(self) -> None:
-        session = getattr(self, "_active_session", None)
-        if session is not None:
-            session.layout.focus(session.default_buffer)
 
     async def _prepare_ui_session_change(self) -> None:
         """Close work scoped to a UI session before replacing or removing it."""

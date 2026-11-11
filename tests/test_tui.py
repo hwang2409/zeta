@@ -42,7 +42,6 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
@@ -131,7 +130,6 @@ from zeta.tui.composer import (
     build_key_bindings,
     parse_input,
 )
-from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
 
 
@@ -5239,7 +5237,7 @@ def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
         recommendation=None,
         status="open",
     )
-    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
+    panel = DecisionsPanel()
     panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
 
     rendered = _render_overlay_at_80(panel.render_lines())
@@ -6433,6 +6431,7 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
         on_exit=lambda: None,
         on_finder_open=lambda: None,
         finder_active=lambda: False,
+        on_finder_input=lambda _value: None,
         search_active=lambda: False,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
@@ -6457,14 +6456,12 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
     def open_finder() -> None:
         nonlocal active
         active = True
-        session.app.layout.focus(finder_field.window)
 
     def accept() -> None:
         nonlocal active, accepts
         active = False
         accepts += 1
 
-    finder_field = OverlayTextField("TEST_FINDER", on_text_changed=values.append)
     with create_pipe_input() as pipe:
         session = PromptSession(
             input=pipe,
@@ -6476,14 +6473,11 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
                 finder_active=lambda: active,
+                on_finder_input=values.append,
                 on_finder_move=moves.append,
                 on_finder_accept=accept,
                 on_finder_cancel=lambda: None,
             ),
-        )
-        session.app.layout = Layout(
-            HSplit([session.app.layout.container, finder_field.window]),
-            focused_element=session.default_buffer,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
@@ -6498,7 +6492,7 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
         pipe.send_text("\r")  # Enter accepts and closes the finder.
         await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
-        await asyncio.wait_for(task, timeout=10)
+        await task
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:
