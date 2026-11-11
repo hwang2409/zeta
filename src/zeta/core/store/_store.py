@@ -81,6 +81,7 @@ from ._execution_owner import ExecutionOwnerStoreMixin
 from ._history_index import HistoryIndex, HistoryIndexError, HistoryPageStoreMixin
 from ._incremental_validation import (
     IncrementalValidationMixin,
+    _ApprovalValidationOverlay,
     validate_approval_reason,
 )
 from ._lifecycle import StoreLifecycleMixin
@@ -299,7 +300,7 @@ class ConversationStore(
             self._history_index._mark_unavailable()
             return
         try:
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(self._entries)
         except (OSError, HistoryIndexError):
             self._history_index._mark_unavailable()
 
@@ -346,7 +347,7 @@ class ConversationStore(
                 self._history_index._mark_unavailable()
             return
         if not self._history_index.available:
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(self._entries)
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(
@@ -498,7 +499,11 @@ class ConversationStore(
                 )
             self._agent_lifecycle = self._sanitize_lifecycle(lifecycle)
 
-    def _validate_entries(self) -> None:
+    def _validate_entries(
+        self,
+        approval_overlay: _ApprovalValidationOverlay | None = None,
+        approval_candidate_ids: set[str] | None = None,
+    ) -> None:
         ids: set[str] = set()
         approval_requests: dict[str, ConversationEntry] = {}
         approval_resolutions: set[str] = set()
@@ -535,7 +540,20 @@ class ConversationStore(
             if entry.id not in active_ids:
                 ids.add(entry.id)
                 continue
-            if entry.type == "message":
+            if (
+                approval_overlay is not None
+                and approval_candidate_ids is not None
+                and entry.id in approval_candidate_ids
+                and entry.type in {"message", "approval_request", "approval_resolution"}
+            ):
+                approval_overlay.record(entry)
+            elif approval_overlay is not None and entry.type in {
+                "message",
+                "approval_request",
+                "approval_resolution",
+            }:
+                pass
+            elif entry.type == "message":
                 requests = entry.data.get("approval_requests", [])
                 if type(requests) is list:
                     for request in requests:
@@ -708,12 +726,13 @@ class ConversationStore(
             self._validate_entry_payload(entry)
             entries.append(entry)
             parent_id = entry_id
-        # Validate the complete candidate sequence before any bytes reach disk.
-        # Batches are intentionally small; ordinary one-row appends retain the
-        # O(1) incremental integrity path.
+        # Validate the complete candidate sequence before authoritative bytes
+        # reach disk. Approval relations use only a touched-id overlay; later
+        # p08b slices move the other relation sets behind the same seam.
+        approvals = self._approval_overlay_for_write(entries)
         self._entries.extend(entries)
         try:
-            self._validate_entries()
+            self._validate_entries(approvals, {entry.id for entry in entries})
         finally:
             del self._entries[-len(entries) :]
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
@@ -767,10 +786,12 @@ class ConversationStore(
             type=entry_type,
             data=copy.deepcopy(data) if copy_data else data,
         )
-        # Reject with the same payload validator used while loading before any
-        # bytes reach disk. This keeps every append path from creating a row the
-        # next store open cannot read.
+        # Reject with the same payload and relation validators used while loading
+        # before any authoritative bytes reach disk.
         self._validate_entry_payload(entry)
+        touched = _ApprovalValidationOverlay.touched([entry])
+        if touched or entry.type == "approval_request":
+            self._approval_overlay_for_write([entry]).record(entry)
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -789,9 +810,11 @@ class ConversationStore(
             self._record_active_entry(entry)
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.
-            self._validate_entries()
+            self._validate_entries(
+                _ApprovalValidationOverlay(), {row.id for row in self._entries}
+            )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(self._entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
@@ -1139,17 +1162,6 @@ class ConversationStore(
             data["reason"] = reason
         return self._append_row_unlocked("approval_resolution", data, parent_id)
 
-    def approval_states(self) -> dict[str, tuple[ToolCall, str | None]]:
-        """Return strict approval state after waiting for concurrent writers."""
-        with self._append_lock():
-            return self._approval_states_from_indexes()
-
-    def _approval_states_from_indexes(self) -> dict[str, tuple[ToolCall, str | None]]:
-        return self._approval_states_from_maps(
-            self._active_approval_requests,
-            self._active_approval_resolutions,
-        )
-
     @staticmethod
     def _request_entry(
         branch: list[ConversationEntry],
@@ -1193,16 +1205,6 @@ class ConversationStore(
                     tool_call, _ = states[request_id]
                     states[request_id] = (tool_call, entry.data["decision"])
         return states
-
-    def pending_approvals(self) -> list[tuple[str, ToolCall]]:
-        """Return latency-tolerant display state; use approval_states for decisions."""
-        self._sync_log_without_waiting()
-        states = self._approval_states_from_indexes()
-        return [
-            (request_id, tool_call)
-            for request_id, (tool_call, decision) in states.items()
-            if decision is None
-        ]
 
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self._active_branch())

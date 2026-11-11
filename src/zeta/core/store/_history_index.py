@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
-from ...protocol.types import is_passive_harness_message, is_visible_harness_notice
+from ...protocol.types import ToolCall, is_passive_harness_message, is_visible_harness_notice
 from ..checkpoints import ConversationEntry
 
 _HISTORY_PAGE_ATTEMPTS = 16
@@ -53,6 +53,23 @@ class InvalidHistoryPageRequest(HistoryIndexError):
 
 
 @dataclass(frozen=True, slots=True)
+class IndexedApprovalState:
+    tool_call: Mapping[str, object]
+    decision: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedApprovalResolution:
+    data: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedPendingApprovalPage:
+    items: tuple[tuple[str, Mapping[str, object]], ...]
+    next_seq: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class IndexedHistoryPage:
     groups: tuple[tuple[ConversationEntry, ...], ...]
     start: int
@@ -67,7 +84,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -204,6 +221,15 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS accepted_messages ("
             "delivery_id TEXT PRIMARY KEY, message BLOB NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS active_approval_requests ("
+            "request_id TEXT PRIMARY KEY, request_seq INTEGER NOT NULL, "
+            "tool_call BLOB NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS active_approval_resolutions ("
+            "request_id TEXT PRIMARY KEY, decision TEXT NOT NULL, data BLOB NOT NULL)"
+        )
 
     def _stored_facts(self, connection: sqlite3.Connection) -> dict[str, object] | None:
         row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
@@ -230,10 +256,24 @@ class HistoryIndex:
         except FileNotFoundError:
             pass
 
+    @staticmethod
+    def _active_ids(rows: Sequence[object]) -> set[str]:
+        by_id = {HistoryIndex._row(entry)[1]: entry for entry in rows}
+        active: set[str] = set()
+        current = rows[-1] if rows else None
+        while current is not None:
+            row = HistoryIndex._row(current)
+            if row[1] in active:
+                break
+            active.add(row[1])
+            current = by_id.get(row[2]) if row[2] else None
+        return active
+
     def _rebuild(
         self, source_facts: object, validated_rows: Iterable[object]
     ) -> None:
-        rows = iter(validated_rows)
+        rows = tuple(validated_rows)
+        active_ids = self._active_ids(rows)
         connection: sqlite3.Connection | None = None
         try:
             self._remove_file()
@@ -244,23 +284,33 @@ class HistoryIndex:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
+                    active = entry_id in active_ids
                     history_group = (
-                        group if self._belongs_in_history(entry_type, data) else None
+                        group if active and self._belongs_in_history(entry_type, data) else None
                     )
-                    if self._starts_next_group(entry_type, data):
+                    if active and self._starts_next_group(entry_type, data):
                         group += 1
                     connection.execute(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
                         (seq, entry_id, parent_id, lane, entry_type, encoded, history_group),
                     )
-                    if entry_type == "message":
+                    if active and entry_type == "message":
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
                                 "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
                                 (approval["request_id"], self._value(approval["tool_call"])),
                             )
-                    if entry_type == "client_delivery" and isinstance(data.get("accepted_message"), dict):
+                            connection.execute(
+                                "INSERT INTO active_approval_requests(request_id,request_seq,tool_call) VALUES(?,?,?)",
+                                (approval["request_id"], seq, self._value(approval["tool_call"])),
+                            )
+                    if active and entry_type == "approval_resolution":
+                        connection.execute(
+                            "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
+                            (data["request_id"], data["decision"], self._value(data)),
+                        )
+                    if active and entry_type == "client_delivery" and isinstance(data.get("accepted_message"), dict):
                         connection.execute(
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
@@ -345,6 +395,15 @@ class HistoryIndex:
                         "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
                         (approval["request_id"], self._value(approval["tool_call"])),
                     )
+                    connection.execute(
+                        "INSERT INTO active_approval_requests(request_id,request_seq,tool_call) VALUES(?,?,?)",
+                        (approval["request_id"], entry.seq, self._value(approval["tool_call"])),
+                    )
+            if entry.type == "approval_resolution":
+                connection.execute(
+                    "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
+                    (data["request_id"], data["decision"], self._value(data)),
+                )
             accepted = data.get("accepted_message")
             if entry.type == "client_delivery" and isinstance(accepted, dict):
                 connection.execute(
@@ -587,6 +646,103 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
+    def _approval_query(
+        self,
+        facts: object,
+        query: str,
+        parameters: tuple[object, ...] = (),
+    ) -> list[tuple[object, ...]]:
+        with self._lock:
+            self._check_open()
+            if not self._available and not self._observer:
+                raise HistoryIndexUnavailableError("history index is unavailable")
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connection(write=False)
+                stored = self._stored_facts(connection)
+                expected = self._facts(facts)
+                if stored is None or any(
+                    stored.get(key) != value for key, value in expected.items()
+                ):
+                    self._available = False
+                    raise StaleHistorySnapshot
+                return connection.execute(query, parameters).fetchall()
+            except HistoryIndexError:
+                raise
+            except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise HistoryIndexUnavailableError("approval index query failed") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    def approval_state(
+        self, facts: object, request_id: str
+    ) -> IndexedApprovalState | None:
+        rows = self._approval_query(
+            facts,
+            "SELECT r.tool_call,s.decision FROM active_approval_requests r "
+            "LEFT JOIN active_approval_resolutions s USING(request_id) "
+            "WHERE r.request_id=?",
+            (request_id,),
+        )
+        if not rows:
+            return None
+        tool_call, decision = rows[0]
+        return IndexedApprovalState(json.loads(tool_call), decision)
+
+    def approval_resolution_data(
+        self, facts: object, request_id: str
+    ) -> IndexedApprovalResolution | None:
+        rows = self._approval_query(
+            facts,
+            "SELECT data FROM active_approval_resolutions WHERE request_id=?",
+            (request_id,),
+        )
+        return (
+            None
+            if not rows
+            else IndexedApprovalResolution(json.loads(rows[0][0]))
+        )
+
+    def pending_approval_page(
+        self, facts: object, after_seq: int, limit: int = PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        if not 1 <= limit <= self.PAGE_LIMIT:
+            raise InvalidHistoryPageRequest("invalid pending approval page limit")
+        rows = self._approval_query(
+            facts,
+            "SELECT r.request_id,r.request_seq,r.tool_call "
+            "FROM active_approval_requests r "
+            "LEFT JOIN active_approval_resolutions s USING(request_id) "
+            "WHERE s.request_id IS NULL AND r.request_seq>? "
+            "ORDER BY r.request_seq LIMIT ?",
+            (after_seq, limit),
+        )
+        return IndexedPendingApprovalPage(
+            tuple((request_id, json.loads(tool_call)) for request_id, _seq, tool_call in rows),
+            int(rows[-1][1]) if len(rows) == limit else None,
+        )
+
+    def approval_relations(
+        self, facts: object, request_ids: set[str]
+    ) -> dict[str, str | None]:
+        if not request_ids:
+            return {}
+        result: dict[str, str | None] = {}
+        ordered = tuple(sorted(request_ids))
+        for start in range(0, len(ordered), self.PAGE_LIMIT):
+            page = ordered[start : start + self.PAGE_LIMIT]
+            placeholders = ",".join("?" for _ in page)
+            rows = self._approval_query(
+                facts,
+                "SELECT r.request_id,s.decision FROM active_approval_requests r "
+                "LEFT JOIN active_approval_resolutions s USING(request_id) "
+                f"WHERE r.request_id IN ({placeholders})",
+                tuple(page),
+            )
+            result.update(rows)
+        return result
+
     def _mark_unavailable(self) -> None:
         self._available = False
 
@@ -602,7 +758,7 @@ def _rebuild_history_index(store: ConversationStore) -> None:
             facts = store._history_index_facts()
             if store._history_index.catch_up_validated(facts, store._entries):
                 return
-            store._sync_history_index(store.active_branch_snapshot())
+            store._sync_history_index(store._entries)
     finally:
         writer.close()
 
@@ -661,10 +817,125 @@ def _overlay_resident_entries(
     return replace(page, groups=groups)
 
 
+def _read_stable_approval(store: ConversationStore, query: object) -> object:
+    index = store._history_index
+    if index is None:
+        raise HistoryIndexUnavailableError("history index is unavailable")
+    for attempt in range(_HISTORY_PAGE_ATTEMPTS):
+        if not index.available:
+            _rebuild_history_index(store)
+        facts = store._history_index_facts()
+        try:
+            result = query(index, facts)
+        except (StaleHistorySnapshot, HistoryIndexUnavailableError) as exc:
+            if store._history_index_facts() != facts:
+                raise StaleHistorySnapshot from exc
+            if store._read_only or attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+                raise
+            index._mark_unavailable()
+            continue
+        if store._history_index_facts() == facts:
+            return result
+        if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
+            raise StaleHistorySnapshot
+    raise HistoryIndexUnavailableError("history index is unavailable")
+
+
 class HistoryPageStoreMixin:
+    def approval_state_resident(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        state: tuple[ToolCall, str | None] | None = None
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", ()):
+                    if request.get("request_id") == request_id:
+                        state = (ToolCall.from_dict(request["tool_call"]), None)
+            elif (
+                entry.type == "approval_resolution"
+                and entry.data.get("request_id") == request_id
+                and state is not None
+            ):
+                state = (state[0], entry.data["decision"])
+        return state
+
+    def approval_resolution_resident(
+        self, request_id: str
+    ) -> dict[str, str] | None:
+        for entry in reversed(self._active_branch()):
+            if (
+                entry.type == "approval_resolution"
+                and entry.data.get("request_id") == request_id
+            ):
+                return dict(entry.data)
+        return None
+
+    def pending_approval_items_resident(self) -> list[tuple[str, ToolCall]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", ()):
+                    states[request["request_id"]] = (
+                        ToolCall.from_dict(request["tool_call"]), None
+                    )
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                if request_id in states:
+                    states[request_id] = (states[request_id][0], entry.data["decision"])
+        return [
+            (request_id, state[0])
+            for request_id, state in states.items()
+            if state[1] is None
+        ]
+
     @property
     def repair_generation(self: ConversationStore) -> str | None:
         return self._repair_generation
+
+    async def approval_state(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        result = await self._to_thread_store(
+            lambda: _read_stable_approval(
+                self, lambda index, facts: index.approval_state(facts, request_id)
+            )
+        )
+        return (
+            None
+            if result is None
+            else (ToolCall.from_dict(dict(result.tool_call)), result.decision)
+        )
+
+    async def approval_resolution(self, request_id: str) -> Mapping[str, str] | None:
+        result = await self._to_thread_store(
+            lambda: _read_stable_approval(
+                self,
+                lambda index, facts: index.approval_resolution_data(facts, request_id),
+            )
+        )
+        return None if result is None else result.data
+
+    async def pending_approval_page(
+        self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        return await self._to_thread_store(
+            lambda: _read_stable_approval(
+                self,
+                lambda index, facts: index.pending_approval_page(
+                    facts, after_seq, limit
+                ),
+            )
+        )
+
+    def _approval_relations(self, request_ids: set[str]) -> dict[str, str | None]:
+        index = self._history_index
+        if index is None or not index.available:
+            raise HistoryIndexUnavailableError("history index is unavailable")
+        facts = self._history_index_facts()
+        result = index.approval_relations(facts, request_ids)
+        if self._history_index_facts() != facts:
+            raise StaleHistorySnapshot
+        return result
 
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]

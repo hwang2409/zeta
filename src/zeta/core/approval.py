@@ -751,8 +751,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         def strict_pending(store: ConversationStore) -> dict[str, ToolCall]:
             return {
                 request_id: tool_call
-                for request_id, (tool_call, decision) in store.approval_states().items()
-                if decision is None
+                for request_id, tool_call in store.pending_approval_items_resident()
             }
 
         return self._collect_pending_requests(strict_pending)
@@ -762,7 +761,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
 
         # Display and key-filter callers only; decisions use pending_requests().
         return self._collect_pending_requests(
-            lambda store: dict(store.pending_approvals())
+            lambda store: dict(store.pending_approval_items_resident())
         )
 
     def _collect_pending_requests(
@@ -795,7 +794,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 delegated_pending[delegated_store] = pending_for_store(delegated_store)
             pending = delegated_pending[delegated_store]
             if request_id not in pending:
-                resolution = delegated_store.approval_resolution_data(request_id)
+                resolution = delegated_store.approval_resolution_resident(request_id)
                 if resolution is not None:
                     self._delegated_resolutions[(child_id, request_id)] = resolution
                 self._delegated.pop((child_id, request_id), None)
@@ -853,7 +852,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             except ValueError:
                 pass
             finally:
-                resolution = store.approval_resolution_data(request.request_id)
+                resolution = store.approval_resolution_resident(request.request_id)
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
@@ -915,7 +914,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
-            state = delegated[1].approval_states().get(delegated[0].request_id)
+            state = delegated[1].approval_state_resident(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
@@ -923,7 +922,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return None
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
-        state = store.approval_states().get(request_id)
+        state = store.approval_state_resident(request_id)
         return _resolved_decision(state[1] if state is not None else None)
 
     def durable_resolution(
@@ -946,12 +945,12 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         raw_id = delegated[0].request_id if delegated is not None else request_id
         if store is None or isinstance(raw_id, tuple):
             return None
-        state = store.approval_states().get(raw_id)
+        state = store.approval_state_resident(raw_id)
         if state is None or state[1] is None:
             return None
         if state[1] != "abort":
             return {"request_id": raw_id, "decision": state[1]}
-        return store.approval_resolution_data(raw_id)
+        return store.approval_resolution_resident(raw_id)
 
     def durable_decision(
         self,
@@ -999,7 +998,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return self._delegated.get((child_instance_id, request_id))
         if request_id in self._ephemeral:
             return None
-        if self._store is not None and request_id in self._store.approval_states():
+        if (
+            self._store is not None
+            and self._store.approval_state_resident(request_id) is not None
+        ):
             return None
         matches = [
             delegated
@@ -1017,7 +1019,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Build an ask request for atomic persistence with its assistant anchor."""
 
         store = self._require_store()
-        state = store.approval_states().get(tool_call.id)
+        state = store.approval_state_resident(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -1039,7 +1041,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         store = self._require_store()
-        state = store.approval_states().get(tool_call.id)
+        state = store.approval_state_resident(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -1082,7 +1084,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             ephemeral = self._ephemeral.get(tool_call.id)
             if ephemeral is not None and ephemeral[1] is not None:
                 return True, _resolved_decision(ephemeral[1])
-            state = store.approval_states().get(tool_call.id)
+            state = store.approval_state_resident(tool_call.id)
             if state is not None and state[1] is not None:
                 return True, _resolved_decision(state[1])
             return False, None

@@ -429,7 +429,7 @@ class AgentLoop(
 
     def prepare_resume_pending_tool(self, request_id: str) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
-        state = self.store.approval_states().get(request_id)
+        state = self.store.approval_state_resident(request_id)
         if state is None or state[1] is None:
             return False
         if self._existing_tool_result(state[0].id) is not None:
@@ -577,7 +577,7 @@ class AgentLoop(
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""
         await self._ensure_mcp_servers()
-        state = self.store.approval_states().get(request_id)
+        state = self.store.approval_state_resident(request_id)
         if state is None or state[1] is None:
             return None
         tool_call = state[0]
@@ -641,7 +641,7 @@ class AgentLoop(
         return result
     def finalize_canceled(self, request_id: str) -> ToolResult | None:
         """Persist one canceled result for a durable approval request."""
-        state = self.store.approval_states().get(request_id)
+        state = self.store.approval_state_resident(request_id)
         if state is None:
             return None
         tool_call = state[0]

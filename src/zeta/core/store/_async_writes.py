@@ -29,8 +29,6 @@ if TYPE_CHECKING:
 
 _PATCH_FIELDS = (
     "cwd",
-    "_active_approval_requests",
-    "_active_approval_resolutions",
     "_active_tool_results",
     "_active_agent_call_ids",
     "_active_agent_receipts",

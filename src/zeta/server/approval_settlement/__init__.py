@@ -49,12 +49,12 @@ async def persist_durably(
             reason=reason if decision == "abort" else None,
         )
     except asyncio.CancelledError:
-        resolution = store.approval_resolution_data(request_id)
+        resolution = await store.approval_resolution(request_id)
         if resolution is None:
             raise
         return SettlementResult(resolution)
     except OSError:
-        resolution = store.approval_resolution_data(request_id)
+        resolution = await store.approval_resolution(request_id)
         if resolution is not None:
             return SettlementResult(resolution)
         try:
@@ -65,4 +65,4 @@ async def persist_durably(
             )
         except OSError:
             return SettlementResult(None)
-    return SettlementResult(store.approval_resolution_data(request_id))
+    return SettlementResult(await store.approval_resolution(request_id))

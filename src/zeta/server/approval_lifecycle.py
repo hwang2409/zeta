@@ -525,20 +525,25 @@ class ApprovalLifecycle:
             if isinstance(record.target.key, tuple)
         )
 
-        foreground_states = foreground.approval_states_snapshot()
-        child_states = {
-            target.store: target.store.approval_states_snapshot()
-            for target in delegated
-        }
+        pending: list[tuple[str, ToolCall]] = []
+        after_seq = 0
+        while True:
+            page = await foreground.pending_approval_page(after_seq)
+            pending.extend(
+                (request_id, ToolCall.from_dict(dict(tool_call)))
+                for request_id, tool_call in page.items
+            )
+            if page.next_seq is None:
+                break
+            after_seq = page.next_seq
         requests = [
             policy.request_from_store(
                 request_id, tool_call, label=await policy.display_label(tool_call)
             )
-            for request_id, (tool_call, decision) in foreground_states.items()
-            if decision is None
+            for request_id, tool_call in pending
         ]
         for target in delegated:
-            state = child_states[target.store].get(target.store_request_id)
+            state = await target.store.approval_state(target.store_request_id)
             if state is not None and state[1] is None and target.request is not None:
                 requests.append(target.request)
         return [
@@ -732,7 +737,7 @@ class ApprovalLifecycle:
         record = self._new_record(_ApprovalTarget(core_key, policy.store, core_key))
         token = record.token
         generation = record.generation
-        state = record.target.store.approval_states_snapshot().get(core_key)
+        state = await record.target.store.approval_state(core_key)
         label = None if state is None else await policy.display_label(state[0])
         current = self._state.records.get(core_key)
         if (
@@ -886,7 +891,7 @@ class ApprovalLifecycle:
         return await asyncio.shield(admitted)
 
     async def _finish_external(self, record: ApprovalRecord) -> None:
-        resolution = record.target.store.approval_resolution_data(
+        resolution = await record.target.store.approval_resolution(
             record.target.store_request_id
         )
         if resolution is not None:
@@ -1087,9 +1092,7 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        durable_state = target.store.approval_states_snapshot().get(
-            target.store_request_id
-        )
+        durable_state = await target.store.approval_state(target.store_request_id)
         # Look the label up before the ownership check, so a stale record is dropped.
         label = None if durable_state is None else await policy.display_label(durable_state[0])
         current = self._state.records.get(key)
@@ -1160,7 +1163,7 @@ class ApprovalLifecycle:
             return
         record = current
         if record.disposition == "external":
-            resolution = target.store.approval_resolution_data(target.store_request_id)
+            resolution = await target.store.approval_resolution(target.store_request_id)
             if resolution is not None:
                 await asyncio.shield(self._finish_record(record, resolution))
             else:
@@ -1215,30 +1218,11 @@ class ApprovalLifecycle:
             return
         if record.phase != "pending" and record.phase != "settling":
             return
-        resolution = record.target.store.approval_resolution_data(
+        resolution = await record.target.store.approval_resolution(
             record.target.store_request_id
         )
         if resolution is not None:
             await asyncio.shield(self._finish_record(record, resolution))
-
-    def _end_stale_approvals(self, session_id: str | None) -> None:
-        del session_id
-        for record in tuple(self._state.records.values()):
-            if record.phase not in {"pending", "settling"}:
-                continue
-            if record.live_end is not None:
-                continue
-            resolution = record.target.store.approval_resolution_data(
-                record.target.store_request_id
-            )
-            if resolution is None:
-                continue
-            if record.publication_owner is not None:
-                if not record.publication_owner.done():
-                    self._start_settlement(record, self._finish_record(record, resolution))
-                continue
-            owner = self._start_settlement(record, self._finish_record(record, resolution))
-            self._change(record, publication_owner=owner)
 
     async def _terminate_approval_records(
         self,

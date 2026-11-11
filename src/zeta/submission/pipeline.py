@@ -984,7 +984,7 @@ class SubmissionPipeline:
         durable = (
             owner is None
             and isinstance(request.key, str)
-            and self._host.loop.store.approval_states().get(request.request_id)
+            and self._host.loop.store.approval_state_resident(request.request_id)
             == (request.tool_call, None)
         )
         if message.decision is ApprovalDecision.ALLOW:

@@ -53,31 +53,6 @@ def validate_approval_history_data(data: Mapping[str, Any]) -> None:
 class ApprovalHistoryStoreMixin:
     """Persist delegated wire identity and retrieve durable resolutions."""
 
-    def approval_states_snapshot(self) -> dict[str, tuple[ToolCall, str | None]]:
-        """Read approval state from the owner-installed indexes."""
-        return self._approval_states_from_maps(
-            self._active_approval_requests,
-            self._active_approval_resolutions,
-        )
-
-    @staticmethod
-    def _approval_states_from_maps(
-        requests: Mapping[str, ConversationEntry],
-        resolutions: Mapping[str, str],
-    ) -> dict[str, tuple[ToolCall, str | None]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for request_id, entry in requests.items():
-            request = next(
-                request
-                for request in entry.data.get("approval_requests", [])
-                if request["request_id"] == request_id
-            )
-            states[request_id] = (
-                ToolCall.from_dict(request["tool_call"]),
-                resolutions.get(request_id),
-            )
-        return states
-
     def append_approval_history(
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:
@@ -94,15 +69,3 @@ class ApprovalHistoryStoreMixin:
         return await self._commit_storage_command(
             _AppendApprovalHistoryCommand(payload=payload)
         )
-
-    def approval_resolution_data(self, request_id: str) -> dict[str, str] | None:
-        """Read a published approval resolution without touching the log."""
-        if request_id not in self._active_approval_resolutions:
-            return None
-        for entry in reversed(self._entries):
-            if (
-                entry.type == "approval_resolution"
-                and entry.data.get("request_id") == request_id
-            ):
-                return dict(entry.data)
-        return None
