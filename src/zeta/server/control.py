@@ -1066,6 +1066,26 @@ class ServeControl:
                 self._event(event, session_id=session_id, background=True)
             )
 
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
+        connections = self.server.connections
+        if connections is None:
+            return
+        def publish() -> None:
+            controller = connections.controller_metadata()
+            if not self.closing and controller is not None and "run_work" in controller.features:
+                if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
+                    awaitable = self._notify(EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields)
+                elif event is EventDescriptor.TODO_UPDATED:
+                    awaitable = self._notify(EventDescriptor.TODO_UPDATED, session_id, **fields)
+                else:
+                    raise ValueError(f"unsupported run-work event: {event.value}")
+                asyncio.create_task(awaitable)
+        try:
+            connections.loop.call_soon_threadsafe(publish)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
+
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
         if not self.closing and self.server.connections is not None:

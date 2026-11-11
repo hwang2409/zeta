@@ -35,6 +35,9 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 
+# hang guard for a cold full cli start on loaded CI runners
+CLI_RUN_TIMEOUT = 60
+
 
 def _capability(
     tool: str, arguments: dict[str, object]
@@ -195,7 +198,7 @@ def test_print_mode_runs_session_hook_inside_async_activation(
         env=environment,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=CLI_RUN_TIMEOUT,
         check=False,
     )
 
@@ -236,7 +239,7 @@ def test_restricted_session_disables_command_hooks_by_default(
         env=environment,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=CLI_RUN_TIMEOUT,
         check=False,
     )
 
@@ -275,7 +278,7 @@ def test_allow_hooks_explicitly_enables_hooks_in_restricted_session(
         env=environment,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=CLI_RUN_TIMEOUT,
         check=False,
     )
 
