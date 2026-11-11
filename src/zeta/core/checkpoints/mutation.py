@@ -413,6 +413,7 @@ def _execute_append[ResultT](
         store._write_bytes(
             b"".join(store._encoded_entry_line(entry) for entry in entries)
         )
+        store._apply_history_index_entries(tuple(entries))
         _install_appended_entries(store, entries)
         generation_after = store.conversation_generation
         committed = tuple(store._snapshot_entry(entry) for entry in entries)

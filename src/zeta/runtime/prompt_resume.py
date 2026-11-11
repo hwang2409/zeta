@@ -20,7 +20,10 @@ from ..core.store import ConversationStore
 from ..core.store.prompt_composition import PromptComposition
 from ..memory.entry_store import utc_now
 from ..memory.prompt_projection import MEMORY_PROMPT_BYTE_CAP, render_entry_memory
-from ..project_context.projection import ProjectContextProjection
+from ..project_context.projection import (
+    ProjectContextProjection,
+    compose_with_stable_projection,
+)
 from ..project_registry import Project, ProjectRegistry
 from ..skills import SkillCatalog, discover_session_skills
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
@@ -408,17 +411,16 @@ def resume_prompt(
     capture = manager.project_registry if projection is not None else None
 
     def compose(current: SessionMetadata) -> PromptComposition:
-        # Re-read project memory with no session shape lock held; a change since
-        # the last capture is a changed composition input, so compose again.
         nonlocal projection
-        while True:
-            composition = compose_with(current, projection=projection)
-            if capture is None:
-                return composition
-            fresh = capture.project_context_projection(current.project_id)
-            if fresh == projection:
-                return composition
-            projection = fresh
+        composition, projection = compose_with_stable_projection(
+            capture,
+            current.project_id,
+            projection,
+            lambda current_projection: compose_with(
+                current, projection=current_projection
+            ),
+        )
+        return composition
 
     owns_skill_index = metadata.prompt_recipe is not None
     composition = manager.resume_prompt_composition(metadata, store, compose)

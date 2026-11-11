@@ -194,6 +194,7 @@ class ZetaServer:
         runtime: ServerRuntime | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
+        prebound_socket: socket.socket | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -244,6 +245,7 @@ class ZetaServer:
         self.connections: ConnectionRegistry | None = None
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
+        self._prebound_socket = prebound_socket
         self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
@@ -254,6 +256,7 @@ class ZetaServer:
             self.runtime.set_approval_control_binder(self.control.bind_policy)
             self.runtime.set_background_event_sink(self.control._publish_background_event)
             self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
+            self.runtime.set_run_work_event_sink(self.control._publish_run_work_event)
             self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
 
     async def _publish_foreground_events(self) -> None:
@@ -262,6 +265,19 @@ class ZetaServer:
             await self.control._event(
                 event, session_id=self.runtime.session_id, turn_id=None
             )
+
+    async def _close_foreground_events(self) -> None:
+        # a borrowed publisher belongs to the TUI and outlives this server
+        if self._foreground_event_publisher is None:
+            self.foreground_event_publisher.close()
+            return
+        subscription, self._foreground_subscription = self._foreground_subscription, None
+        if subscription is not None:
+            self._foreground_event_publisher.unsubscribe(subscription)
+        task, self._foreground_task = self._foreground_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     @property
     def address(self) -> str:
@@ -275,10 +291,15 @@ class ZetaServer:
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(asyncio.get_running_loop())
         if self.port is None:
-            self._unix_listener = await _UnixSocketListener.start(
-                self.socket_path, self._accept
-            )
-            self._server = self._unix_listener.server
+            if self._prebound_socket is not None:
+                self._server = await asyncio.start_unix_server(
+                    self._accept, sock=self._prebound_socket, limit=MAX_FRAME_BYTES + 1
+                )
+            else:
+                self._unix_listener = await _UnixSocketListener.start(
+                    self.socket_path, self._accept
+                )
+                self._server = self._unix_listener.server
         else:
             self._server = await asyncio.start_server(
                 self._accept, "127.0.0.1", self.port, limit=MAX_FRAME_BYTES + 1
@@ -319,7 +340,7 @@ class ZetaServer:
                 try:
                     await self.control.close()
                 finally:
-                    self.foreground_event_publisher.close()
+                    await self._close_foreground_events()
                 try:
                     if not self._borrowed:
                         await self.runtime.close()
@@ -341,13 +362,6 @@ class ZetaServer:
                         self._server.close()
                         await self._server.wait_closed()
                 finally:
-                    if self._foreground_subscription is not None:
-                        self._foreground_subscription.close()
-                        self._foreground_subscription = None
-                    if self._foreground_task is not None:
-                        self._foreground_task.cancel()
-                        await asyncio.gather(self._foreground_task, return_exceptions=True)
-                        self._foreground_task = None
                     self._server = None
                     self._unix_listener = None
 

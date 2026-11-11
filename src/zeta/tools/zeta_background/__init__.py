@@ -124,7 +124,14 @@ async def _task_kill(
         cause="task_kill tool requested by the agent",
         tui_presented=True,
     )
-    status = "running" if result["running"] else "exited"
+    if result["killed_by_this_call"]:
+        status = f"killed by this call ({result['cause']})"
+    elif result["running"]:
+        status = "running"
+    else:
+        status = "exited"
+    if result["exit_code"] is not None:
+        status += f", code {result['exit_code']}"
     return _result(
         f"background task {result['task_id']} {status}",
         result,

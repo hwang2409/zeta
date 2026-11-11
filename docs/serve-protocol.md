@@ -186,6 +186,8 @@ feature. Observer connections receive only methods with `read` access.
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
 | `revoke_session_grants` | `1.1` | `session_grants` | `session_mutation` |
+| `run_work_list` | `1.0` | `run_work` | `controller_read` |
+| `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
 | `child_run_list` | `1.0` | `child_runs` | `controller_read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 
@@ -831,6 +833,15 @@ work. The result contains `cleared`, the number of removed messages.
 {"jsonrpc":"2.0","id":9,"result":{"cleared":2}}
 ```
 
+### `run_work_list` and `background_task_cancel`
+
+Both methods require the negotiated `run_work` feature and an active session.
+`run_work_list` takes `session_id` and returns `tasks` and `todo` snapshots. Each task has `id`, `status`, `command`, `elapsed_seconds`, and `cancelable`; a known terminal code adds `exit_code`. Todo rows contain only `content` and `status`.
+
+Task status is one of `starting`, `running`, `stopping`, `exited`, `failed`, or `killed`. `starting` and `stopping` are lifecycle events; `exited` is a clean natural exit, `failed` is a known nonzero natural exit, and `killed` is a killed or terminated task. `cancelable` is true only for `starting`, `running`, and `stopping`.
+
+`background_task_cancel` takes `session_id` and `task_id`. It asks the task registry to stop the task and returns the committed terminal task row as `{"task": row}`. Task lifecycle commits emit `background_task_updated`; todo store commits emit `todo_updated`. Events use the same projections and go only to a controller that negotiated `run_work`. These are live-only events, not replay rows; after reconnect, a replacement controller must call `run_work_list` to recover the current `tasks` and `todo` snapshots.
+
 ### `status`
 
 Params: optional `include_connection_setup_counts` (boolean). When it is `true`,
@@ -1268,6 +1279,8 @@ Event fields are:
 | `session_grants_changed` (feature `session_grants`) | `event`, `data: {change: "grant"|"revoke"|"clear"|"reset", changed: array[string], grants: object}` | `session_id` |
 | `replay_stream_ended` (feature `session_replay_seq`) | `event`, `session_id: string`, `stream_id: string`, `reason: "session_replaced"|"evicted"|"rejoined"` | none; never carries `seq` |
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
+| `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
+| `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1434,11 +1447,24 @@ error code and message. Provider status and origin remain internal.
   and returns the tree. Selecting the current leaf is a no-op. Invalid heads
   return `-32602`. Fork and switch affect conversation state, not workspace files.
 - `session_history_and_subscribe`: with `session_replay_seq`, takes exactly one
-  active `session_id` and atomically returns the newest bounded history page plus
-  `replay: {"stream_id": "...", "history_seq": 0}`. Events admitted after the
-  join carry that opaque stream id and monotonically increasing `seq`, starting
-  at 1. The result has the same shape as `session_history` with `before: null`
-  (`messages`, `next_before`, `history_validator`). Negotiating
+  active `session_id` and atomically returns the newest bounded history page,
+  `status: {"state": "idle|running|tool", "pending_approvals": [...],
+  "pending_approvals_truncated": false}`. Its `status.state` has the ordinary
+  `status.state` shape, and `replay: {"stream_id": "...", "history_seq": 0}`.
+  The status is captured at join start. Apply the joined status, then sequenced
+  events after it. Open approvals are the baseline request ids plus
+  `approval_request` ids in the joined page, minus `approval_end` ids in the
+  joined page, then updated by the sequenced tail by id. A session admits at
+  most 64 pending approvals across foreground and delegated tools. A 65th
+  request waits until one admitted request resolves; it is never denied or
+  dropped. Therefore `pending_approvals_truncated` is retained for parser
+  compatibility but is always `false`. Events admitted after the join carry
+  that opaque stream id and monotonically increasing `seq`, starting at 1.
+  Apart from `status` and `replay`, the result has the same shape as
+  `session_history` with `before: null` (`messages`, `next_before`,
+  `history_validator`). A client can include a previous `before` and
+  `history_validator` when it rejoins; the server validates that cursor, then
+  still returns the newest page for the new stream. Negotiating
   `session_replay_seq` also gives the connection the semantics of
   `session_history_fidelity`, `session_history_backward`, and
   `user_message_event`, for the join result, later `session_history` pages, and
@@ -1489,13 +1515,18 @@ error code and message. Provider status and origin remain internal.
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
   `next_before` plus a fixed `history_validator`; continuations use `before` and
-  return complete groups strictly below it in chronological order. Appends are
-  safe, but a branch change returns `-32009` with
+  return complete groups strictly below it in chronological order. The validator
+  has `end`, `entry_id`, and nullable `repair_generation` fields for
+  `session_history`, `child_run_history`, and `session_history_and_subscribe`.
+  An old two-field validator gets one `-32009` with `stale_history_snapshot`; the
+  client restarts from the newest page and then receives the three-field shape.
+  Appends are safe, but a branch change or transcript repair returns `-32009` with
   `stale_history_snapshot`. Backward and forward walks share source groups,
   but response-local truncation can differ because their envelopes differ.
   Example request: `{ "session_id": "abc", "before": null }`; the reply has
   `messages`, `next_before`, and `history_validator: { "end": 12,
-  "entry_id": "..." }`. A continuation supplies both `before` and that
+  "entry_id": "...", "repair_generation": null }`. A continuation supplies
+  both `before` and that
   validator. `before` and `history_validator` without the feature, mixed with
   `offset`, or malformed values return `-32602`; a changed validator returns
   `-32009` with data code `stale_history_snapshot`. The cursor counts the same
@@ -1807,6 +1838,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `content_read` | enables `content_read` for inline image rows exposed by negotiated history fidelity; observers must negotiate both `serve_observers` and `content_read` |
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
+| `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
 | `child_runs` | adds controller-only `child_run_list` and `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends

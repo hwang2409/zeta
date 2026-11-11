@@ -1148,11 +1148,12 @@ class TUIApp(
             session_id=self.loop.store.session_id,
         )
         try:
-            observer_host = getattr(self, "observer_host", None)
-            if observer_host is not None:
-                await observer_host.start()
             if not resume_ui:
                 self._begin_startup_replay()
+            observer_host = getattr(self, "observer_host", None)
+            if observer_host is not None and (error := await observer_host.start_or_close()):
+                self.observer_host = None  # optional endpoint: never stops the TUI or a fork
+                self._handle_background_notice(f"remote observer unavailable: {error}")
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session

@@ -37,6 +37,7 @@ from ..core.session import (
 )
 from ..core.slash import resolve_session_budget
 from ..models.catalog import REMOVED_PROVIDER_ERROR
+from ..project_context.projection import compose_with_stable_projection
 from ..protocol.types import CompletionBackend, StreamEvent, StreamEventType
 from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
@@ -146,10 +147,9 @@ def background_notice(
 
     message: str | None
     if isinstance(notice, BackgroundTaskNotice):
-        # Starts have a tool card, natural exits have a durable notification,
-        # and explicit kills have a task_kill card. The structured phase keeps
-        # this decision independent of user-controlled command text.
-        message = None
+        # Starts have a tool card and natural exits have a durable notification.
+        # Kills keep the cause in the tool card but also need the lifecycle notice.
+        message = notice.message if notice.phase == "task_kill" else None
     elif isinstance(notice, BackgroundTaskShutdownNotice) and notice.tasks:
         # Shutdown task exits and macro cancellations have durable receipts.
         message = None
@@ -437,18 +437,23 @@ def _create_app_with_root(
         model = config.model
         skill_catalog = discover_session_skills(home=home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=home, project_dir=repo_root)
-        project_context = _app.load_project_context(
-            cwd=effective_cwd,
-            repo_root=repo_root,
-            zeta_home=home,
-            system_override=system_prompt_override,
-            system_append=system_prompt_append,
-            catalog=skill_catalog,
-            session_project=session_project,
-            cwd_project=cwd_project,
-            inbox_enabled=config.inbox_enabled,
-            registry=manager.project_registry_state,
-            project_projection=projection,
+        project_context, projection = compose_with_stable_projection(
+            registry,
+            session_project.project_id if session_project is not None else None,
+            projection,
+            lambda current_projection: _app.load_project_context(
+                cwd=effective_cwd,
+                repo_root=repo_root,
+                zeta_home=home,
+                system_override=system_prompt_override,
+                system_append=system_prompt_append,
+                catalog=skill_catalog,
+                session_project=session_project,
+                cwd_project=cwd_project,
+                inbox_enabled=config.inbox_enabled,
+                registry=manager.project_registry_state,
+                project_projection=current_projection,
+            ),
         )
     recency: _SessionRecency | None = None
     pending_override = None
