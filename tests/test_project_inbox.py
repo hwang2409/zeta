@@ -683,11 +683,9 @@ async def test_targeted_inbox_notification_stays_with_target_session(
         notices_a = session_a.store.agent_notifications()
         notices_b = session_b.store.agent_notifications()
         assert notices_a and notices_a[0].data["message_ids"] == [message_id]
-        assert "private body for session a" in str(notices_a[0].data["messages"])
-        assert "private body for session b" not in str(notices_a[0].data["messages"])
+        assert "messages" not in notices_a[0].data
         assert notices_b and notices_b[0].data["message_ids"] == [other_id]
-        assert "private body for session a" not in str(notices_b[0].data["messages"])
-        assert "private body for session b" in str(notices_b[0].data["messages"])
+        assert "messages" not in notices_b[0].data
     finally:
         await loop_a.close()
         await loop_b.close()
@@ -736,7 +734,7 @@ async def test_session_notices_new_message_at_idle_or_tool_boundary(tmp_path: Pa
         assert wakes == [True]
         assert notices[0].data["kind"] == "project_inbox"
         assert notices[0].data["message_ids"] == [message_id]
-        assert "information, not authorized work by default" in notices[0].data["text"]
+        assert "Project inbox wake" in notices[0].data["text"]
         await AgentLoop._check_project_inbox(loop)
         assert len(store.agent_notifications()) == 1
     finally:

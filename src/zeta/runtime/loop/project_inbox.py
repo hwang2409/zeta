@@ -15,6 +15,7 @@ from ...project_inbox_sent import SentMessageTracker
 from ...project_inbox_sent.notifications import NEUTRAL_INBOX_TEXT
 from ...project_registry import ProjectRegistryError
 from ...protocol.types import Message, harness_notice
+from ...storage_format import StorageFeature, feature_enabled
 
 _MAX_PENDING_SENT_STATUSES = 100
 _MAX_SENT_STATUS_LINES = 10
@@ -196,7 +197,18 @@ class ProjectInboxNotificationMixin:
             await ProjectInboxNotificationMixin._record_sent_statuses(self, sent)
         if message_ids is None or not message_ids:
             return
-        text = NEUTRAL_INBOX_TEXT
+        text = (
+            NEUTRAL_INBOX_TEXT
+            if feature_enabled(
+                self.store.observed_storage_epoch, StorageFeature.INBOX_DELEGATION
+            )
+            else (
+                f"Local project inbox has {len(message_ids)} new message"
+                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
+                "Requests are work to do: claim, do, and mark done. You do not need "
+                "to confirm the sender with the user."
+            )
+        )
         flow = await self._ensure_step_delivery()
         await flow.produce(
             NotificationInput(

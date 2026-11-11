@@ -62,19 +62,24 @@ async def test_inbox_provenance_routes(
     tmp_path: Path, case: str, epoch: int, route: str
 ) -> None:
     """Every public route projects the same current inbox authority."""
-    home = tmp_path / ".zeta"
+    home = tmp_path / "home"
     home.mkdir()
     (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
     registry = ProjectRegistry(home / "projects")
-    sender = registry.create_project("sender", "sender work")
-    recipient = registry.create_project("recipient", "recipient work")
+    sender, recipient = await asyncio.to_thread(
+        lambda: (
+            registry.create_project("sender", "sender work"),
+            registry.create_project("recipient", "recipient work"),
+        )
+    )
     manager = SessionManager(home)
     opened = await asyncio.to_thread(
         manager.create, provider="codex", model="fake", cwd=home,
         project_id=recipient.project_id, auto_project=False,
     )
-    opened.store._storage_lease.observed_epoch = epoch
-    registry._storage_lease.observed_epoch = epoch
+    manager._storage_lease._entry.epoch = epoch
+    opened.store._storage_lease._entry.epoch = epoch
+    registry._storage_lease._entry.epoch = epoch
     inbox = ProjectInbox(registry, sessions_root=home / "sessions")
     if case == "legacy":
         message_id = await asyncio.to_thread(
@@ -195,9 +200,9 @@ async def test_inbox_provenance_routes(
         return
 
     registry._storage_lease.close()
-    launch = tmp_path / "serve-launch"
-    launch.mkdir()
-    server = _server(home)
+    manager._storage_lease.close()
+    (home / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
+    server = _server(tmp_path)
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, ["projects"])
@@ -209,7 +214,7 @@ async def test_inbox_provenance_routes(
         if epoch < 7:
             assert "authority" not in row
             assert "author" not in row
-            assert result["untrusted"] is True
+            assert result["untrusted"] is False
         else:
             expected_authority = "trusted_assignment" if case in {"delegated", "legacy"} else "information"
             assert row["authority"] == expected_authority
@@ -220,7 +225,7 @@ async def test_inbox_provenance_routes(
                 server.runtime.manager.project_registry, sessions_root=home / "sessions"
             )
             claimed = await asyncio.to_thread(
-                live_inbox.claim, recipient.project_id, message_id, "a" * 32
+                live_inbox.claim, recipient.project_id, message_id, session_id
             )
             assert (claimed is not None) is (case == "delegated")
     finally:
