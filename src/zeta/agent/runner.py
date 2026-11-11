@@ -74,6 +74,7 @@ from .turn_limit import (
     ChildTurnControl,
     append_child_start,
     finalize_exhausted_child,
+    forward_nested_agent_start,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
     make_publish_child_lifecycle,
@@ -149,13 +150,7 @@ async def consume_child(
         nonlocal failure_error, failure_message, final_message, last_message, explicit_report
         final_message = None
         async for event in events:
-            if event.type is StreamEventType.AGENT_START and child_loop.agent_depth > 1:
-                child_loop._publish_background_event(
-                    StreamEvent(
-                        StreamEventType.AGENT_START,
-                        data={"agent_instance_id": child_loop.agent_instance_id},
-                    )
-                )
+            forward_nested_agent_start(child_loop, event)
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
