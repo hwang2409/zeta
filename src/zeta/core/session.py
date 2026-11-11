@@ -38,9 +38,7 @@ from .session_execution import (
     SessionOwnedError,
     session_owner_status,
 )
-from .store.prompt_composition import (
-    PromptCompositionMixin,
-)
+from .store.prompt_composition import PromptCompositionMixin
 from .session_files import (
     SessionError,
     SessionIdAmbiguousError,
@@ -322,28 +320,31 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             _initialization_execution_ranked=False,
         )
         metadata._execution_lease = store.execution_lease
-        if before_reference_publication is not None:
-            before_reference_publication(OpenedSession(metadata, store))
-        store._rank_execution = True
-        store.activate_runtime_lease()
-        if project_id is not None:
-            try:
-                _persist_pending_root_link(
-                    self.sessions_dir, session_id, project_id,
-                    project_role or "session", parent_session_id,
-                    self._storage_lease, authority=authority,
-                )
-            except (SessionError, OSError) as exc:
-                logger.warning("could not persist project linkage intent: %s", exc)
-            self._reconcile_project_link(session_id, _reference_authority=authority)
-        return OpenedSession(metadata, store)
+        try:
+            if before_reference_publication is not None:
+                before_reference_publication(OpenedSession(metadata, store))
+            store._rank_execution = True
+            store.activate_runtime_lease()
+            if project_id is not None:
+                try:
+                    _persist_pending_root_link(
+                        self.sessions_dir, session_id, project_id,
+                        project_role or "session", parent_session_id,
+                        self._storage_lease, authority=authority,
+                    )
+                except (SessionError, OSError) as exc:
+                    logger.warning("could not persist project linkage intent: %s", exc)
+                self._reconcile_project_link(session_id, _reference_authority=authority)
+            return OpenedSession(metadata, store)
+        except BaseException:
+            store.close()
+            self.delete(session_id)
+            raise
 
     def associate_project(self, metadata: SessionMetadata, project_id: str) -> SessionMetadata:
         return associate_project_link(self, metadata, project_id)
 
-    def read_metadata(
-        self, session_id: str, *, lock_timeout: float | None = None
-    ) -> SessionMetadata:
+    def read_metadata(self, session_id: str, *, lock_timeout: float | None = None) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
         self._validate_id(session_id)
         if lock_timeout is None:
@@ -654,7 +655,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     (value, "sessions") for value in sorted(project_ids)
                 )
                 with registry._project_locks(
-                    domains, exclusive=True, authority=authority
+                    domains, exclusive=True
                 ) as project_fds, session_directory(
                     self.sessions_dir, session_id
                 ) as (_, directory_fd), project_links_lock(directory_fd):

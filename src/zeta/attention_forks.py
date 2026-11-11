@@ -270,27 +270,28 @@ def _create_fork_session(
         )
 
     metadata = source_metadata
-    fork = manager.create(
-        provider=metadata.provider,
-        model=metadata.model,
-        cwd=metadata.cwd,
-        retained_tail=metadata.retained_tail,
-        compaction_budget=metadata.compaction_budget,
-        **clone_prompt_composition(metadata),
-        vim_mode=metadata.vim_mode,
-        budget_pinned=metadata.budget_pinned,
-        name=f"Discussion: {record.title}",
-        project_id=metadata.project_id,
-        project_role="session",
-        parent_session_id=record.session_id,
-        tool_allow=ATTENTION_FORK_POLICY.allow,
-        auto_project=False,
-        _session_id=fork_id,
-        _reference_stack=reference_stack,
-        _reference_authorities=reference_authorities,
-        _before_reference_publication=populate,
-    )
+    fork: OpenedSession | None = None
     try:
+        fork = manager.create(
+            provider=metadata.provider,
+            model=metadata.model,
+            cwd=metadata.cwd,
+            retained_tail=metadata.retained_tail,
+            compaction_budget=metadata.compaction_budget,
+            **clone_prompt_composition(metadata),
+            vim_mode=metadata.vim_mode,
+            budget_pinned=metadata.budget_pinned,
+            name=f"Discussion: {record.title}",
+            project_id=metadata.project_id,
+            project_role="session",
+            parent_session_id=record.session_id,
+            tool_allow=ATTENTION_FORK_POLICY.allow,
+            auto_project=False,
+            _session_id=fork_id,
+            _reference_stack=reference_stack,
+            _reference_authorities=reference_authorities,
+            _before_reference_publication=populate,
+        )
         with session_directory(manager.sessions_dir, fork_id) as (_, fork_fd):
             write_session_file(
                 fork_fd,
@@ -308,8 +309,12 @@ def _create_fork_session(
                     + "\n"
                 ).encode(),
             )
-    finally:
-        fork.store.close()
+    except BaseException:
+        if fork is not None:
+            fork.store.close()
+            manager.delete(fork_id)
+        raise
+    fork.store.close()
     return fork_id
 
 

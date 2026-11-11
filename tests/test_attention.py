@@ -12,10 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import zeta
+from zeta import attention_forks
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
     create_discussion_fork,
@@ -28,6 +30,7 @@ from zeta.attention_replies import AttentionReplies, ReplyConflict
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -553,6 +556,67 @@ def test_concurrent_fork_creators_reuse_one_usable_session(
     )
     assert validated.record.fork_session_id == fork_ids[0]
     fork.store.close()
+    opened.store.close()
+
+
+@pytest.mark.parametrize("failure", ("population", "attention record"))
+def test_failed_fork_publication_removes_session_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    opened = _session(tmp_path)
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+    )
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    manager = SessionManager(tmp_path)
+    sessions_before = {item.session_id for item in manager.list_sessions_read_only()}
+    fork_id = "f" * 32
+    monkeypatch.setattr(
+        attention_forks, "uuid4", lambda: SimpleNamespace(hex=fork_id)
+    )
+
+    real_append = ConversationStore.append_message
+    if failure == "population":
+        def fail_population(*args, **kwargs):
+            raise OSError("population failed")
+
+        monkeypatch.setattr(ConversationStore, "append_message", fail_population)
+    else:
+        real_write = attention_forks.write_session_file
+
+        def fail_attention_record(directory_fd, name, data, *args, **kwargs):
+            if name == "attention_fork.json":
+                raise OSError("attention record failed")
+            return real_write(directory_fd, name, data, *args, **kwargs)
+
+        monkeypatch.setattr(
+            attention_forks, "write_session_file", fail_attention_record
+        )
+
+    with pytest.raises(OSError, match=f"{failure} failed"):
+        create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+
+    assert not (manager.sessions_dir / fork_id).exists()
+    assert {
+        item.session_id for item in manager.list_sessions_read_only()
+    } == sessions_before
+    monkeypatch.setattr(ConversationStore, "append_message", real_append)
+    replacement = manager.create(
+        provider="codex",
+        model="fake",
+        cwd=tmp_path,
+        auto_project=False,
+        _session_id=fork_id,
+    )
+    replacement.store.close()
+    manager.delete(fork_id)
     opened.store.close()
 
 

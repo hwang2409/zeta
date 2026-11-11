@@ -355,19 +355,6 @@ def reconcile_child_links(
     without ever double-recording a link.
     """
     if _reference_authority is None:
-        project_ids: set[str] = set()
-        try:
-            with (
-                session_directory(sessions_dir, session_id) as (_, session_fd),
-                child_directory(
-                    session_fd, PENDING_CHILD_LINKS_DIRNAME
-                ) as pending_fd,
-            ):
-                    for _name, link in _collect_pending_intents(pending_fd, session_fd)[0]:
-                        if isinstance(link.get("project_id"), str):
-                            project_ids.add(link["project_id"])
-        except (FileNotFoundError, OSError, SessionError):
-            pass
         with reference_publication(
             Path(sessions_dir).parent,
             project_registry._storage_lease,
@@ -456,7 +443,7 @@ def _reconcile_child_links_pass_admitted(
         }
         domains = tuple((project_id, "sessions") for project_id in sorted(project_ids))
         with project_registry._project_locks(
-            domains, exclusive=True, authority=authority
+            domains, exclusive=True
         ) as project_fds, session_directory(
             sessions_dir, session_id
         ) as (_, session_fd), project_links_lock(session_fd):

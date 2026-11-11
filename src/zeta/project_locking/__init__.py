@@ -220,7 +220,6 @@ class ProjectLockingMixin:
         domains: tuple[tuple[str, str], ...],
         *,
         exclusive: bool,
-        authority=None,
     ) -> Iterator[tuple[int, ...]]:
         require_off_loop_lock("project domain authority", ProjectRegistryError)
         if domains != tuple(sorted(set(domains))):
