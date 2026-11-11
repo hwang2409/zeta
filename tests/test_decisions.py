@@ -49,6 +49,7 @@ from zeta.tui.app import TUIApp
 from zeta.tui.cards.decisions import DecisionsPanel
 from zeta.tui.layout import status_toolbar
 from zeta.tui.overlay import OverlayControl
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.render import format_status
 from zeta.tui.slash_handlers.decisions_panel import DecisionsMixin, _DecisionsScanOwner
 
@@ -804,7 +805,7 @@ def _item(
 
 
 def test_decisions_popup_lists_items_and_offers_options() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     one = _item("1" * 32, "Pick DB", "Choose a durable store.", ["SQLite", "Postgres"])
     two = _item("2" * 32, "Pick region", "Where to deploy the worker.")
     # Distinct ids so selection is stable.
@@ -820,7 +821,7 @@ def test_decisions_popup_lists_items_and_offers_options() -> None:
 
 
 def test_decisions_popup_accepts_fragments_with_mouse_handlers() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items(
         [
             _item(
@@ -843,11 +844,11 @@ def test_decisions_popup_accepts_fragments_with_mouse_handlers() -> None:
 
 
 def test_decisions_popup_answer_mode_captures_text() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items([_item("1" * 32, "Pick DB", "Choose.")])
     assert panel.enter_answer() is True
     assert panel.mode == "answer"
-    panel.set_answer("use sqlite")
+    panel.answer_field.set_text("use sqlite")
     assert "use sqlite" in _plain(panel.render_lines())
     panel.exit_answer()
     assert panel.mode == "list"
@@ -1164,7 +1165,7 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
 
 
 def test_decisions_short_detail_has_no_overflow_indicator() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items([_item("1" * 32, "Short", "Why", ["One"])])
     control = OverlayControl()
     control.set_lines(panel.render_lines())
@@ -1177,7 +1178,7 @@ def test_decisions_short_detail_has_no_overflow_indicator() -> None:
 
 
 def test_decisions_wraps_wide_unbroken_tokens_by_cells() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items([_item("1" * 32, "界界界界界界界界", "Why")])
     lines = panel.render_lines()
     question = [line for line in lines if "界" in _plain([line])]
@@ -1188,7 +1189,7 @@ def test_decisions_wraps_wide_unbroken_tokens_by_cells() -> None:
 
 
 def test_decisions_detail_keeps_full_text_and_recommendation() -> None:
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items(
         [
             _item(
