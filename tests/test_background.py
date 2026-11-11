@@ -817,7 +817,7 @@ async def test_background_task_owner_state_table(
                     await asyncio.wait_for(read_blocked.wait(), 10)
                     return await original_read_output(*args)
 
-                # Keep the reader pending so the drain race takes the gated branch.
+                # test-contract: seam keep the reader pending so the drain race takes the gated branch
                 monkeypatch.setattr(
                     registry.background_tasks, "_read_output", read_output
                 )
