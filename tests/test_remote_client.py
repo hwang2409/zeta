@@ -198,15 +198,18 @@ async def test_configured_remote_keeps_ssh_user_and_port(tmp_path: Path) -> None
 
 def test_attach_history_replays_prompt_text_and_named_tool_card(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
-    call = ToolCall("call-1", "bash", {"command": "echo streamed-line-1"})
-    store.append_message(with_message_origin(
-        Message(MessageRole.USER, [TextContent("hello remote")]), MessageOrigin.USER))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("running a command now."), ToolUseContent(call)]))
-    store.append_message(Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult("call-1", "streamed-line-1")))
-    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("after the tool.")]))
-    # the rows the host's serve sends for session_history_and_subscribe.
-    result, _, _ = replay_history(SimpleNamespace(opened=SimpleNamespace(store=store)), include_delivery_id=False,
-                                  fidelity=True, content_read=False, served_turn_end=False)
+    try:
+        call = ToolCall("call-1", "bash", {"command": "echo streamed-line-1"})
+        store.append_message(with_message_origin(
+            Message(MessageRole.USER, [TextContent("hello remote")]), MessageOrigin.USER))
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("running a command now."), ToolUseContent(call)]))
+        store.append_message(Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult("call-1", "streamed-line-1")))
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent("after the tool.")]))
+        # the rows the host's serve sends for session_history_and_subscribe.
+        result, _, _ = replay_history(SimpleNamespace(opened=SimpleNamespace(store=store)), include_delivery_id=False,
+                                      fidelity=True, content_read=False, served_turn_end=False)
+    finally:
+        store.close()
     frame = json.dumps({"jsonrpc": "2.0", "id": 2, "result": result}).encode()
     state = RemoteViewState.create(SimpleNamespace(console=Console()), "home", "abc123", "")
     for event in decode_line(frame):
