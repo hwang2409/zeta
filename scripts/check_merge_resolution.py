@@ -6,11 +6,13 @@ import argparse
 import ast
 import difflib
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections import Counter
 from dataclasses import dataclass
 
@@ -1174,42 +1176,61 @@ def _merge_paths(base: str, main: str, branch: str, commit: str) -> tuple[set[st
     return changed, all_paths
 
 
+def _normalize_line(path: str, line: str) -> str:
+    if not path.endswith(".py"):
+        return " ".join(line.split())
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(line).readline)
+        return "".join(
+            token.string if token.type == tokenize.STRING else token.string.replace(" ", "").replace("\t", "")
+            for token in tokens
+            if token.type not in {tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NEWLINE, tokenize.NL}
+        )
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return line.replace(" ", "").replace("\t", "")
+
+
+def _equal_base_lines(base: list[str], side: list[str]) -> dict[int, int]:
+    return {
+        old_index: new_index
+        for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+            None, base, side, autojunk=False
+        ).get_opcodes()
+        if tag == "equal"
+        for old_index, new_index in zip(range(old_start, old_end), range(new_start, new_end))
+    }
+
+
 def _removed_line_findings(
     path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
     main_range: str,
 ) -> list[Item]:
-    base = base_text.splitlines()
-    branch = branch_text.splitlines()
-    merge = merge_text.splitlines()
+    base = [_normalize_line(path, line) for line in base_text.splitlines()]
+    main = [_normalize_line(path, line) for line in main_text.splitlines()]
+    branch_lines = branch_text.splitlines()
+    branch = [_normalize_line(path, line) for line in branch_lines]
+    merge_lines = merge_text.splitlines()
+    merge = [_normalize_line(path, line) for line in merge_lines]
+    branch_equal = _equal_base_lines(base, branch)
+    merge_equal = _equal_base_lines(base, merge)
+    main_equal = _equal_base_lines(base, main)
     branch_added = {
-        line
+        branch[index]
         for tag, _old_start, _old_end, new_start, new_end in difflib.SequenceMatcher(
             None, base, branch, autojunk=False
         ).get_opcodes()
         if tag in {"insert", "replace"}
-        for line in branch[new_start:new_end]
+        for index in range(new_start, new_end)
     }
     findings = []
-    for tag, old_start, old_end, _new_start, _new_end in difflib.SequenceMatcher(
-        None, base, main_text.splitlines(), autojunk=False
-    ).get_opcodes():
-        if tag not in {"delete", "replace"}:
+    for base_index, merge_index in merge_equal.items():
+        if base_index not in branch_equal or base[base_index] in branch_added:
             continue
-        removed = base[old_start:old_end]
-        for line_number, line in enumerate(removed, old_start + 1):
-            if line in branch_added:
-                continue
-            # Match the deleted hunk with two lines of its original context. This
-            # avoids treating an unrelated repeated line as a resolution error.
-            context_start = max(0, old_start - 2)
-            context_end = min(len(base), old_end + 2)
-            pattern = base[context_start:context_end]
-            for index in range(len(merge) - len(pattern) + 1):
-                if merge[index : index + len(pattern)] == pattern:
-                    findings.append(
-                        Item(path, "main-deleted-line", main_range, line_number, line)
-                    )
-                    break
+        if base_index in main_equal:
+            continue
+        findings.append(
+            Item(path, "main-deleted-line", main_range, base_index + 1, merge_lines[merge_index])
+        )
     return findings
 
 

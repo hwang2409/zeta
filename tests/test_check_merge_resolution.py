@@ -54,34 +54,43 @@ def test_item_in_uses_keyed_lookup_without_iterating_values():
     assert items.values_calls == 0
 
 
-def test_main_deletion_readded_is_flagged_unless_branch_added_it(tmp_path: Path):
-    for name, branch_text, expected in (
-        ("bad", "before\nbranch\nafter\n", True),
-        ("allowed", "before\nremoved\nremoved\nafter\n", False),
-    ):
-        (tmp_path / name).mkdir()
-        r = repo(tmp_path / name)
-        (r / "src").mkdir()
-        (r / "src/a.py").write_text("before\nremoved\nafter\n")
-        commit(r, "base")
-        subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
-        (r / "src/a.py").write_text(branch_text)
-        commit(r, "branch")
-        subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
-        (r / "src/a.py").write_text("before\nafter\n")
-        commit(r, "main deletes line")
-        _set_origin_main(r)
-        subprocess.run(
-            ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
-        )
-        (r / "src/a.py").write_text(branch_text)
-        commit(r, "merge")
-        result = run(r)
-        assert (result.returncode == 1) is expected
-        if expected:
-            assert "a.py" in result.stdout
-            assert "main deletion re-added" in result.stdout
-            assert "keep main's deletion or justify it in the PR" in result.stdout
+@pytest.mark.parametrize(
+    ("name", "branch_text", "merge_text", "expected"),
+    (
+        ("bad", "before\nremoved\nafter\n", "before\nremoved\nafter\n", True),
+        ("allowed", "before\nremoved\nremoved\nafter\n", "before\nremoved\nremoved\nafter\n", False),
+        ("whitespace", "before\ndanger()\nafter\n", "before\ndanger( )\nafter\n", True),
+    ),
+)
+def test_main_deletion_readded_is_flagged_unless_branch_added_it(
+    tmp_path: Path, name: str, branch_text: str, merge_text: str, expected: bool
+):
+    (tmp_path / name).mkdir()
+    r = repo(tmp_path / name)
+    (r / "src").mkdir()
+    base_text = "before\nremoved\nafter\n" if name != "whitespace" else "before\ndanger()\nafter\n"
+    (r / "src/a.py").write_text(base_text)
+    commit(r, "base")
+    subprocess.run(["git", "checkout", "-qb", "branch"], cwd=r, check=True)
+    (r / "src/a.py").write_text(branch_text)
+    if branch_text == base_text:
+        (r / "branch.txt").write_text("branch change\n")
+    commit(r, "branch")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=r, check=True)
+    (r / "src/a.py").write_text("before\nafter\n")
+    commit(r, "main deletes line")
+    _set_origin_main(r)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "branch"], cwd=r, check=False
+    )
+    (r / "src/a.py").write_text(merge_text)
+    commit(r, "merge")
+    result = run(r)
+    assert (result.returncode == 1) is expected
+    if expected:
+        assert "a.py" in result.stdout
+        assert "main deletion re-added" in result.stdout
+        assert "keep main's deletion or justify it in the PR" in result.stdout
 
 
 def test_dropped_membership_element_flagged(tmp_path: Path):
