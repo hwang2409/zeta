@@ -1934,6 +1934,7 @@ async def test_inbox_send_reports_busy_lock_as_retryable(
     def _busy(*_args: object, **_kwargs: object):
         raise ProjectRegistryBusyError()
 
+    # test-contract: seam force a busy registry lock to assert error mapping
     monkeypatch.setattr(registry, "_project_lock", _busy)
     busy = await _inbox(tool_registry, arguments)
     error = busy["structuredContent"]["error"]
@@ -1944,6 +1945,7 @@ async def test_inbox_send_reports_busy_lock_as_retryable(
     def _unsafe(*_args: object, **_kwargs: object):
         raise ProjectRegistryError("inbox lock is not a private regular unshared file")
 
+    # test-contract: seam force an unsafe-lock error to assert it stays non-retryable
     monkeypatch.setattr(registry, "_project_lock", _unsafe)
     unsafe = await _inbox(tool_registry, arguments)
     unsafe_error = unsafe["structuredContent"]["error"]
