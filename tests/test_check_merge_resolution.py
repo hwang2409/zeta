@@ -125,6 +125,68 @@ def test_branch_edit_overlapping_main_deletion_is_flagged(tmp_path: Path):
     assert "main deletion re-added" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("name", "branch_text", "merge_text"),
+    (
+        ("moved", "before()\nremoved()\nafter()\n", "removed()\nbefore()\nafter()\n"),
+        (
+            "readded_in_place",
+            "before()\nremoved()\nafter()\n# b\n",
+            "before()\nremoved()\nafter()\n# b\n",
+        ),
+    ),
+)
+def test_readded_main_deletion_is_flagged_under_final(
+    tmp_path: Path, name: str, branch_text: str, merge_text: str
+):
+    # CI always passes --final (scripts/ci_merge_resolution.sh), so the rule must still
+    # fire when the re-added block is still present in the final tree.
+    r = tmp_path / name
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        branch_text,
+        "before()\nafter()\n",
+        merge_text,
+        merge_text,
+    )
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 1
+    assert "main deletion re-added" in result.stdout
+
+
+def test_readded_main_deletion_removed_later_is_cleared_under_final(tmp_path: Path):
+    # A later commit drops the re-added block, so --final must clear the finding.
+    r = tmp_path / "fixed_later"
+    r.mkdir()
+    merge, final = _public_line_case(
+        r,
+        "before()\nremoved()\nafter()\n",
+        "before()\nremoved()\nafter()\n# b\n",
+        "before()\nafter()\n",
+        "before()\nremoved()\nafter()\n# b\n",
+        "before()\nafter()\n# b\n",
+    )
+    result = run(r, merge, "--final", final)
+    assert result.returncode == 0
+    assert "removed again in the final tree" in result.stdout
+
+
+def test_branch_edit_reusing_common_line_is_not_flagged(tmp_path: Path):
+    # Branch edits a line inside main's deleted block to a common line ("return None")
+    # that already lives elsewhere; keeping main's deletion is correct, not a re-add.
+    r = tmp_path / "common_line"
+    r.mkdir()
+    base = "def a():\n    x = 1\n    return x\n\ndef b():\n    return None\n"
+    branch = "def a():\n    x = 1\n    return None\n\ndef b():\n    return None\n"
+    main = "def b():\n    return None\n"
+    merge, _ = _public_line_case(r, base, branch, main, main, main)
+    result = run(r, merge)
+    assert result.returncode == 0
+    assert "clean merge" in result.stdout
+
+
 @pytest.mark.parametrize("text", [
     'before()\nvalue = "a b"\nafter()\n',
     "before()\n# a b\nafter()\n",
@@ -622,7 +684,10 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
                 "def helper(): return 1\n",
                 "src/b.py",
             ),
-            0,
+            # The merge reverted src/a.py to the base line "base = 1" that both main and the
+            # branch removed, and the final head keeps it, so it is a real re-added deletion
+            # (exit 1) on top of the helper move that is cleared (moved/restored later).
+            1,
             "moved/restored later: src/b.py",
         )
     if case == "restored in place":
@@ -678,7 +743,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
                 "VALUE = 1\n",
                 "src/b.py",
             ),
-            0,
+            # Merge reverted src/a.py to "base = 1" (removed by both sides) and the final head
+            # keeps it: a real re-added deletion (exit 1) alongside the cleared constant move.
+            1,
             "moved/restored later: src/b.py",
         )
     if case == "constant duplicate final":
@@ -706,7 +773,9 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
                 "class Box:\n    value = 1\n    def method(self): return 1\n",
                 "src/b.py",
             ),
-            0,
+            # Merge reverted src/a.py to "base = 1" (removed by both sides) and the final head
+            # keeps it: a real re-added deletion (exit 1) alongside the cleared class move.
+            1,
             "moved/restored later: src/b.py",
         )
     if case == "element same-named collection moved":
@@ -795,14 +864,14 @@ def _final_case(r: Path, case: str) -> tuple[str, str, int, str]:
     ("case", "expected", "needle"),
     [
         ("unrelated same-name def", 1, "def helper"),
-        ("true move", 0, "moved/restored later: src/b.py"),
+        ("true move", 1, "moved/restored later: src/b.py"),
         ("restored in place", 0, "moved/restored later: src/a.py"),
         ("element unrelated", 1, "TARGET"),
         ("element restored", 0, "moved/restored later: src/a.py"),
         ("constant different value", 1, "VALUE"),
-        ("constant moved same value", 0, "moved/restored later: src/b.py"),
+        ("constant moved same value", 1, "moved/restored later: src/b.py"),
         ("constant duplicate final", 1, "VALUE"),
-        ("class moved with member", 0, "moved/restored later: src/b.py"),
+        ("class moved with member", 1, "moved/restored later: src/b.py"),
         ("element same-named collection moved", 0, "moved/restored later: src/b.py"),
         ("duplicate final collection", 1, "TARGET"),
         ("dispatch restored", 0, "moved/restored later: src/a.py"),

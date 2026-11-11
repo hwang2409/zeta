@@ -1252,17 +1252,32 @@ def _count_sequence(lines: list[str], sequence: list[str]) -> int:
 
 def _removed_line_findings(
     path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
-    main_range: str,
+    main_range: str, final_text: str | None = None,
 ) -> list[Item]:
     base = _normalized_lines(path, base_text)
     main = _normalized_lines(path, main_text)
     branch = _normalized_lines(path, branch_text)
     merge_lines = merge_text.splitlines()
     merge = _normalized_lines(path, merge_text)
+    final = _normalized_lines(path, final_text) if final_text is not None else None
     deleted = _deleted_intervals(base, main)
     replacements = _branch_replacements(base, branch, deleted)
     findings = []
     for base_index, _old_end, replacement in replacements:
+        # One overlapping copy of the branch's edited line may legitimately survive the
+        # deletion, so count the extra copies rather than any match (the "- 1" is that copy).
+        expected = max(
+            0,
+            _count_sequence(main, replacement)
+            + _count_sequence(branch, replacement)
+            - _count_sequence(base, replacement)
+            - 1,
+        )
+        if _count_sequence(merge, replacement) <= expected:
+            continue
+        if final is not None and _count_sequence(final, replacement) <= expected:
+            _report_fixed_later(path, replacement)
+            continue
         merge_index = _find_sequence(merge, replacement)
         if merge_index is not None:
             findings.append(
@@ -1270,12 +1285,16 @@ def _removed_line_findings(
             )
     for start, end in deleted:
         sequence = base[start:end]
-        expected = (
+        expected = max(
+            0,
             _count_sequence(main, sequence)
             + _count_sequence(branch, sequence)
-            - _count_sequence(base, sequence)
+            - _count_sequence(base, sequence),
         )
         if _count_sequence(merge, sequence) <= expected:
+            continue
+        if final is not None and _count_sequence(final, sequence) <= expected:
+            _report_fixed_later(path, sequence)
             continue
         merge_index = _find_sequence(merge, sequence)
         if merge_index is not None:
@@ -1285,13 +1304,23 @@ def _removed_line_findings(
     return findings
 
 
-def _path_line_findings(path: str, revisions: list[str], sources: dict, parsed: dict) -> list[Item]:
+def _report_fixed_later(path: str, sequence: list[str]) -> None:
+    print(
+        f"info: {path}: main-deleted-line: re-added block {sequence[0]!r} "
+        f"removed again in the final tree"
+    )
+
+
+def _path_line_findings(
+    path: str, revisions: list[str], sources: dict, parsed: dict,
+    final_text: str | None = None,
+) -> list[Item]:
     texts = [sources.get((revision, path)) for revision in revisions]
     if texts[0] is None or texts[3] is None:
         return []
     findings = _removed_line_findings(
         path, texts[0], texts[1] or "", texts[2] or "", texts[3],
-        f"{revisions[0]}..{revisions[1]}",
+        f"{revisions[0]}..{revisions[1]}", final_text,
     )
     if any(text is None or not text for text in texts[:3]):
         return findings
@@ -1320,11 +1349,15 @@ def _parse_merge_data(commit: str, main: str, branch: str, args):
     parsed, unresolved, error = parse_revisions(revisions, all_paths, sources)
     if error:
         return text, changed, all_paths, parsed, unresolved, error, revisions, []
+    final_sources = (
+        load_sources([args.final], all_paths) if args.final else {}
+    )
     line_findings = [
         finding
         for path in all_paths
-        for finding in _path_line_findings(path, revisions, sources, parsed)
-        if not (args.final and finding.kind == "main-deleted-line")
+        for finding in _path_line_findings(
+            path, revisions, sources, parsed, final_sources.get((args.final, path))
+        )
     ]
     return text, changed, all_paths, parsed, unresolved, error, revisions, line_findings
 
