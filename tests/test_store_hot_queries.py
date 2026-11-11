@@ -31,7 +31,7 @@ def test_approval_index_rebuilds_non_v4_without_changing_authority(
     call = ToolCall(f"call-{old_version}", "bash", {"cmd": "pwd"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
-        [call],
+        [(call.id, call)],
     )
     transcript = store.log_path.read_bytes()
     sidecar = store.session_dir / "history-index.sqlite3"
@@ -112,7 +112,7 @@ def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -
     store.replay = _unexpected_history_scan  # type: ignore[method-assign]
 
     page = asyncio.run(store.pending_approval_page())
-    assert page.items == [(pending.id, pending.to_dict())]
+    assert page.items == ((pending.id, pending.to_dict()),)
     assert asyncio.run(store.approval_state(pending.id)) == (pending, None)
     assert asyncio.run(store.approval_state(resolved.id)) == (resolved, "deny")
 
@@ -125,7 +125,7 @@ def test_pending_approvals_sees_external_append(tmp_path: Path) -> None:
 
     writer.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(request)]),
-        [(request.id, request.to_dict())],
+        [(request.id, request)],
     )
 
     assert asyncio.run(reader.pending_approval_page()).items == ((request.id, request.to_dict()),)
@@ -190,7 +190,7 @@ def test_fast_path_detects_same_size_rewrite_with_restored_mtime(
     request = ToolCall("rewrite", "read", {"path": "README.md"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(request)]),
-        [(request.id, request.to_dict())],
+        [(request.id, request)],
     )
     assert store.resolve_approval(request.id, "allow")
     original_stat = store.path.stat()
