@@ -863,7 +863,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
-        return None
+        return
 
     def approve(
         self,

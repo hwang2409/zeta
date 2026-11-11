@@ -6927,7 +6927,7 @@ async def test_delegated_approvals_use_child_instance_keys(tmp_path: Path) -> No
         )
     )
     async with asyncio.timeout(10):
-        while len((await asyncio.wait_for(policy.pending_requests(), 10))) < 2:
+        while len(await asyncio.wait_for(policy.pending_requests(), 10)) < 2:
             await asyncio.sleep(0)
 
     pending = {request.key for request in (await asyncio.wait_for(policy.pending_requests(), 10))}

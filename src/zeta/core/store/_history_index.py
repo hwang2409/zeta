@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
-from ...protocol.types import ToolCall, is_passive_harness_message, is_visible_harness_notice
+from ...protocol.types import (
+    ToolCall,
+    is_passive_harness_message,
+    is_visible_harness_notice,
+)
 from ..checkpoints import ConversationEntry
 
 _HISTORY_PAGE_ATTEMPTS = 16
@@ -883,8 +887,11 @@ class HistoryPageStoreMixin:
     async def approval_state(
         self, request_id: str
     ) -> tuple[ToolCall, str | None] | None:
-        if not self._read_only:
-            self._sync_log_without_waiting()
+        self._sync_log_without_waiting()
+        if self._read_only:
+            return await self._to_thread_store(
+                lambda: self._resident_approval_state(request_id)
+            )
         result = await self._to_thread_store(
             lambda: _read_stable_approval(
                 self, lambda index, facts: index.approval_state(facts, request_id)
@@ -897,8 +904,11 @@ class HistoryPageStoreMixin:
         )
 
     async def approval_resolution(self, request_id: str) -> Mapping[str, str] | None:
-        if not self._read_only:
-            self._sync_log_without_waiting()
+        self._sync_log_without_waiting()
+        if self._read_only:
+            return await self._to_thread_store(
+                lambda: self._resident_approval_resolution(request_id)
+            )
         result = await self._to_thread_store(
             lambda: _read_stable_approval(
                 self,
@@ -910,8 +920,11 @@ class HistoryPageStoreMixin:
     async def pending_approval_page(
         self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
     ) -> IndexedPendingApprovalPage:
-        if not self._read_only:
-            self._sync_log_without_waiting()
+        self._sync_log_without_waiting()
+        if self._read_only:
+            return await self._to_thread_store(
+                lambda: self._resident_pending_approval_page(after_seq, limit)
+            )
         return await self._to_thread_store(
             lambda: _read_stable_approval(
                 self,

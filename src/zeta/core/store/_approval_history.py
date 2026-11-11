@@ -7,6 +7,7 @@ from typing import Any
 
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
+from ._history_index import IndexedPendingApprovalPage
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:
@@ -113,3 +114,51 @@ class ApprovalHistoryStoreMixin:
                     tool_call, _ = states[request_id]
                     states[request_id] = (tool_call, entry.data["decision"])
         return states
+
+    # A read-only reader cannot read the shared sidecar for its own lagging
+    # view: the sidecar is updated in place by the writer and may be mid-append.
+    # It answers approval reads from its resident branch, like main's
+    # latency-tolerant display path, without blocking on the writer's lock.
+    def _resident_approval_state(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        return self._approval_states_from_branch(
+            list(self._active_branch())
+        ).get(request_id)
+
+    def _resident_approval_resolution(
+        self, request_id: str
+    ) -> Mapping[str, Any] | None:
+        for entry in reversed(self._active_branch()):
+            if (
+                entry.type == "approval_resolution"
+                and entry.data.get("request_id") == request_id
+            ):
+                return dict(entry.data)
+        return None
+
+    def _resident_pending_approval_page(
+        self, after_seq: int, limit: int
+    ) -> IndexedPendingApprovalPage:
+        resolved: set[str] = set()
+        pending: list[tuple[int, str, Mapping[str, object]]] = []
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    pending.append(
+                        (entry.seq, request["request_id"], request["tool_call"])
+                    )
+            elif entry.type == "approval_resolution":
+                resolved.add(entry.data["request_id"])
+        rows = sorted(
+            (
+                (seq, request_id, tool_call)
+                for seq, request_id, tool_call in pending
+                if request_id not in resolved and seq > after_seq
+            ),
+            key=lambda row: row[0],
+        )[:limit]
+        return IndexedPendingApprovalPage(
+            tuple((request_id, tool_call) for _seq, request_id, tool_call in rows),
+            rows[-1][0] if len(rows) == limit else None,
+        )
