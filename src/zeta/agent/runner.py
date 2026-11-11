@@ -148,6 +148,17 @@ async def consume_child(
             return child_loop.agent_depth + 1
         return child_loop.agent_depth
 
+    def emit_lifecycle(
+        kind: str, event: StreamEvent, *, tool_result: ToolResult | None = None
+    ) -> None:
+        publish_lifecycle(
+            kind,
+            event.tool_call,
+            tool_result=tool_result,
+            depth=lifecycle_depth(event.tool_call),
+            owner=event.data.get("agent_instance_id"),
+        )
+
     async def consume_events(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
@@ -171,19 +182,9 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: approval pending: {name}"
                 update_step(status)
                 publish(status)
-                publish_lifecycle(
-                    "approval_start",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                    owner=event.data.get("agent_instance_id"),
-                )
+                emit_lifecycle("approval_start", event)
             elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                publish_lifecycle(
-                    "approval_end",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                    owner=event.data.get("agent_instance_id"),
-                )
+                emit_lifecycle("approval_end", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
                 record_tool_call()
                 name = event.tool_call.name if event.tool_call is not None else "tool"
@@ -194,12 +195,7 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: tool: {name} {summary}"
                 update_step(status)
                 publish(status)
-                publish_lifecycle(
-                    "execution_start",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                    owner=event.data.get("agent_instance_id"),
-                )
+                emit_lifecycle("execution_start", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
                 if (
                     event.tool_call is not None
@@ -209,13 +205,7 @@ async def consume_child(
                     and isinstance(event.tool_result.structured_content, dict)
                 ):
                     explicit_report = dict(event.tool_result.structured_content)
-                publish_lifecycle(
-                    "execution_end",
-                    event.tool_call,
-                    tool_result=event.tool_result,
-                    depth=lifecycle_depth(event.tool_call),
-                    owner=event.data.get("agent_instance_id"),
-                )
+                emit_lifecycle("execution_end", event, tool_result=event.tool_result)
             elif event.type is StreamEventType.TURN_END:
                 last_message = event.message
                 turns = child_turns() + 1
