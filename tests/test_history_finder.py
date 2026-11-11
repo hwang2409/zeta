@@ -9,8 +9,8 @@ import pytest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
-from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.overlay_text_field import OverlayTextField
+from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.transcript import FinderControl
 from zeta.tui.transcript.finder_runtime import FinderRuntimeTarget
 from zeta.tui.transcript.history_finder import HistoryFinder, build_history_candidates

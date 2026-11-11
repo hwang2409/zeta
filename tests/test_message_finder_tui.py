@@ -20,8 +20,8 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
 from zeta.tui.app import TUIApp
-from zeta.tui.theme import RICH_THEME
 from zeta.tui.overlay_text_field import OverlayTextField
+from zeta.tui.theme import RICH_THEME
 from zeta.tui.transcript import FinderControl, TranscriptWidget, transcript_finder
 from zeta.tui.transcript.history_finder import HistoryFinder
 from zeta.tui.transcript.message_finder import Role
