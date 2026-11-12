@@ -8,9 +8,9 @@ import os
 import subprocess
 import sys
 import threading
-from io import StringIO
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -23,7 +23,6 @@ from zeta.config.settings import load_settings
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError
-from zeta.tui.app import create_app
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     Message,
@@ -35,6 +34,7 @@ from zeta.protocol.types import (
 )
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
+from zeta.tui.app import create_app
 
 
 def git(path: Path, *args: str) -> None:
@@ -142,12 +142,14 @@ def test_tui_startup_retries_busy_registry_and_links_project(
             raise ProjectRegistryBusyError()
         original(fd, mode)
 
+    # test-contract: seam patch the real registry lock for deterministic contention
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         metadata = SessionManager(tmp_path / "zeta-home").read_metadata(
             app.loop.store.session_id
         )
+        # test-contract: seam assert the real tui startup links the project
         assert metadata.project_id is not None
     finally:
         asyncio.run(app.close())
@@ -167,6 +169,7 @@ def test_tui_busy_registry_notice_renders(
             raise ProjectRegistryBusyError()
         original(fd, mode)
 
+    # test-contract: seam patch the real registry lock for deterministic contention
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     app.console = Console(file=StringIO())
