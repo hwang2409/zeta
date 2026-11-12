@@ -3482,6 +3482,7 @@ def _delivery_fold_reads(store: ConversationStore) -> dict[str, object]:
             for child, e in store.agent_completion_notifications_by_child().items()
         },
         "last_turn_end": (lt.id if (lt := store.last_turn_end()) is not None else None),
+        "has_outstanding_tool_calls": store.has_outstanding_tool_calls(),
         "has_task_exit": store.has_task_exit_notification("task-7"),
         "agent_tool_result": (
             r.to_dict()
@@ -3592,6 +3593,7 @@ _DELIVERY_ROUTES = (
     "fork_rebuild",
     "off_loop_refresh",
     "install_race",
+    "open_tool_call",
 )
 
 
@@ -3702,6 +3704,31 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
             # the immutable fold is installed by reference, not a lost patch.
             await asyncio.wait_for(reader._refresh_off_loop(), 10)
             target = reader
+        elif route == "open_tool_call":
+            # A trailing tool call with no result leaves one outstanding tool
+            # call, so has_outstanding_tool_calls() reads True from the fold's
+            # open_tool_calls set. A cold reopen rebuilds the fold from the full
+            # branch, so this row proves open_tool_calls survives the rebuild
+            # route and equals the live append route.
+            target = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, target)
+            await asyncio.to_thread(
+                target.append_message,
+                Message(
+                    MessageRole.ASSISTANT,
+                    [ToolUseContent(ToolCall("open-call-9", "bash", {"command": "x"}))],
+                ),
+            )
+            assert target.has_outstanding_tool_calls() is True
+            # Keep the pending call before a fold-neutral append so this row
+            # detects dropping an already-open call during installation.
+            target.append_agent_notification(
+                "fold-neutral",
+                child_session_path="/fold-neutral",
+                description="fold-neutral",
+                status="completed",
+                text="done",
+            )
         else:  # install_race — the B1 regression the identity-eq fold dropped
             # The owner swaps its fold to an equal-valued object (a fold-neutral
             # checkpoint) while an async command is in flight, and an external

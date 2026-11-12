@@ -43,6 +43,7 @@ class DeliveryFold:
         "last_terminal_transition",
         "last_turn_end",
         "notification_ids",
+        "open_tool_calls",
         "presented",
         "prompt_ids",
         "prompt_messages",
@@ -51,6 +52,7 @@ class DeliveryFold:
 
     def __init__(self) -> None:
         self.tool_results: dict[str, ToolResult] = {}
+        self.open_tool_calls: set[str] = set()
         self.agent_call_ids: set[str] = set()
         self.agent_receipts: list[tuple[str, str]] = []
         self.notification_ids: set[str] = set()
@@ -93,6 +95,7 @@ class DeliveryFold:
         """Return a mutable working fold with its own containers for one change."""
         new = DeliveryFold.__new__(DeliveryFold)
         new.tool_results = dict(self.tool_results)
+        new.open_tool_calls = set(self.open_tool_calls)
         new.agent_call_ids = set(self.agent_call_ids)
         new.agent_receipts = list(self.agent_receipts)
         new.notification_ids = set(self.notification_ids)
@@ -183,19 +186,22 @@ class DeliveryFold:
         if tool_result is not None:
             self.tool_results[tool_result.tool_call_id] = tool_result
         for block in message.content:
-            if (
-                isinstance(block, ToolUseContent)
-                and block.tool_call.name.casefold() == "agent"
-            ):
+            if not isinstance(block, ToolUseContent):
+                continue
+            # Track every open tool call so has_outstanding_tool_calls() is an
+            # O(1) fold read. Add the ids first, then discard the result id
+            # below, matching the per-message order of the branch scan it
+            # replaces.
+            self.open_tool_calls.add(block.tool_call.id)
+            if block.tool_call.name.casefold() == "agent":
                 self.agent_call_ids.add(block.tool_call.id)
                 prior_result = self.tool_results.get(block.tool_call.id)
                 if prior_result is not None:
                     self._record_agent_receipt(prior_result)
-        if (
-            tool_result is not None
-            and tool_result.tool_call_id in self.agent_call_ids
-        ):
-            self._record_agent_receipt(tool_result)
+        if tool_result is not None:
+            self.open_tool_calls.discard(tool_result.tool_call_id)
+            if tool_result.tool_call_id in self.agent_call_ids:
+                self._record_agent_receipt(tool_result)
 
     def _apply_notification(self, entry: ConversationEntry) -> None:
         handle = entry.data.get("child_instance_id")

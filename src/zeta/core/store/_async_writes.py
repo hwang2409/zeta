@@ -83,6 +83,23 @@ class _RefreshCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _BranchOperationCommand(_StoreMutationCommand):
+    """One branch-changing append (checkpoint, fork, switch) run off the loop.
+
+    The durable writer validates, appends, and rebuilds the active-branch
+    sidecar and fold under the append lock; the owner loop only installs the
+    result through the existing ``replace_entries`` route.
+    """
+
+    operation: str
+    argument: str | None
+
+    def apply(self, store: Any) -> Any:
+        method = getattr(store, self.operation)
+        return method() if self.argument is None else method(self.argument)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _AppendMessageCommand(_StoreMutationCommand):
     message: Any
     parent_id: str | None
@@ -1033,6 +1050,29 @@ class AsyncDurableWritesMixin:
     async def append_pending_prompt_async(self: ConversationStore, text: str) -> Any:
         return await self._commit_storage_command(
             _AppendPendingPromptCommand(text=text)
+        )
+
+    async def append_fork_async(
+        self: ConversationStore, selector: str
+    ) -> ConversationEntry:
+        return await self._commit_storage_command(
+            _BranchOperationCommand(operation="append_fork", argument=selector)
+        )
+
+    async def append_message_fork_async(
+        self: ConversationStore, entry_id: str
+    ) -> ConversationEntry:
+        return await self._commit_storage_command(
+            _BranchOperationCommand(operation="append_message_fork", argument=entry_id)
+        )
+
+    async def switch_to_branch_async(
+        self: ConversationStore, head_entry_id: str
+    ) -> ConversationEntry:
+        return await self._commit_storage_command(
+            _BranchOperationCommand(
+                operation="switch_to_branch", argument=head_entry_id
+            )
         )
 
     @staticmethod
