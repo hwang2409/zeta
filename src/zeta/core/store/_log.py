@@ -127,7 +127,7 @@ class _FullLoadValidator:
         self.baseline = (len(store._entries), store._entry_prefix_digest)
         self._digest_at_baseline: bytes | None = b"" if not store._entries else None
         self.state = copy.copy(store)
-        self.state._resident_rows.replace(())
+        self.state._resident_rows = type(store._resident_rows)(())
         self.state._entry_prefix_digest = b""
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()

@@ -137,6 +137,7 @@ class ConversationStore(
     def _entries(self, entries: Iterable[ConversationEntry]) -> None:
         if isinstance(entries, list) and hasattr(self, "_resident_rows"):
             self._resident_rows.entries = entries
+            self._resident_rows._rebuild_branch()
             return
         self._resident_rows = ResidentRows(entries)
 
