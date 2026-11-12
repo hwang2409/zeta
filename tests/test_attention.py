@@ -949,7 +949,7 @@ def test_p06_8_attention_resolution_process_progress(tmp_path: Path) -> None:
             "opposing attention resolution made no progress while the holder held"
         )
         if outcome[0] == "refused":
-            assert outcome[1] in {"InboxError", "ProjectRegistryBusyError"}, outcome
+            assert outcome[1] in {"InboxBusyError", "ProjectRegistryBusyError"}, outcome
             assert AttentionStore(manager.sessions_dir / other_session, writer_epoch=5).get(
                 other_attention
             ).status == "open"
