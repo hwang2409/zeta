@@ -595,35 +595,41 @@ class RetentionPlanner:
                     if is_retention_pinned(parent_fd, scan=scan):
                         return True
             except FileNotFoundError:
-                return False
+                return True
             current = parent
         return True
 
     def _state_payload(self) -> dict:
-        """Project memory state onto the registered shape (observability only)."""
-        sweep, flight = self._sweep, self._flight
-        walk = flight.walk if flight is not None else _Walk()
-        anchor = sweep.anchor if sweep is not None else 0
-        return {
-            "root_id": flight.root_id if flight is not None else "pending",
-            "device": flight.device if flight is not None else 0,
-            "inode": flight.inode if flight is not None else 0,
-            "cutoff": str(sweep.cutoff_ns) if sweep is not None else "0",
-            "walk_started_at": str(anchor),
-            "lease_epoch": self._lease_epoch,
-            "frontier": [list(c) for c in walk.frontier]
-            + ([list(walk.listing[0])] if walk.listing is not None else []),
-            "completed_directories": [list(f) for f in walk.fingerprints],
-            "max_activity": walk.max_activity,
-            "bytes": walk.bytes,
-            "descendant_ids": ["/".join(c) for c in flight.store_dirs if c] if flight else [],
-            "entry_count": walk.entries,
-            "reference_cursor": {},
-            "start_generation": 0,
-            "references": {},
-            "phase": "discover" if flight is None else ("walk" if not walk.done else "references"),
-            "preview": self._latest,
+        """Project memory state directly onto the registered shape."""
+        payload = {
+            "root_id": "pending", "device": 0, "inode": 0, "cutoff": "0",
+            "walk_started_at": "0", "lease_epoch": self._lease_epoch,
+            "frontier": [[]], "completed_directories": [], "max_activity": 0,
+            "bytes": 0, "descendant_ids": [], "entry_count": 0,
+            "reference_cursor": {}, "start_generation": 0, "references": {},
+            "phase": "discover", "preview": self._latest,
         }
+        if self._sweep is not None:
+            payload.update(
+                cutoff=str(self._sweep.cutoff_ns),
+                walk_started_at=str(self._sweep.anchor),
+            )
+        if self._flight is not None:
+            walk = self._flight.walk
+            payload.update(
+                root_id=self._flight.root_id,
+                device=self._flight.device,
+                inode=self._flight.inode,
+                frontier=[list(c) for c in walk.frontier]
+                + ([list(walk.listing[0])] if walk.listing is not None else []),
+                completed_directories=[list(f) for f in walk.fingerprints],
+                max_activity=walk.max_activity,
+                bytes=walk.bytes,
+                descendant_ids=["/".join(c) for c in self._flight.store_dirs if c],
+                entry_count=walk.entries,
+                phase="references" if walk.done else "walk",
+            )
+        return payload
 
 
 class _ClosureAuthority:
@@ -678,20 +684,25 @@ class _EntryScan:
         except OSError as exc:
             raise RetentionPlannerError("unsafe retention directory") from exc
         self.charge = charge
+        self._pending = None
         self._closed = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        try:
-            entry = next(self._entries)
-            info = entry.stat(follow_symlinks=False)
-        except StopIteration:
-            raise
-        except OSError as exc:
-            raise RetentionPlannerError("unsafe retention entry") from exc
-        self.charge(info.st_size if stat.S_ISREG(info.st_mode) else 0)
+        if self._pending is None:
+            try:
+                entry = next(self._entries)
+                info = entry.stat(follow_symlinks=False)
+            except StopIteration:
+                raise
+            except OSError as exc:
+                raise RetentionPlannerError("unsafe retention entry") from exc
+            self._pending = (entry, info.st_size if stat.S_ISREG(info.st_mode) else 0)
+        entry, size = self._pending
+        self.charge(size)
+        self._pending = None
         return entry
 
     def close(self) -> None:
@@ -922,7 +933,9 @@ def _authority_inbox_reason(home_fd, ids, scan: _ClosureBudget) -> str | None:
         with scan.iter_entries(status_fd) as entries:
             for entry in entries:
                 name = entry.name
-                if name.endswith(".json") and _classify_inbox_record(
+                if not name.endswith(".json"):
+                    raise RetentionPlannerError("unexpected inbox file")
+                if _classify_inbox_record(
                     _read_json(status_fd, name, scan), name, ids, bodies_fd
                 ):
                     return "pending inbox reference"
@@ -973,27 +986,31 @@ def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | N
                 continue
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                 raise RetentionPlannerError("unsafe possible dependent")
-            try:
-                with child_directory(sessions_fd, other) as other_fd:
-                    meta = _canonical_metadata(
-                        _read_json(other_fd, _METADATA_NAME, scan), other
-                    )
-                    fork_value = _read_json(other_fd, _ATTENTION_FORK_NAME, scan)
-                    fork = None
-                    if fork_value is not None:
-                        try:
-                            fork = read_attention_fork(Path(other), directory_fd=other_fd)
-                        except (TypeError, ValueError, SessionError) as exc:
-                            raise RetentionPlannerError("malformed attention fork") from exc
-                    if _attention_reference(other_fd, root_id, scan):
-                        return "published top-level dependent"
-            except FileNotFoundError:
-                continue
-            if meta.parent_session_id == root_id:
-                return "published top-level dependent"
-            if fork is not None and fork.forked_from_session == root_id:
+            if _dependent_reason(sessions_fd, other, root_id, scan):
                 return "published top-level dependent"
     return None
+
+
+def _dependent_reason(sessions_fd, other, root_id, scan) -> bool:
+    try:
+        with child_directory(sessions_fd, other) as other_fd:
+            meta = _canonical_metadata(_read_json(other_fd, _METADATA_NAME, scan), other)
+            fork_value = _read_json(other_fd, _ATTENTION_FORK_NAME, scan)
+            try:
+                fork = (
+                    read_attention_fork(Path(other), directory_fd=other_fd)
+                    if fork_value is not None else None
+                )
+            except (TypeError, ValueError, SessionError) as exc:
+                raise RetentionPlannerError("malformed attention fork") from exc
+            attention = _attention_reference(other_fd, root_id, scan)
+    except FileNotFoundError:
+        return False
+    return bool(
+        attention
+        or meta.parent_session_id == root_id
+        or (fork is not None and fork.forked_from_session == root_id)
+    )
 
 
 def _attention_reference(other_fd, root_id, scan) -> bool:

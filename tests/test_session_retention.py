@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shutil
 import stat
 import time
 from contextlib import ExitStack, contextmanager
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta import session_retention
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.session_files import SessionError, session_root
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -717,10 +719,16 @@ def _setup_authority(tmp_path, manager, stack, root, kind, mode):
                 '{"records":[{"id":"x","reported":["done"]}]}'
             )
     elif kind == "inbox":
-        payload = _valid_inbox(root if mode == "present" else "f" * 32)
-        if mode == "malformed":
-            payload = {"title": "x"}
-        _write_inbox(tmp_path, payload)
+        if mode.startswith("non_json_"):
+            status = mode.removeprefix("non_json_")
+            inbox = tmp_path / "projects" / "p_x" / "inbox" / status
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / "interrupted-record").write_text("partial")
+        else:
+            payload = _valid_inbox(root if mode == "present" else "f" * 32)
+            if mode == "malformed":
+                payload = {"title": "x"}
+            _write_inbox(tmp_path, payload)
     else:
         _setup_authority_tail(tmp_path, manager, stack, root, kind, mode)
 
@@ -733,6 +741,10 @@ def _setup_authority_tail(tmp_path, manager, stack, root, kind, mode):
         if mode == "present":
             with session_root(root_dir) as fd:
                 write_retention_pin(fd)
+        elif mode == "missing_parent":
+            meta = json.loads((root_dir / "meta.json").read_text())
+            meta["parent_session_id"] = "f" * 32
+            (root_dir / "meta.json").write_text(json.dumps(meta))
         else:
             (root_dir / RETENTION_PIN_FILENAME).write_text('{"pinned":false}')
     elif kind == "age":
@@ -942,6 +954,9 @@ def _check_deadline_case(tmp_path, kind):
 
 _RUN_PASS_ROWS = [
     *_MATRIX_ROWS,
+    ("pin", "missing_parent"),
+    ("inbox", "non_json_new"),
+    ("inbox", "non_json_claimed"),
     *((kind, "deadline") for kind in _MATRIX_KINDS),
     *((kind, "over_bound") for kind in _OVER_BOUND_KINDS),
 ]
@@ -955,3 +970,108 @@ def test_closure_authority_run_pass_matrix(tmp_path, monkeypatch, kind, case):
         _check_over_bound_case(tmp_path, kind)
     else:
         _check_authority_case(tmp_path, monkeypatch, kind, case)
+
+
+def _charge_fault_fixture(home):
+    now = 2_000_000_000_000_000_000
+    manager = _manager(home)
+    with ExitStack() as stack:
+        roots = [_create_closed(manager, stack) for _ in range(3)]
+    recent = home / "sessions" / roots[1] / "deep" / "subtree" / "recent"
+    recent.parent.mkdir(parents=True)
+    recent.write_text("recent")
+    for root in roots:
+        _age_tree(home / "sessions" / root)
+    os.utime(recent, ns=(now, now))
+    _write_sent_ledger(home, roots[0], ["done"])
+    _write_inbox(home, _valid_inbox("f" * 32))
+    manager._storage_lease.close()
+    return roots
+
+
+def _run_charge_fault_sweep(home, roots, monkeypatch, fail_at=None):
+    now = 2_000_000_000_000_000_000
+    with ExitStack() as stack:
+        budget_charge = session_retention._Budget.charge_entry
+        closure_entry = session_retention._ClosureBudget.charge_entry
+        closure_charge = session_retention._ClosureBudget.charge
+        charges = 0
+        charging_entry = False
+
+        def fault():
+            nonlocal charges
+            charges += 1
+            if charges == fail_at:
+                raise session_retention._Deferred
+
+        def charged_budget_entry(self, size=0):
+            if not charging_entry:
+                fault()
+            return budget_charge(self, size)
+
+        def charged_closure_entry(self, size):
+            nonlocal charging_entry
+            fault()
+            charging_entry = True
+            try:
+                return closure_entry(self, size)
+            finally:
+                charging_entry = False
+
+        def charged_record(self, size):
+            if not charging_entry:
+                fault()
+            return closure_charge(self, size)
+
+        monkeypatch.setattr(session_retention._Budget, "charge_entry", charged_budget_entry)
+        monkeypatch.setattr(session_retention._ClosureBudget, "charge_entry", charged_closure_entry)
+        monkeypatch.setattr(session_retention._ClosureBudget, "charge", charged_record)
+        monkeypatch.setattr(
+            session_retention.uuid, "uuid4", lambda: type("FixedUUID", (), {"hex": "preview"})()
+        )
+        lease = stack.enter_context(_opened_lease(home))
+        planner = _planner(stack, home, lease, now_ns=lambda: now)
+        reasons = {}
+        passes = 0
+        while passes < 20:
+            passes += 1
+            result = planner.run_pass(days=30)
+            reasons.update({
+                row.root_id: (row.closed, row.reason, row.bytes) for row in result.reasons
+            })
+            if result.complete:
+                break
+        else:
+            raise AssertionError("faulted sweep did not complete in 20 passes")
+
+    assert set(reasons) == set(roots), "completed sweep omitted candidate roots"
+    classification = tuple(reasons[root] for root in roots)
+    selected = tuple(index for index, root in enumerate(roots) if root in result.preview.root_ids)
+    preview = (
+        result.preview.days, result.preview.cutoff, selected,
+        result.preview.count, result.preview.bytes, result.preview.created_at,
+    )
+    return charges, passes, classification, preview
+
+
+def test_every_charge_deferral_preserves_final_sweep(tmp_path, monkeypatch):
+    fixture = tmp_path / "fixture"
+    roots = _charge_fault_fixture(fixture)
+    baseline = tmp_path / "case-000"
+    shutil.copytree(fixture, baseline)
+    with monkeypatch.context() as patch:
+        total, _, expected_classification, expected_preview = _run_charge_fault_sweep(
+            baseline, roots, patch
+        )
+    assert 10 <= total < 100, f"focused fixture made {total} charges"
+
+    for charge in range(1, total + 1):
+        case = tmp_path / f"case-{charge:03}"
+        shutil.copytree(fixture, case)
+        with monkeypatch.context() as patch:
+            _, passes, classification, preview = _run_charge_fault_sweep(
+                case, roots, patch, fail_at=charge
+            )
+        assert passes > 1, f"charge {charge} did not cross a pass boundary"
+        assert classification == expected_classification, f"charge {charge} changed root decisions"
+        assert preview == expected_preview, f"charge {charge} changed the completed preview"
