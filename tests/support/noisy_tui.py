@@ -27,7 +27,7 @@ def _thread_error() -> None:
 
 async def _fails_on_teardown() -> None:
     try:
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 3600)
     except asyncio.CancelledError:
         raise RuntimeError("ZNOISE-teardown") from None
 
@@ -38,7 +38,7 @@ def make_noise() -> None:
     _Unraisable()
     thread = threading.Thread(target=_thread_error)
     thread.start()
-    thread.join()
+    thread.join(timeout=10)
     subprocess.run(["sh", "-c", "echo ZNOISE-child >&2"], check=True)
     # Raises only when asyncio.run cancels it after the TUI exits.
     _PENDING.append(asyncio.get_running_loop().create_task(_fails_on_teardown()))
