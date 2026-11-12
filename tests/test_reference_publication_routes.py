@@ -14,6 +14,7 @@ import zeta.core.session as session_module
 import zeta.core.session_files as session_files_module
 import zeta.core.session_links as session_links_module
 import zeta.project_inbox as project_inbox_module
+import zeta.project_inbox_sent.delivery as project_inbox_delivery_module
 import zeta.project_registry as project_registry_module
 import zeta.remote_sync as remote_sync_module
 from tests.support.owned import await_or_fail
@@ -300,6 +301,7 @@ def _patch_reference_publication(monkeypatch: pytest.MonkeyPatch, calls: list[in
         session_module,
         session_links_module,
         project_inbox_module,
+        project_inbox_delivery_module,
         project_registry_module,
         remote_sync_module,
     ):

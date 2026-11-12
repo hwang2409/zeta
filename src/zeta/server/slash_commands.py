@@ -500,7 +500,8 @@ class ServerSlashSession:
         try:
             state = await asyncio.to_thread(
                 ProjectInbox(
-                    registry, sessions_root=registry.root.parent / "sessions"
+                    registry,
+                    sessions_root=registry.root.parent / "sessions",
                 ).command,
                 project_id,
                 args,

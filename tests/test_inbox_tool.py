@@ -28,7 +28,12 @@ from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.skills import SkillCatalog
-from zeta.storage_format import WriterLease, open_writer
+from zeta.storage_format import (
+    FEATURE_EPOCHS,
+    StorageFeature,
+    WriterLease,
+    open_writer,
+)
 from zeta.tools.agent import ChildApprovalPolicy
 from zeta.tools.inbox import _inbox, _model_visible, _validate_action
 from zeta.tools.registry import ToolRegistry
@@ -36,12 +41,27 @@ from zeta.tools.registry import ToolRegistry
 project_inbox_sent_module = sys.modules[SentMessageTracker.__module__]
 
 
+@pytest.fixture
+def home_epoch(request: pytest.FixtureRequest) -> int | None:
+    """Indirect parameter: pin the home writer epoch before the writer caches it."""
+    return getattr(request, "param", None)
+
+
 @pytest.fixture(autouse=True)
-def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
+def _retain_async_test_writer(
+    tmp_path: Path, request: pytest.FixtureRequest, home_epoch: int | None
+):
     if request.node.get_closest_marker("asyncio") is None:
         yield
         return
-    with open_writer(tmp_path / ".zeta"):
+    home = tmp_path / ".zeta"
+    if home_epoch is not None:
+        # Pin the home below the durable-intent epoch before the writer caches
+        # it, so the inbox tool exercises the schema-v1 ledger path these tests
+        # gate.
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "storage-format.json").write_text(f'{{"writer_epoch": {home_epoch}}}\n')
+    with open_writer(home):
         yield
 
 
@@ -731,6 +751,11 @@ async def _exercise_concurrent_repair(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "home_epoch",
+    [FEATURE_EPOCHS[StorageFeature.INBOX_DURABLE_INTENT] - 1],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "scenario",
     (

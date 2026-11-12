@@ -44,6 +44,7 @@ from zeta.memory.entry_history import EntryMemoryHistoryMixin
 from zeta.memory.entry_store import _exact_dict
 from zeta.memory.entry_sync import parse_resolution_candidates
 from zeta.project_errors import ProjectRegistryError
+from zeta.project_inbox_sent import _v2
 from zeta.project_memory_history import ProjectMemoryHistoryMixin
 from zeta.project_registry import ProjectRegistry
 from zeta.project_schema import validate_project_record
@@ -450,6 +451,20 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         "resolved_at": None,
         "fork_session_id": None,
         "decision": None,
+    }
+
+    _v2_envelope = {
+        "schema_version": 1,
+        "id": "a" * 32,
+        "origin": "user",
+        "from": {"project": "p_" + "a" * 30, "session": "c" * 32},
+        "to_project": "p_" + "a" * 30,
+        "to_session": None,
+        "kind": "question",
+        "title": "t",
+        "body": "hello",
+        "in_reply_to": None,
+        "created_at": "2026-01-01T00:00:00.000000Z",
     }
 
     cases = [
@@ -1284,6 +1299,77 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
             ),
             {"from_project": "p_" + "a" * 32, "kind": "question"},
             frozenset({"from_project", "kind"}),
+        ),
+        ShapeCase(
+            "sent_message_ledger.from",
+            _v2.decode_from,
+            {"project": "p_" + "a" * 30, "session": "c" * 32},
+            frozenset({"project", "session"}),
+        ),
+        ShapeCase(
+            "sent_message_ledger.recipient_body_ref",
+            _v2.decode_recipient_body_ref,
+            {"file": "bodies/" + "a" * 32 + ".txt"},
+            frozenset({"file"}),
+        ),
+        ShapeCase(
+            "sent_message_ledger.sender_spill_ref",
+            _v2.decode_sender_spill_ref,
+            {
+                "file": "project-inbox-sent-spill/" + "a" * 32 + ".txt",
+                "length": 5,
+                "sha256": "d" * 64,
+            },
+            frozenset({"file", "length", "sha256"}),
+        ),
+        ShapeCase(
+            "sent_message_ledger.envelope",
+            _v2.decode_envelope,
+            _v2_envelope,
+            frozenset(
+                {
+                    "schema_version",
+                    "id",
+                    "from",
+                    "to_project",
+                    "kind",
+                    "title",
+                    "body",
+                    "created_at",
+                }
+            ),
+        ),
+        ShapeCase(
+            "sent_message_ledger.v2_record",
+            _v2.decode_record,
+            {
+                "id": "a" * 32,
+                "created_at": "2026-01-01T00:00:00.000000Z",
+                "target_project": "p_" + "a" * 30,
+                "publication": "pending",
+                "envelope": _v2_envelope,
+                "reported": [],
+            },
+            frozenset(
+                {"id", "created_at", "target_project", "publication", "envelope"}
+            ),
+        ),
+        ShapeCase(
+            "sent_message_ledger.v2_root",
+            _v2.decode_root,
+            {
+                "schema_version": 2,
+                "records": [
+                    {
+                        "id": "a" * 32,
+                        "created_at": "2026-01-01T00:00:00.000000Z",
+                        "target_project": "p_" + "a" * 30,
+                        "publication": "published",
+                        "reported": [],
+                    }
+                ],
+            },
+            frozenset({"schema_version", "records"}),
         ),
     ]
 
