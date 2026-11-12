@@ -119,7 +119,11 @@ class ProjectInboxNotificationMixin:
                 await self._poll_project_inbox_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - supervisor must survive any sink
+            except Exception as exc:  # supervisor must survive any poll sink
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    # a cancel reached us as a poll error; honor the shutdown.
+                    raise asyncio.CancelledError from exc
                 self._set_project_inbox_health("degraded", str(exc))
             finally:
                 done = self._project_inbox_poll_done
@@ -137,7 +141,10 @@ class ProjectInboxNotificationMixin:
             try:
                 result = await asyncio.shield(worker)
             except asyncio.CancelledError:
-                await asyncio.shield(worker)
+                # join the held thread, but its error must not replace the cancel.
+                await asyncio.wait([worker])
+                if not worker.cancelled():
+                    worker.exception()
                 raise
             poll = _PollResult(tuple(result[0] or ()), tuple(result[1]))
             self._pending_project_inbox_poll = poll
@@ -229,7 +236,10 @@ class ProjectInboxNotificationMixin:
                     try:
                         await asyncio.shield(worker)
                     except asyncio.CancelledError:
-                        await asyncio.shield(worker)
+                        # join the held thread; its error must not replace the cancel.
+                        await asyncio.wait([worker])
+                        if not worker.cancelled():
+                            worker.exception()
                         raise
                 continue
             if isinstance(reported, list) and status not in reported:
