@@ -116,7 +116,12 @@ class UpdateChecker:
         self._last_seen = self._initial
 
     def start(self) -> None:
-        if self._task is None:
+        loop = asyncio.get_running_loop()
+        if (
+            self._task is None
+            or self._task.done()
+            or self._task.get_loop() is not loop
+        ):
             self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:

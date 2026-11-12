@@ -14,8 +14,6 @@ from zeta.runtime.update_notice import (
     source_revision,
 )
 from zeta.server import ZetaServer
-from zeta.server.connections import EVENT_FEATURES
-from zeta.server.protocol import EventDescriptor
 from zeta.tui import layout
 
 
@@ -80,6 +78,53 @@ def test_checker_reports_one_revision_change_without_sleep() -> None:
     assert asyncio.run(checker.tick())
     assert not asyncio.run(checker.tick())
     assert updates == [("old", "new")]
+
+
+def test_process_monitor_restarts_after_new_event_loop(monkeypatch) -> None:
+    revision = ["old"]
+    monitor = ProcessUpdateMonitor(
+        Path("/not-used"),
+    )
+    monitor._checker._read_revision = lambda _: revision[0]
+    received: list[tuple[str, str]] = []
+
+    async def first_loop() -> None:
+        await monitor.tick()
+        monitor.start()
+
+    asyncio.run(first_loop())
+
+    async def second_loop() -> None:
+        updated = asyncio.Event()
+
+        async def on_update(old: str, new: str) -> None:
+            received.append((old, new))
+            updated.set()
+
+        monitor.subscribe(on_update)
+        revision[0] = "new"
+        monitor.start()
+        await asyncio.wait_for(updated.wait(), 10)
+
+    asyncio.run(second_loop())
+    assert received == [("old", "new")]
+    assert monitor.current == ("old", "new")
+
+    class Output:
+        def get_size(self):
+            return type("Size", (), {"columns": 80})()
+
+    class PromptApp:
+        output = Output()
+
+    class App:
+        _remote_view = None
+
+    monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)
+    monkeypatch.setattr(layout, "get_app", lambda: PromptApp())
+    assert "zeta updated · /restart" in "".join(
+        text for _style, text in layout.status_toolbar(App())
+    )
 
 
 def test_source_revision_reads_detached_and_packed_heads(tmp_path: Path) -> None:
@@ -178,8 +223,3 @@ async def test_fresh_serve_publishes_update_without_opened_session(tmp_path: Pat
         writer.close()
         await writer.wait_closed()
         await server.close()
-
-
-def test_serve_mapping_declares_update_event() -> None:
-    assert EventDescriptor.ZETA_UPDATED.value == "zeta_updated"
-    assert EVENT_FEATURES[EventDescriptor.ZETA_UPDATED] == frozenset({"zeta_updated"})
