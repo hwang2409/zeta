@@ -550,7 +550,9 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         cwd=app.loop.store.cwd,
     )
     fragments = status_formatted_text(status)
-    status_width = cell_len(status.plain)
+    if app.restart_pending:
+        fragments.insert(0, ("class:status-bar", "restart pending · "))
+    status_width = cell_len(status.plain) + (18 if app.restart_pending else 0)
     if status_width < width:
         fragments.append(("class:status-bar", " " * (width - status_width - 1) + "·"))
     return fragments
