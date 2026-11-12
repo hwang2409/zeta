@@ -937,7 +937,8 @@ that gets no answer within its own timeout can treat the server as hung.
 All examples below use the common event envelope:
 
 The `zeta_updated` event requires the negotiated `zeta_updated` feature and
-contains `data.old_revision` and `data.new_revision`. `old_revision` is the
+contains `data.old_revision` and `data.new_revision`. When a session is open,
+it also carries `session_id`; otherwise that field is absent. `old_revision` is the
 revision the process is running, fixed when it starts. `new_revision` is the
 latest revision found on disk. These values are opaque strings: they are a git
 SHA when the source is in a git checkout, or a source hash when it is not.
@@ -1327,7 +1328,7 @@ Event fields are:
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
-| `zeta_updated` (feature `zeta_updated`) | `event`, `session_id: string`, `data: {old_revision: string, new_revision: string}` | none |
+| `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
