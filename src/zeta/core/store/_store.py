@@ -48,7 +48,6 @@ from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
-    active_branch,
     load_session_json,
 )
 from ..checkpoints.entry_types import validate_conversation_entry

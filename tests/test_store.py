@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import fcntl
 import hashlib
@@ -9,6 +8,8 @@ import sys
 import threading
 import warnings
 from collections.abc import Callable
+
+from tests.support.branch_reads import branch_entries, branch_messages
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -3170,9 +3171,10 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     second = store.append_message(
         with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
     )
-    store._entries[0] = replace(first, parent_id=second.id)
+    store._resident_rows.entries[0] = replace(first, parent_id=second.id)
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
+        store._resident_rows._rebuild_branch()
         branch_entries(store)
 
 
