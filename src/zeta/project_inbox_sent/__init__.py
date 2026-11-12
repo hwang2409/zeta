@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+import os
 import re
 import threading
 from collections.abc import Iterable, Iterator
@@ -17,7 +19,16 @@ from ..core.session_files import (
     read_session_file,
     session_root,
 )
-from ..storage_format import open_writer, require_closed_variant
+from ..storage_format import (
+    ReplaceSubtree,
+    SetValue,
+    StorageFeature,
+    StorageFormatError,
+    feature_enabled,
+    open_writer,
+    require_closed_variant,
+)
+from . import _v2
 
 if TYPE_CHECKING:
     from ..project_inbox import ProjectInbox
@@ -27,6 +38,9 @@ _ID = re.compile(r"[0-9a-f]{32}\Z")
 _SENT_TRACKING_FILE = "project-inbox-sent.json"
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 SENT_HISTORY_LIMIT = 512
+# Mirrors project_inbox.BODY_SPILL_BYTES; a larger durable intent body spills to
+# a sender-owned file rather than inflating the bounded ledger.
+_SENDER_SPILL_BYTES = 64 * 1024
 
 
 def _id(value: object, field: str = "message id") -> str:
@@ -99,12 +113,19 @@ class _BrokenLedger(ValueError):
 class SentMessageTracker:
     """Own the bounded sent ledger and its read-time broken projection."""
 
-    def __init__(self, sessions_root: Path, session_id: str) -> None:
+    def __init__(
+        self, sessions_root: Path, session_id: str, *, observed_epoch: int = 0
+    ) -> None:
         self.sessions_root = Path(sessions_root)
         self.session_id = _id(session_id, "session id")
+        self.observed_epoch = observed_epoch
+        self._at_epoch = feature_enabled(
+            observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        )
         self.path = self.sessions_root / self.session_id / _SENT_TRACKING_FILE
         self._lock = threading.RLock()
         self._deleted_ids: set[str] = set()
+        self._intents: dict[str, tuple[str, str]] = {}
         self._receipts: tuple[tuple[str, str], ...] = ()
         self._state = self._load_state()
         self._records = (
@@ -192,10 +213,201 @@ class SentMessageTracker:
             self._prune()
             return self._persist((record,), self._deleted_ids)
 
+    def record_intent(self, envelope: dict[str, Any]) -> SentLedgerOutcome[None]:
+        """Durably record a sender intent before the recipient publish.
+
+        At or above the durable-intent epoch this writes a pending schema-v2
+        record that carries the full recipient envelope, so a crash before the
+        recipient publish recovers to exactly one delivered message. Below the
+        epoch it only retains the in-process intent and writes nothing.
+        """
+        message_id = _id(envelope["id"])
+        target = _text(envelope["to_project"], "target project")
+        created = _text(envelope["created_at"], "created_at")
+        with self._lock:
+            self._refresh()
+            if isinstance(self._state, _Broken):
+                return self._outcome(None)
+            existing = next((r for r in self._records if r["id"] == message_id), None)
+            if existing is not None:
+                if existing["target_project"] != target:
+                    raise ValueError("sent-message tracking record conflicts")
+                self._intents[message_id] = (target, created)
+                return self._outcome(None)
+            if not self._at_epoch:
+                self._intents[message_id] = (target, created)
+                return self._outcome(None)
+            record = {
+                "id": message_id,
+                "created_at": created,
+                "target_project": target,
+                "publication": "pending",
+                "envelope": self._spill_envelope(envelope),
+                "reported": [],
+            }
+            self._records.append(record)
+            self._records.sort(key=self._chronology)
+            self._pending.add(message_id)
+            self._prune()
+            return self._persist((record,), self._deleted_ids)
+
+    def mark_published(
+        self, message_id: str, target_project: str
+    ) -> SentLedgerOutcome[None]:
+        """Mark the recipient publish durable for a previously recorded intent."""
+        message_id = _id(message_id)
+        target_project = _text(target_project, "target project")
+        with self._lock:
+            self._refresh()
+            if isinstance(self._state, _Broken):
+                self._intents.pop(message_id, None)
+                return self._outcome(None)
+            if not self._at_epoch:
+                created = self._intents.pop(message_id, (target_project, _now()))[1]
+                return self._record_published_v1(message_id, target_project, created)
+            self._intents.pop(message_id, None)
+            record = next((r for r in self._records if r["id"] == message_id), None)
+            if record is None:
+                return self._outcome(None)
+            changed = record.get("publication") != "published"
+            record["publication"] = "published"
+            envelope = record.get("envelope")
+            if envelope is not None and isinstance(envelope.get("body"), dict) and (
+                "sha256" in envelope["body"]
+            ):
+                envelope["body"] = {"file": _v2.recipient_body_name(message_id)}
+                self._delete_spill(message_id)
+                changed = True
+            if changed:
+                return self._persist((record,), self._deleted_ids)
+            return self._outcome(None)
+
+    def pending_intents(self) -> list[dict[str, Any]]:
+        """Return recipient envelopes whose publish is not yet durable."""
+        with self._lock:
+            self._refresh()
+            if not self._at_epoch or isinstance(self._state, _Broken):
+                return []
+            result: list[dict[str, Any]] = []
+            for record in self._records:
+                if record.get("publication") != "pending":
+                    continue
+                envelope = record.get("envelope")
+                if envelope is None:
+                    continue
+                resolved = dict(envelope)
+                resolved["body"] = self._resolve_pending_body(
+                    record["id"], envelope["body"]
+                )
+                result.append(resolved)
+            return result
+
+    def _record_published_v1(
+        self, message_id: str, target_project: str, created: str
+    ) -> SentLedgerOutcome[None]:
+        existing = next((r for r in self._records if r["id"] == message_id), None)
+        if existing is not None:
+            if existing["target_project"] != target_project:
+                raise ValueError("sent-message tracking record conflicts")
+            return self._outcome(None)
+        record = {
+            "id": message_id,
+            "target_project": target_project,
+            "created_at": created,
+            "reported": [],
+        }
+        self._records.append(record)
+        self._records.sort(key=self._chronology)
+        self._pending.add(message_id)
+        self._prune()
+        return self._persist((record,), self._deleted_ids)
+
+    def _spill_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        body = envelope["body"]
+        stored = dict(envelope)
+        if isinstance(body, str):
+            data = body.encode("utf-8")
+            if len(data) > _SENDER_SPILL_BYTES:
+                self._write_spill(envelope["id"], data)
+                stored["body"] = {
+                    "file": _v2.sender_spill_name(envelope["id"]),
+                    "length": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+        return stored
+
+    def _resolve_pending_body(
+        self, message_id: str, body: object
+    ) -> str:
+        if isinstance(body, str):
+            return body
+        if isinstance(body, dict) and "sha256" in body:
+            return self._read_spill(
+                message_id, body["length"], body["sha256"]
+            ).decode("utf-8")
+        raise ValueError("pending sender intent body is not resolvable")
+
+    def _write_spill(self, message_id: str, data: bytes) -> None:
+        with (
+            self._session_directory(create=True) as session_fd,
+            child_directory(
+                session_fd, _v2.SENDER_SPILL_DIR, create=True
+            ) as spill_fd,
+        ):
+            atomic_publish_file(
+                spill_fd, f"{message_id}.txt", data, sync_directory=True
+            )
+
+    def _read_spill(self, message_id: str, length: int, sha256: str) -> bytes:
+        with (
+            self._session_directory(create=False) as session_fd,
+            child_directory(
+                session_fd, _v2.SENDER_SPILL_DIR, create=False
+            ) as spill_fd,
+        ):
+            data = read_session_file(spill_fd, f"{message_id}.txt")
+        if len(data) != length or hashlib.sha256(data).hexdigest() != sha256:
+            raise ValueError("sender spill does not match its reference")
+        return data
+
+    def _delete_spill(self, message_id: str) -> None:
+        try:
+            with (
+                self._session_directory(create=False) as session_fd,
+                child_directory(
+                    session_fd, _v2.SENDER_SPILL_DIR, create=False
+                ) as spill_fd,
+            ):
+                os.unlink(f"{message_id}.txt", dir_fd=spill_fd)
+        except (FileNotFoundError, SessionError):
+            pass
+
+    @staticmethod
+    def _to_v2(record: dict[str, Any]) -> dict[str, Any]:
+        if "publication" in record:
+            return record
+        # A pre-epoch v1 row is already published; it carries no envelope.
+        return {
+            "id": record["id"],
+            "created_at": record["created_at"],
+            "target_project": record["target_project"],
+            "publication": "published",
+            "reported": list(record["reported"]),
+        }
+
     def records(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
             self._refresh()
             return tuple(dict(record) for record in reversed(self._records))
+
+    def tracked_targets(self) -> set[str]:
+        """Distinct target projects of non-terminal tracked records."""
+        with self._lock:
+            return {
+                record["target_project"]
+                for record in self._records
+                if "done" not in record["reported"]
+            }
 
     def sent_view(
         self,
@@ -310,6 +522,14 @@ class SentMessageTracker:
             require_closed_variant("sent_message_ledger.schema_version", version)
         except (ValueError, AttributeError):
             return _Broken(path, "unsupported_schema")
+        if version == _v2.V2_SCHEMA_VERSION:
+            try:
+                decoded = _v2.decode_root(value)
+            except (ValueError, TypeError):
+                return _Broken(path, "invalid_records")
+            records = list(decoded["records"])
+            records.sort(key=self._chronology)
+            return _Loaded(path, tuple(records))
         try:
             records = value.get("records")
             if not isinstance(records, list):
@@ -355,6 +575,8 @@ class SentMessageTracker:
     def _persist(
         self, upserts: Iterable[dict[str, Any]], delete_ids: Iterable[str]
     ) -> SentLedgerOutcome[None]:
+        if self._at_epoch:
+            return self._persist_v2()
         operation_outcome: SentLedgerOutcome[None] | None = None
 
         def guard_current(raw: object) -> None:
@@ -403,4 +625,37 @@ class SentMessageTracker:
             if operation_outcome is not None:
                 self._deleted_ids.clear()
                 return operation_outcome
+            raise ValueError("sent-message tracking is unsafe or unavailable") from exc
+
+    def _persist_v2(self) -> SentLedgerOutcome[None]:
+        """Publish the full schema-v2 root, converting any pre-epoch v1 rows.
+
+        v2 is a strict shape, so the whole record set is rewritten under the
+        shape lock rather than patched; the per-session sender ledger has one
+        writer, so there is no concurrent upsert to preserve.
+        """
+        records = [self._to_v2(record) for record in self._records]
+        try:
+            with (
+                open_writer(self.sessions_root.parent) as lease,
+                self._session_directory(create=True) as session_fd,
+            ):
+                lease.publish_json(
+                    session_fd,
+                    _SENT_TRACKING_FILE,
+                    (
+                        SetValue(("schema_version",), _v2.V2_SCHEMA_VERSION),
+                        ReplaceSubtree(("records",), records),
+                    ),
+                    publish=lambda fd, name, data: atomic_publish_file(
+                        fd, name, data, sync_directory=True
+                    ),
+                    initial={"schema_version": _v2.V2_SCHEMA_VERSION, "records": []},
+                )
+            self._deleted_ids.clear()
+            return self._outcome(None)
+        except StorageFormatError:
+            self._adopt_state(_Broken(self.path, "invalid_json"))
+            return self._outcome(None)
+        except (OSError, SessionError, ValueError, TypeError) as exc:
             raise ValueError("sent-message tracking is unsafe or unavailable") from exc

@@ -799,7 +799,9 @@ class SlashHandlerMixin:
         try:
             state = await asyncio.to_thread(
                 ProjectInbox(
-                    registry, sessions_root=registry.root.parent / "sessions"
+                    registry,
+                    sessions_root=registry.root.parent / "sessions",
+                    observed_epoch=registry.observed_storage_epoch,
                 ).command,
                 project_id,
                 args,

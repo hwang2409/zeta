@@ -23,6 +23,7 @@ from .core.session_files import (
     atomic_publish_file,
     child_directory,
     open_session_file,
+    read_session_file,
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_provenance import decorate, delegation_enabled
@@ -143,11 +144,16 @@ class ProjectInbox:
         sessions_root: Path,
         sent_tracker: SentMessageTracker | None = None,
         receipts: Iterable[tuple[str, str]] = (),
+        observed_epoch: int = 0,
     ):
         self.registry = registry
         self.sessions_root = Path(sessions_root)
         self.sent_tracker = sent_tracker
         self.receipts = tuple(receipts)
+        self.observed_epoch = observed_epoch
+        self._generation_enabled = feature_enabled(
+            observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        )
 
     def command(self, project: str, args: str, *, from_session: str | None = None) -> str:
         body = None
@@ -243,7 +249,8 @@ class ProjectInbox:
         on_visible: Callable[[], None] | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> str:
-        session, target, message_id = self._deliver(
+        message_id, _outcome = self._deliver_tracked(
+            on_visible=on_visible,
             origin=_origin,
             from_project=from_project,
             from_session=from_session,
@@ -255,13 +262,6 @@ class ProjectInbox:
             message_id=message_id,
             to_session=to_session,
         )
-        if on_visible is not None:
-            try:
-                on_visible()
-            except Exception:  # noqa: BLE001,S110
-                # The durable record remains authoritative if its wake cannot run.
-                pass
-        self._sent_tracker(session).record(message_id, target)
         return message_id
 
     def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
@@ -330,7 +330,7 @@ class ProjectInbox:
         to_session: str | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> tuple[str, SentLedgerOutcome[None]]:
-        session, target, message_id = self._deliver(
+        return self._deliver_tracked(
             origin=_origin,
             from_project=from_project,
             from_session=from_session,
@@ -342,18 +342,41 @@ class ProjectInbox:
             message_id=message_id,
             to_session=to_session,
         )
-        return message_id, self._sent_tracker(session).record(message_id, target)
 
-    def _deliver(self, **kwargs: Any) -> tuple[str, str, str]:
+    def _deliver_tracked(
+        self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
+    ) -> tuple[str, SentLedgerOutcome[None]]:
         session, target, message_id, body, record = self._outgoing(**kwargs)
+        # Durable sender intent precedes the recipient publish, so a crash in
+        # between recovers to exactly one delivered message at the feature epoch.
+        tracker = self._sent_tracker(session)
+        tracker.record_intent(record)
         with self._directories(target, create=True) as dirs:
             self._publish_outgoing(dirs, message_id, body, record)
-        return session, target, message_id
+        if on_visible is not None:
+            try:
+                on_visible()
+            except Exception:  # noqa: BLE001,S110
+                # The durable record remains authoritative if its wake cannot run.
+                pass
+        return message_id, tracker.mark_published(message_id, target)
+
+    def recover_sent_intents(self, tracker: SentMessageTracker) -> None:
+        """Re-publish any durable intent whose recipient publish is not durable."""
+        for envelope in tracker.pending_intents():
+            target = envelope["to_project"]
+            message_id = envelope["id"]
+            record = dict(envelope)
+            with self._directories(target, create=True) as dirs:
+                self._publish_outgoing(dirs, message_id, record["body"], record)
+            tracker.mark_published(message_id, target)
 
     def _sent_tracker(self, session: str) -> SentMessageTracker:
         if self.sent_tracker is not None and self.sent_tracker.session_id == session:
             return self.sent_tracker
-        return SentMessageTracker(self.sessions_root, session)
+        return SentMessageTracker(
+            self.sessions_root, session, observed_epoch=self.observed_epoch
+        )
 
     def _outgoing(
         self,
@@ -400,7 +423,7 @@ class ProjectInbox:
 
     def _publish_outgoing(
         self,
-        dirs: tuple[int, int, int, int, int],
+        dirs: tuple[int, int, int, int, int, int],
         message_id: str,
         body: str,
         record: dict[str, Any],
@@ -421,6 +444,7 @@ class ProjectInbox:
                 continue
             break
         if existing is None:
+            self._advance_generation(dirs[5])
             self._publish_record(new_fd, name, record)
             return
         immutable_fields = {
@@ -457,7 +481,9 @@ class ProjectInbox:
         target = self._resolve_project(project)
         invalid: list[dict[str, str]] = []
         with self._directories(target.project_id, create=True) as dirs:
-            self._recover_stale(*dirs[:3], bodies_fd=dirs[3], invalid=invalid)
+            self._recover_stale(
+                *dirs[:3], bodies_fd=dirs[3], inbox_fd=dirs[5], invalid=invalid
+            )
             result = {
                 "new": self._read_directory(
                     dirs[0], dirs[3], status="new", invalid=invalid
@@ -711,7 +737,9 @@ class ProjectInbox:
         self._ensure_directories(target.project_id)
         invalid: list[dict[str, str]] = []
         with self._directories(target.project_id, create=True) as dirs:
-            self._recover_stale(*dirs[:3], bodies_fd=dirs[3], invalid=invalid)
+            self._recover_stale(
+                *dirs[:3], bodies_fd=dirs[3], inbox_fd=dirs[5], invalid=invalid
+            )
             records = self._read_directory(
                 dirs[0], dirs[3], status="new", invalid=invalid, resolve_body=False
             )
@@ -747,6 +775,7 @@ class ProjectInbox:
                 )
             except FileExistsError:
                 return False
+            self._advance_generation(dirs[5])
             with os.fdopen(fd, "wb") as stream:
                 stream.write(b"wake\n")
                 stream.flush()
@@ -770,6 +799,7 @@ class ProjectInbox:
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:
                     return None
+                self._advance_generation(dirs[5])
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
@@ -846,6 +876,7 @@ class ProjectInbox:
                 record["reply"] = reply
                 record["reply_id"] = reply_id
                 record["done_at"] = _now()
+                self._advance_generation(dirs[5])
                 self._publish_record(claimed_fd, name, record)
                 try:
                     os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=done_fd)
@@ -898,7 +929,7 @@ class ProjectInbox:
     @contextmanager
     def _directory_handles(
         self, project_fd: int, *, create: bool
-    ) -> Iterator[tuple[int, int, int, int, int]]:
+    ) -> Iterator[tuple[int, int, int, int, int, int]]:
         with ExitStack() as stack:
             project_fd = os.dup(project_fd)
             stack.callback(os.close, project_fd)
@@ -919,7 +950,7 @@ class ProjectInbox:
                 if create or set(os.listdir(inbox_fd)) != {".lock"}:
                     raise
                 raise _InboxNotFound from exc
-            yield fds  # type: ignore[misc]
+            yield (*fds, inbox_fd)  # type: ignore[misc]
 
     @contextmanager
     def _lock(self, project_id: str, *, exclusive: bool) -> Iterator[int]:
@@ -931,7 +962,7 @@ class ProjectInbox:
     @contextmanager
     def _directories(
         self, project_id: str, *, create: bool
-    ) -> Iterator[tuple[int, int, int, int, int]]:
+    ) -> Iterator[tuple[int, int, int, int, int, int]]:
         if not create:
             raise AssertionError(
                 "read operations must use the registry read transaction"
@@ -942,7 +973,7 @@ class ProjectInbox:
     @contextmanager
     def _held_directories(
         self, project_id: str
-    ) -> Iterator[tuple[int, int, int, int, int]]:
+    ) -> Iterator[tuple[int, int, int, int, int, int]]:
         """Hold the exclusive inbox authority; only acquisition errors are translated."""
         with ExitStack() as stack:
             with _storage_errors():
@@ -951,6 +982,48 @@ class ProjectInbox:
                     self._directory_handles(project_fd, create=True)
                 )
             yield fds
+
+    def _advance_generation(self, inbox_fd: int) -> None:
+        """Bump the monotone inbox generation before a scanner-visible mutation.
+
+        Below the durable-intent epoch no generation file exists and the scanner
+        still uses directory stat fingerprints, so this is a no-op.
+        """
+        if not self._generation_enabled:
+            return
+        atomic_publish_file(
+            inbox_fd,
+            "generation",
+            str(self._read_generation(inbox_fd) + 1).encode("ascii"),
+            sync_directory=True,
+        )
+
+    @staticmethod
+    def _read_generation(inbox_fd: int) -> int:
+        try:
+            raw = read_session_file(inbox_fd, "generation")
+        except FileNotFoundError:
+            return 0
+        try:
+            text = raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise InboxError("invalid inbox generation") from exc
+        if not text.isdigit():
+            raise InboxError("invalid inbox generation")
+        return int(text)
+
+    def _project_generation(self, project_id: str) -> int:
+        """Read one inbox generation for the scanner without the inbox lock."""
+        path = self.registry.root / project_id / "inbox" / "generation"
+        try:
+            text = path.read_bytes().decode("ascii").strip()
+        except FileNotFoundError:
+            return 0
+        except (OSError, UnicodeDecodeError) as exc:
+            raise InboxError("invalid inbox generation") from exc
+        if not text.isdigit():
+            raise InboxError("invalid inbox generation")
+        return int(text)
 
     def _publish_record(
         self,
@@ -1194,6 +1267,7 @@ class ProjectInbox:
         done_fd: int,
         *,
         bodies_fd: int,
+        inbox_fd: int,
         invalid: list[dict[str, str]],
     ) -> None:
         del done_fd
@@ -1208,6 +1282,7 @@ class ProjectInbox:
             claimer = record.get("claimer_session")
             if isinstance(claimer, str) and self._session_alive(claimer):
                 continue
+            self._advance_generation(inbox_fd)
             record.pop("claimer_session", None)
             claimed_at = record.pop("claimed_at", None)
             record["recovery_note"] = (

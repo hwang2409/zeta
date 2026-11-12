@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 7
+WRITER_EPOCH: Final = 8
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -35,6 +35,7 @@ class StorageFeature(StrEnum):
     ATTENTION_KINDS = "attention_kinds"
     INBOX_DELEGATION = "inbox_delegation"
     PROJECT_LOCKS = "project_locks"
+    INBOX_DURABLE_INTENT = "inbox_durable_intent"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -44,6 +45,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
     StorageFeature.INBOX_DELEGATION: 7,
+    StorageFeature.INBOX_DURABLE_INTENT: 8,
 }
 
 
@@ -173,6 +175,28 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
         }
     ),
     "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
+    "sent_message_ledger.v2_root": frozenset({"schema_version", "records"}),
+    "sent_message_ledger.v2_record": frozenset(
+        {"id", "created_at", "target_project", "publication", "envelope", "reported"}
+    ),
+    "sent_message_ledger.envelope": frozenset(
+        {
+            "schema_version",
+            "id",
+            "origin",
+            "from",
+            "to_project",
+            "to_session",
+            "kind",
+            "title",
+            "body",
+            "in_reply_to",
+            "created_at",
+        }
+    ),
+    "sent_message_ledger.from": frozenset({"project", "session"}),
+    "sent_message_ledger.recipient_body_ref": frozenset({"file"}),
+    "sent_message_ledger.sender_spill_ref": frozenset({"file", "length", "sha256"}),
 }
 
 
@@ -215,7 +239,8 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.schema_version": frozenset({1}),
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
-    "sent_message_ledger.schema_version": frozenset({1}),
+    "sent_message_ledger.schema_version": frozenset({1, 2}),
+    "sent_message_ledger.publication": frozenset({"pending", "published"}),
     "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
     "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
     "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),

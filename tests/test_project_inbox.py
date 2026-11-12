@@ -13,12 +13,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
+import zeta.storage_format as storage_format_module
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
@@ -606,6 +608,257 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
     assert [scanner.scan() for _ in range(5)] == [None] * 5
     assert locks == 0
     assert parses == 0
+
+
+def _epoch_projects(tmp_path: Path, *, writer_epoch: int | None = None):
+    """A projects home whose observed storage epoch is the current writer epoch,
+    or a lower epoch when writer_epoch is patched before the home is created."""
+    if writer_epoch is not None:
+        home = tmp_path / ".zeta"
+        with mock.patch.object(storage_format_module, "WRITER_EPOCH", writer_epoch):
+            registry = ProjectRegistry(home / "projects")
+            project_a = registry.create_project("alpha", "alpha work")
+            project_b = registry.create_project("beta", "beta work")
+        return home, registry, project_a, project_b
+    return _projects(tmp_path)
+
+
+def test_durable_intent_recovers_exactly_one_delivery_after_crash(
+    tmp_path: Path,
+) -> None:
+    # (1) At the feature epoch a crash between the durable sender intent and the
+    # recipient publish recovers to exactly one delivered message.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    assert registry.observed_storage_epoch >= 8
+    session_id = "a" * 32
+    tracker = SentMessageTracker(
+        home / "sessions", session_id, observed_epoch=registry.observed_storage_epoch
+    )
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+        observed_epoch=registry.observed_storage_epoch,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("crash before recipient publish")
+
+    with mock.patch.object(inbox, "_publish_outgoing", boom):
+        with pytest.raises(RuntimeError):
+            inbox.send_user(
+                from_project=project_a.project_id,
+                from_session=session_id,
+                to_project=project_b.project_id,
+                kind="info",
+                title="pending",
+                body="durable body",
+            )
+
+    # The recipient has nothing yet; the sender ledger holds one pending intent.
+    assert inbox.list(project_b.project_id)["new"] == []
+    ledger = json.loads(
+        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+    )
+    assert ledger["schema_version"] == 2
+    assert [record["publication"] for record in ledger["records"]] == ["pending"]
+
+    # A fresh process view of the sender session recovers the intent on its
+    # first poll, exactly as activation does after a restart.
+    recovered_tracker = SentMessageTracker(
+        home / "sessions", session_id, observed_epoch=registry.observed_storage_epoch
+    )
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=session_id,
+        tracker=recovered_tracker,
+    )
+    scanner.poll()
+    # A second poll is idempotent and delivers no duplicate.
+    scanner.poll()
+    delivered = inbox.list(project_b.project_id)["new"]
+    assert len(delivered) == 1
+    assert delivered[0]["title"] == "pending"
+    final_ledger = json.loads(
+        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+    )
+    assert [record["publication"] for record in final_ledger["records"]] == ["published"]
+
+
+def test_below_epoch_keeps_v1_ledger_and_writes_no_generation(
+    tmp_path: Path,
+) -> None:
+    # (2) Below the feature epoch the storage shape is unchanged: schema v1, no
+    # generation file, and the sent view round-trips.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path, writer_epoch=7)
+    assert registry.observed_storage_epoch == 7
+    session_id = "a" * 32
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        observed_epoch=registry.observed_storage_epoch,
+    )
+    message_id = inbox.send_user(
+        from_project=project_a.project_id,
+        from_session=session_id,
+        to_project=project_b.project_id,
+        kind="info",
+        title="legacy",
+        body="body",
+    )
+    ledger = json.loads(
+        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+    )
+    assert ledger["schema_version"] == 1
+    assert set(ledger["records"][0]) == {"id", "target_project", "created_at", "reported"}
+    assert not (registry.root / project_b.project_id / "inbox" / "generation").exists()
+    sent = inbox.sent(project_a.project_id, session_id=session_id)
+    assert [row["id"] for row in sent["messages"]] == [message_id]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        {"extra_record_key": True},
+        {"bad_sha256": True},
+        {"bad_spill_name": True},
+    ],
+)
+def test_strict_v2_decode_rejects_malformed_ledger(
+    tmp_path: Path, corruption: dict[str, bool]
+) -> None:
+    # (3) The strict v2 decoder marks the ledger broken on an unknown key, a bad
+    # sha256, or a spill name that does not match its message id.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    session_id = "a" * 32
+    message_id = "e" * 32
+    body_ref: dict[str, object] = {
+        "file": "project-inbox-sent-spill/" + message_id + ".txt",
+        "length": 5,
+        "sha256": "d" * 64,
+    }
+    envelope: dict[str, object] = {
+        "schema_version": 1,
+        "id": message_id,
+        "origin": "user",
+        "from": {"project": project_a.project_id, "session": session_id},
+        "to_project": project_b.project_id,
+        "to_session": None,
+        "kind": "info",
+        "title": "t",
+        "body": body_ref,
+        "in_reply_to": None,
+        "created_at": "2026-01-01T00:00:00.000000Z",
+    }
+    if corruption.get("bad_sha256"):
+        body_ref["sha256"] = "z" * 64
+    if corruption.get("bad_spill_name"):
+        body_ref["file"] = "project-inbox-sent-spill/" + "f" * 32 + ".txt"
+    record: dict[str, object] = {
+        "id": message_id,
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "target_project": project_b.project_id,
+        "publication": "pending",
+        "envelope": envelope,
+        "reported": [],
+    }
+    if corruption.get("extra_record_key"):
+        record["surprise"] = True
+    session_dir = home / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    (session_dir / "project-inbox-sent.json").write_text(
+        json.dumps({"schema_version": 2, "records": [record]})
+    )
+    tracker = SentMessageTracker(
+        home / "sessions", session_id, observed_epoch=registry.observed_storage_epoch
+    )
+    outcome = tracker.health()
+    assert outcome.health.state == "broken"
+    assert outcome.warning
+
+
+def test_generation_gates_scan_and_each_mutation_advances_it(
+    tmp_path: Path,
+) -> None:
+    # (4) An unchanged inbox generation performs no message/body open on scan,
+    # and every visible mutation advances the generation.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    inbox = ProjectInbox(
+        registry,
+        sessions_root=home / "sessions",
+        observed_epoch=registry.observed_storage_epoch,
+    )
+    sender_session = "a" * 32
+    dead_session = "d" * 32
+    live_session = "c" * 32
+
+    def generation() -> int:
+        return inbox._project_generation(project_b.project_id)
+
+    steps: list[str] = []
+
+    def advanced(label: str, before: int) -> None:
+        steps.append(label)
+        assert generation() > before, f"{label} did not advance the generation"
+
+    before = generation()
+    message_id = inbox.send_user(
+        from_project=project_a.project_id,
+        from_session=sender_session,
+        to_project=project_b.project_id,
+        kind="info",
+        title="work",
+        body="body",
+    )
+    advanced("send", before)
+
+    before = generation()
+    inbox.claim(project_b.project_id, message_id, dead_session)
+    advanced("claim", before)
+
+    before = generation()
+    inbox.list(project_b.project_id)  # the dead claimer triggers stale recovery
+    advanced("stale recovery", before)
+
+    inbox.claim(project_b.project_id, message_id, live_session)
+    before = generation()
+    inbox.done(project_b.project_id, message_id, live_session, outcome="done")
+    advanced("done", before)
+
+    before = generation()
+    assert inbox.claim_wake(project_b.project_id, (message_id,))
+    advanced("wake create", before)
+
+    assert steps == ["send", "claim", "stale recovery", "done", "wake create"]
+
+    # A warm scanner with no further mutation opens no message or body.
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=sender_session,
+        tracker=SentMessageTracker(
+            home / "sessions",
+            sender_session,
+            observed_epoch=registry.observed_storage_epoch,
+        ),
+    )
+    for _ in range(3):
+        scanner.poll()  # warm the recovery pass and the generation signature
+    reads = 0
+    real_read = scanner.inbox._read_record
+
+    def counted_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return real_read(*args, **kwargs)
+
+    with mock.patch.object(scanner.inbox, "_read_record", counted_read):
+        results = [scanner.poll() for _ in range(10)]
+    assert results == [(None, ())] * 10
+    assert reads == 0
 
 
 @pytest.mark.asyncio
@@ -1910,21 +2163,21 @@ async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
 
 
 def _raise_once_scanner_factory(loop, exc):
-    """Wrap the real scanner so its first full scan raises, then it recovers."""
+    """Wrap the real scanner so its first full poll raises, then it recovers."""
     real_new = loop._new_project_inbox_scanner
     state = {"n": 0}
 
     def new_scanner():
         scanner = real_new()
-        real_scan = scanner.scan
+        real_poll = scanner.poll
 
-        def wrapped_scan():
+        def wrapped_poll():
             state["n"] += 1
             if state["n"] == 1:
                 raise exc
-            return real_scan()
+            return real_poll()
 
-        scanner.scan = wrapped_scan
+        scanner.poll = wrapped_poll
         return scanner
 
     return new_scanner
@@ -1996,16 +2249,16 @@ async def test_p03a_failed_commit_retries_same_poll_before_rescan(
 
     def counting_scanner():
         scanner = real_new()
-        real_scan = scanner.scan
+        real_poll = scanner.poll
 
         def counting():
             scan_calls["n"] += 1
-            return real_scan()
+            return real_poll()
 
-        scanner.scan = counting
+        scanner.poll = counting
         return scanner
 
-    # test-contract: seam inject a scanner that counts real scans at the runtime seam
+    # test-contract: seam inject a scanner that counts real polls at the runtime seam
     monkeypatch.setattr(loop, "_new_project_inbox_scanner", counting_scanner)
 
     attempts = {"n": 0}
@@ -2044,7 +2297,7 @@ async def test_p03a_failed_commit_retries_same_poll_before_rescan(
         notices = store.agent_notifications()
         assert len(notices) == 1
         assert notices[0].data["message_ids"] == [message_id]
-        # the identical poll is reused: the scanner never scans a second time.
+        # the identical poll is reused: the scanner never polls a second time.
         assert scan_calls["n"] == 1
     finally:
         await loop.close()
@@ -2136,20 +2389,20 @@ async def test_p03a_close_waits_for_blocked_scanner_worker(tmp_path, monkeypatch
 
     def blocking_scanner():
         scanner = real_new()
-        real_scan = scanner.scan
+        real_poll = scanner.poll
 
         def blocking():
             scan_calls["n"] += 1
-            result = real_scan()
+            result = real_poll()
             scanner_started.set()
             gate.wait(timeout=10)
             scanner_finished.set()
             return result
 
-        scanner.scan = blocking
+        scanner.poll = blocking
         return scanner
 
-    # test-contract: seam inject a scanner whose real scan blocks the poll worker
+    # test-contract: seam inject a scanner whose real poll blocks the poll worker
     monkeypatch.setattr(loop, "_new_project_inbox_scanner", blocking_scanner)
 
     release_event = asyncio.Event()
@@ -2238,7 +2491,10 @@ async def test_p03a_status_backlog_survives_without_a_count_cap(tmp_path: Path) 
     tracker = loop.tool_registry.sent_message_tracker
     assert tracker is not None
     inbox = ProjectInbox(
-        registry, sessions_root=home / "sessions", sent_tracker=tracker
+        registry,
+        sessions_root=home / "sessions",
+        sent_tracker=tracker,
+        observed_epoch=registry.observed_storage_epoch,
     )
     ids = []
     for index in range(101):

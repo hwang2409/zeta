@@ -80,7 +80,9 @@ class ProjectInboxNotificationMixin:
         tracker = self.tool_registry.sent_message_tracker
         if tracker is None:
             tracker = SentMessageTracker(
-                projects.root.parent / "sessions", self.store.session_id
+                projects.root.parent / "sessions",
+                self.store.session_id,
+                observed_epoch=self.store.observed_storage_epoch,
             )
             self.tool_registry.sent_message_tracker = tracker
         sent_outcome = tracker.reconcile(self.store.sent_message_receipts())
