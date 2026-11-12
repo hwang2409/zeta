@@ -153,7 +153,7 @@ class IncrementalValidationMixin:
     def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
         staged = copy.copy(self)
-        staged._entries = list(self._entries)
+        staged._resident_rows = type(self._resident_rows)(self._entries)
         staged._entry_ids = set(self._entry_ids)
         staged._entry_prefix_digest = self._entry_prefix_digest
         staged._delivery_fold = self._delivery_fold.staged()
@@ -183,7 +183,7 @@ class IncrementalValidationMixin:
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
-        self._entries = staged._entries
+        self._resident_rows.replace(staged._entries)
         self._record_client_delivery_entries(entries)
         return True
 
@@ -217,7 +217,7 @@ class IncrementalValidationMixin:
         if entry.type == "fork":
             self._validate_fork_entry(entry)
         self._apply_to_working_fold(entry, approvals)
-        self._entries.append(entry)
+        self._resident_rows.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))
@@ -240,7 +240,7 @@ class IncrementalValidationMixin:
             self._record_physical_entry(entry)
             previous = entry
         self._delivery_fold = fold
-        self._entries.extend(entries)
+        self._resident_rows.extend(entries)
 
     def _apply_to_working_fold(
         self,
