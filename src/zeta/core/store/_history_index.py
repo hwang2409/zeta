@@ -784,7 +784,7 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
                 if not store._history_index.catch_up_validated(
                     facts, observer._entries
                 ):
-                    observer._sync_history_index(observer.active_branch_snapshot())
+                    observer._sync_history_index(observer._entries)
                 return facts
         finally:
             observer.close()
@@ -794,7 +794,7 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
         with writer._append_lock():
             facts = store._history_index_facts()
             if not store._history_index.catch_up_validated(facts, store._entries):
-                store._sync_history_index(store.active_branch_snapshot())
+                store._sync_history_index(store._entries)
             return facts
     finally:
         writer.close()

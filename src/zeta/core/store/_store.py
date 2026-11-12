@@ -728,7 +728,11 @@ class ConversationStore(
             self._write_line(entry.to_dict())
         finally:
             self._write_deadline = previous_deadline
-        self._apply_history_index_entries((entry,), leave_stale_on_loop=not linear)
+        if linear:
+            self._apply_history_index_entries((entry,))
+        # A fork is rebuilt by _sync_history_index below: skipping the
+        # incremental apply leaves the stored boundary behind, so the sync
+        # detects the non-contiguous tail and fully rebuilds the active branch.
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -741,7 +745,7 @@ class ConversationStore(
                 _ApprovalValidationOverlay(), {row.id for row in self._entries}
             )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(self._entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
