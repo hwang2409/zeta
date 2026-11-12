@@ -1943,7 +1943,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
     calls = 0
 
     class Store:
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             nonlocal calls
             calls += 1
             return entries

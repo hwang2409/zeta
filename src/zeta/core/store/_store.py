@@ -1170,7 +1170,7 @@ class ConversationStore(
     def active_branch_contains_message(self, message: Message) -> bool:
         """Return whether ``message`` is on the active branch (tail-first scan).
 
-        Replaces ``message in self.messages()`` on the interactive delivery
+        Replaces a full branch message scan on the interactive delivery
         path: the message was just appended, so a reverse scan finds it near
         the tail without copying the whole branch.
         """

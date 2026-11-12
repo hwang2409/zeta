@@ -47,7 +47,7 @@ class _HistoryStore:
         self._log_offset = len(entries)
         self._entry_prefix_digest = bytes([len(entries)])
 
-    def active_branch_snapshot(self) -> list[object]:
+    def branch_refs(self) -> list[object]:
         return list(self.entries)
 
 
