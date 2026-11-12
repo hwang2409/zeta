@@ -867,14 +867,22 @@ unhealthy because approval persistence failed, `state` remains `"idle"` and
 `send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
 separate error and does not change the unhealthy status behavior.
 
-With the negotiated `approval_reconnect` feature, `pending_approvals` is the
-server's live projection and is limited to 64 entries. The result also contains
+With the negotiated `approval_reconnect` feature, `pending_approvals` is the live
+projection merged with the durable store projection by `request_id` (a live row
+wins on overlap, keeping its `resolution_pending`), limited to 64 entries. The
+durable projection covers a session resumed after a serve restart, when the loop
+holds no live approval records yet, and any approval that is only durable while
+another is settling live, so an approval persisted before the restart stays
+visible (still bounded to 64). The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Read-only observers receive the same live baseline as the controller,
 but approval mutations still return `-32008`. Without the feature, the status
 shape and unbounded strict durable projection are unchanged, and observers
-receive the same rows as the controller.
+receive the same rows as the controller. A `session_history_and_subscribe` join
+status gets this same merged baseline even for clients without
+`approval_reconnect`, so a join during the settling window lists both the
+settling and the still-durable approvals.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn

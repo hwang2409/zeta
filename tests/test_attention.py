@@ -12,10 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import zeta
+from zeta import attention_forks
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
     create_discussion_fork,
@@ -28,6 +30,7 @@ from zeta.attention_replies import AttentionReplies, ReplyConflict
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.project_context import ProjectContext, load_project_context
 from zeta.core.session import SessionManager
+from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -482,7 +485,7 @@ async def test_attention_fork_preserves_prompt_composition_on_resume(
     )
     fork_id = await asyncio.to_thread(lambda: create_discussion_fork(home, source.store.session_id, attention.id))
     source.store.close()
-    fork = manager.open(fork_id, _read_only=True)
+    fork = await asyncio.to_thread(manager.open, fork_id, _read_only=True)
     try:
         assert fork.metadata.prompt_recipe == recipe
         assert fork.metadata.prompt_components == context.prompt_components
@@ -556,6 +559,67 @@ def test_concurrent_fork_creators_reuse_one_usable_session(
     opened.store.close()
 
 
+@pytest.mark.parametrize("failure", ("population", "attention record"))
+def test_failed_fork_publication_removes_session_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    opened = _session(tmp_path)
+    anchor = opened.store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("Choose")])
+    )
+    attention = AttentionStore(opened.store.session_dir, writer_epoch=5).request(
+        session_id=opened.store.session_id,
+        project_id=None,
+        entry_id=anchor.id,
+        entry_seq=anchor.seq,
+        title="Question",
+        why="Need a choice.",
+    )
+    manager = SessionManager(tmp_path)
+    sessions_before = {item.session_id for item in manager.list_sessions_read_only()}
+    fork_id = "f" * 32
+    monkeypatch.setattr(
+        attention_forks, "uuid4", lambda: SimpleNamespace(hex=fork_id)
+    )
+
+    real_append = ConversationStore.append_message
+    if failure == "population":
+        def fail_population(*args, **kwargs):
+            raise OSError("population failed")
+
+        monkeypatch.setattr(ConversationStore, "append_message", fail_population)
+    else:
+        real_write = attention_forks.write_session_file
+
+        def fail_attention_record(directory_fd, name, data, *args, **kwargs):
+            if name == "attention_fork.json":
+                raise OSError("attention record failed")
+            return real_write(directory_fd, name, data, *args, **kwargs)
+
+        monkeypatch.setattr(
+            attention_forks, "write_session_file", fail_attention_record
+        )
+
+    with pytest.raises(OSError, match=f"{failure} failed"):
+        create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
+
+    assert not (manager.sessions_dir / fork_id).exists()
+    assert {
+        item.session_id for item in manager.list_sessions_read_only()
+    } == sessions_before
+    monkeypatch.setattr(ConversationStore, "append_message", real_append)
+    replacement = manager.create(
+        provider="codex",
+        model="fake",
+        cwd=tmp_path,
+        auto_project=False,
+        _session_id=fork_id,
+    )
+    replacement.store.close()
+    manager.delete(fork_id)
+    opened.store.close()
+
+
 def test_failed_fork_binding_removes_created_session(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -595,11 +659,13 @@ def _create_gated_discussion_fork(
 ) -> None:
     original = SessionManager._reconcile_project_link
 
-    def gated_publication(manager: SessionManager, session_id: str) -> None:
+    def gated_publication(
+        manager: SessionManager, session_id: str, **kwargs: object
+    ) -> None:
         publication_started.set()  # type: ignore[attr-defined]
         if not publication_release.wait(10):  # type: ignore[attr-defined]
             raise AssertionError("fork project publication was not released")
-        original(manager, session_id)
+        original(manager, session_id, **kwargs)
 
     SessionManager._reconcile_project_link = gated_publication
     try:
@@ -633,17 +699,9 @@ def _mutate_fork_source(
         result.put(("mutated",))  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize(
-    ("mutation", "refusal"),
-    [
-        ("delete", "not found"),
-        # Only the exact post-publication revalidation can reject this case:
-        # the attention record is still present and the bind would succeed.
-        ("append", "source changed during fork allocation"),
-    ],
-)
+@pytest.mark.parametrize("mutation", ["delete", "append"])
 def test_p06_8_discussion_fork_allocation_process_progress(
-    tmp_path: Path, mutation: str, refusal: str
+    tmp_path: Path, mutation: str
 ) -> None:
     manager = SessionManager(tmp_path)
     project = manager.project_registry.create_project("alpha", "Alpha")
@@ -686,9 +744,6 @@ def test_p06_8_discussion_fork_allocation_process_progress(
     try:
         assert publication_started.wait(10), "fork project publication did not start"
         mutator.start()
-        assert mutation_result.get(timeout=10) == ("mutated",), (
-            "public opposing mutation did not complete before fork project publication"
-        )
         publication_release.set()
         creator.join(10)
         mutator.join(10)
@@ -698,11 +753,13 @@ def test_p06_8_discussion_fork_allocation_process_progress(
         assert mutator.exitcode == 0
 
         outcome = fork_result.get(timeout=10)
-        assert outcome[0] == "rejected", "stale discussion fork was bound"
-        assert refusal in outcome[2]
+        assert outcome[0] == "created", "reference-gated fork was not bound"
+        assert mutation_result.get(timeout=10) == ("mutated",)
         remaining = {path.name for path in manager.sessions_dir.iterdir()}
-        assert remaining == (set() if mutation == "delete" else {source_session_id}), (
-            "created fork was not cleaned"
+        assert remaining == (
+            {outcome[1]}
+            if mutation == "delete"
+            else {source_session_id, outcome[1]}
         )
     finally:
         publication_release.set()
