@@ -17,9 +17,7 @@ from .model import SubmissionState, _Entry
 class ApprovalPipelineMixin:
     """Consumer-side approval handlers for ``SubmissionPipeline``."""
 
-    async def _on_approval_lifecycle(
-        self, message: _ApprovalLifecycle
-    ) -> None:
+    def _on_approval_lifecycle(self, message: _ApprovalLifecycle) -> None:
         entry = self._entry_for(message.submission)
         if entry is None:
             return
@@ -27,8 +25,6 @@ class ApprovalPipelineMixin:
             self._approval_owners[message.call.id] = entry.submission
             if entry.state is SubmissionState.PREPROCESSING:
                 entry.state = SubmissionState.AWAITING_APPROVAL
-            self.seed_pending_approvals_now()
-            self._host._present_pending_approvals()
             return
         self._approval_owners = {
             key: owner
@@ -37,69 +33,12 @@ class ApprovalPipelineMixin:
         }
         if entry.state is SubmissionState.AWAITING_APPROVAL:
             entry.state = SubmissionState.PREPROCESSING
-        self.seed_pending_approvals_now()
-        self._host._present_pending_approvals()
-
-    async def refresh_pending_approvals(self) -> None:
-        policy = self._host._approval_policy
-        if policy is not None:
-            policy.set_pending_changed_hook(self._request_pending_refresh)
-        started = self._pending_change_seq
-        pending = (
-            ()
-            if policy is None
-            else tuple(await policy.pending_requests_for_display())
-        )
-        # Never let a result overtaken by a newer change replace the cache.
-        if started >= self._pending_applied_seq:
-            self._pending_approvals = pending
-            self._pending_applied_seq = started
-
-    def seed_pending_approvals_now(self) -> None:
-        """Refresh the display cache from the resident snapshot, no off-loop yield.
-
-        Presentation reads the cache, but an approval registered on the same task
-        step (serve inbox loop, provider tool) has not been picked up by the
-        off-loop refresh yet. This reads the same authoritative pending state
-        synchronously (like approval_state_now) so the card shows at once.
-        """
-        policy = self._host._approval_policy
-        self._pending_approvals = (
-            ()
-            if policy is None
-            else tuple(policy.pending_requests_for_display_now())
-        )
-
-    def _request_pending_refresh(self) -> None:
-        """Schedule one off-loop refresh; coalesce bursts into a single rerun.
-
-        The hook only schedules: it bumps a change counter and, when no refresh
-        is in flight, starts one. A change that arrives while a refresh runs sets
-        the counter again, so the drain loop reruns exactly once more.
-        """
-        self._pending_change_seq += 1
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        if self._pending_refresh_task is None or self._pending_refresh_task.done():
-            self._pending_refresh_task = loop.create_task(
-                self._drain_pending_refresh()
-            )
-
-    async def _drain_pending_refresh(self) -> None:
-        applied = self._pending_applied_seq
-        while self._pending_change_seq != applied:
-            applied = self._pending_change_seq
-            await self.refresh_pending_approvals()
-            self._host._present_pending_approvals()
 
     async def _on_approval_action(self, message: _ApprovalAction) -> None:
         policy = self._host._approval_policy
         if policy is None:
             self._ack_action(message)
             return
-        await self.refresh_pending_approvals()
         request = self._find_request(message.requested_key)
         if request is None:
             self._host._print_system("approval · no matching request")
@@ -134,7 +73,6 @@ class ApprovalPipelineMixin:
                 entry.denied = True
                 entry.state = SubmissionState.DENIED
         self._host._print_system(f"approval · {verb} {request.key}")
-        await self.refresh_pending_approvals()
         self._host._present_pending_approvals()
         self._host._invalidate_prompt()
         if durable and self._host.loop.prepare_resume_pending_tool(
@@ -169,9 +107,10 @@ class ApprovalPipelineMixin:
         policy = self._host._approval_policy
         if policy is None:
             return
-        # Cancellation is a decision: use the strict pending view and record a
-        # canceled result only when this abort actually won.
-        for request in self._pending_approvals:
+        # Cancellation is a decision: the live pending view is the strict view
+        # (display and strict share _collect_pending_requests); record a canceled
+        # result only when this abort actually won.
+        for request in self.pending_approvals:
             if self._approval_owners.get(request.key) is not entry.submission:
                 continue
             if not policy.abort(request.key):

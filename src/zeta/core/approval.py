@@ -388,19 +388,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         self._label_resolver: Callable[[ToolCall], Awaitable[str | None]] | None = None
         self._capability_resolver: Callable[[ToolCall], ApprovalCapability] | None = None
         self._serve_control: _ServeApprovalControl | None = None
-        self._pending_changed: Callable[[], None] | None = None
         self._approval_slots = asyncio.Semaphore(PENDING_APPROVAL_LIMIT)
 
     def bind_store(self, store: ConversationStore) -> None:
         self._store = store
-
-    def set_pending_changed_hook(self, hook: Callable[[], None] | None) -> None:
-        """Register one display host to notify when the pending set changes."""
-        self._pending_changed = hook
-
-    def _notify_pending_changed(self) -> None:
-        if self._pending_changed is not None:
-            self._pending_changed()
 
     async def acquire_approval_slot(self) -> bool:
         if self._serve_control is None:
@@ -917,7 +908,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             ),
             store,
         )
-        self._notify_pending_changed()
 
     async def cleanup_delegated(self, child_instance_id: str) -> None:
         """Resolve and remove all delegated requests owned by one child."""
@@ -939,7 +929,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
-        self._notify_pending_changed()
         return
 
     def approve(
@@ -978,18 +967,15 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             aborted = delegated[1].resolve_approval(
                 delegated[0].request_id, "abort", reason=reason
             )
-            self._notify_pending_changed()
             return aborted
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
             self._ephemeral[request_id] = (ephemeral[0], "abort")
-            self._notify_pending_changed()
             return True
         store = self._require_store()
         aborted = store.resolve_approval(request_id, "abort", reason=reason)
-        self._notify_pending_changed()
         return aborted
 
     async def abort_or_winner(
@@ -1069,18 +1055,15 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             resolved_ok = delegated[1].resolve_approval(
                 delegated[0].request_id, resolved.value
             )
-            self._notify_pending_changed()
             return resolved_ok
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
             self._ephemeral[request_id] = (ephemeral[0], resolved.value)
-            self._notify_pending_changed()
             return True
         store = self._require_store()
         resolved_ok = store.resolve_approval(request_id, resolved.value)
-        self._notify_pending_changed()
         return resolved_ok
 
     def _delegated_entry(
@@ -1175,7 +1158,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     ApprovalRequest(tool_call.id, tool_call, action=action),
                     None,
                 )
-            self._notify_pending_changed()
 
         async def current() -> tuple[bool, ApprovalDecision | None]:
             ephemeral = self._ephemeral.get(tool_call.id)
@@ -1198,7 +1180,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Remove one non-durable approval after its owner finishes."""
 
         self._ephemeral.pop(request_id, None)
-        self._notify_pending_changed()
 
     async def _resolve_abort_or_winner(
         self,

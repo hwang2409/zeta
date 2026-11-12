@@ -74,10 +74,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._consumer: asyncio.Task[None] | None = None
         self._entries: dict[int, _Entry] = {}
         self._approval_owners: dict[str | tuple[str, str], Submission] = {}
-        self._pending_approvals: tuple[ApprovalRequest, ...] = ()
-        self._pending_change_seq = 0
-        self._pending_applied_seq = -1
-        self._pending_refresh_task: asyncio.Task[None] | None = None
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
@@ -106,14 +102,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._deferred: deque[_Message] = deque()
         self._closed = False
         self._shutting_down = False
-        if host._approval_policy is not None:
-            host._approval_policy.set_pending_changed_hook(self._request_pending_refresh)
-            # Seed durable approvals (e.g. a resumed session) synchronously so a
-            # present before the first off-loop refresh shows them; the refresh
-            # reconciles.
-            self._pending_approvals = tuple(
-                host._approval_policy.pending_requests_for_display_now()
-            )
 
     @property
     def provider_task(self) -> asyncio.Task[NotificationOutcome] | None:
@@ -190,7 +178,15 @@ class SubmissionPipeline(ApprovalPipelineMixin):
 
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
-        return self._pending_approvals
+        # One owner for the runtime pending projection: the policy's resident
+        # snapshot (store page + delegated + ephemeral), read live on each
+        # present. Cheap because the store memoizes it by the active leaf.
+        policy = self._host._approval_policy
+        return (
+            ()
+            if policy is None
+            else tuple(policy.pending_requests_for_display_now())
+        )
 
     def submit(
         self,
@@ -285,8 +281,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self,
         call: ToolCall,
         submission_id: int | None,
-        *,
-        child_instance_id: str | None = None,
     ) -> None:
         entry = (
             self._entries.get(submission_id)
@@ -295,15 +289,9 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         )
         if entry is not None:
             self._send(_ApprovalLifecycle(entry.submission, "approval_start", call))
-        # The display cache is refreshed off-loop when the pipeline handles the
-        # lifecycle message, but the host presents synchronously now. Seed the
-        # fresh request so it shows at once; the refresh reconciles. Delegated
-        # child approvals have no local submission entry, so this seed is the
-        # only synchronous path that surfaces them. The seed carries
-        # child_instance_id so its key matches the request the refresh resolves.
-        seeded = ApprovalRequest(call.id, call, child_instance_id=child_instance_id)
-        if all(request.key != seeded.key for request in self._pending_approvals):
-            self._pending_approvals = (*self._pending_approvals, seeded)
+        # A delegated child approval has no local submission entry; it is already
+        # registered on the policy (register_delegated), so the live
+        # pending_approvals property surfaces it on the next present.
 
     def notify_approval_finished(self, call: ToolCall) -> None:
         owner = self._approval_owners.get(call.id)
@@ -320,10 +308,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._closed = True
         self._shutting_down = True
         self._notification_retry.close()
-        if self._pending_refresh_task is not None and not self._pending_refresh_task.done():
-            self._pending_refresh_task.cancel()
-        if self._host._approval_policy is not None:
-            self._host._approval_policy.set_pending_changed_hook(None)
         for entry in self._entries.values():
             if entry.signal is not None:
                 entry.signal.abort()
@@ -448,7 +432,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
                 elif isinstance(message, _DurableToolDone):
                     self._on_durable_tool_done(message)
                 elif isinstance(message, _ApprovalLifecycle):
-                    await self._on_approval_lifecycle(message)
+                    self._on_approval_lifecycle(message)
                 elif isinstance(message, _ApprovalAction):
                     await self._on_approval_action(message)
                 elif isinstance(message, _AbortAction):
