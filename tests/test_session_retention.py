@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+import pytest
+
 from zeta.core.session import SessionManager, SessionMetadata
-from zeta.core.session_files import session_root
+from zeta.core.session_files import SessionError, session_root
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.session_retention import (
     RETENTION_PIN_FILENAME,
     RetentionBounds,
@@ -194,44 +198,62 @@ def test_closure_reasons_table(tmp_path):
         unsafe = _create_closed(manager, stack)
         os.symlink("meta.json", tmp_path / "sessions" / unsafe / "danger")
 
+        pinned_child = _create_closed(manager, stack, parent_session_id=pinned)
+
+        marker = _create_closed(manager, stack)
+        (tmp_path / "sessions" / marker / "session_state.json").write_text(
+            json.dumps({"agent_children": {"call_1": {"run_id": "r"}}})
+        )
+
+        sent_done = _create_closed(manager, stack)
+        _write_sent_ledger(tmp_path, sent_done, ["claimed", "done"])
+        sent_open = _create_closed(manager, stack)
+        _write_sent_ledger(tmp_path, sent_open, ["claimed"])
+        sent_broken = _create_closed(manager, stack)
+        _write_sent_ledger(tmp_path, sent_broken, "done")
+
         candidate = _create_closed(manager, stack)
-        candidate_bytes = _true_tree_bytes(tmp_path / "sessions" / candidate)
+        selected = (dependent, sent_done, candidate)
+        expected_bytes = sum(_true_tree_bytes(tmp_path / "sessions" / i) for i in selected)
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        future = stack.enter_context(RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(roots_advanced=32),
-            now_ns=lambda: _future_ns(),
-        ))
-        result = future.run_pass(days=30)
-        reasons = {row.root_id: (row.closed, row.reason) for row in result.reasons}
+        future = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        result, reasons = _run_sweep(future)
 
     assert reasons[held_id] == (False, "session is open or in use")
     assert reasons[live_child] == (False, "live or recoverable child")
     assert reasons[pinned] == (False, "pinned")
+    assert reasons[pinned_child] == (False, "pinned")
     assert reasons[pending] == (False, "pending project link")
     assert reasons[parent] == (False, "published top-level dependent")
     assert reasons[inbox] == (False, "pending inbox reference")
     assert reasons[reserved] == (False, "session is being deleted")
     assert reasons[unsafe] == (False, "unsafe entry in tree")
+    assert reasons[marker] == (False, "live or recoverable child")
+    assert reasons[sent_open] == (False, "unacknowledged sent message")
+    assert reasons[sent_broken] == (False, "broken sent tracker")
+    assert reasons[sent_done] == (True, None)
     assert reasons[dependent] == (True, None)
     assert reasons[candidate] == (True, None)
-    # The candidate's exact retained bytes are reported in the preview.
-    assert result.complete is True
-    assert candidate in result.preview.root_ids
-    assert result.preview.bytes >= candidate_bytes
+    assert sorted(result.preview.root_ids) == sorted(selected)
+    assert result.preview.bytes == expected_bytes
 
 
 def test_not_old_blocks_under_real_clock(tmp_path):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
         fresh = _create_closed(manager, stack)
+        aged = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / aged)
+        recent_meta = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / recent_meta, keep_metadata=True)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        import time
-
-        planner = stack.enter_context(RetentionPlanner(tmp_path, lease, now_ns=time.time_ns))
-        result = planner.run_pass(days=30)
-        reasons = {row.root_id: (row.closed, row.reason) for row in result.reasons}
+        planner = RetentionPlanner(tmp_path, lease, now_ns=time.time_ns)
+        _, reasons = _run_sweep(planner)
     assert reasons[fresh] == (False, "not old enough")
+    assert reasons[aged] == (True, None)
+    # Metadata timestamps are activity even when every mtime is old.
+    assert reasons[recent_meta] == (False, "not old enough")
 
 
 def test_resume_completes_over_passes_with_exact_bytes(tmp_path):
@@ -307,7 +329,7 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
         planner_a.close()  # process exit: the walked root directory is not rewalked
         # A file in the already-listed root directory changes; the directory
         # mtime does not, so only a fresh walk can see it.
-        walked = sorted(p for p in root_dir.iterdir() if p.is_file())[0]
+        walked = min(p for p in root_dir.iterdir() if p.is_file())
         with walked.open("ab") as stream:
             stream.write(b"z" * 17)
         recent = _future_ns() - _DAY_NS
@@ -319,6 +341,114 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
         result, reasons = _run_sweep(planner_b)
     assert reasons[root] == (False, "not old enough")
     assert root not in result.preview.root_ids
+
+
+def test_every_root_is_swept_and_the_next_sweep_starts_fresh(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        ids = sorted(_create_closed(manager, stack) for _ in range(40))
+        # The dependent sorts last, past every per-pass candidate bound.
+        parent, dependent = ids[0], ids[-1]
+        meta = tmp_path / "sessions" / dependent / "meta.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "parent_session_id": parent}))
+        expected = sum(_true_tree_bytes(tmp_path / "sessions" / i) for i in ids[1:])
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        first, reasons = _run_sweep(planner)
+        second, _ = _run_sweep(planner)
+    assert reasons[parent] == (False, "published top-level dependent")
+    assert sorted(first.preview.root_ids) == ids[1:]
+    assert first.preview.bytes == expected
+    # A finished sweep is not resumed: the next one recounts from scratch.
+    assert second.preview.preview_id != first.preview.preview_id
+    assert sorted(second.preview.root_ids) == ids[1:]
+    assert second.preview.bytes == expected
+
+
+def test_in_flight_walk_keeps_conforming_writers_out(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_with_message(manager, "first")
+        child = tmp_path / "sessions" / root / "agents" / "1"
+        child.mkdir(parents=True)
+        (child / "agent_lifecycle.json").write_text(
+            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
+        )
+        _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, bounds=RetentionBounds(entries_per_root=1))
+        planner.run_pass(days=30)  # the root directory is walked; the walk is suspended
+        # Walk progress stays authoritative only because no conforming writer
+        # can append between passes (a stale age would select an active root).
+        with pytest.raises(SessionError):
+            manager.open(root).store.close()
+        result, reasons = _run_sweep(planner)
+        manager.open(root).store.close()  # the finished sweep holds no lease
+    assert reasons[root] == (True, None)
+    assert result.preview.root_ids == (root,)
+
+
+def test_unreadable_entry_blocks_only_its_root(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        ids = sorted(_create_closed(manager, stack) for _ in range(2))
+        blocked = tmp_path / "sessions" / ids[0] / "spill"
+        blocked.mkdir()
+        blocked.chmod(0)
+        stack.callback(blocked.chmod, 0o700)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        result, reasons = _run_sweep(planner)
+    assert reasons[ids[0]] == (False, "unreadable entry: Permission denied")
+    assert reasons[ids[1]] == (True, None)
+    assert result.preview.root_ids == (ids[1],)
+
+
+def test_bounds_are_checked_per_entry_and_per_record(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        big = _create_closed(manager, stack)
+        spill = tmp_path / "sessions" / big / "spill"
+        spill.mkdir()
+        for index in range(10):
+            (spill / f"{index}.txt").write_text("s" * (index + 1))
+        expected = _true_tree_bytes(tmp_path / "sessions" / big)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(
+            tmp_path, lease, bounds=RetentionBounds(entries_per_root=4), now_ns=_future_ns
+        )
+        planner.run_pass(days=30)
+        walked = json.loads((tmp_path / "retention-state.json").read_text())["entry_count"]
+        result, reasons = _run_sweep(planner)
+
+        inbox = tmp_path / "projects" / "p_x" / "inbox" / "new"
+        inbox.mkdir(parents=True)
+        for index in range(3):
+            (inbox / f"{index}.json").write_text(json.dumps({"to_session": "other"}))
+        bounded = RetentionPlanner(
+            tmp_path, lease, bounds=RetentionBounds(reference_records_per_root=2),
+            now_ns=_future_ns,
+        )
+        _, bounded_reasons = _run_sweep(bounded)
+    assert walked <= 4
+    assert reasons[big] == (True, None)
+    assert result.preview.bytes == expected
+    assert bounded_reasons[big] == (False, "references not fully scanned")
+
+
+def test_malformed_metadata_is_never_closed(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        ids = sorted(_create_closed(manager, stack) for _ in range(2))
+        (tmp_path / "sessions" / ids[0] / "meta.json").write_text("{not json")
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        result, reasons = _run_sweep(planner)
+    # The broken root is ineligible, and it may hide a parent link, so the
+    # other root's dependent scan cannot pass either.
+    assert reasons[ids[0]][0] is False
+    assert reasons[ids[1]][0] is False
+    assert result.preview.root_ids == ()
 
 
 def test_below_feature_epoch_writes_nothing(tmp_path):
@@ -347,9 +477,47 @@ def test_planner_entry_points_have_no_production_callers():
 
 
 def _future_ns() -> int:
-    import time
-
     return time.time_ns() + 60 * _DAY_NS
+
+
+def _reply(text):
+    return Message(MessageRole.ASSISTANT, [TextContent(text)])
+
+
+def _create_with_message(manager, text):
+    opened = manager.create(
+        provider="codex", model="gpt-5.6-sol", cwd=str(manager.home), auto_project=False,
+    )
+    try:
+        opened.store.append_message(_reply(text))
+    finally:
+        opened.store.close()
+    return opened.metadata.session_id
+
+
+def _age_tree(session_dir, *, days=100, keep_metadata=False):
+    """Make a session look ``days`` old: metadata timestamps and every mtime."""
+    if not keep_metadata:
+        meta = session_dir / "meta.json"
+        value = json.loads(meta.read_text())
+        value["created_at"] = value["updated_at"] = _OLD
+        meta.write_text(json.dumps(value))
+    old = time.time_ns() - days * _DAY_NS
+    for dirpath, _dirs, files in os.walk(session_dir, topdown=False):
+        for name in files:
+            os.utime(os.path.join(dirpath, name), ns=(old, old), follow_symlinks=False)
+        os.utime(dirpath, ns=(old, old))
+
+
+def _write_sent_ledger(home, session_id, reported):
+    """A v1 sent ledger, the shape ``SentMessageTracker`` itself loads."""
+    record = {
+        "id": "a" * 32, "target_project": "p_x",
+        "created_at": "2020-01-01T00:00:00+00:00", "reported": reported,
+    }
+    path = home / "sessions" / session_id / "project-inbox-sent.json"
+    path.write_text(json.dumps({"schema_version": 1, "records": [record]}))
+    path.chmod(0o600)
 
 
 def _run_sweep(planner, days=30):
