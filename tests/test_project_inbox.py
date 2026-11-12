@@ -801,7 +801,7 @@ def test_generation_gates_scan_and_each_mutation_advances_it(
     live_session = "c" * 32
 
     def generation() -> int:
-        return inbox.project_generation(project_b.project_id)
+        return inbox.generation.project_generation(project_b.project_id)
 
     steps: list[str] = []
 

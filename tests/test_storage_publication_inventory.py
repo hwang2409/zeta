@@ -22,7 +22,7 @@ _DURABILITY_CALLBACKS = {
     ("project_inbox_sent/__init__.py", "_write_spill", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     ("project_inbox.py", "_set_delegation", "atomic_publish_file"),
-    ("project_inbox.py", "_advance_generation", "atomic_publish_file"),
+    ("project_inbox_sent/generation.py", "advance", "atomic_publish_file"),
     (
         "memory/entry_history.py",
         "_rollback_memory_migration_for_test",

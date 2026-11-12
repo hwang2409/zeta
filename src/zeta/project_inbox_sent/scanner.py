@@ -61,7 +61,7 @@ class ProjectInboxScanner:
             # Retry every poll, not only the first: a live-session publish that
             # failed leaves a durable intent that a later poll must still
             # deliver. Each intent is isolated inside recover_sent_intents.
-            failures = self.inbox.recover_sent_intents(self.tracker)
+            failures = self.inbox.delivery.recover_sent_intents(self.tracker)
             if failures:
                 self._recovery_warning = "; ".join(failures)[:200]
         if self.inbox.generation_enabled and not (
@@ -87,12 +87,12 @@ class ProjectInboxScanner:
         return message_ids, sent
 
     def _generation_signature(self) -> _Signature:
-        own = self.inbox.project_generation(self.project_id)
+        own = self.inbox.generation.project_generation(self.project_id)
         targets = (
             self.tracker.tracked_targets() if self.tracker is not None else set()
         )
         return own, tuple(
-            (target, self.inbox.project_generation(target))
+            (target, self.inbox.generation.project_generation(target))
             for target in sorted(targets)
         )
 

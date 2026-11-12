@@ -23,11 +23,12 @@ from .core.session_files import (
     atomic_publish_file,
     child_directory,
     open_session_file,
-    read_session_file,
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_provenance import decorate, delegation_enabled
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
+from .project_inbox_sent.delivery import SentDelivery
+from .project_inbox_sent.generation import InboxGeneration
 from .project_inbox_sent.scanner import ProjectInboxScanner  # noqa: F401
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
@@ -35,7 +36,6 @@ from .storage_format import (
     CLOSED_VARIANTS,
     FEATURE_EPOCHS,
     StorageFeature,
-    StorageFormatError,
     feature_enabled,
     mapping_mutations,
     open_writer,
@@ -158,9 +158,15 @@ class ProjectInbox:
         # select an epoch different from the registry (and then silently lose
         # generation-gated delivery).
         self.observed_epoch = registry.observed_storage_epoch
-        self.generation_enabled = feature_enabled(
-            self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        self.generation = InboxGeneration(
+            registry,
+            feature_enabled(self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT),
         )
+        self.delivery = SentDelivery(self)
+
+    @property
+    def generation_enabled(self) -> bool:
+        return self.generation.enabled
 
     def command(self, project: str, args: str, *, from_session: str | None = None) -> str:
         body = None
@@ -256,7 +262,7 @@ class ProjectInbox:
         on_visible: Callable[[], None] | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> str:
-        message_id, _outcome = self._deliver_tracked(
+        message_id, _outcome = self.delivery.deliver_tracked(
             on_visible=on_visible,
             origin=_origin,
             from_project=from_project,
@@ -337,7 +343,7 @@ class ProjectInbox:
         to_session: str | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> tuple[str, SentLedgerOutcome[None]]:
-        return self._deliver_tracked(
+        return self.delivery.deliver_tracked(
             origin=_origin,
             from_project=from_project,
             from_session=from_session,
@@ -348,74 +354,6 @@ class ProjectInbox:
             in_reply_to=in_reply_to,
             message_id=message_id,
             to_session=to_session,
-        )
-
-    def _deliver_tracked(
-        self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
-    ) -> tuple[str, SentLedgerOutcome[None]]:
-        session, target, message_id, body, record = self._outgoing(**kwargs)
-        # At the durable-intent epoch a pending record precedes the recipient
-        # publish, so a crash in between recovers to exactly one delivery. The
-        # post-publish record() call marks it published; below the epoch it
-        # writes the schema-v1 row after publish, exactly as before.
-        tracker = self._sent_tracker(session)
-        durable = feature_enabled(
-            self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
-        )
-        if durable:
-            tracker.record_intent(record)
-        try:
-            with self._directories(target, create=True) as dirs:
-                self._publish_outgoing(dirs, message_id, body, record)
-        except InboxConflictError:
-            raise
-        except (InboxError, OSError, SessionError, StorageFormatError) as exc:
-            if durable:
-                # The intent is already durable; a later poll re-publishes it.
-                # Tell the caller so the model does not send a duplicate.
-                # (_directories translates OSError into a generic InboxError.)
-                raise InboxError(
-                    "inbox message saved; the recipient could not be reached "
-                    "now and delivery will be retried automatically. Do not "
-                    "resend this message."
-                ) from exc
-            raise
-        if on_visible is not None:
-            try:
-                on_visible()
-            except Exception:  # noqa: BLE001,S110
-                # The durable record remains authoritative if its wake cannot run.
-                pass
-        return message_id, tracker.record(message_id, target)
-
-    def recover_sent_intents(self, tracker: SentMessageTracker) -> list[str]:
-        """Re-publish each durable intent whose recipient publish is not durable.
-
-        Every intent is isolated: one that cannot be resolved or published (a
-        missing spill, a conflict, an OSError) is reported and skipped rather
-        than blocking the recovery of the others or the incoming scan. The
-        returned reasons let the poller surface degraded health.
-        """
-        failures: list[str] = []
-        for envelope in tracker.pending_intents():
-            target = envelope["to_project"]
-            message_id = envelope["id"]
-            try:
-                body = tracker.resolve_pending_body(message_id, envelope["body"])
-                record = dict(envelope)
-                record["body"] = body
-                with self._directories(target, create=True) as dirs:
-                    self._publish_outgoing(dirs, message_id, body, record)
-                tracker.record(message_id, target)
-            except (OSError, SessionError, InboxError, ValueError) as exc:
-                failures.append(f"{message_id}: {exc}")
-        return failures
-
-    def _sent_tracker(self, session: str) -> SentMessageTracker:
-        if self.sent_tracker is not None and self.sent_tracker.session_id == session:
-            return self.sent_tracker
-        return SentMessageTracker(
-            self.sessions_root, session, observed_epoch=self.observed_epoch
         )
 
     def _outgoing(
@@ -484,7 +422,7 @@ class ProjectInbox:
                 continue
             break
         if existing is None:
-            self._advance_generation(dirs[5])
+            self.generation.advance(dirs[5])
             self._publish_record(new_fd, name, record)
             return
         immutable_fields = {
@@ -569,7 +507,7 @@ class ProjectInbox:
         if type(limit) is not int or not 1 <= limit <= SENT_PAGE_LIMIT:
             raise InboxError(f"limit must be an integer from 1 to {SENT_PAGE_LIMIT}")
 
-        outcome = self._sent_tracker(session_id).sent_view(
+        outcome = self.delivery.tracker_for(session_id).sent_view(
             self, source.project_id, self._receipts_for_session(session_id)
         )
         sent = outcome.result
@@ -587,118 +525,6 @@ class ProjectInbox:
 
     def _receipts_for_session(self, session_id: str) -> tuple[tuple[str, str], ...]:
         return self.receipts
-
-    def _broken_project_rows(
-        self,
-        project_id: str,
-        source_project: str,
-        source_session: str,
-        receipt_map: dict[str, set[str]],
-    ) -> list[dict[str, Any]]:
-        invalid: list[dict[str, str]] = []
-        rows: list[dict[str, Any]] = []
-        def read(project_fd: int) -> None:
-            try:
-                with self._directory_handles(project_fd, create=False) as dirs:
-                    for status, directory_fd in zip(("new", "claimed", "done"), dirs[:3]):
-                        for record in self._read_directory(
-                            directory_fd,
-                            dirs[3],
-                            status=status,
-                            invalid=invalid,
-                            resolve_body=False,
-                        ):
-                            if record.get("from") == {
-                                "project": source_project,
-                                "session": source_session,
-                            }:
-                                rows.append(self._broken_row(record, status, project_id, project_name, source_session, receipt_map))
-            except _InboxNotFound:
-                return
-        # Identity ranks before the inbox lock, so resolve the name first.
-        try:
-            project_name = self.registry.show_project(project_id).name
-        except ProjectNotFoundError:
-            project_name = project_id
-        with self._lock(project_id, exclusive=False) as project_fd:
-            read(project_fd)
-        return rows
-
-    def _broken_row(
-        self,
-        record: dict[str, Any],
-        status: str,
-        project_id: str,
-        project_name: str,
-        source_session: str,
-        receipt_map: dict[str, set[str]],
-    ) -> dict[str, Any]:
-        row = {
-            "id": record["id"],
-            "status": status,
-            "to_project": project_id,
-            "to_project_name": project_name[:200],
-            "from_session": source_session,
-            "kind": record["kind"],
-            "title": record["title"][:200],
-            "created_at": record["created_at"][:64],
-            "reported": [
-                name for name in ("claimed", "done") if name in receipt_map.get(record["id"], set())
-            ],
-        }
-        if status in {"claimed", "done"}:
-            row["claimed_at"] = str(record.get("claimed_at") or "")[:64]
-            row["claimer_session"] = record.get("claimer_session")
-        if status == "done":
-            row.update(
-                done_at=str(record.get("done_at") or "")[:64],
-                outcome=str(record.get("outcome") or "")[:500],
-                reply_id=record.get("reply_id"),
-            )
-        return row
-
-    def _resolve_tracked_sent(
-        self,
-        source_project: str,
-        source_session: str,
-        tracked: tuple[dict[str, Any], ...],
-    ) -> list[dict[str, Any]]:
-        sent: list[dict[str, Any]] = []
-        for item in tracked:
-            found = self._read_tracked_message(
-                source_project,
-                source_session,
-                item["target_project"],
-                item["id"],
-            )
-            if found is None:
-                continue
-            status, record = found
-            try:
-                target_name = self.registry.show_project(item["target_project"]).name
-            except ProjectNotFoundError:
-                target_name = item["target_project"]
-            result: dict[str, Any] = {
-                "id": record["id"],
-                "status": status,
-                "to_project": str(record["to_project"])[:200],
-                "to_project_name": target_name[:200],
-                "from_session": source_session,
-                "kind": record["kind"],
-                "title": record["title"][:200],
-                "created_at": record["created_at"][:64],
-                "reported": list(item["reported"]),
-            }
-            if status in {"claimed", "done"}:
-                result["claimed_at"] = str(record.get("claimed_at") or "")[:64]
-                result["claimer_session"] = record.get("claimer_session")
-            if status == "done":
-                result["done_at"] = str(record.get("done_at") or "")[:64]
-                result["outcome"] = str(record.get("outcome") or "")[:500]
-                result["reply_id"] = record.get("reply_id")
-            sent.append(result)
-        sent.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
-        return sent
 
     def read(self, project: str) -> dict[str, list[dict[str, Any]]]:
         """Read inbox state without creating storage or recovering claims."""
@@ -817,7 +643,7 @@ class ProjectInbox:
                 )
             except FileExistsError:
                 return False
-            self._advance_generation(dirs[5])
+            self.generation.advance(dirs[5])
             with os.fdopen(fd, "wb") as stream:
                 stream.write(b"wake\n")
                 stream.flush()
@@ -841,7 +667,7 @@ class ProjectInbox:
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:
                     return None
-                self._advance_generation(dirs[5])
+                self.generation.advance(dirs[5])
                 os.rename(name, name, src_dir_fd=new_fd, dst_dir_fd=claimed_fd)
             except FileNotFoundError:
                 return None
@@ -918,7 +744,7 @@ class ProjectInbox:
                 record["reply"] = reply
                 record["reply_id"] = reply_id
                 record["done_at"] = _now()
-                self._advance_generation(dirs[5])
+                self.generation.advance(dirs[5])
                 self._publish_record(claimed_fd, name, record)
                 try:
                     os.rename(name, name, src_dir_fd=claimed_fd, dst_dir_fd=done_fd)
@@ -1024,61 +850,6 @@ class ProjectInbox:
                     self._directory_handles(project_fd, create=True)
                 )
             yield fds
-
-    def _advance_generation(self, inbox_fd: int) -> None:
-        """Bump the monotone inbox generation before a scanner-visible mutation.
-
-        Below the durable-intent epoch no generation file exists and the scanner
-        still uses directory stat fingerprints, so this is a no-op.
-        """
-        if not self.generation_enabled:
-            return
-        atomic_publish_file(
-            inbox_fd,
-            "generation",
-            str(self._read_generation(inbox_fd) + 1).encode("ascii"),
-            sync_directory=True,
-        )
-
-    @staticmethod
-    def _read_generation(inbox_fd: int) -> int:
-        try:
-            raw = read_session_file(inbox_fd, "generation")
-        except FileNotFoundError:
-            return 0
-        try:
-            text = raw.decode("ascii").strip()
-        except UnicodeDecodeError as exc:
-            raise InboxError("invalid inbox generation") from exc
-        if not text.isdigit():
-            raise InboxError("invalid inbox generation")
-        return int(text)
-
-    def project_generation(self, project_id: str) -> int:
-        """Read one inbox generation for the scanner without the inbox lock.
-
-        Uses the O_NOFOLLOW directory helpers like every other inbox read, so a
-        symlinked path component cannot redirect the read.
-        """
-        try:
-            root_fd = os.open(
-                os.fspath(self.registry.root),
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            )
-        except (FileNotFoundError, NotADirectoryError):
-            return 0
-        try:
-            with (
-                child_directory(root_fd, project_id, create=False) as project_fd,
-                child_directory(project_fd, "inbox", create=False) as inbox_fd,
-            ):
-                return self._read_generation(inbox_fd)
-        except FileNotFoundError:
-            return 0
-        except OSError as exc:
-            raise InboxError("invalid inbox generation") from exc
-        finally:
-            os.close(root_fd)
 
     def _publish_record(
         self,
@@ -1337,7 +1108,7 @@ class ProjectInbox:
             claimer = record.get("claimer_session")
             if isinstance(claimer, str) and self._session_alive(claimer):
                 continue
-            self._advance_generation(inbox_fd)
+            self.generation.advance(inbox_fd)
             record.pop("claimer_session", None)
             claimed_at = record.pop("claimed_at", None)
             record["recovery_note"] = (

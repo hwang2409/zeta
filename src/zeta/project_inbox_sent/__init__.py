@@ -411,7 +411,7 @@ class SentMessageTracker:
             if isinstance(self._state, _Broken):
                 result = self._projected_broken_sent(inbox, source_project)
             else:
-                result = inbox._resolve_tracked_sent(
+                result = inbox.delivery.resolve_tracked_sent(
                     source_project, self.session_id, tracked
                 )
             return self._outcome(result)
@@ -427,7 +427,7 @@ class SentMessageTracker:
             inbox.registry.list_projects(), key=lambda project: project.project_id
         ):
             rows.extend(
-                inbox._broken_project_rows(
+                inbox.delivery.broken_project_rows(
                     target.project_id,
                     source_project,
                     self.session_id,
