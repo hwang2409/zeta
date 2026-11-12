@@ -97,9 +97,14 @@ NOTIFICATION_WIRE_EVENTS = {
     "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
+    "project_inbox_health": EventDescriptor.PROJECT_INBOX_HEALTH,
     "child_question": EventDescriptor.CHILD_QUESTION,
     "child_question_withdrawn": EventDescriptor.CHILD_QUESTION_WITHDRAWN,
 }
+
+# Notification kinds that ride the notification wire but are never persisted,
+# so they have no store validator and are absent from NOTIFICATION_KINDS.
+LIVE_NOTIFICATION_KINDS = frozenset({"project_inbox_health"})
 
 
 def notification_wire_event(kind: object, protocol_version: str) -> EventDescriptor:
@@ -201,6 +206,48 @@ def approval_request(payload: Mapping[str, object]) -> dict[str, object]:
 
 def approval_end(payload: Mapping[str, object]) -> dict[str, object]:
     return dict(payload)
+
+
+def approval_end_for_features(
+    fields: Mapping[str, object], *, include_restart_reason: bool
+) -> dict[str, object]:
+    """Shape one ``approval_end`` payload for a connection's negotiated features.
+
+    A client that did not negotiate ``approval_restart_reason`` still learns the
+    request is terminal, but the unknown ``server_restarted`` reason is removed
+    from both the top-level ``reason`` and ``data.reason``. Every other reason,
+    and the terminal end itself, is preserved. One shaper for live, history,
+    replay, and child-run history output.
+    """
+    if include_restart_reason:
+        return dict(fields)
+    data = fields.get("data")
+    if not (isinstance(data, dict) and data.get("reason") == "server_restarted"):
+        return dict(fields)
+    shaped = dict(fields)
+    shaped.pop("reason", None)
+    reduced = dict(data)
+    reduced.pop("reason", None)
+    shaped["data"] = reduced
+    return shaped
+
+
+def shape_approval_history_rows(
+    rows: list[dict[str, object]], *, include_restart_reason: bool
+) -> list[dict[str, object]]:
+    """Strip ``server_restarted`` from projected ``approval_end`` history rows for
+    a legacy connection. Only removes bytes, so cached page sizes stay safe."""
+    if include_restart_reason:
+        return rows
+    shaped: list[dict[str, object]] = []
+    for row in rows:
+        if row.get("event") == "approval_end":
+            shaped.append(
+                approval_end_for_features(row, include_restart_reason=False)
+            )
+        else:
+            shaped.append(row)
+    return shaped
 
 
 def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:

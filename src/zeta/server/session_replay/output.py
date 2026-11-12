@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from .. import event_contract
 from ..handlers import lifecycle, validation
 from ..handlers.history import replay_history
 from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
@@ -43,6 +44,7 @@ class ReplayOutput:
         required_feature: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        replay_row: rows.RowFacts | None = None,
     ) -> None:
         """Send an event to observers that joined its replay scope."""
         if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
@@ -55,6 +57,7 @@ class ReplayOutput:
                     session_id,
                     self._fields_for_connection(observer, event, fields),
                     covers,
+                    replay_row=replay_row,
                 )
 
     def _replay_covers(
@@ -184,6 +187,8 @@ class ReplayOutput:
 
     def _replay_store(self, scope: ReplayScopeId) -> Any:
         """The scope's store while a replay stream or join needs it, else None."""
+        if scope.kind == "child":
+            return self.child_runs.live_store(scope.value)
         for connection in self._connections:
             if self.replay.scope_for(connection) == scope:
                 runtime = connection.server.runtime
@@ -191,14 +196,20 @@ class ReplayOutput:
                     return runtime.opened.store
         return None
 
-    def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        self.invalidate_replay_connection(connection, reason="rejoined")
+    async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         runtime = connection.server.runtime
-        store = validation.active(runtime, {"session_id": scope.value})
-        status = lifecycle.live_status_baseline(connection)
-        self.replay.begin_join(
-            connection, scope, store.reset_generation(), status
+        if scope.kind == "child":
+            store = self.child_runs.live_store(scope.value)
+        else:
+            store = validation.active(runtime, {"session_id": scope.value})
+        self.invalidate_replay_connection(connection, reason="rejoined")
+        pending = self.replay.begin_join(
+            connection,
+            scope,
+            None if store is None else store.reset_generation(),
+            {},
         )
+        pending.status = await lifecycle.live_status_baseline(connection)
 
     def finish_replay_join(
         self,
@@ -220,8 +231,13 @@ class ReplayOutput:
         """Check a generation change against the stream or pending join."""
         generation = self.replay.reset_generation(connection)
         store = self._replay_store(scope)
-        if generation is None or store is None:
-            return generation is None
+        if generation is None:
+            return True
+        if store is None:
+            # the child scope's store is gone only because the run ended; an ended
+            # run's rows are frozen and cannot renumber, so the stream holds until it
+            # ends. a replaced or evicted scope is invalidated directly, not here.
+            return scope.kind == "child"
         current = store.reset_generation()
         if current == generation:
             return True
@@ -322,6 +338,25 @@ class ReplayOutput:
             output.queue = kept
             self._assert_retained_accounting(output)
 
+    def _member_scope(
+        self,
+        connection: Any,
+        session_id: str,
+        fields: dict[str, object],
+        facts: rows.RowFacts | None,
+    ) -> ReplayScopeId | None:
+        scope = self.replay.scope_for(connection)
+        if scope is None:
+            return None
+        if scope.kind == "top":
+            return scope if scope.value == session_id else None
+        data = fields.get("data")
+        agent = data.get("agent_instance_id") if isinstance(data, dict) else None
+        agent = agent or fields.get("agent_instance_id") or (facts.agent if facts else None)
+        if type(agent) is str and (agent == scope.value or agent.startswith(scope.value + ":")):
+            return scope
+        return None
+
     def _publish_replay(
         self,
         state: Any,
@@ -329,12 +364,20 @@ class ReplayOutput:
         session_id: str | None,
         fields: dict[str, object],
         covers: rows.Covers,
+        *,
+        scope: ReplayScopeId | None = None,
+        replay_row: rows.RowFacts | None = None,
     ) -> bool:
         """Admit one frame to a replay stream; False when the caller sends it plainly."""
         if "session_replay_seq" not in state.features or session_id is None:
             return False
-        scope = ReplayScopeId.top(session_id)
         connection = state.connection
+        if scope is None:
+            scope = self._member_scope(connection, session_id, fields, replay_row)
+            if scope is None:
+                return False
+        if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(connection):
+            return True
         if covers is not None and not self._frontier_holds(connection, scope):
             if self.replay.is_pending(connection):
                 self.replay.mark_pending_stale(connection)
@@ -389,7 +432,13 @@ class ReplayOutput:
         )
         return True
 
-    async def admit_join_response(self, connection: Any, frame: _Frame) -> bool:
+    async def admit_join_response(
+        self,
+        connection: Any,
+        request_id: str | int | None,
+        result: object,
+        baseline_builder: Any = None,
+    ) -> bool:
         state = self._connections.get(connection)
         if state is None or state.output is None:
             self.invalidate_replay_connection(connection)
@@ -398,6 +447,17 @@ class ReplayOutput:
         if output.phase not in {"claimed_buffering", "flushing", "ready"}:
             self.invalidate_replay_connection(connection)
             return False
+        scope = self.replay.scope_for(connection)
+        if scope is None or not self._frontier_holds(connection, scope):
+            self.invalidate_replay_connection(connection)
+            return False
+        if baseline_builder is not None:
+            result = baseline_builder(result)
+        frame = connection.codec._result_response(request_id, result)
+        if frame is None:
+            # fail closed: the client never gets this stream id, so no frame may carry it
+            self.invalidate_replay_connection(connection)
+            return await self.send(connection, connection.codec.response(request_id, result))
         held = self.replay.pending_tail(connection)
         stream_id = self.replay.pending_stream_id(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
@@ -453,6 +513,14 @@ class ReplayOutput:
         self.invalidate_replay_connection(state.connection)
         state.connection.writer.close()
 
+    def publish_child_lifecycle(self, event, scope, session_id, fields, covers=None):
+        for state in (self._controller, *self._observers):
+            if state is None or "child_run_events" not in state.features:
+                continue
+            if self.replay.scope_for(state.connection) != scope:
+                continue
+            self._publish_replay(state, event, session_id, fields, covers, scope=scope)
+
     async def read_replay_history(
         self,
         connection: Any,
@@ -472,6 +540,7 @@ class ReplayOutput:
                 fidelity="session_history_fidelity" in features,
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
+                child_runs="child_run_events" in features,
                 **(
                     {"supplied_validator": history_validator}
                     if history_validator is not None
@@ -482,4 +551,26 @@ class ReplayOutput:
 
         result = await self.run_read(connection, read)
         assert isinstance(result, tuple)
-        return result
+        history, *rest = result
+        shaped = self._strip_restart_reason(connection, history)
+        if shaped is history:
+            return result
+        return (shaped, *rest)
+
+    def _strip_restart_reason(self, connection: Any, history: object) -> object:
+        """Strip ``server_restarted`` from projected approval rows for a legacy
+        connection (no ``approval_restart_reason`` feature). One output seam for
+        every history page; returns the same object when nothing is stripped."""
+        if "approval_restart_reason" in self._connections[connection].features:
+            return history
+        if not isinstance(history, dict):
+            return history
+        rows = history.get("messages")
+        if not isinstance(rows, list):
+            return history
+        shaped = event_contract.shape_approval_history_rows(
+            rows, include_restart_reason=False
+        )
+        if shaped is rows:
+            return history
+        return {**history, "messages": shaped}

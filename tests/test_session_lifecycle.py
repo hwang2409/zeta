@@ -88,9 +88,13 @@ async def test_slash_name_persists_label_and_shows_current(
         )
         == "session name: planning"
     )
-    assert SessionManager(home).open(app.loop.store.session_id).metadata.name == (
-        "planning"
+    reopened = await asyncio.to_thread(
+        SessionManager(home).open, app.loop.store.session_id
     )
+    try:
+        assert reopened.metadata.name == "planning"
+    finally:
+        reopened.store.close()
     assert (
         await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
             app, "/name"

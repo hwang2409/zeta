@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core.agent_progress import publish_child_ended
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     Message,
@@ -183,10 +184,19 @@ def _recovered_completion_input(
 
 def _recover_nested_children(
     store: ConversationStore,
+    history_store: ConversationStore,
     notification_store: ConversationStore,
     recovery_stores: dict[Path, ConversationStore],
+    home_epoch: int,
 ) -> None:
-    """Cancel descendants left behind when an ancestor session exits."""
+    """Cancel descendants left behind when an ancestor session exits.
+
+    ``history_store`` is the root session store. Serve writes every delegated
+    ``approval_history`` row (at any depth) to that one store, so the delegated
+    end for a grandchild is repaired there, not against the intermediate parent.
+    """
+
+    from ..runtime.approval_recovery import repair_delegated_child
 
     child_markers = store.agent_children()
     if not child_markers:
@@ -195,12 +205,23 @@ def _recover_nested_children(
         tool_call = ToolCall.from_dict(marker["tool_call"])
         child_path = Path(marker["child_session_path"])
         child_store = recovery_stores.get(child_path)
+        child_instance_id = marker.get(
+            "child_instance_id", f"{store.session_id}:{child_path.name}"
+        )
         with nullcontext():
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
+                    history_store,
                     notification_store,
                     recovery_stores,
+                    home_epoch,
+                )
+                # Post-order: the child's own approvals are closed and any
+                # missing delegated end is written on the root session history
+                # before this marker is cleaned up.
+                repair_delegated_child(
+                    history_store, child_store, child_instance_id, home_epoch
                 )
             existing_result = store.tool_result(tool_call.id) is not None
             notification_status: str | None = None
@@ -232,6 +253,7 @@ def _recover_nested_children(
                     store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if existing is None:
                     lifecycle = (
@@ -251,6 +273,17 @@ def _recover_nested_children(
                     notification_status = terminal.status
                     notification_text = terminal.text
                     notification_stats = terminal.stats
+                    if child_store is not None:
+                        if notification_status == "canceled":
+                            child_store.mark_agent_canceled(tool_call.id)
+                        elif child_store.agent_lifecycle() is not None:
+                            child_store.finish_agent_lifecycle(
+                                "completed"
+                                if notification_status != "error"
+                                else "failed",
+                                final_result=notification_text
+                                or "background child completed",
+                            )
                     existing = _recover_completion_notification(
                         store,
                         notification_store,
@@ -263,6 +296,9 @@ def _recover_nested_children(
                             text=notification_text,
                             stats=notification_stats,
                             report=accepted_report,
+                        ),
+                        child_lifecycle=(
+                            child_store.agent_lifecycle() if child_store is not None else None
                         ),
                     )
                 else:
@@ -278,23 +314,27 @@ def _recover_nested_children(
                     else None
                 )
                 if lifecycle_result is not None:
-                    store.append_message(
+                    receipt = store.append_message(
                         Message(
                             MessageRole.TOOL_RESULT,
                             [TextContent(lifecycle_result.content)],
                             tool_result=lifecycle_result,
                         )
                     )
+                    _publish_recovered_end(child_store, receipt)
                     child_store.finish_agent_parent()
                     store.finish_agent_child(marker_key)
                     continue
-                store.append_message(
+                if child_store is not None:
+                    child_store.mark_agent_canceled(tool_call.id)
+                receipt = store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
                         [TextContent("tool execution canceled")],
                         tool_result=_nested_canceled_result(marker),
                     )
                 )
+                _publish_recovered_end(child_store, receipt)
             if child_store is not None:
                 if marker.get("background") and notification_status == "canceled":
                     child_store.mark_agent_canceled(tool_call.id)
@@ -316,21 +356,32 @@ def _recover_completion_notification(
     notification_store: ConversationStore,
     child_instance_id: str,
     fallback: NotificationInput | None = None,
+    *,
+    child_lifecycle: object = None,
 ) -> ConversationEntry | None:
     return conversation_channel.recover_completion_mirrors(
         notification_store,
         owner_store,
         child_instance_id,
         dict(fallback.data) if fallback is not None else None,
+        child_lifecycle,
     )
 
-def recover_agent_children(loop: AgentLoopForRecovery) -> None:
+def _publish_recovered_end(
+    child_store: ConversationStore | None, receipt: ConversationEntry
+) -> None:
+    if child_store is not None and (handle := child_store.agent_handle()) is not None:
+        publish_child_ended(handle, receipt.seq, child_store.agent_lifecycle())
+
+
+def recover_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> None:
     """Resolve child markers left by a process exit before resuming."""
 
-    _recover_agent_children(loop)
+    _recover_agent_children(loop, home_epoch)
 
 def _recover_agent_children(
     loop: AgentLoopForRecovery,
+    home_epoch: int,
     *,
     should_stop: Callable[[], bool] | None = None,
 ) -> None:
@@ -360,8 +411,17 @@ def _recover_agent_children(
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
+                    loop.store,
                     notification_store,
                     recovery_stores,
+                    home_epoch,
+                )
+                # Close this child's own approvals and write any missing
+                # delegated end on the root store before marker cleanup.
+                from ..runtime.approval_recovery import repair_delegated_child
+
+                repair_delegated_child(
+                    loop.store, child_store, child_instance_id, home_epoch
                 )
             if marker.get("background"):
                 terminal = child_store.agent_lifecycle() if child_store else None
@@ -386,6 +446,7 @@ def _recover_agent_children(
                     loop.store,
                     notification_store,
                     child_instance_id,
+                    child_lifecycle=terminal,
                 )
                 if notification is None:
                     lifecycle = (
@@ -409,6 +470,19 @@ def _recover_agent_children(
                     recovered_killed_ids = terminal.killed_task_ids
                     recovered_killed_count = terminal.killed_task_count
                     recovered_killed_truncated = terminal.killed_task_ids_truncated
+                    newly_canceled = (
+                        recovered_status == "canceled" and terminal_state != "canceled"
+                    )
+                    if child_store is not None:
+                        if newly_canceled:
+                            child_store.mark_agent_canceled(tool_call.id)
+                        elif accepted_report is not None and lifecycle is not None:
+                            child_store.finish_agent_lifecycle(
+                                "failed"
+                                if accepted_report["status"] == "failed"
+                                else "completed",
+                                final_result=recovered_text,
+                            )
                     notification = _recover_completion_notification(
                         loop.store,
                         notification_store,
@@ -425,22 +499,12 @@ def _recover_agent_children(
                             killed_task_ids_truncated=recovered_killed_truncated,
                             report=accepted_report,
                         ),
+                        child_lifecycle=(
+                            child_store.agent_lifecycle() if child_store is not None else None
+                        ),
                     )
-                    if child_store is not None:
-                        if (
-                            recovered_status == "canceled"
-                            and terminal_state != "canceled"
-                        ):
-                            child_store.mark_agent_canceled(tool_call.id)
-                        else:
-                            if accepted_report is not None and lifecycle is not None:
-                                child_store.finish_agent_lifecycle(
-                                    "failed"
-                                    if accepted_report["status"] == "failed"
-                                    else "completed",
-                                    final_result=recovered_text,
-                                )
-                            child_store.finish_agent_parent()
+                    if child_store is not None and not newly_canceled:
+                        child_store.finish_agent_parent()
                 elif child_store is not None:
                     if notification.data["status"] == "canceled":
                         child_store.mark_agent_canceled(tool_call.id)
@@ -462,7 +526,9 @@ def _recover_agent_children(
                 else None
             )
             if existing_result is None:
-                loop.store.append_message(
+                if child_store is not None and recovered_result is None:
+                    child_store.mark_agent_canceled(tool_call.id)
+                receipt = loop.store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
                         [
@@ -485,11 +551,13 @@ def _recover_agent_children(
                         ),
                     )
                 )
-            if child_path.parent == agents_root and child_path.name.isdigit():
-                if existing_result is None and recovered_result is None:
-                    child_store.mark_agent_canceled(tool_call.id)
-                elif recovered_result is not None or existing_result is not None:
-                    child_store.finish_agent_parent()
+                _publish_recovered_end(child_store, receipt)
+            if (
+                child_path.parent == agents_root
+                and child_path.name.isdigit()
+                and (recovered_result is not None or existing_result is not None)
+            ):
+                child_store.finish_agent_parent()
             loop.store.finish_agent_child(marker_key)
     recover_orphaned_questions(
         loop.store, excluded_child_subtrees=busy_child_subtrees
@@ -736,6 +804,7 @@ async def finish_background_child(
                 killed_task_count=killed_task_count or None,
                 killed_task_ids_truncated=killed_task_ids_truncated,
                 report=notification_report,
+                child_lifecycle=child_store.agent_lifecycle(),
             )
 
         transition = asyncio.create_task(commit_adopt_publish())

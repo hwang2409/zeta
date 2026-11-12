@@ -6,8 +6,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from ..core.checkpoints import _now
-from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.checkpoints import ConversationEntry, _now
+from ..core.store import (
+    MAX_AGENT_NOTIFICATION_TEXT,
+    ConversationStore,
+)
 from ..protocol.types import (
     MessageOrigin,
     StreamEvent,
@@ -54,6 +57,29 @@ def _transition_idle(child_store: ConversationStore) -> None:
     )
 
 
+def _fold_text(folded: tuple[ConversationEntry, ...]) -> tuple[str, str]:
+    """Build the fold head and the tail trailer for folded completion reports.
+
+    The head carries each report; the trailer names where the full text lives.
+    The caller puts the head at the start of the first receipt component and the
+    trailer at the end of the child's own text, so receipt tail-truncation cuts
+    the folded reports before any byte of the child's own report (see receipt.py).
+    """
+
+    head = "sub-agent reports received after this agent finished:\n" + "\n\n".join(
+        f"[{entry.data['description']}]\n{entry.data['text']}" for entry in folded
+    )
+    paths = [entry.data["child_session_path"] for entry in folded]
+    extra = len(paths) - 3
+    trailer = (
+        f"\n[{len(folded)} sub-agent report(s) folded above; "
+        f"full text: {', '.join(paths[:3])}"
+        + (f" (+{extra} more)" if extra > 0 else "")
+        + "]"
+    )
+    return head, trailer
+
+
 def _finalize_result(
     result: dict[str, object],
     *,
@@ -64,6 +90,7 @@ def _finalize_result(
     child_turns: object,
     tool_call_id: str,
     max_receipt_bytes: int,
+    folded: tuple[ConversationEntry, ...] = (),
 ) -> dict[str, object]:
     if isinstance(result.get("explicitFinishReport"), dict):
         return result
@@ -92,6 +119,13 @@ def _finalize_result(
         if segment_reports and len(segment_reports) > 1
         else raw_text
     )
+    if folded:
+        head, trailer = _fold_text(folded)
+        reply = f"{reply}{trailer}" if reply else trailer
+        if report:
+            report = f"{head}\n\n{report}"
+        else:
+            reply = f"{head}\n\n{reply}"
     return build_agent_receipt(
         state,
         reply,
@@ -158,6 +192,7 @@ async def consume_run(
     terminal_result: dict[str, object] | None = None
     delivered_follow_up = False
     segment_reports: list[str] = []
+    folded: tuple[ConversationEntry, ...] = ()
     ordinary_idle_presented = False
     kwargs["record_report"] = segment_reports.append
     kwargs["child_store"] = child_store
@@ -193,7 +228,20 @@ async def consume_run(
                     safety_task.cancel()
                     await asyncio.gather(safety_task, return_exceptions=True)
                     safety_task = None
-            if flow.has_pending_edge:
+            finish_gate_state = kwargs["finish_gate_state"]
+            settled = (
+                await flow.settle_terminal()
+                if isinstance(finish_gate_state, FinishGateState)
+                and finish_gate_state.terminal_admitted
+                else None
+            )
+            # A terminal run delivers only a non-suppressed prompt; every other
+            # staged input was classified, acked or kept by settle_terminal. A
+            # non-terminal run delivers any pending edge as before.
+            deliver = (
+                settled.prompt_pending if settled is not None else flow.has_pending_edge
+            )
+            if deliver:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 flow.reset_stalled_episode()
                 ordinary_idle_presented = False
@@ -319,20 +367,13 @@ async def consume_run(
                     **kwargs,
                 )
                 continue
-            terminal = await flow.admit_terminal("segment_end")
-            if terminal.pending:
+            if settled is None and (await flow.admit_terminal("segment_end")).pending:
+                # A non-terminal pass still has pending input (a late prompt or
+                # notification): loop so it is delivered next pass. A terminal
+                # pass already settled everything, so it falls through to finalize.
                 continue
-            terminal_result = _finalize_result(
-                result,
-                segment_reports=segment_reports,
-                receipt_components=receipt_components,
-                delivered_follow_up=delivered_follow_up,
-                child_store=child_store,
-                child_turns=child_turns,
-                tool_call_id=tool_call_id,
-                max_receipt_bytes=max_receipt_bytes,
-            )
-            return terminal_result
+            folded = settled.folded if settled is not None else ()
+            break
         terminal_result = _finalize_result(
             result,
             segment_reports=segment_reports,
@@ -342,9 +383,11 @@ async def consume_run(
             child_turns=child_turns,
             tool_call_id=tool_call_id,
             max_receipt_bytes=max_receipt_bytes,
+            folded=folded,
         )
         return terminal_result
     finally:
+        child_store.pending_prompt_queue.end_run()
         if safety_task is not None and not safety_task.done():
             safety_task.cancel()
         if safety_task is not None:

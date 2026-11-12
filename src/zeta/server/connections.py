@@ -9,15 +9,17 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..core.agent_progress import register_child_run_sink
 from ..core.session_files import descend_directory
 from ..core.store import ConversationStore, ObserverSnapshotChanged, TranscriptLoadError
 from ..core.store._child_runs import (
     child_run_segments,
     parse_child_run_id,
+    run_row_identity,
     verify_child_run_directory,
 )
 from ..core.thread_call import ThreadCallWorkers
-from . import content
+from . import content, event_contract
 from .handlers import history, lifecycle, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
@@ -33,6 +35,7 @@ from .session_replay import (
     SessionReplay,
     history_features,
 )
+from .session_replay.children import ChildRunProjection
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -80,7 +83,11 @@ EVENT_FEATURES = {
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.PROJECT_INBOX_HEALTH: NO_FEATURE,
     EventDescriptor.CHILD_QUESTION: NO_FEATURE,
+    EventDescriptor.CHILD_STARTED: frozenset({"child_run_events"}),
+    EventDescriptor.CHILD_PROGRESS: frozenset({"child_run_events"}),
+    EventDescriptor.CHILD_ENDED: frozenset({"child_run_events"}),
     EventDescriptor.CHILD_QUESTION_WITHDRAWN: NO_FEATURE,
     EventDescriptor.CHILD_MESSAGE_DELIVERED: NO_FEATURE,
     EventDescriptor.ACCOUNT_LIMIT: NO_FEATURE,
@@ -173,6 +180,8 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
+        self.child_runs = ChildRunProjection(loop, self)
+        self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
@@ -331,6 +340,11 @@ class ConnectionRegistry(ReplayOutput):
                 state.features
             ):
                 shaped.pop(name)
+        if event is EventDescriptor.APPROVAL_END:
+            shaped = event_contract.approval_end_for_features(
+                shaped,
+                include_restart_reason="approval_restart_reason" in state.features,
+            )
         return shaped
 
     def try_admit_controller(
@@ -348,7 +362,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -368,6 +382,7 @@ class ConnectionRegistry(ReplayOutput):
             session_id,
             self._fields_for_connection(self._controller, event, fields),
             covers,
+            replay_row=replay_row,
         ):
             return outcome
         if not self._admit(self._controller, frame):
@@ -402,7 +417,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers
+                event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -423,6 +438,7 @@ class ConnectionRegistry(ReplayOutput):
             session_id,
             self._fields_for_connection(state, event, fields),
             covers,
+            replay_row=replay_row,
         ):
             return True
         if not self._admit(state, frame):
@@ -907,7 +923,7 @@ class ConnectionRegistry(ReplayOutput):
         runtime = connection.server.runtime
         store = validation.active(runtime, params)
         features = history_features(self._connections[connection].features)
-        return await self.run_read(
+        result = await self.run_read(
             connection,
             lambda: history.history(
                 _observer_runtime(store),
@@ -920,6 +936,7 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
+        return self._strip_restart_reason(connection, result)
 
     async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
         if set(params) - {"handle", "offset", "limit"}:
@@ -964,7 +981,7 @@ class ConnectionRegistry(ReplayOutput):
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
         target = (runtime.session_id, runtime.opened.store)
-        return await self.run_read(
+        result = await self.run_read(
             connection,
             lambda: perform_child_history_read(
                 target,
@@ -974,6 +991,33 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
+        return self._strip_restart_reason(connection, result)
+
+    async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
+        # params are validated by the child_run_events handler before begin_replay_join
+        runtime = connection.server.runtime
+        if runtime.opened is None or params["session_id"] != runtime.session_id:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        features = self._connections[connection].features
+        target = (runtime.session_id, runtime.opened.store)
+        def read():
+            result = perform_child_history_read(target, params, registry=self, fidelity="session_history_fidelity" in features)
+            from ..core.agent_progress import read_agent_lifecycle
+            from ..core.child_runs import project_child_run_row
+            reader = self._child_reader_for(target[1], params["run_id"])
+            lifecycle = read_agent_lifecycle(reader.session_dir / "agent_lifecycle.json")
+            item = lifecycle if isinstance(lifecycle, dict) else None
+            if item is not None:
+                item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0)}
+            row = None
+            if item is not None:
+                session_id, parent_run_id = run_row_identity(params["run_id"])
+                row = project_child_run_row(item, session_id=session_id, parent_run_id=parent_run_id, accepts_follow_ups=False)
+            if row is None:
+                raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
+            return result, row
+        result = await self.run_read(connection, read, session_id=runtime.session_id)
+        return result[0], 0, result[1]
 
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str, *, allow_stale: bool = False
@@ -1044,6 +1088,7 @@ class ConnectionRegistry(ReplayOutput):
 
     async def aclose(self) -> None:
         self._closed = True
+        self._unregister_child_run_sink()
         states = tuple(self._connections.values())
         await asyncio.to_thread(self.close_child_reader)
         self._reads.close()

@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from enum import IntEnum
+from pathlib import Path
+
+# sorts before every valid project id, so retention authorities are acquired
+# with project domains in one global order.
+RETENTION_HOME_ID = "\x00zeta-retention"
 
 
 class _Rank(IntEnum):
@@ -75,3 +83,57 @@ def domain_lock(project_id: str, domain: str) -> AbstractContextManager[None]:
 
 def shape_lock() -> AbstractContextManager[None]:
     return ranked_lock(_Rank.SHAPE)
+
+
+@contextmanager
+def domain_authority(
+    home: Path,
+    project_id: str,
+    domain: str,
+    *,
+    exclusive: bool,
+    nonblocking: bool = False,
+) -> Iterator[None]:
+    """Hold one ranked domain authority and its process-shared lock file."""
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir(".domain-locks", mode=0o700, dir_fd=home_fd)
+        except FileExistsError:
+            pass
+        lock_dir_fd = os.open(
+            ".domain-locks",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=home_fd,
+        )
+        try:
+            lock_name = (
+                f"{project_id.encode('utf-8').hex()}-"
+                f"{domain.encode('utf-8').hex()}.lock"
+            )
+            fd = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=lock_dir_fd,
+            )
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise OSError("domain lock must be a regular, unshared file")
+                with domain_lock(project_id, domain):
+                    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                    if nonblocking:
+                        operation |= fcntl.LOCK_NB
+                    fcntl.flock(fd, operation)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(lock_dir_fd)
+    finally:
+        os.close(home_fd)

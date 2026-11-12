@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from zeta.core.checkpoints import ConversationEntry
-from zeta.core.store import PersistedAppend
+from zeta.core.store import PersistedAppend, TranscriptLoadError
 from zeta.memory.safety import redact_secrets
 from zeta.protocol.types import MESSAGE_ORIGIN_METADATA
 
@@ -163,6 +163,8 @@ def _read_transcript(
     path: Path,
     cursor: _Cursor | None,
     append_receipts: tuple[PersistedAppend, ...] | None = None,
+    *,
+    session_id: str,
 ) -> _ReadResult:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     fd = os.open(path, flags)
@@ -195,6 +197,28 @@ def _read_transcript(
         last_seq = 0 if full else cursor.last_seq
         last_entry_id = None if full else cursor.last_entry_id
         bytes_read = 0
+        physical_row = 0
+
+        def corrupt(
+            reason_code: str, *, kind: str = "invalid_row"
+        ) -> TranscriptLoadError:
+            # Reuse #1100's typed, path-free diagnosis so the project rebuild can
+            # skip and name one bad session with the same wording as /repair.
+            return TranscriptLoadError(
+                kind=kind,  # type: ignore[arg-type]
+                session_id=session_id,
+                row_number=row,
+                byte_offset=None,
+                valid_prefix_end=None,
+                reason_code=reason_code,
+                repairable=False,
+                repair_available=False,
+                source_device=0,
+                source_inode=0,
+                source_size=0,
+                prefix_digest="",
+            )
+
         with os.fdopen(fd, "rb", closefd=False) as handle:
             while True:
                 start = handle.tell()
@@ -206,27 +230,37 @@ def _read_transcript(
                 if not line:
                     offset = start
                     break
+                physical_row += 1
                 bytes_read += len(line)
+                row = physical_row if full else None
                 if len(line) > MAX_ROW_BYTES:
-                    raise ValueError("transcript row exceeds size limit")
+                    raise corrupt("invalid_payload")
                 if not line.endswith(b"\n"):
                     offset = start
                     break
                 offset = handle.tell()
-                value = json.loads(line)
+                try:
+                    value = json.loads(line)
+                except ValueError as exc:
+                    raise corrupt("invalid_json") from exc
                 if not isinstance(value, dict):
-                    raise TypeError("transcript row is not an object")
+                    raise corrupt("invalid_payload")
                 if value.get("type") == "header":
                     if not full or rows:
                         if not full:
-                            return _read_transcript(path, None)
-                        raise ValueError("unexpected transcript header")
+                            return _read_transcript(path, None, session_id=session_id)
+                        raise corrupt(
+                            "unrecoverable_header", kind="unrecoverable_header"
+                        )
                     continue
-                entry = ConversationEntry.from_dict(value)
+                try:
+                    entry = ConversationEntry.from_dict(value)
+                except (ValueError, TypeError) as exc:
+                    raise corrupt("invalid_payload") from exc
                 if entry.seq != last_seq + 1:
                     if not full:
-                        return _read_transcript(path, None)
-                    raise ValueError("transcript sequence is not contiguous")
+                        return _read_transcript(path, None, session_id=session_id)
+                    raise corrupt("invalid_sequence")
                 rows.append(_project_entry(entry))
                 last_seq = entry.seq
                 last_entry_id = entry.id

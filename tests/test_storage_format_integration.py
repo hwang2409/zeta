@@ -449,7 +449,8 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
 
     from zeta.core.session_links import persist_pending_root_link
 
-    persist_pending_root_link(
+    await asyncio.to_thread(
+        persist_pending_root_link,
         manager.sessions_dir,
         store.session_id,
         "project-1",
@@ -459,7 +460,8 @@ async def test_remaining_session_publishers_preserve_unknown_nested_keys(
     )
     link_path = store.session_dir / "project_link_pending.json"
     _inject(link_path)
-    persist_pending_root_link(
+    await asyncio.to_thread(
+        persist_pending_root_link,
         manager.sessions_dir,
         store.session_id,
         "project-1",

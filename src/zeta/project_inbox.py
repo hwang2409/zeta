@@ -23,6 +23,7 @@ from .core.session_files import (
     atomic_publish_file,
     child_directory,
     open_session_file,
+    reference_publication,
 )
 from .project_errors import ProjectNotFoundError, ProjectRegistryBusyError
 from .project_inbox_provenance import decorate, delegation_enabled
@@ -252,8 +253,9 @@ class ProjectInbox:
         on_visible: Callable[[], None] | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> str:
-        session, target, message_id = self._deliver(
+        message_id, _outcome = self._deliver(
             origin=_origin,
+            on_visible=on_visible,
             from_project=from_project,
             from_session=from_session,
             to_project=to_project,
@@ -264,13 +266,6 @@ class ProjectInbox:
             message_id=message_id,
             to_session=to_session,
         )
-        if on_visible is not None:
-            try:
-                on_visible()
-            except Exception:  # noqa: BLE001,S110
-                # The durable record remains authoritative if its wake cannot run.
-                pass
-        self._sent_tracker(session).record(message_id, target)
         return message_id
 
     def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
@@ -339,7 +334,7 @@ class ProjectInbox:
         to_session: str | None = None,
         _origin: str = AGENT_ORIGIN,
     ) -> tuple[str, SentLedgerOutcome[None]]:
-        session, target, message_id = self._deliver(
+        return self._deliver(
             origin=_origin,
             from_project=from_project,
             from_session=from_session,
@@ -351,13 +346,30 @@ class ProjectInbox:
             message_id=message_id,
             to_session=to_session,
         )
-        return message_id, self._sent_tracker(session).record(message_id, target)
 
-    def _deliver(self, **kwargs: Any) -> tuple[str, str, str]:
-        session, target, message_id, body, record = self._outgoing(**kwargs)
-        with self._directories(target, create=True) as dirs:
-            self._publish_outgoing(dirs, message_id, body, record)
-        return session, target, message_id
+    def _deliver(
+        self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
+    ) -> tuple[str, SentLedgerOutcome[None]]:
+        session, target, message_id, to_session, body, record = self._outgoing(**kwargs)
+        # The reference gate holds storage authority while this message (a reference
+        # to one or two sessions) is published and recorded in the sent ledger.
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session, to_session) if to_session else (session,),
+        ):
+            with self._directories(target, create=True) as dirs:
+                self._publish_outgoing(dirs, message_id, body, record)
+            if on_visible is not None:
+                try:
+                    on_visible()
+                except Exception:  # noqa: BLE001,S110
+                    # The durable record remains authoritative if its wake cannot run.
+                    pass
+            outcome = self._sent_tracker(session).record(
+                message_id, target, _storage_lease=self.registry._storage_lease
+            )
+        return message_id, outcome
 
     def _sent_tracker(self, session: str) -> SentMessageTracker:
         if self.sent_tracker is not None and self.sent_tracker.session_id == session:
@@ -377,7 +389,7 @@ class ProjectInbox:
         message_id: str | None = None,
         to_session: str | None = None,
         origin: str = AGENT_ORIGIN,
-    ) -> tuple[str, str, str, str, dict[str, Any]]:
+    ) -> tuple[str, str, str, str | None, str, dict[str, Any]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
         session = _id(from_session, "session id")
@@ -405,7 +417,7 @@ class ProjectInbox:
             "created_at": _now(),
         }
         record.update({"origin": origin}) if delegation_enabled(self.registry) else None
-        return session, target.project_id, message_id, body, record
+        return session, target.project_id, message_id, to_session, body, record
 
     def _publish_outgoing(
         self,
@@ -764,7 +776,11 @@ class ProjectInbox:
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
         name = f"{message_id}.json"
-        with self._directories(target.project_id, create=True) as dirs:
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session_id,),
+        ), self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
