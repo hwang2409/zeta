@@ -823,10 +823,16 @@ def _cleanup_ephemeral(app: object) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _tui_print(message: str) -> None:
+    from ..tui.loop_errors import write_terminal
+
+    write_terminal(message)
+
+
 def _print_exit_hint(app: object) -> None:
     if app.ephemeral_root is not None:
         return
-    print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
+    _tui_print(f"resume with: zeta --resume {app.loop.store.session_id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,15 +854,15 @@ def _unsaved_draft(app: object) -> _UnsavedDraft | None:
 
 
 def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> None:
-    print("unsaved composer draft:", file=sys.stderr)
+    _tui_print("unsaved composer draft:")
     if draft.session_id != current_session_id:
-        print(f"session: {draft.session_id}", file=sys.stderr)
+        _tui_print(f"session: {draft.session_id}")
     if draft.text:
-        print(draft.text, file=sys.stderr)
+        _tui_print(draft.text)
     if draft.attachment_names:
-        print("attachments:", file=sys.stderr)
+        _tui_print("attachments:")
         for name in draft.attachment_names:
-            print(f"- {name}", file=sys.stderr)
+            _tui_print(f"- {name}")
 
 
 def _retain_active_draft(
@@ -874,8 +880,12 @@ def _create_tui_app(
     from ..tui.bootstrap import create_app
 
     try:
+        if args.force_provider and args.model is None:
+            from ..tui.loop_errors import restore_stderr_for_cli
+
+            restore_stderr_for_cli()
         if args.continue_session or args.resume is not None:
-            print("Loading session…", flush=True)
+            _tui_print("Loading session…")
             return asyncio.run(asyncio.to_thread(create_app, args))
         return create_app(args)
     except SessionError as exc:
@@ -883,7 +893,14 @@ def _create_tui_app(
     except StorageFormatError:
         raise
     except ValueError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
+        _tui_print(f"zeta: {exc}")
+        return None
+    except Exception as exc:
+        if _has_console_message(exc):
+            raise
+        from ..tui.loop_errors import log_tui_crash
+
+        _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
         return None
 
 
@@ -899,6 +916,18 @@ def _run_tui_session(
 
 
 def _run_tui_lifecycle(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> tuple[int, str | None]:
+    from ..tui.loop_errors import stderr_to_log
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        with stderr_to_log():
+            return _run_tui_lifecycle_captured(args, parser)
+    return _run_tui_lifecycle_captured(args, parser)
+
+
+def _run_tui_lifecycle_captured(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
@@ -941,7 +970,7 @@ def _run_tui_lifecycle(
                     args.continue_session = False
                     args.resume = None
             except terminal_render_error as exc:
-                print(f"zeta: {exc}", file=sys.stderr)
+                _tui_print(f"zeta: {exc}")
                 _print_exit_hint(app)
                 exit_status = 1
                 break
@@ -950,7 +979,7 @@ def _run_tui_lifecycle(
                     raise
                 from ..tui.loop_errors import log_tui_crash
 
-                print(f"zeta: crashed; details in {log_tui_crash(exc)}", file=sys.stderr)
+                _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
                 _print_exit_hint(app)
                 exit_status = 1
                 break
@@ -960,10 +989,7 @@ def _run_tui_lifecycle(
                 continue
             if restart_requested:
                 if restart_cancels_work:
-                    print(
-                        "restart · running children or background tasks will be cancelled",
-                        file=sys.stderr,
-                    )
+                    _tui_print("restart · running children or background tasks will be cancelled")
                 restart_session_id = current_session_id
                 break
             _print_exit_hint(app)
@@ -1257,6 +1283,8 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "completion":
         print(completion_script(args.shell), end="")
         return 0
+    if args.force_provider and args.model is None:
+        parser.error("--force-provider requires --model")
     if args.prompt is not None:
         from ..runtime.headless import run_headless
 
