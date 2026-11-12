@@ -332,6 +332,7 @@ class CommandRuntimeMixin:
                         await cancellation
                 finally:
                     self.loop._background_owner.unregister(instance_id)
+                    self.loop.notify_restart_idle_check()
 
         watcher = asyncio.create_task(watch())
         self.loop._background_owner.register(

@@ -9,11 +9,14 @@ from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.cli import main as cli_main
 from zeta.cli.main import _exec_restart, _restart_argv
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.submission.messages import _ProviderDone
+from zeta.submission.model import Submission, SubmissionState, _Entry
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import FullScreenPromptSession
 
@@ -96,10 +99,10 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
 
     async def run_prompt_toolkit(_session: object, current: TUIApp) -> None:
         while current._startup_replay_active:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="startup replay")
         current._submit_input("/restart")
         while not current._exit_requested:
-            await asyncio.sleep(0)
+            await await_or_fail(asyncio.sleep(0), what="restart exit")
 
     def restore_terminal(_session: FullScreenPromptSession) -> None:
         events.append("restore")
@@ -136,58 +139,156 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
     assert events == ["restore", "close", "exec"]
 
 
-def test_restart_when_idle_arms_then_requests_restart_after_work_ends(
+@pytest.mark.asyncio
+async def test_restart_when_idle_uses_provider_clear_and_composer_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root-session", cwd=tmp_path)
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions", session_id="root-session"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
         provider="codex",
         model="offline",
     )
     session = FullScreenPromptSession(input=DummyInput(), output=DummyOutput())
-    app._session = session
-    app._active_session = None
+    app._active_session = session
+    session.app.current_buffer.on_text_changed += (
+        lambda _: app._maybe_restart_when_idle()
+    )
     events: list[str] = []
 
     class Controller:
         def is_visible(self, _app: TUIApp) -> bool:
             return True
 
+        pending_approvals: tuple[object, ...] = ()
+
+        def main_activity_pending(self, _app: TUIApp) -> bool:
+            return False
+
         def request_restart(self) -> None:
             events.append("restart")
 
     app._fork_controller = Controller()
     running = True
-    monkeypatch.setattr(
-        TUIApp,
-        "restart_has_running_work",
-        property(lambda _app: running),
-    )
+    monkeypatch.setattr(TUIApp, "restart_has_running_work", property(lambda _app: running))
+    submission = Submission(id=1, text="prompt")
+    entry = _Entry(submission, state=SubmissionState.DISPATCHED, message=object())
+    provider_task = asyncio.create_task(asyncio.sleep(0))
+    await await_or_fail(provider_task, what="provider completion")
+    app._submissions._provider_entry = entry
+    app._submissions._provider_task = provider_task
 
-    assert app.slash_restart("") == (
-        "restart pending · waiting for running work · /restart now to cancel it"
-    )
-    assert app.restart_pending
-    assert not app._exit_requested
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/restart") == (
+            "restart pending · waiting for running work · /restart now to cancel it"
+        )
+        assert app.restart_pending
+        assert "restart pending" in "".join(
+            text for _, text in app._status_toolbar()
+        )
 
-    composer_text = True
-    running = False
-    # test-contract: seam inject the idle predicate to force the composer transition.
-    monkeypatch.setattr(
-        app,
-        "_restart_is_idle",
-        lambda: not running and not composer_text,
-    )
-    app._maybe_restart_when_idle()
-    assert app.restart_pending
-    assert not events
+        session.app.current_buffer.text = "draft"
+        running = False
+        app._submissions._on_provider_done(_ProviderDone(submission, provider_task))
+        assert app.restart_pending
+        assert events == []
 
-    composer_text = False
-    app._maybe_restart_when_idle()
-    assert events == ["restart"]
-    assert app._exit_requested
-    asyncio.run(app.close())
+        session.app.current_buffer.text = ""
+        assert events == ["restart"]
+        assert app._exit_requested
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_when_idle_fires_at_provider_state_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions", session_id="root-session"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    session = FullScreenPromptSession(input=DummyInput(), output=DummyOutput())
+    app._active_session = session
+    events: list[str] = []
+
+    class Controller:
+        pending_approvals: tuple[object, ...] = ()
+
+        def is_visible(self, _app: TUIApp) -> bool:
+            return True
+
+        def main_activity_pending(self, _app: TUIApp) -> bool:
+            return False
+
+        def request_restart(self) -> None:
+            events.append("restart")
+
+    app._fork_controller = Controller()
+    running = True
+    monkeypatch.setattr(TUIApp, "restart_has_running_work", property(lambda _app: running))
+    submission = Submission(id=1, text="prompt")
+    entry = _Entry(submission, state=SubmissionState.DISPATCHED, message=object())
+    provider_task = asyncio.create_task(asyncio.sleep(0))
+    await await_or_fail(provider_task, what="provider completion")
+    app._submissions._provider_entry = entry
+    app._submissions._provider_task = provider_task
+
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/restart") == (
+            "restart pending · waiting for running work · /restart now to cancel it"
+        )
+        running = False
+        app._submissions._on_provider_done(_ProviderDone(submission, provider_task))
+        await await_or_fail(asyncio.sleep(0), what="restart idle check")
+        assert events == ["restart"]
+    finally:
+        await app.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_arguments_use_real_slash_dispatch(tmp_path: Path) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    try:
+        app._restart_when_idle = True
+        assert await app._slash_commands.dispatch_async(app, "/restart cancel") == (
+            "restart canceled"
+        )
+        assert not app.restart_pending
+        events: list[str] = []
+        app._fork_controller = type(
+            "Controller",
+            (),
+            {
+                "is_visible": lambda _self, _app: True,
+                "request_restart": lambda _self: events.append("restart"),
+            },
+        )()
+        assert await app._slash_commands.dispatch_async(app, "/restart now") == (
+            "restarting from the local checkout..."
+        )
+        assert events == ["restart"]
+        assert "use /restart" in await app._slash_commands.dispatch_async(
+            app, "/restart later"
+        )
+    finally:
+        await app.close()
 
 
 def test_restart_cancel_disarms_pending_restart(tmp_path: Path) -> None:

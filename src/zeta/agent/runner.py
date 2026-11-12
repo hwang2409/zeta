@@ -1129,6 +1129,7 @@ async def run_agent_tool(
             )
             loop._background_owner.finish_store(child_instance_id, child_store)
             loop._background_owner.unregister(child_instance_id)
+            loop.notify_restart_idle_check()
             if child_policy is not None:
                 await child_policy.cleanup()
 
@@ -1252,6 +1253,7 @@ async def run_agent_tool(
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         loop._background_owner.project_context_loops.pop(child_store.session_id, None)
         loop._background_owner.unregister(child_instance_id)
+        loop.notify_restart_idle_check()
         if child_policy is not None:
             await child_policy.cleanup()
         if not abort_task.done():

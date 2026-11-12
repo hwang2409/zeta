@@ -933,6 +933,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
                 entry.state = SubmissionState.READY
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
+        self._host._maybe_restart_when_idle()
 
     async def _wait_for_preprocessing(
         self,
