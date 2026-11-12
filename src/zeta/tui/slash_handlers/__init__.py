@@ -801,7 +801,6 @@ class SlashHandlerMixin:
                 ProjectInbox(
                     registry,
                     sessions_root=registry.root.parent / "sessions",
-                    observed_epoch=registry.observed_storage_epoch,
                 ).command,
                 project_id,
                 args,

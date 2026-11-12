@@ -118,13 +118,13 @@ def decode_envelope(value: object) -> dict[str, Any]:
         "in_reply_to": _opt_id(value.get("in_reply_to"), "in_reply_to"),
         "created_at": _nonempty(value.get("created_at"), "created_at"),
     }
-    if "origin" in value:
-        origin = value["origin"]
-        # Origin has no stored closed-variant shape; the recipient publish path
-        # re-validates it. Keep the sender ledger tolerant of the legacy value.
-        if origin not in {"agent", "user", "local"}:
-            raise ValueError("invalid envelope origin")
-        envelope["origin"] = origin
+    # At the durable-intent epoch (8) the delegation feature (7) is always on, so
+    # a sender record always carries an immutable origin; the recipient publish
+    # re-validates it.
+    origin = value.get("origin")
+    if origin not in {"agent", "user", "local"}:
+        raise ValueError("invalid envelope origin")
+    envelope["origin"] = origin
     return envelope
 
 

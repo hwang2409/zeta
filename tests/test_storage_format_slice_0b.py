@@ -25,7 +25,13 @@ from zeta.project_registry import ProjectRegistry, ProjectRegistryError
 from zeta.runtime.loop.project_inbox import ProjectInboxNotificationMixin
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
-from zeta.storage_format import CLOSED_VARIANTS, SetValue, open_writer
+from zeta.storage_format import (
+    CLOSED_VARIANTS,
+    FEATURE_EPOCHS,
+    SetValue,
+    StorageFeature,
+    open_writer,
+)
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -610,7 +616,8 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
     monkeypatch.setattr("zeta.tui.slash_handlers.ProjectInbox", InboxStub)
     monkeypatch.setattr("zeta.server.slash_commands.ProjectInbox", InboxStub)
     inbox_registry = SimpleNamespace(
-        root=Path("/home/projects"), observed_storage_epoch=7
+        root=Path("/home/projects"),
+        observed_storage_epoch=FEATURE_EPOCHS[StorageFeature.INBOX_DURABLE_INTENT] - 1,
     )
     tui_inbox = SimpleNamespace(
         loop=SimpleNamespace(

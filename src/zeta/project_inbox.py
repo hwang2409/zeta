@@ -35,6 +35,7 @@ from .storage_format import (
     CLOSED_VARIANTS,
     FEATURE_EPOCHS,
     StorageFeature,
+    StorageFormatError,
     feature_enabled,
     mapping_mutations,
     open_writer,
@@ -68,6 +69,10 @@ _LOGGED_INVALID: OrderedDict[
 
 class InboxError(ValueError):
     """An inbox operation or stored message was rejected."""
+
+
+class InboxConflictError(InboxError):
+    """A message id already exists at the recipient with different content."""
 
 
 class _InboxNotFound(FileNotFoundError):
@@ -144,15 +149,17 @@ class ProjectInbox:
         sessions_root: Path,
         sent_tracker: SentMessageTracker | None = None,
         receipts: Iterable[tuple[str, str]] = (),
-        observed_epoch: int = 0,
     ):
         self.registry = registry
         self.sessions_root = Path(sessions_root)
         self.sent_tracker = sent_tracker
         self.receipts = tuple(receipts)
-        self.observed_epoch = observed_epoch
-        self._generation_enabled = feature_enabled(
-            observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        # The feature switch follows the home's observed epoch, so no caller can
+        # select an epoch different from the registry (and then silently lose
+        # generation-gated delivery).
+        self.observed_epoch = registry.observed_storage_epoch
+        self.generation_enabled = feature_enabled(
+            self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
         )
 
     def command(self, project: str, args: str, *, from_session: str | None = None) -> str:
@@ -352,10 +359,27 @@ class ProjectInbox:
         # post-publish record() call marks it published; below the epoch it
         # writes the schema-v1 row after publish, exactly as before.
         tracker = self._sent_tracker(session)
-        if feature_enabled(self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT):
+        durable = feature_enabled(
+            self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        )
+        if durable:
             tracker.record_intent(record)
-        with self._directories(target, create=True) as dirs:
-            self._publish_outgoing(dirs, message_id, body, record)
+        try:
+            with self._directories(target, create=True) as dirs:
+                self._publish_outgoing(dirs, message_id, body, record)
+        except InboxConflictError:
+            raise
+        except (InboxError, OSError, SessionError, StorageFormatError) as exc:
+            if durable:
+                # The intent is already durable; a later poll re-publishes it.
+                # Tell the caller so the model does not send a duplicate.
+                # (_directories translates OSError into a generic InboxError.)
+                raise InboxError(
+                    "inbox message saved; the recipient could not be reached "
+                    "now and delivery will be retried automatically. Do not "
+                    "resend this message."
+                ) from exc
+            raise
         if on_visible is not None:
             try:
                 on_visible()
@@ -364,15 +388,28 @@ class ProjectInbox:
                 pass
         return message_id, tracker.record(message_id, target)
 
-    def recover_sent_intents(self, tracker: SentMessageTracker) -> None:
-        """Re-publish any durable intent whose recipient publish is not durable."""
+    def recover_sent_intents(self, tracker: SentMessageTracker) -> list[str]:
+        """Re-publish each durable intent whose recipient publish is not durable.
+
+        Every intent is isolated: one that cannot be resolved or published (a
+        missing spill, a conflict, an OSError) is reported and skipped rather
+        than blocking the recovery of the others or the incoming scan. The
+        returned reasons let the poller surface degraded health.
+        """
+        failures: list[str] = []
         for envelope in tracker.pending_intents():
             target = envelope["to_project"]
             message_id = envelope["id"]
-            record = dict(envelope)
-            with self._directories(target, create=True) as dirs:
-                self._publish_outgoing(dirs, message_id, record["body"], record)
-            tracker.record(message_id, target)
+            try:
+                body = tracker.resolve_pending_body(message_id, envelope["body"])
+                record = dict(envelope)
+                record["body"] = body
+                with self._directories(target, create=True) as dirs:
+                    self._publish_outgoing(dirs, message_id, body, record)
+                tracker.record(message_id, target)
+            except (OSError, SessionError, InboxError, ValueError) as exc:
+                failures.append(f"{message_id}: {exc}")
+        return failures
 
     def _sent_tracker(self, session: str) -> SentMessageTracker:
         if self.sent_tracker is not None and self.sent_tracker.session_id == session:
@@ -476,7 +513,9 @@ class ProjectInbox:
         # Decoding resolves spilled bodies, so compare against the caller body.
         expected["body"] = body
         if comparable != expected:
-            raise InboxError("message id already exists with different content")
+            raise InboxConflictError(
+                "message id already exists with different content"
+            )
 
     def list(
         self, project: str, *, session_id: str | None = None
@@ -992,7 +1031,7 @@ class ProjectInbox:
         Below the durable-intent epoch no generation file exists and the scanner
         still uses directory stat fingerprints, so this is a no-op.
         """
-        if not self._generation_enabled:
+        if not self.generation_enabled:
             return
         atomic_publish_file(
             inbox_fd,
@@ -1015,18 +1054,31 @@ class ProjectInbox:
             raise InboxError("invalid inbox generation")
         return int(text)
 
-    def _project_generation(self, project_id: str) -> int:
-        """Read one inbox generation for the scanner without the inbox lock."""
-        path = self.registry.root / project_id / "inbox" / "generation"
+    def project_generation(self, project_id: str) -> int:
+        """Read one inbox generation for the scanner without the inbox lock.
+
+        Uses the O_NOFOLLOW directory helpers like every other inbox read, so a
+        symlinked path component cannot redirect the read.
+        """
         try:
-            text = path.read_bytes().decode("ascii").strip()
+            root_fd = os.open(
+                os.fspath(self.registry.root),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            return 0
+        try:
+            with (
+                child_directory(root_fd, project_id, create=False) as project_fd,
+                child_directory(project_fd, "inbox", create=False) as inbox_fd,
+            ):
+                return self._read_generation(inbox_fd)
         except FileNotFoundError:
             return 0
-        except (OSError, UnicodeDecodeError) as exc:
+        except OSError as exc:
             raise InboxError("invalid inbox generation") from exc
-        if not text.isdigit():
-            raise InboxError("invalid inbox generation")
-        return int(text)
+        finally:
+            os.close(root_fd)
 
     def _publish_record(
         self,

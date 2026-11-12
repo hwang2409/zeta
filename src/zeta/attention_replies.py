@@ -607,7 +607,6 @@ class AttentionReplies:
         inbox = ProjectInbox(
             state.registry,
             sessions_root=self.home / "sessions",
-            observed_epoch=state.registry.observed_storage_epoch,
         )
         preamble = (
             f"User relayed from session {sender}. Check whether the situation has changed before acting."

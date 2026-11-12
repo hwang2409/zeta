@@ -106,7 +106,6 @@ class ProjectRequests:
         self.inbox = ProjectInbox(
             self.registry,
             sessions_root=home / "sessions",
-            observed_epoch=self.registry.observed_storage_epoch,
         )
         self.runtime = runtime
         self.codec = codec

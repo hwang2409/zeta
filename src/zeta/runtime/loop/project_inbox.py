@@ -145,7 +145,13 @@ class ProjectInboxNotificationMixin:
             self._pending_project_inbox_poll = poll
         await self._deliver_project_inbox_poll(scanner, poll)
         self._pending_project_inbox_poll = None
-        self._set_project_inbox_health("healthy")
+        warning = scanner.recovery_warning
+        if warning:
+            # A durable intent could not be re-delivered this poll; the scan
+            # still ran. Surface it as degraded without blocking delivery.
+            self._set_project_inbox_health("degraded", warning)
+        else:
+            self._set_project_inbox_health("healthy")
 
     def _set_project_inbox_health(self, state: str, reason: str | None = None) -> None:
         if getattr(self, "_project_inbox_health_state", "healthy") == state:

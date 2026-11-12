@@ -173,7 +173,6 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
             sessions_root=projects.root.parent / "sessions",
             sent_tracker=tracker,
             receipts=store.sent_message_receipts(),
-            observed_epoch=store.observed_storage_epoch,
         ),
         registry.project_id,
         store.session_id,

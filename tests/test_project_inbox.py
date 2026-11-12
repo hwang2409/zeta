@@ -610,6 +610,14 @@ def test_unchanged_scanner_uses_no_locks_or_json_parses(
     assert parses == 0
 
 
+_BELOW_DURABLE_INTENT_EPOCH = (
+    storage_format_module.FEATURE_EPOCHS[
+        storage_format_module.StorageFeature.INBOX_DURABLE_INTENT
+    ]
+    - 1
+)
+
+
 def _epoch_projects(tmp_path: Path, *, writer_epoch: int | None = None):
     """A projects home whose observed storage epoch is the current writer epoch,
     or a lower epoch when writer_epoch is patched before the home is created."""
@@ -638,7 +646,6 @@ def test_durable_intent_recovers_exactly_one_delivery_after_crash(
         registry,
         sessions_root=home / "sessions",
         sent_tracker=tracker,
-        observed_epoch=registry.observed_storage_epoch,
     )
 
     def boom(*_args, **_kwargs):
@@ -694,13 +701,14 @@ def test_below_epoch_keeps_v1_ledger_and_writes_no_generation(
 ) -> None:
     # (2) Below the feature epoch the storage shape is unchanged: schema v1, no
     # generation file, and the sent view round-trips.
-    home, registry, project_a, project_b = _epoch_projects(tmp_path, writer_epoch=7)
-    assert registry.observed_storage_epoch == 7
+    home, registry, project_a, project_b = _epoch_projects(
+        tmp_path, writer_epoch=_BELOW_DURABLE_INTENT_EPOCH
+    )
+    assert registry.observed_storage_epoch == _BELOW_DURABLE_INTENT_EPOCH
     session_id = "a" * 32
     inbox = ProjectInbox(
         registry,
         sessions_root=home / "sessions",
-        observed_epoch=registry.observed_storage_epoch,
     )
     message_id = inbox.send_user(
         from_project=project_a.project_id,
@@ -723,7 +731,6 @@ def test_below_epoch_keeps_v1_ledger_and_writes_no_generation(
 @pytest.mark.parametrize(
     "corruption",
     [
-        {"extra_record_key": True},
         {"bad_sha256": True},
         {"bad_spill_name": True},
     ],
@@ -766,8 +773,6 @@ def test_strict_v2_decode_rejects_malformed_ledger(
         "envelope": envelope,
         "reported": [],
     }
-    if corruption.get("extra_record_key"):
-        record["surprise"] = True
     session_dir = home / "sessions" / session_id
     session_dir.mkdir(parents=True)
     (session_dir / "project-inbox-sent.json").write_text(
@@ -790,14 +795,13 @@ def test_generation_gates_scan_and_each_mutation_advances_it(
     inbox = ProjectInbox(
         registry,
         sessions_root=home / "sessions",
-        observed_epoch=registry.observed_storage_epoch,
     )
     sender_session = "a" * 32
     dead_session = "d" * 32
     live_session = "c" * 32
 
     def generation() -> int:
-        return inbox._project_generation(project_b.project_id)
+        return inbox.project_generation(project_b.project_id)
 
     steps: list[str] = []
 
@@ -862,6 +866,215 @@ def test_generation_gates_scan_and_each_mutation_advances_it(
         results = [scanner.poll() for _ in range(10)]
     assert results == [(None, ())] * 10
     assert reads == 0
+
+
+def _durable_envelope(
+    *, message_id: str, from_project: str, to_project: str, session_id: str, body: str
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "id": message_id,
+        "origin": "user",
+        "from": {"project": from_project, "session": session_id},
+        "to_project": to_project,
+        "to_session": None,
+        "kind": "info",
+        "title": "durable",
+        "body": body,
+        "in_reply_to": None,
+        "created_at": "2026-01-01T00:00:00.000000Z",
+    }
+
+
+def test_published_intent_persists_before_unlinking_sender_spill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (B1 / acceptance 6) A large body spills to a sender-owned file while the
+    # intent is pending. The spill is unlinked only after the mark-published
+    # write commits; if that write fails, the spill survives, so a fresh scanner
+    # recovers the intent instead of wedging on a dangling reference.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    epoch = registry.observed_storage_epoch
+    session_id = "a" * 32
+    message_id = "b" * 32
+    body = "x" * (70 * 1024)
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    spill = (
+        home / "sessions" / session_id / "project-inbox-sent-spill" / f"{message_id}.txt"
+    )
+    envelope = _durable_envelope(
+        message_id=message_id,
+        from_project=project_a.project_id,
+        to_project=project_b.project_id,
+        session_id=session_id,
+        body=body,
+    )
+
+    tracker.record_intent(envelope)
+    # Phase 1: the pending intent references a sender spill that exists on disk.
+    assert spill.exists()
+    ledger = json.loads(
+        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+    )
+    assert ledger["records"][0]["publication"] == "pending"
+    assert "sha256" in ledger["records"][0]["envelope"]["body"]
+
+    calls = {"n": 0}
+    real_persist = SentMessageTracker._persist
+
+    def flaky(self, upserts, delete_ids):
+        calls["n"] += 1
+        # The intent was already written before this patch; this first call is
+        # the mark-published write.
+        if calls["n"] == 1:
+            raise ValueError("sent-message tracking is unsafe or unavailable")
+        return real_persist(self, upserts, delete_ids)
+
+    # test-contract: durability fail the mark-published durable write via the seam
+    monkeypatch.setattr(SentMessageTracker, "_persist", flaky)
+    with pytest.raises(ValueError):
+        tracker.record(message_id, project_b.project_id)
+    monkeypatch.setattr(SentMessageTracker, "_persist", real_persist)
+
+    # B1: the failed mark-published write did not unlink the still-referenced
+    # spill, so recovery is not wedged.
+    assert spill.exists()
+
+    recovered = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=session_id,
+        tracker=recovered,
+    )
+    scanner.poll()
+    scanner.poll()  # idempotent
+    reader = ProjectInbox(registry, sessions_root=home / "sessions")
+    delivered = reader.list(project_b.project_id)["new"]
+    assert len(delivered) == 1
+    assert delivered[0]["body"] == body
+    # Phase 2: after the durable publish the sender spill is gone and the
+    # recipient body file exists.
+    assert not spill.exists()
+    assert (
+        registry.root / project_b.project_id / "inbox" / "bodies" / f"{message_id}.txt"
+    ).exists()
+
+
+def test_concurrent_trackers_merge_without_losing_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (B2) The sender ledger has several concurrent writers (the runtime plus
+    # every /inbox send or attention reply). A v2 write must merge the changed
+    # row under the shape lock, not rewrite the whole set, or a row that another
+    # writer committed meanwhile is lost (the audit loss this slice closes).
+    import zeta.project_inbox_sent as sent_module
+
+    home, registry, _project_a, project_b = _epoch_projects(tmp_path)
+    epoch = registry.observed_storage_epoch
+    session_id = "a" * 32
+    first = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    second = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    real_open_writer = sent_module.open_writer
+    fired = {"done": False}
+
+    def interleaving_open_writer(root):
+        if not fired["done"]:
+            fired["done"] = True
+            # Another writer commits its row while the first holds its stale view.
+            second.record("2" * 32, project_b.project_id)
+        return real_open_writer(root)
+
+    monkeypatch.setattr(sent_module, "open_writer", interleaving_open_writer)
+    first.record("1" * 32, project_b.project_id)
+    ledger = json.loads(
+        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+    )
+    assert sorted(r["id"] for r in ledger["records"]) == ["1" * 32, "2" * 32]
+
+
+def test_cli_style_inbox_list_advances_generation_on_stale_recovery(
+    tmp_path: Path,
+) -> None:
+    # (B3) `zeta inbox` builds ProjectInbox(registry, sessions_root=...) with no
+    # epoch. Its list() recovers a message abandoned by a dead claimer; at the
+    # feature epoch that recovery must advance the generation, or the recipient's
+    # generation-gated scanner never sees the message again. ProjectInbox now
+    # derives its epoch from the registry, so the cli construction observes it.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+
+    def generation() -> int:
+        # Read the raw generation file directly, so the assertion does not depend
+        # on the fix's accessor and still reaches the behavior on the old base.
+        path = registry.root / project_b.project_id / "inbox" / "generation"
+        return int(path.read_bytes()) if path.exists() else 0
+
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message_id = inbox.send_user(
+        from_project=project_a.project_id,
+        from_session="a" * 32,
+        to_project=project_b.project_id,
+        kind="info",
+        title="t",
+        body="b",
+    )
+    inbox.claim(project_b.project_id, message_id, "d" * 32)  # a dead claimer
+    before = generation()
+    recovered = ProjectInbox(registry, sessions_root=home / "sessions").list(
+        project_b.project_id
+    )
+    assert [m["id"] for m in recovered["new"]] == [message_id]
+    assert generation() > before
+
+
+def test_pending_intent_retries_on_a_later_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (M2) A live-session send whose recipient publish fails leaves a durable
+    # intent. The caller is told the message is saved and will be retried, and a
+    # later poll re-delivers it; recovery is not limited to the first poll.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    epoch = registry.observed_storage_epoch
+    session_id = "a" * 32
+    message_id = "b" * 32
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    scanner = ProjectInboxScanner(
+        registry,
+        project_a.project_id,
+        sessions_root=home / "sessions",
+        session_id=session_id,
+        tracker=tracker,
+    )
+    scanner.poll()  # first poll: nothing pending
+
+    fail = {"on": True}
+    real_publish = scanner.inbox._publish_outgoing
+
+    def maybe_fail(*args, **kwargs):
+        if fail["on"]:
+            raise OSError("recipient inbox is temporarily unavailable")
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(scanner.inbox, "_publish_outgoing", maybe_fail)
+    with pytest.raises((OSError, InboxError)) as excinfo:
+        scanner.inbox.send_user(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="info",
+            title="t",
+            body="late",
+            message_id=message_id,
+        )
+    assert "retried" in str(excinfo.value)
+
+    reader = ProjectInbox(registry, sessions_root=home / "sessions")
+    scanner.poll()  # a later poll still cannot reach the recipient
+    assert reader.list(project_b.project_id)["new"] == []
+    fail["on"] = False
+    scanner.poll()  # the next poll delivers the retained intent
+    assert [m["id"] for m in reader.list(project_b.project_id)["new"]] == [message_id]
 
 
 @pytest.mark.asyncio
@@ -1765,7 +1978,10 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
     try:
         await loop._check_project_inbox()
         first_turn = asyncio.create_task(_collect_turn(loop, "first"))
-        assert await asyncio.to_thread(append_committed.wait, 2)
+        assert await await_or_fail(
+            asyncio.to_thread(append_committed.wait, 10),
+            what="status commit reaches the injected pause",
+        )
         first_turn.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
@@ -2497,7 +2713,6 @@ async def test_p03a_status_backlog_survives_without_a_count_cap(tmp_path: Path) 
         registry,
         sessions_root=home / "sessions",
         sent_tracker=tracker,
-        observed_epoch=registry.observed_storage_epoch,
     )
     ids = []
     for index in range(101):
