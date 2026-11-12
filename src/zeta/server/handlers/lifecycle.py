@@ -14,6 +14,7 @@ from ...mcp.config import (
     load_mcp_config,
     load_mcp_config_overlay,
 )
+from ...protocol.types import StreamEvent, StreamEventType
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -37,6 +38,25 @@ _RESERVED_HEADERS = frozenset({
     "upgrade",
 })
 _RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-")
+
+
+async def _publish_project_registry_notice(self) -> None:
+    runtime = self.server.runtime
+    if runtime.project_registry_busy:
+        await self.server.control._event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": f"project-registry-busy:{runtime.session_id}",
+                    "kind": "project_registry_busy",
+                    "text": (
+                        "project memory and inbox are off for this session: "
+                        "the project registry was busy; restart to retry"
+                    ),
+                },
+            ),
+            session_id=runtime.session_id,
+        )
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
@@ -83,6 +103,7 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
+            await _publish_project_registry_notice(self)
             await self.server.control.publish_session_grant_reset()
             return {"session": session_snapshot(self)}
     except BaseException:
@@ -170,6 +191,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
+            await _publish_project_registry_notice(self)
             await self.server.control.publish_session_grant_reset()
             return {"session": session_snapshot(self)}
     except BaseException:

@@ -1049,6 +1049,13 @@ the project inbox poller state; its data has `kind` (`project_inbox_health`),
 (at most 200 characters, present only when degraded). It is live only: it is
 not persisted and is never replayed. Below 1.2 it rides `sub_agent_receipt`.
 
+When project association cannot acquire the project registry lock during
+session setup, the server sends one live `project_registry_busy` notification
+for the new session or resumed session. Its `data` has `notification_id`,
+`kind` (`project_registry_busy`), and `text`; the notification is not persisted
+or replayed. It uses the existing `sub_agent_receipt` event envelope, so this is
+additive and older clients can ignore the unknown `kind` and continue normally.
+
 `child_hold` is sent once per hold when a
 background child waits more than 15 minutes on a provider rate limit or a
 subscription limit; its data has `reason` (`rate_limit` or
