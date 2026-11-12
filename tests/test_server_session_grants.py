@@ -2133,17 +2133,21 @@ async def test_session_grant_lifecycle_table_over_real_transports(
     async def frames_until(name: str) -> list[dict[str, Any]]:
         if transport == "unix":
             frames = await _frames_until_event(reader, name)
-        else:
-            frames = []
-            while True:
-                if pending:
-                    frame = pending.pop(0)
-                else:
-                    frame = await read_websocket_json()
-                frames.append(frame)
-                if frame.get("params", {}).get("event") == name:
-                    break
-        observed.extend(frames)
+            observed.extend(frames)
+            return frames
+        frames = []
+        while True:
+            if pending:
+                # Already recorded in `observed` when request()/receive_response()
+                # first read it; draining `pending` must not record it a second
+                # time, so each wire frame lands in `observed` exactly once.
+                frame = pending.pop(0)
+            else:
+                frame = await read_websocket_json()
+                observed.append(frame)
+            frames.append(frame)
+            if frame.get("params", {}).get("event") == name:
+                break
         return frames
 
     async def hello_create() -> tuple[dict[str, Any], str]:
@@ -2864,22 +2868,18 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 assert len(durable_ends) == 1, (
                     f"external_end wrote {len(durable_ends)} durable ends"
                 )
-                # The owner writes exactly one durable end (asserted above); that
-                # durable check is the real duplicate-publication guard, because a
-                # second publish would write a second durable row and fail it. On
-                # the wire a websocket surfaces the same terminal delivery twice (a
-                # response batch and the event stream both carry it), and the two
-                # frames are byte-identical, so dedupe by content: exactly one
-                # distinct approval_end for call-1. Two genuinely distinct
-                # deliveries (different content) still fail here.
-                wire_ends = {
-                    json.dumps(frame.get("params", {}), sort_keys=True)
+                # Exactly one approval_end for call-1 on the wire (no content
+                # dedupe). The harness now records each wire frame in `observed`
+                # once, so a duplicate publication would show as two frames and
+                # fail here. The durable assertion above is the primary guard.
+                wire_ends = [
+                    frame
                     for frame in observed
                     if frame.get("params", {}).get("event") == "approval_end"
                     and frame.get("params", {}).get("request_id") == "call-1"
-                }
+                ]
                 assert len(wire_ends) == 1, (
-                    f"external_end emitted {len(wire_ends)} distinct approval_end frames"
+                    f"external_end emitted {len(wire_ends)} approval_end frames"
                 )
     finally:
         release.set() if "release" in locals() else None
