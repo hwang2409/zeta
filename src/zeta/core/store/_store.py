@@ -195,6 +195,9 @@ class ConversationStore(
             self._runtime_lease: session_execution.SessionExecutionLease | None = None
             self._closed = False
             self._closing = False
+            # ((head_seq, head_id), snapshot); memoizes the resident approval
+            # projection read by the `*_now` seam. None until the first read.
+            self._approval_now_cache = None
             self._owner_thread_id: int | None = None
             self._transcript_generation = 0
             self._initialize_async_writes()
@@ -648,7 +651,7 @@ class ConversationStore(
         # Validate the complete candidate sequence before authoritative bytes
         # reach disk. Approval relations use only a touched-id overlay; later
         # p08b slices move the other relation sets behind the same seam.
-        approvals = self._approval_overlay_for_write(entries)
+        approvals = self._full_branch_approval_overlay()
         self._entries.extend(entries)
         try:
             self._validate_entries(approvals, {entry.id for entry in entries})
@@ -712,7 +715,7 @@ class ConversationStore(
         touched = _ApprovalValidationOverlay.touched([entry])
         if touched or entry.type == "approval_request":
             if linear:
-                self._approval_overlay_for_write([entry]).record(entry)
+                self._full_branch_approval_overlay().record(entry)
             else:
                 # A fork re-selects the active branch, so the active-branch
                 # index cannot seed a sibling branch. Validate the whole
@@ -1066,25 +1069,11 @@ class ConversationStore(
         reason: str | None = None,
     ) -> ConversationEntry | None:
         branch = self.replay()
-        try:
-            indexed_state = self._approval_index_state(request_id)
-        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
-            states = self._approval_states_from_branch(branch)
-            state = states.get(request_id)
-            if state is None or state[1] is not None:
-                return None
-            request_entry = self._request_entry(branch, request_id)
-        else:
-            if indexed_state is None or indexed_state.decision is not None:
-                return None
-            request_entry = next(
-                (
-                    entry
-                    for entry in branch
-                    if entry.id == indexed_state.request_entry_id
-                ),
-                None,
-            )
+        states = self._approval_states_from_branch(branch)
+        state = states.get(request_id)
+        if state is None or state[1] is not None:
+            return None
+        request_entry = self._request_entry(branch, request_id)
         if request_entry is None:
             return None
         active_ids = {entry.id for entry in branch}

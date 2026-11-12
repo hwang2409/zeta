@@ -91,17 +91,17 @@ class _ApprovalValidationOverlay:
 class IncrementalValidationMixin:
     """Validate linear appended entries without rescanning the full log."""
 
-    def _approval_overlay_for_write(
-        self, entries: list[ConversationEntry]
-    ) -> _ApprovalValidationOverlay:
-        touched = _ApprovalValidationOverlay.touched(entries)
-        try:
-            return _ApprovalValidationOverlay(self._approval_relations(touched))
-        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
-            approvals = _ApprovalValidationOverlay()
-            for entry in self._active_branch():
-                approvals.record(entry)
-            return approvals
+    def _full_branch_approval_overlay(self) -> _ApprovalValidationOverlay:
+        """Build the active-branch approval relations by one authoritative scan.
+
+        Approval-row validation is independent of the derived sidecar: it reads
+        the resident branch so a stale or absent index can never fail (or pass)
+        an authoritative write.
+        """
+        approvals = _ApprovalValidationOverlay()
+        for entry in self._active_branch():
+            approvals.record(entry)
+        return approvals
 
     def _reset_incremental_validation_state(self) -> None:
         self._entry_ids: set[str] = set()
@@ -171,14 +171,14 @@ class IncrementalValidationMixin:
         staged._task_notification_ids = set(self._task_notification_ids)
         staged._sent_message_receipts = list(self._sent_message_receipts)
         touched_approvals = _ApprovalValidationOverlay.touched(entries)
-        try:
-            approvals = _ApprovalValidationOverlay(
-                self._approval_relations(touched_approvals)
-                if touched_approvals
-                else None
-            )
-        except Exception:  # noqa: BLE001 -- derived state cannot validate authority
-            return False
+        # An incremental tail that touches an approval row validates against the
+        # authoritative branch overlay (one scan, only when approvals appear),
+        # never a full reload: the sidecar is derived and must not gate authority.
+        approvals = (
+            self._full_branch_approval_overlay()
+            if touched_approvals
+            else _ApprovalValidationOverlay()
+        )
         for index, entry in enumerate(entries):
             # Large off-thread refreshes must release the GIL often enough for
             # the owner event loop to remain responsive.

@@ -741,26 +741,6 @@ class HistoryIndex:
             int(rows[-1][1]) if len(rows) == limit else None,
         )
 
-    def approval_relations(
-        self, facts: object, request_ids: set[str]
-    ) -> dict[str, str | None]:
-        if not request_ids:
-            return {}
-        result: dict[str, str | None] = {}
-        ordered = tuple(sorted(request_ids))
-        for start in range(0, len(ordered), self.PAGE_LIMIT):
-            page = ordered[start : start + self.PAGE_LIMIT]
-            placeholders = ",".join("?" for _ in page)
-            rows = self._approval_query(
-                facts,
-                "SELECT r.request_id,s.decision FROM active_approval_requests r "
-                "LEFT JOIN active_approval_resolutions s USING(request_id) "
-                f"WHERE r.request_id IN ({placeholders})",
-                tuple(page),
-            )
-            result.update(rows)
-        return result
-
     def _mark_unavailable(self) -> None:
         self._available = False
 
@@ -849,37 +829,49 @@ def _overlay_resident_entries(
     return replace(page, groups=groups)
 
 
-def _read_stable_approval(store: ConversationStore, query: object) -> object:
+def _decide_approval(
+    store: ConversationStore, index_query: object, resident: object
+) -> object:
+    """Answer an approval read from the index when its facts match, else from
+    the resident active branch.
+
+    The seam never raises ``StaleHistorySnapshot`` or an fd error to callers: a
+    closed, read-only, or index-less store, an in-flight append by this store,
+    or a stale sidecar after the bounded retries all fall back to ``resident``,
+    the authoritative in-memory branch. ``_mark_unavailable`` runs only for a
+    genuine sidecar mismatch, never for this store's own append.
+    """
     index = store._history_index
-    if index is None:
-        raise HistoryIndexUnavailableError("history index is unavailable")
+    if store._closed or store._read_only or index is None:
+        return resident()
     rebuilt_facts: dict[str, object] | None = None
     physical_keys = ("st_dev", "st_ino", "byte_boundary")
     for attempt in range(_HISTORY_PAGE_ATTEMPTS):
         if not index.available:
-            rebuilt_facts = _rebuild_history_index(store)
+            try:
+                rebuilt_facts = _rebuild_history_index(store)
+            except (OSError, HistoryIndexError):
+                return resident()
         facts = rebuilt_facts or store._history_index_facts()
         rebuilt_facts = None
         try:
-            result = query(index, facts)
-        except (StaleHistorySnapshot, HistoryIndexUnavailableError) as exc:
+            result = index_query(index, facts)
+        except (StaleHistorySnapshot, HistoryIndexUnavailableError, OSError):
             current = store._history_index_facts()
             if any(current[key] != facts[key] for key in physical_keys):
-                raise StaleHistorySnapshot from exc
+                # This store's own in-flight append moved the file; the resident
+                # branch already holds it. Do not rebuild for our own write.
+                return resident()
             if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                raise
+                return resident()
             index._mark_unavailable()
             continue
-        current = store._history_index_facts()
-        if current == facts or (
-            store._read_only
-            and all(current[key] == facts[key] for key in physical_keys)
-        ):
+        if store._history_index_facts() == facts:
             return result
         if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-            raise StaleHistorySnapshot
+            return resident()
         index._mark_unavailable()
-    raise HistoryIndexUnavailableError("history index is unavailable")
+    return resident()
 
 
 class HistoryPageStoreMixin:
@@ -979,76 +971,55 @@ class HistoryPageStoreMixin:
     async def approval_state(
         self, request_id: str
     ) -> tuple[ToolCall, str | None] | None:
-        self._sync_log_without_waiting()
-        if self._read_only:
-            return await self._to_thread_store(
-                lambda: self._resident_approval_state(request_id)
+        if not self._closed:
+            self._sync_log_without_waiting()
+
+        def index_query(index: HistoryIndex, facts: Mapping[str, object]) -> object:
+            result = index.approval_state(facts, request_id)
+            return (
+                None
+                if result is None
+                else (ToolCall.from_dict(dict(result.tool_call)), result.decision)
             )
-        result = await self._to_thread_store(
-            lambda: _read_stable_approval(
-                self, lambda index, facts: index.approval_state(facts, request_id)
+
+        return await self._to_thread_store(
+            lambda: _decide_approval(
+                self,
+                index_query,
+                lambda: self._resident_approval_state(request_id),
             )
-        )
-        return (
-            None
-            if result is None
-            else (ToolCall.from_dict(dict(result.tool_call)), result.decision)
         )
 
     async def approval_resolution(self, request_id: str) -> Mapping[str, str] | None:
-        self._sync_log_without_waiting()
-        if self._read_only:
-            return await self._to_thread_store(
-                lambda: self._resident_approval_resolution(request_id)
-            )
-        result = await self._to_thread_store(
-            lambda: _read_stable_approval(
+        if not self._closed:
+            self._sync_log_without_waiting()
+
+        def index_query(index: HistoryIndex, facts: Mapping[str, object]) -> object:
+            result = index.approval_resolution(facts, request_id)
+            return None if result is None else result.data
+
+        return await self._to_thread_store(
+            lambda: _decide_approval(
                 self,
-                lambda index, facts: index.approval_resolution(facts, request_id),
+                index_query,
+                lambda: self._resident_approval_resolution(request_id),
             )
         )
-        return None if result is None else result.data
 
     async def pending_approval_page(
         self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
     ) -> IndexedPendingApprovalPage:
-        self._sync_log_without_waiting()
-        if self._read_only:
-            return await self._to_thread_store(
-                lambda: self._resident_pending_approval_page(after_seq, limit)
-            )
+        if not self._closed:
+            self._sync_log_without_waiting()
         return await self._to_thread_store(
-            lambda: _read_stable_approval(
+            lambda: _decide_approval(
                 self,
                 lambda index, facts: index.pending_approval_page(
                     facts, after_seq, limit
                 ),
+                lambda: self._resident_pending_approval_page(after_seq, limit),
             )
         )
-
-    def _approval_index_state(self, request_id: str) -> IndexedApprovalState | None:
-        if not self._derived_update_inline_allowed():
-            raise HistoryIndexUnavailableError("approval index query requires off-loop work")
-        index = self._history_index
-        if index is None or not index.available:
-            raise HistoryIndexUnavailableError("history index is unavailable")
-        facts = self._history_index_facts()
-        result = index.approval_state(facts, request_id)
-        if self._history_index_facts() != facts:
-            raise StaleHistorySnapshot
-        return result
-
-    def _approval_relations(self, request_ids: set[str]) -> dict[str, str | None]:
-        if not self._derived_update_inline_allowed():
-            raise HistoryIndexUnavailableError("approval index query requires off-loop work")
-        index = self._history_index
-        if index is None or not index.available:
-            raise HistoryIndexUnavailableError("history index is unavailable")
-        facts = self._history_index_facts()
-        result = index.approval_relations(facts, request_ids)
-        if self._history_index_facts() != facts:
-            raise StaleHistorySnapshot
-        return result
 
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]

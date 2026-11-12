@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ._history_index import HistoryIndex, IndexedPendingApprovalPage
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovalNowSnapshot:
+    """Resident active-branch approval projection, memoized by the active leaf."""
+
+    states: dict[str, tuple[ToolCall, str | None]]
+    resolutions: dict[str, Mapping[str, Any]]
+    pending: tuple[tuple[int, str, Mapping[str, object]], ...]
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:
@@ -126,17 +136,6 @@ class ApprovalHistoryStoreMixin:
             list(self._active_branch())
         ).get(request_id)
 
-    # The owner's write path (ApprovalPolicy.authorize) needs the request it is
-    # about to publish to be readable in the same task step, with no off-loop
-    # yield before it. This is a resident, non-blocking scan (no sqlite on the
-    # loop): it pulls any external append without waiting, then reads the
-    # resident branch, matching main's synchronous approval_states() read.
-    def approval_state_now(
-        self, request_id: str
-    ) -> tuple[ToolCall, str | None] | None:
-        self._sync_log_without_waiting()
-        return self._resident_approval_state(request_id)
-
     def _resident_approval_resolution(
         self, request_id: str
     ) -> Mapping[str, Any] | None:
@@ -148,48 +147,75 @@ class ApprovalHistoryStoreMixin:
                 return dict(entry.data)
         return None
 
-    # The serve stale-approval sweep runs before publishing every event. It must
-    # read the resident resolution in the same task step, with no off-loop yield:
-    # an await here would reorder event delivery (an agent_end could overtake a
-    # concurrent child's approval_request). This matches main's synchronous
-    # approval_resolution_data read.
-    def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
-        self._sync_log_without_waiting()
-        return self._resident_approval_resolution(request_id)
-
     def _resident_pending_approval_page(
         self, after_seq: int, limit: int
     ) -> IndexedPendingApprovalPage:
-        resolved: set[str] = set()
-        pending: list[tuple[int, str, Mapping[str, object]]] = []
-        for entry in self._active_branch():
-            if entry.type == "message":
-                for request in entry.data.get("approval_requests", []):
-                    pending.append(
-                        (entry.seq, request["request_id"], request["tool_call"])
-                    )
-            elif entry.type == "approval_resolution":
-                resolved.add(entry.data["request_id"])
-        rows = sorted(
-            (
-                (seq, request_id, tool_call)
-                for seq, request_id, tool_call in pending
-                if request_id not in resolved and seq > after_seq
-            ),
-            key=lambda row: row[0],
-        )[:limit]
+        rows = [
+            row
+            for row in self._approval_now_snapshot().pending
+            if row[0] > after_seq
+        ][:limit]
         return IndexedPendingApprovalPage(
             tuple((request_id, tool_call) for _seq, request_id, tool_call in rows),
             rows[-1][0] if len(rows) == limit else None,
         )
 
-    # The display seed at resume needs the pending page in the same task step,
-    # with no off-loop yield, matching approval_state_now. The async
-    # pending_approval_page reconciles later off-loop.
+    # One resident projection of the active branch, memoized by the active-leaf
+    # (sequence, id). The key moves on every append (own writes included) and on
+    # every branch switch or rewind, so a resolve made on the loop is visible to
+    # the next `*_now` read at once, while the serve stale sweep that fires on
+    # every published event rescans only when the leaf changes (O(1) otherwise).
+    def _approval_now_snapshot(self) -> _ApprovalNowSnapshot:
+        key = (self.active_branch_head_sequence(), self.active_branch_head_id())
+        cached = self._approval_now_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        snapshot = self._build_approval_now_snapshot()
+        self._approval_now_cache = (key, snapshot)
+        return snapshot
+
+    def _build_approval_now_snapshot(self) -> _ApprovalNowSnapshot:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        resolutions: dict[str, Mapping[str, Any]] = {}
+        resolved: set[str] = set()
+        requested: list[tuple[int, str, Mapping[str, object]]] = []
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    request_id = request["request_id"]
+                    states[request_id] = (
+                        ToolCall.from_dict(request["tool_call"]),
+                        None,
+                    )
+                    requested.append((entry.seq, request_id, request["tool_call"]))
+            elif entry.type == "approval_resolution":
+                request_id = entry.data["request_id"]
+                resolved.add(request_id)
+                resolutions[request_id] = dict(entry.data)
+                if request_id in states:
+                    states[request_id] = (states[request_id][0], entry.data["decision"])
+        pending = tuple(
+            sorted(
+                (row for row in requested if row[1] not in resolved),
+                key=lambda row: row[0],
+            )
+        )
+        return _ApprovalNowSnapshot(states, resolutions, pending)
+
+    # The owner loop reads the request it just published (ApprovalPolicy and the
+    # serve admission) and the resolution it just wrote (the stale sweep) from
+    # this resident projection, with no off-loop yield and no sqlite on the loop.
+    def approval_state_now(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        return self._approval_now_snapshot().states.get(request_id)
+
+    def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
+        return self._approval_now_snapshot().resolutions.get(request_id)
+
     def pending_approval_page_now(
         self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
     ) -> IndexedPendingApprovalPage:
-        self._sync_log_without_waiting()
         return self._resident_pending_approval_page(after_seq, limit)
 
     def delegated_unmatched_requests(
