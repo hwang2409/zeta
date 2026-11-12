@@ -30,6 +30,7 @@ from .receipt import (
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
+    from .pending_delivery import StepDeliveryFlow
 
 
 _IMMEDIATE_FINISH_REMINDER = (
@@ -62,7 +63,7 @@ _MOOT_TERMINAL_KINDS = ("task_exited", "child_idle", "child_hold")
 
 
 def _terminal_edge_disposition(
-    flow: object,
+    flow: StepDeliveryFlow,
 ) -> tuple[tuple[str, ...], tuple[str, ...], list[str]]:
     """Split a terminal run's pending edge into settle, fold and keep groups.
 
@@ -104,7 +105,7 @@ def _terminal_edge_disposition(
     return tuple(moot_ids), tuple(completion_ids), completion_texts
 
 
-def _terminal_block_pending(flow: object) -> bool:
+def _terminal_block_pending(flow: StepDeliveryFlow) -> bool:
     """Report pending input that still needs a settle pass after a terminal.
 
     A kept grandchild question stays durable forever (finalize reroutes it), so
