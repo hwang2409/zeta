@@ -6,17 +6,15 @@ import copy
 import time
 
 from ...protocol.types import Message, ToolResult, ToolUseContent
+from ...storage_format import (
+    # the stored-format registry owns the reasons a resolution may carry
+    APPROVAL_RESOLUTION_REASONS,
+)
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 from ..checkpoints.entry_types import sent_message_receipts
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     TASK_EXITED_NOTIFICATION_KIND,
-)
-
-# Abort reasons a stored approval resolution may carry. `grace_expired` is
-# reserved for the approval reconnect grace (not emitted yet).
-APPROVAL_RESOLUTION_REASONS = frozenset(
-    {"controller_disconnected", "turn_canceled", "child_cleanup", "grace_expired"}
 )
 
 

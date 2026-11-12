@@ -43,6 +43,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.server.handlers.history_projection import _history_entry_rows
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
+from zeta.storage_format import WRITER_EPOCH
 from zeta.tools import ToolRegistry
 from zeta.tools.agent import _read_agent_status
 from zeta.tui.app import TUIApp
@@ -1097,7 +1098,7 @@ async def test_turn_limit_recovery_after_lifecycle_commit_publishes_once(
     owner = BackgroundAgentOwner(parent)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
     try:
-        recover_agent_children(loop)
+        recover_agent_children(loop, WRITER_EPOCH)
         notifications = parent.agent_notifications(pending_only=False)
         assert len(notifications) == 1
         from zeta.agent.turn_limit import project_notification_data
@@ -1114,7 +1115,7 @@ async def test_turn_limit_recovery_after_lifecycle_commit_publishes_once(
             child.session_dir / "turn-limit-handoff.md"
         ).read_bytes() == handoff_bytes
 
-        recover_agent_children(loop)
+        recover_agent_children(loop, WRITER_EPOCH)
         assert len(parent.agent_notifications(pending_only=False)) == 1
         assert (
             child.session_dir / "turn-limit-handoff.md"
@@ -1167,7 +1168,7 @@ def test_nested_turn_limit_recovery_matches_existing_mid_publication_behavior(
     owner = BackgroundAgentOwner(root)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
     try:
-        recover_agent_children(loop)
+        recover_agent_children(loop, WRITER_EPOCH)
         assert len(root.agent_notifications(pending_only=False)) == 1
         assert len(parent.agent_notifications(pending_only=False)) == 1
         assert not parent.agent_children()
