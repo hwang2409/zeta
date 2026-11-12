@@ -2559,6 +2559,55 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
 
 
 @pytest.mark.asyncio
+async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_closed(
+    tmp_path: Path,
+) -> None:
+    # Regression: when the cancelled grandchild's own store is already torn down
+    # (its close task won the race against the settlement), the one publisher
+    # must still publish approval_end instead of crashing on a closed store and
+    # hanging the root forever. See the 3x-seen flake on this surface.
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = NestedDelegatedApprovalBackend(target)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    child_watcher: asyncio.Task[object] | None = None
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        grandchild_id = approval["agent_instance_id"]
+        child_id = grandchild_id.rsplit(":", 1)[0]
+        assert server.runtime.loop is not None
+        owner = server.runtime.loop._background_owner
+        child_watcher = owner._watchers[child_id]
+        # Force the losing race deterministically: close the grandchild store
+        # before the cancel, so every settlement write hits a closed store.
+        owner._active_stores[grandchild_id][0].close()
+        assert owner.cancel(child_id)
+        frames = await _request(reader, writer, 4, "status")
+        async with asyncio.timeout(TIMEOUT):
+            while not any(
+                event["request_id"] == approval["request_id"]
+                for event in _named_events(frames, "approval_end")
+            ):
+                frames.append(await _read(reader))
+        await _request(reader, writer, 5, "status")
+        assert len(backend.grandchild.calls) == 1
+    finally:
+        if child_watcher is not None and not child_watcher.done():
+            child_watcher.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(child_watcher, return_exceptions=True), TIMEOUT
+            )
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolution", "expected_decision", "expected_reason"),
     [("deny", "deny", None), ("cleanup", "abort", "child_cleanup")],
