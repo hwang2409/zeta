@@ -2122,6 +2122,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 else read_websocket_json()
             )
             if transport == "websocket" and frame.get("params", {}).get("event") != name:
+                # Record every wire frame in `observed` once at read time; a later
+                # `frames_until` drains it from `pending` without re-recording.
+                observed.append(frame)
                 pending.append(frame)
                 continue
             observed.append(frame)
@@ -2133,17 +2136,21 @@ async def test_session_grant_lifecycle_table_over_real_transports(
     async def frames_until(name: str) -> list[dict[str, Any]]:
         if transport == "unix":
             frames = await _frames_until_event(reader, name)
-        else:
-            frames = []
-            while True:
-                if pending:
-                    frame = pending.pop(0)
-                else:
-                    frame = await read_websocket_json()
-                frames.append(frame)
-                if frame.get("params", {}).get("event") == name:
-                    break
-        observed.extend(frames)
+            observed.extend(frames)
+            return frames
+        frames = []
+        while True:
+            if pending:
+                # Already recorded in `observed` when request()/receive_response()
+                # first read it; draining `pending` must not record it a second
+                # time, so each wire frame lands in `observed` exactly once.
+                frame = pending.pop(0)
+            else:
+                frame = await read_websocket_json()
+                observed.append(frame)
+            frames.append(frame)
+            if frame.get("params", {}).get("event") == name:
+                break
         return frames
 
     async def hello_create() -> tuple[dict[str, Any], str]:
@@ -2280,7 +2287,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         entered.set()
                         await await_or_fail(release.wait(), what="durable settlement")
                     result = await original_commit(store, command)
-                    if case == "external_end" and is_resolution:
+                    if case == "external_end" and is_resolution and not entered.is_set():
                         # test-contract: prove the settlement task owns the gated await
                         gate_owner = asyncio.current_task()
                         record = server.control._approvals.state.records["call-1"]
@@ -2850,6 +2857,33 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             else:
                 await frames_until("turn_end")
             assert not server.control._approvals.state.records
+            if case == "external_end":
+                # The external approval_end arrived during the durable commit: the
+                # owner must write exactly one durable end and emit exactly one
+                # approval_end on the wire.
+                assert server.runtime.opened is not None
+                durable_ends = [
+                    entry
+                    for entry in server.runtime.opened.store.replay()
+                    if entry.type == "approval_resolution"
+                    and entry.data.get("request_id") == "call-1"
+                ]
+                assert len(durable_ends) == 1, (
+                    f"external_end wrote {len(durable_ends)} durable ends"
+                )
+                # Exactly one approval_end for call-1 on the wire (no content
+                # dedupe). The harness now records each wire frame in `observed`
+                # once, so a duplicate publication would show as two frames and
+                # fail here. The durable assertion above is the primary guard.
+                wire_ends = [
+                    frame
+                    for frame in observed
+                    if frame.get("params", {}).get("event") == "approval_end"
+                    and frame.get("params", {}).get("request_id") == "call-1"
+                ]
+                assert len(wire_ends) == 1, (
+                    f"external_end emitted {len(wire_ends)} approval_end frames"
+                )
     finally:
         release.set() if "release" in locals() else None
         if "release_competing" in locals():

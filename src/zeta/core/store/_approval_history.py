@@ -106,3 +106,52 @@ class ApprovalHistoryStoreMixin:
             ):
                 return dict(entry.data)
         return None
+
+    def delegated_unmatched_requests(
+        self, child_instance_id: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return (wire_request_id, tool_call) for a child's delegated requests
+        that have no matching ``approval_end`` on the active branch.
+
+        ``tool_call["id"]`` is the child store's request id, so a caller can
+        reread the child's authoritative resolution and project a parent end.
+        """
+        requests: dict[str, dict[str, Any]] = {}
+        ended: set[str] = set()
+        for entry in self._active_branch():
+            if entry.type != "approval_history":
+                continue
+            data = entry.data
+            event = data.get("event")
+            if event == "approval_request":
+                if data.get("agent_instance_id") == child_instance_id:
+                    requests[data["request_id"]] = data["tool_call"]
+            elif event == "approval_end":
+                request_id = data.get("request_id")
+                if isinstance(request_id, str):
+                    ended.add(request_id)
+        return [
+            (wire_id, tool_call)
+            for wire_id, tool_call in requests.items()
+            if wire_id not in ended
+        ]
+
+    def append_approval_history_end_if_absent(
+        self, payload: Mapping[str, Any]
+    ) -> bool:
+        """Append one delegated ``approval_end`` only if the active branch has
+        none for this wire id. The absence check and append share one lock, so
+        a repeated restart never writes a duplicate end."""
+        wire_id = payload["request_id"]
+        with self._append_lock():
+            for entry in self._active_branch():
+                if (
+                    entry.type == "approval_history"
+                    and entry.data.get("event") == "approval_end"
+                    and entry.data.get("request_id") == wire_id
+                ):
+                    return False
+            self._append_row_unlocked(
+                "approval_history", {"event": "approval_end", **payload}
+            )
+            return True
