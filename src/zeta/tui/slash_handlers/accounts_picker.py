@@ -24,6 +24,7 @@ class AccountsPicker:
     labels: dict[AccountId, str] | None = None
     usages: dict[AccountId, UsageState] | None = None
     unavailable: set[AccountId] | None = None
+    switching_unavailable: str | None = None
     refreshing: bool = False
     logout_confirmation: AccountId | None = None
     index: int = 0
@@ -78,6 +79,8 @@ class AccountsPicker:
                     style=theme.WARNING,
                 )
             )
+        if self.switching_unavailable is not None:
+            rows.append(Text(f"view only · {self.switching_unavailable}", style=theme.WARNING))
         rows.append(Text(HINT, style=theme.AFFORDANCE))
         return Panel(
             Group(*rows),

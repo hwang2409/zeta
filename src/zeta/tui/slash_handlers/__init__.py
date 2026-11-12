@@ -206,6 +206,7 @@ class SlashHandlerMixin:
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
             {item.account for item in displays if not item.available},
+            self._accounts_switching_unavailable(),
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -226,6 +227,12 @@ class SlashHandlerMixin:
             return login_failure_message(exc)
         return f"logged in as {requested[1]}:{requested[2].lower()}"
 
+    def _accounts_switching_unavailable(self) -> str | None:
+        if self.active or self.pending_approvals:
+            return "switching waits until the turn ends"
+        context = self.loop.account_context
+        return context.switching_unavailable
+
     async def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
@@ -237,18 +244,13 @@ class SlashHandlerMixin:
             if context is None:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
-        if self.active or self.pending_approvals:
-            return (
-                "accounts unavailable: cannot switch while a turn or approval is active"
-            )
         if context is None:
             return "accounts unavailable for this session"
-        if context.switching_unavailable is not None:
-            return context.switching_unavailable
         snapshot = await context.list_snapshot()
         if not snapshot.displays:
             return "no accounts; run zeta login <provider> --account <name>"
-        return self._show_accounts_picker(snapshot)
+        self._show_accounts_picker(snapshot)
+        return ""
 
     def _handle_account_limit(self, event: StreamEvent) -> asyncio.Task[None]:
         context = self.loop.account_context
@@ -419,6 +421,15 @@ class SlashHandlerMixin:
             return backend
 
         async def switch() -> None:
+            if getattr(self, "active", False) or getattr(self, "pending_approvals", ()):
+                unavailable = "switching waits until the turn ends"
+            else:
+                unavailable = getattr(context, "switching_unavailable", None)
+            if unavailable is not None:
+                picker.switching_unavailable = unavailable
+                self._repaint_accounts_picker()
+                self._print_system(f"account unchanged: {unavailable}")
+                return
             try:
                 await context.switch_active(
                     self.loop,

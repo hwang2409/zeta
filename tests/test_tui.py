@@ -14770,6 +14770,63 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
 
 @pytest.mark.asyncio
+async def test_accounts_picker_is_view_only_during_turn_then_switches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    busy = True
+    monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
+
+    assert await app.slash_accounts("") == ""
+    assert app.accounts_picker_active
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "codex:first" in plain
+    assert "codex:second" in plain
+    assert "usage" in plain
+    assert "view only · switching waits until the turn ends" in plain
+
+    app.accounts_picker_move(1)
+    blocked = app.accounts_picker_select()
+    assert blocked is not None
+    await asyncio.wait_for(blocked, 10)
+    assert await asyncio.to_thread(context.resolve, "codex") == first
+    assert app.accounts_picker_active
+
+    busy = False
+    switched = app.accounts_picker_select()
+    assert switched is not None
+    await asyncio.wait_for(switched, 10)
+    assert await asyncio.to_thread(context.resolve, "codex") == second
+    await app.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_account_picker_ignores_repeat_select_while_switching(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
