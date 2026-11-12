@@ -814,7 +814,7 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
         mirror.write_text(header + "stale mirror\n")
         mirror.chmod(mirror_mode)
         inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-        message_id = inbox.send(
+        message_id = inbox.send_user(
             from_project=sender.project_id,
             from_session="a" * 32,
             to_project=project.project_id,
@@ -867,7 +867,7 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
     sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     await asyncio.to_thread(registry.update_memory, project.project_id, {"brief.md": "content\n"})
     await asyncio.to_thread(
-        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send_user,
         from_project=sender.project_id,
         from_session="d" * 32,
         to_project=project.project_id,
@@ -927,7 +927,7 @@ async def test_project_inbox_rejects_missing_required_directory(tmp_path: Path) 
     project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
     sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     await asyncio.to_thread(
-        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send_user,
         from_project=sender.project_id,
         from_session="d" * 32,
         to_project=project.project_id,
@@ -1017,7 +1017,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
     await asyncio.to_thread(registry.accept_memory, alpha.project_id, "state.md")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     message_id = await asyncio.to_thread(
-        inbox.send,
+        inbox.send_user,
         from_project=beta.project_id,
         from_session="b" * 32,
         to_project=alpha.project_id,
@@ -1145,7 +1145,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
             "next_offset": None,
         }
         assert result["messages"][0]["id"] == message_id
-        assert result["messages"][0]["origin"] == "local"
+        assert result["messages"][0]["origin"] == "user"
         assert _mtimes(server.home) == before
 
         await _request(reader, writer, 7, "new_session", {})
@@ -1234,7 +1234,7 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(
         content = ("\x01" if index == 0 else str(index)) * (128 * 1024)
         await asyncio.to_thread(registry.update_memory, project.project_id, {name: content})
     await asyncio.to_thread(
-        ProjectInbox(registry, sessions_root=server.home / "sessions").send,
+        ProjectInbox(registry, sessions_root=server.home / "sessions").send_user,
         from_project=sender.project_id,
         from_session="c" * 32,
         to_project=project.project_id,
@@ -1270,7 +1270,7 @@ async def test_project_requests_bound_large_views_and_report_unknown_project(
         )
         inbox_result = inbox_frames[-1]["result"]
         message = inbox_result["messages"][0]
-        assert message["origin"] == "local"
+        assert message["origin"] == "user"
         assert inbox_result["untrusted"] is False
         assert "body" in message["truncated_fields"]
         assert len(str(inbox_frames[-1]).encode()) < 1_048_576
@@ -1298,7 +1298,7 @@ async def test_project_inbox_isolates_and_reports_invalid_messages(
     sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     valid_id = await asyncio.to_thread(
-        inbox.send,
+        inbox.send_user,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,
@@ -1342,7 +1342,7 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
     sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     local_id = await asyncio.to_thread(
-        inbox.send,
+        inbox.send_user,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,
@@ -1352,7 +1352,7 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
         message_id="0" * 32,
     )
     external_id = await asyncio.to_thread(
-        inbox.send,
+        inbox.send_user,
         from_project=sender.project_id,
         from_session="b" * 32,
         to_project=target.project_id,
@@ -1388,7 +1388,7 @@ async def test_project_inbox_trust_is_derived_from_returned_page(
             )
         )[-1]["result"]
         assert [message["id"] for message in local_page["messages"]] == [local_id]
-        assert local_page["messages"][0]["origin"] == "local"
+        assert local_page["messages"][0]["origin"] == "user"
         assert local_page["untrusted"] is False
         assert local_page["next_offset"] == 1
 
@@ -1415,7 +1415,7 @@ def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
     project = registry.create_project("alpha", "repo")
     sender = registry.create_project("sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
-    message_id = inbox.send(
+    message_id = inbox.send_user(
         from_project=sender.project_id,
         from_session="d" * 32,
         to_project=project.project_id,
@@ -1451,7 +1451,7 @@ async def test_malformed_inbox_fuzz_corpus_is_isolated(tmp_path: Path) -> None:
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     valid_ids = {
         await asyncio.to_thread(
-            inbox.send,
+            inbox.send_user,
             from_project=sender.project_id,
             from_session="d" * 32,
             to_project=project.project_id,
@@ -1545,7 +1545,7 @@ async def test_project_inbox_omits_large_unknown_structured_fields(
     sender = await asyncio.to_thread(registry.create_project, "sender", "repo")
     inbox = ProjectInbox(registry, sessions_root=server.home / "sessions")
     message_id = await asyncio.to_thread(
-        inbox.send,
+        inbox.send_user,
         from_project=sender.project_id,
         from_session="a" * 32,
         to_project=target.project_id,

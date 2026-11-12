@@ -490,8 +490,6 @@ class ServerSlashSession:
         return await self._runtime.loop.slash_mcp(stripped)
 
     async def slash_inbox(self, args: str) -> str:
-        if args.strip():
-            return "usage: /inbox"
         runtime = self._runtime
         if runtime.loop is None or runtime.opened is None:
             return "project inbox unavailable: no active session"
@@ -503,12 +501,14 @@ class ServerSlashSession:
             state = await asyncio.to_thread(
                 ProjectInbox(
                     registry, sessions_root=registry.root.parent / "sessions"
-                ).list,
+                ).command,
                 project_id,
+                args,
+                from_session=runtime.opened.metadata.session_id,
             )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
-        return json.dumps(state, indent=2, sort_keys=True)
+        return state
 
 
 def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
