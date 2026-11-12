@@ -17,6 +17,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend
 from tests.support.serve_close import close_serve
 from tests.test_server import _connect, _request
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_inbox import ProjectInbox, ProjectInboxScanner
 from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer, slash_commands
@@ -860,7 +861,9 @@ async def test_project_requests_do_not_modify_filesystem(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_project_request_error_classification(tmp_path: Path) -> None:
+async def test_project_request_error_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     server = _server(tmp_path)
     registry = ProjectRegistry(server.home / "projects")
     project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
@@ -915,6 +918,20 @@ async def test_project_request_error_classification(tmp_path: Path) -> None:
         assert invalid[-1]["error"] == {
             "code": -32602,
             "message": "limit is out of range",
+        }
+
+        def _busy(*_args: object, **_kwargs: object):
+            raise ProjectRegistryBusyError()
+
+        # test-contract: seam force a busy registry lock during the inbox read
+        monkeypatch.setattr(ProjectRegistry, "_project_lock", _busy)
+        busy = await _request(
+            reader, writer, 6, "project_inbox", {"project_id": project.project_id}
+        )
+        assert busy[-1]["error"] == {
+            "code": -32000,
+            "message": "inbox is busy; retry",
+            "data": {"code": "project_registry_busy", "retryable": True},
         }
     finally:
         await close_serve(server, writer)

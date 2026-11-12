@@ -24,6 +24,7 @@ from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.project_errors import ProjectRegistryBusyError, ProjectRegistryError
 from zeta.project_inbox import (
     SENT_PAGE_LIMIT,
     InboxError,
@@ -31,7 +32,7 @@ from zeta.project_inbox import (
     ProjectInboxScanner,
     SentMessageTracker,
 )
-from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
@@ -47,6 +48,7 @@ from zeta.server.event_contract import notification_wire_event
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
+from zeta.tools.inbox import _inbox
 from zeta.tools.registry import ToolRegistry
 from zeta.tui import theme
 from zeta.tui.transcript.transcript import TranscriptWidget
@@ -1907,6 +1909,52 @@ async def test_inbox_activation_reads_broken_ledger_off_owner_loop(
             )
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_send_reports_busy_lock_as_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, registry, project_a, project_b = await asyncio.to_thread(
+        _projects, tmp_path
+    )
+    tool_registry = SimpleNamespace(
+        project_registry=registry,
+        project_id=project_a.project_id,
+        _session_store=SimpleNamespace(
+            session_id="a" * 32,
+            sent_message_receipts=lambda: (),
+        ),
+        sent_message_tracker=None,
+    )
+    arguments = {
+        "action": "send",
+        "project": project_b.project_id,
+        "kind": "info",
+        "title": "title",
+        "body": "body",
+    }
+
+    def _busy(*_args: object, **_kwargs: object):
+        raise ProjectRegistryBusyError()
+
+    # test-contract: seam force a busy registry lock to assert error mapping
+    monkeypatch.setattr(registry, "_project_lock", _busy)
+    busy = await _inbox(tool_registry, arguments)
+    error = busy["structuredContent"]["error"]
+    assert error["kind"] == "inbox_busy"
+    assert "busy" in error["message"].lower()
+    assert "retry" in error["message"].lower()
+
+    def _unsafe(*_args: object, **_kwargs: object):
+        raise ProjectRegistryError("inbox lock is not a private regular unshared file")
+
+    # test-contract: seam force an unsafe-lock error to assert it stays non-retryable
+    monkeypatch.setattr(registry, "_project_lock", _unsafe)
+    unsafe = await _inbox(tool_registry, arguments)
+    unsafe_error = unsafe["structuredContent"]["error"]
+    assert unsafe_error["kind"] != "inbox_busy"
+    assert "unsafe or unavailable" in unsafe_error["message"]
 
 
 def _raise_once_scanner_factory(loop, exc):
