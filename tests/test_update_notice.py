@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
 
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path
 from tests.test_server import _connect
-from zeta.runtime.update_notice import UpdateChecker, source_revision
+from zeta.runtime.update_notice import (
+    ProcessUpdateMonitor,
+    UpdateChecker,
+    source_revision,
+)
 from zeta.server import ZetaServer
 from zeta.server.connections import EVENT_FEATURES
 from zeta.server.protocol import EventDescriptor
@@ -28,6 +32,24 @@ def test_checker_reports_each_transition_from_running_revision() -> None:
     assert asyncio.run(checker.tick())
     assert asyncio.run(checker.tick())
     assert updates == [("old", "new"), ("old", "newer")]
+
+
+@pytest.mark.asyncio
+async def test_failing_subscriber_does_not_stop_other_subscribers(tmp_path: Path) -> None:
+    monitor = ProcessUpdateMonitor(tmp_path / "package.py")
+    received: list[tuple[str, str]] = []
+
+    async def failing(_old: str, _new: str) -> None:
+        raise RuntimeError("subscriber failed")
+
+    async def receiving(old: str, new: str) -> None:
+        received.append((old, new))
+
+    monitor.subscribe(failing)
+    monitor.subscribe(receiving)
+    await monitor._publish("old", "new")
+    assert received == [("old", "new")]
+    assert monitor.current == ("old", "new")
 
 
 def test_checker_silently_retries_a_failed_read() -> None:
@@ -112,8 +134,9 @@ def test_updated_footer_uses_the_persistent_notice(monkeypatch) -> None:
 
     class App:
         _remote_view = None
-        _zeta_updated = True
 
+    monitor = type("Monitor", (), {"current": ("old", "new")})()
+    monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)
     monkeypatch.setattr(layout, "get_app", lambda: PromptApp())
     assert "zeta updated · /restart" in "".join(
         text for _style, text in layout.status_toolbar(App())
@@ -130,14 +153,25 @@ async def test_fresh_serve_publishes_update_without_opened_session(tmp_path: Pat
     )
     reader, writer = await _connect(server)
     try:
-        writer.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {
-            "protocol_version": "1.2", "role": "controller", "features": ["zeta_updated"]
-        }}) + "\n").encode())
-        await writer.drain()
-        await asyncio.wait_for(reader.readline(), 10)
-        await asyncio.sleep(0)
+        await send(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "role": "controller", "features": ["zeta_updated"]},
+        )
+        await read_until(
+            reader, lambda frame: frame.get("id") == 1, what="hello response"
+        )
+        await send(reader, writer, 2, "ping")
+        await read_until(reader, lambda frame: frame.get("id") == 2, what="ping response")
         await server.publish_update("old", "new")
-        frame = json.loads(await asyncio.wait_for(reader.readline(), 10))
+        frame = await read_until(
+            reader,
+            lambda frame: frame.get("params", {}).get("event") == "zeta_updated",
+            what="zeta update event",
+        )
+        frame = next(frame for frame in frame if frame.get("params", {}).get("event") == "zeta_updated")
         assert frame["params"]["event"] == "zeta_updated"
         assert frame["params"]["data"] == {"old_revision": "old", "new_revision": "new"}
     finally:

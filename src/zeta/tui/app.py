@@ -229,8 +229,8 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
-        self._update_monitor = process_update_monitor(zeta.__file__ or "")
-        self._update_unsubscribe = self._update_monitor.subscribe(self._handle_update)
+        update_monitor = process_update_monitor(zeta.__file__ or "")
+        update_monitor.subscribe(self._handle_update)
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -259,7 +259,7 @@ class TUIApp(
         self._composer_insertions: list[str] = []
         self._exit_requested = False
         self._terminal_restored = False
-        self._loop_state = "idle"; self._zeta_updated = False
+        self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
         self._usage_tracker = UsageTracker(
             self.loop.context_assembler, provider=provider
@@ -822,7 +822,7 @@ class TUIApp(
         self._abort_requested = False
         return stop_after_tool
     async def _handle_update(self, old_revision: str, new_revision: str) -> None:
-        self._zeta_updated = True; self._invalidate_prompt()
+        self._invalidate_prompt()
         if (observer_host := self.observer_host) is not None:
             await observer_host.publish_update(old_revision, new_revision)
     def _handle_background_notice(self, notice: object) -> None:
@@ -1157,7 +1157,7 @@ class TUIApp(
             if observer_host is not None and (error := await observer_host.start_or_close()):
                 self.observer_host = None  # optional endpoint: never stops the TUI or a fork
                 self._handle_background_notice(f"remote observer unavailable: {error}")
-            self._update_monitor.start()
+            process_update_monitor(zeta.__file__ or "").start()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session

@@ -87,12 +87,6 @@ class RuntimeCloseMixin:
                 await self._draft.shutdown_pending()
             except Exception:  # noqa: BLE001, S110 - notice already reported
                 pass
-            unsubscribe = getattr(self, "_update_unsubscribe", None)
-            if unsubscribe is not None:
-                unsubscribe()
-            update_monitor = getattr(self, "_update_monitor", None)
-            if update_monitor is not None and not update_monitor._subscribers:
-                await attempt_async(update_monitor.close)
             observer_host = getattr(self, "observer_host", None)
             if observer_host is not None:
                 await attempt_async(observer_host.close)

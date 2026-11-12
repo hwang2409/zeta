@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import weakref
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -104,42 +105,40 @@ class UpdateChecker:
         *,
         interval: float = CHECK_INTERVAL_SECONDS,
         read_revision: Callable[[str | Path], str | None] = source_revision,
+        defer_initial: bool = False,
     ) -> None:
         self._package_file = package_file
         self._on_update: Callable[[str, str], Awaitable[None]] | None = on_update
         self._interval = interval
         self._read_revision = read_revision
-        self._initial = read_revision(package_file)
+        self._initial = None if defer_initial else read_revision(package_file)
         self._task: asyncio.Task[None] | None = None
         self._last_seen = self._initial
-        self._reported = False
 
     def start(self) -> None:
-        if self._task is None and self._initial is not None:
+        if self._task is None:
             self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
         if self._task is None:
-            self._on_update = None
             return
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
-        self._on_update = None
 
     async def tick(self) -> bool:
         """Check once; this seam lets tests trigger a check without sleeping."""
-        if self._last_seen is None:
-            return False
         try:
             current = await asyncio.to_thread(self._read_revision, self._package_file)
         except (OSError, ValueError):
+            return False
+        if self._last_seen is None:
+            self._initial = self._last_seen = current
             return False
         if current is None or current == self._last_seen or current == self._initial:
             return False
         old = self._initial
         self._last_seen = current
-        self._reported = True
         on_update = self._on_update
         if on_update is not None:
             await on_update(old, current)
@@ -147,25 +146,39 @@ class UpdateChecker:
 
     async def _run(self) -> None:
         while True:
-            await asyncio.sleep(self._interval)
             try:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 _LOGGER.exception("update notice subscriber failed")
+            await asyncio.sleep(self._interval)
 
 
 class ProcessUpdateMonitor:
     """One process-owned checker shared by all visible surfaces."""
 
     def __init__(self, package_file: str | Path) -> None:
-        self._subscribers: set[Callable[[str, str], Awaitable[None]]] = set()
-        self._checker = UpdateChecker(package_file, self._publish)
+        self._subscribers: set[weakref.ReferenceType[Callable[[str, str], Awaitable[None]]]] = set()
+        self._notice: tuple[str, str] | None = None
+        self._checker = UpdateChecker(package_file, self._publish, defer_initial=True)
 
     def subscribe(self, callback: Callable[[str, str], Awaitable[None]]) -> Callable[[], None]:
-        self._subscribers.add(callback)
-        return lambda: self._subscribers.discard(callback)
+        reference = (
+            weakref.WeakMethod(callback)
+            if hasattr(callback, "__self__")
+            else weakref.ref(callback)
+        )
+        self._subscribers.add(reference)
+
+        def unsubscribe() -> None:
+            self._subscribers.discard(reference)
+
+        return unsubscribe
+
+    @property
+    def current(self) -> tuple[str, str] | None:
+        return self._notice
 
     def start(self) -> None:
         self._checker.start()
@@ -178,8 +191,16 @@ class ProcessUpdateMonitor:
         return await self._checker.tick()
 
     async def _publish(self, old: str, new: str) -> None:
-        for callback in tuple(self._subscribers):
-            await callback(old, new)
+        self._notice = (old, new)
+        for reference in tuple(self._subscribers):
+            callback = reference()
+            if callback is None:
+                self._subscribers.discard(reference)
+                continue
+            try:
+                await callback(old, new)
+            except Exception:
+                _LOGGER.exception("update notice subscriber failed")
 
 
 _process_monitor: ProcessUpdateMonitor | None = None
