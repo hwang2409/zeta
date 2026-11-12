@@ -50,7 +50,6 @@ from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
-    THINKING_LIMIT_RECOVERY_EVENT,
     build_nudge_message,
     build_tool_limit_recovery_message,
     empty_turn_error,
@@ -3379,6 +3378,8 @@ async def test_thinking_only_max_tokens_retries_then_continues(tmp_path: Path) -
 
     # A thinking-only output-limit stop is retried once instead of ending the run.
     assert len(backend.calls) == 2
+    from zeta.runtime.loop.empty_turn import THINKING_LIMIT_RECOVERY_EVENT
+
     assert [
         event.data["kind"] for event in events if event.type is StreamEventType.RETRY
     ] == ["output_limit_recovery"]
@@ -3424,6 +3425,8 @@ async def test_thinking_only_max_tokens_errors_when_retry_also_limited(
 
     # One bounded retry: the second output-limit stop surfaces the terminal error.
     assert len(backend.calls) == 2
+    from zeta.runtime.loop.empty_turn import THINKING_LIMIT_RECOVERY_EVENT
+
     recoveries = [
         message
         for message in store.messages()
