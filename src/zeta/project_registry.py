@@ -234,6 +234,11 @@ class ProjectRegistry(
             self, release_later, self._storage_lease.close
         )
 
+    @property
+    def observed_storage_epoch(self) -> int:
+        """The stored-format epoch observed when this registry opened its lease."""
+        return self._storage_lease.observed_epoch
+
     def _ensure_root(self) -> None:
         created = False
         try:
