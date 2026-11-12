@@ -3489,7 +3489,10 @@ async def _run_child_finish_gate_order(
             child_store.close()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="finish-gate task cleanup",
+        )
         store.close()
         await loop.close()
 
