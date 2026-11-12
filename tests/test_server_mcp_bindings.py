@@ -549,6 +549,8 @@ async def test_reconnect_rebinds_mcp_during_pending_approval(
                 asyncio.shield(server.control._turn_task), TIMEOUT
             )
             assert mcp.methods.count("tools/call") == 1
+            call_index = mcp.methods.index("tools/call")
+            assert mcp.headers[call_index] == "Bearer reconnect-secret"
         finally:
             writer2.close()
             await writer2.wait_closed()
