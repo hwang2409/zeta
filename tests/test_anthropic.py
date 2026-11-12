@@ -413,10 +413,10 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         for block in request_payload["system"]
     )
     assert request_payload["model"] == "claude-sonnet-4-6"
-    assert request_payload["max_tokens"] == 16384
+    assert request_payload["max_tokens"] == 128000
     assert request_payload["thinking"] == {
         "type": "enabled",
-        "budget_tokens": 8192,
+        "budget_tokens": 64000,
     }
     assert "interleaved-thinking-2025-05-14" in requests[0].headers["anthropic-beta"]
     assert request_payload["system"][0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
