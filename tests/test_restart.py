@@ -143,24 +143,28 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ("main-arm", "fork-waits", "composer-blocks", "now", "bad-arg"),
+    ("main-arm", "fork-waits", "macro", "composer-blocks", "now", "bad-arg"),
 )
 async def test_restart_controller_covers_fork_and_argument_cases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    states: dict[TUIApp, tuple[bool, bool]] = {}
+    states: dict[TUIApp, tuple[bool, bool, bool]] = {}
 
     def running(app: TUIApp) -> bool:
         return states[app][0]
 
-    def composer_empty(app: TUIApp) -> bool:
+    def active(app: TUIApp) -> bool:
         return states[app][1]
+
+    def composer_empty(app: TUIApp) -> bool:
+        return states[app][2]
 
     monkeypatch.setattr(
         TUIApp,
         "restart_has_running_work",
         property(running),
     )
+    monkeypatch.setattr(TUIApp, "active", property(active))
     monkeypatch.setattr(TUIApp, "composer_empty", property(composer_empty))
     main = TUIApp(
         AgentLoop(
@@ -183,16 +187,27 @@ async def test_restart_controller_covers_fork_and_argument_cases(
     controller = ForkStackController(main, lambda _target: asyncio.sleep(0, result=fork))
     controller._stack.append(fork)
     fork.set_fork_controller(controller)
-    states[main] = (case in {"main-arm", "fork-waits", "composer-blocks", "now"}, True)
-    states[fork] = (False, case != "composer-blocks")
+    states[main] = (
+        case in {"main-arm", "fork-waits", "composer-blocks", "now"},
+        case == "macro",
+        True,
+    )
+    states[fork] = (False, False, case != "composer-blocks")
     try:
         if case == "main-arm":
             assert await main._slash_commands.dispatch_async(main, "/restart") == (
                 "restart pending · waiting for running work · /restart now to cancel it"
             )
-            states[main] = (False, True)
+            states[main] = (False, False, True)
             controller.notify_restart_idle_check()
             assert controller.restart_requested and fork._exit_requested
+        elif case == "macro":
+            assert await main._slash_commands.dispatch_async(main, "/restart") == (
+                "restart pending · waiting for running work · /restart now to cancel it"
+            )
+            states[main] = (False, False, True)
+            controller.notify_restart_idle_check()
+            assert controller.restart_requested
         elif case == "fork-waits":
             assert await fork._slash_commands.dispatch_async(fork, "/restart") == (
                 "restart pending · waiting for running work · /restart now to cancel it"
@@ -204,10 +219,10 @@ async def test_restart_controller_covers_fork_and_argument_cases(
             )
         elif case == "composer-blocks":
             assert await main._slash_commands.dispatch_async(main, "/restart")
-            states[main] = (False, True)
+            states[main] = (False, False, True)
             controller.notify_restart_idle_check()
             assert not controller.restart_requested
-            states[fork] = (False, True)
+            states[fork] = (False, False, True)
             controller.notify_restart_idle_check()
             assert controller.restart_requested and fork._exit_requested
         elif case == "now":

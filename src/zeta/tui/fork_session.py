@@ -227,7 +227,9 @@ class ForkStackController:
 
     @property
     def restart_has_running_work(self) -> bool:
-        return any(runtime.restart_has_running_work for runtime in self._stack)
+        return any(
+            runtime.restart_has_running_work or runtime.active for runtime in self._stack
+        )
 
     def _restart_is_idle(self) -> bool:
         return (
