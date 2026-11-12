@@ -504,6 +504,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         try:
             await self._settle_slash(entry, message.task)
         finally:
+            self._host._maybe_restart_when_idle()
             # the command finished after the keypress that started it was drawn; nothing else
             # repaints an idle screen, so its output would wait for the next key.
             self._host._invalidate_prompt()
