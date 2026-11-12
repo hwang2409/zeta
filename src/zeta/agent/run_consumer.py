@@ -205,7 +205,13 @@ async def consume_run(
                 # moot once the run is terminal: delivering one re-enters the
                 # concluded gate or re-exposes the already-consumed request to the
                 # model, which never ends. The consumed request was acked when its
-                # turn ended, so nothing is lost; settle the queue and finalize.
+                # turn ended, so nothing is lost. Durably settle the moot
+                # notifications -- the task was killed, the sub-agent is adopted by
+                # the parent -- so they are not re-delivered on resume, then close
+                # the queue and finalize.
+                stale = flow.pending_ids()
+                if stale:
+                    await flow.store.acknowledge_staged_delivery(None, stale)
                 await flow.admit_terminal("segment_end")
                 terminal_result = _finalize_result(
                     result,

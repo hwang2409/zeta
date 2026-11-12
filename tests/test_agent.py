@@ -11543,6 +11543,10 @@ async def test_consume_run_after_finish_gate_terminal(
         assert seen_prompts == (
             ["new follow-up"] if late_input == "new_prompt" else []
         )
+        # Nothing is left pending for a resume to re-deliver: a moot
+        # notification was durably acked, a delivered prompt was consumed.
+        flow = await child_loop._ensure_step_delivery()
+        assert flow.pending_ids() == ()
     finally:
         await child_loop.close()
         child_store.close()
