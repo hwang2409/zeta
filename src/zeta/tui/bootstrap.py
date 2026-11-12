@@ -608,9 +608,20 @@ def _create_app_with_root(
     budget_pinned = composition.budget_pinned
     theme_notices = _apply_startup_theme(config.theme, home)
     _validate_keybindings(config.keybindings)
+    project_registry_notice = (
+        (
+            (
+                "project memory and inbox are off for this session: the project registry "
+                "was busy; restart to retry"
+            ),
+        )
+        if composition.project_registry_busy
+        else ()
+    )
     startup_notices = (
         tuple(loaded_settings.notices)
         + project_context.notices
+        + project_registry_notice
         + external_tools.notices
         + theme_notices
     )

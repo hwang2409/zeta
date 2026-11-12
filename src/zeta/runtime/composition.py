@@ -75,6 +75,7 @@ class RuntimeComposition:
     external_tools: ExternalToolDiscovery
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
+    project_registry_busy: bool = False
 
 
 def compose_runtime(
@@ -462,6 +463,11 @@ def compose_runtime(
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
+            project_registry_busy=(
+                project_discovery.registry_busy
+                if project_discovery is not None
+                else False
+            ),
         )
         cleanup.pop_all()
         return composition
