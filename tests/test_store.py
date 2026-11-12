@@ -3323,22 +3323,26 @@ async def test_approval_policy_ignores_legacy_resident_maps(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    "mode",
+    "scenario",
     [
         "index_stale_logical",
         "own_append_physical",
         "index_unavailable",
         "closed_store",
+        "resolve_visible_to_now",
+        "concurrent_own_append",
     ],
 )
 @pytest.mark.asyncio
-async def test_approval_read_seam_answers_from_branch_instead_of_raising(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+async def test_approval_read_seam_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    # B1/M5: an approval read must never surface StaleHistorySnapshot or an fd
-    # error to its caller. When the sidecar is stale, moving under this store's
-    # own append, unavailable, or the store is closed, the seam answers from the
-    # authoritative resident branch instead of raising.
+    # One table for the store approval read seam. The never-raise and
+    # concurrent-append rows are the B1/M5 regression (they fail on 9cb37568 at
+    # the assertion below); resolve_visible_to_now guards the B2 head-leaf memo.
+    # Policy/serve approve cannot deterministically reach the stale, own-append,
+    # or index-unavailable cases (they need the store internals), so this table
+    # lives at the store seam; publication-step rows belong to the serve lane.
     store = ConversationStore(tmp_path, session_id="seam")
     call = ToolCall("req-seam", "bash", {"cmd": "ls"})
     store.append_approval_request(call.id, call)
@@ -3348,9 +3352,39 @@ async def test_approval_read_seam_answers_from_branch_instead_of_raising(
     def raise_stale(*_args: object, **_kwargs: object) -> object:
         raise StaleHistorySnapshot
 
-    if mode == "index_stale_logical":
+    if scenario == "resolve_visible_to_now":
+        assert store.approval_state_now(call.id) == (call, None)
+        assert store.approval_resolution_now(call.id) is None
+        assert [rid for rid, _ in store.pending_approval_page_now().items] == [call.id]
+        store.resolve_approval(call.id, "allow")
+        assert store.approval_state_now(call.id) == (call, "allow")
+        assert store.approval_resolution_now(call.id)["decision"] == "allow"
+        assert store.pending_approval_page_now().items == ()
+        store.close()
+        return
+
+    if scenario == "concurrent_own_append":
+        async def appender() -> None:
+            for index_i in range(60):
+                await store.append_message_async(
+                    message(MessageRole.ASSISTANT, f"row {index_i}")
+                )
+
+        async def reader() -> list[object]:
+            return [await store.approval_state(call.id) for _ in range(60)]
+
+        _written, states = await asyncio.wait_for(
+            asyncio.gather(appender(), reader()), 30
+        )
+        assert all(state == (call, None) for state in states), (
+            "every read must return the pending request, never raise or miss it"
+        )
+        store.close()
+        return
+
+    if scenario == "index_stale_logical":
         monkeypatch.setattr(index, "approval_state", raise_stale)
-    elif mode == "own_append_physical":
+    elif scenario == "own_append_physical":
         real_facts = store._history_index_facts
         seen = {"n": 0}
 
@@ -3363,10 +3397,12 @@ async def test_approval_read_seam_answers_from_branch_instead_of_raising(
                 facts["byte_boundary"] = int(facts["byte_boundary"]) + 1
             return facts
 
+        # test-contract: seam forces the in-flight own-append physical-facts move
         monkeypatch.setattr(store, "_history_index_facts", moving_facts)
         monkeypatch.setattr(index, "approval_state", raise_stale)
-    elif mode == "index_unavailable":
+    elif scenario == "index_unavailable":
         index._mark_unavailable()
+        # test-contract: seam forces the index-unavailable rebuild-failure path
         monkeypatch.setattr(
             "zeta.core.store._history_index._rebuild_history_index",
             lambda _store: (_ for _ in ()).throw(
@@ -3378,62 +3414,11 @@ async def test_approval_read_seam_answers_from_branch_instead_of_raising(
 
     try:
         state = await asyncio.wait_for(store.approval_state(call.id), 10)
-    except (HistoryIndexError, OSError):
+    except (HistoryIndexError, OSError, storage_format.StorageFormatError):
         state = "seam raised"
     assert state == (call, None), f"seam must answer from the branch, got {state!r}"
-    if mode != "closed_store":
+    if scenario != "closed_store":
         store.close()
-
-
-def test_resolve_on_loop_is_visible_to_the_now_seam_at_once(
-    tmp_path: Path,
-) -> None:
-    # B2 memo: the sync `*_now` seam memoizes the resident projection by the
-    # active leaf. A resolve on the loop moves the leaf, so the next `*_now`
-    # read reflects it with no sync and no refresh.
-    store = ConversationStore(tmp_path, session_id="now-memo")
-    call = ToolCall("req-now", "bash", {"cmd": "ls"})
-    store.append_approval_request(call.id, call)
-
-    assert store.approval_state_now(call.id) == (call, None)
-    assert store.approval_resolution_now(call.id) is None
-    assert [rid for rid, _ in store.pending_approval_page_now().items] == [call.id]
-
-    store.resolve_approval(call.id, "allow")
-
-    assert store.approval_state_now(call.id) == (call, "allow")
-    assert store.approval_resolution_now(call.id)["decision"] == "allow"
-    assert store.pending_approval_page_now().items == ()
-    store.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_own_append_keeps_approval_reads_correct(
-    tmp_path: Path,
-) -> None:
-    # B1 reproduction: back-to-back own appends move the log file while a reader
-    # polls approval_state. On the pre-fix store the reads raised
-    # StaleHistorySnapshot; the seam now returns the right state on every read.
-    store = ConversationStore(tmp_path, session_id="race")
-    call = ToolCall("req-race", "bash", {"cmd": "ls"})
-    store.append_approval_request(call.id, call)
-
-    async def appender() -> None:
-        for index in range(60):
-            await store.append_message_async(
-                message(MessageRole.ASSISTANT, f"row {index}")
-            )
-
-    async def reader() -> list[object]:
-        return [await store.approval_state(call.id) for _ in range(60)]
-
-    _written, states = await asyncio.wait_for(
-        asyncio.gather(appender(), reader()), 30
-    )
-    assert all(state == (call, None) for state in states), (
-        "every read must return the pending request, never raise or miss it"
-    )
-    store.close()
 
 
 def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:

@@ -96,12 +96,22 @@ class IncrementalValidationMixin:
 
         Approval-row validation is independent of the derived sidecar: it reads
         the resident branch so a stale or absent index can never fail (or pass)
-        an authoritative write.
+        an authoritative write. The already-committed branch is known valid, so
+        this collects its request/resolution relations in one tight pass rather
+        than re-running per-entry validation; only the candidate row is checked.
         """
-        approvals = _ApprovalValidationOverlay()
+        relations: dict[str, str | None] = {}
         for entry in self._active_branch():
-            approvals.record(entry)
-        return approvals
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", ()):
+                    request_id = request.get("request_id")
+                    if isinstance(request_id, str):
+                        relations.setdefault(request_id, None)
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                if isinstance(request_id, str):
+                    relations[request_id] = entry.data.get("decision")
+        return _ApprovalValidationOverlay(relations)
 
     def _reset_incremental_validation_state(self) -> None:
         self._entry_ids: set[str] = set()
