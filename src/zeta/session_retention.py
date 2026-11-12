@@ -249,7 +249,7 @@ class _Budget:
 
 
 @dataclass
-class _RootScan:
+class _ClosureBudget:
     """One root's reference-scan counters; every record also charges the pass."""
 
     budget: _Budget
@@ -404,7 +404,7 @@ class RetentionPlanner:
         sweep = self._sweep
         if sweep is None or sweep.days != days:
             self.close()
-            sweep = self._sweep = _Sweep(days, self._now_ns(), _list_roots(home_fd))
+            sweep = self._sweep = _Sweep(days, self._now_ns(), _discover_roots(home_fd))
         budget = _Budget(self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns)
         reasons = self._advance(home_fd, sweep, budget)
         complete = sweep.index >= len(sweep.roots)
@@ -456,7 +456,7 @@ class RetentionPlanner:
             flight = self._hold(sessions_fd, root_id)
             if not self._walk(flight, budget):
                 return None
-            reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, _RootScan(budget))
+            reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, _ClosureBudget(budget))
         except _Deferred:
             if not self._flight.deferred:
                 self._flight.deferred = True
@@ -483,7 +483,7 @@ class RetentionPlanner:
                 root_fd = stack.enter_context(child_directory(sessions_fd, root_id))
             except FileNotFoundError as exc:
                 raise SessionNotFoundError(f"session {root_id} was not found") from exc
-            store_dirs = [(), *_iter_store_dirs(root_fd)]
+            store_dirs = [(), *_authority_store_dirs(root_fd)]
             for comps in store_dirs:
                 dfd = stack.enter_context(_descend(root_fd, comps))
                 _flock_nb(dfd)
@@ -504,7 +504,7 @@ class RetentionPlanner:
         root_entries = 0
         while not walk.done:
             if walk.listing is None:
-                walk.listing = _open_listing(flight, walk)
+                walk.listing = _walk_directory(flight, walk)
             comps, names = walk.listing
             with _descend(flight.root_fd, comps) as dfd:
                 while names:
@@ -524,7 +524,7 @@ class RetentionPlanner:
     def _closure_reason(self, home_fd, sessions_fd, flight, sweep, scan) -> str | None:
         return _ClosureAuthority(self, home_fd, sessions_fd, flight, sweep, scan).classify()
 
-    def _sent_reason(self, flight) -> str | None:
+    def _authority_sent_reason(self, flight) -> str | None:
         for comps in flight.store_dirs:
             with _descend(flight.root_fd, comps) as directory_fd:
                 reason = _sent_file_reason(directory_fd)
@@ -539,7 +539,7 @@ class RetentionPlanner:
         seen = {root_id}
         current = root_id
         for _ in range(self.bounds.metadata_candidates):
-            parent = _parent_id(sessions_fd, current)
+            parent = _authority_parent_id(sessions_fd, current)
             if parent is None:
                 return False
             if parent in seen:
@@ -602,11 +602,11 @@ class _ClosureAuthority:
                 ids.add(root_id + ":" + ":".join(child_parts))
         checks = (
             lambda: "session is being deleted" if _reservation_present(self.home_fd, root_id) else None,
-            lambda: _store_reason(self.flight),
-            lambda: self.planner._sent_reason(self.flight),
+            lambda: _authority_store_reason(self.flight),
+            lambda: self.planner._authority_sent_reason(self.flight),
             lambda: "pinned" if self.planner._pinned(self.sessions_fd, self.flight.root_fd, root_id) else None,
-            lambda: _inbox_reason(self.home_fd, ids, self.scan),
-            lambda: _dependent_reason(self.sessions_fd, root_id, self.scan),
+            lambda: _authority_inbox_reason(self.home_fd, ids, self.scan),
+            lambda: _authority_dependents(self.sessions_fd, root_id, self.scan),
         )
         if (reason := next((item for check in checks if (item := check()) is not None), None)) is not None:
             return reason
@@ -621,7 +621,7 @@ _descend = descend_directory
 _TIMESTAMP_FIELDS = ("created_at", "updated_at", "started_at", "finished_at")
 
 
-def _list_roots(home_fd) -> tuple[str, ...]:
+def _discover_roots(home_fd) -> tuple[str, ...]:
     """Every root directory id at sweep start, in sorted order."""
     try:
         with child_directory(home_fd, "sessions") as sessions_fd:
@@ -660,7 +660,7 @@ def _lease_file(stack, directory_fd, name) -> None:
     _flock_nb(fd)
 
 
-def _open_listing(flight: _InFlight, walk: _Walk):
+def _walk_directory(flight: _InFlight, walk: _Walk):
     comps = walk.frontier.pop()
     if len(comps) > _MAX_TREE_DEPTH:
         raise RetentionPlannerError("tree is too deep")
@@ -733,13 +733,13 @@ def _sent_file_reason(directory_fd) -> str | None:
     return None
 
 
-def _store_reason(flight: _InFlight) -> str | None:
+def _authority_store_reason(flight: _InFlight) -> str | None:
     """Store-local blockers; also folds metadata timestamps into activity."""
     for comps in flight.store_dirs:
         with _descend(flight.root_fd, comps) as dfd:
             if _read_json(dfd, _PENDING_LINK_NAME) is not None:
                 return "pending project link"
-            if _directory_nonempty(dfd, _PENDING_CHILD_LINKS_DIRNAME):
+            if _authority_directory_nonempty(dfd, _PENDING_CHILD_LINKS_DIRNAME):
                 return "pending child link"
             if _has_child_marker(dfd):
                 return "live or recoverable child"
@@ -803,7 +803,7 @@ def _metadata_activity(value) -> int:
     return latest
 
 
-def _parent_id(sessions_fd, session_id) -> str | None:
+def _authority_parent_id(sessions_fd, session_id) -> str | None:
     """The metadata parent id; malformed metadata makes the root ineligible."""
     try:
         with child_directory(sessions_fd, session_id) as session_fd:
@@ -820,16 +820,16 @@ def _parent_id(sessions_fd, session_id) -> str | None:
     return parent
 
 
-def _inbox_reason(home_fd, ids, scan: _RootScan) -> str | None:
-    for status_fd in _inbox_status_dirs(home_fd):
-        for name in sorted(os.listdir(status_fd)):
-            scan.charge(0)
-            if name.endswith(".json") and _inbox_names(_read_json(status_fd, name, scan), ids):
+def _authority_inbox_reason(home_fd, ids, scan: _ClosureBudget) -> str | None:
+    for status_fd in _authority_inbox_dirs(home_fd):
+        for entry in scan.iter_entries(status_fd):
+            name = entry.name
+            if name.endswith(".json") and _classify_inbox_record(_read_json(status_fd, name, scan), ids):
                 return "pending inbox reference"
     return None
 
 
-def _inbox_status_dirs(home_fd):
+def _authority_inbox_dirs(home_fd):
     """Yield each project's inbox ``new`` and ``claimed`` fds, never following links."""
     with ExitStack() as stack:
         projects_fd = _open_dir(stack, home_fd, "projects")
@@ -862,11 +862,11 @@ def _open_dir(stack, directory_fd, name) -> int | None:
     return fd
 
 
-def _dependent_reason(sessions_fd, root_id, scan: _RootScan) -> str | None:
+def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | None:
     """Scan every other root for a published dependent; a bound hit blocks."""
-    for other in sorted(os.listdir(sessions_fd)):
-        scan.charge(0)
-        if other == root_id or other.startswith(".") or not _is_directory(sessions_fd, other):
+    for entry in scan.iter_entries(sessions_fd):
+        other = entry.name
+        if other == root_id or other.startswith(".") or not entry.is_dir(follow_symlinks=False):
             continue
         try:
             with child_directory(sessions_fd, other) as other_fd:
@@ -912,7 +912,7 @@ def _dependent_reason(sessions_fd, root_id, scan: _RootScan) -> str | None:
     return None
 
 
-def _iter_store_dirs(root_fd, prefix=()):
+def _authority_store_dirs(root_fd, prefix=()):
     """Yield component paths for every child store directory under a root."""
     if len(prefix) > _MAX_TREE_DEPTH:
         raise RetentionPlannerError("tree is too deep")
@@ -929,7 +929,7 @@ def _iter_store_dirs(root_fd, prefix=()):
     for name in entries:
         comps = (*prefix, _AGENTS_DIRNAME, name)
         yield comps
-        yield from _iter_store_dirs(root_fd, comps)
+        yield from _authority_store_dirs(root_fd, comps)
 
 
 def _reservation_present(home_fd, root_id) -> bool:
@@ -945,13 +945,13 @@ def _reservation_present(home_fd, root_id) -> bool:
     return False
 
 
-def _directory_nonempty(directory_fd, name) -> bool:
+def _authority_directory_nonempty(directory_fd, name) -> bool:
     with ExitStack() as stack:
         fd = _open_dir(stack, directory_fd, name)
         return fd is not None and any(not entry.startswith(".") for entry in os.listdir(fd))
 
 
-def _inbox_names(record, ids) -> bool:
+def _classify_inbox_record(record, ids) -> bool:
     if type(record) is not dict:
         raise RetentionPlannerError("malformed inbox record")
     if not record:
