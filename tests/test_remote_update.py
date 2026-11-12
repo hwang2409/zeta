@@ -92,8 +92,11 @@ def run_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote: Path, targe
     old_path = os.environ.copy()
     os.environ.update(env)
     try:
-        with pytest.raises(SystemExit) if False else _capture() as captured:
-            code = main(["remote", "update", "fake-host"])
+        with _capture() as captured:
+            try:
+                code = main(["remote", "update", "fake-host"])
+            except SystemExit as exc:
+                code = int(exc.code)
     finally:
         os.environ.clear()
         os.environ.update(old_path)
