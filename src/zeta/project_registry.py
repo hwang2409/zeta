@@ -28,6 +28,7 @@ from .core.session_files import (
     SessionError,
     atomic_publish_file,
     open_session_file,
+    reference_publication,
 )
 from .locking import format_lock
 from .memory.transaction import MemoryTransactions
@@ -911,9 +912,17 @@ class ProjectRegistry(
         prepared = self._prepare_session_records(project_id, records)
         if not prepared:
             return
-        with self._project_lock(
-            project_id, "sessions", exclusive=True
-        ) as project_fd:
+        ids = tuple(
+            session_id
+            for record in prepared
+            for session_id in (record["session_id"], record.get("parent_session_id"))
+            if isinstance(session_id, str)
+        )
+        with reference_publication(
+            self.root.parent,
+            self._storage_lease,
+            referenced_ids=ids,
+        ), self._project_lock(project_id, "sessions", exclusive=True) as project_fd:
             self._update_sessions_locked(project_fd, set(), prepared)
 
     @staticmethod

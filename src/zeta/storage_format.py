@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 8
+WRITER_EPOCH: Final = 10
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -35,6 +35,8 @@ class StorageFeature(StrEnum):
     ATTENTION_KINDS = "attention_kinds"
     INBOX_DELEGATION = "inbox_delegation"
     PROJECT_LOCKS = "project_locks"
+    APPROVAL_RESTART_REASON = "approval_restart_reason"
+    SESSION_RETENTION = "session_retention"
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
 
 
@@ -45,13 +47,46 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
     StorageFeature.INBOX_DELEGATION: 7,
-    StorageFeature.INBOX_DURABLE_INTENT: 8,
+    StorageFeature.SESSION_RETENTION: 8,
+    # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
+    # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
+    # Recheck main+1 at the final merge.
+    StorageFeature.APPROVAL_RESTART_REASON: 9,
+    StorageFeature.INBOX_DURABLE_INTENT: 10,
 }
 
 
 def feature_enabled(home_epoch: int, feature: StorageFeature) -> bool:
     """Return whether a home can use the feature's stored shapes."""
     return home_epoch >= FEATURE_EPOCHS[feature]
+
+
+# Abort reasons a stored approval resolution may carry. `grace_expired` is
+# reserved for the approval reconnect grace (not emitted yet). `server_restarted`
+# is written by restart recovery at or above APPROVAL_RESTART_REASON's epoch.
+# This is the one owner; _incremental_validation and the registry import it.
+APPROVAL_RESOLUTION_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "controller_disconnected",
+        "turn_canceled",
+        "child_cleanup",
+        "grace_expired",
+        "server_restarted",
+    }
+)
+
+
+def restart_abort_reason(home_epoch: int) -> str | None:
+    """Pick the restart-recovery abort reason for a home at ``home_epoch``.
+
+    One selector for every store in a recovered tree. All stores share the root
+    writer lease, so they share this one observed home epoch.
+    """
+    return (
+        "server_restarted"
+        if feature_enabled(home_epoch, StorageFeature.APPROVAL_RESTART_REASON)
+        else None
+    )
 
 
 def writer_epoch() -> int:
@@ -175,6 +210,17 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
         }
     ),
     "transcript_recovery.target": frozenset({"root_session_id", "child_run_id"}),
+    "retention_arm": frozenset({
+        "schema_version", "gate_version", "armed_by_zeta_version", "armed_at", "preview_id"
+    }),
+    "retention_state": frozenset({
+        "root_id", "device", "inode", "cutoff", "walk_started_at", "lease_epoch",
+        "frontier", "completed_directories", "max_activity", "bytes", "descendant_ids",
+        "entry_count", "reference_cursor", "start_generation", "references", "phase", "preview"
+    }),
+    "retention_preview": frozenset({"preview_id", "days", "cutoff", "root_ids", "count", "bytes", "created_at"}),
+    "retention_reservation": frozenset({"schema_version", "session_id", "transaction_id", "source_path", "trash_path", "device", "inode"}),
+    "retention_manifest": frozenset({"schema_version", "session_id", "transaction_id", "device", "inode", "descendants", "bytes", "stage", "generation"}),
     "sent_message_ledger.v2_root": frozenset({"schema_version", "records"}),
     "sent_message_ledger.v2_record": frozenset(
         {"id", "created_at", "target_project", "publication", "envelope", "reported"}
@@ -207,9 +253,17 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "approval.resolution_reason": APPROVAL_RESOLUTION_REASONS,
     "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
+    "retention.phase": frozenset({
+        "discover", "lease", "walk", "references", "ready", "quarantined", "removing"
+    }),
+    "retention.manifest_stage": frozenset({
+        "quarantined", "projects", "inbox", "attention", "indexes",
+        "references-clean", "removing", "removed", "id_republished"
+    }),
     "conversation.entry_type": frozenset(
         {
             "message",
@@ -290,6 +344,112 @@ def require_closed_variant(shape: str, value: object) -> object:
     if value not in accepted:
         raise StorageFormatError(f"unsupported stored variant for {shape}: {value!r}")
     return value
+
+
+def _retention_text(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise StorageFormatError(f"invalid retention {name}")
+    return value
+
+
+def _retention_count(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise StorageFormatError(f"invalid retention {name}")
+    return value
+
+
+def validate_retention_arm(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_arm")
+    if payload.get("schema_version") != 1 or payload.get("gate_version") != 1:
+        raise StorageFormatError("unsupported retention arm version")
+    for name in ("armed_by_zeta_version", "armed_at", "preview_id"):
+        _retention_text(payload.get(name), name)
+
+
+def validate_retention_preview(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_preview")
+    for name in ("preview_id", "cutoff", "created_at"):
+        _retention_text(payload.get(name), name)
+    days = _retention_count(payload.get("days"), "days")
+    if days == 0:
+        raise StorageFormatError("invalid retention days")
+    roots = payload.get("root_ids")
+    if type(roots) is not list or any(type(item) is not str or not item for item in roots):
+        raise StorageFormatError("invalid retention root ids")
+    if len(set(roots)) != len(roots):
+        raise StorageFormatError("duplicate retention root id")
+    if _retention_count(payload.get("count"), "count") != len(roots):
+        raise StorageFormatError("retention preview count does not match roots")
+    _retention_count(payload.get("bytes"), "bytes")
+
+
+def validate_retention_reservation(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_reservation")
+    if payload.get("schema_version") != 1:
+        raise StorageFormatError("unsupported retention reservation version")
+    for name in ("session_id", "transaction_id", "source_path", "trash_path"):
+        _retention_text(payload.get(name), name)
+    _retention_count(payload.get("device"), "device")
+    _retention_count(payload.get("inode"), "inode")
+
+
+def validate_retention_manifest(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_manifest")
+    if payload.get("schema_version") != 1:
+        raise StorageFormatError("unsupported retention manifest version")
+    for name in ("session_id", "transaction_id"):
+        _retention_text(payload.get(name), name)
+    for name in ("device", "inode", "bytes", "generation"):
+        _retention_count(payload.get(name), name)
+    descendants = payload.get("descendants")
+    if type(descendants) is not list or any(
+        type(item) is not str or not item for item in descendants
+    ):
+        raise StorageFormatError("invalid retention descendants")
+    if len(set(descendants)) != len(descendants):
+        raise StorageFormatError("duplicate retention descendant")
+    require_closed_variant("retention.manifest_stage", payload.get("stage"))
+
+
+def validate_retention_state(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_state")
+    for name in ("root_id", "cutoff", "walk_started_at", "lease_epoch"):
+        _retention_text(payload.get(name), name)
+    for name in ("device", "inode", "max_activity", "bytes", "entry_count", "start_generation"):
+        _retention_count(payload.get(name), name)
+    frontier = payload.get("frontier")
+    if type(frontier) is not list or any(
+        type(path) is not list
+        or any(type(component) is not str or not component for component in path)
+        for path in frontier
+    ):
+        raise StorageFormatError("invalid retention frontier")
+    completed = payload.get("completed_directories")
+    if type(completed) is not list or any(
+        type(item) is not list
+        or len(item) != 4
+        or type(item[0]) is not str
+        or any(type(value) is not int or value < 0 for value in item[1:])
+        for item in completed
+    ):
+        raise StorageFormatError("invalid retention completed directories")
+    descendants = payload.get("descendant_ids")
+    if type(descendants) is not list or any(
+        type(item) is not str or not item for item in descendants
+    ):
+        raise StorageFormatError("invalid retention descendant ids")
+    cursor = payload.get("reference_cursor")
+    references = payload.get("references")
+    if type(cursor) is not dict or type(references) is not dict:
+        raise StorageFormatError("invalid retention reference progress")
+    require_closed_variant("retention.phase", payload.get("phase"))
+    if "preview" not in payload:
+        raise StorageFormatError("missing retention preview")
+    preview = payload["preview"]
+    if preview is not None:
+        if type(preview) is not dict:
+            raise StorageFormatError("invalid retention preview")
+        validate_retention_preview(preview)
 
 
 def registry_dump() -> dict[str, object]:

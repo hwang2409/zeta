@@ -162,15 +162,23 @@ def _client_notifier(client: _Client):
 
 def _hold_registry_lock_after_start(
     home: str,
+    warmed: multiprocessing.synchronize.Event,
     start: multiprocessing.synchronize.Event,
     ready: multiprocessing.synchronize.Event,
     release: multiprocessing.synchronize.Event,
 ) -> None:
-    assert start.wait(timeout=5)
+    # Warm up this spawned process (import plus opening the home fd) and signal
+    # `warmed` before the test starts timing the lock handoff. Only the flock
+    # itself then falls inside the `ready` deadline. Without this, slow spawn
+    # startup on a loaded CI runner can miss the deadline, the lock never looks
+    # held, and the account-lock timeout never reaches serve.
     store = AccountStore(home)
-    with store._home() as home_fd, store._registry_guard(home_fd):
-        ready.set()
-        release.wait()
+    with store._home() as home_fd:
+        warmed.set()
+        assert start.wait(timeout=30), "hang: set_settings never reached the lock"
+        with store._registry_guard(home_fd):
+            ready.set()
+            assert release.wait(timeout=30), "hang: test never released the lock"
 
 
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
@@ -7670,15 +7678,19 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
     )
     reader, writer = await _connect(server)
     context = multiprocessing.get_context("spawn")
+    warmed = context.Event()
     start = context.Event()
     ready = context.Event()
     release = context.Event()
     holder = context.Process(
         target=_hold_registry_lock_after_start,
-        args=(str(tmp_path), start, ready, release),
+        args=(str(tmp_path), warmed, start, ready, release),
     )
     holder.start()
     try:
+        # Let the spawned holder finish startup before timing the lock handoff,
+        # so only the flock acquire sits inside the `ready` deadline below.
+        assert await asyncio.to_thread(warmed.wait, 60), "hang: holder never warmed up"
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         original_resolve = AccountStore.resolve_account
@@ -7686,7 +7698,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
         def resolve_then_lock(store, provider, selected=None):
             resolved = original_resolve(store, provider, selected)
             start.set()
-            assert ready.wait(timeout=5)
+            assert ready.wait(timeout=30), "hang: holder never acquired the lock"
             return resolved
 
         monkeypatch.setattr(AccountStore, "resolve_account", resolve_then_lock)
@@ -13081,10 +13093,20 @@ async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["oserror", "cancelled"])
+@pytest.mark.parametrize(
+    "variant",
+    ["oserror", "cancelled_settlement_owner", "cancelled_external_end_owner"],
+)
 async def test_delegated_history_failure_still_publishes_approval_end_first(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
+    failure = "oserror" if variant == "oserror" else "cancelled"
+    # Two tasks race to publish the delegated approval end: the deny settlement
+    # task and the shielded runtime TOOL_APPROVAL_END task. Whichever reaches
+    # _finish_record first becomes record.publication_owner and performs the
+    # history write. The cancellation target must be that owner, not an assumed
+    # task, so force each ownership order deterministically and cancel the owner.
+    settlement_owns_first = variant == "cancelled_settlement_owner"
     target = tmp_path / "input.txt"
     target.write_text("data")
     agent = ToolCall(
@@ -13124,6 +13146,26 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     monkeypatch.setattr(
         ConversationStore, "append_approval_history_async", fail_terminal_history
     )
+
+    real_finish_record = ApprovalLifecycle._finish_record
+
+    async def ordered_finish_record(self, record, resolution, row=None):
+        # The settlement task runs _finish_record inline; the runtime
+        # TOOL_APPROVAL_END route runs it in a separate shielded task. Hold the
+        # route that must lose the ownership race until the winner owns the
+        # record and is blocked inside the history write (history_write_started).
+        live = self._state.records.get(record.target.key)
+        settlement_task = live.settlement if live is not None else record.settlement
+        is_settlement = asyncio.current_task() is settlement_task
+        if is_settlement != settlement_owns_first:
+            await asyncio.wait_for(history_write_started.wait(), timeout=10)
+        return await real_finish_record(self, record, resolution, row)
+
+    if failure == "cancelled":
+        # test-contract: seam no public hook orders the two publication routes
+        monkeypatch.setattr(
+            ApprovalLifecycle, "_finish_record", ordered_finish_record
+        )
     reader, writer = await _ready(server)
     assert server.connections is not None
     parent_tool_ended = asyncio.Event()
@@ -13180,14 +13222,17 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             )
             await writer.drain()
             await asyncio.wait_for(history_write_started.wait(), timeout=10)
-            settlement = None
+            owner = None
             if failure == "cancelled":
                 record = server.control._approvals.state.records[
                     (approval["agent_instance_id"], child_call.id)
                 ]
-                settlement = record.settlement
-                assert settlement is not None
-                settlement.cancel()
+                owner = record.publication_owner
+                assert owner is not None and not owner.done()
+                # The forced order must make the intended task own publication,
+                # so the external-first row cannot silently become a 50/50 race.
+                assert (owner is record.settlement) is settlement_owns_first
+                owner.cancel()
                 await asyncio.wait_for(history_cancelled.wait(), timeout=10)
             approval_owner = (
                 "approval_end",
@@ -13201,8 +13246,12 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             )
             assert len(frames_for_call(frames, approval["request_id"])) == 2
             key = (approval["agent_instance_id"], child_call.id)
-            if settlement is not None:
-                await asyncio.wait_for(settlement, timeout=10)
+            if owner is not None:
+                # The cancelled owner drains without a hang. A cancelled shield
+                # task re-raises CancelledError, so inspect completion rather
+                # than awaiting its result.
+                done, _ = await asyncio.wait([owner], timeout=10)
+                assert owner in done, "publication owner did not drain"
                 assert history_calls == 1
                 status_frames = await _request(reader, writer, 5, "status")
                 frames.extend(status_frames)

@@ -28,6 +28,7 @@ from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
     ProtocolError,
+    bound_reconnect_approvals,
 )
 from .session_replay.rows import DELEGATED, WRITE_FAILED, RowFacts
 
@@ -444,8 +445,7 @@ class ApprovalLifecycle:
         ]
         if not reconnect:
             return visible
-        truncated = len(visible) > 64
-        bounded = visible[:64]
+        bounded, truncated = bound_reconnect_approvals(visible)
         return (bounded, truncated) if include_truncated else bounded
 
     @staticmethod
@@ -1023,7 +1023,8 @@ class ApprovalLifecycle:
                     written = history_outcome is None and record.history_published
                     end_result = self._admit(
                         EventDescriptor.APPROVAL_END, session_id,
-                        replay_row=DELEGATED if written else WRITE_FAILED, **payload,
+                        replay_row=replace(DELEGATED if written else WRITE_FAILED, agent=record.target.key[0]),
+                        **payload,
                     )
                     terminal_result = (
                         self._admit(EventDescriptor.TOOL_END, session_id, **terminal[2])
@@ -1061,8 +1062,10 @@ class ApprovalLifecycle:
                     if current.terminal_watchdog is not None:
                         current.terminal_watchdog.cancel()
                     self._remove(record.target.key)
-        if isinstance(history_outcome, asyncio.CancelledError) or grant_cancelled:
-            raise history_outcome or asyncio.CancelledError
+        # approval_end is already published after a cancelled history await; do not
+        # retry it. Only a deferred grant-publication cancellation is propagated.
+        if grant_cancelled:
+            raise asyncio.CancelledError
 
     async def _start_approval(
         self, event: StreamEvent, session_id: str | None, wire_event: EventDescriptor

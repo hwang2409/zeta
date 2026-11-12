@@ -23,6 +23,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.storage_format import WRITER_EPOCH
 from zeta.tui.slash_handlers import SlashHandlerMixin
 
 
@@ -63,7 +64,7 @@ async def test_corrupt_child_stays_unavailable_until_tui_repair_then_reopens(
         accepts_follow_ups=True,
     )
     restarted = AgentLoop(FakeBackend([]), root, skill_catalog=SkillCatalog.empty())
-    recover_agent_children(restarted)
+    recover_agent_children(restarted, WRITER_EPOCH)
     assert root.agent_notifications() == []
     assert transcript.read_bytes() == damaged
     assert len(root.agent_children()) == 1

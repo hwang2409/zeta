@@ -1320,33 +1320,41 @@ def test_pr_line_final_multiset_and_insertion_table(tmp_path: Path) -> None:
             ).returncode == 0
 
 
-def test_historical_pr_line_rows_are_public_cli_regressions(tmp_path: Path) -> None:
-    for revision in ("628344f0", "f8ccd8fb"):
-        present = subprocess.run(
-            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
-            cwd=Path(__file__).parents[1], check=False,
-        )
-        if present.returncode:
-            if os.environ.get("CI"):
-                raise AssertionError(
-                    f"historical commit {revision} is absent from the CI checkout"
-                )
-            pytest.skip(f"historical commit {revision} is absent from this local checkout")
+def _require_historical_commit(revision: str) -> Path:
     repo_root = Path(__file__).parents[1]
-    first = run(repo_root, "628344f0")
-    first_output = first.stdout + first.stderr
-    assert "pr-line SlashHandlerMixin._show_accounts_picker" in first_output
-    assert "pr-line ServerSlashSession.slash_accounts" in first_output
-    assert "pr/branch parent line" in first_output
-    second = run(repo_root, "f8ccd8fb")
-    second_output = second.stdout + second.stderr
+    present = subprocess.run(
+        ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+        cwd=repo_root, check=False,
+    )
+    if present.returncode:
+        if os.environ.get("CI"):
+            raise AssertionError(
+                f"historical commit {revision} is absent from the CI checkout"
+            )
+        pytest.skip(f"historical commit {revision} is absent from this local checkout")
+    return repo_root
+
+
+def test_historical_pr_line_rows_628344f0_are_public_cli_regressions() -> None:
+    repo_root = _require_historical_commit("628344f0")
+    result = run(repo_root, "628344f0")
+    output = result.stdout + result.stderr
+    assert "pr-line SlashHandlerMixin._show_accounts_picker" in output
+    assert "pr-line ServerSlashSession.slash_accounts" in output
+    assert "pr/branch parent line" in output
+
+
+def test_historical_pr_line_rows_f8ccd8fb_are_public_cli_regressions() -> None:
+    repo_root = _require_historical_commit("f8ccd8fb")
+    result = run(repo_root, "f8ccd8fb")
+    output = result.stdout + result.stderr
     for expected in (
         "tests/test_server_mcp_tool_filter.py: pr-line <module>@",
         "tests/test_mcp_oauth.py: pr-line <module>@",
         "tests/test_mcp_oauth.py: pr-line _monkey_home@",
         "src/zeta/tui/cards/mcp_manager.py: pr-line <module>@",
     ):
-        assert expected in second_output
+        assert expected in output
 
 
 

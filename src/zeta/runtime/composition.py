@@ -363,7 +363,7 @@ def compose_runtime(
         loop.session_metadata = metadata
         loop.account_context = account_context
         if resuming:
-            bootstrap_agent_children(loop)
+            bootstrap_agent_children(loop, manager.observed_storage_epoch)
             opened.store._prepare_durable_writer_snapshot()
         memory_reconciler = None
         if memory_enabled:

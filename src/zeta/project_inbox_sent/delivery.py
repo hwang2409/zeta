@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from ..core.session_files import SessionError
+from ..core.session_files import SessionError, reference_publication
 from ..project_errors import ProjectNotFoundError
 from ..storage_format import StorageFeature, StorageFormatError, feature_enabled
 from . import SentLedgerOutcome, SentMessageTracker
@@ -34,7 +34,7 @@ class SentDelivery:
         from ..project_inbox import InboxConflictError, InboxError
 
         inbox = self._inbox
-        session, target, message_id, body, record = inbox._outgoing(**kwargs)
+        session, target, message_id, to_session, body, record = inbox._outgoing(**kwargs)
         # At the durable-intent epoch a pending record precedes the recipient
         # publish, so a crash in between recovers to exactly one delivery. The
         # post-publish record() call marks it published; below the epoch it
@@ -43,34 +43,45 @@ class SentDelivery:
         durable = feature_enabled(
             inbox.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
         )
-        if durable:
-            # A broken sender ledger saves no intent, so there is nothing to
-            # retry; drop the durable promise and let a failed publish surface
-            # the plain error below, which tells the model it may resend.
-            durable = tracker.record_intent(record).health.state != "broken"
-        try:
-            with inbox._directories(target, create=True) as dirs:
-                inbox._publish_outgoing(dirs, message_id, body, record)
-        except InboxConflictError:
-            raise
-        except (InboxError, OSError, SessionError, StorageFormatError) as exc:
+        lease = inbox.registry._storage_lease
+        # The reference gate holds storage authority while this message (a
+        # reference to one or two sessions) is published and recorded, so the
+        # retention reaper cannot delete a referenced session mid-publish.
+        with reference_publication(
+            inbox.registry.root.parent,
+            lease,
+            referenced_ids=(session, to_session) if to_session else (session,),
+        ):
             if durable:
-                # The intent is already durable; a later poll re-publishes it.
-                # Tell the caller so the model does not send a duplicate.
-                # (_directories translates OSError into a generic InboxError.)
-                raise InboxError(
-                    "inbox message saved; the recipient could not be reached "
-                    "now and delivery will be retried automatically. Do not "
-                    "resend this message."
-                ) from exc
-            raise
-        if on_visible is not None:
+                # A broken sender ledger saves no intent, so there is nothing to
+                # retry; drop the durable promise and let a failed publish
+                # surface the plain error below, which tells the model it may
+                # resend.
+                durable = tracker.record_intent(record).health.state != "broken"
             try:
-                on_visible()
-            except Exception:  # noqa: BLE001,S110
-                # The durable record remains authoritative if its wake cannot run.
-                pass
-        return message_id, tracker.record(message_id, target)
+                with inbox._directories(target, create=True) as dirs:
+                    inbox._publish_outgoing(dirs, message_id, body, record)
+            except InboxConflictError:
+                raise
+            except (InboxError, OSError, SessionError, StorageFormatError) as exc:
+                if durable:
+                    # The intent is already durable; a later poll re-publishes
+                    # it. Tell the caller so the model does not send a duplicate.
+                    # (_directories translates OSError into a generic InboxError.)
+                    raise InboxError(
+                        "inbox message saved; the recipient could not be reached "
+                        "now and delivery will be retried automatically. Do not "
+                        "resend this message."
+                    ) from exc
+                raise
+            if on_visible is not None:
+                try:
+                    on_visible()
+                except Exception:  # noqa: BLE001,S110
+                    # The durable record stays authoritative if its wake fails.
+                    pass
+            outcome = tracker.record(message_id, target, _storage_lease=lease)
+        return message_id, outcome
 
     def recover_sent_intents(self, tracker: SentMessageTracker) -> list[str]:
         """Re-publish each durable intent whose recipient publish is not durable.

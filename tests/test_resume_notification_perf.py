@@ -25,6 +25,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.skills.catalog import SkillCatalog
+from zeta.storage_format import WRITER_EPOCH
 from zeta.tui.app import TUIApp
 
 
@@ -78,7 +79,7 @@ async def test_recovery_does_not_duplicate_notification_appended_after_indexing(
         "sync_agent_completion_notification",
         side_effect=sync_after_external_completion,
     ):
-        await asyncio.to_thread(recover_agent_children, loop)
+        await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
 
     notifications = [
         entry
@@ -130,7 +131,7 @@ async def test_nested_recovery_refreshes_both_notification_stores_per_child(
         "sync_agent_completion_notification",
         side_effect=sync_after_indexes,
     ):
-        await asyncio.to_thread(recover_agent_children, loop)
+        await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
 
     with ConversationStore(child_paths[2].parent, session_id="2") as child_2:
         assert child_2.agent_canceled() is None
@@ -177,7 +178,7 @@ async def test_nested_recovery_uses_notification_returned_by_second_store(
         "sync_agent_completion_notification",
         side_effect=sync_after_fallback,
     ):
-        await asyncio.to_thread(recover_agent_children, loop)
+        await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
 
     with ConversationStore(child_path.parent, session_id=child_path.name) as child:
         assert child.agent_canceled() is None
@@ -217,7 +218,8 @@ def test_recovery_notification_index_keeps_first_duplicate(
         SimpleNamespace(
             store=store,
             _background_owner=SimpleNamespace(notification_store=store),
-        )
+        ),
+        WRITER_EPOCH,
     )
 
     with ConversationStore(child_path.parent, session_id=child_path.name) as child:
@@ -317,7 +319,7 @@ def test_recovery_uses_point_notification_queries_for_many_children(
             wraps=store.sync_agent_completion_notification,
         ) as point_query,
     ):
-        recover_agent_children(loop)
+        recover_agent_children(loop, WRITER_EPOCH)
 
     # test-contract: complexity recovery uses point queries, not full scans
     assert full_scan.call_count == 0

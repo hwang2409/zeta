@@ -13,11 +13,13 @@ from typing import Any
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
 from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import TIMEOUT, _connect, _read, _request
+from zeta.core.session import SessionManager
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -26,9 +28,10 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolUseContent,
     with_message_origin,
 )
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, approval_settlement
 from zeta.server.handlers import history as history_module
 from zeta.server.protocol import EventDescriptor
 
@@ -377,6 +380,197 @@ async def test_observer_joins_with_pending_approval_baseline(tmp_path: Path) -> 
         if legacy_observer_writer is not None:
             legacy_observer_writer.close()
             await legacy_observer_writer.wait_closed()
+        await close_serve(server, controller_writer)
+
+
+@pytest.mark.asyncio
+async def test_join_baseline_represents_durable_approval_after_restart(
+    tmp_path: Path,
+) -> None:
+    # A durable foreground approval persisted before a serve restart must appear in the
+    # join baseline for a resumed idle session, not only in the status RPC. The loop owns
+    # no in-memory approval records until a turn resumes, so the baseline falls back to the
+    # durable store the same way status does.
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call = ToolCall("resumed-call", "read", {"path": str(target)})
+    opened.store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call)],
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    backend = FakeBackend([])
+    server = ZetaServer(
+        home=tmp_path,
+        provider="codex",
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["session_replay_seq"]},
+        )
+        await _request(
+            controller_reader, controller_writer, 2, "resume", {"session_id": session_id}
+        )
+        controller_join = (
+            await _request(
+                controller_reader,
+                controller_writer,
+                3,
+                "session_history_and_subscribe",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+        assert [
+            row["request_id"]
+            for row in controller_join["status"]["pending_approvals"]
+        ] == [call.id]
+
+        observer_reader, observer_writer = await _observer(
+            server, 10, ["serve_observers", "session_replay_seq"]
+        )
+        observer_join = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                11,
+                "session_history_and_subscribe",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]
+        assert [
+            row["request_id"]
+            for row in observer_join["status"]["pending_approvals"]
+        ] == [call.id]
+        rejected = (
+            await _request(
+                observer_reader,
+                observer_writer,
+                12,
+                "approve",
+                {"request_id": call.id},
+            )
+        )[-1]
+        assert rejected["error"]["code"] == -32008
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
+        await close_serve(server, controller_writer)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_baseline_keeps_durable_row_beside_settling_live_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two durable foreground approvals survive a restart. A controller approves one (D1)
+    # over the socket; its decision persists, so D1 is a live settling record while D2
+    # stays durable-only. In that window a second client's join baseline must still list
+    # BOTH D1 (with resolution_pending "approve") and D2. The old rule ("the live rows if
+    # there are any, else the durable store") returned only D1 and dropped D2.
+    manager = SessionManager(tmp_path)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    target = tmp_path / "input.txt"
+    target.write_text("approved")
+    call_one = ToolCall("call-d1", "read", {"path": str(target)})
+    call_two = ToolCall("call-d2", "read", {"path": str(target)})
+    opened.store.append_message_with_approval_requests(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(call_one), ToolUseContent(call_two)],
+        ),
+        [(call_one.id, call_one), (call_two.id, call_two)],
+    )
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = ZetaServer(
+        home=tmp_path,
+        provider="codex",
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    controller_reader, controller_writer = await _connect(server)
+    observer_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            controller_reader,
+            controller_writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["session_replay_seq"]},
+        )
+        await _request(
+            controller_reader, controller_writer, 2, "resume", {"session_id": session_id}
+        )
+
+        # Hold D1 in its settling phase: block the durable persist so the approve handler
+        # parks after it has created D1's live settling record but before it finishes.
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_persist = approval_settlement.persist_durably
+
+        async def blocking_persist(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            await await_or_fail(release.wait(), what="release settlement")
+            return await real_persist(*args, **kwargs)
+
+        monkeypatch.setattr(approval_settlement, "persist_durably", blocking_persist)
+
+        # Approve D1 over the real socket without reading the reply yet; the handler parks
+        # in the blocked persist while D1 settles.
+        await send(controller_reader, controller_writer, 3, "approve", {"request_id": call_one.id})
+        await await_or_fail(entered.wait(), what="settlement entered")
+        try:
+            # A second client joins during the settling window. Its baseline must show D1
+            # settling (resolution_pending) alongside the still-durable D2.
+            observer_reader, observer_writer = await _observer(
+                server, 10, ["serve_observers", "session_replay_seq"]
+            )
+            observer_join = (
+                await _request(
+                    observer_reader,
+                    observer_writer,
+                    11,
+                    "session_history_and_subscribe",
+                    {"session_id": session_id},
+                )
+            )[-1]["result"]
+            rows = {
+                row["request_id"]: row
+                for row in observer_join["status"]["pending_approvals"]
+            }
+            assert set(rows) == {call_one.id, call_two.id}
+            assert rows[call_one.id].get("resolution_pending") == "approve"
+        finally:
+            # Release the persist and read the approve reply off the controller socket,
+            # so a failed assertion above does not deadlock on the parked settlement.
+            release.set()
+            await read_until(
+                controller_reader,
+                lambda frame: frame.get("id") == 3
+                and frame.get("result", {}).get("accepted") is True,
+                what="approve D1 reply",
+            )
+    finally:
+        if observer_writer is not None:
+            observer_writer.close()
+            await observer_writer.wait_closed()
         await close_serve(server, controller_writer)
 
 

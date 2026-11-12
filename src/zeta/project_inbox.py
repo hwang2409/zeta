@@ -23,6 +23,7 @@ from .core.session_files import (
     atomic_publish_file,
     child_directory,
     open_session_file,
+    reference_publication,
 )
 from .project_errors import ProjectNotFoundError
 from .project_inbox_provenance import decorate, delegation_enabled
@@ -369,7 +370,7 @@ class ProjectInbox:
         message_id: str | None = None,
         to_session: str | None = None,
         origin: str = AGENT_ORIGIN,
-    ) -> tuple[str, str, str, str, dict[str, Any]]:
+    ) -> tuple[str, str, str, str | None, str, dict[str, Any]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
         session = _id(from_session, "session id")
@@ -397,7 +398,7 @@ class ProjectInbox:
             "created_at": _now(),
         }
         record.update({"origin": origin}) if delegation_enabled(self.registry) else None
-        return session, target.project_id, message_id, body, record
+        return session, target.project_id, message_id, to_session, body, record
 
     def _publish_outgoing(
         self,
@@ -658,7 +659,11 @@ class ProjectInbox:
         message_id = _id(message_id)
         session_id = _id(session_id, "session id")
         name = f"{message_id}.json"
-        with self._directories(target.project_id, create=True) as dirs:
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session_id,),
+        ), self._directories(target.project_id, create=True) as dirs:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)

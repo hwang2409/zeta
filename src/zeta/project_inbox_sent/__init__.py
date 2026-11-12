@@ -7,7 +7,7 @@ import os
 import re
 import threading
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +21,7 @@ from ..core.session_files import (
 )
 from ..storage_format import (
     StorageFeature,
+    WriterLease,
     feature_enabled,
     open_writer,
     require_closed_variant,
@@ -185,7 +186,13 @@ class SentMessageTracker:
         ):
             yield session_fd
 
-    def record(self, message_id: str, project_id: str) -> SentLedgerOutcome[None]:
+    def record(
+        self,
+        message_id: str,
+        project_id: str,
+        *,
+        _storage_lease: WriterLease | None = None,
+    ) -> SentLedgerOutcome[None]:
         """Record a delivered send after its recipient publish.
 
         Below the durable-intent epoch this writes the schema-v1 ledger row, as
@@ -218,7 +225,9 @@ class SentMessageTracker:
             self._records.sort(key=self._chronology)
             self._pending.add(message_id)
             self._prune()
-            return self._persist((record,), self._deleted_ids)
+            return self._persist(
+                (record,), self._deleted_ids, _storage_lease=_storage_lease
+            )
 
     def record_intent(self, envelope: dict[str, Any]) -> SentLedgerOutcome[None]:
         """Durably record a sender intent before the recipient publish.
@@ -592,7 +601,11 @@ class SentMessageTracker:
         }
 
     def _persist(
-        self, upserts: Iterable[dict[str, Any]], delete_ids: Iterable[str]
+        self,
+        upserts: Iterable[dict[str, Any]],
+        delete_ids: Iterable[str],
+        *,
+        _storage_lease: WriterLease | None = None,
     ) -> SentLedgerOutcome[None]:
         if self._at_epoch:
             return self._persist_v2(upserts, delete_ids)
@@ -618,7 +631,9 @@ class SentMessageTracker:
 
         try:
             with (
-                open_writer(self.sessions_root.parent) as lease,
+                nullcontext(_storage_lease)
+                if _storage_lease is not None
+                else open_writer(self.sessions_root.parent) as lease,
                 self._session_directory(create=True) as session_fd,
             ):
                 try:
