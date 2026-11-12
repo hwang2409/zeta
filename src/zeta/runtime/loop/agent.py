@@ -685,7 +685,9 @@ class AgentLoop(
                 message=user_message,
                 reuse_persisted=False,
             )
-        elif user_message is not None and user_message not in self.store.messages():
+        elif user_message is not None and not self.store.active_branch_contains_message(
+            user_message
+        ):
             raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)

@@ -71,7 +71,7 @@ from tests.support.credentials import (
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
-from tests.support.owned import await_or_fail, owned_app
+from tests.support.owned import await_or_fail, close_owned_app, owned_app
 from tests.support.processes import read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from tests.test_agent import CancelledBeforeAnswerBackend, _collect
@@ -9790,11 +9790,12 @@ async def test_resume_replay_matches_slash_fork_render(
     fork_app = _test_tui_app(store, fork_output)
     with create_pipe_input() as pipe:
         fork_app._active_session = _display_session(fork_app, pipe, full_screen)
-        assert fork_app.slash_fork("saved") == (
+        assert await fork_app.slash_fork("saved") == (
             "forked to checkpoint 'saved' at seq 13"
         )
         forked = _rendered_display(fork_app, fork_output, full_screen)
 
+    await close_owned_app(fork_app)
     resumed = await _run_reopened_session(store, full_screen)
     assert resumed == forked
 
@@ -9811,10 +9812,11 @@ async def test_resume_replays_only_the_forked_branch(
     fork_app = _test_tui_app(store, fork_output)
     with create_pipe_input() as pipe:
         fork_app._active_session = _display_session(fork_app, pipe, full_screen)
-        assert fork_app.slash_fork("saved") == (
+        assert await fork_app.slash_fork("saved") == (
             "forked to checkpoint 'saved' at seq 13"
         )
 
+    await close_owned_app(fork_app)
     rendered = Text.from_ansi(await _run_reopened_session(store, full_screen)).plain
     assert "kept reply" in rendered
     assert "new branch" in rendered
