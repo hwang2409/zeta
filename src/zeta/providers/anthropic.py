@@ -94,9 +94,9 @@ DEFAULT_MAX_TOKENS = 16_384
 DEFAULT_THINKING_BUDGET = 8_192
 
 # Published max output tokens per Claude model, from the docs.anthropic.com
-# model overview (read 2026-11-12). Keyed by model id; a dated alias such as
-# claude-sonnet-4-5-20250929 matches its base id by prefix. An unknown model
-# keeps the conservative DEFAULT_MAX_TOKENS / DEFAULT_THINKING_BUDGET.
+# model overview (read 2026-11-12). Keyed by canonical model ids and the
+# documented dated aliases. An unknown model keeps the conservative
+# DEFAULT_MAX_TOKENS / DEFAULT_THINKING_BUDGET.
 MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "claude-opus-4-5": 64_000,
     "claude-opus-4-6": 128_000,
@@ -109,6 +109,9 @@ MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "claude-sonnet-5": 128_000,
     "claude-haiku-4-5": 64_000,
     "claude-fable-5": 128_000,
+    # documented dated model ids
+    "claude-sonnet-4-5-20250929": 64_000,
+    "claude-haiku-4-5-20251001": 64_000,
 }
 
 
@@ -119,18 +122,9 @@ def model_output_limits(model: str) -> tuple[int, int]:
     of it: that leaves the other half for the answer, and keeps the same ratio
     as the 16,384 / 8,192 fallback used for an unknown model.
     """
-    match = max(
-        (
-            key
-            for key in MODEL_MAX_OUTPUT_TOKENS
-            if model == key or model.startswith(key + "-")
-        ),
-        key=len,
-        default=None,
-    )
-    if match is None:
+    limit = MODEL_MAX_OUTPUT_TOKENS.get(model)
+    if limit is None:
         return DEFAULT_MAX_TOKENS, DEFAULT_THINKING_BUDGET
-    limit = MODEL_MAX_OUTPUT_TOKENS[match]
     return limit, limit // 2
 OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
@@ -494,8 +488,10 @@ class AnthropicBackend(CompletionBackend):
         default_max_tokens, default_thinking_budget = model_output_limits(model)
         if max_tokens is None:
             max_tokens = default_max_tokens
-        if thinking_budget is None:
-            thinking_budget = default_thinking_budget
+            if thinking_budget is None:
+                thinking_budget = default_thinking_budget
+        elif thinking_budget is None:
+            thinking_budget = max_tokens // 2
         _validate_thinking_parameters(max_tokens, thinking_budget)
         self.model = model
         self.max_tokens = max_tokens

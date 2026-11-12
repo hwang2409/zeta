@@ -37,6 +37,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
     build_authorization_url,
     build_messages_payload,
+    model_output_limits,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.completion import (
@@ -439,6 +440,34 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
     ]
     assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
     await client.aclose()
+
+
+def test_explicit_max_tokens_derives_thinking_budget(tmp_path: Path) -> None:
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    backend = AnthropicBackend(
+        model="claude-opus-4-8",
+        max_tokens=32_768,
+        token_store=store,
+    )
+
+    assert backend.max_tokens == 32_768
+    assert backend.thinking_budget == 16_384
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-sonnet-5-5", (16_384, 8_192)),
+        ("claude-sonnet-5-preview", (16_384, 8_192)),
+        ("claude-opus-4-5-preview", (16_384, 8_192)),
+        ("claude-sonnet-4-5-20250929", (64_000, 32_000)),
+        ("claude-haiku-4-5-20251001", (64_000, 32_000)),
+    ],
+)
+def test_model_output_limits_match_only_known_model_ids(
+    model: str, expected: tuple[int, int]
+) -> None:
+    assert model_output_limits(model) == expected
 
 
 @pytest.mark.asyncio
