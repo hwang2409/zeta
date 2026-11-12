@@ -264,6 +264,7 @@ FEATURES = (
     "child_runs",
     "delivery_session_guard",
     "run_work",
+    "approval_restart_reason",
 )
 
 

@@ -17,7 +17,7 @@ from ..core.store._child_runs import (
     verify_child_run_directory,
 )
 from ..core.thread_call import ThreadCallWorkers
-from . import content
+from . import content, event_contract
 from .handlers import history, lifecycle, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
@@ -332,6 +332,11 @@ class ConnectionRegistry(ReplayOutput):
                 state.features
             ):
                 shaped.pop(name)
+        if event is EventDescriptor.APPROVAL_END:
+            shaped = event_contract.approval_end_for_features(
+                shaped,
+                include_restart_reason="approval_restart_reason" in state.features,
+            )
         return shaped
 
     def try_admit_controller(
@@ -908,7 +913,7 @@ class ConnectionRegistry(ReplayOutput):
         runtime = connection.server.runtime
         store = validation.active(runtime, params)
         features = history_features(self._connections[connection].features)
-        return await self.run_read(
+        result = await self.run_read(
             connection,
             lambda: history.history(
                 _observer_runtime(store),
@@ -921,6 +926,7 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
+        return self._strip_restart_reason(connection, result)
 
     async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
         if set(params) - {"handle", "offset", "limit"}:
@@ -965,7 +971,7 @@ class ConnectionRegistry(ReplayOutput):
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
         target = (runtime.session_id, runtime.opened.store)
-        return await self.run_read(
+        result = await self.run_read(
             connection,
             lambda: perform_child_history_read(
                 target,
@@ -975,6 +981,7 @@ class ConnectionRegistry(ReplayOutput):
             ),
             session_id=runtime.session_id,
         )
+        return self._strip_restart_reason(connection, result)
 
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str, *, allow_stale: bool = False

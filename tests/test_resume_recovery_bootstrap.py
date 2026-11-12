@@ -334,10 +334,10 @@ async def test_resume_recovery_cancel_during_setup_is_safe(tmp_path: Path) -> No
 
     original_recover = zeta.agent.background_lifecycle.recover_agent_children
 
-    def gated_recover(loop):
+    def gated_recover(loop, home_epoch):
         entered.set()
         assert release.wait(2)
-        return original_recover(loop)
+        return original_recover(loop, home_epoch)
 
     with patch.object(zeta.agent.background_lifecycle, "recover_agent_children", gated_recover):
         resume = asyncio.create_task(runtime.resume_session(session_id))
