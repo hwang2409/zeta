@@ -16,9 +16,10 @@ from ...project_errors import (
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
-from ...project_inbox import LOCAL_ORIGIN, InboxError, ProjectInbox
+from ...project_inbox import InboxError, ProjectInbox
 from ...project_memory_history import PROJECT_MEMORY_FILES
 from ...project_registry import Project, ProjectRegistry
+from ...storage_format import StorageFeature, feature_enabled
 from ..protocol import ErrorDescriptor, FrameCodec
 
 if TYPE_CHECKING:
@@ -287,7 +288,15 @@ class ProjectRequests:
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
         state = self.inbox.read(project.project_id)
-        messages = [self._bounded_message(request_id, item) for item in state[status]]
+        projected = [
+            self.inbox.decorate(project.project_id, item) for item in state[status]
+        ]
+        messages = [self._bounded_message(request_id, item) for item in projected]
+        provenance_enabled = feature_enabled(
+            self.registry._storage_lease.observed_epoch,
+            StorageFeature.INBOX_DELEGATION,
+        )
+        projected_by_id = {item["id"]: item for item in projected}
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
             request_id,
@@ -298,7 +307,14 @@ class ProjectRequests:
             extra_for_page=lambda page: {
                 "status": status,
                 "untrusted": any(
-                    message.get("origin") != LOCAL_ORIGIN for message in page
+                    (
+                        projected_by_id.get(message.get("id"), {}).get("authority")
+                        != "trusted_assignment"
+                    )
+                    if provenance_enabled
+                    else projected_by_id.get(message.get("id"), {}).get("origin")
+                    != "local"
+                    for message in page
                 ),
                 "invalid": invalid,
             },
@@ -341,7 +357,7 @@ class ProjectRequests:
 
         envelope = {
             "status": "claimed",
-            "untrusted": result.get("origin") != LOCAL_ORIGIN,
+            "untrusted": result.get("authority") != "trusted_assignment",
             "messages": [result],
         }
         optional = [
