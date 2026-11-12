@@ -26,7 +26,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited
 from zeta.agent.receipt import build_agent_receipt, receipt_message_size
-from zeta.core import process_env
 from zeta.core.process_env import CREDENTIAL_ENV_NAMES, subprocess_env
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -2688,7 +2687,6 @@ def test_tmux_tmpdir_falls_back_when_home_dir_cannot_be_made(
     # still drop TMUX/TMUX_PANE and hand out a usable private TMUX_TMPDIR.
     blocker = tmp_path / "home-is-a-file"
     blocker.write_text("")
-    monkeypatch.setattr(process_env, "_FALLBACK_TMUX_TMPDIR", None)
     monkeypatch.setenv("ZETA_HOME", str(blocker))
     monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1,0")
     monkeypatch.setenv("TMUX_PANE", "%1")
