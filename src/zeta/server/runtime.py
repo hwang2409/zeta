@@ -141,6 +141,7 @@ class SessionState:
     policy: ApprovalPolicy
     project_dir: Path
     repo_root: Path
+    project_registry_busy: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -158,6 +159,7 @@ class SessionState:
             policy=composition.policy,
             project_dir=composition.project_dir,
             repo_root=composition.repo_root,
+            project_registry_busy=composition.project_registry_busy,
         )
 
     @property
@@ -354,6 +356,10 @@ class ServerRuntime:
         return self.metadata.session_id
 
     @property
+    def project_registry_busy(self) -> bool:
+        return self._state is not None and self._state.project_registry_busy
+
+    @property
     def project_dir(self) -> Path:
         if self._state is None:
             raise RuntimeError("server has no active session")
@@ -441,27 +447,7 @@ class ServerRuntime:
             model=model,
         )
         await self._replace(composition)
-        await self._publish_project_registry_notice(composition)
         return self.metadata
-
-    async def _publish_project_registry_notice(
-        self, composition: RuntimeComposition
-    ) -> None:
-        if composition.project_registry_busy:
-            await self.control._event(
-                StreamEvent(
-                    StreamEventType.AGENT_NOTIFICATION,
-                    data={
-                        "notification_id": f"project-registry-busy:{self.metadata.session_id}",
-                        "kind": "project_registry_busy",
-                        "text": (
-                            "project memory and inbox are off for this session: "
-                            "the project registry was busy; restart to retry"
-                        ),
-                    },
-                ),
-                session_id=self.metadata.session_id,
-            )
 
     def _prepare_new_session(
         self, session_cwd: Path, provider: str | None, model: str | None
@@ -474,12 +460,14 @@ class ServerRuntime:
         registry = self.manager.project_registry
         if registry is not None and config.auto_project:
             try:
-                discovery = associate_project_discovery(discovery, registry)
+                discovery = associate_project_discovery(
+                    discovery, registry, create=False
+                )
             except (ProjectRegistryError, OSError, ValueError):
                 pass
         projection = (
             project_context_projection_for_discovery(discovery, registry)
-            if registry is not None
+            if registry is not None and not discovery.registry_busy
             else None
         )
         session_project = projection.session_project if projection is not None else None
@@ -532,12 +520,14 @@ class ServerRuntime:
             and opened.metadata.project_id is None
         ):
             try:
-                discovery = associate_project_discovery(discovery, registry)
+                discovery = associate_project_discovery(
+                    discovery, registry, create=False
+                )
             except (ProjectRegistryError, OSError, ValueError):
                 pass
         projection = (
             registry.project_context_projection(opened.metadata.project_id)
-            if registry is not None
+            if registry is not None and not discovery.registry_busy
             else None
         )
         session_project = projection.session_project if projection is not None else None
@@ -584,7 +574,6 @@ class ServerRuntime:
 
         composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
-        await self._publish_project_registry_notice(composition)
         return self.metadata
 
     @staticmethod

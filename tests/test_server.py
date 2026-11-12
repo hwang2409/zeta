@@ -86,7 +86,9 @@ from zeta.core.store import (
 from zeta.core.store._validation import NOTIFICATION_KINDS
 from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken, token_store_path
 from zeta.oauth import OAuthTokens
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
@@ -8712,6 +8714,75 @@ async def _hello_wire_line(home: Path, params: dict[str, Any]) -> str:
     reader, writer = await _connect(server)
     try:
         return await _raw_response_line(reader, writer, "hello", "hello", params)
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("method", ["new_session", "resume"])
+@pytest.mark.parametrize("busy", [False, True], ids=["normal", "busy"])
+@pytest.mark.asyncio
+async def test_session_swap_project_registry_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, busy: bool
+) -> None:
+    project = tmp_path / "project"
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "init", "--quiet", str(project)],
+        check=True,
+        capture_output=True,
+    )
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    await asyncio.to_thread(
+        server.runtime.manager.project_registry.create_project, "other", "test"
+    )
+    params: dict[str, object] = {"provider": "codex"}
+    if method == "resume":
+        opened = await asyncio.to_thread(
+            server.runtime.manager.create,
+            provider="codex",
+            model="test",
+            cwd=project,
+            auto_project=False,
+        )
+        params = {"session_id": opened.metadata.session_id}
+        opened.store.close()
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader, writer, 1, "hello", {"protocol_version": "1.2"}
+        )
+        if busy:
+            def busy_registry(_fd: int, _mode: int) -> None:
+                raise ProjectRegistryBusyError()
+
+            # test-contract: seam hold the registry busy through the retry budget
+            monkeypatch.setattr(
+                ProjectRegistry, "_acquire_lock", staticmethod(busy_registry)
+            )
+        await _send(reader, writer, 2, method, params)
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == 2, what=f"{method} response"
+        )
+        await _send(reader, writer, 3, "status", {})
+        frames += await read_until(
+            reader, lambda frame: frame.get("id") == 3, what="status response"
+        )
+        response = next(frame for frame in frames if frame.get("id") == 2)
+        notices = [
+            frame
+            for frame in frames
+            if frame.get("params", {}).get("data", {}).get("kind")
+            == "project_registry_busy"
+        ]
+
+        assert "result" in response
+        if busy:
+            assert len(notices) == 1, frames
+            assert notices[0]["params"]["session_id"] == response["result"][
+                "session"
+            ]["session_id"]
+        else:
+            assert [frame.get("id") for frame in frames] == [2, 3]
     finally:
         await close_serve(server, writer)
 
