@@ -49,7 +49,7 @@ async def persist_durably(
             reason=reason if decision == "abort" else None,
         )
     except asyncio.CancelledError:
-        resolution = await store.approval_resolution(request_id)
+        resolution = store.approval_resolution_now(request_id)
         if resolution is None:
             raise
         return SettlementResult(resolution)
@@ -58,9 +58,9 @@ async def persist_durably(
         # message; treat it as an unavailable durable write, not a crash.
         if str(exc) != "session store is closed":
             raise
-        return SettlementResult(store.approval_resolution_data(request_id))
+        return SettlementResult(store.approval_resolution_now(request_id))
     except OSError:
-        resolution = await store.approval_resolution(request_id)
+        resolution = store.approval_resolution_now(request_id)
         if resolution is not None:
             return SettlementResult(resolution)
         try:
@@ -71,4 +71,4 @@ async def persist_durably(
             )
         except OSError:
             return SettlementResult(None)
-    return SettlementResult(await store.approval_resolution(request_id))
+    return SettlementResult(store.approval_resolution_now(request_id))
