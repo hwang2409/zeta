@@ -1156,6 +1156,18 @@ class ConversationStore(
         self._assert_owner_thread()
         return tuple(self._entries)
 
+    def resident_entries(self) -> tuple[ConversationEntry, ...]:
+        """Return one immutable snapshot of the resident row list (no row copy).
+
+        Unlike ``resident_entries_snapshot`` this does not assert the owner
+        thread: it is the single-read seam an off-loop reader (``session.tree``
+        via ``run_read``) uses to take one consistent view of the branch tree
+        without the per-row deep copy of the ``entries`` property. The tuple is a
+        new container; the entries inside it are the shared resident objects, so
+        callers read them and never mutate ``entry.data``.
+        """
+        return tuple(self._entries)
+
     @classmethod
     def _snapshot_branch(
         cls, branch: Iterable[ConversationEntry]

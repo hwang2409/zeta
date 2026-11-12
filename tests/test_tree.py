@@ -561,6 +561,7 @@ async def test_tree_switch_runs_off_loop_and_cancel_still_finalizes(
             assert release is not None and release.wait(10)
         return original_sync(self, entries)
 
+    # test-contract: seam hold the real branch rebuild off the event loop.
     monkeypatch.setattr(
         ConversationStore, "_sync_history_index", gated_sync, raising=True
     )
