@@ -174,6 +174,22 @@ class SessionReferenceGate:
         return value
 
 
+def read_reference_generation(home: Path) -> int:
+    """Return the current reference generation without touching the gate.
+
+    A read-only observer used by the dormant retention planner to detect that a
+    reference transaction raced its scan. An absent file is generation zero.
+    """
+    path = Path(home) / _SESSION_REFERENCE_GENERATION
+    try:
+        raw = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return 0
+    if not raw.endswith("\n") or not raw[:-1].isdigit():
+        raise SessionError("session reference generation is malformed")
+    return int(raw[:-1])
+
+
 @contextmanager
 def reference_publication(
     home: Path,
