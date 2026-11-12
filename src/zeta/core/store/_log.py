@@ -42,11 +42,10 @@ from ..transcript_recovery import (
     repair_transcript,
 )
 from ..transcript_recovery.stream import TranscriptStream
+from ._delivery_fold import DeliveryFold
 from ._incremental_validation import _ApprovalValidationOverlay
-from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
-    from ...protocol.types import Message, ToolResult
     from ._client_delivery import ClientDelivery
     from ._store import ConversationStore
 
@@ -82,19 +81,7 @@ class _DetachedLogState:
     entries: list[ConversationEntry]
     entry_ids: set[str]
     entry_prefix_digest: bytes
-    active_tool_results: dict[str, ToolResult]
-    active_agent_call_ids: set[str]
-    active_agent_receipts: list[tuple[str, str]]
-    notification_ids: set[str]
-    active_notifications: dict[str, ConversationEntry]
-    active_completion_notifications: dict[str, ConversationEntry]
-    active_notification_presentations: set[str]
-    pending_prompt_ids: set[str]
-    active_pending_prompt_entries: dict[str, ConversationEntry]
-    active_pending_prompt_messages: dict[str, Message]
-    active_notification_delivery_message: Message | None
-    active_last_message: Message | None
-    active_last_turn_end: ConversationEntry | None
+    delivery_fold: DeliveryFold
     task_notification_ids: set[str]
     sent_message_receipts: list[tuple[str, str]]
     client_deliveries: OrderedDict[str, ClientDelivery]
@@ -126,19 +113,7 @@ class _FullLoadValidator:
         "_entries",
         "_entry_ids",
         "_entry_prefix_digest",
-        "_active_tool_results",
-        "_active_agent_call_ids",
-        "_active_agent_receipts",
-        "_notification_ids",
-        "_active_notifications",
-        "_active_completion_notifications",
-        "_active_notification_presentations",
-        "_pending_prompt_ids",
-        "_active_pending_prompt_entries",
-        "_active_pending_prompt_messages",
-        "_active_notification_delivery_message",
-        "_active_last_message",
-        "_active_last_turn_end",
+        "_delivery_fold",
         "_task_notification_ids",
         "_sent_message_receipts",
         "_client_deliveries",
@@ -267,13 +242,7 @@ class _FullLoadValidator:
         if len(self.state._entries) == self.baseline[0]:
             self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
-        if (
-            entry.type == "notification"
-            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-        ):
-            task_id = entry.data.get("task_id")
-            if type(task_id) is str and task_id:
-                self.state._task_notification_ids.add(task_id)
+        self.state._record_physical_entry(entry)
         return entry
 
     def validated_prefix(self, end_offset: int) -> ValidatedPrefix:
@@ -391,21 +360,7 @@ class ConversationLogMixin:
             entries=self._entries,
             entry_ids=self._entry_ids,
             entry_prefix_digest=self._entry_prefix_digest,
-            active_tool_results=self._active_tool_results,
-            active_agent_call_ids=self._active_agent_call_ids,
-            active_agent_receipts=self._active_agent_receipts,
-            notification_ids=self._notification_ids,
-            active_notifications=self._active_notifications,
-            active_completion_notifications=self._active_completion_notifications,
-            active_notification_presentations=self._active_notification_presentations,
-            pending_prompt_ids=self._pending_prompt_ids,
-            active_pending_prompt_entries=self._active_pending_prompt_entries,
-            active_pending_prompt_messages=self._active_pending_prompt_messages,
-            active_notification_delivery_message=(
-                self._active_notification_delivery_message
-            ),
-            active_last_message=self._active_last_message,
-            active_last_turn_end=self._active_last_turn_end,
+            delivery_fold=self._delivery_fold,
             task_notification_ids=self._task_notification_ids,
             sent_message_receipts=self._sent_message_receipts,
             client_deliveries=self._client_deliveries,
@@ -419,22 +374,12 @@ class ConversationLogMixin:
     def _snapshot_log_state(self: ConversationStore) -> _DetachedLogState:
         """Copy mutable indexes so a retained writer can keep its own state."""
         state = self._detach_log_state()
+        # The delivery fold is immutable after install, so a retained writer can
+        # share the reference and build its own fold by staged()+swap instead.
         return replace(
             state,
             entries=list(state.entries),
             entry_ids=set(state.entry_ids),
-            active_tool_results=dict(state.active_tool_results),
-            active_agent_call_ids=set(state.active_agent_call_ids),
-            active_agent_receipts=list(state.active_agent_receipts),
-            notification_ids=set(state.notification_ids),
-            active_notifications=dict(state.active_notifications),
-            active_completion_notifications=dict(state.active_completion_notifications),
-            active_notification_presentations=set(
-                state.active_notification_presentations
-            ),
-            pending_prompt_ids=set(state.pending_prompt_ids),
-            active_pending_prompt_entries=dict(state.active_pending_prompt_entries),
-            active_pending_prompt_messages=dict(state.active_pending_prompt_messages),
             task_notification_ids=set(state.task_notification_ids),
             sent_message_receipts=list(state.sent_message_receipts),
             client_deliveries=state.client_deliveries.copy(),
@@ -538,23 +483,7 @@ class ConversationLogMixin:
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
         self._entry_prefix_digest = state.entry_prefix_digest
-        self._active_tool_results = state.active_tool_results
-        self._active_agent_call_ids = state.active_agent_call_ids
-        self._active_agent_receipts = state.active_agent_receipts
-        self._notification_ids = state.notification_ids
-        self._active_notifications = state.active_notifications
-        self._active_completion_notifications = state.active_completion_notifications
-        self._active_notification_presentations = (
-            state.active_notification_presentations
-        )
-        self._pending_prompt_ids = state.pending_prompt_ids
-        self._active_pending_prompt_entries = state.active_pending_prompt_entries
-        self._active_pending_prompt_messages = state.active_pending_prompt_messages
-        self._active_notification_delivery_message = (
-            state.active_notification_delivery_message
-        )
-        self._active_last_message = state.active_last_message
-        self._active_last_turn_end = state.active_last_turn_end
+        self._delivery_fold = state.delivery_fold
         self._task_notification_ids = state.task_notification_ids
         self._sent_message_receipts = state.sent_message_receipts
         self._client_deliveries = state.client_deliveries

@@ -159,16 +159,10 @@ class PendingPromptQueue:
 
     def acknowledge(self, prompt_id: str) -> None:
         with self._lock():
-            branch = self._store.replay()
-            prompts = [entry for entry in branch if entry.type == "pending_prompt"]
-            if not any(entry.id == prompt_id for entry in prompts):
+            fold = self._store._delivery_fold
+            if prompt_id not in fold.prompt_ids:
                 raise ValueError(f"unknown pending prompt: {prompt_id}")
-            acknowledged = {
-                entry.data["prompt_id"]
-                for entry in branch
-                if entry.type == "pending_prompt_ack"
-            }
-            if prompt_id not in acknowledged:
+            if prompt_id in fold.active_prompts:
                 self._store._append_row_unlocked(
                     "pending_prompt_ack", {"prompt_id": prompt_id}
                 )
@@ -216,7 +210,7 @@ class PendingPromptQueue:
                 return "pending follow-up must be read before finish"
             pending_notifications = [
                 entry
-                for notification_id, entry in self._store._active_notifications.items()
+                for notification_id, entry in self._store._delivery_fold.active_notifications.items()
                 if notification_id not in persisted_notification_ids
                 and entry.data.get("display_only") is not True
             ]
@@ -282,17 +276,17 @@ class PendingPromptQueue:
         return not any(
             notification_id not in persisted_notification_ids
             and entry.data.get("display_only") is not True
-            for notification_id, entry in self._store._active_notifications.items()
+            for notification_id, entry in self._store._delivery_fold.active_notifications.items()
         )
 
     def _terminal_transition_unlocked(self) -> ConversationEntry | None:
-        return next(
-            (
-                entry
-                for entry in reversed(self._store.replay())
-                if entry.type == "terminal_transition"
-            ),
-            None,
+        # The fold holds the last terminal_transition on the branch; snapshot it
+        # so a resident entry (and its report) never crosses to the event loop.
+        transition = self._store._delivery_fold.last_terminal_transition
+        return (
+            self._store._snapshot_entry(transition)
+            if transition is not None
+            else None
         )
 
     def _queue_closed_unlocked(self) -> bool:
@@ -303,5 +297,5 @@ class PendingPromptQueue:
     def _pending_unlocked(self) -> list[ConversationEntry]:
         return [
             self._store._snapshot_entry(entry)
-            for entry in self._store._active_pending_prompt_entries.values()
+            for entry in self._store._delivery_fold.active_prompts.values()
         ]

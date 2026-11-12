@@ -556,7 +556,7 @@ class StepDeliveryFlow:
             if not self._low_capacity_notice_emitted:
                 count = sum(
                     entry.data.get("display_only") is not True
-                    for entry in self.store._active_notifications.values()
+                    for entry in self.store.delivery_fold.active_notifications.values()
                 )
                 record_path = str(self.store.path)
                 if len(record_path) > 240:
@@ -657,10 +657,10 @@ class StepDeliveryFlow:
     def pending_ids(self) -> tuple[str, ...]:
         """Return live durable ids that can cause a post-cap provider turn."""
 
-        ids = tuple(self.store._active_pending_prompt_entries)
+        ids = tuple(self.store.delivery_fold.active_prompts)
         ids += tuple(
             entry_id
-            for entry_id, entry in self.store._active_notifications.items()
+            for entry_id, entry in self.store.delivery_fold.active_notifications.items()
             if entry.data.get("display_only") is not True
         )
         return tuple(item_id for item_id in ids if item_id not in self._suppressed_ids)
@@ -724,7 +724,7 @@ class StepDeliveryFlow:
         }:
             raise ValueError("unknown terminal intent")
         pending, closed = await self.store.admit_step_delivery_terminal(intent)
-        prompt_pending = bool(self.store._active_pending_prompt_entries)
+        prompt_pending = bool(self.store.delivery_fold.active_prompts)
         if self._low_capacity_notifications and not prompt_pending:
             pending = False
         if pending and self.pending_ids():
@@ -740,7 +740,7 @@ class StepDeliveryFlow:
             self._edges.add("prompt")
         if any(
             entry.data.get("display_only") is not True
-            for entry in self.store._active_notifications.values()
+            for entry in self.store.delivery_fold.active_notifications.values()
         ):
             self._edges.add("notification")
 
@@ -752,7 +752,7 @@ class StepDeliveryFlow:
         self._low_capacity_notice_emitted = False
         if any(
             entry.data.get("display_only") is not True
-            for entry in self.store._active_notifications.values()
+            for entry in self.store.delivery_fold.active_notifications.values()
         ):
             self._arm_edge("notification")
 

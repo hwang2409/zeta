@@ -174,7 +174,6 @@ class NotificationStateMixin:
             if note is not None:
                 data["note"] = note
             entry = self._append_row_unlocked("notification", data)
-            self._task_notification_ids.add(task_id)
             return self._snapshot_entry(entry)
 
     def append_inbox_notification_if_absent(
@@ -201,7 +200,7 @@ class NotificationStateMixin:
             pending = next(
                 (
                     entry
-                    for entry in self._active_notifications.values()
+                    for entry in self._delivery_fold.active_notifications.values()
                     if entry.data.get("kind") == PROJECT_INBOX_NOTIFICATION_KIND
                 ),
                 None,
@@ -281,7 +280,7 @@ class NotificationStateMixin:
         with self._append_lock():
             questions = [
                 entry
-                for entry in self._active_notifications.values()
+                for entry in self._delivery_fold.active_notifications.values()
                 if entry.data.get("kind") == CHILD_QUESTION_NOTIFICATION_KIND
                 and entry.data.get("child_instance_id") == child_instance_id
             ]
@@ -344,7 +343,7 @@ class NotificationStateMixin:
             data["display_only"] = True
         validate_child_idle_notification_data(data)
         with self._append_lock():
-            if child_instance_id in self._active_completion_notifications:
+            if child_instance_id in self._delivery_fold.completions_by_child:
                 return None
             return self._snapshot_entry(self._append_row_unlocked("notification", data))
 
@@ -413,7 +412,7 @@ class NotificationStateMixin:
             report=report,
         )
         with self._append_lock():
-            existing = self._active_completion_notifications.get(child_instance_id)
+            existing = self._delivery_fold.completions_by_child.get(child_instance_id)
             if existing is not None:
                 return self._snapshot_entry(existing), False
             appended = self._append_row_unlocked("notification", data)
@@ -425,7 +424,7 @@ class NotificationStateMixin:
         """Return detached first completion notifications keyed by child id."""
         return {
             child_id: self._snapshot_entry(entry)
-            for child_id, entry in self._active_completion_notifications.items()
+            for child_id, entry in self._delivery_fold.completions_by_child.items()
         }
 
     def sync_agent_completion_notification(
@@ -433,7 +432,7 @@ class NotificationStateMixin:
     ) -> ConversationEntry | None:
         """Incrementally sync the log tail and return one active notification."""
         with self._append_lock():
-            entry = self._active_completion_notifications.get(child_instance_id)
+            entry = self._delivery_fold.completions_by_child.get(child_instance_id)
             return self._snapshot_entry(entry) if entry is not None else None
 
     def tui_replay_entries(self: ConversationStore) -> tuple[TUIReplayEntry, ...]:
@@ -500,7 +499,7 @@ class NotificationStateMixin:
         """Return durable background-child notifications on the active branch."""
 
         entries = (
-            self._active_notifications.values()
+            self._delivery_fold.active_notifications.values()
             if pending_only
             else (
                 entry for entry in self._active_branch() if entry.type == "notification"
@@ -517,7 +516,7 @@ class NotificationStateMixin:
     ) -> bool:
         """Return whether the TUI has already shown this notification."""
 
-        return notification_id in self._active_notification_presentations
+        return notification_id in self._delivery_fold.presented
 
     def record_agent_notification_delivery(
         self: ConversationStore,
@@ -535,26 +534,15 @@ class NotificationStateMixin:
         if not presented and not acknowledged:
             return
         with self._append_lock():
-            branch = self.replay()
-            if not any(
-                entry.type == "notification" and entry.id == notification_id
-                for entry in branch
-            ):
+            fold = self._delivery_fold
+            if notification_id not in fold.notification_ids:
                 raise ValueError(f"unknown agent notification: {notification_id}")
             rows: list[tuple[str, dict[str, str]]] = []
-            if presented and not any(
-                entry.type == "notification_tui_presented"
-                and entry.data["notification_id"] == notification_id
-                for entry in branch
-            ):
+            if presented and notification_id not in fold.presented:
                 rows.append(
                     ("notification_tui_presented", {"notification_id": notification_id})
                 )
-            if acknowledged and not any(
-                entry.type == "notification_ack"
-                and entry.data["notification_id"] == notification_id
-                for entry in branch
-            ):
+            if acknowledged and notification_id in fold.active_notifications:
                 rows.append(("notification_ack", {"notification_id": notification_id}))
             if rows:
                 self._append_many_unlocked(rows)
@@ -584,24 +572,17 @@ class NotificationStateMixin:
         if not ordered_ids:
             return
         with self._append_lock():
-            branch = self._active_branch()
-            notifications = {
-                entry.id for entry in branch if entry.type == "notification"
-            }
+            fold = self._delivery_fold
             unknown = next(
-                (item for item in ordered_ids if item not in notifications), None
+                (item for item in ordered_ids if item not in fold.notification_ids),
+                None,
             )
             if unknown is not None:
                 raise ValueError(f"unknown agent notification: {unknown}")
-            presented = {
-                entry.data["notification_id"]
-                for entry in branch
-                if entry.type == "notification_tui_presented"
-            }
             rows = [
                 ("notification_tui_presented", {"notification_id": notification_id})
                 for notification_id in ordered_ids
-                if notification_id not in presented
+                if notification_id not in fold.presented
             ]
             if rows:
                 self._append_many_unlocked(rows)
@@ -631,24 +612,17 @@ class NotificationStateMixin:
         if not ordered_ids:
             return
         with self._append_lock():
-            branch = self._active_branch()
-            notifications = {
-                entry.id for entry in branch if entry.type == "notification"
-            }
+            fold = self._delivery_fold
             unknown = next(
-                (item for item in ordered_ids if item not in notifications), None
+                (item for item in ordered_ids if item not in fold.notification_ids),
+                None,
             )
             if unknown is not None:
                 raise ValueError(f"unknown agent notification: {unknown}")
-            acknowledged = {
-                entry.data["notification_id"]
-                for entry in branch
-                if entry.type == "notification_ack"
-            }
             rows = [
                 ("notification_ack", {"notification_id": notification_id})
                 for notification_id in ordered_ids
-                if notification_id not in acknowledged
+                if notification_id in fold.active_notifications
             ]
             if rows:
                 self._append_many_unlocked(rows)
