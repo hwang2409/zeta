@@ -632,6 +632,12 @@ class ConversationLogMixin:
 
     def _sync_log_without_waiting(self: ConversationStore) -> None:
         """Synchronize changed log metadata unless another writer owns it."""
+        if self._closed:
+            # A delegated approval whose run already ended keeps its record for
+            # the serve stale sweep after its store is closed. The log fd is
+            # gone, so skip the sync and answer from the resident branch (the
+            # last authoritative state), as the pre-sidecar resident read did.
+            return
         if self._observer_snapshot:
             self._sync_observer_snapshot()
             return
