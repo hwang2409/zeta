@@ -633,8 +633,11 @@ def test_isolated_sent_ledger_states(tmp_path, reported, expected):
     assert reasons[root][0] is expected
 
 
-_MATRIX_KINDS = ("pending_link", "sent_root", "inbox", "dependent_meta", "dependent_fork", "source_attention", "child_sent")
+_MATRIX_KINDS = ("pending_link", "sent_root", "inbox", "dependent_meta", "dependent_fork", "source_attention", "child_sent", "child_inbox")
 _MATRIX_MODES = ("absent", "present", "malformed")
+_DEADLINE_KINDS = ("inbox", "dependent_meta", "source_attention", "child_sent")
+_MATRIX_ROWS = [(kind, mode) for mode in _MATRIX_MODES for kind in _MATRIX_KINDS]
+_MATRIX_ROWS.extend((kind, "deadline") for kind in _DEADLINE_KINDS)
 
 
 def _build_authority_row(tmp_path, kind, mode):
@@ -690,14 +693,40 @@ def _build_authority_row(tmp_path, kind, mode):
             (child / "project-inbox-sent.json").write_text((root_dir / "project-inbox-sent.json").read_text())
         else:
             (child / "project-inbox-sent.json").write_text("{}")
+    elif kind == "child_inbox":
+        child = root_dir / "agents" / "1"
+        child.mkdir(parents=True)
+        (child / "agent_lifecycle.json").write_text(json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD}))
+        (child / ".lock").write_text("")
+        inbox = tmp_path / "projects" / "p_x" / "inbox" / "new"
+        inbox.mkdir(parents=True)
+        (inbox / "record.json").write_text(
+            json.dumps({"to_session": f"{root}:1"}) if mode == "present" else "{}"
+        )
     return stack, root, mode == "absent" or (mode == "present" and kind == "sent_root")
 
 
-@pytest.mark.parametrize("kind", _MATRIX_KINDS)
-@pytest.mark.parametrize("mode", _MATRIX_MODES)
+@pytest.mark.parametrize(("kind", "mode"), _MATRIX_ROWS)
 def test_closure_authority_matrix(tmp_path, kind, mode):
-    stack, root, expected = _build_authority_row(tmp_path, kind, mode)
+    stack, root, expected = _build_authority_row(tmp_path, kind, "absent" if mode == "deadline" else mode)
+    if mode != "deadline":
+        with stack:
+            lease = stack.enter_context(_opened_lease(tmp_path))
+            _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+        assert reasons[root][0] is expected
+        return
+
+    base = time.time_ns() + 60 * _DAY_NS
+    calls = 0
+
+    def now_ns():
+        nonlocal calls
+        calls += 1
+        return base if calls < 12 else base + 31 * 1_000_000_000
+
     with stack:
         lease = stack.enter_context(_opened_lease(tmp_path))
-        _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
-    assert reasons[root][0] is expected
+        result = RetentionPlanner(tmp_path, lease, now_ns=now_ns).run_pass(days=30)
+    assert not result.complete
+    assert result.preview is None
+    assert not any(row.root_id == root and row.closed for row in result.reasons)
