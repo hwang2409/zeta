@@ -143,6 +143,7 @@ class ServeControl:
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._active_mcp_bindings: dict[str, dict[str, str]] = {}
+        self._mcp_binding_servers: frozenset[str] = frozenset()
         self._mcp_binding_required = False
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
@@ -396,7 +397,6 @@ class ServeControl:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         self._active_mcp_bindings = {}
-
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
             if loop is not None:

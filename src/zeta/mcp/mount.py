@@ -357,6 +357,22 @@ class MCPMount:
             await old_actor.close()
         return await actor.reconnect(notice_sink=notice_sink)
 
+    async def replace_server(
+        self,
+        server_config: MCPServerConfig,
+        *,
+        source: Path,
+        notice_sink: NoticeSink | None = None,
+    ) -> MCPServerStatus:
+        """Replace one connection while preserving its actor and tool handlers."""
+        async with self._config_lock:
+            actor = self._actors.get(server_config.name)
+            if actor is None or self._closed:
+                raise ValueError(f"unknown MCP server: {server_config.name}")
+            self.configs[server_config.name] = server_config
+            self.sources[server_config.name] = source
+        return await actor.replace(server_config, source, notice_sink=notice_sink)
+
     async def add_server(
         self,
         server_config: MCPServerConfig,

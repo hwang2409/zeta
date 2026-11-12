@@ -70,9 +70,11 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 headers, configs = bindings
                 await self.server.runtime.loop.set_mcp_bindings(headers, configs)
                 self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_servers = frozenset(headers)
                 self.server.control._mcp_binding_required = bool(headers)
             elif self.server.runtime.loop is not None:
                 self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_servers = frozenset()
                 self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
             self.server.control._host_binding_required = (
@@ -155,9 +157,11 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 headers, configs = bindings
                 await self.server.runtime.loop.set_mcp_bindings(headers, configs)
                 self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_servers = frozenset(headers)
                 self.server.control._mcp_binding_required = bool(headers)
             elif previous_session_id != session_id:
                 self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_servers = frozenset()
                 self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
             self.server.control._host_binding_required = (
@@ -184,6 +188,30 @@ async def mcp_bindings(
     parsed = parse_mcp_bindings(params["mcp_bindings"])
     configs = await resolve_mcp_bindings(self, parsed, params.get("cwd"))
     return parsed, configs
+
+
+async def reconnect_mcp_bindings(
+    self, params: dict[str, Any]
+) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
+    if "mcp_bindings" not in params:
+        return None
+    validation.require_feature(self, "approval_reconnect", "mcp_bindings")
+    bindings = await mcp_bindings(self, params)
+    assert bindings is not None
+    session_id = validation.required_string(params, "session_id")
+    state = self.server.runtime.state
+    control = self.server.control
+    if (
+        state is None
+        or state.session_id != session_id
+        or not control._mcp_binding_required
+        or frozenset(bindings[0]) != control._mcp_binding_servers
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "mcp_bindings must match the active session",
+        )
+    return bindings
 
 
 def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:

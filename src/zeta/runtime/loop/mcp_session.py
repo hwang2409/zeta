@@ -3,6 +3,7 @@
 import asyncio
 import shlex
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Self
 
@@ -107,22 +108,40 @@ class MCPSession:
         bindings: dict[str, dict[str, str]],
         configs: dict[str, MCPServerConfig] | None = None,
     ) -> None:
-        """Set transient per-attachment headers and remount MCP servers."""
+        """Set transient per-attachment headers without replacing tool handlers."""
         await self.clear_mcp_bindings()
         self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
         self._mcp_binding_configs = dict(configs or {})
+        if self._mcp_mount is not None:
+            await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
 
     async def clear_mcp_bindings(self) -> None:
         if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
             self._mcp_mount_task.cancel()
             await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
-        if self._mcp_mount is not None:
-            await self._mcp_mount.close()
-            self._mcp_mount = None
-        self._mcp_mount_task = None
-        self._mcp_mount_attempted = False
+            self._mcp_mount_task = None
+            self._mcp_mount_attempted = self._mcp_mount is not None
+        if self._mcp_mount is not None and self._mcp_bindings:
+            await self._replace_mcp_binding_configs(
+                {name: {} for name in self._mcp_bindings},
+                self._mcp_binding_configs,
+            )
         self._mcp_bindings = {}
         self._mcp_binding_configs = {}
+
+    async def _replace_mcp_binding_configs(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        mount = self._mcp_mount
+        assert mount is not None
+        for name, headers in bindings.items():
+            config = configs[name]
+            await mount.replace_server(
+                replace(config, headers={**config.headers, **headers}),
+                source=mount.sources[name],
+            )
 
     def set_mcp_scope(
         self,

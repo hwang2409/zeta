@@ -15,6 +15,7 @@ from tests.support.fake_backend import (
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
 from zeta.mcp import MCPServerConfig, StreamableHTTPMCPClient
 from zeta.mcp.client import MCPHTTPError
@@ -478,6 +479,82 @@ async def test_bound_http_error_redacts_header_everywhere(
         assert caught.value.__context__ is None
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_rebinds_mcp_during_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    mcp_config = {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "servers": {"page": mcp_config, "other": mcp_config}
+    }))
+    backend = FakeBackend([
+        ScriptedTurn([TextContent("mounted")]),
+        ScriptedTurn(tool_calls=[ToolCall("page-call", "page__echo", {})]),
+        ScriptedTurn([TextContent("done")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    features = ["approval_reconnect", "new_session_settings", "session_mcp_bindings"]
+    binding = {"server": "page", "headers": {"Authorization": "Bearer reconnect-secret"}}
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        created = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol",
+            "approval_mode": "ask", "mcp_bindings": [binding]
+        }))[-1]["result"]
+        session_id = created["session"]["session_id"]
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await _event(reader, "turn_end")
+        await _request(reader, writer, 4, "send", {"text": "use page"})
+        approval = await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+
+        reader2, writer2 = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
+        )
+        try:
+            hello = await _request(reader2, writer2, 5, "hello", {
+                "protocol_version": "1.2",
+                "features": features,
+                "session_id": session_id,
+                "mcp_bindings": [binding],
+            })
+            assert "error" not in hello[-1]
+            assert server.control._active_mcp_bindings == {
+                "page": {"Authorization": "Bearer reconnect-secret"}
+            }
+            allowed = await _request(reader2, writer2, 6, "approve", {
+                "request_id": approval["request_id"]
+            })
+            assert "error" not in allowed[-1]
+            async with asyncio.timeout(TIMEOUT):
+                while mcp.methods.count("tools/call") != 1:
+                    await asyncio.sleep(0)
+            assert server.control._turn_task is not None
+            await asyncio.wait_for(
+                asyncio.shield(server.control._turn_task), TIMEOUT
+            )
+            assert mcp.methods.count("tools/call") == 1
+        finally:
+            writer2.close()
+            await writer2.wait_closed()
+    finally:
+        await server.close()
+        await mcp.close()
 
 
 @pytest.mark.asyncio
