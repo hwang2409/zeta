@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
@@ -14,6 +15,7 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
+from ..locking import RETENTION_HOME_ID
 from ..storage_format import (
     ACCEPTED_KEY_SETS,
     FEATURE_EPOCHS,
@@ -30,6 +32,7 @@ from . import (
     _read_manifest,
     _rewrite_cwd,
     _safe_component,
+    _snapshot_reference_ids,
     _tree_state,
     _write_json,
     project_publish,
@@ -68,7 +71,7 @@ finally:
 '''
 
 
-_PROJECT_AUTHORITY = rf'''
+_REMOTE_WRITER_EPOCH = rf'''
 import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
 _PROJECT_LOCKS_FEATURE_EPOCH = {FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]}
 _WRITER_EPOCH = {writer_epoch()}
@@ -130,16 +133,19 @@ def _writer_epoch(home):
     if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: sys.exit(53)
     _LEASE = (lock_fd, epoch)
     return epoch
+'''
 
+
+_PROJECT_AUTHORITY = _REMOTE_WRITER_EPOCH + r'''
 def _lock_file(directory_fd, name, operation):
     try:
         fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
     except OSError as exc:
-        _reject(f"lock {{name}}: cannot open ({{exc.strerror}})")
+        _reject(f"lock {name}: cannot open ({exc.strerror})")
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(fd)
-        _reject(f"lock {{name}}: not a regular single-link file")
+        _reject(f"lock {name}: not a regular single-link file")
     os.fchmod(fd, 0o600)
     try:
         fcntl.flock(fd, operation)
@@ -156,7 +162,7 @@ def _validate_project(project_fd, ident):
     except (OSError, ValueError):
         sys.exit(44)
     if record.get("project_id") != ident:
-        _reject(f"projects/{{ident}}/project.json: project_id does not match")
+        _reject(f"projects/{ident}/project.json: project_id does not match")
 
 def _project_fd(projects_fd, ident):
     try:
@@ -267,20 +273,100 @@ with lock_path.open("a+") as lock:
 print(value, end="")
 '''
 
-_SESSION_INSTALL_SCRIPT = r'''
-import fcntl, hashlib, json, os, pathlib, shutil, sys, tarfile, tempfile
+# The remote session install shares the local SessionReferenceGate semantics:
+# only at the SESSION_RETENTION feature epoch it takes the shared "references"
+# authority (RETENTION_HOME_ID), rejects a destination or referenced id that
+# retention is deleting, bumps the durable generation, and holds the lock
+# across the rename. Below the feature epoch it is a passthrough.
+_SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + rf'''
+_SESSION_RETENTION_EPOCH = {FEATURE_EPOCHS[StorageFeature.SESSION_RETENTION]}
+_RETENTION_HOME_ID = {RETENTION_HOME_ID!r}
+_REFERENCES_DOMAIN = "references"
+_GENERATION_NAME = "session-reference-generation"
+
+def _reference_unavailable(ident):
+    print(f"session reference unavailable: {{ident}} is being deleted", file=sys.stderr)
+    sys.exit(54)
+
+def _validate_reference_ids(home, ids):
+    trash = home / "session-trash"
+    for ident in ids:
+        if not ident or ident in {{".", ".."}} or "/" in ident or "\x00" in ident:
+            _reject(f"session reference id is not one path component: {{ident!r}}")
+        if (trash / "reservations" / f"{{ident}}.json").exists() or (trash / ident).exists():
+            _reference_unavailable(ident)
+
+def _bump_generation(home):
+    path = home / _GENERATION_NAME
+    try:
+        raw = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        value = 0
+    else:
+        if not raw.endswith("\n") or not raw[:-1].isdigit():
+            _reject("session reference generation is malformed")
+        value = int(raw[:-1])
+        if value > 2**63 - 2:
+            _reject("session reference generation is out of range")
+    value += 1
+    temporary = path.with_name(f".{{path.name}}.{{secrets.token_hex(16)}}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, f"{{value}}\n".encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, path)
+    directory_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+@contextlib.contextmanager
+def _reference_gate(home, installed_ids, referenced_ids):
+    if _writer_epoch(home) < _SESSION_RETENTION_EPOCH:
+        yield
+        return
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try: os.mkdir(".domain-locks", mode=0o700, dir_fd=home_fd)
+        except FileExistsError: pass
+        lock_dir_fd = os.open(".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
+        try:
+            lock_name = f"{{_RETENTION_HOME_ID.encode('utf-8').hex()}}-{{_REFERENCES_DOMAIN.encode('utf-8').hex()}}.lock"
+            fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    _reject("session reference authority is unsafe")
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                try:
+                    _validate_reference_ids(home, (*installed_ids, *referenced_ids))
+                    if installed_ids:
+                        _bump_generation(home)
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(lock_dir_fd)
+    finally:
+        os.close(home_fd)
+'''
+
+
+_SESSION_INSTALL_BODY = r'''
+import hashlib, shutil, tarfile, tempfile
 home = pathlib.Path(sys.argv[1]).expanduser().resolve()
 ident, expected = sys.argv[2], sys.argv[3]
 max_members, max_bytes = int(sys.argv[4]), int(sys.argv[5])
+referenced = tuple(json.loads(sys.argv[6]))
 if pathlib.Path(ident).parts != (ident,): sys.exit(45)
-def _reject(reason): print(f"zeta-remote: {reason}", file=sys.stderr); sys.exit(46)
 parent = home / "sessions"; parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 destination = parent / ident
-lease = None
-if destination.exists():
-    lease = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
-    try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: sys.exit(48)
 def digest(root):
     value = hashlib.sha256()
     if not root.exists(): return "missing"
@@ -291,54 +377,70 @@ def digest(root):
             with path.open("rb") as stream:
                 while chunk := stream.read(1024 * 1024): value.update(chunk)
     return value.hexdigest()
-if expected != digest(destination): sys.exit(47)
-staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{ident}.incoming-", dir=parent))
-try:
-    members = declared = extracted = 0
-    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as archive:
-        for member in archive:
-            members += 1
-            if members > max_members: sys.exit(49)
-            if member.size < 0: _reject(f"archive member {member.name}: negative size")
-            declared += member.size
-            if declared > max_bytes: sys.exit(50)
-            if shutil.disk_usage(parent).free < declared - extracted: sys.exit(51)
-            parts = pathlib.PurePosixPath(member.name).parts
-            if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): _reject(f"archive member {member.name}: unsafe path or link")
-            target = staging.joinpath(*parts[1:])
-            if target.name == "runtime.lease": _reject(f"archive member {member.name}: runtime lease")
-            if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
-            elif member.isfile():
-                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                source = archive.extractfile(member)
-                if source is None: _reject(f"archive member {member.name}: unreadable")
-                with target.open("wb") as output:
-                    remaining = member.size
-                    while remaining:
-                        chunk = source.read(min(1024 * 1024, remaining))
-                        if not chunk: _reject(f"archive member {member.name}: truncated")
-                        extracted += len(chunk); remaining -= len(chunk)
-                        if extracted > max_bytes: sys.exit(50)
-                        output.write(chunk)
-                    if source.read(1): sys.exit(50)
-                target.chmod(0o600)
-            else: _reject(f"archive member {member.name}: not a file or directory")
-    manifest = json.loads((staging / "transfer.json").read_text())
-    resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
-    expected_cwd = home / "remote-workspaces" / ident
-    if resume_cwd != expected_cwd: _reject("transfer.json: resume_cwd does not match the remote workspace")
-    expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
-    backup = parent / f".{ident}.replaced-{os.getpid()}"
-    if backup.exists(): shutil.rmtree(backup)
-    if destination.exists(): destination.rename(backup)
-    try: staging.rename(destination)
-    except BaseException:
-        if backup.exists() and not destination.exists(): backup.rename(destination)
-        raise
-    if backup.exists(): shutil.rmtree(backup)
-finally:
-    if staging.exists(): shutil.rmtree(staging)
+with _reference_gate(home, (ident,), referenced):
+    lease = None
+    if destination.exists():
+        lease = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+        try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: sys.exit(48)
+    if expected != digest(destination): sys.exit(47)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{ident}.incoming-", dir=parent))
+    try:
+        members = declared = extracted = 0
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as archive:
+            for member in archive:
+                members += 1
+                if members > max_members: sys.exit(49)
+                if member.size < 0: _reject(f"archive member {member.name}: negative size")
+                declared += member.size
+                if declared > max_bytes: sys.exit(50)
+                if shutil.disk_usage(parent).free < declared - extracted: sys.exit(51)
+                parts = pathlib.PurePosixPath(member.name).parts
+                if not parts or parts[0] != "payload" or any(p in {"", ".", ".."} for p in parts) or member.issym() or member.islnk(): _reject(f"archive member {member.name}: unsafe path or link")
+                target = staging.joinpath(*parts[1:])
+                if target.name == "runtime.lease": _reject(f"archive member {member.name}: runtime lease")
+                if member.isdir(): target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                elif member.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    source = archive.extractfile(member)
+                    if source is None: _reject(f"archive member {member.name}: unreadable")
+                    with target.open("wb") as output:
+                        remaining = member.size
+                        while remaining:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                            if not chunk: _reject(f"archive member {member.name}: truncated")
+                            extracted += len(chunk); remaining -= len(chunk)
+                            if extracted > max_bytes: sys.exit(50)
+                            output.write(chunk)
+                        if source.read(1): sys.exit(50)
+                    target.chmod(0o600)
+                else: _reject(f"archive member {member.name}: not a file or directory")
+        manifest = json.loads((staging / "transfer.json").read_text())
+        resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
+        expected_cwd = home / "remote-workspaces" / ident
+        if resume_cwd != expected_cwd: _reject("transfer.json: resume_cwd does not match the remote workspace")
+        expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
+        pin = destination / ".retention-pin.json"
+        if destination.exists() and pin.is_file() and not pin.is_symlink():
+            shutil.copyfile(pin, staging / ".retention-pin.json")
+            (staging / ".retention-pin.json").chmod(0o600)
+        backup = parent / f".{ident}.replaced-{os.getpid()}"
+        if backup.exists(): shutil.rmtree(backup)
+        if destination.exists(): destination.rename(backup)
+        try: staging.rename(destination)
+        except BaseException:
+            if backup.exists() and not destination.exists(): backup.rename(destination)
+            raise
+        if backup.exists(): shutil.rmtree(backup)
+    finally:
+        if staging.exists(): shutil.rmtree(staging)
 '''
+
+
+def _session_install_script() -> str:
+    """Install a whole session through the shared reference gate."""
+
+    return _SESSION_REFERENCE_GATE + _SESSION_INSTALL_BODY
 
 
 _PROJECT_INSTALL_WRAPPER = r"""
@@ -625,18 +727,20 @@ class SshTransport:
         self._raise_install_error(result, project=True)
 
     def _install_session(self, ident: str, source: Path, expected: str) -> None:
+        _installed_ids, referenced_ids = _snapshot_reference_ids(source, ident)
         with tempfile.TemporaryDirectory(prefix="zeta-ssh-install-") as temporary:
             archive = Path(temporary) / "snapshot.tar.gz"
             _pack(source, archive)
             with archive.open("rb") as incoming:
                 result = self._run(
-                    _SESSION_INSTALL_SCRIPT,
+                    _session_install_script(),
                     [
                         self._home(),
                         ident,
                         expected,
                         str(self.max_archive_members),
                         str(self.max_archive_bytes),
+                        json.dumps(list(referenced_ids)),
                     ],
                     stdin=incoming,
                     check=False,
@@ -653,6 +757,11 @@ class SshTransport:
         if result.returncode == 48:
             raise RemoteSyncError(
                 "remote session is active; stop it before replacement"
+            )
+        if result.returncode == 54:
+            raise RemoteSyncError(
+                result.stderr.decode(errors="replace").strip()
+                or "session reference unavailable"
             )
         if result.returncode == 49:
             raise RemoteSyncError("remote archive exceeds the member limit")

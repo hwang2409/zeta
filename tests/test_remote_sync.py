@@ -757,6 +757,93 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     assert not list((remote / "sessions").glob(".*.incoming-*"))
 
 
+def _ssh_session(home: Path, *, parent: str | None = None) -> str:
+    opened = SessionManager(home).create(
+        provider="codex", model="fake", cwd=home, parent_session_id=parent
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+    return session_id
+
+
+def _set_remote_epoch(remote: Path, epoch: int) -> None:
+    remote.mkdir(parents=True, exist_ok=True)
+    (remote / "storage-format.json").write_text(
+        f'{{"writer_epoch":{epoch}}}\n', encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("reserved", ("destination", "parent"))
+def test_ssh_install_refuses_reserved_reference_and_leaves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reserved: str
+) -> None:
+    # The SSH installer must join the remote home's SessionReferenceGate at the
+    # feature epoch: a reservation for the installed id or a referenced
+    # parent_session_id refuses the install and never touches the destination.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    parent = "p" * 32 if reserved == "parent" else None
+    session_id = _ssh_session(local, parent=parent)
+    _set_remote_epoch(remote, 8)
+    reserved_id = session_id if reserved == "destination" else parent
+    reservations = remote / "session-trash" / "reservations"
+    reservations.mkdir(parents=True)
+    (reservations / f"{reserved_id}.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RemoteSyncError, match="session reference unavailable"):
+        push_session(
+            local,
+            SshTransport("fake", str(remote), name="cloud"),
+            session_id=session_id,
+        )
+
+    assert not (remote / "sessions" / session_id).exists()
+
+
+def test_ssh_install_replace_preserves_retention_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Replacing a remote session keeps its retention pin sidecar, which the
+    # transferred snapshot never carries.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    session_id = _ssh_session(local)
+    _set_remote_epoch(remote, 8)
+    transport = SshTransport("fake", str(remote), name="cloud")
+    push_session(local, transport, session_id=session_id)
+    pin = remote / "sessions" / session_id / ".retention-pin.json"
+    pin.write_text('{"pinned":true,"schema_version":1}\n', encoding="utf-8")
+    pin.chmod(0o600)
+
+    push_session(local, transport, session_id=session_id, force=True)
+
+    assert pin.read_text() == '{"pinned":true,"schema_version":1}\n'
+
+
+def test_ssh_install_below_feature_epoch_writes_no_retention_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Below the SESSION_RETENTION feature epoch the installer stays dormant and
+    # writes no reference-generation or domain-lock state.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    session_id = _ssh_session(local)
+    _set_remote_epoch(remote, 7)
+
+    push_session(
+        local,
+        SshTransport("fake", str(remote), name="cloud"),
+        session_id=session_id,
+    )
+
+    assert (remote / "sessions" / session_id).exists()
+    assert not (remote / "session-reference-generation").exists()
+    assert not (remote / ".domain-locks").exists()
+
+
 def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
