@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -40,140 +40,27 @@ logger = logging.getLogger(__name__)
 APPROVAL_SETTLEMENT_CLOSE_TIMEOUT = FRAME_CANCEL_GRACE
 
 
-ApprovalKey = str | tuple[str, str]
-
-
-@dataclass(frozen=True, slots=True)
-class SessionHealth:
-    code: str
-    message: str
-
-
-@dataclass(frozen=True, slots=True)
-class ApprovalMachineState:
-    """Immutable live approval projection for one loaded serve session."""
-
-    generation: int = 0
-    records: Mapping[ApprovalKey, ApprovalRecord] = MappingProxyType({})
-    health: SessionHealth | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class Register:
-    request: ApprovalRequest
-    store: ConversationStore
-    child_instance_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class Start:
-    stream_event: StreamEvent
-    session_id: str | None
-    wire_event: EventDescriptor
-
-
-@dataclass(frozen=True, slots=True)
-class Decide:
-    method: ApprovalDecision
-    request_id: str
-    scope: str = "once"
-
-
-@dataclass(frozen=True, slots=True)
-class ExternalEnd:
-    key: ApprovalKey
-    session_id: str | None
-    data: Mapping[str, object]
-    suppress_write_errors: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class Cancel:
-    request_id: str
-    child_instance_id: str | None = None
-    reason: str = "turn_canceled"
-
-
-@dataclass(frozen=True, slots=True)
-class CleanupChild:
-    child_instance_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class Terminate:
-    foreground_only: bool = False
-    suppress_write_errors: bool = False
-    reason: str = "controller_disconnected"
-
-
-@dataclass(frozen=True, slots=True)
-class BeginGrace:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Reclaim:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Ready:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Expire:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Replace:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class Close:
-    pass
-
-
-ApprovalEvent = (
-    Register
-    | Start
-    | Decide
-    | ExternalEnd
-    | Cancel
-    | CleanupChild
-    | Terminate
-    | BeginGrace
-    | Reclaim
-    | Ready
-    | Expire
-    | Replace
-    | Close
+from .approval_machine import (
+    ApprovalEvent,
+    ApprovalKey,
+    ApprovalMachineState,
+    BeginGrace,
+    Cancel,
+    CleanupChild,
+    Close,
+    Decide,
+    Expire,
+    ExternalEnd,
+    Ready,
+    Reclaim,
+    Register,
+    Replace,
+    SessionHealth,
+    Start,
+    Terminate,
+    _Completed,
+    approval_display_fields,
 )
-
-
-class _Completed:
-    def __init__(self, value: object = None) -> None:
-        self._value = value
-
-    def __await__(self):
-        async def result() -> object:
-            return self._value
-
-        return result().__await__()
-
-
-def approval_display_fields(request: ApprovalRequest) -> dict[str, object]:
-    """Return immutable trusted display facts for an approval request."""
-
-    fields: dict[str, object] = {}
-    if request.action is not None:
-        fields["approval_action"] = request.action
-    display = request.audit_display()
-    if display:
-        fields["approval_display"] = display
-    return fields
 
 
 class ApprovalLifecycle:
@@ -1250,10 +1137,12 @@ class ApprovalLifecycle:
         # hop exists by construction, so a concurrent resolve, cancel, or cleanup
         # runs during the write and a failure surfaces from this await, the same
         # in tests and in production.
-        write = asyncio.ensure_future(
+        write = self._task_owner.start(
+            target.key,
             target.history_store.append_approval_history_async(
                 {"event": "approval_request", **payload}
-            )
+            ),
+            "request_write",
         )
         try:
             await write
