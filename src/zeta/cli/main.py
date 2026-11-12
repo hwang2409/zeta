@@ -915,12 +915,13 @@ def _run_tui_lifecycle(
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
+                from ..tui.loop_errors import stderr_to_log
 
                 patch_stdout = globals().get("patch_stdout") or default_patch_stdout
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
-                with patch_stdout(raw=True):
+                with patch_stdout(raw=True), stderr_to_log():
                     restart_requested, restart_cancels_work = asyncio.run(
                         _run_tui(run_app, args)
                     )
@@ -932,6 +933,15 @@ def _run_tui_lifecycle(
                     args.resume = None
             except terminal_render_error as exc:
                 print(f"zeta: {exc}", file=sys.stderr)
+                _print_exit_hint(app)
+                exit_status = 1
+                break
+            except Exception as exc:
+                if _has_console_message(exc):
+                    raise
+                from ..tui.loop_errors import tui_error_log
+
+                print(f"zeta: crashed; details in {tui_error_log()}", file=sys.stderr)
                 _print_exit_hint(app)
                 exit_status = 1
                 break
@@ -993,16 +1003,17 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
+def _has_console_message(exc: Exception) -> bool:
+    from ..accounts import AccountError
+
+    return isinstance(exc, StorageFormatError | AccountError)
+
+
 def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
-    except StorageFormatError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
-        return 2
     except Exception as exc:
-        from ..accounts import AccountError
-
-        if not isinstance(exc, AccountError):
+        if not _has_console_message(exc):
             raise
         print(f"zeta: {exc}", file=sys.stderr)
         return 2

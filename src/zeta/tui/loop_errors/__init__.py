@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
+import sys
 import threading
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +50,57 @@ def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
         _DIAGNOSTIC_QUEUE.put_nowait((path, record))
     except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
         return
+
+
+def tui_error_log() -> Path:
+    return env_home() / "logs" / _TUI_ERROR_LOG
+
+
+def _copy_stderr_to_log(read_fd: int, path: Path) -> None:
+    with os.fdopen(read_fd, "rb", buffering=0) as pipe:
+        while chunk := pipe.read(65536):
+            write_tui_diagnostic(
+                path, {"type": "stderr", "text": chunk.decode("utf-8", "replace")}
+            )
+
+
+@contextmanager
+def stderr_to_log() -> Iterator[None]:
+    """Send everything written to stderr to the TUI error log while the TUI runs.
+
+    One owner for fd 2: Python writes (warnings, logging's last-resort handler,
+    unraisable and thread exceptions, asyncio shutdown errors) and child
+    processes that inherit fd 2 all reach the log instead of the terminal.
+    """
+
+    path = tui_error_log()
+    sys.stderr.flush()
+    read_fd, write_fd = os.pipe()
+    reader = threading.Thread(
+        target=_copy_stderr_to_log, args=(read_fd, path), name="zeta-tui-stderr", daemon=True
+    )
+    reader.start()
+    terminal_fd = os.dup(2)
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    previous = sys.stderr
+    sys.stderr = open(  # noqa: SIM115 - lives until the terminal is restored below
+        2, "w", buffering=1, encoding="utf-8", errors="backslashreplace", closefd=False
+    )
+    try:
+        yield
+    except Exception as exc:
+        # Logged before the terminal returns, so the caller can print one line.
+        stack = "".join(traceback.format_exception(exc))
+        write_tui_diagnostic(path, {"type": "crash", "traceback": stack})
+        raise
+    finally:
+        sys.stderr.flush()
+        sys.stderr = previous
+        os.dup2(terminal_fd, 2)
+        os.close(terminal_fd)
+        # Children that still hold the pipe keep logging; do not wait for them.
+        reader.join(timeout=1)
 
 
 async def start_prompt_during_activation(
@@ -101,7 +156,7 @@ async def run_prompt_toolkit(
         _loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     ) -> None:
         error = context.get("exception")
-        log_path = env_home() / "logs" / _TUI_ERROR_LOG
+        log_path = tui_error_log()
         if isinstance(error, BaseException):
             message = f"unexpected ui error: {type(error).__name__}"
             stack = "".join(traceback.format_exception(error))
