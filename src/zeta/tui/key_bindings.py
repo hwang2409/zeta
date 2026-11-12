@@ -1035,7 +1035,7 @@ def build_key_bindings(
             if (
                 get_app().editing_mode is EditingMode.VI
                 and get_app().vi_state.input_mode is InputMode.INSERT
-                and event.key_sequence[0].key == Keys.ESCAPE
+                and event.key_sequence[0].key == Keys.Escape
             ):
                 get_app().vi_state.input_mode = InputMode.NAVIGATION
                 return

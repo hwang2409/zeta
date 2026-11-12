@@ -7,10 +7,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 from ...core.store import ObserverSnapshotChanged
-from ...core.store._history_index import (
-    InvalidHistoryPageRequest,
-    StaleHistorySnapshot,
-)
+from ...core.store._history_index import InvalidHistoryPageRequest
 from ..protocol import MAX_REQUEST_ID_BYTES, ErrorDescriptor, FrameCodec, ProtocolError
 from ..runtime import ServerRuntime
 from . import child_run_lifecycle
@@ -607,11 +604,6 @@ def _backward_history_request(
         ) if read_page is not None else None
     except InvalidHistoryPageRequest as exc:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
-    except StaleHistorySnapshot as exc:
-        raise ProtocolError(
-            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
-            "session history changed; restart from the newest page",
-        ) from exc
     if page is None:
         return _projected_backward_history_request(
             runtime,
@@ -667,11 +659,6 @@ def _forward_history_request(
         page = read_page({"offset": offset}) if read_page is not None else None
     except InvalidHistoryPageRequest as exc:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
-    except StaleHistorySnapshot as exc:
-        raise ProtocolError(
-            ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
-            "session history changed; restart from the newest page",
-        ) from exc
     if page is None:
         return _projected_forward_history_request(
             runtime,
