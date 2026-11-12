@@ -112,24 +112,36 @@ class ResidentRows:
     def __init__(self, entries: Iterable[ConversationEntry] = ()) -> None:
         self.entries: list[ConversationEntry] = []
         self.rows: list[RowRef] = []
-        self.branch: tuple[ConversationEntry, ...] = ()
+        self.branch: list[ConversationEntry] = []
         self.replace(entries)
 
     def append(self, entry: ConversationEntry) -> None:
+        previous = self.entries[-1] if self.entries else None
         self.entries.append(entry)
         self.rows.append(RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry)))
-        self._rebuild_branch()
+        if (previous is None and entry.parent_id is None) or (
+            previous is not None and entry.parent_id == previous.id
+        ):
+            self.branch.append(entry)
+        else:
+            self._rebuild_branch()
 
     def extend(self, entries: Iterable[ConversationEntry]) -> None:
         additions = list(entries)
         if not additions:
             return
+        previous = self.entries[-1] if self.entries else None
         self.entries.extend(additions)
         self.rows.extend(
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in additions
         )
-        self._rebuild_branch()
+        if (previous is None and additions[0].parent_id is None) or (
+            previous is not None and additions[0].parent_id == previous.id
+        ):
+            self.branch.extend(additions)
+        else:
+            self._rebuild_branch()
 
     def truncate_to(self, length: int) -> None:
         del self.entries[length:]
@@ -145,7 +157,7 @@ class ResidentRows:
         self._rebuild_branch()
 
     def _rebuild_branch(self) -> None:
-        by_id = {e.id: e for e in self.entries}
+        by_id = {self.entries[index].id: self.entries[index] for index in range(len(self.entries))}
         current = self.entries[-1] if self.entries else None
         branch: list[ConversationEntry] = []
         seen: set[str] = set()
@@ -155,7 +167,7 @@ class ResidentRows:
             seen.add(current.id)
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        self.branch = tuple(reversed(branch))
+        self.branch = list(reversed(branch))
 
     def entry(self, ref: RowRef) -> ConversationEntry:
         for entry in self.entries:
