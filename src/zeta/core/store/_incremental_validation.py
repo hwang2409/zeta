@@ -216,7 +216,7 @@ class IncrementalValidationMixin:
         self._validate_entry_payload(entry)
         if entry.type == "fork":
             self._validate_fork_entry(entry)
-        self._record_active_entry(entry, approvals)
+        self._apply_to_working_fold(entry, approvals)
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -242,14 +242,16 @@ class IncrementalValidationMixin:
         self._delivery_fold = fold
         self._entries.extend(entries)
 
-    def _record_active_entry(
+    def _apply_to_working_fold(
         self,
         entry: ConversationEntry,
         approvals: _ApprovalValidationOverlay | None = None,
     ) -> None:
-        """Apply one active-branch entry to the current working delivery fold.
+        """Apply one active-branch entry in place to the current working fold.
 
-        Callers hold either a fresh fold (rebuild, branch select) or a staged
-        working fold (incremental tail); an installed fold is never mutated.
+        The caller must first set ``self._delivery_fold`` to a working fold it
+        owns (a fresh fold on rebuild or branch select, a ``staged()`` copy on an
+        incremental tail); this writes into that fold in place. It must never run
+        against an installed fold, which is immutable.
         """
         self._delivery_fold.apply(entry, approvals)

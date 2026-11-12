@@ -1662,22 +1662,6 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
 
 
-def _detached_states_equal(a: object, b: object) -> bool:
-    """Compare two detached log states, folding in delivery-fold content.
-
-    The delivery fold is immutable after install and compares by identity, so
-    match its containers by value and the remaining fields by the dataclass eq.
-    """
-    fold_fields = DeliveryFold.__slots__
-    if any(
-        getattr(a.delivery_fold, name) != getattr(b.delivery_fold, name)
-        for name in fold_fields
-    ):
-        return False
-    shared = a.delivery_fold
-    return replace(a, delivery_fold=shared) == replace(b, delivery_fold=shared)
-
-
 @pytest.mark.asyncio
 async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     tmp_path: Path,
@@ -1712,7 +1696,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
+    assert store._detach_log_state() == fresh._detach_log_state()
     assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
 
 
@@ -1742,7 +1726,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
     await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
+    assert store._detach_log_state() == fresh._detach_log_state()
     assert [item.content[0].text for item in store.messages()] == ["owner", "worker"]
 
 
@@ -1784,7 +1768,7 @@ async def test_async_publish_matches_fresh_load_after_each_owner_worker_race(
         await await_or_fail(write, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
+        assert store._detach_log_state() == fresh._detach_log_state()
 
 
 @pytest.mark.asyncio
@@ -1914,7 +1898,7 @@ async def test_durable_publish_preserves_newer_owner_state(
         await await_or_fail(write, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
+        assert store._detach_log_state() == fresh._detach_log_state()
         assert store.bash_cwd == fresh.bash_cwd
         assert store.todo_items() == fresh.todo_items()
         assert store.todo_dismissed == fresh.todo_dismissed
@@ -1973,7 +1957,7 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
         await await_or_fail(refresh, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
+        assert store._detach_log_state() == fresh._detach_log_state()
         assert store.bash_cwd == fresh.bash_cwd
         assert store.todo_items() == fresh.todo_items()
         assert store.todo_dismissed == fresh.todo_dismissed
@@ -2541,7 +2525,7 @@ def test_full_load_validates_the_final_branch_once(
         )
     store.close()
     validations = 0
-    original = ConversationStore._record_active_entry
+    original = ConversationStore._apply_to_working_fold
 
     def count_validation(
         self: ConversationStore,
@@ -2553,7 +2537,7 @@ def test_full_load_validates_the_final_branch_once(
         original(self, entry, approvals)
 
     # test-contract: seam count active-branch validation through a real store reopen
-    monkeypatch.setattr(ConversationStore, "_record_active_entry", count_validation)
+    monkeypatch.setattr(ConversationStore, "_apply_to_working_fold", count_validation)
 
     reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
 
@@ -3607,13 +3591,14 @@ _DELIVERY_ROUTES = (
     "tail_refresh",
     "fork_rebuild",
     "off_loop_refresh",
+    "install_race",
 )
 
 
 @pytest.mark.parametrize("route", _DELIVERY_ROUTES)
 @pytest.mark.asyncio
 async def test_delivery_fold_install_routes_match_cold_reopen(
-    tmp_path: Path, route: str
+    tmp_path: Path, route: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # test-contract: every DeliveryFold install route must agree with a cold
     # full load of the identical bytes. The bug class is "one install route
@@ -3627,6 +3612,7 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
     writer: ConversationStore | None = None
     cold: ConversationStore | None = None
     target: ConversationStore | None = None
+    race_notification_id: str | None = None
     try:
         if route == "live_append":
             target = ConversationStore(root, session_id=session_id)
@@ -3673,7 +3659,12 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
                 text="done a",
             )
             # Async commands install through the worker patch route
-            # (_install_validated_linear_entries).
+            # (_install_delta_entries -> _install_validated_linear_entries, then
+            # the resident-patch install in _install_committed_delta). This row
+            # proves the route's public reads match a cold reopen end to end; it
+            # does not pin the _install_validated_linear_entries fold swap on its
+            # own, because the resident patch installs the same fold value too
+            # (see the report). The install_race row pins the patch install.
             await target.record_agent_notification_delivery_async(
                 notification.id, presented=True, acknowledged=False
             )
@@ -3703,7 +3694,7 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
             # Forking off an earlier checkpoint is a non-linear append, which
             # rebuilds the active-branch fold (_rebuild_incremental_validation_state).
             target.append_fork(str(checkpoint.seq))
-        else:  # off_loop_refresh — the B1 replace_entries route
+        elif route == "off_loop_refresh":  # the B1 replace_entries route
             reader = ConversationStore(root, session_id=session_id)
             writer = ConversationStore(root, session_id=session_id)
             await asyncio.to_thread(_apply_delivery_script, writer)
@@ -3711,11 +3702,75 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
             # the immutable fold is installed by reference, not a lost patch.
             await asyncio.wait_for(reader._refresh_off_loop(), 10)
             target = reader
+        else:  # install_race — the B1 regression the identity-eq fold dropped
+            # The owner swaps its fold to an equal-valued object (a fold-neutral
+            # checkpoint) while an async command is in flight, and an external
+            # instance appends a notification in that same window. The command's
+            # writer reloads, sees the external row, and sends a replace delta
+            # whose resident patch carries the writer's fold with `expected` ==
+            # the owner's baseline fold object. With identity equality the
+            # owner's swapped-but-equal object reads as "changed by the owner",
+            # so the patch is dropped and the external notification is lost from
+            # the resident fold while its row is in _entries. Value equality
+            # behind the identity fast path keeps the writer's fold. It fails on
+            # b793222d at the `assert cold_reads == live` below (the external
+            # notification missing from agent_notifications()).
+            target = ConversationStore(root, session_id=session_id)
+            writer = ConversationStore(root, session_id=session_id)
+            target.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("boundary")])
+            )
+            # Warm the durable writer so the next command reuses it and reaches
+            # _reload_durable_writer_if_changed (the first command creates it).
+            await target.append_message_async(
+                Message(MessageRole.ASSISTANT, [TextContent("warm")])
+            )
+            reload_reached = threading.Event()
+            release_reload = threading.Event()
+            original_reload = ConversationStore._reload_durable_writer_if_changed
+
+            def gated_reload(durable: ConversationStore) -> None:
+                reload_reached.set()
+                assert release_reload.wait(10)
+                original_reload(durable)
+
+            # test-contract: seam gates the writer reload so the owner can swap
+            # its fold and an external instance can append inside the window.
+            monkeypatch.setattr(
+                ConversationStore,
+                "_reload_durable_writer_if_changed",
+                staticmethod(gated_reload),
+            )
+            in_flight = asyncio.create_task(
+                target.append_message_async(
+                    Message(MessageRole.ASSISTANT, [TextContent("in flight")])
+                )
+            )
+            assert await asyncio.to_thread(reload_reached.wait, 10)
+            # Owner swaps its fold to an equal-valued object before the reload.
+            target.append_checkpoint("cp")
+            external_notification = writer.append_agent_notification(
+                "child-ext",
+                child_session_path="/c/ext",
+                description="ext",
+                status="completed",
+                text="external done",
+            )
+            race_notification_id = external_notification.id
+            release_reload.set()
+            await await_or_fail(in_flight, what="install_race in-flight command")
 
         live = await asyncio.to_thread(_delivery_fold_reads, target)
         cold = ConversationStore(root, session_id=session_id)
         cold_reads = await asyncio.to_thread(_delivery_fold_reads, cold)
         assert cold_reads == live, route
+        if race_notification_id is not None:
+            # On the fixed head the owner fold kept the external notification,
+            # so acking it (its row is already durable) succeeds. On the buggy
+            # head the assert above already failed because the fold lost it.
+            await target.record_agent_notification_delivery_async(
+                race_notification_id, acknowledged=True
+            )
     finally:
         seen: set[int] = set()
         for handle in (target, reader, writer, cold):

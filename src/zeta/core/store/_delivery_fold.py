@@ -10,11 +10,11 @@ Immutable after install
 -----------------------
 An installed fold is never mutated in place. Every change builds a new fold with
 ``staged()`` (copied containers), applies the new entries to that working copy,
-and swaps it in by one reference. ``__copy__``/``__deepcopy__`` return ``self``
-and equality is identity, so the cross-instance worker patch protocol treats
-"same object" as "unchanged": the writer that built a new fold is detected as
-changed and installed by reference, with no per-command deep copy of the whole
-fold, and the ``replace_entries`` refresh route installs the writer's fold.
+and swaps it in by one reference. ``__copy__``/``__deepcopy__`` return ``self``,
+so there is no per-command deep copy of the whole fold. Equality is by value
+behind an identity fast path, so the cross-instance worker patch protocol detects
+an owner that swapped its fold to an equal-valued object as unchanged and still
+installs the writer's fold on the ``replace_entries`` refresh route.
 """
 
 from __future__ import annotations
@@ -65,14 +65,29 @@ class DeliveryFold:
         self.last_turn_end: ConversationEntry | None = None
         self.last_terminal_transition: ConversationEntry | None = None
 
-    # An installed fold is immutable, so a copy is the same object. This makes
-    # the worker patch protocol's value equality an identity test (see module
-    # docstring) and removes the per-command deep copy of the whole fold.
+    # An installed fold is immutable, so a copy is the same object. This removes
+    # the per-command deep copy of the whole fold.
     def __copy__(self) -> DeliveryFold:
         return self
 
     def __deepcopy__(self, memo: object) -> DeliveryFold:
         return self
+
+    # The worker patch protocol compares a baseline value to the resident one to
+    # decide whether to install the writer's value (``_async_writes`` install
+    # check). That comparison must be by value, not identity: the owner can swap
+    # its fold to a new object with unchanged values while a command is in
+    # flight, and an identity test would then drop the writer's fold (with an
+    # external notification in it) on the replace route. The identity fast path
+    # keeps the common "same object" case free.
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        if not isinstance(other, DeliveryFold):
+            return NotImplemented
+        return all(getattr(self, name) == getattr(other, name) for name in self.__slots__)
+
+    __hash__ = None
 
     def staged(self) -> DeliveryFold:
         """Return a mutable working fold with its own containers for one change."""

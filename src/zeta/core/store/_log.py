@@ -274,7 +274,7 @@ class _FullLoadValidator:
         approvals = _ApprovalValidationOverlay()
         for entry in reversed(branch):
             try:
-                self.state._record_active_entry(entry, approvals)
+                self.state._apply_to_working_fold(entry, approvals)
             except ConversationIntegrityError as exc:
                 raise self._error(
                     self.rows_by_id[entry.id],
