@@ -3379,7 +3379,9 @@ async def test_approval_read_seam_table(
             return original_rebuild(target)
 
         store.resolve_approval(call.id, "allow")
+        # test-contract: seam an on-loop append marks the index unavailable
         assert not index.available
+        # test-contract: seam counts rebuilds of the sidecar on the hot read path
         monkeypatch.setattr(
             history_index_module, "_rebuild_history_index", counting_rebuild
         )
@@ -3387,6 +3389,7 @@ async def test_approval_read_seam_table(
         resolution = await asyncio.wait_for(store.approval_resolution(call.id), 10)
         assert state == (call, "allow")
         assert resolution is not None and resolution["decision"] == "allow"
+        # test-contract: seam the hot-path read answers from resident memo, not a rebuild
         assert rebuilds == [], (
             "an approval read must not rebuild the sidecar after an on-loop append"
         )
