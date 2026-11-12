@@ -519,14 +519,18 @@ class ServeControl:
             Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
+        # The Decide just wrote on this thread, so the memoized `*_now` seam has
+        # the resolution without an await (and without the B1 stale-read risk of
+        # an off-loop read here). Resume only a request the Decide resolved.
         state = (
-            await loop.store.approval_state(core_key)
+            loop.store.approval_state_now(core_key)
             if isinstance(core_key, str)
             else None
         )
         if (
             not self.turn_busy()
             and state is not None
+            and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])
         ):
             host_commands = self._active_host_commands

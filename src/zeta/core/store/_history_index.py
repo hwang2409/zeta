@@ -768,7 +768,6 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
                 return facts
         finally:
             observer.close()
-        return
     writer = store._new_persistent_durable_writer()
     try:
         with writer._append_lock():

@@ -638,7 +638,14 @@ class AgentLoop(
             )
         return result
     def finalize_canceled(self, tool_call: ToolCall) -> ToolResult | None:
-        """Persist one canceled result for a durable approval request."""
+        """Persist one canceled result for a durable approval request.
+
+        Only a request that is still an unresolved durable approval on the
+        active branch is finalized: a non-durable (ephemeral) request has no
+        store row and must not get a canceled tool result written for it.
+        """
+        if self.store.approval_state_now(tool_call.id) is None:
+            return None
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing

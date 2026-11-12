@@ -991,7 +991,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
-            state = await delegated[1].approval_state(delegated[0].request_id)
+            # Sync resident read: this handler runs inside tool cancellation, so
+            # it must not await. resolve_approval wrote on this thread, so the
+            # memoized `*_now` seam already reflects the winning decision.
+            state = delegated[1].approval_state_now(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
@@ -999,7 +1002,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return None
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
-        state = await store.approval_state(request_id)
+        state = store.approval_state_now(request_id)
         return _resolved_decision(state[1] if state is not None else None)
 
     async def durable_resolution(
