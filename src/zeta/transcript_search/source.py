@@ -25,6 +25,21 @@ PREFIX_DIGEST_BYTES = 64 * 1024
 _SAFE_ARGUMENTS = ("command", "path", "url", "query", "name", "cwd")
 
 
+class CorruptTranscriptSource(ValueError):
+    """One source transcript could not be read; names the row and path, not content.
+
+    Raised by ``_read_transcript`` so a project-wide rebuild can skip and name one
+    bad session instead of aborting with a raw JSON error.
+    """
+
+    def __init__(self, *, path: Path, row: int | None, reason: str) -> None:
+        self.path = Path(path)
+        self.row = row
+        self.reason = reason
+        location = f" at row {row}" if row is not None else ""
+        super().__init__(f"corrupt transcript{location}: {path} ({reason})")
+
+
 @dataclass(frozen=True, slots=True)
 class _Cursor:
     byte_offset: int
@@ -195,6 +210,7 @@ def _read_transcript(
         last_seq = 0 if full else cursor.last_seq
         last_entry_id = None if full else cursor.last_entry_id
         bytes_read = 0
+        physical_row = 0
         with os.fdopen(fd, "rb", closefd=False) as handle:
             while True:
                 start = handle.tell()
@@ -206,27 +222,47 @@ def _read_transcript(
                 if not line:
                     offset = start
                     break
+                physical_row += 1
                 bytes_read += len(line)
+                row = physical_row if full else None
                 if len(line) > MAX_ROW_BYTES:
-                    raise ValueError("transcript row exceeds size limit")
+                    raise CorruptTranscriptSource(
+                        path=path, row=row, reason="row exceeds size limit"
+                    )
                 if not line.endswith(b"\n"):
                     offset = start
                     break
                 offset = handle.tell()
-                value = json.loads(line)
+                try:
+                    value = json.loads(line)
+                except ValueError as exc:
+                    raise CorruptTranscriptSource(
+                        path=path, row=row, reason="invalid json"
+                    ) from exc
                 if not isinstance(value, dict):
-                    raise TypeError("transcript row is not an object")
+                    raise CorruptTranscriptSource(
+                        path=path, row=row, reason="row is not an object"
+                    )
                 if value.get("type") == "header":
                     if not full or rows:
                         if not full:
                             return _read_transcript(path, None)
-                        raise ValueError("unexpected transcript header")
+                        raise CorruptTranscriptSource(
+                            path=path, row=row, reason="unexpected header"
+                        )
                     continue
-                entry = ConversationEntry.from_dict(value)
+                try:
+                    entry = ConversationEntry.from_dict(value)
+                except (ValueError, TypeError) as exc:
+                    raise CorruptTranscriptSource(
+                        path=path, row=row, reason="invalid conversation entry"
+                    ) from exc
                 if entry.seq != last_seq + 1:
                     if not full:
                         return _read_transcript(path, None)
-                    raise ValueError("transcript sequence is not contiguous")
+                    raise CorruptTranscriptSource(
+                        path=path, row=row, reason="sequence is not contiguous"
+                    )
                 rows.append(_project_entry(entry))
                 last_seq = entry.seq
                 last_entry_id = entry.id

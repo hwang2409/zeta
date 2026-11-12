@@ -313,6 +313,34 @@ def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
     assert rebuilt.status().unit_count == incremental.status().unit_count == 2
 
 
+def test_rebuild_skips_corrupt_session_and_names_it(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    good = _source(
+        sessions,
+        "good",
+        [
+            _row(1, "user", "healthy canary question"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    bad = _source(sessions, "bad", [_row(1, "user", "doomed")])
+    # A newline-terminated invalid row mid-file is the corruption that blocked
+    # the whole project's rebuild on main with a raw "Expecting property name".
+    bad.conversation_path.write_text(
+        json.dumps(_row(1, "user", "doomed")) + "\n" + "{not json}\n",
+        encoding="utf-8",
+    )
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+
+    try:
+        status = index.rebuild((bad, good))
+    except index_module.TranscriptIndexError:
+        status = None
+    assert status is not None, "rebuild aborted instead of skipping the corrupt session"
+    assert _result_ids(index, "canary"), "good session not searchable after rebuild"
+    assert any("bad" in message for message in status.skipped)
+
+
 def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) -> None:
     private_key = (
         "-----BEGIN PRIVATE KEY-----\n"

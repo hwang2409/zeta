@@ -14,7 +14,7 @@ import threading
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 from zeta.core.checkpoints import ConversationEntry, active_branch
 from zeta.core.store._log import PersistedAppend
 from zeta.transcript_search.source import (
+    CorruptTranscriptSource,
     _Cursor,
     _prefix_digest,
     _read_transcript,
@@ -161,6 +162,7 @@ class IndexStatus:
     size_bytes: int
     ready: bool
     detail: str | None = None
+    skipped: tuple[str, ...] = ()
 
 
 class TranscriptIndex:
@@ -243,6 +245,7 @@ class TranscriptIndex:
 
     def _rebuild_locked(self, sources: Sequence[TranscriptSource]) -> IndexStatus:
         generation = self._generation_best_effort() + 1
+        skipped: list[str] = []
         try:
             with self._temporary_database() as temporary_path:
                 replacement = self._reference(temporary_path, self.project_id)
@@ -255,9 +258,14 @@ class TranscriptIndex:
                     )
                     connection.commit()
                 for source in sources:
-                    replacement._append_locked(source, force_full=True)
+                    try:
+                        replacement._append_locked(source, force_full=True)
+                    except CorruptTranscriptSource as corrupt:
+                        skipped.append(
+                            f"skipped corrupt session {source.session_id}: {corrupt}"
+                        )
                 self._publish(temporary_path)
-                return self._status()
+                return replace(self._status(), skipped=tuple(skipped))
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise TranscriptIndexError(
                 f"could not rebuild transcript index: {exc}"

@@ -126,6 +126,12 @@ def run(
             value = project.to_dict()
         elif args.project_verb == "index":
             value = _run_index(args, registry)
+            skipped = value.get("skipped") if isinstance(value, dict) else None
+            if skipped:
+                print(json.dumps(value, indent=2, sort_keys=True), file=out)
+                for message in skipped:
+                    print(f"zeta: {message}", file=err)
+                return 1
         elif args.project_verb == "memory":
             if args.project == "accept":
                 if getattr(args, "reason", None) is not None:
@@ -408,6 +414,7 @@ def _status_value(status: Any) -> dict[str, object]:
         "sanitizer_version": status.sanitizer_version,
         "ready": status.ready,
         "detail": status.detail,
+        "skipped": list(status.skipped),
         "generation": status.generation,
         "unit_count": status.unit_count,
         "session_count": status.session_count,
