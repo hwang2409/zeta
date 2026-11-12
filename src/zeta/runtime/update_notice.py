@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+
+_LOGGER = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SECONDS = 180.0
 
@@ -128,7 +131,10 @@ class UpdateChecker:
         """Check once; this seam lets tests trigger a check without sleeping."""
         if self._last_seen is None:
             return False
-        current = await asyncio.to_thread(self._read_revision, self._package_file)
+        try:
+            current = await asyncio.to_thread(self._read_revision, self._package_file)
+        except (OSError, ValueError):
+            return False
         if current is None or current == self._last_seen or current == self._initial:
             return False
         old = self._initial
@@ -146,9 +152,8 @@ class UpdateChecker:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001, S112 - checks are best effort
-                # A transient checkout/read failure must not affect the TUI.
-                continue
+            except Exception:
+                _LOGGER.exception("update notice subscriber failed")
 
 
 class ProcessUpdateMonitor:

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
+import pytest
+
+from tests.support.sockets import short_socket_path
+from tests.test_server import _connect
 from zeta.runtime.update_notice import UpdateChecker, source_revision
+from zeta.server import ZetaServer
 from zeta.server.connections import EVENT_FEATURES
 from zeta.server.protocol import EventDescriptor
 from zeta.tui import layout
@@ -112,6 +118,32 @@ def test_updated_footer_uses_the_persistent_notice(monkeypatch) -> None:
     assert "zeta updated · /restart" in "".join(
         text for _style, text in layout.status_toolbar(App())
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_serve_publishes_update_without_opened_session(tmp_path: Path) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=short_socket_path(tmp_path),
+        provider="ollama",
+        model="offline",
+    )
+    reader, writer = await _connect(server)
+    try:
+        writer.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {
+            "protocol_version": "1.2", "role": "controller", "features": ["zeta_updated"]
+        }}) + "\n").encode())
+        await writer.drain()
+        await asyncio.wait_for(reader.readline(), 10)
+        await asyncio.sleep(0)
+        await server.publish_update("old", "new")
+        frame = json.loads(await asyncio.wait_for(reader.readline(), 10))
+        assert frame["params"]["event"] == "zeta_updated"
+        assert frame["params"]["data"] == {"old_revision": "old", "new_revision": "new"}
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
 
 
 def test_serve_mapping_declares_update_event() -> None:

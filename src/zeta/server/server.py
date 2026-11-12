@@ -286,7 +286,7 @@ class ZetaServer:
             await self.connections.publish_feature_event(
                 "zeta_updated",
                 EventDescriptor.ZETA_UPDATED,
-                self.runtime.session_id,
+                self.runtime.session_id if self.runtime.opened is not None else None,
                 data={"old_revision": old_revision, "new_revision": new_revision},
             )
 
