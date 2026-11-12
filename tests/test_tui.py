@@ -11262,7 +11262,12 @@ async def test_empty_max_tokens_completion_does_not_print_neutral_fallback(
     output = StringIO()
     app = TUIApp(
         AgentLoop(
-            FakeBackend([ScriptedTurn([], stop_reason="max_tokens")]),
+            FakeBackend(
+                [
+                    ScriptedTurn([], stop_reason="max_tokens"),
+                    ScriptedTurn([], stop_reason="max_tokens"),
+                ]
+            ),
             ConversationStore(tmp_path / "sessions"),
             skill_catalog=SkillCatalog.empty(),
         ),
@@ -11274,6 +11279,8 @@ async def test_empty_max_tokens_completion_does_not_print_neutral_fallback(
     await app._consume_turn("prompt")
 
     rendered = Text.from_ansi(output.getvalue()).plain
+    # The first limit stop is retried once and shown; the second ends the turn.
+    assert rendered.count("output token limit reached while thinking") == 1
     assert rendered.count("error · max_tokens") == 1
     assert "no response" not in rendered
 

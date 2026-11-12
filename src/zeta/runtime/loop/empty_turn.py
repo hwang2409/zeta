@@ -33,6 +33,7 @@ EMPTY_TURN_NUDGE_TEXT = (
     "Reply to the user or continue the task."
 )
 TOOL_LIMIT_RECOVERY_EVENT = "tool_call_output_limit_recovery"
+THINKING_LIMIT_RECOVERY_EVENT = "thinking_output_limit_recovery"
 
 # Provider stop reasons are short; keep the persisted value bounded regardless.
 MAX_STOP_REASON_CHARS = 64
@@ -316,6 +317,18 @@ def build_tool_limit_recovery_message(tool_name: str) -> Message:
         "output-limit recovery",
         text,
         event=TOOL_LIMIT_RECOVERY_EVENT,
+    )
+
+
+def build_thinking_limit_recovery_message() -> Message:
+    text = (
+        "You hit the output token limit while thinking and produced no reply. "
+        "Think briefly, then reply to the user or make a tool call now."
+    )
+    return harness_notice(
+        "output-limit recovery",
+        text,
+        event=THINKING_LIMIT_RECOVERY_EVENT,
     )
 
 
