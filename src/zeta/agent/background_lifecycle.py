@@ -789,7 +789,7 @@ async def finish_background_child(
                 reason="canceled" if status == "canceled" else "finished",
             )
             if status != "canceled":
-                await background_owner.conversation_channel.reroute_questions_from(
+                await background_owner.conversation_channel.drain_terminal(
                     child_store
                 )
             return await background_owner.conversation_channel.publish_completion(
