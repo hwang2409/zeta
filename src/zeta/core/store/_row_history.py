@@ -184,8 +184,15 @@ class RecentRowsMixin:
         """
         floor = self.recent_row_floor()
         if type(key) is ApprovalRequest:
-            entry = self._active_approval_requests.get(key.request_id)
-            return None if entry is None else entry.seq
+            for entry in reversed(self._entries[floor - 1 :]):
+                if entry.type != "message":
+                    continue
+                if any(
+                    request.get("request_id") == key.request_id
+                    for request in entry.data.get("approval_requests", ())
+                ):
+                    return entry.seq
+            return None
         entries = self._entries
         row_type, test = _predicate(key)
         if type(key) in (AssistantResponseAfter, UserTurnMessageAfter):

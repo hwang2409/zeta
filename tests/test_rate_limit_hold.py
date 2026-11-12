@@ -224,6 +224,7 @@ async def _serve_mapping(event: StreamEvent) -> list[tuple[str, dict[str, object
         frames.append((getattr(name, "value", name), fields))
 
     control._notify = notify
+
     control._end_stale_approvals = lambda _session_id: None
     await control._event(event, session_id="session", background=True)
     return frames

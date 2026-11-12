@@ -427,7 +427,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             assert result["decision"] == "approve"
             expected = "allow"
         await server.control.wait_for_approval_settlement()
-        assert store.approval_resolution_data(call.id)["decision"] == expected
+        assert (await store.approval_resolution(call.id))["decision"] == expected
         rows = [entry for entry in store.entries if entry.type == "approval_resolution"]
         assert len(rows) == 1
         pending = await server.control.pending_approvals()
@@ -517,7 +517,7 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement before commit")
         await server.control.wait_for_approval_settlement()
-        assert store.approval_resolution_data(call.id)["decision"] == "allow"
+        assert (await store.approval_resolution(call.id))["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
     finally:
         await close_serve(server, writer)
@@ -554,7 +554,7 @@ async def test_cancelled_after_durable_commit_keeps_decision(
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement after commit")
         await server.control.wait_for_approval_settlement()
-        resolution = store.approval_resolution_data(call.id)
+        resolution = await store.approval_resolution(call.id)
         assert resolution is not None and resolution["decision"] == "allow"
         assert call.id not in server.control._approvals.state.records
         assert ends.count(EventDescriptor.APPROVAL_END) == 1
@@ -722,7 +722,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
 
         # test-contract: seam records the settlement-owned durable write
         monkeypatch.setattr(store, "resolve_approval_async", record_writer)
-        assert abort() is None
+        assert await abort() is None
         await asyncio.sleep(0)
         await server.control.wait_for_approval_settlement()
 
@@ -769,7 +769,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             call
         )
         if child is not None:
-            request = authorizer.prepare(call, capability=capability)
+            request = await authorizer.prepare(call, capability=capability)
             assert request is not None
             child.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -825,7 +825,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         await server.control.wait_for_approval_settlement()
 
         assert writes == 3
-        assert store.approval_resolution_data(call.id) == {
+        assert await store.approval_resolution(call.id) == {
             "request_id": call.id,
             "decision": "abort",
             "reason": "child_cleanup" if path == "delegated" else "turn_canceled",
@@ -1533,7 +1533,7 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
         gate.release.set()
         await asyncio.wait_for(released, 10)
         assert gate.thread_ids != [threading.get_ident()]
-        resolution = server.runtime.opened.store.approval_resolution_data(call.id)
+        resolution = await server.runtime.opened.store.approval_resolution(call.id)
         actual = (json.dumps(resolution, separators=(",", ":")) + "\n").encode()
         assert actual == expected
     finally:
@@ -1574,7 +1574,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         )
         policy.register_delegated(late_request, late, child_instance_id="late-child")
         await server.control.wait_for_approval_settlement()
-        assert late.approval_resolution_data(late_call.id)["decision"] == "abort"
+        assert late.approval_resolution_now(late_call.id)["decision"] == "abort"
         policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
@@ -1746,7 +1746,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         frames = await await_or_fail(rpc, what="test await")
         await server.control.wait_for_approval_settlement()
 
-        resolution = store.approval_resolution_data(call.id)
+        resolution = await store.approval_resolution(call.id)
         assert resolution is not None
         response = frames[-1]
         assert "error" not in response
@@ -1804,7 +1804,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
             background=True,
         )
         await server.control.controller_released()
-        resolution = child.approval_resolution_data(call.id)
+        resolution = await child.approval_resolution(call.id)
         assert resolution is not None
         assert resolution["decision"] == "abort"
         assert resolution["reason"] in {
@@ -1934,7 +1934,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10
         )
 
-        assert child.approval_resolution_data(call.id) == {
+        assert await child.approval_resolution(call.id) == {
             "request_id": call.id,
             "decision": "abort",
             "reason": "child_cleanup",
@@ -2025,7 +2025,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         assert approved[-1]["result"]["request_id"] == call.id
         await _frames_until_event(replay_reader, "agent_end")
         assert (
-            server.runtime.opened.store.approval_resolution_data(call.id)["decision"]
+            (await server.runtime.opened.store.approval_resolution(call.id))["decision"]
             == "allow"
         )
         assert len(backend.calls) == 2
@@ -2286,9 +2286,16 @@ async def test_approval_reconnect_status_bound_is_negotiated(tmp_path: Path) -> 
         features=["approval_reconnect"],
     )
     try:
-        states = server.runtime.opened.store.approval_states()
-        for call, _decision in states.values():
-            await server.control._event(_start_event(call))
+        after_seq = 0
+        while True:
+            page = await server.runtime.opened.store.pending_approval_page(after_seq)
+            for _request_id, tool_call in page.items:
+                await server.control._event(
+                    _start_event(ToolCall.from_dict(dict(tool_call)))
+                )
+            if page.next_seq is None:
+                break
+            after_seq = page.next_seq
         negotiated, truncated = server.control.pending_approvals_now(
             reconnect=True, include_truncated=True
         )

@@ -525,20 +525,22 @@ class ApprovalLifecycle:
             if isinstance(record.target.key, tuple)
         )
 
-        foreground_states = foreground.approval_states_snapshot()
-        child_states = {
-            target.store: target.store.approval_states_snapshot()
-            for target in delegated
-        }
+        pending: list[tuple[str, ToolCall]] = []
+        after_seq = 0
+        while True:
+            page = foreground.pending_approval_page_now(after_seq)
+            pending.extend((k, ToolCall.from_dict(dict(v))) for k, v in page.items)
+            if page.next_seq is None:
+                break
+            after_seq = page.next_seq
         requests = [
             policy.request_from_store(
                 request_id, tool_call, label=await policy.display_label(tool_call)
             )
-            for request_id, (tool_call, decision) in foreground_states.items()
-            if decision is None
+            for request_id, tool_call in pending
         ]
         for target in delegated:
-            state = child_states[target.store].get(target.store_request_id)
+            state = target.store.approval_state_now(target.store_request_id)
             if state is not None and state[1] is None and target.request is not None:
                 requests.append(target.request)
         return [
@@ -735,7 +737,7 @@ class ApprovalLifecycle:
         record = self._new_record(_ApprovalTarget(core_key, policy.store, core_key))
         token = record.token
         generation = record.generation
-        state = record.target.store.approval_states_snapshot().get(core_key)
+        state = record.target.store.approval_state_now(core_key)
         label = None if state is None else await policy.display_label(state[0])
         current = self._state.records.get(core_key)
         if (
@@ -883,7 +885,7 @@ class ApprovalLifecycle:
         return await asyncio.shield(admitted)
 
     async def _finish_external(self, record: ApprovalRecord) -> None:
-        resolution = record.target.store.approval_resolution_data(
+        resolution = record.target.store.approval_resolution_now(
             record.target.store_request_id
         )
         if resolution is not None:
@@ -1098,7 +1100,7 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        durable_state = target.store.approval_states_snapshot().get(
+        durable_state = target.store.approval_state_now(
             target.store_request_id
         )
         # Look the label up before the ownership check, so a stale record is dropped.
@@ -1171,7 +1173,7 @@ class ApprovalLifecycle:
             return
         record = current
         if record.disposition == "external":
-            resolution = target.store.approval_resolution_data(target.store_request_id)
+            resolution = target.store.approval_resolution_now(target.store_request_id)
             if resolution is not None:
                 await asyncio.shield(self._finish_record(record, resolution))
             else:
@@ -1243,7 +1245,7 @@ class ApprovalLifecycle:
             return record.settlement
         if record.live_end is not None:
             return None
-        resolution = record.target.store.approval_resolution_data(
+        resolution = record.target.store.approval_resolution_now(
             record.target.store_request_id
         )
         if resolution is None:

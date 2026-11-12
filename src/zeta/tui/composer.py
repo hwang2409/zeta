@@ -477,7 +477,7 @@ class ComposerAttachmentMixin:
             for request in self.pending_approvals:
                 if self._approval_policy is not None:
                     self._approval_policy.abort(request.key)
-                self.loop.finalize_canceled(request.request_id)
+                self.loop.finalize_canceled(request.tool_call)
             if self._loop_state == "tool-running" and not self._resuming_tool:
                 self._abort_requested = True
             else:

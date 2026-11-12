@@ -464,14 +464,16 @@ async def test_live_approval_handle_survives_refresh_and_submission(
         await asyncio.wait_for(turn, timeout=5)
 
         expected = "deny" if verb == "deny" else "allow"
-        assert store.approval_states()[call.id][1] == expected
+        assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == expected
         assert executed == ([] if verb == "deny" else [{}])
         assert not controller.pending_approvals
         assert not app._approval_units
         assert bool(policy.always_allow) == (verb == "always")
     finally:
-        await app.close()
-        await asyncio.gather(submission, return_exceptions=True)
+        await asyncio.wait_for(app.close(), 10)
+        await asyncio.wait_for(
+            asyncio.gather(submission, return_exceptions=True), 10
+        )
 
 
 def test_visible_approval_card_is_removed_when_request_ends() -> None:

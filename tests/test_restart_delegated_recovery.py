@@ -228,7 +228,7 @@ def _resolution_at(
             _storage_lease=root._storage_lease,
         )
         try:
-            return store.approval_resolution_data(request_id)
+            return store.approval_resolution_now(request_id)
         finally:
             store.close()
     finally:

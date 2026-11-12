@@ -30,6 +30,7 @@ from ..tools._shared.shell import (
 )
 from ..tui.composer import UndoCandidate, parse_input
 from ..tui.user import USER_DISPLAY_TEXT_METADATA
+from ._approval_pipeline import ApprovalPipelineMixin
 from .messages import (
     _AbortAction,
     _ApprovalAction,
@@ -54,7 +55,7 @@ from .model import (
 from .notification_retry import NotificationOutcome, NotificationRetry
 
 
-class SubmissionPipeline:
+class SubmissionPipeline(ApprovalPipelineMixin):
     """Serialize actions and own every submission transition."""
 
     _NONTERMINAL = frozenset(
@@ -93,6 +94,7 @@ class SubmissionPipeline:
             ),
         )
         self._durable_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._durable_tool_calls: dict[str, ToolCall] = {}
         # Running slash dispatches by submission id; each holds or awaits the
         # session slash lock, so the consumer stays free for aborts and approvals.
         self._slash_tasks: dict[int, asyncio.Task[Any]] = {}
@@ -176,8 +178,15 @@ class SubmissionPipeline:
 
     @property
     def pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        # One owner for the runtime pending projection: the policy's resident
+        # snapshot (store page + delegated + ephemeral), read live on each
+        # present. Cheap because the store memoizes it by the active leaf.
         policy = self._host._approval_policy
-        return () if policy is None else tuple(policy.pending_requests_for_display())
+        return (
+            ()
+            if policy is None
+            else tuple(policy.pending_requests_for_display_now())
+        )
 
     def submit(
         self,
@@ -269,7 +278,9 @@ class SubmissionPipeline:
         await acknowledged
 
     def notify_approval_started(
-        self, call: ToolCall, submission_id: int | None
+        self,
+        call: ToolCall,
+        submission_id: int | None,
     ) -> None:
         entry = (
             self._entries.get(submission_id)
@@ -278,6 +289,9 @@ class SubmissionPipeline:
         )
         if entry is not None:
             self._send(_ApprovalLifecycle(entry.submission, "approval_start", call))
+        # A delegated child approval has no local submission entry; it is already
+        # registered on the policy (register_delegated), so the live
+        # pending_approvals property surfaces it on the next present.
 
     def notify_approval_finished(self, call: ToolCall) -> None:
         owner = self._approval_owners.get(call.id)
@@ -960,91 +974,6 @@ class SubmissionPipeline:
             ):
                 entry.completion.set_result(None)
 
-    def _on_approval_lifecycle(self, message: _ApprovalLifecycle) -> None:
-        entry = self._entry_for(message.submission)
-        if entry is None:
-            return
-        if message.kind == "approval_start":
-            self._approval_owners[message.call.id] = entry.submission
-            if entry.state is SubmissionState.PREPROCESSING:
-                entry.state = SubmissionState.AWAITING_APPROVAL
-            return
-        self._approval_owners = {
-            key: owner
-            for key, owner in self._approval_owners.items()
-            if owner is not entry.submission or key != message.call.id
-        }
-        if entry.state is SubmissionState.AWAITING_APPROVAL:
-            entry.state = SubmissionState.PREPROCESSING
-
-    async def _on_approval_action(self, message: _ApprovalAction) -> None:
-        policy = self._host._approval_policy
-        if policy is None:
-            self._ack_action(message)
-            return
-        request = self._find_request(message.requested_key)
-        if request is None:
-            self._host._print_system("approval · no matching request")
-            self._ack_action(message)
-            return
-        owner = self._approval_owners.get(request.key)
-        durable = (
-            owner is None
-            and isinstance(request.key, str)
-            and self._host.loop.store.approval_states().get(request.request_id)
-            == (request.tool_call, None)
-        )
-        if message.decision is ApprovalDecision.ALLOW:
-            if message.always:
-                try:
-                    rule = policy.remember_allow(request)
-                except ValueError as exc:
-                    self._host._print_system(
-                        f"approval · cannot always allow {request.key}: {exc}"
-                    )
-                    self._ack_action(message)
-                    return
-            policy.approve(request.key)
-            verb = (
-                f"always allowed {rule} for this session · request" if message.always else "approved"
-            )
-        else:
-            policy.deny(request.key)
-            verb = "denied"
-            entry = self._entry_for(owner)
-            if entry is not None:
-                entry.denied = True
-                entry.state = SubmissionState.DENIED
-        self._host._print_system(f"approval · {verb} {request.key}")
-        self._host._present_pending_approvals()
-        self._host._invalidate_prompt()
-        if durable and self._host.loop.prepare_resume_pending_tool(
-            request.request_id
-        ):
-            task = asyncio.create_task(
-                self._host.loop.resume_pending_tool(
-                    request.request_id,
-                    prepared=True,
-                    event_sink=self._host._handle_tool_event,
-                )
-            )
-            self._durable_tasks[request.request_id] = task
-            task.add_done_callback(
-                lambda completed, request_id=request.request_id: self._send(
-                    _DurableToolDone(request_id, completed)
-                )
-            )
-        self._ack_action(message)
-
-    def _find_request(self, requested_key: str | None) -> ApprovalRequest | None:
-        requests = self.pending_approvals
-        if requested_key is None:
-            return requests[0] if requests else None
-        return next(
-            (request for request in requests if str(request.key) == requested_key),
-            None,
-        )
-
     def _on_abort(self, submission_id: int | None) -> None:
         if (
             submission_id is None
@@ -1055,7 +984,8 @@ class SubmissionPipeline:
             self._host.loop.abort()
             if self._host._approval_policy is not None:
                 self._host._approval_policy.abort(request_id)
-            self._host.loop.finalize_canceled(request_id)
+            tool_call = self._durable_tool_calls[request_id]
+            self._host.loop.finalize_canceled(tool_call)
             if not task.done():
                 task.cancel()
             self._host._invalidate_prompt()
@@ -1076,6 +1006,7 @@ class SubmissionPipeline:
         if self._durable_tasks.get(message.request_id) is not message.task:
             return
         self._durable_tasks.pop(message.request_id)
+        self._durable_tool_calls.pop(message.request_id, None)
         if message.task.cancelled():
             return
         try:
@@ -1149,20 +1080,6 @@ class SubmissionPipeline:
             entry.child_task.cancel()
         entry.state = SubmissionState.CANCELED
         self._host._invalidate_prompt()
-
-    def _abort_approvals(self, entry: _Entry) -> None:
-        policy = self._host._approval_policy
-        if policy is None:
-            return
-        # Cancellation is a decision: use the strict pending view and record a
-        # canceled result only when this abort actually won.
-        for request in policy.pending_requests():
-            if self._approval_owners.get(request.key) is not entry.submission:
-                continue
-            if not policy.abort(request.key):
-                continue
-            if entry is self._provider_entry and isinstance(request.key, str):
-                self._host.loop.finalize_canceled(request.key)
 
     def _cancel_or_restore(self, entry: _Entry) -> None:
         if entry.undo_requested:

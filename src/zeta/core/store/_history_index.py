@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
-from ...protocol.types import is_passive_harness_message, is_visible_harness_notice
+from ...protocol.types import (
+    ToolCall,
+    is_passive_harness_message,
+    is_visible_harness_notice,
+)
 from ..checkpoints import ConversationEntry
 from ..transcript_recovery import recovery_status
 
@@ -55,6 +59,24 @@ class InvalidHistoryPageRequest(HistoryIndexError):
 
 
 @dataclass(frozen=True, slots=True)
+class IndexedApprovalState:
+    request_entry_id: str
+    tool_call: Mapping[str, object]
+    decision: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedApprovalResolution:
+    data: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedPendingApprovalPage:
+    items: tuple[tuple[str, Mapping[str, object]], ...]
+    next_seq: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class IndexedHistoryPage:
     groups: tuple[tuple[ConversationEntry, ...], ...]
     start: int
@@ -69,7 +91,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -142,6 +164,12 @@ class HistoryIndex:
         return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
+    def _value_ordered(value: object) -> str:
+        # Approval-resolution data is read back and reserialized for a
+        # byte-identical transcript row, so its key order must be preserved.
+        return json.dumps(value, separators=(",", ":"))
+
+    @staticmethod
     def _row(entry: object) -> tuple[int, str, str | None, str, str, str]:
         if isinstance(entry, Mapping):
             value = entry
@@ -206,6 +234,15 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS accepted_messages ("
             "delivery_id TEXT PRIMARY KEY, message BLOB NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS active_approval_requests ("
+            "request_id TEXT PRIMARY KEY, request_seq INTEGER NOT NULL, "
+            "request_entry_id TEXT NOT NULL, tool_call BLOB NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS active_approval_resolutions ("
+            "request_id TEXT PRIMARY KEY, decision TEXT NOT NULL, data BLOB NOT NULL)"
+        )
 
     def _stored_facts(self, connection: sqlite3.Connection) -> dict[str, object] | None:
         row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
@@ -232,10 +269,24 @@ class HistoryIndex:
         except FileNotFoundError:
             pass
 
+    @staticmethod
+    def _active_ids(rows: Sequence[object]) -> set[str]:
+        by_id = {HistoryIndex._row(entry)[1]: entry for entry in rows}
+        active: set[str] = set()
+        current = rows[-1] if rows else None
+        while current is not None:
+            row = HistoryIndex._row(current)
+            if row[1] in active:
+                break
+            active.add(row[1])
+            current = by_id.get(row[2]) if row[2] else None
+        return active
+
     def _rebuild(
         self, source_facts: object, validated_rows: Iterable[object]
     ) -> None:
-        rows = iter(validated_rows)
+        rows = tuple(validated_rows)
+        active_ids = self._active_ids(rows)
         connection: sqlite3.Connection | None = None
         try:
             self._remove_file()
@@ -246,23 +297,33 @@ class HistoryIndex:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
+                    active = entry_id in active_ids
                     history_group = (
-                        group if self._belongs_in_history(entry_type, data) else None
+                        group if active and self._belongs_in_history(entry_type, data) else None
                     )
-                    if self._starts_next_group(entry_type, data):
+                    if active and self._starts_next_group(entry_type, data):
                         group += 1
                     connection.execute(
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
                         (seq, entry_id, parent_id, lane, entry_type, encoded, history_group),
                     )
-                    if entry_type == "message":
+                    if active and entry_type == "message":
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
                                 "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
                                 (approval["request_id"], self._value(approval["tool_call"])),
                             )
-                    if entry_type == "client_delivery" and isinstance(data.get("accepted_message"), dict):
+                            connection.execute(
+                                "INSERT INTO active_approval_requests(request_id,request_seq,request_entry_id,tool_call) VALUES(?,?,?,?)",
+                                (approval["request_id"], seq, entry_id, self._value(approval["tool_call"])),
+                            )
+                    if active and entry_type == "approval_resolution":
+                        connection.execute(
+                            "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
+                            (data["request_id"], data["decision"], self._value_ordered(data)),
+                        )
+                    if active and entry_type == "client_delivery" and isinstance(data.get("accepted_message"), dict):
                         connection.execute(
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
@@ -347,6 +408,20 @@ class HistoryIndex:
                         "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
                         (approval["request_id"], self._value(approval["tool_call"])),
                     )
+                    connection.execute(
+                        "INSERT INTO active_approval_requests(request_id,request_seq,request_entry_id,tool_call) VALUES(?,?,?,?)",
+                        (
+                            approval["request_id"],
+                            entry.seq,
+                            entry.id,
+                            self._value(approval["tool_call"]),
+                        ),
+                    )
+            if entry.type == "approval_resolution":
+                connection.execute(
+                    "INSERT INTO active_approval_resolutions(request_id,decision,data) VALUES(?,?,?)",
+                    (data["request_id"], data["decision"], self._value_ordered(data)),
+                )
             accepted = data.get("accepted_message")
             if entry.type == "client_delivery" and isinstance(accepted, dict):
                 connection.execute(
@@ -589,6 +664,95 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
+    def _approval_query(
+        self,
+        facts: object,
+        query: str,
+        parameters: tuple[object, ...] = (),
+    ) -> list[tuple[object, ...]]:
+        with self._lock:
+            self._check_open()
+            if not self._available and not self._observer:
+                raise HistoryIndexUnavailableError("history index is unavailable")
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connection(write=False)
+                stored = self._stored_facts(connection)
+                expected = self._facts(facts)
+                if stored is None or any(
+                    stored.get(key) != value for key, value in expected.items()
+                ):
+                    self._available = False
+                    raise StaleHistorySnapshot
+                return connection.execute(query, parameters).fetchall()
+            except HistoryIndexError:
+                raise
+            except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise HistoryIndexUnavailableError("approval index query failed") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    def approval_state(
+        self, facts: object, request_id: str
+    ) -> IndexedApprovalState | None:
+        rows = self._approval_query(
+            facts,
+            "SELECT r.request_entry_id,r.tool_call,s.decision FROM active_approval_requests r "
+            "LEFT JOIN active_approval_resolutions s USING(request_id) "
+            "WHERE r.request_id=?",
+            (request_id,),
+        )
+        if not rows:
+            return None
+        request_entry_id, tool_call, decision = rows[0]
+        return IndexedApprovalState(request_entry_id, json.loads(tool_call), decision)
+
+    def approval_resolution(
+        self, facts: object, request_id: str
+    ) -> IndexedApprovalResolution | None:
+        rows = self._approval_query(
+            facts,
+            "SELECT data FROM active_approval_resolutions WHERE request_id=?",
+            (request_id,),
+        )
+        return (
+            None
+            if not rows
+            else IndexedApprovalResolution(json.loads(rows[0][0]))
+        )
+
+    def pending_approval_page(
+        self, facts: object, after_seq: int, limit: int = PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        if not 1 <= limit <= self.PAGE_LIMIT:
+            raise InvalidHistoryPageRequest("invalid pending approval page limit")
+        # ``limit`` bounds distinct message seqs, not rows: a page returns every
+        # pending request of the first ``limit`` pending messages after
+        # ``after_seq``. The cursor is a seq with a strict ``>``, so ending a
+        # page inside a message would skip its remaining requests forever.
+        rows = self._approval_query(
+            facts,
+            "SELECT r.request_id,r.request_seq,r.tool_call "
+            "FROM active_approval_requests r "
+            "LEFT JOIN active_approval_resolutions s USING(request_id) "
+            "WHERE s.request_id IS NULL AND r.request_seq IN ("
+            "  SELECT seq FROM ("
+            "    SELECT DISTINCT r2.request_seq AS seq "
+            "    FROM active_approval_requests r2 "
+            "    LEFT JOIN active_approval_resolutions s2 ON s2.request_id=r2.request_id "
+            "    WHERE s2.request_id IS NULL AND r2.request_seq>? "
+            "    ORDER BY seq LIMIT ?"
+            "  )"
+            ") ORDER BY r.request_seq",
+            (after_seq, limit),
+        )
+        seqs = {row[1] for row in rows}
+        return IndexedPendingApprovalPage(
+            tuple((request_id, json.loads(tool_call)) for request_id, _seq, tool_call in rows),
+            int(rows[-1][1]) if len(seqs) == limit else None,
+        )
+
     def _mark_unavailable(self) -> None:
         self._available = False
 
@@ -597,14 +761,32 @@ class HistoryIndex:
             self._closed = True
 
 
-def _rebuild_history_index(store: ConversationStore) -> None:
+def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
+    if store._read_only:
+        observer = type(store)(
+            store.root_dir,
+            session_id=store.session_id,
+            _must_exist=True,
+            _read_only=True,
+            _history_index=store._history_index,
+        )
+        try:
+            with observer._append_lock(observer=True):
+                facts = observer._history_index_facts()
+                if not store._history_index.catch_up_validated(
+                    facts, observer._entries
+                ):
+                    observer._sync_history_index(observer._entries)
+                return facts
+        finally:
+            observer.close()
     writer = store._new_persistent_durable_writer()
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
-            if store._history_index.catch_up_validated(facts, store._entries):
-                return
-            store._sync_history_index(store.active_branch_snapshot())
+            if not store._history_index.catch_up_validated(facts, store._entries):
+                store._sync_history_index(store._entries)
+            return facts
     finally:
         writer.close()
 
@@ -656,6 +838,33 @@ def _overlay_resident_entries(
         for group in page.groups
     )
     return replace(page, groups=groups)
+
+
+def _decide_approval(
+    store: ConversationStore, index_query: object, resident: object
+) -> object:
+    """Answer an approval read from the index when its facts match, else from
+    the resident active branch.
+
+    The seam never rebuilds the sidecar and never marks it unavailable: a
+    closed, read-only, or index-less store, an unavailable index (any on-loop
+    append marks it so), or a facts change around the query all fall back to
+    ``resident``, the O(1) memoized in-memory projection. The async caller has
+    already run ``_sync_log_without_waiting`` so resident is current. The
+    sidecar rebuild belongs to the history-page path (``_read_stable_page``),
+    not to an approval read on the hot loop.
+    """
+    index = store._history_index
+    if store._closed or store._read_only or index is None or not index.available:
+        return resident()
+    facts = store._history_index_facts()
+    try:
+        result = index_query(index, facts)
+    except (StaleHistorySnapshot, HistoryIndexUnavailableError, OSError):
+        return resident()
+    if store._history_index_facts() == facts:
+        return result
+    return resident()
 
 
 class HistoryPageStoreMixin:
@@ -751,6 +960,59 @@ class HistoryPageStoreMixin:
     @property
     def repair_generation(self: ConversationStore) -> str | None:
         return self._repair_generation
+
+    async def approval_state(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        if not self._closed:
+            self._sync_log_without_waiting()
+
+        def index_query(index: HistoryIndex, facts: Mapping[str, object]) -> object:
+            result = index.approval_state(facts, request_id)
+            return (
+                None
+                if result is None
+                else (ToolCall.from_dict(dict(result.tool_call)), result.decision)
+            )
+
+        return await self._to_thread_store(
+            lambda: _decide_approval(
+                self,
+                index_query,
+                lambda: self.approval_state_now(request_id),
+            )
+        )
+
+    async def approval_resolution(self, request_id: str) -> Mapping[str, str] | None:
+        if not self._closed:
+            self._sync_log_without_waiting()
+
+        def index_query(index: HistoryIndex, facts: Mapping[str, object]) -> object:
+            result = index.approval_resolution(facts, request_id)
+            return None if result is None else result.data
+
+        return await self._to_thread_store(
+            lambda: _decide_approval(
+                self,
+                index_query,
+                lambda: self.approval_resolution_now(request_id),
+            )
+        )
+
+    async def pending_approval_page(
+        self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        if not self._closed:
+            self._sync_log_without_waiting()
+        return await self._to_thread_store(
+            lambda: _decide_approval(
+                self,
+                lambda index, facts: index.pending_approval_page(
+                    facts, after_seq, limit
+                ),
+                lambda: self._resident_pending_approval_page(after_seq, limit),
+            )
+        )
 
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]

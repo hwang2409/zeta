@@ -27,13 +27,94 @@ def validate_approval_reason(decision: str, reason: str | None) -> None:
         raise ValueError("invalid approval resolution reason")
 
 
+class _ApprovalValidationOverlay:
+    """Operation-scoped approval relations for authoritative row validation."""
+
+    def __init__(self, relations: dict[str, str | None] | None = None) -> None:
+        relations = relations or {}
+        self.requests = set(relations)
+        self.resolutions = {
+            request_id for request_id, decision in relations.items() if decision is not None
+        }
+
+    @staticmethod
+    def touched(entries: list[ConversationEntry]) -> set[str]:
+        request_ids: set[str] = set()
+        for entry in entries:
+            if entry.type == "message":
+                request_ids.update(
+                    request["request_id"]
+                    for request in entry.data.get("approval_requests", ())
+                    if isinstance(request, dict)
+                    and isinstance(request.get("request_id"), str)
+                )
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                if isinstance(request_id, str):
+                    request_ids.add(request_id)
+        return request_ids
+
+    def record(self, entry: ConversationEntry) -> None:
+        if entry.type == "message":
+            for request in entry.data.get("approval_requests", ()):
+                request_id = request.get("request_id")
+                if type(request_id) is str and request_id:
+                    if request_id in self.requests:
+                        raise ConversationIntegrityError(
+                            f"duplicate approval request: {request_id}"
+                        )
+                    self.requests.add(request_id)
+        elif entry.type == "approval_request":
+            raise ConversationIntegrityError(
+                "standalone approval requests are not supported"
+            )
+        elif entry.type == "approval_resolution":
+            request_id = entry.data.get("request_id")
+            if request_id not in self.requests:
+                raise ConversationIntegrityError(
+                    f"approval resolution is not linked to request: {request_id}"
+                )
+            reason = entry.data.get("reason")
+            if reason is not None and (
+                type(reason) is not str
+                or entry.data.get("decision") != "abort"
+                or reason not in APPROVAL_RESOLUTION_REASONS
+            ):
+                raise ConversationIntegrityError("invalid approval resolution reason")
+            if request_id in self.resolutions:
+                raise ConversationIntegrityError(
+                    f"duplicate approval resolution: {request_id}"
+                )
+            self.resolutions.add(request_id)
+
+
 class IncrementalValidationMixin:
     """Validate linear appended entries without rescanning the full log."""
 
+    def _full_branch_approval_overlay(self) -> _ApprovalValidationOverlay:
+        """Build the active-branch approval relations by one authoritative scan.
+
+        Approval-row validation is independent of the derived sidecar: it reads
+        the resident branch so a stale or absent index can never fail (or pass)
+        an authoritative write. The already-committed branch is known valid, so
+        this collects its request/resolution relations in one tight pass rather
+        than re-running per-entry validation; only the candidate row is checked.
+        """
+        relations: dict[str, str | None] = {}
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", ()):
+                    request_id = request.get("request_id")
+                    if isinstance(request_id, str):
+                        relations.setdefault(request_id, None)
+            elif entry.type == "approval_resolution":
+                request_id = entry.data.get("request_id")
+                if isinstance(request_id, str):
+                    relations[request_id] = entry.data.get("decision")
+        return _ApprovalValidationOverlay(relations)
+
     def _reset_incremental_validation_state(self) -> None:
         self._entry_ids: set[str] = set()
-        self._active_approval_requests: dict[str, ConversationEntry] = {}
-        self._active_approval_resolutions: dict[str, str] = {}
         self._active_tool_results: dict[str, ToolResult] = {}
         self._active_agent_call_ids: set[str] = set()
         self._active_agent_receipts: list[tuple[str, str]] = []
@@ -62,10 +143,11 @@ class IncrementalValidationMixin:
         while current is not None:
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
+        approvals = _ApprovalValidationOverlay()
         for index, entry in enumerate(reversed(branch)):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
-            self._record_active_entry(entry)
+            self._record_active_entry(entry, approvals)
 
     def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
@@ -73,8 +155,6 @@ class IncrementalValidationMixin:
         staged._entries = list(self._entries)
         staged._entry_ids = set(self._entry_ids)
         staged._entry_prefix_digest = self._entry_prefix_digest
-        staged._active_approval_requests = dict(self._active_approval_requests)
-        staged._active_approval_resolutions = dict(self._active_approval_resolutions)
         staged._active_tool_results = dict(self._active_tool_results)
         staged._active_agent_call_ids = set(self._active_agent_call_ids)
         staged._active_agent_receipts = list(self._active_agent_receipts)
@@ -100,19 +180,26 @@ class IncrementalValidationMixin:
         staged._active_last_turn_end = self._active_last_turn_end
         staged._task_notification_ids = set(self._task_notification_ids)
         staged._sent_message_receipts = list(self._sent_message_receipts)
+        touched_approvals = _ApprovalValidationOverlay.touched(entries)
+        # An incremental tail that touches an approval row validates against the
+        # authoritative branch overlay (one scan, only when approvals appear),
+        # never a full reload: the sidecar is derived and must not gate authority.
+        approvals = (
+            self._full_branch_approval_overlay()
+            if touched_approvals
+            else _ApprovalValidationOverlay()
+        )
         for index, entry in enumerate(entries):
             # Large off-thread refreshes must release the GIL often enough for
             # the owner event loop to remain responsive.
             if index and index % 64 == 0:
                 time.sleep(0.001)
-            if not staged._accept_incremental_entry(entry):
+            if not staged._accept_incremental_entry(entry, approvals):
                 return False
 
         self._before_incremental_state_install()
         self._entry_ids = staged._entry_ids
         self._entry_prefix_digest = staged._entry_prefix_digest
-        self._active_approval_requests = staged._active_approval_requests
-        self._active_approval_resolutions = staged._active_approval_resolutions
         self._active_tool_results = staged._active_tool_results
         self._active_agent_call_ids = staged._active_agent_call_ids
         self._active_agent_receipts = staged._active_agent_receipts
@@ -140,7 +227,9 @@ class IncrementalValidationMixin:
     def _before_incremental_state_install(self) -> None:
         """Test hook immediately before a staged tail becomes visible."""
 
-    def _accept_incremental_entry(self, entry: ConversationEntry) -> bool:
+    def _accept_incremental_entry(
+        self, entry: ConversationEntry, approvals: _ApprovalValidationOverlay
+    ) -> bool:
         """Validate and install one linear tail entry, or request a full reload."""
         expected_seq = self._entries[-1].seq + 1 if self._entries else 1
         if entry.seq != expected_seq:
@@ -164,7 +253,7 @@ class IncrementalValidationMixin:
         self._validate_entry_payload(entry)
         if entry.type == "fork":
             self._validate_fork_entry(entry)
-        self._record_active_entry(entry)
+        self._record_active_entry(entry, approvals)
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -235,14 +324,6 @@ class IncrementalValidationMixin:
             and tool_result.tool_call_id in self._active_agent_call_ids
         ):
             self._record_agent_receipt(tool_result)
-        for request in entry.data.get("approval_requests", []):
-            request_id = request.get("request_id")
-            if type(request_id) is str and request_id:
-                if request_id in self._active_approval_requests:
-                    raise ConversationIntegrityError(
-                        f"duplicate approval request: {request_id}"
-                    )
-                self._active_approval_requests[request_id] = entry
 
     def _record_notification_entry(self, entry: ConversationEntry) -> None:
         handle = entry.data.get("child_instance_id")
@@ -262,33 +343,19 @@ class IncrementalValidationMixin:
         self._pending_prompt_ids.add(entry.id)
         self._active_pending_prompt_entries[entry.id] = entry
 
-    def _record_active_entry(self, entry: ConversationEntry) -> None:
+    def _record_active_entry(
+        self,
+        entry: ConversationEntry,
+        approvals: _ApprovalValidationOverlay | None = None,
+    ) -> None:
+        if approvals is not None:
+            approvals.record(entry)
         if entry.type == "turn_end":
             self._active_last_turn_end = entry
         elif entry.type == "message":
             self._record_message_entry(entry)
-        elif entry.type == "approval_request":
-            raise ConversationIntegrityError(
-                "standalone approval requests are not supported"
-            )
-        elif entry.type == "approval_resolution":
-            request_id = entry.data.get("request_id")
-            if request_id not in self._active_approval_requests:
-                raise ConversationIntegrityError(
-                    f"approval resolution is not linked to request: {request_id}"
-                )
-            reason = entry.data.get("reason")
-            if reason is not None and (
-                type(reason) is not str
-                or entry.data.get("decision") != "abort"
-                or reason not in APPROVAL_RESOLUTION_REASONS
-            ):
-                raise ConversationIntegrityError("invalid approval resolution reason")
-            if request_id in self._active_approval_resolutions:
-                raise ConversationIntegrityError(
-                    f"duplicate approval resolution: {request_id}"
-                )
-            self._active_approval_resolutions[request_id] = entry.data["decision"]
+        elif entry.type in {"approval_request", "approval_resolution"}:
+            pass
         elif entry.type == "notification":
             self._record_notification_entry(entry)
         elif entry.type == "notification_ack":

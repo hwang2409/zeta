@@ -2767,7 +2767,7 @@ async def test_resumed_pending_approval_is_presented_and_resolvable(
 
     assert call.name in app.console.file.getvalue()  # card shows the tool name
     await app._handle_prompt_value(f"/approve {call.id}")
-    assert app.loop.store.pending_approvals() == []
+    assert (await app.loop.store.pending_approval_page()).items == ()
 
 
 @pytest.mark.asyncio
@@ -2913,9 +2913,9 @@ async def test_cancel_honors_approval_won_by_other_writer(
     finalized: list[str] = []
     finalize_canceled = app.loop.finalize_canceled
 
-    def record_finalize_canceled(request_id: str) -> ToolResult | None:
-        finalized.append(request_id)
-        return finalize_canceled(request_id)
+    def record_finalize_canceled(tool_call: ToolCall) -> ToolResult | None:
+        finalized.append(tool_call.id)
+        return finalize_canceled(tool_call)
 
     monkeypatch.setattr(app.loop, "finalize_canceled", record_finalize_canceled)
     submission = app._submissions.submit("start")
@@ -2937,7 +2937,7 @@ async def test_cancel_honors_approval_won_by_other_writer(
     process.join(timeout=2)
     writer.close()
     await wait_until(lambda: app._submissions.active_submission_id is None)
-    decision = opened.store.approval_states()[call.id][1]
+    decision = (await opened.store.approval_state(call.id))[1]
     await app._submissions.close()
 
     assert not process.is_alive()
@@ -3111,7 +3111,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
     )
     policy.approve(call.id)
 
-    assert loop.prepare_resume_pending_tool(call.id)
+    assert loop.prepare_resume_pending_tool(call)
     loop.abort()
     result = await loop.resume_pending_tool(call.id, prepared=True)
 
@@ -3130,8 +3130,8 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
         [(call.id, call)],
     )
 
-    first = loop.finalize_canceled(call.id)
-    second = loop.finalize_canceled(call.id)
+    first = loop.finalize_canceled(call)
+    second = loop.finalize_canceled(call)
 
     results = [
         message.tool_result
@@ -3161,7 +3161,7 @@ def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
         )
     )
 
-    result = loop.finalize_canceled(call.id)
+    result = loop.finalize_canceled(call)
     results = [
         message.tool_result
         for message in opened.store.messages()
@@ -3508,7 +3508,9 @@ def test_resume_reemits_pending_approval_state(tmp_path: Path) -> None:
     opened.store.close()
     resumed = manager.open(session_id)
 
-    assert resumed.store.pending_approvals() == [(call.id, call)]
+    assert asyncio.run(resumed.store.pending_approval_page()).items == (
+        (call.id, call.to_dict()),
+    )
 
 
 def test_future_metadata_version_is_rejected(

@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
+from ._history_index import HistoryIndex, IndexedPendingApprovalPage
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovalNowSnapshot:
+    """Resident active-branch approval projection, memoized by the active leaf."""
+
+    states: dict[str, tuple[ToolCall, str | None]]
+    resolutions: dict[str, Mapping[str, Any]]
+    pending: tuple[tuple[int, str, Mapping[str, object]], ...]
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:
@@ -53,31 +64,6 @@ def validate_approval_history_data(data: Mapping[str, Any]) -> None:
 class ApprovalHistoryStoreMixin:
     """Persist delegated wire identity and retrieve durable resolutions."""
 
-    def approval_states_snapshot(self) -> dict[str, tuple[ToolCall, str | None]]:
-        """Read approval state from the owner-installed indexes."""
-        return self._approval_states_from_maps(
-            self._active_approval_requests,
-            self._active_approval_resolutions,
-        )
-
-    @staticmethod
-    def _approval_states_from_maps(
-        requests: Mapping[str, ConversationEntry],
-        resolutions: Mapping[str, str],
-    ) -> dict[str, tuple[ToolCall, str | None]]:
-        states: dict[str, tuple[ToolCall, str | None]] = {}
-        for request_id, entry in requests.items():
-            request = next(
-                request
-                for request in entry.data.get("approval_requests", [])
-                if request["request_id"] == request_id
-            )
-            states[request_id] = (
-                ToolCall.from_dict(request["tool_call"]),
-                resolutions.get(request_id),
-            )
-        return states
-
     def append_approval_history(
         self, payload: Mapping[str, Any]
     ) -> ConversationEntry:
@@ -95,17 +81,131 @@ class ApprovalHistoryStoreMixin:
             _AppendApprovalHistoryCommand(payload=payload)
         )
 
-    def approval_resolution_data(self, request_id: str) -> dict[str, str] | None:
-        """Read a published approval resolution without touching the log."""
-        if request_id not in self._active_approval_resolutions:
-            return None
-        for entry in reversed(self._entries):
-            if (
-                entry.type == "approval_resolution"
-                and entry.data.get("request_id") == request_id
-            ):
-                return dict(entry.data)
+    @staticmethod
+    def _request_entry(
+        branch: list[ConversationEntry],
+        request_id: str,
+    ) -> ConversationEntry | None:
+        for entry in branch:
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    if request["request_id"] == request_id:
+                        return entry
         return None
+
+    @staticmethod
+    def _approval_request_entries(
+        entries: Iterable[ConversationEntry],
+    ) -> dict[str, ConversationEntry]:
+        return {
+            request["request_id"]: entry
+            for entry in entries
+            if entry.type == "message"
+            for request in entry.data.get("approval_requests", [])
+        }
+
+    @staticmethod
+    def _approval_states_from_branch(
+        branch: list[ConversationEntry],
+    ) -> dict[str, tuple[ToolCall, str | None]]:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        for entry in branch:
+            if entry.type == "message":
+                requests = entry.data.get("approval_requests", [])
+                for request in requests:
+                    request_id = request["request_id"]
+                    states[request_id] = (
+                        ToolCall.from_dict(request["tool_call"]),
+                        None,
+                    )
+            elif entry.type == "approval_resolution":
+                request_id = entry.data["request_id"]
+                if request_id in states:
+                    tool_call, _ = states[request_id]
+                    states[request_id] = (tool_call, entry.data["decision"])
+        return states
+
+    # A read-only reader cannot read the shared sidecar for its own lagging
+    # view: the sidecar is updated in place by the writer and may be mid-append.
+    # It answers approval reads from its resident branch, like main's
+    # latency-tolerant display path, without blocking on the writer's lock.
+    def _resident_pending_approval_page(
+        self, after_seq: int, limit: int
+    ) -> IndexedPendingApprovalPage:
+        pending = [
+            row for row in self._approval_now_snapshot().pending if row[0] > after_seq
+        ]
+        # Requests of one message share a seq; the cursor is that seq with a
+        # strict ``>``. Ending a page inside a message would skip its remaining
+        # requests forever, so a page stops only at a message boundary (and
+        # always holds at least the first message, even past ``limit``).
+        page: list[tuple[int, str, Mapping[str, object]]] = []
+        for row in pending:
+            if len(page) >= limit and row[0] != page[-1][0]:
+                break
+            page.append(row)
+        return IndexedPendingApprovalPage(
+            tuple((request_id, tool_call) for _seq, request_id, tool_call in page),
+            page[-1][0] if len(page) < len(pending) else None,
+        )
+
+    # One resident projection of the active branch, memoized by the active-leaf
+    # (sequence, id). The key moves on every append (own writes included) and on
+    # every branch switch or rewind, so a resolve made on the loop is visible to
+    # the next `*_now` read at once, while the serve stale sweep that fires on
+    # every published event rescans only when the leaf changes (O(1) otherwise).
+    def _approval_now_snapshot(self) -> _ApprovalNowSnapshot:
+        key = (self.active_branch_head_sequence(), self.active_branch_head_id())
+        cached = self._approval_now_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        snapshot = self._build_approval_now_snapshot()
+        self._approval_now_cache = (key, snapshot)
+        return snapshot
+
+    def _build_approval_now_snapshot(self) -> _ApprovalNowSnapshot:
+        states: dict[str, tuple[ToolCall, str | None]] = {}
+        resolutions: dict[str, Mapping[str, Any]] = {}
+        resolved: set[str] = set()
+        requested: list[tuple[int, str, Mapping[str, object]]] = []
+        for entry in self._active_branch():
+            if entry.type == "message":
+                for request in entry.data.get("approval_requests", []):
+                    request_id = request["request_id"]
+                    states[request_id] = (
+                        ToolCall.from_dict(request["tool_call"]),
+                        None,
+                    )
+                    requested.append((entry.seq, request_id, request["tool_call"]))
+            elif entry.type == "approval_resolution":
+                request_id = entry.data["request_id"]
+                resolved.add(request_id)
+                resolutions[request_id] = dict(entry.data)
+                if request_id in states:
+                    states[request_id] = (states[request_id][0], entry.data["decision"])
+        pending = tuple(
+            sorted(
+                (row for row in requested if row[1] not in resolved),
+                key=lambda row: row[0],
+            )
+        )
+        return _ApprovalNowSnapshot(states, resolutions, pending)
+
+    # The owner loop reads the request it just published (ApprovalPolicy and the
+    # serve admission) and the resolution it just wrote (the stale sweep) from
+    # this resident projection, with no off-loop yield and no sqlite on the loop.
+    def approval_state_now(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        return self._approval_now_snapshot().states.get(request_id)
+
+    def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
+        return self._approval_now_snapshot().resolutions.get(request_id)
+
+    def pending_approval_page_now(
+        self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        return self._resident_pending_approval_page(after_seq, limit)
 
     def delegated_unmatched_requests(
         self, child_instance_id: str

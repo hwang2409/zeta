@@ -38,12 +38,12 @@ def _capability(call: ToolCall) -> ResolvedCapability:
     )
 
 
-def _persist_prepared_request(
+async def _persist_prepared_request(
     registry: ToolRegistry,
     child_store: ConversationStore,
     call: ToolCall,
 ) -> None:
-    request = registry.prepare_approval(call)
+    request = await registry.prepare_approval(call)
     assert request is not None
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -63,7 +63,7 @@ async def _approve_after_registration(
         waiting.set()
     await asyncio.wait_for(registered.wait(), timeout=10)
     key = (child_instance_id, request_id)
-    assert key in {request.key for request in parent_policy.pending_requests()}, (
+    assert key in {request.key for request in (await asyncio.wait_for(parent_policy.pending_requests(), 10))}, (
         "delegated approval was not published"
     )
     assert parent_policy.approve(key)
@@ -127,7 +127,7 @@ def test_path_approval_display_is_canonical_binding_target(
         tool_name,
         {"path": str(requested)},
     )
-    request = child.prepare(call, capability=_capability(call))
+    request = asyncio.run(child.prepare(call, capability=_capability(call)))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -160,7 +160,7 @@ def test_shell_approval_display_is_canonical_binding_cwd(
         {"command": "pwd", "cwd": str(alias)},
     )
 
-    request = child.prepare(call, capability=_capability(call))
+    request = asyncio.run(child.prepare(call, capability=_capability(call)))
 
     assert request is not None
     binding = child._pending_bindings[call.id]
@@ -294,11 +294,11 @@ def test_child_abort_fails_closed_when_capability_cannot_be_resolved(
     registry.register("echo", lambda arguments: "must not run")
     registry.set_approval_policy(child_policy)
     call = ToolCall("unresolved-child-call", "echo", {})
-    _persist_prepared_request(registry, child_store, call)
+    asyncio.run(_persist_prepared_request(registry, child_store, call))
     registry._tools.pop(call.name)
 
-    assert registry.abort_approval(call) is None
-    assert child_store.approval_states()[call.id][1] == "abort"
+    assert asyncio.run(registry.abort_approval(call)) is None
+    assert asyncio.run(child_store.approval_state(call.id))[1] == "abort"
 
 
 @pytest.mark.asyncio
@@ -340,7 +340,7 @@ async def test_parent_and_child_approval_decision_paths(
     registry.register("echo", lambda arguments: executed.append("ran") or "ran")
     registry.set_approval_policy(policy)
     call = ToolCall(f"{outcome}-{policy_kind}", "echo", {})
-    request = registry.prepare_approval(call)
+    request = await registry.prepare_approval(call)
     assert request is not None
     decision_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -350,7 +350,7 @@ async def test_parent_and_child_approval_decision_paths(
     if outcome in {"allow", "deny"}:
         assert decision_store.resolve_approval(call.id, outcome)
     elif outcome == "abort":
-        assert registry.abort_approval(call) is None
+        assert await registry.abort_approval(call) is None
     elif outcome == "winner":
         original_resolve = decision_store.resolve_approval
 
@@ -376,10 +376,10 @@ async def test_parent_and_child_approval_decision_paths(
             registry.execute(call, _lifecycle_sink=publish_approval_state)
         )
         await asyncio.wait_for(approval_started.wait(), timeout=10)
-        assert decision_store.pending_approvals()
+        assert (await asyncio.wait_for(decision_store.pending_approval_page(), 10)).items
         assert not execution.done()
         registry.abort()
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
 
     if outcome != "cancel":
         result = await registry.execute(call)
@@ -427,7 +427,7 @@ async def test_bound_edit_abort_arbitration_preserves_winner(
         "edit",
         {"path": str(target), "old_string": "before", "new_string": "after"},
     )
-    _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
 
     if abort_winner == "allow":
         original_resolve = child_store.resolve_approval
@@ -468,11 +468,11 @@ async def test_failed_binding_capture_is_not_approvable_and_denies_execution(
     )
     call = ToolCall("capture-failed", "write", {"path": "credentials"})
 
-    assert child.prepare(call, capability=_capability(call)) is None
+    assert await child.prepare(call, capability=_capability(call)) is None
     decision = await child.authorize(call, AbortSignal(), capability=_capability(call))
 
     assert decision is ApprovalDecision.DENY
-    assert parent.pending_requests() == []
+    assert (await asyncio.wait_for(parent.pending_requests(), 10)) == []
     assert child.denial_reason(call.id) == (
         "approval binding unavailable; submit a new tool request"
     )
@@ -514,7 +514,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
         {"path": str(alias / "victim.txt"), "content": "PWN"},
     )
 
-    _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     publication_attempted = asyncio.Event()
@@ -526,7 +526,7 @@ async def test_write_uses_binding_captured_before_persisted_request(
         publication_attempted.set()
 
         async def publish() -> None:
-            await release_publication.wait()
+            await asyncio.wait_for(release_publication.wait(), 10)
             register_delegated(*args, **kwargs)  # type: ignore[arg-type]
             registered.set()
 
@@ -550,16 +550,16 @@ async def test_write_uses_binding_captured_before_persisted_request(
         await asyncio.wait_for(waiting.wait(), timeout=10)
         assert not approval.done()
         release_publication.set()
-        await approval
-        result = await execution
+        await asyncio.wait_for(approval, 10)
+        result = await asyncio.wait_for(execution, 10)
     finally:
         release_publication.set()
         if not approval.done():
             approval.cancel()
-            await asyncio.gather(approval, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(approval, return_exceptions=True), 10)
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False
@@ -598,23 +598,26 @@ async def _assert_shell_uses_displayed_cwd(
     arguments = {"command": "touch marker.txt", "cwd": str(alias)}
     call = ToolCall(f"{tool_name}-swap", tool_name, arguments)
 
-    _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     alias.unlink()
     alias.symlink_to(evil, target_is_directory=True)
     registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_after_registration(
-            parent_policy, registered, f"{tool_name}-swap", call.id
+        await asyncio.wait_for(
+            _approve_after_registration(
+                parent_policy, registered, f"{tool_name}-swap", call.id
+            ),
+            10,
         )
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
         if tool_name == "run_background" and result["isError"] is False:
             task_id = result["structuredContent"]["task_id"]
-            await registry.background_tasks.wait(task_id)
+            await asyncio.wait_for(registry.background_tasks.wait(task_id), 10)
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False
@@ -665,7 +668,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
         "bash",
         {"command": "touch marker.txt", "cwd": str(approved_cwd)},
     )
-    _persist_prepared_request(first_registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(first_registry, child_store, call), 10)
     await first_registry.close()
 
     restarted_policy = ChildApprovalPolicy(
@@ -686,7 +689,7 @@ async def test_restart_with_pending_request_fails_closed_after_allow(
     finally:
         await restarted_registry.close()
 
-    assert parent_policy.pending_requests() == []
+    assert (await asyncio.wait_for(parent_policy.pending_requests(), 10)) == []
     assert result["isError"] is True
     assert result["content"][0]["text"] == (
         "tool execution denied: approval binding unavailable; "
@@ -739,7 +742,7 @@ async def test_canceled_execution_discards_its_approval_binding(
             capability=capability,
         )
         binding_created.set()
-        await never_release.wait()
+        await asyncio.wait_for(never_release.wait(), 10)
         return decision
 
     monkeypatch.setattr(child_policy, "authorize", pause_after_binding)
@@ -751,7 +754,7 @@ async def test_canceled_execution_discards_its_approval_binding(
         assert len(child_policy._execution_bindings) == 1
         execution.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await execution
+            await asyncio.wait_for(execution, 10)
         assert child_policy._execution_bindings == {}
 
         monkeypatch.setattr(child_policy, "authorize", original_authorize)
@@ -763,7 +766,7 @@ async def test_canceled_execution_discards_its_approval_binding(
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
 
@@ -779,7 +782,7 @@ async def test_allow_wins_abort_transfers_pending_binding_atomically(
         parent_policy, child_store, "child", "race", child_cwd=tmp_path
     )
     call = ToolCall("race", "bash", {"command": "echo safe"})
-    request = child_policy.prepare(call, capability=_capability(call))
+    request = await child_policy.prepare(call, capability=_capability(call))
     assert request is not None
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
@@ -870,18 +873,20 @@ async def _execute_after_manual_approval(
         child_cwd, session_store=child_store, skill_catalog=SkillCatalog.empty()
     )
     registry.set_approval_policy(child_policy)
-    _persist_prepared_request(registry, child_store, call)
+    await asyncio.wait_for(_persist_prepared_request(registry, child_store, call), 10)
     mutate()
     monkeypatch = pytest.MonkeyPatch()
     registered = _observe_delegated_registration(parent_policy, monkeypatch)
     execution = asyncio.create_task(registry.execute(call))
     try:
-        await _approve_after_registration(parent_policy, registered, call.id, call.id)
-        return await execution
+        await asyncio.wait_for(
+            _approve_after_registration(parent_policy, registered, call.id, call.id), 10
+        )
+        return await asyncio.wait_for(execution, 10)
     finally:
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
         monkeypatch.undo()
 
@@ -957,7 +962,7 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
         )
         assert execution_token in child_policy._execution_bindings
         authorized.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return decision
 
     monkeypatch.setattr(child_policy, "authorize", pause_after_binding)
@@ -969,12 +974,12 @@ async def test_read_scoped_auto_allow_rejects_symlink_parent_swap(
         alias.unlink()
         alias.symlink_to(evil, target_is_directory=True)
         release.set()
-        result = await execution
+        result = await asyncio.wait_for(execution, 10)
     finally:
         release.set()
         if not execution.done():
             execution.cancel()
-            await asyncio.gather(execution, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), 10)
         await registry.close()
 
     assert result["isError"] is False

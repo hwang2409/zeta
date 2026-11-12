@@ -632,7 +632,7 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
         assert [item["request_id"] for item in status_result["pending_approvals"]] == [
             "call-2"
         ]
-        assert server.runtime.opened.store.approval_resolution_data("call-2") is None
+        assert server.runtime.opened.store.approval_resolution_now("call-2") is None
 
         observer_denied = await observer_request(
             11,
@@ -2636,7 +2636,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 all_frames.extend(snapshot_frames)
                 assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
                 assert server.runtime.opened is not None
-                resolution = server.runtime.opened.store.approval_resolution_data(
+                resolution = server.runtime.opened.store.approval_resolution_now(
                     "call-1"
                 )
                 assert resolution is not None

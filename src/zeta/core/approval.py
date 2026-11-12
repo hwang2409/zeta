@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import inspect
 import os
 import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -21,7 +20,6 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
 )
-from .abort import AbortSignal
 from .store import ConversationStore
 
 PRECEDENCE = ("deny", "ask", "allow", "default")
@@ -291,11 +289,11 @@ class _AbortSignal(Protocol):
 async def _poll_approval_resolution(
     abort_signal: _AbortSignal,
     *,
-    current: Callable[[], tuple[bool, ApprovalDecision | None]],
+    current: Callable[[], Awaitable[tuple[bool, ApprovalDecision | None]]],
     abort_or_winner: Callable[[], Awaitable[ApprovalDecision | None]],
 ) -> ApprovalDecision | None:
     while True:
-        resolved, decision = current()
+        resolved, decision = await current()
         if resolved:
             return decision
         if abort_signal.is_set():
@@ -330,7 +328,7 @@ class ApprovalAbortPolicy(Protocol):
 
     def abort(self, request_id: str) -> bool: ...
 
-    def abort_or_winner(
+    async def abort_or_winner(
         self,
         request_id: str,
         *,
@@ -756,57 +754,97 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 return True
         return False
 
-    def pending_requests(self) -> list[ApprovalRequest]:
+    async def pending_requests(self) -> list[ApprovalRequest]:
         """Return strict pending state for decisions and server actions."""
+        return await self._collect_pending_requests()
 
-        def strict_pending(store: ConversationStore) -> dict[str, ToolCall]:
-            return {
-                request_id: tool_call
-                for request_id, (tool_call, decision) in store.approval_states().items()
-                if decision is None
-            }
+    @staticmethod
+    async def _pending_for_store(
+        store: ConversationStore,
+    ) -> dict[str, ToolCall]:
+        pending: dict[str, ToolCall] = {}
+        after_seq = 0
+        while True:
+            page = await store.pending_approval_page(after_seq)
+            pending.update(
+                {
+                    request_id: ToolCall.from_dict(dict(tool_call))
+                    for request_id, tool_call in page.items
+                }
+            )
+            if page.next_seq is None:
+                return pending
+            after_seq = page.next_seq
 
-        return self._collect_pending_requests(strict_pending)
-
-    def pending_requests_for_display(self) -> list[ApprovalRequest]:
-        """Return latency-tolerant pending state for TUI display and key filters."""
-
-        # Display and key-filter callers only; decisions use pending_requests().
-        return self._collect_pending_requests(
-            lambda store: dict(store.pending_approvals())
+    def _display_request(
+        self, request_id: str, tool_call: ToolCall
+    ) -> ApprovalRequest:
+        action = None
+        capability_resolved = self._capability_resolver is None
+        if self._capability_resolver is not None:
+            try:
+                action = self._capability_resolver(tool_call).action
+                capability_resolved = True
+            except (KeyError, TypeError, ValueError):
+                capability_resolved = False
+        return ApprovalRequest(
+            request_id,
+            tool_call,
+            action=action,
+            capability_resolved=capability_resolved,
         )
 
-    def _collect_pending_requests(
-        self,
-        pending_for_store: Callable[[ConversationStore], dict[str, ToolCall]],
-    ) -> list[ApprovalRequest]:
+    def pending_requests_for_display_now(self) -> list[ApprovalRequest]:
+        """Synchronous resident snapshot of pending approvals for display.
+
+        A resumed session's durable approvals are not announced by the policy
+        change hook, and the first off-loop refresh has not run yet. This reads
+        the resident branch with no off-loop yield (like approval_state_now), so
+        the card shows at once; the async refresh reconciles.
+        """
+        requests: list[ApprovalRequest] = []
+        store = self._store
+        if store is not None:
+            after_seq = 0
+            while True:
+                page = store.pending_approval_page_now(after_seq)
+                requests.extend(
+                    self._display_request(request_id, ToolCall.from_dict(dict(tool_call)))
+                    for request_id, tool_call in page.items
+                )
+                if page.next_seq is None:
+                    break
+                after_seq = page.next_seq
+        for (_child_id, request_id), (
+            request,
+            delegated_store,
+        ) in list(self._delegated.items()):
+            state = delegated_store.approval_state_now(request_id)
+            if state is not None and state[1] is None:
+                requests.append(request)
+        requests.extend(
+            request
+            for request, decision in self._ephemeral.values()
+            if decision is None
+        )
+        return requests
+
+    async def _collect_pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()
         requests: list[ApprovalRequest] = []
-        for request_id, tool_call in pending_for_store(store).items():
-            action = None
-            capability_resolved = self._capability_resolver is None
-            if self._capability_resolver is not None:
-                try:
-                    action = self._capability_resolver(tool_call).action
-                    capability_resolved = True
-                except (KeyError, TypeError, ValueError):
-                    capability_resolved = False
-            request = ApprovalRequest(
-                request_id,
-                tool_call,
-                action=action,
-                capability_resolved=capability_resolved,
-            )
-            requests.append(request)
+        for request_id, tool_call in (await self._pending_for_store(store)).items():
+            requests.append(self._display_request(request_id, tool_call))
         delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()
         ):
             if delegated_store not in delegated_pending:
-                delegated_pending[delegated_store] = pending_for_store(delegated_store)
+                delegated_pending[delegated_store] = await self._pending_for_store(
+                    delegated_store
+                )
             pending = delegated_pending[delegated_store]
             if request_id not in pending:
-                resolution = delegated_store.approval_resolution_data(request_id)
+                resolution = await delegated_store.approval_resolution(request_id)
                 if resolution is not None:
                     self._delegated_resolutions[(child_id, request_id)] = resolution
                 self._delegated.pop((child_id, request_id), None)
@@ -849,9 +887,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             store,
         )
 
-    def cleanup_delegated(
-        self, child_instance_id: str
-    ) -> Awaitable[object] | None:
+    def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         """Resolve and remove all delegated requests owned by one child."""
 
         if self._serve_control is not None:
@@ -864,7 +900,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             except ValueError:
                 pass
             finally:
-                resolution = store.approval_resolution_data(request.request_id)
+                # Same-instance read-after-own-write: resolve_approval just wrote
+                # on this thread, so the resident *_now seam has the resolution.
+                resolution = store.approval_resolution_now(request.request_id)
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
@@ -903,7 +941,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> bool:
         delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            return delegated[1].resolve_approval(delegated[0].request_id, "abort", reason=reason)
+            return delegated[1].resolve_approval(
+                delegated[0].request_id, "abort", reason=reason
+            )
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
@@ -913,7 +953,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         store = self._require_store()
         return store.resolve_approval(request_id, "abort", reason=reason)
 
-    def abort_or_winner(
+    async def abort_or_winner(
         self,
         request_id: str,
         *,
@@ -926,7 +966,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         delegated = self._delegated_entry(request_id, None)
         if delegated is not None:
             delegated[1].resolve_approval(delegated[0].request_id, "abort")
-            state = delegated[1].approval_states().get(delegated[0].request_id)
+            # Sync resident read: this handler runs inside tool cancellation, so
+            # it must not await. resolve_approval wrote on this thread, so the
+            # memoized `*_now` seam already reflects the winning decision.
+            state = delegated[1].approval_state_now(delegated[0].request_id)
             return _resolved_decision(state[1] if state is not None else None)
         ephemeral = self._ephemeral.get(request_id)
         if ephemeral is not None:
@@ -934,10 +977,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return None
         store = self._require_store()
         store.resolve_approval(request_id, "abort")
-        state = store.approval_states().get(request_id)
+        state = store.approval_state_now(request_id)
         return _resolved_decision(state[1] if state is not None else None)
 
-    def durable_resolution(
+    async def durable_resolution(
         self,
         request_id: str | tuple[str, str],
         *,
@@ -957,20 +1000,20 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         raw_id = delegated[0].request_id if delegated is not None else request_id
         if store is None or isinstance(raw_id, tuple):
             return None
-        state = store.approval_states().get(raw_id)
+        state = await store.approval_state(raw_id)
         if state is None or state[1] is None:
             return None
         if state[1] != "abort":
             return {"request_id": raw_id, "decision": state[1]}
-        return store.approval_resolution_data(raw_id)
+        return await store.approval_resolution(raw_id)
 
-    def durable_decision(
+    async def durable_decision(
         self,
         request_id: str | tuple[str, str],
         *,
         child_instance_id: str | None = None,
     ) -> str | None:
-        resolution = self.durable_resolution(
+        resolution = await self.durable_resolution(
             request_id, child_instance_id=child_instance_id
         )
         return None if resolution is None else resolution["decision"]
@@ -1008,18 +1051,21 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return self._delegated.get(request_id)
         if child_instance_id is not None:
             return self._delegated.get((child_instance_id, request_id))
+        # A bare id names the foreground store when it owns one; otherwise it may
+        # name a unique delegated request (resident sync read, like main's
+        # approval_states() check, no off-loop yield).
         if request_id in self._ephemeral:
             return None
-        if self._store is not None and request_id in self._store.approval_states():
+        if self._store is not None and self._store.approval_state_now(request_id) is not None:
             return None
         matches = [
             delegated
-            for (child_id, delegated_id), delegated in self._delegated.items()
+            for (_child_id, delegated_id), delegated in self._delegated.items()
             if delegated_id == request_id
         ]
         return matches[0] if len(matches) == 1 else None
 
-    def prepare(
+    async def prepare(
         self,
         tool_call: ToolCall,
         *,
@@ -1028,7 +1074,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Build an ask request for atomic persistence with its assistant anchor."""
 
         store = self._require_store()
-        state = store.approval_states().get(tool_call.id)
+        state = await store.approval_state(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -1050,7 +1096,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
     ) -> ApprovalDecision | None:
         store = self._require_store()
-        state = store.approval_states().get(tool_call.id)
+        state = store.approval_state_now(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
@@ -1089,13 +1135,17 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     None,
                 )
 
-        def current() -> tuple[bool, ApprovalDecision | None]:
+        async def current() -> tuple[bool, ApprovalDecision | None]:
             ephemeral = self._ephemeral.get(tool_call.id)
             if ephemeral is not None and ephemeral[1] is not None:
                 return True, _resolved_decision(ephemeral[1])
-            state = store.approval_states().get(tool_call.id)
+            state = await store.approval_state(tool_call.id)
             if state is not None and state[1] is not None:
                 return True, _resolved_decision(state[1])
+            if store.closed:
+                # A closed store can never resolve this approval; stop polling
+                # and let the turn finish, as main did when the closed read raised.
+                return True, None
             return False, None
 
         return await _poll_approval_resolution(
@@ -1119,7 +1169,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> ApprovalDecision | None:
         settlement = self._request_serve_abort(request_id)
         if settlement is None:
-            return self.abort_or_winner(request_id, capability=capability)
+            return await self.abort_or_winner(request_id, capability=capability)
         resolution = await asyncio.shield(settlement)
         return _resolved_decision(
             resolution["decision"] if resolution is not None else None
@@ -1146,107 +1196,6 @@ def _resolved_decision(value: str | None) -> ApprovalDecision | None:
     return None
 
 
-ApprovalHook = Callable[
-    [str, dict[str, object]], bool | str | Awaitable[bool | str] | None
-]
-AdvanceGeneration = Callable[[AbortSignal], AbortSignal]
-
-
 def canceled_result(tool_call_id: str) -> ToolResult:
     return ToolResult(tool_call_id, "tool execution canceled", True, is_canceled=True)
 
-
-@dataclass(slots=True)
-class ApprovalGate:
-    """Run durable approval and the optional pre-execution hook."""
-
-    policy: ApprovalPolicy | None
-    hook: ApprovalHook | None
-
-    async def run(
-        self,
-        tool_call: ToolCall,
-        arguments: dict[str, object],
-        signal: AbortSignal,
-        advance_generation: AdvanceGeneration,
-        lifecycle: Callable[[str], None] | None = None,
-        *,
-        skip_approval: bool = False,
-        persist_request: bool = True,
-        execution_token: str | None = None,
-        capability: ApprovalCapability,
-    ) -> tuple[ToolResult | None, AbortSignal]:
-        execution_signal = signal
-        if self.policy is not None and not skip_approval:
-            approval_started = (
-                self.policy.durable_decision(tool_call.id) is None
-                and self.policy.decide(capability) is ApprovalDecision.ASK
-            )
-            slot_acquired = False
-            if approval_started:
-                slot_acquired = await self.policy.acquire_approval_slot()
-                if lifecycle is not None:
-                    lifecycle("approval_start")
-            try:
-                authorize = self.policy.authorize
-                parameters = inspect.signature(authorize).parameters
-                kwargs: dict[str, object] = {}
-                if not persist_request and "persist_request" in parameters:
-                    kwargs["persist_request"] = False
-                if execution_token is not None and "execution_token" in parameters:
-                    kwargs["execution_token"] = execution_token
-                if capability is not None and "capability" in parameters:
-                    kwargs["capability"] = capability
-                decision = await authorize(tool_call, signal, **kwargs)
-            except Exception as exc:  # noqa: BLE001 - report approval failures
-                return ToolResult(
-                    tool_call.id, f"approval failed: {exc}", True
-                ), execution_signal
-            finally:
-                if approval_started:
-                    if lifecycle is not None:
-                        lifecycle("approval_end")
-                    if slot_acquired:
-                        self.policy.release_approval_slot()
-            if decision is None:
-                return canceled_result(tool_call.id), execution_signal
-            if signal.is_set():
-                durable_decision = self.policy.durable_decision(tool_call.id)
-                if durable_decision == ApprovalDecision.DENY.value:
-                    return ToolResult(
-                        tool_call.id, "tool execution denied", True
-                    ), execution_signal
-                if durable_decision != ApprovalDecision.ALLOW.value:
-                    return canceled_result(tool_call.id), execution_signal
-                execution_signal = advance_generation(signal)
-                if execution_signal.is_set():
-                    return canceled_result(tool_call.id), execution_signal
-            if decision is ApprovalDecision.DENY:
-                message = "tool execution denied"
-                denial_reason = getattr(self.policy, "denial_reason", None)
-                if callable(denial_reason):
-                    reason = denial_reason(tool_call.id)
-                    if reason:
-                        message = f"{message}: {reason}"
-                return ToolResult(tool_call.id, message, True), execution_signal
-        if self.hook is None:
-            if signal.is_set() and execution_signal is signal:
-                return canceled_result(tool_call.id), execution_signal
-            return None, execution_signal
-        try:
-            allowed = self.hook(tool_call.name, arguments)
-            if inspect.isawaitable(allowed):
-                allowed = await allowed
-        except Exception as exc:  # noqa: BLE001 - report hook failures
-            return ToolResult(
-                tool_call.id, f"pre-execution hook failed: {exc}", True
-            ), execution_signal
-        if isinstance(allowed, str):
-            return ToolResult(tool_call.id, allowed, True), execution_signal
-        if allowed is False:
-            return ToolResult(
-                tool_call.id, "tool execution denied by hook", True
-            ), execution_signal
-        if signal.is_set() and execution_signal is signal:
-            return canceled_result(tool_call.id), execution_signal
-        return None, execution_signal
