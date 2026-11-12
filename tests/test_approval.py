@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +6,7 @@ from threading import Event
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (

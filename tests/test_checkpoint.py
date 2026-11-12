@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 from io import StringIO
@@ -9,6 +8,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
 from zeta.core.checkpoints import CheckpointForkMixin

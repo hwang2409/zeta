@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import base64
 import contextvars
@@ -16,6 +14,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.store import ConversationStore

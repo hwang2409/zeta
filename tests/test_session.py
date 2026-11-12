@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import dataclasses
 import fcntl
@@ -24,6 +22,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.tui.app as tui_app
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry

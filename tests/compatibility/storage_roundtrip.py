@@ -1,8 +1,6 @@
 """Exercise real stored-family readers and writers in a supplied temporary home."""
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import argparse
 import asyncio
 import json
@@ -10,6 +8,7 @@ import warnings
 from collections.abc import Callable
 from pathlib import Path
 
+from tests.support.branch_reads import branch_messages
 from zeta.storage_format import WRITER_EPOCH, advance
 
 _SESSION_NAME = "format-roundtrip-predecessor"

@@ -1,5 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import base64
 import json
@@ -19,6 +17,7 @@ import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.completion as completion_module
+from tests.support.branch_reads import branch_messages
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail

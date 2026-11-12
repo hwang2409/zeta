@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import gc
 import json
@@ -13,6 +11,7 @@ from typing import ClassVar
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.owned import await_or_fail
 from zeta.core.checkpoints import mutation as mutation_module
 from zeta.core.store import (

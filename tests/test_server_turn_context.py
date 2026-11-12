@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import threading
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
 from tests.test_server import (

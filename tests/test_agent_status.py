@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import gc
 import json
@@ -17,6 +16,7 @@ import pytest
 
 import zeta.tools.agent as agent_tools
 from tests.support.agent_lifecycle import wait_background_owner
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.agent.presets import AGENT_PRESETS

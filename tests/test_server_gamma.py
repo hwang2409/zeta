@@ -1,8 +1,7 @@
+
 """Protocol fixes found while building the gamma web client."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import base64
@@ -19,6 +18,7 @@ from types import MethodType
 import pytest
 from PIL import Image
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve

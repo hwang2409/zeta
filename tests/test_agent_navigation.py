@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import fcntl
 import gc
@@ -21,6 +19,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest

@@ -1,5 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import gc
 import json
@@ -33,6 +31,7 @@ from tests.support.agent_lifecycle import (
     wait_background_owner,
     watch_delegated_registrations,
 )
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail

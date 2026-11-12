@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import os
 import threading
@@ -10,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow

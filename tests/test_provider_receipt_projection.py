@@ -1,4 +1,5 @@
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries
+
 """Eviction receipts reach providers as harness notes, never as assistant turns."""
 
 import json

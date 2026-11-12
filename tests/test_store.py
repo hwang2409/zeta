@@ -8,8 +8,6 @@ import sys
 import threading
 import warnings
 from collections.abc import Callable
-
-from tests.support.branch_reads import branch_entries, branch_messages
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
 from zeta.core import agent_state, transcript_recovery

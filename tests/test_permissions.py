@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 from io import StringIO
 from pathlib import Path
@@ -9,6 +7,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.config.settings import load_settings, resolve
 from zeta.core.approval import (

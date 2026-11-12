@@ -1,3 +1,4 @@
+
 """Tests for the ZETA-74 mid-stream stall watchdog.
 
 Covers: the shared ``stall_watchdog`` helper; provider-level integration for
@@ -7,8 +8,6 @@ stall RETRY event; and headless/settings surface areas.
 """
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import io
@@ -20,6 +19,7 @@ import httpx
 import pytest
 
 import zeta.accounts.store as account_store
+from tests.support.branch_reads import branch_messages
 from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.credentials import anthropic_credentials, codex_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn

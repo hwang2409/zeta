@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -11,6 +9,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.tui_render import render_full_screen
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages

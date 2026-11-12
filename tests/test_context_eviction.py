@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 import random
@@ -12,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 import zeta.context_eviction as eviction_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from zeta.agent.tool_results import validated_tool_result
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import (

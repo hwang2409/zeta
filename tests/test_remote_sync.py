@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import ast
 import asyncio
 import concurrent.futures
@@ -24,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
 from zeta.cli.main import main as cli_main

@@ -1,8 +1,7 @@
+
 """Inbox name grants and approval labels through the real AgentLoop turn."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import ast
 import asyncio
@@ -12,6 +11,7 @@ from pathlib import Path
 import pytest
 from rich.text import Text
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalPolicy

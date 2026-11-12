@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import json
 import os
@@ -15,6 +13,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore

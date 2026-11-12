@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import fcntl
 import json
@@ -12,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import io
 import json
@@ -22,6 +20,7 @@ import pytest
 
 import zeta.transcript_search.index as index_module
 import zeta.transcript_search.refresh as refresh_module
+from tests.support.branch_reads import branch_entries
 from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project

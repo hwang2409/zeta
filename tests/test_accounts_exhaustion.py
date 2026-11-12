@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import base64
 import faulthandler
@@ -20,6 +18,7 @@ import pytest
 
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (

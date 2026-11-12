@@ -1,9 +1,9 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import os
 from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import (
     ConversationIntegrityError,

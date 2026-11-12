@@ -1,8 +1,7 @@
+
 """One owner cancels a tool handler task: every route sends it at most one cancel."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import gc
@@ -14,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.core.abort import AbortSignal

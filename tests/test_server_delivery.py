@@ -1,8 +1,7 @@
+
 """Idempotent client-delivery tests for the native serve protocol."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import os
@@ -15,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend

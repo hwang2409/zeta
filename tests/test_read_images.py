@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import base64
 import binascii
@@ -18,6 +17,7 @@ import pytest
 from PIL import Image
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.media import image_normalization

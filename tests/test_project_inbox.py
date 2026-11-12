@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import argparse
 import asyncio
 import io
@@ -23,6 +21,7 @@ from rich.console import Console
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 import zeta.storage_format as storage_format_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import ast
 import asyncio
 import base64
@@ -64,6 +62,7 @@ import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.completion import completion_control
 from tests.support.credentials import (
     anthropic_credentials,

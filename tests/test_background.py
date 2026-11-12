@@ -1,8 +1,7 @@
+
 """Tests for session-scoped background process tools."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import concurrent.futures
@@ -28,6 +27,7 @@ from rich.text import Text
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,

@@ -1,8 +1,7 @@
+
 """Rendering failures must restore the terminal and preserve resumable state."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 from io import StringIO
@@ -15,6 +14,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.cli import main as cli
 from zeta.core.session import SessionManager

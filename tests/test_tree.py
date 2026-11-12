@@ -1,8 +1,7 @@
+
 """ZETA-80: fork from arbitrary user messages and the /tree branch browser."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import contextlib
@@ -14,6 +13,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
 from zeta.core.store import ConversationStore

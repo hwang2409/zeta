@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import os
 import threading
@@ -14,6 +12,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background_lifecycle import recover_agent_children
 from zeta.core.store import ConversationStore

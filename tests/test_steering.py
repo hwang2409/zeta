@@ -1,8 +1,7 @@
+
 """Tests for ZETA-82 mid-turn steering + composer escape hatches."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import errno
@@ -21,6 +20,7 @@ from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.providers.completion as completion_module
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy

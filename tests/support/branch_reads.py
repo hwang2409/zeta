@@ -1,3 +1,4 @@
+
 """test-only readers for the store's public row-reference interface."""
 
 import copy

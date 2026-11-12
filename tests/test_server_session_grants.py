@@ -1,8 +1,7 @@
+
 """Real-transport coverage for negotiated session-grant control."""
 
 from __future__ import annotations
-
-from tests.support.branch_reads import branch_entries, branch_messages
 
 import ast
 import asyncio
@@ -18,6 +17,7 @@ from websockets.asyncio.client import connect
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support import server_client
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve

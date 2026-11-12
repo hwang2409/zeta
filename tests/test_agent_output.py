@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import contextlib
 import json
@@ -13,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import zeta.tools.agent as agent_tools
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import owned_child_process

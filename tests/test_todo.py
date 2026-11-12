@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import ast
 import inspect
 import json
@@ -12,6 +11,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore

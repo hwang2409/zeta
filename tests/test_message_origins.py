@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import json
 import subprocess
@@ -15,6 +13,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.agent_lifecycle import wait_background_owner
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve

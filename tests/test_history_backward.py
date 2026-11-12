@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import contextlib
 import threading
@@ -11,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request

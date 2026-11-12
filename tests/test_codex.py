@@ -1,5 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import base64
 import http.server
@@ -15,6 +13,7 @@ import httpx
 import pytest
 
 import zeta.providers.codex as codex_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.completion import completion_control
 from tests.support.credentials import codex_credentials
 from tests.support.owned import await_or_fail

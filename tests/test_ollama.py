@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import json
 import os
@@ -11,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail

@@ -346,7 +346,7 @@ def create_discussion_fork(
             if record.fork_session_id:
                 return record.fork_session_id
             source_metadata = source.metadata
-            branch = list(source.store.entry(ref) for ref in source.store.branch_refs())
+            branch = [source.store.entry(ref) for ref in source.store.branch_refs()]
             anchor_index = next(
                 (
                     index
@@ -388,7 +388,7 @@ def create_discussion_fork(
                     current = attention_store.get(attention_id)
                     if (
                         reopened_source.metadata != source_metadata
-                        or list(reopened_source.store.entry(ref) for ref in reopened_source.store.branch_refs()) != branch
+                        or [reopened_source.store.entry(ref) for ref in reopened_source.store.branch_refs()] != branch
                         or current != record
                         or current.status == "resolved"
                     ):

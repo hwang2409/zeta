@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import contextlib
 import errno
@@ -23,6 +22,7 @@ import zeta.tools._shared.tool_spawn as tool_spawn_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited

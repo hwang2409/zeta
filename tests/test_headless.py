@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import argparse
 import io
 import json
@@ -15,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.cli.main import build_parser, main
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRule

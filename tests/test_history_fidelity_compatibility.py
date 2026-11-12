@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import os
 import shutil
 import subprocess
@@ -10,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,

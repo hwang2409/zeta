@@ -1,10 +1,10 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.background_lifecycle import recover_agent_children

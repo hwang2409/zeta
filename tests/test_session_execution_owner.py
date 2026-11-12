@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import fcntl
 import functools
@@ -20,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from zeta.core import session_execution
 from zeta.core.session import SessionManager
 from zeta.core.session_execution import (

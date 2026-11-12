@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import hashlib
 import json
@@ -14,6 +12,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.runner as agent_runner_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import owned_app
 from zeta.agent.presets import AgentPreset

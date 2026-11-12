@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 import threading
@@ -6,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore

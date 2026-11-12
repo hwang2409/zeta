@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from tests.support.branch_reads import branch_entries, branch_messages
-
 import asyncio
 import fcntl
 import hashlib
@@ -19,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import zeta
+from tests.support.branch_reads import branch_entries, branch_messages
 from zeta import attention_forks
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,

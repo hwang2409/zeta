@@ -1,4 +1,3 @@
-from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import shlex
 import subprocess
@@ -20,6 +19,7 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
