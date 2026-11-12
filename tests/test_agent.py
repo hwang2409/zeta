@@ -10555,18 +10555,18 @@ async def test_drain_terminal_reroutes_late_grandchild_completion_to_root(
         background=True,
         child_instance_id="gc",
     )
-    completion_kwargs: dict[str, Any] = dict(
-        child_instance_id="gc",
-        marker_key="gc",
-        child_session_path=_GC_PATH,
-        description="grandchild",
-        status="completed",
-        text="grandchild done",
-        stats=None,
-        killed_task_ids=None,
-        killed_task_count=None,
-        killed_task_ids_truncated=False,
-    )
+    completion_kwargs = {
+        "child_instance_id": "gc",
+        "marker_key": "gc",
+        "child_session_path": _GC_PATH,
+        "description": "grandchild",
+        "status": "completed",
+        "text": "grandchild done",
+        "stats": None,
+        "killed_task_ids": None,
+        "killed_task_count": None,
+        "killed_task_ids_truncated": False,
+    }
     try:
         await await_or_fail(
             channel.publish_completion(**completion_kwargs),
@@ -10661,18 +10661,18 @@ async def test_drain_terminal_seals_store_so_late_completion_retries_to_root(
         )
 
     monkeypatch.setattr(child_store, "commit_delivery_input", gated_commit)
-    completion_kwargs: dict[str, Any] = dict(
-        child_instance_id="gc",
-        marker_key="gc",
-        child_session_path=_GC_PATH,
-        description="grandchild",
-        status="completed",
-        text="grandchild done",
-        stats=None,
-        killed_task_ids=None,
-        killed_task_count=None,
-        killed_task_ids_truncated=False,
-    )
+    completion_kwargs = {
+        "child_instance_id": "gc",
+        "marker_key": "gc",
+        "child_session_path": _GC_PATH,
+        "description": "grandchild",
+        "status": "completed",
+        "text": "grandchild done",
+        "stats": None,
+        "killed_task_ids": None,
+        "killed_task_count": None,
+        "killed_task_ids_truncated": False,
+    }
     try:
         publish = asyncio.ensure_future(channel.publish_completion(**completion_kwargs))
         await await_or_fail(parked.wait(), what="parked completion commit")
