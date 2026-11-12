@@ -973,10 +973,10 @@ async def test_account_switch_never_replays_transcript(
 ) -> None:
     context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
 
-    def fail_replay(_store: ConversationStore) -> list[object]:
-        raise AssertionError("account switching must not replay the transcript")
+    def fail_branch_read(_store: ConversationStore) -> list[object]:
+        raise AssertionError("account switching must not read the transcript")
 
-    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
+    monkeypatch.setattr(ConversationStore, "branch_refs", fail_branch_read)
     monkeypatch.setattr(
         tui_slash_handlers,
         "build_backend",

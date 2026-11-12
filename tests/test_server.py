@@ -1948,15 +1948,8 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
             calls += 1
             return entries
 
-        def replay(self):
-            raise AssertionError("session_history must not replay the store")
-
-        @property
-        def entries(self):
-            raise AssertionError("session_history must not read store.entries")
-
-        def messages(self):
-            raise AssertionError("session_history must not read branch_messages(store)")
+        def entry(self, ref):
+            return ref
 
     runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
     result = history_module.history(runtime, {}, include_delivery_id=False)

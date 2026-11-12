@@ -276,7 +276,7 @@ def test_scan_reads_raw_rows_without_decoding(
 
     # test-contract: seam proves the lookup reads raw entry.data dicts
     monkeypatch.setattr(Message, "from_dict", classmethod(refuse))
-    monkeypatch.setattr(ConversationStore, "replay", refuse)
+    monkeypatch.setattr(ConversationStore, "branch_refs", refuse)
     # test-contract: seam proves the lookup never snapshots rows
     monkeypatch.setattr(ConversationStore, "_snapshot_entry", staticmethod(refuse))
 
