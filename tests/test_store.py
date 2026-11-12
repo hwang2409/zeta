@@ -3331,6 +3331,7 @@ async def test_approval_policy_ignores_legacy_resident_maps(tmp_path: Path) -> N
         "closed_store",
         "resolve_visible_to_now",
         "concurrent_own_append",
+        "no_rebuild_after_on_loop_resolve",
     ],
 )
 @pytest.mark.asyncio
@@ -3360,6 +3361,35 @@ async def test_approval_read_seam_table(
         assert store.approval_state_now(call.id) == (call, "allow")
         assert store.approval_resolution_now(call.id)["decision"] == "allow"
         assert store.pending_approval_page_now().items == ()
+        store.close()
+        return
+
+    if scenario == "no_rebuild_after_on_loop_resolve":
+        # B1 regression: an on-loop resolve marks the sidecar unavailable; the
+        # following async approval read must answer from the resident memo, not
+        # rebuild the whole sidecar on the hot path. On 3166a096 the read calls
+        # _rebuild_history_index, so this count is non-zero and the assert fails.
+        import zeta.core.store._history_index as history_index_module
+
+        original_rebuild = history_index_module._rebuild_history_index
+        rebuilds: list[int] = []
+
+        def counting_rebuild(target: object) -> object:
+            rebuilds.append(1)
+            return original_rebuild(target)
+
+        store.resolve_approval(call.id, "allow")
+        assert not index.available
+        monkeypatch.setattr(
+            history_index_module, "_rebuild_history_index", counting_rebuild
+        )
+        state = await asyncio.wait_for(store.approval_state(call.id), 10)
+        resolution = await asyncio.wait_for(store.approval_resolution(call.id), 10)
+        assert state == (call, "allow")
+        assert resolution is not None and resolution["decision"] == "allow"
+        assert rebuilds == [], (
+            "an approval read must not rebuild the sidecar after an on-loop append"
+        )
         store.close()
         return
 
