@@ -10446,7 +10446,7 @@ async def test_terminal_reroute_moves_running_grandchild_idle_to_effective_paren
 ) -> None:
     """A dead child's idle for a still-running grandchild reaches the next parent.
 
-    ``reroute_questions_from`` runs at finalize. On main it moves only questions,
+    ``drain_terminal`` runs at finalize. On main it moves only questions,
     so a running grandchild's idle (kept durable by settle_terminal) would reach
     no model once its direct parent ends. The fix also moves idle and hold to the
     effective parent, with the payload unchanged, and acks them in the dead store.
@@ -10489,7 +10489,7 @@ async def test_terminal_reroute_moves_running_grandchild_idle_to_effective_paren
                 dedupe_key="gc",
             ),
         )
-        moved = await channel.reroute_questions_from(child_store)
+        moved = await channel.drain_terminal(child_store)
         assert moved == 1
         # The idle is now a model-visible notification on the effective parent...
         root_idle = [
