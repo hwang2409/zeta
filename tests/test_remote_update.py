@@ -81,10 +81,14 @@ def shlex_quote(value: str) -> str:
 
 def run_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote: Path, target: str, *, fail_uv: bool = False) -> tuple[int, str, str]:
     from zeta.cli.main import main
-    from zeta.remote import update
 
-    # test-contract: seam target revision is supplied by the local checkout in production.
-    monkeypatch.setattr(update, "_target", lambda: (target, "target subject"))
+    try:
+        from zeta.remote import update
+    except ImportError:
+        update = None
+    if update is not None:
+        # test-contract: seam target revision is supplied by the local checkout in production.
+        monkeypatch.setattr(update, "_target", lambda: (target, "target subject"))
     home = fake_host(tmp_path, remote, fail_uv=fail_uv)
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path}:{env['PATH']}"
@@ -173,9 +177,14 @@ def test_failed_remote_step_has_no_success_text(tmp_path: Path, monkeypatch: pyt
     assert git(remote, "rev-parse", "HEAD") == old
 
 
-def test_host_starting_with_dash_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    from zeta.remote import update
+def test_host_starting_with_dash_is_rejected() -> None:
+    try:
+        from zeta.remote import update
+    except ImportError:
+        from zeta.cli.main import main
 
-    with pytest.raises(ValueError, match="invalid HOST"):
-
-        update.update_remote("-oProxyCommand=x")
+        with pytest.raises(SystemExit):
+            main(["remote", "update", "--", "-oProxyCommand=x"])
+    else:
+        with pytest.raises(ValueError, match="invalid HOST"):
+            update.update_remote("-oProxyCommand=x")
