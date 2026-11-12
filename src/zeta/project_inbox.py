@@ -668,13 +668,8 @@ class ProjectInbox:
             result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
             return result
 
-        try:
-            with self._lock(target.project_id, exclusive=False) as project_fd:
-                return read(project_fd)
-        except ProjectRegistryBusyError as exc:
-            raise InboxBusyError("inbox is busy; retry") from exc
-        except (OSError, ProjectRegistryError, SessionError) as exc:
-            raise InboxError("inbox storage is unsafe or unavailable") from exc
+        with _storage_errors(), self._lock(target.project_id, exclusive=False) as project_fd:
+            return read(project_fd)
 
     def _read_tracked_message(
         self,
@@ -708,13 +703,8 @@ class ProjectInbox:
             except _InboxNotFound:
                 return None
 
-        try:
-            with self._lock(target_project, exclusive=False) as project_fd:
-                return read(project_fd)
-        except ProjectRegistryBusyError as exc:
-            raise InboxBusyError("inbox is busy; retry") from exc
-        except (OSError, ProjectRegistryError, SessionError) as exc:
-            raise InboxError("inbox storage is unsafe or unavailable") from exc
+        with _storage_errors(), self._lock(target_project, exclusive=False) as project_fd:
+            return read(project_fd)
 
     def new_ids(
         self, project: str, *, session_id: str | None = None
