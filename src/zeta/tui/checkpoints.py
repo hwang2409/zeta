@@ -299,22 +299,25 @@ class CheckpointTranscriptMixin:
     async def _complete_message_fork(
         self, index, source, snapshots, target_snapshot, forced
     ) -> str:
-        try:
-            entry = await self.loop.store.append_message_fork_async(source.id)
-        except (ValueError, ConversationIntegrityError) as exc:
-            return f"fork failed: {exc}"
-        _, restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
-        )
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        header = (
-            f"forked to user message {index} at seq {source.seq} "
-            f"(label '{entry.data['label']}')"
-        )
-        if restore_note:
-            return f"{header} ({restore_note})"
-        return f"{header} · conversation-only, no workspace snapshot at this message"
+        async def commit_and_rebuild() -> str:
+            try:
+                entry = await self.loop.store.append_message_fork_async(source.id)
+            except (ValueError, ConversationIntegrityError) as exc:
+                return f"fork failed: {exc}"
+            _, restore_note = _restore_workspace(
+                snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
+            )
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            header = (
+                f"forked to user message {index} at seq {source.seq} "
+                f"(label '{entry.data['label']}')"
+            )
+            if restore_note:
+                return f"{header} ({restore_note})"
+            return f"{header} · conversation-only, no workspace snapshot at this message"
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
 
     def _fork_from_checkpoint_label(
         self, selector: str, forced: bool
@@ -328,23 +331,26 @@ class CheckpointTranscriptMixin:
         return self._complete_checkpoint_fork(selector, snapshots, forced)
 
     async def _complete_checkpoint_fork(self, selector, snapshots, forced) -> str:
-        try:
-            entry = await self.loop.store.append_fork_async(selector)
-        except ValueError as exc:
-            return f"fork failed: {exc}"
-        target_snapshot = _resolve_fork_snapshot(snapshots, entry)
-        _, restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
-        )
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        message = (
-            f"forked to checkpoint '{entry.data['label']}' at seq "
-            f"{entry.data['from_seq']}"
-        )
-        if restore_note:
-            return f"{message} ({restore_note})"
-        return message
+        async def commit_and_rebuild() -> str:
+            try:
+                entry = await self.loop.store.append_fork_async(selector)
+            except ValueError as exc:
+                return f"fork failed: {exc}"
+            target_snapshot = _resolve_fork_snapshot(snapshots, entry)
+            _, restore_note = _restore_workspace(
+                snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
+            )
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            message = (
+                f"forked to checkpoint '{entry.data['label']}' at seq "
+                f"{entry.data['from_seq']}"
+            )
+            if restore_note:
+                return f"{message} ({restore_note})"
+            return message
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
 
     def slash_tree(self, args: str) -> str | Awaitable[str]:
         if self.active:
@@ -368,13 +374,26 @@ class CheckpointTranscriptMixin:
         return self._switch_to_branch(index, target)
 
     async def _switch_to_branch(self, index, target) -> str:
+        async def commit_and_rebuild() -> str:
+            try:
+                await self.loop.store.switch_to_branch_async(target.head.id)
+            except (ValueError, ConversationIntegrityError) as exc:
+                return f"tree: switch failed: {exc}"
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            return f"switched to branch {index} (head seq {target.head.seq})"
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
+
+    async def _await_committed_branch_operation(
+        self, operation: Awaitable[str]
+    ) -> str:
+        task = asyncio.create_task(operation)
         try:
-            await self.loop.store.switch_to_branch_async(target.head.id)
-        except (ValueError, ConversationIntegrityError) as exc:
-            return f"tree: switch failed: {exc}"
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        return f"switched to branch {index} (head seq {target.head.seq})"
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
 
     def slash_undo(self, args: str) -> str:
         return self._navigate_snapshot(args, verb="undo", past="undone")

@@ -132,6 +132,62 @@ async def test_message_fork_never_splits_tool_call_result_pair(
     await close_owned_app(app)
 
 
+async def test_message_fork_cancellation_restores_workspace_and_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(
+        with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER)
+    )
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply"))
+    store.append_message(
+        with_message_origin(_msg(MessageRole.USER, "later"), MessageOrigin.USER)
+    )
+    store.append_message(_msg(MessageRole.ASSISTANT, "later reply"))
+    app = _make_tui(store)
+    started = threading.Event()
+    release = threading.Event()
+    workspace_file = tmp_path / "workspace.txt"
+    workspace_file.write_text("later")
+    transcript_rebuilt = False
+    original_append = ConversationStore.append_message_fork_async
+
+    async def held_append(self: ConversationStore, entry_id: str):
+        started.set()
+        await asyncio.to_thread(release.wait, 10)
+        return await original_append(self, entry_id)
+
+    def restore_workspace(*args, **kwargs):
+        workspace_file.write_text("first")
+        return True, None
+
+    def rebuild_transcript() -> None:
+        nonlocal transcript_rebuilt
+        transcript_rebuilt = True
+
+    monkeypatch.setattr(ConversationStore, "append_message_fork_async", held_append)
+    monkeypatch.setattr("zeta.tui.checkpoints._restore_workspace", restore_workspace)
+    # test-contract: seam patch the composite operation's post-commit rebuild.
+    monkeypatch.setattr(app, "_rebuild_transcript", rebuild_transcript)
+    task = asyncio.ensure_future(app.slash_fork("1"))
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        task.cancel()
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert workspace_file.read_text() == "first"
+        assert transcript_rebuilt
+        assert store.replay()[-1].type == "fork"
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        await close_owned_app(app)
+
+
 def test_message_fork_persists_and_reopens(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="s1")
     first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first user"), MessageOrigin.USER))

@@ -3720,6 +3720,15 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
                 ),
             )
             assert target.has_outstanding_tool_calls() is True
+            # Keep the pending call before a fold-neutral append so this row
+            # detects dropping an already-open call during installation.
+            target.append_agent_notification(
+                "fold-neutral",
+                child_session_path="/fold-neutral",
+                description="fold-neutral",
+                status="completed",
+                text="done",
+            )
         else:  # install_race — the B1 regression the identity-eq fold dropped
             # The owner swaps its fold to an equal-valued object (a fold-neutral
             # checkpoint) while an async command is in flight, and an external
