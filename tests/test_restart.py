@@ -173,6 +173,7 @@ def test_restart_when_idle_arms_then_requests_restart_after_work_ends(
 
     composer_text = True
     running = False
+    # test-contract: seam inject the idle predicate to force the composer transition.
     monkeypatch.setattr(
         app,
         "_restart_is_idle",
