@@ -378,16 +378,21 @@ def descend_directory(parent_fd: int, components: tuple[str, ...]):
         yield directory_fd
 
 
-@contextmanager
-def child_directory(parent_fd: int, name: str, *, create: bool = False):
-    """Pin a child without following symbolic links, including during creation."""
+def _open_child_directory(parent_fd: int, name: str, *, create: bool = False) -> int:
+    """Open one validated child without following symbolic links."""
     _component(name)
     if create:
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             pass
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+
+@contextmanager
+def child_directory(parent_fd: int, name: str, *, create: bool = False):
+    """Pin a child without following symbolic links, including during creation."""
+    fd = _open_child_directory(parent_fd, name, create=create)
     try:
         yield fd
     finally:
@@ -407,16 +412,16 @@ def session_root(path: Path, *, create: bool = False):
     fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for name in parts[split:]:
-            if create:
-                try:
-                    os.mkdir(name, mode=0o700, dir_fd=fd)
-                except FileExistsError:
-                    pass
-            child_fd = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
-            )
-            os.close(fd)
+            child_fd = _open_child_directory(fd, name, create=create)
+            parent_fd = fd
             fd = child_fd
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                try:
+                    os.close(parent_fd)
+                finally:
+                    raise
         yield fd
     finally:
         os.close(fd)

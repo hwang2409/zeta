@@ -301,6 +301,69 @@ def test_child_store_rejects_symlink_in_nested_sessions_root(tmp_path):
     assert list(outside.iterdir()) == []
 
 
+def test_session_root_rejects_untrusted_components_without_external_writes(tmp_path):
+    from zeta.core.session_files import child_directory, session_root
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    session_fd = os.open(sessions, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in ("", ".", "..", str(tmp_path / "absolute"), "nested/name"):
+            with pytest.raises(SessionError):
+                with child_directory(session_fd, name, create=True):
+                    pass
+    finally:
+        os.close(session_fd)
+    (sessions / "link").symlink_to(outside, target_is_directory=True)
+    link_parent_fd = os.open(sessions, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            with child_directory(link_parent_fd, "link"):
+                pass
+    finally:
+        os.close(link_parent_fd)
+    with pytest.raises(SessionError):
+        with session_root(sessions / "nested" / ".." / "escaped", create=True):
+            pass
+    assert list(outside.iterdir()) == []
+    assert not (tmp_path / "absolute").exists()
+
+
+def test_session_root_closes_child_when_parent_close_fails(tmp_path, monkeypatch):
+    from zeta.core.session_files import session_root
+
+    sessions = tmp_path / "sessions"
+    (sessions / "one" / "two").mkdir(parents=True)
+    opened: list[int] = []
+    real_open = os.open
+    real_close = os.close
+    close_attempts = 0
+
+    def record_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def fail_once(fd):
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise OSError("injected close failure")
+        real_close(fd)
+
+    monkeypatch.setattr("zeta.core.session_files.os.open", record_open)
+    monkeypatch.setattr("zeta.core.session_files.os.close", fail_once)
+    with pytest.raises(OSError, match="injected close failure"):
+        with session_root(sessions / "one" / "two"):
+            pass
+    monkeypatch.undo()
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
 def test_session_file_helper_rejects_path_components(tmp_path):
     from zeta.core.session_files import open_session_file
 
