@@ -387,6 +387,7 @@ async def consume_run(
         )
         return terminal_result
     finally:
+        child_store.pending_prompt_queue.end_run()
         if safety_task is not None and not safety_task.done():
             safety_task.cancel()
         if safety_task is not None:
