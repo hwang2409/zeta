@@ -2731,6 +2731,7 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         approval_end_published = asyncio.Event()
         terminal_published = asyncio.Event()
         original_admit = server.control._admit_controller
+        original_notify = server.control._notify
 
         def observe_admit(
             event: EventDescriptor, session_id: str | None = None, **fields: object
@@ -2745,8 +2746,18 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
                 terminal_published.set()
             return outcome
 
+        async def observe_notify(
+            event: EventDescriptor, session_id: str | None = None, **fields: object
+        ) -> bool:
+            written = await original_notify(event, session_id, **fields)
+            if event is EventDescriptor.TOOL_END:
+                terminal_published.set()
+            return written
+
         # test-contract: seam observe admission to the real connection output
         monkeypatch.setattr(server.control, "_admit_controller", observe_admit)
+        # test-contract: seam observe completion of terminal wire publication
+        monkeypatch.setattr(server.control, "_notify", observe_notify)
         # Force the losing race deterministically: close the grandchild store
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
