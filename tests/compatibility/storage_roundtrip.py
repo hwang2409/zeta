@@ -35,10 +35,10 @@ def _missing_api(family: str, owner: object, names: tuple[str, ...]) -> bool:
 def _message_texts(store: object) -> list[str]:
     return [
         part.text
-        for ref in store.branch_refs()  # type: ignore[attr-defined]
-        for entry in [store.entry(ref)]  # type: ignore[attr-defined]
-        if entry.type == "message"
-        for part in Message.from_dict(entry.data["message"]).content
+        for row in store.path.read_text().splitlines()  # type: ignore[attr-defined]
+        for data in [json.loads(row)]
+        if data.get("type") == "message"
+        for part in Message.from_dict(data["data"]["message"]).content
         if hasattr(part, "text")
     ]
 
