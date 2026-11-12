@@ -253,6 +253,7 @@ class TUIApp(
         self._next_image_token = 1
         self._composer_insertions: list[str] = []
         self._exit_requested = False
+        self._restart_when_idle = False
         self._terminal_restored = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
@@ -821,6 +822,7 @@ class TUIApp(
         self._agent_navigation.request_refresh()
         if not self._defer_startup_notice(notice):
             background_notice(self, notice)
+        self._maybe_restart_when_idle()
 
     def _handle_background_event(self, event: StreamEvent) -> None:
         if not self._defer_startup_runtime_event(event):
@@ -841,6 +843,7 @@ class TUIApp(
         }:
             self._handle_tool_event(event)
             self._finish_background_invalidation()
+            self._maybe_restart_when_idle()
             return
         if event.data.get("agent_instance_id") is not None:
             return
@@ -855,6 +858,7 @@ class TUIApp(
             if presentation is not None and presentation.visible_output:
                 if event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._finish_background_invalidation()
+                    self._maybe_restart_when_idle()
                 else:
                     self._invalidate_background_prompt()
 
@@ -865,6 +869,7 @@ class TUIApp(
             self._startup_wake_pending = True
             return
         self._submissions.wake()
+        self._maybe_restart_when_idle()
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()
@@ -1152,6 +1157,7 @@ class TUIApp(
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
+            session.default_buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
                 await start_prompt_during_activation(self, session, run_prompt_toolkit)

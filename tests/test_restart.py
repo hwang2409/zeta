@@ -134,3 +134,69 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
         ["--provider", "codex", "--continue", "--model", "offline"]
     ) == 0
     assert events == ["restore", "close", "exec"]
+
+
+def test_restart_when_idle_arms_then_requests_restart_after_work_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root-session", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    session = FullScreenPromptSession(input=DummyInput(), output=DummyOutput())
+    app._session = session
+    app._active_session = None
+    events: list[str] = []
+
+    class Controller:
+        def is_visible(self, _app: TUIApp) -> bool:
+            return True
+
+        def request_restart(self) -> None:
+            events.append("restart")
+
+    app._fork_controller = Controller()
+    running = True
+    monkeypatch.setattr(
+        TUIApp,
+        "restart_has_running_work",
+        property(lambda _app: running),
+    )
+
+    assert app.slash_restart("") == (
+        "restart pending · waiting for running work · /restart now to cancel it"
+    )
+    assert app.restart_pending
+    assert not app._exit_requested
+
+    composer_text = True
+    running = False
+    monkeypatch.setattr(
+        app,
+        "_restart_is_idle",
+        lambda: not running and not composer_text,
+    )
+    app._maybe_restart_when_idle()
+    assert app.restart_pending
+    assert not events
+
+    composer_text = False
+    app._maybe_restart_when_idle()
+    assert events == ["restart"]
+    assert app._exit_requested
+    asyncio.run(app.close())
+
+
+def test_restart_cancel_disarms_pending_restart(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions", session_id="root-session", cwd=tmp_path)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    app._restart_when_idle = True
+    assert app.slash_restart("cancel") == "restart canceled"
+    assert not app.restart_pending
+    asyncio.run(app.close())
