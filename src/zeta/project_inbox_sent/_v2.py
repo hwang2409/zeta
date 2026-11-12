@@ -93,9 +93,9 @@ def decode_body(value: object, message_id: str | None = None) -> str | dict[str,
             raise TypeError("invalid envelope body")
         return value
     if isinstance(value, dict):
-        if set(value) <= {"file"}:
-            return decode_recipient_body_ref(value, message_id)
-        return decode_sender_spill_ref(value, message_id)
+        if "sha256" in value or "length" in value:
+            return decode_sender_spill_ref(value, message_id)
+        return decode_recipient_body_ref(value, message_id)
     raise ValueError("invalid envelope body")
 
 
