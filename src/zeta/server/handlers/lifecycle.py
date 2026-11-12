@@ -175,18 +175,20 @@ def session_snapshot(self) -> dict[str, object] | None:
     return snapshot
 
 
-def live_status_baseline(self) -> dict[str, object]:
+def session_runtime_state(self) -> str:
     runtime = self.server.runtime
     control = self.server.control
-    pending, truncated = control.pending_approvals_now(
-        reconnect=True, include_truncated=True
+    return (
+        "idle"
+        if control.unhealthy() or runtime.state is None
+        else "running" if control.turn_busy() else runtime.state.status
     )
+
+
+async def live_status_baseline(self) -> dict[str, object]:
+    pending, truncated = await self.server.control.reconnect_baseline()
     return {
-        "state": (
-            "idle"
-            if control.unhealthy() or runtime.state is None
-            else "running" if control.turn_busy() else runtime.state.status
-        ),
+        "state": session_runtime_state(self),
         "pending_approvals": pending,
         "pending_approvals_truncated": truncated,
     }
@@ -201,11 +203,13 @@ async def status(
     runtime = self.server.runtime
     session = session_snapshot(self)
     reconnect = "approval_reconnect" in self.features
-    baseline = live_status_baseline(self)
     if reconnect:
+        baseline = await live_status_baseline(self)
+        state = baseline["state"]
         pending_approvals = baseline["pending_approvals"]
         pending_approvals_truncated = baseline["pending_approvals_truncated"]
     else:
+        state = session_runtime_state(self)
         pending_approvals = await self.server.control.pending_approvals()
         pending_approvals_truncated = None
     loop = runtime.loop
@@ -227,7 +231,7 @@ async def status(
     )
     status = {
         "session": session,
-        "state": baseline["state"],
+        "state": state,
         "explicit_finish": (
             loop.explicit_finish
             if loop is not None

@@ -163,6 +163,32 @@ def _wait_for_group_exit_sync(
         time.sleep(0.05)
 
 
+async def _await_group_drain(
+    processes: Sequence[asyncio.subprocess.Process], term_grace: float
+) -> None:
+    """Give the whole process group, not just the tracked root, the term grace.
+
+    The root can exit before a detached group member (one still in the group
+    because it did not call setsid) runs its SIGTERM handler. Waiting only on
+    ``process.wait()`` returns the instant the root is gone, so that member
+    would be SIGKILLed with no grace. Reap the roots, then keep polling until
+    the groups drain or the grace elapses.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + term_grace
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(process.wait() for process in processes)),
+            timeout=term_grace,
+        )
+    except TimeoutError:
+        return
+    while any(_group_exists(process.pid) for process in processes):
+        if loop.time() >= deadline:
+            return
+        await asyncio.sleep(0.02)
+
+
 async def _terminate_processes(
     processes: Sequence[asyncio.subprocess.Process],
     term_grace: float,
@@ -184,15 +210,7 @@ async def _terminate_processes(
         _signal_pids(descendants.get(process.pid, {}), signal.SIGTERM)
     if after_signal is not None:
         after_signal()
-    try:
-        await snapshot(
-            asyncio.wait_for(
-                asyncio.gather(*(process.wait() for process in processes)),
-                timeout=term_grace,
-            )
-        )
-    except TimeoutError:
-        pass
+    await snapshot(_await_group_drain(processes, term_grace))
     current = await snapshot(asyncio.to_thread(_snapshot_descendants_sync, None))
     cleanup: list[Awaitable[None]] = []
     for process in processes:
