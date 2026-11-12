@@ -28,7 +28,11 @@ from zeta.core.store import (
     TranscriptLoadError,
     _async_writes,
 )
-from zeta.core.store._history_index import HistoryIndexUnavailableError
+from zeta.core.store._history_index import (
+    HistoryIndexError,
+    HistoryIndexUnavailableError,
+    StaleHistorySnapshot,
+)
 from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
@@ -3316,6 +3320,120 @@ async def test_approval_policy_ignores_legacy_resident_maps(tmp_path: Path) -> N
     ]
     foreign.close()
     resident.close()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "index_stale_logical",
+        "own_append_physical",
+        "index_unavailable",
+        "closed_store",
+    ],
+)
+@pytest.mark.asyncio
+async def test_approval_read_seam_answers_from_branch_instead_of_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    # B1/M5: an approval read must never surface StaleHistorySnapshot or an fd
+    # error to its caller. When the sidecar is stale, moving under this store's
+    # own append, unavailable, or the store is closed, the seam answers from the
+    # authoritative resident branch instead of raising.
+    store = ConversationStore(tmp_path, session_id="seam")
+    call = ToolCall("req-seam", "bash", {"cmd": "ls"})
+    store.append_approval_request(call.id, call)
+    index = store._history_index
+    assert index is not None
+
+    def raise_stale(*_args: object, **_kwargs: object) -> object:
+        raise StaleHistorySnapshot
+
+    if mode == "index_stale_logical":
+        monkeypatch.setattr(index, "approval_state", raise_stale)
+    elif mode == "own_append_physical":
+        real_facts = store._history_index_facts
+        seen = {"n": 0}
+
+        def moving_facts() -> dict[str, object]:
+            facts = dict(real_facts())
+            seen["n"] += 1
+            # The post-query recheck sees a moved byte boundary, as an in-flight
+            # own append would; the seam must not rebuild or raise for that.
+            if seen["n"] % 2 == 0:
+                facts["byte_boundary"] = int(facts["byte_boundary"]) + 1
+            return facts
+
+        monkeypatch.setattr(store, "_history_index_facts", moving_facts)
+        monkeypatch.setattr(index, "approval_state", raise_stale)
+    elif mode == "index_unavailable":
+        index._mark_unavailable()
+        monkeypatch.setattr(
+            "zeta.core.store._history_index._rebuild_history_index",
+            lambda _store: (_ for _ in ()).throw(
+                HistoryIndexUnavailableError("down")
+            ),
+        )
+    else:  # closed_store
+        store.close()
+
+    try:
+        state = await asyncio.wait_for(store.approval_state(call.id), 10)
+    except (HistoryIndexError, OSError):
+        state = "seam raised"
+    assert state == (call, None), f"seam must answer from the branch, got {state!r}"
+    if mode != "closed_store":
+        store.close()
+
+
+def test_resolve_on_loop_is_visible_to_the_now_seam_at_once(
+    tmp_path: Path,
+) -> None:
+    # B2 memo: the sync `*_now` seam memoizes the resident projection by the
+    # active leaf. A resolve on the loop moves the leaf, so the next `*_now`
+    # read reflects it with no sync and no refresh.
+    store = ConversationStore(tmp_path, session_id="now-memo")
+    call = ToolCall("req-now", "bash", {"cmd": "ls"})
+    store.append_approval_request(call.id, call)
+
+    assert store.approval_state_now(call.id) == (call, None)
+    assert store.approval_resolution_now(call.id) is None
+    assert [rid for rid, _ in store.pending_approval_page_now().items] == [call.id]
+
+    store.resolve_approval(call.id, "allow")
+
+    assert store.approval_state_now(call.id) == (call, "allow")
+    assert store.approval_resolution_now(call.id)["decision"] == "allow"
+    assert store.pending_approval_page_now().items == ()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_own_append_keeps_approval_reads_correct(
+    tmp_path: Path,
+) -> None:
+    # B1 reproduction: back-to-back own appends move the log file while a reader
+    # polls approval_state. On the pre-fix store the reads raised
+    # StaleHistorySnapshot; the seam now returns the right state on every read.
+    store = ConversationStore(tmp_path, session_id="race")
+    call = ToolCall("req-race", "bash", {"cmd": "ls"})
+    store.append_approval_request(call.id, call)
+
+    async def appender() -> None:
+        for index in range(60):
+            await store.append_message_async(
+                message(MessageRole.ASSISTANT, f"row {index}")
+            )
+
+    async def reader() -> list[object]:
+        return [await store.approval_state(call.id) for _ in range(60)]
+
+    _written, states = await asyncio.wait_for(
+        asyncio.gather(appender(), reader()), 30
+    )
+    assert all(state == (call, None) for state in states), (
+        "every read must return the pending request, never raise or miss it"
+    )
+    store.close()
 
 
 def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:
