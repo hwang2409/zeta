@@ -14881,6 +14881,83 @@ async def test_account_picker_ignores_repeat_select_while_switching(
 
 
 @pytest.mark.asyncio
+async def test_account_switch_serializes_real_prompt_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    initial_backend = FakeBackend([])
+    switched_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    loop = AgentLoop(initial_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._active_session = app._make_session()
+    app._presenter.print_unit = lambda _renderable: None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_switch = SessionAccountContext.switch_active
+    async def held_switch(self, *args: object, **kwargs: object) -> None:
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        await original_switch(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.build_backend",
+        lambda *_args, **_kwargs: (switched_backend, "codex"),
+    )
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        app.accounts_picker_move(1)
+        switch_task = app.accounts_picker_select()
+        assert switch_task is not None
+        await asyncio.wait_for(entered.wait(), 10)
+
+        app._submit_input("hello")
+        await wait_until(lambda: app._submissions.active)
+        assert all(entry.state.value != "dispatched" for entry in app._submissions._entries.values())
+        assert switched_backend.calls == []
+        assert initial_backend.calls == []
+
+        release.set()
+        await asyncio.wait_for(switch_task, 10)
+        await asyncio.sleep(0)
+        assert not app.account_switch_pending
+        assert loop.backend is switched_backend
+        app._submissions.wake()
+        await wait_until(
+            lambda: any(
+                entry.state.value == "dispatched"
+                for entry in app._submissions._entries.values()
+            )
+        )
+        await wait_until(lambda: not app._submissions.active)
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+        assert initial_backend.calls == []
+    finally:
+        release.set()
+        await app.close()
+        opened.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
