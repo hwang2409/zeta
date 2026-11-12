@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .core.store._startup_facts import ContextCalibrationRecord
+from .core.store._rows import ContextCalibrationRecord
 
 _ALPHA = 0.5
 _MIN_RATIO = 1.0

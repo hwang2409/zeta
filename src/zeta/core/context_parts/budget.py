@@ -8,7 +8,7 @@ from typing import Any
 
 from ...context_calibration import ContextCalibration
 from ...protocol.types import Message, MessageRole, TextContent
-from ..store._startup_facts import ContextCalibrationRecord
+from ..store._rows import ContextCalibrationRecord
 
 
 class ContextRequestBudget:
