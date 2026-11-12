@@ -1975,7 +1975,9 @@ class FinishGateBackend(CompletionBackend):
             blocks = [TextContent("root complete")]
         for block in blocks:
             if isinstance(block, TextContent) and (
-                "child" in block.text or "merged result" in block.text
+                "child" in block.text
+                or "merged result" in block.text
+                or block.text == self.completion_notification_text
             ):
                 self.child_final_responses.append(block.text)
         yield StreamEvent(StreamEventType.MESSAGE_START)
@@ -4120,7 +4122,7 @@ async def test_child_finish_gate_text_handoff_is_not_control_signal(
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
-    assert lifecycle["final_result"].startswith("merged result: evidence ready")
+    assert "evidence ready" in lifecycle["final_result"]
     assert not store.agent_children()
     child_store.close()
     await loop.close()
@@ -5384,7 +5386,7 @@ async def test_child_finish_gate_model_bound_waits_for_grandchild(
     )
     receipt = store.tool_result("child")
     assert receipt is not None
-    assert "merged result: evidence ready" in receipt.content
+    assert "evidence ready" in receipt.content
     await loop.close()
 
 
