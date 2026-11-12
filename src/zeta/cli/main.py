@@ -882,10 +882,6 @@ def _create_tui_app(
     from ..tui.bootstrap import create_app
 
     try:
-        if args.force_provider and args.model is None:
-            from ..tui.stderr_capture import restore_stderr_for_cli
-
-            restore_stderr_for_cli()
         if args.continue_session or args.resume is not None:
             _tui_print("Loading session…")
             return asyncio.run(asyncio.to_thread(create_app, args))

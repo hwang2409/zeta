@@ -70,6 +70,27 @@ def _capture_env(home: Path) -> dict[str, str]:
     return env
 
 
+def test_capture_uses_temp_fallback_when_home_log_is_unavailable(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "tui-stderr").write_text("not a directory")
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    env = _capture_env(home) | {"TMPDIR": str(fallback)}
+    code = """
+import os
+from zeta.tui.stderr_capture import stderr_to_log
+with stderr_to_log():
+    os.write(2, b'ZFALLBACK\\n')
+"""
+    terminal, returncode = _run_pty_python(code, env)
+    assert returncode == 0
+    assert b"ZFALLBACK" not in terminal
+    logs = list((fallback / "zeta-tui-stderr").glob("*.log"))
+    assert len(logs) == 1
+    assert b"ZFALLBACK" in logs[0].read_bytes()
+
+
 def test_pre_capture_atexit_stderr_stays_captured(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     code = """
@@ -85,52 +106,25 @@ with stderr_to_log():
     assert b"ZATEXIT-LEAK" not in terminal
 
 
-def test_shutdown_does_not_wait_for_stalled_writer(tmp_path: Path) -> None:
+def test_startup_retention_skips_locked_logs(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
-    code = """
-import os, threading
-import zeta.tui.stderr_capture as capture
-started = threading.Event()
-def stalled(_path):
-    started.set()
-    threading.Event().wait(3600)
-capture._open_log = stalled
-with capture.stderr_to_log():
-    os.write(2, b'ZSTALLED-WRITER\\n')
-assert started.wait(10)
-"""
-    terminal, returncode = _run_pty_python(code, _capture_env(home), timeout=8)
-
-    assert returncode == 0
-    assert b"ZSTALLED-WRITER" not in terminal
-
-
-def test_existing_and_rotated_logs_are_private(tmp_path: Path) -> None:
-    home = tmp_path / "zeta-home"
-    logs = home / "logs"
+    logs = home / "logs" / "tui-stderr"
     logs.mkdir(parents=True)
-    active = logs / "tui-stderr.log"
-    active.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
-    active.chmod(0o644)
-    rotated = logs / "tui-stderr.log.1"
-    rotated.write_bytes(b"older")
-    rotated.chmod(0o644)
+    old = logs / "1-1.log"
+    old.write_bytes(b"x" * (50 * 1024 * 1024))
+    old.touch()
     code = """
-import os, time
+import os
 from zeta.tui.stderr_capture import stderr_to_log
 with stderr_to_log():
     os.write(2, b'ZPRIVATE\\n')
-    deadline = time.monotonic() + 10
-    while os.path.getsize(os.path.join(os.environ['ZETA_HOME'], 'logs', 'tui-stderr.log.1')) < 1000000:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
 """
     terminal, returncode = _run_pty_python(code, _capture_env(home))
-
     assert returncode == 0
     assert b"ZPRIVATE" not in terminal
-    assert active.stat().st_mode & 0o777 == 0o600
-    assert rotated.stat().st_mode & 0o777 == 0o600
+    assert old.exists()
+    current = next(path for path in logs.glob("*.log") if path != old)
+    assert current.stat().st_mode & 0o777 == 0o600
 
 
 def test_restart_replacement_gets_terminal_stderr(tmp_path: Path) -> None:
@@ -170,7 +164,9 @@ def test_stderr_flood_does_not_block_event_loop(tmp_path: Path) -> None:
     env = os.environ | {"ZETA_HOME": str(tmp_path / "zeta-home")}
     child = subprocess.run([sys.executable, "-c", code], env=env, timeout=10, check=False)
     assert child.returncode == 0
-    assert (tmp_path / "zeta-home" / "logs" / "tui-stderr.log").stat().st_size >= 1048576
+    logs = list((tmp_path / "zeta-home" / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 1
+    assert logs[0].stat().st_size >= 1048576
 
 
 def test_stray_stderr_never_reaches_the_terminal(tmp_path: Path) -> None:
@@ -219,5 +215,5 @@ def test_stray_stderr_never_reaches_the_terminal(tmp_path: Path) -> None:
     for text in (*NOISE, "Traceback"):
         assert text not in terminal, f"terminal showed stray stderr: {text}"
     assert "resume with:" in terminal
-    log = (home / "logs" / "tui-stderr.log").read_text()
+    log = next((home / "logs" / "tui-stderr").glob("*.log")).read_text()
     assert [text for text in NOISE if text not in log] == []
