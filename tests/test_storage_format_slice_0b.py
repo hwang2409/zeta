@@ -170,7 +170,7 @@ def test_sent_ledger_preserves_unknown_record_fields_and_prunes_by_id(
     session_id = "1" * 32
     messages = ("2" * 32, "3" * 32, "4" * 32)
     project_id = "5" * 32
-    tracker = SentMessageTracker(sessions, session_id)
+    tracker = SentMessageTracker(sessions, session_id, observed_epoch=0)
     tracker.record(messages[0], project_id)
     ledger = sessions / session_id / "project-inbox-sent.json"
     value = _read(ledger)
@@ -179,7 +179,7 @@ def test_sent_ledger_preserves_unknown_record_fields_and_prunes_by_id(
     records[0]["future-field"] = "kept"
     _write(ledger, value)
 
-    tracker = SentMessageTracker(sessions, session_id)
+    tracker = SentMessageTracker(sessions, session_id, observed_epoch=0)
     tracker.mark_reported(((messages[0], "done"),))
     tracker.record(messages[1], project_id)
     value = _read(ledger)
@@ -187,7 +187,7 @@ def test_sent_ledger_preserves_unknown_record_fields_and_prunes_by_id(
     assert isinstance(records, list)
     records[1]["future-field"] = "kept"
     _write(ledger, value)
-    tracker = SentMessageTracker(sessions, session_id)
+    tracker = SentMessageTracker(sessions, session_id, observed_epoch=0)
     tracker.record(messages[2], project_id)
 
     records = _read(ledger)["records"]
@@ -200,7 +200,7 @@ def test_sent_ledger_preserves_unknown_record_fields_and_prunes_by_id(
 def test_sent_ledger_preserves_unknown_record_ids(tmp_path: Path) -> None:
     sessions = tmp_path / "sessions"
     session_id = "1" * 32
-    tracker = SentMessageTracker(sessions, session_id)
+    tracker = SentMessageTracker(sessions, session_id, observed_epoch=0)
     tracker.record("2" * 32, "3" * 32)
     ledger = sessions / session_id / "project-inbox-sent.json"
     value = _read(ledger)
@@ -217,7 +217,7 @@ def test_sent_ledger_preserves_unknown_record_ids(tmp_path: Path) -> None:
     )
     _write(ledger, value)
 
-    SentMessageTracker(sessions, session_id).record("6" * 32, "7" * 32)
+    SentMessageTracker(sessions, session_id, observed_epoch=0).record("6" * 32, "7" * 32)
 
     records = _read(ledger)["records"]
     assert isinstance(records, list)
@@ -816,7 +816,7 @@ def test_closed_variant_readers_reject_without_mutation(
         },
     )
     before = ledger.read_bytes()
-    tracker = SentMessageTracker(home / "sessions", "2" * 32)
+    tracker = SentMessageTracker(home / "sessions", "2" * 32, observed_epoch=0)
     health = tracker.health().health
     assert health.state == "broken"
     assert health.reason == "invalid_records"

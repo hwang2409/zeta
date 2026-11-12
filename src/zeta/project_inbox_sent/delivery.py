@@ -44,7 +44,10 @@ class SentDelivery:
             inbox.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
         )
         if durable:
-            tracker.record_intent(record)
+            # A broken sender ledger saves no intent, so there is nothing to
+            # retry; drop the durable promise and let a failed publish surface
+            # the plain error below, which tells the model it may resend.
+            durable = tracker.record_intent(record).health.state != "broken"
         try:
             with inbox._directories(target, create=True) as dirs:
                 inbox._publish_outgoing(dirs, message_id, body, record)
@@ -81,6 +84,10 @@ class SentDelivery:
 
         inbox = self._inbox
         failures: list[str] = []
+        # shortcut: an intent whose target can never succeed (a removed project,
+        # or a caller-supplied id that conflicts) retries every poll for the
+        # session's life with degraded health; there is no abandonment path.
+        # Upgrade to a dead-letter/abandon path if that case becomes common.
         for envelope in tracker.pending_intents():
             target = envelope["to_project"]
             message_id = envelope["id"]

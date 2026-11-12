@@ -70,7 +70,7 @@ def _stale_tracker_writer(
     target_project: str,
     connection,
 ) -> None:
-    tracker = SentMessageTracker(Path(sessions_root), session_id)
+    tracker = SentMessageTracker(Path(sessions_root), session_id, observed_epoch=0)
     connection.send("loaded")
     connection.recv()
     try:
@@ -934,6 +934,7 @@ def test_published_intent_persists_before_unlinking_sender_spill(
     monkeypatch.setattr(SentMessageTracker, "_persist", flaky)
     with pytest.raises(ValueError):
         tracker.record(message_id, project_b.project_id)
+    # test-contract: durability restore the real writer so the recovery phase runs
     monkeypatch.setattr(SentMessageTracker, "_persist", real_persist)
 
     # B1: the failed mark-published write did not unlink the still-referenced
@@ -962,36 +963,167 @@ def test_published_intent_persists_before_unlinking_sender_spill(
     ).exists()
 
 
-def test_concurrent_trackers_merge_without_losing_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "concurrent_record",
+        "stale_mark_spilled",
+        "stale_mark_inline",
+        "duplicate_record",
+        "restart_reads_merged",
+        "write_fails_after_publish",
+    ],
+)
+def test_v2_sent_ledger_merge_is_monotonic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    # (B2) The sender ledger has several concurrent writers (the runtime plus
-    # every /inbox send or attention reply). A v2 write must merge the changed
-    # row under the shape lock, not rewrite the whole set, or a row that another
-    # writer committed meanwhile is lost (the audit loss this slice closes).
+    # One owner (`SentMessageTracker._merge_v2_row`) merges every v2 write under
+    # the shape lock, so no concurrent or stale writer can revert a row: a new
+    # row is inserted, an unknown disk row is kept, publication only advances
+    # pending->published, a published row carries no envelope, and a claimed/done
+    # status is never lost. The stale_mark_* rows are the MA1 regression that
+    # fails on 01434489 before this owner existed; the others pin behavior that a
+    # future merge change must not break.
     import zeta.project_inbox_sent as sent_module
 
-    home, registry, _project_a, project_b = _epoch_projects(tmp_path)
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
     epoch = registry.observed_storage_epoch
     session_id = "a" * 32
-    first = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
-    second = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    ledger_path = home / "sessions" / session_id / "project-inbox-sent.json"
+
+    def rows() -> list[dict]:
+        return json.loads(ledger_path.read_text())["records"]
+
+    def tracker() -> SentMessageTracker:
+        return SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+
+    def envelope(message_id: str, body: str) -> dict:
+        return _durable_envelope(
+            message_id=message_id,
+            from_project=project_a.project_id,
+            to_project=project_b.project_id,
+            session_id=session_id,
+            body=body,
+        )
+
     real_open_writer = sent_module.open_writer
-    fired = {"done": False}
 
-    def interleaving_open_writer(root):
-        if not fired["done"]:
-            fired["done"] = True
-            # Another writer commits its row while the first holds its stale view.
-            second.record("2" * 32, project_b.project_id)
-        return real_open_writer(root)
+    def interleave_once(action) -> None:
+        fired = {"x": False}
 
-    monkeypatch.setattr(sent_module, "open_writer", interleaving_open_writer)
-    first.record("1" * 32, project_b.project_id)
-    ledger = json.loads(
-        (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
+        def patched(root):
+            if not fired["x"]:
+                fired["x"] = True
+                action()
+            return real_open_writer(root)
+
+        monkeypatch.setattr(sent_module, "open_writer", patched)
+
+    if scenario == "concurrent_record":
+        first, second = tracker(), tracker()
+        # The second writer commits its row while the first holds a stale view.
+        interleave_once(lambda: second.record("2" * 32, project_b.project_id))
+        first.record("1" * 32, project_b.project_id)
+        assert sorted(r["id"] for r in rows()) == ["1" * 32, "2" * 32]
+        return
+
+    if scenario in ("stale_mark_spilled", "stale_mark_inline"):
+        body = "z" * (70 * 1024) if scenario == "stale_mark_spilled" else "small body"
+        mid = "c" * 32
+        sender = tracker()
+        sender.record_intent(envelope(mid, body))
+        runtime = tracker()
+        # While the runtime tracker (refreshed to the pending row) commits a
+        # claimed receipt, the sender publishes: pending->published, envelope
+        # dropped, spill unlinked. The runtime's stale pending+envelope write
+        # must not revert that.
+        interleave_once(lambda: sender.record(mid, project_b.project_id))
+        runtime.mark_reported([(mid, "claimed")])
+        row = rows()[0]
+        assert row["publication"] == "published"
+        assert "envelope" not in row
+        assert "claimed" in row["reported"]
+        return
+
+    if scenario == "duplicate_record":
+        mid = "1" * 32
+        t = tracker()
+        t.record(mid, project_b.project_id)
+        t.record(mid, project_b.project_id)
+        assert [r["id"] for r in rows()] == [mid]
+        assert rows()[0]["publication"] == "published"
+        return
+
+    if scenario == "restart_reads_merged":
+        mid = "1" * 32
+        t = tracker()
+        t.record_intent(envelope(mid, "hello"))
+        t.record(mid, project_b.project_id)
+        restarted = tracker().records()
+        assert [r["id"] for r in restarted] == [mid]
+        assert restarted[0]["publication"] == "published"
+        assert "envelope" not in restarted[0]
+        return
+
+    # write_fails_after_publish: a failed mark-published write leaves the pending
+    # row and its spill intact, so recovery is not wedged and nothing is lost.
+    mid = "b" * 32
+    spill = home / "sessions" / session_id / "project-inbox-sent-spill" / f"{mid}.txt"
+    t = tracker()
+    t.record_intent(envelope(mid, "y" * (70 * 1024)))
+    assert spill.exists()
+    real_persist = SentMessageTracker._persist
+    calls = {"n": 0}
+
+    def flaky(self, upserts, delete_ids):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the mark-published write
+            raise ValueError("sent-message tracking is unsafe or unavailable")
+        return real_persist(self, upserts, delete_ids)
+
+    # test-contract: durability fail the mark-published write via the ledger seam
+    monkeypatch.setattr(SentMessageTracker, "_persist", flaky)
+    with pytest.raises(ValueError):
+        t.record(mid, project_b.project_id)
+    # test-contract: durability restore the real writer after the forced failure
+    monkeypatch.setattr(SentMessageTracker, "_persist", real_persist)
+    assert spill.exists()
+    assert rows()[0]["publication"] == "pending"
+
+
+def test_broken_ledger_publish_failure_returns_plain_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (MA2) A broken sender ledger saves no durable intent, so a failed recipient
+    # publish must surface the plain original error (the model may resend), not
+    # the durable "saved; will be retried" promise, which would strand a message
+    # that was never recorded and so can never be recovered.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    epoch = registry.observed_storage_epoch
+    session_id = "a" * 32
+    (home / "sessions" / session_id).mkdir(parents=True)
+    (home / "sessions" / session_id / "project-inbox-sent.json").write_text("{not json")
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=epoch)
+    inbox = ProjectInbox(
+        registry, sessions_root=home / "sessions", sent_tracker=tracker
     )
-    assert sorted(r["id"] for r in ledger["records"]) == ["1" * 32, "2" * 32]
+
+    def boom(*_args, **_kwargs):
+        raise OSError("recipient down")
+
+    # test-contract: seam force the recipient publish to fail with no saved intent
+    monkeypatch.setattr(inbox, "_publish_outgoing", boom)
+    with pytest.raises((OSError, InboxError)) as exc:
+        inbox.send_user(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="info",
+            title="t",
+            body="b",
+            message_id="d" * 32,
+        )
+    assert "saved" not in str(exc.value)
 
 
 def test_cli_style_inbox_list_advances_generation_on_stale_recovery(
@@ -1056,6 +1188,7 @@ def test_pending_intent_retries_on_a_later_poll(
             raise OSError("recipient inbox is temporarily unavailable")
         return real_publish(*args, **kwargs)
 
+    # test-contract: seam make the recipient publish fail, then recover on a poll
     monkeypatch.setattr(scanner.inbox, "_publish_outgoing", maybe_fail)
     with pytest.raises((OSError, InboxError)) as excinfo:
         scanner.inbox.send_user(
@@ -1910,7 +2043,7 @@ def test_newest_record_with_lowest_id_survives_pruning(
     monkeypatch.setattr(tracker_module, "SENT_HISTORY_LIMIT", 2)
     # test-contract: seam make pruning order deterministic
     monkeypatch.setattr(tracker_module, "_now", lambda: next(timestamps))
-    tracker = SentMessageTracker(home / "sessions", "a" * 32)
+    tracker = SentMessageTracker(home / "sessions", "a" * 32, observed_epoch=0)
 
     tracker.record("f" * 32, project_b.project_id)
     tracker.record("e" * 32, project_b.project_id)
@@ -2099,7 +2232,7 @@ def test_broken_sent_ledger_projects_authoritative_delivery_without_writing(
     session_dir.mkdir(parents=True)
     ledger = session_dir / "project-inbox-sent.json"
     original = b'{"schema_version":1,"records":[\n'
-    tracker = SentMessageTracker(home / "sessions", session_id)
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=0)
     ledger.write_bytes(original)
     inbox = ProjectInbox(
         registry, sessions_root=home / "sessions", sent_tracker=tracker
@@ -2131,7 +2264,7 @@ def test_broken_projection_keeps_identity_when_spilled_body_is_undecodable(
 ) -> None:
     home, registry, project_a, project_b = _projects(tmp_path)
     session_id = "a" * 32
-    tracker = SentMessageTracker(home / "sessions", session_id)
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=0)
     inbox = ProjectInbox(
         registry,
         sessions_root=home / "sessions",
@@ -2168,7 +2301,7 @@ def test_broken_sent_projection_prunes_completed_row_with_both_receipts(
     session_dir.mkdir(parents=True)
     ledger = session_dir / "project-inbox-sent.json"
     completed_id = f"{0:032x}"
-    tracker = SentMessageTracker(home / "sessions", session_id)
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=0)
     inbox = ProjectInbox(
         registry,
         sessions_root=home / "sessions",
@@ -2202,7 +2335,7 @@ def test_broken_sent_projection_prunes_completed_row_with_both_receipts(
     ledger.write_bytes(b"{")
     projection_error = None
     try:
-        broken_tracker = SentMessageTracker(home / "sessions", session_id)
+        broken_tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=0)
         broken_tracker.mark_reported(
             ((completed_id, "claimed"), (completed_id, "done"))
         )
@@ -2240,7 +2373,7 @@ def test_broken_sent_ledger_transitions_to_loaded_and_missing(tmp_path: Path) ->
     ledger = home / "sessions" / session_id / "project-inbox-sent.json"
     ledger.parent.mkdir(parents=True)
     ledger.write_bytes(b"{")
-    tracker = SentMessageTracker(home / "sessions", session_id)
+    tracker = SentMessageTracker(home / "sessions", session_id, observed_epoch=0)
     assert "unless the repaired ledger includes their IDs" in tracker.health().warning
     retained = "2" * 32
     ledger.write_text(

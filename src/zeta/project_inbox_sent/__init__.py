@@ -111,7 +111,7 @@ class SentMessageTracker:
     """Own the bounded sent ledger and its read-time broken projection."""
 
     def __init__(
-        self, sessions_root: Path, session_id: str, *, observed_epoch: int = 0
+        self, sessions_root: Path, session_id: str, *, observed_epoch: int
     ) -> None:
         self.sessions_root = Path(sessions_root)
         self.session_id = _id(session_id, "session id")
@@ -227,6 +227,10 @@ class SentMessageTracker:
         envelope, so a crash before the recipient publish recovers to exactly
         one delivered message. Only the durable-intent epoch reaches this path.
         """
+        # shortcut: pending rows keep inline bodies up to 64 KiB with no count
+        # bound (prune drops only done rows), so ~160 pending intents to an
+        # unreachable target reach the 10 MiB ledger cap. Upgrade with a
+        # pending-count bound if that edge becomes reachable in practice.
         message_id = _id(envelope["id"])
         target = _text(envelope["to_project"], "target project")
         created = _text(envelope["created_at"], "created_at")
@@ -361,6 +365,32 @@ class SentMessageTracker:
                 os.unlink(f"{message_id}.txt", dir_fd=spill_fd)
         except (FileNotFoundError, SessionError):
             pass
+
+    @staticmethod
+    def _merge_v2_row(disk: dict[str, Any], upsert: dict[str, Any]) -> None:
+        """Merge one changed row onto its authoritative disk row, monotonically.
+
+        The v2 ledger has several concurrent writers (the session runtime plus
+        every ``/inbox send`` or attention reply that builds its own tracker), so
+        this is the sole owner of the per-row merge; every v2 write goes through
+        it under the shape lock. A stale writer must never revert a row another
+        writer advanced: ``publication`` moves only pending->published, a
+        published row carries no envelope, and ``reported`` unions the two sides
+        so a claimed/done status is never dropped. It mutates both rows in place
+        so the publication seam's own key-merge then yields exactly this row.
+        """
+        if (
+            disk.get("publication") == "published"
+            or upsert.get("publication") == "published"
+        ):
+            upsert["publication"] = "published"
+            disk.pop("envelope", None)
+            upsert.pop("envelope", None)
+        merged = list(disk.get("reported", []))
+        for status in upsert.get("reported", []):
+            if status not in merged:
+                merged.append(status)
+        upsert["reported"] = merged
 
     @staticmethod
     def _to_v2(record: dict[str, Any]) -> dict[str, Any]:
@@ -631,11 +661,6 @@ class SentMessageTracker:
         concurrent writer's row, the exact audit loss this slice closes.
         """
         upsert_list = list(upserts)
-        published_ids = {
-            record["id"]
-            for record in upsert_list
-            if record.get("publication") == "published"
-        }
         operation_outcome: SentLedgerOutcome[None] | None = None
 
         def guard_and_convert(raw: object) -> None:
@@ -645,14 +670,20 @@ class SentMessageTracker:
                 self._adopt_state(state)
                 operation_outcome = self._outcome(None)
                 raise _BrokenLedger
-            # raw is a valid v1 or v2 ledger. Normalize it to a strict v2 root so
-            # the upsert merges losslessly onto the authoritative on-disk rows.
+            # raw is a valid v1 or v2 ledger. Convert every disk row to strict v2
+            # and merge each changed row with its authoritative disk row through
+            # the one monotonic owner, so a stale writer cannot revert a row that
+            # a concurrent writer already advanced.
+            disk: dict[str, dict[str, Any]] = {}
             converted: list[dict[str, Any]] = []
             for row in raw.get("records", []):
                 row = self._to_v2(row)
-                if row["id"] in published_ids:
-                    row.pop("envelope", None)
+                disk[row["id"]] = row
                 converted.append(row)
+            for upsert in upsert_list:
+                disk_row = disk.get(upsert["id"])
+                if disk_row is not None:
+                    self._merge_v2_row(disk_row, upsert)
             raw["schema_version"] = _v2.V2_SCHEMA_VERSION
             raw["records"] = converted
 
