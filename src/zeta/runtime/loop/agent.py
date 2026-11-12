@@ -442,9 +442,7 @@ class AgentLoop(
     ) -> tuple[str, ...]:
         killed: tuple[str, ...] = ()
         try:
-            self.tool_registry.background_tasks.begin_shutdown(
-                background_task_cause, phase="task_kill"
-            )
+            self.tool_registry.background_tasks.begin_shutdown(background_task_cause)
             killed = await self.tool_registry.close()
             late_tasks = tuple(self._tracked_tasks)
             if late_tasks:
@@ -486,7 +484,7 @@ class AgentLoop(
         try:
             if cancel_background and self.agent_depth == 0:
                 self.tool_registry.background_tasks.begin_shutdown(
-                    background_task_cause, phase="task_kill"
+                    background_task_cause
                 )
                 self._background_owner.cancel_all()
             elif cancel_background:

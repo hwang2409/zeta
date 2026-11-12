@@ -162,15 +162,23 @@ def _client_notifier(client: _Client):
 
 def _hold_registry_lock_after_start(
     home: str,
+    warmed: multiprocessing.synchronize.Event,
     start: multiprocessing.synchronize.Event,
     ready: multiprocessing.synchronize.Event,
     release: multiprocessing.synchronize.Event,
 ) -> None:
-    assert start.wait(timeout=5)
+    # Warm up this spawned process (import plus opening the home fd) and signal
+    # `warmed` before the test starts timing the lock handoff. Only the flock
+    # itself then falls inside the `ready` deadline. Without this, slow spawn
+    # startup on a loaded CI runner can miss the deadline, the lock never looks
+    # held, and the account-lock timeout never reaches serve.
     store = AccountStore(home)
-    with store._home() as home_fd, store._registry_guard(home_fd):
-        ready.set()
-        release.wait()
+    with store._home() as home_fd:
+        warmed.set()
+        assert start.wait(timeout=30), "hang: set_settings never reached the lock"
+        with store._registry_guard(home_fd):
+            ready.set()
+            assert release.wait(timeout=30), "hang: test never released the lock"
 
 
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
@@ -7670,15 +7678,19 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
     )
     reader, writer = await _connect(server)
     context = multiprocessing.get_context("spawn")
+    warmed = context.Event()
     start = context.Event()
     ready = context.Event()
     release = context.Event()
     holder = context.Process(
         target=_hold_registry_lock_after_start,
-        args=(str(tmp_path), start, ready, release),
+        args=(str(tmp_path), warmed, start, ready, release),
     )
     holder.start()
     try:
+        # Let the spawned holder finish startup before timing the lock handoff,
+        # so only the flock acquire sits inside the `ready` deadline below.
+        assert await asyncio.to_thread(warmed.wait, 60), "hang: holder never warmed up"
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         original_resolve = AccountStore.resolve_account
@@ -7686,7 +7698,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
         def resolve_then_lock(store, provider, selected=None):
             resolved = original_resolve(store, provider, selected)
             start.set()
-            assert ready.wait(timeout=5)
+            assert ready.wait(timeout=30), "hang: holder never acquired the lock"
             return resolved
 
         monkeypatch.setattr(AccountStore, "resolve_account", resolve_then_lock)

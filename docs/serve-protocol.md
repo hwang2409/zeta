@@ -1534,7 +1534,8 @@ error code and message. Provider status and origin remain internal.
   `session_history`, `child_run_history`, and `session_history_and_subscribe`.
   An old two-field validator gets one `-32009` with `stale_history_snapshot`; the
   client restarts from the newest page and then receives the three-field shape.
-  Appends are safe, but a branch change or transcript repair returns `-32009` with
+  Appends are safe, but a continuation across a branch change or transcript
+  repair returns `-32009` with
   `stale_history_snapshot`. Backward and forward walks share source groups,
   but response-local truncation can differ because their envelopes differ.
   Example request: `{ "session_id": "abc", "before": null }`; the reply has
