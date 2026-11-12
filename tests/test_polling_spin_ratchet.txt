@@ -8,8 +8,6 @@ tests/test_attachments.py::test_session_switch_drops_staged_paste::2560082da4934
 tests/test_child_run_events_slice1.py::run::b00ea5cb929e3bb8::1
 tests/test_mcp_envelope.py::heartbeat::e83f1ce061a3e2cb::1
 tests/test_memory_structured_updater.py::wait::e1a9381f378dd05d::1
-tests/test_restart.py::run_prompt_toolkit::91dc2675bc0ac044::1
-tests/test_restart.py::run_prompt_toolkit::d1a58bb6f79c3aec::1
 tests/test_server.py::test_canceled_write_to_stalled_client_aborts_within_grace::8d97fce390f06b7e::1
 tests/test_server.py::test_disconnected_wake_turn_reuses_durable_notification_input::aee498c16e261cf8::1
 tests/test_server.py::test_failed_wake_turn_keeps_durable_notification_input::590301b1abee1a0d::1

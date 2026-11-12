@@ -703,6 +703,7 @@ class SlashHandlerMixin:
             self._restart_when_idle = False
             self._fork_controller.request_restart()
             self.request_exit()
+            asyncio.get_running_loop().call_soon(self.request_exit)
 
     def slash_restart(self, args: str) -> str:
         requested = args.strip()
