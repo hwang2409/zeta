@@ -13,7 +13,6 @@ from ...mcp.config import (
     load_mcp_config,
     load_mcp_config_overlay,
 )
-from ...mcp.management import MCPManagementService
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError

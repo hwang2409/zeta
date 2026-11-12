@@ -14,7 +14,6 @@ from ...mcp import (
     mount_mcp_servers,
     tool_prefix,
 )
-from ...mcp.config import MCPServerConfig
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
@@ -23,6 +22,7 @@ from ...mcp.commands import (
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
+from ...mcp.config import MCPServerConfig
 from ...mcp.oauth import MCPOAuthError
 from ...mcp.oauth_store import (
     MCPCredentialStoreError,
