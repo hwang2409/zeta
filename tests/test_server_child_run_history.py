@@ -9,12 +9,17 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
+from tests.support.replay_transport import connect_replay, negotiate, replay_server
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path
+from zeta.agent import pending_delivery as pending_delivery_module
+from zeta.agent.background_owner import BackgroundAgentOwner
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore, ObserverSnapshotChanged
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
 
 
@@ -828,3 +833,215 @@ async def test_child_history_unix_ignores_production_partial_append(
         release_append.set()
         child.close()
         await close_serve(server, writer)
+
+
+_NOW = "2026-01-01T00:00:00+00:00"
+
+
+def _count_event(messages: list[dict], event: str, run_id: str) -> int:
+    return sum(
+        1 for row in messages if row.get("event") == event and row.get("run_id") == run_id
+    )
+
+
+def _seed_nested(root: ConversationStore, session_id: str, number: str, *, lease=None):
+    """Durable state a child and its grandchild write when the grandchild spawns.
+
+    Returns ``(child, grandchild, child_run_id, grandchild_run_id)``. The child
+    records the grandchild's start row; the grandchild has its own lifecycle. A
+    ``lease`` ties the stores to a live serve's storage lease.
+    """
+    shared = {"_storage_lease": lease} if lease is not None else {"cwd": root.cwd}
+    child = ConversationStore(root.session_dir / "agents", session_id=number, **shared)
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:{number}", started_at=_NOW, depth=1,
+        agent_type="worker", description="child",
+    )
+    gc_shared = {"_storage_lease": lease} if lease is not None else {"cwd": child.cwd}
+    grandchild = ConversationStore(child.session_dir / "agents", session_id="1", **gc_shared)
+    grandchild.start_agent_lifecycle(
+        handle=f"{session_id}:{number}:1", started_at=_NOW, depth=2,
+        agent_type="worker", description="grandchild",
+    )
+    child_id = f"{session_id}:{number}"
+    grandchild_id = f"{session_id}:{number}:1"
+    child.register_agent_child(
+        ToolCall("call-gc", "agent", {}), child_session_path=str(grandchild.session_dir),
+        description="grandchild", background=True, child_instance_id=grandchild_id,
+    )
+    child.append_child_run_started(grandchild_id, child_id, "worker", "grandchild", _NOW)
+    return child, grandchild, child_id, grandchild_id
+
+
+async def _finalize_child(root: ConversationStore, child: ConversationStore) -> None:
+    await child.finalize_background_agent(
+        parent_store=root, terminal_state="completed", final_result="child done",
+        turns_used=0, killed_task_ids=None, killed_task_count=None,
+        killed_task_ids_truncated=False,
+    )
+
+
+def _completion_kwargs(grandchild: ConversationStore, grandchild_id: str) -> dict:
+    return {
+        "child_instance_id": grandchild_id, "marker_key": grandchild_id,
+        "child_session_path": str(grandchild.session_dir), "description": "grandchild",
+        "status": "completed", "text": "grandchild done", "stats": None,
+        "killed_task_ids": None, "killed_task_count": None,
+        "killed_task_ids_truncated": False,
+    }
+
+
+async def _route_adopt(root, child, grandchild, child_id, grandchild_id) -> None:
+    """The child ends while the grandchild still runs; finalize adopts the
+    grandchild to root, so its later completion receipt lands in root."""
+    owner = BackgroundAgentOwner(root)
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(None, pending_delivery_module.StepDeliveryFlow(root))
+    done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    done.set_result(None)
+    owner.register(grandchild_id, lambda: None, done, parent_store=child, parent_instance_id=child_id)
+    await _finalize_child(root, child)
+    owner.adopt(grandchild_id, root, None)
+    grandchild.finish_agent_lifecycle("completed", final_result="grandchild done")
+    await await_or_fail(
+        channel.publish_completion(**_completion_kwargs(grandchild, grandchild_id)),
+        what="adopted grandchild completion to root",
+    )
+
+
+async def _route_sealed(root, child, grandchild, child_id, grandchild_id) -> None:
+    """The grandchild completion resolves to the child store and parks; the child
+    is then finalized and drained (sealed), so the parked commit is refused and
+    re-resolves to root (#1245)."""
+    owner = BackgroundAgentOwner(root)
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(None, pending_delivery_module.StepDeliveryFlow(root))
+    channel.register_delivery_flow(child_id, pending_delivery_module.StepDeliveryFlow(child))
+    channel.register_loop(child_id)
+    done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    done.set_result(None)
+    owner.register(grandchild_id, lambda: None, done, parent_store=child, parent_instance_id=child_id)
+    grandchild.finish_agent_lifecycle("completed", final_result="grandchild done")
+    original_commit = child.commit_delivery_input
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_commit(item, *, return_committed_on_cancel=False):
+        parked.set()
+        await await_or_fail(release.wait(), what="release parked child commit")
+        return await original_commit(item, return_committed_on_cancel=return_committed_on_cancel)
+
+    child.commit_delivery_input = gated_commit
+    publish = asyncio.ensure_future(
+        channel.publish_completion(**_completion_kwargs(grandchild, grandchild_id))
+    )
+    try:
+        await await_or_fail(parked.wait(), what="grandchild completion parks in child")
+        await _finalize_child(root, child)
+        owner.adopt(grandchild_id, root, None)
+        await await_or_fail(channel.drain_terminal(child), what="drain child store")
+        release.set()
+        await await_or_fail(publish, what="grandchild completion re-resolves to root")
+    finally:
+        release.set()
+        if not publish.done():
+            await await_or_fail(publish, what="grandchild completion settles")
+
+
+_ROUTES = {"adopt": _route_adopt, "sealed": _route_sealed}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("adopt", "sealed"))
+async def test_closed_child_history_ends_every_child_started(
+    tmp_path: Path, route: str
+) -> None:
+    """A closed child's history ends every child_started, even when the
+    grandchild's completion receipt landed in an ancestor store (adopt or sealed
+    re-resolve), and a warm reader reflects a grandchild finishing later."""
+    opened = await asyncio.to_thread(
+        lambda: SessionManager(tmp_path).create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    root = opened.store
+    session_id = root.session_id
+    child, grandchild, child_id, grandchild_id = _seed_nested(root, session_id, "1")
+    try:
+        await _ROUTES[route](root, child, grandchild, child_id, grandchild_id)
+        # the route left the grandchild's receipt in root, not the closed child
+        assert not any(
+            entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == grandchild_id
+            for entry in child.agent_notifications()
+        ), "setup error: closed child still holds the grandchild receipt"
+    finally:
+        for store in (grandchild, child, root):
+            store.close()
+
+    resumed = replay_server(
+        tmp_path, "unix", lambda provider, model, home: (FakeBackend([]), model or "offline")
+    )
+    await resumed.start()
+    controller = await connect_replay(resumed, "unix")
+    observer = await connect_replay(resumed, "unix")
+    try:
+        features = ("child_run_history", "child_run_events", "child_runs")
+        await negotiate(controller, extra=features, protocol_version="1.2")
+        resume = await controller.request(2, "resume", {"session_id": session_id})
+        assert "error" not in resume, resume
+
+        history = (
+            await controller.request(
+                3, "child_run_history", {"session_id": session_id, "run_id": child_id}
+            )
+        )["result"]["messages"]
+        assert _count_event(history, "child_started", grandchild_id) == 1, history
+        assert _count_event(history, "child_ended", grandchild_id) == 1, history
+
+        await negotiate(observer, observer=True, extra=features, protocol_version="1.2")
+        joined = (
+            await observer.request(
+                3, "child_run_events", {"session_id": session_id, "run_id": child_id}
+            )
+        )["result"]["messages"]
+        assert _count_event(joined, "child_started", grandchild_id) == 1, joined
+        assert _count_event(joined, "child_ended", grandchild_id) == 1, joined
+
+        # cache gate: a closed child whose grandchild is still running shows no
+        # child_ended; a warm reader still reflects the grandchild finishing even
+        # though the closed store's generation never changes. The child is seeded
+        # after resume so the live runtime's crash recovery does not finalize the
+        # grandchild.
+        lease = resumed.runtime.opened.store._storage_lease
+        pend_child, pend_gc, pend_child_id, pend_gc_id = _seed_nested(
+            resumed.runtime.opened.store, session_id, "2", lease=lease
+        )
+        pend_child.finish_agent_lifecycle("completed", final_result="child done")
+        pend_child.close()
+        pend_gc.close()
+
+        pending = (
+            await controller.request(
+                4, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
+            )
+        )["result"]["messages"]
+        assert _count_event(pending, "child_started", pend_gc_id) == 1, pending
+        assert _count_event(pending, "child_ended", pend_gc_id) == 0, pending
+
+        finished = ConversationStore(
+            resumed.runtime.opened.store.session_dir / "agents" / "2" / "agents",
+            session_id="1",
+            _storage_lease=lease,
+        )
+        finished.finish_agent_lifecycle("completed", final_result="grandchild done")
+        finished.close()
+
+        warmed = (
+            await controller.request(
+                5, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
+            )
+        )["result"]["messages"]
+        assert _count_event(warmed, "child_ended", pend_gc_id) == 1, warmed
+    finally:
+        await controller.close()
+        await observer.close()
+        await resumed.close()

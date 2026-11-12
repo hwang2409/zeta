@@ -291,10 +291,14 @@ def history_projection(
     accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     runs: dict[str, str] = {}
+    started_entries: list[Any] = []
+    ended_run_ids: set[str] = set()
     for entry in branch:
         if entry.type == "child_run_started":
             if child_runs:
-                entries[-1].append(child_run_lifecycle.started_entry(store, entry, runs))
+                started = child_run_lifecycle.started_entry(store, entry, runs)
+                entries[-1].append(started)
+                started_entries.append(started)
             continue
         if entry.type == "client_delivery" and isinstance(
             entry.data.get("accepted_message"), dict
@@ -332,6 +336,7 @@ def history_projection(
                 ended := child_run_lifecycle.ended_entry(store, entry, runs)
             ) is not None:
                 entries[-1].append(ended)
+                ended_run_ids.add(ended.data["run_id"])
             entries.append([])
         elif entry.type in {
             "client_delivery",
@@ -339,6 +344,14 @@ def history_projection(
             "approval_history",
         } or (entry.type == "turn_end" and served_turn_end):
             entries[-1].append(entry)
+
+    skip_cache = False
+    if child_runs and started_entries:
+        orphan_ended, has_unended = child_run_lifecycle.orphan_ended_entries(
+            store, started_entries, ended_run_ids, branch[-1].seq if branch else 0
+        )
+        entries[-1].extend(orphan_ended)
+        skip_cache = has_unended
 
     entry_index = {
         entry.id: entry for group in entries for entry in group if hasattr(entry, "id")
@@ -350,7 +363,7 @@ def history_projection(
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
     )
-    if stable_generation is None:
+    if stable_generation is None or skip_cache:
         return built
     generation = stable_generation
     with _cache_creation_lock:

@@ -61,6 +61,26 @@ def _receipt_run(entry: Any, runs: dict[str, str]) -> tuple[str, str | None] | N
     return run_id, path if type(path) is str else None
 
 
+def _ended_row(store: Any, run_id: str, path: Path) -> dict[str, Any] | None:
+    """Read the grandchild lifecycle at ``path`` and project a finished row, or
+    None when it is unreadable or has not finished yet."""
+    try:
+        lifecycle, _ = read_child_lifecycle(store, path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(lifecycle, dict):
+        lifecycle = getattr(lifecycle, "value", None)
+    if not isinstance(lifecycle, dict) or lifecycle.get("finished_at") is None:
+        return None
+    session_id, parent_run_id = run_row_identity(run_id)
+    return project_child_run_row(
+        lifecycle,
+        session_id=session_id,
+        parent_run_id=parent_run_id,
+        accepts_follow_ups=False,
+    )
+
+
 def ended_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any | None:
     if entry.type not in {"message", "notification"}:
         return None
@@ -77,22 +97,53 @@ def ended_entry(store: Any, entry: Any, runs: dict[str, str]) -> Any | None:
             )
         except (OSError, ValueError):
             return None
-    try:
-        lifecycle, _ = read_child_lifecycle(store, Path(path))
-    except (OSError, ValueError):
+    row = _ended_row(store, run_id, Path(path))
+    if row is None:
         return None
-    if not isinstance(lifecycle, dict):
-        lifecycle = getattr(lifecycle, "value", None)
-    if not isinstance(lifecycle, dict) or lifecycle.get("finished_at") is None:
-        return None
-    session_id, parent_run_id = run_row_identity(run_id)
-    row = project_child_run_row(
-        lifecycle,
-        session_id=session_id,
-        parent_run_id=parent_run_id,
-        accepts_follow_ups=False,
-    )
     return replace(entry, id=f"{entry.id}:child_ended", type="child_ended", data={"run_id": run_id, "_row": row})
+
+
+def orphan_ended_entries(
+    store: Any,
+    started_entries: list[Any],
+    ended_run_ids: set[str],
+    anchor_seq: int,
+) -> tuple[list[Any], bool]:
+    """Derive a child_ended for each started run whose completion receipt landed
+    in an ancestor store (adopt, sealed re-resolve), leaving a closed child's
+    history with a child_started and no child_ended.
+
+    Only a closed store (its own lifecycle has ``finished_at``) is derived from;
+    a live store's receipt is still in transit and covered by the loop. Reads the
+    grandchild's own lifecycle, which whoever received the receipt wrote. Returns
+    ``(entries, has_unended)``; ``has_unended`` flags a run whose grandchild has
+    not finished yet, so the caller must not cache the projection (a closed
+    store's generation does not change when that grandchild ends later)."""
+    lifecycle = store.agent_lifecycle()
+    if not isinstance(lifecycle, dict) or lifecycle.get("finished_at") is None:
+        return [], False
+    entries: list[Any] = []
+    has_unended = False
+    for started in started_entries:
+        run_id = started.data["run_id"]
+        if run_id in ended_run_ids:
+            continue
+        leaf = run_id.rsplit(":", 1)[1]
+        row = _ended_row(store, run_id, store.session_dir / "agents" / leaf)
+        if row is None:
+            has_unended = True
+            continue
+        ended_run_ids.add(run_id)
+        entries.append(
+            replace(
+                started,
+                id=f"{started.id}:child_ended",
+                type="child_ended",
+                seq=anchor_seq,
+                data={"run_id": run_id, "_row": row},
+            )
+        )
+    return entries, has_unended
 
 
 def history_rows(entry: Any) -> list[dict[str, object]]:
