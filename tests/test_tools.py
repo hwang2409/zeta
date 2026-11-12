@@ -9,7 +9,6 @@ import pty
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -2582,24 +2581,30 @@ async def test_bash_tool_isolates_tmux_env_from_host_server(
 async def test_bash_tool_tmux_kill_server_spares_host_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def tmux(*args: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        return proc.returncode, out.decode().strip()
+
     # A host tmux server standing in for the user's server, on its own -L
     # socket so the test never touches the default server.
     host_socket = f"zeta-tmuxguard-{os.getpid()}"
     host_session = f"host-{os.getpid()}"
-    subprocess.run(
-        ["tmux", "-L", host_socket, "new-session", "-d", "-s", host_session,
-         "sleep", "600"],
-        check=True,
+    code, _ = await tmux(
+        "-L", host_socket, "new-session", "-d", "-s", host_session, "sleep", "600"
     )
+    assert code == 0
     try:
-        socket_path = subprocess.run(
-            ["tmux", "-L", host_socket, "display-message", "-p", "#{socket_path}"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-        server_pid = subprocess.run(
-            ["tmux", "-L", host_socket, "display-message", "-p", "#{pid}"],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
+        _, socket_path = await tmux(
+            "-L", host_socket, "display-message", "-p", "#{socket_path}"
+        )
+        _, server_pid = await tmux(
+            "-L", host_socket, "display-message", "-p", "#{pid}"
+        )
         # Reproduce the crash: the tool shell inherits $TMUX pointing at the
         # host server, so a bare `tmux kill-server` would kill it.
         monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
@@ -2617,12 +2622,10 @@ async def test_bash_tool_tmux_kill_server_spares_host_server(
         finally:
             await registry.close()
         assert "done" in result["structuredContent"]["stdout"]
-        alive = subprocess.run(
-            ["tmux", "-L", host_socket, "has-session", "-t", host_session],
-        )
-        assert alive.returncode == 0, "host tmux server was killed by the agent tool"
+        alive, _ = await tmux("-L", host_socket, "has-session", "-t", host_session)
+        assert alive == 0, "host tmux server was killed by the agent tool"
     finally:
-        subprocess.run(["tmux", "-L", host_socket, "kill-server"], check=False)
+        await tmux("-L", host_socket, "kill-server")
 
 
 @pytest.mark.asyncio
