@@ -48,6 +48,7 @@ from ..checkpoints import (
     CheckpointForkMixin,
     ConversationEntry,
     ConversationIntegrityError,
+    active_branch,
     load_session_json,
 )
 from ..checkpoints.entry_types import validate_conversation_entry
@@ -95,8 +96,8 @@ from ._pending_prompts import (
     PendingPromptStoreMixin,
 )
 from ._row_history import RecentRowsMixin, TurnHistoryMixin
-from ._rows import ResidentRows, StartupFactsMixin, sent_message_receipts
 from ._session_state import SessionStatePersistenceMixin
+from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -227,7 +228,6 @@ class ConversationStore(
             self.cwd = str(cwd or Path.cwd())
             self.bash_cwd = str(bash_cwd or self.cwd)
             self._entries: list[ConversationEntry] = []
-            self._resident_rows = ResidentRows()
             self._entry_prefix_digest = b""
             self._initialize_client_delivery_lifecycle()
             self._collect_persisted_appends = _collect_persisted_appends
@@ -1122,16 +1122,10 @@ class ConversationStore(
         """Return the active leaf sequence without materializing the branch."""
         return self._entries[-1].seq if self._entries else 0
 
-    def _row_index(self) -> ResidentRows:
-        """Return the store-owned row index, refreshing it after an append."""
-        rows = self._resident_rows
-        if rows.entries != self._entries:
-            rows.replace(self._entries)
-        return rows
-
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
         """Return resident active-branch entries for store-internal queries."""
-        return self._row_index().branch
+
+        return active_branch(self._entries)
 
     def replay(self) -> list[ConversationEntry]:
         return self._snapshot_branch(self._active_branch())
@@ -1153,13 +1147,14 @@ class ConversationStore(
 
     def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
         """Return stable resident entries for read-only planning."""
-        return self._row_index().branch
+
+        return self._active_branch()
 
     def resident_entries_snapshot(self) -> tuple[ConversationEntry, ...]:
         """Return append-only entry references for work on another thread."""
 
         self._assert_owner_thread()
-        return tuple(self._row_index().entries)
+        return tuple(self._entries)
 
     def resident_entries(self) -> tuple[ConversationEntry, ...]:
         """Return one immutable snapshot of the resident row list (no row copy).
@@ -1171,7 +1166,7 @@ class ConversationStore(
         new container; the entries inside it are the shared resident objects, so
         callers read them and never mutate ``entry.data``.
         """
-        return tuple(self._row_index().entries)
+        return tuple(self._entries)
 
     @classmethod
     def _snapshot_branch(
