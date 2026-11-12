@@ -276,7 +276,11 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         await acknowledged
 
     def notify_approval_started(
-        self, call: ToolCall, submission_id: int | None
+        self,
+        call: ToolCall,
+        submission_id: int | None,
+        *,
+        child_instance_id: str | None = None,
     ) -> None:
         entry = (
             self._entries.get(submission_id)
@@ -285,14 +289,15 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         )
         if entry is not None:
             self._send(_ApprovalLifecycle(entry.submission, "approval_start", call))
-            # The display cache is refreshed off-loop when the pipeline handles
-            # the lifecycle message, but the host presents synchronously now.
-            # Seed the fresh request so it shows at once; the refresh reconciles.
-            if all(str(request.key) != call.id for request in self._pending_approvals):
-                self._pending_approvals = (
-                    *self._pending_approvals,
-                    ApprovalRequest(call.id, call),
-                )
+        # The display cache is refreshed off-loop when the pipeline handles the
+        # lifecycle message, but the host presents synchronously now. Seed the
+        # fresh request so it shows at once; the refresh reconciles. Delegated
+        # child approvals have no local submission entry, so this seed is the
+        # only synchronous path that surfaces them. The seed carries
+        # child_instance_id so its key matches the request the refresh resolves.
+        seeded = ApprovalRequest(call.id, call, child_instance_id=child_instance_id)
+        if all(request.key != seeded.key for request in self._pending_approvals):
+            self._pending_approvals = (*self._pending_approvals, seeded)
 
     def notify_approval_finished(self, call: ToolCall) -> None:
         owner = self._approval_owners.get(call.id)

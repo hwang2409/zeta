@@ -764,6 +764,7 @@ class TUIApp(
                 self._submissions.notify_approval_started(
                     event.tool_call,
                     event.data.get("submission_id", self._active_turn_submission_id),
+                    child_instance_id=event.data.get("agent_instance_id"),
                 )
             if self._agent_navigation.child_view_active:
                 self._agent_navigation.exit_navigation()
