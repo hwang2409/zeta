@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,6 +40,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.tools._shared import background_spawn
+from zeta.tools._shared.shell import run_shell_macro
 
 
 def _python_command(source: str) -> str:
@@ -2549,6 +2551,182 @@ async def test_bash_tool_subprocess_sets_tool_marker(
     )
     assert "ZETA_TOOL_SUBPROCESS=1" in output["structuredContent"]["output"]
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_isolates_tmux_env_from_host_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        result = await registry.execute(
+            ToolCall(
+                "tmux-env",
+                "bash",
+                {"cmd": "/usr/bin/env | grep -E '^TMUX(_PANE|_TMPDIR)?=' || true"},
+            )
+        )
+    finally:
+        await registry.close()
+    lines = result["structuredContent"]["stdout"].splitlines()
+    assert not any(line.startswith("TMUX=") for line in lines)
+    assert not any(line.startswith("TMUX_PANE=") for line in lines)
+    assert f"TMUX_TMPDIR={zeta_home / 'run' / 'tmux'}" in lines
+
+
+async def _run_tmux(
+    *args: str, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode().strip()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.asyncio
+async def test_bash_tool_tmux_kill_server_spares_host_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A host tmux server standing in for the user's server, on its own -L
+    # socket so the test never touches the default server.
+    host_socket = f"zeta-tmuxguard-{os.getpid()}"
+    host_session = f"host-{os.getpid()}"
+    code, _ = await _run_tmux(
+        "-L", host_socket, "new-session", "-d", "-s", host_session, "sleep", "600"
+    )
+    assert code == 0
+    # A short home keeps the agent's private socket path under tmux's 104-byte
+    # sun_path limit, so its own `tmux new-session` really starts a server.
+    short_home = tempfile.mkdtemp(prefix="zt", dir="/tmp")
+    try:
+        _, socket_path = await _run_tmux(
+            "-L", host_socket, "display-message", "-p", "#{socket_path}"
+        )
+        _, server_pid = await _run_tmux(
+            "-L", host_socket, "display-message", "-p", "#{pid}"
+        )
+        # Reproduce the crash: the tool shell inherits $TMUX pointing at the
+        # host server, so a bare `tmux kill-server` would kill it.
+        monkeypatch.setenv("ZETA_HOME", short_home)
+        monkeypatch.setenv("TMUX", f"{socket_path},{server_pid},0")
+        monkeypatch.setenv("TMUX_PANE", "%0")
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        try:
+            result = await registry.execute(
+                ToolCall(
+                    "tmux-kill",
+                    "bash",
+                    {"cmd": "tmux new-session -d -s agent; tmux kill-server; echo done"},
+                )
+            )
+        finally:
+            await registry.close()
+        assert "done" in result["structuredContent"]["stdout"]
+        alive, _ = await _run_tmux(
+            "-L", host_socket, "has-session", "-t", host_session
+        )
+        assert alive == 0, "host tmux server was killed by the agent tool"
+    finally:
+        await _run_tmux("-L", host_socket, "kill-server")
+        shutil.rmtree(short_home, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.asyncio
+async def test_bash_tool_tmux_kill_server_spares_canary_in_another_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live server on its own socket, standing in for the real agent server at
+    # ~/.zeta/run/tmux. The agent's private TMUX_TMPDIR is a different dir, so a
+    # bare `tmux kill-server` must not reach the canary (the reviewer's repro).
+    canary_dir = tempfile.mkdtemp(prefix="ztc", dir="/tmp")
+    canary_sock = os.path.join(canary_dir, "sock")
+    canary_session = f"canary-{os.getpid()}"
+    code, _ = await _run_tmux(
+        "-S", canary_sock, "new-session", "-d", "-s", canary_session, "sleep", "600"
+    )
+    assert code == 0
+    short_home = tempfile.mkdtemp(prefix="zt", dir="/tmp")
+    try:
+        monkeypatch.setenv("ZETA_HOME", short_home)
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        try:
+            result = await registry.execute(
+                ToolCall(
+                    "tmux-kill",
+                    "bash",
+                    {"cmd": "tmux new-session -d -s agent; tmux kill-server; echo done"},
+                )
+            )
+        finally:
+            await registry.close()
+        assert "done" in result["structuredContent"]["stdout"]
+        alive, _ = await _run_tmux(
+            "-S", canary_sock, "has-session", "-t", canary_session
+        )
+        assert alive == 0, "canary tmux server was killed by the agent tool"
+    finally:
+        await _run_tmux("-S", canary_sock, "kill-server")
+        shutil.rmtree(canary_dir, ignore_errors=True)
+        shutil.rmtree(short_home, ignore_errors=True)
+
+
+def test_tmux_tmpdir_falls_back_when_home_dir_cannot_be_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A file where the home dir should be makes mkdir raise; subprocess_env must
+    # still drop TMUX/TMUX_PANE and hand out a usable private TMUX_TMPDIR.
+    blocker = tmp_path / "home-is-a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("ZETA_HOME", str(blocker))
+    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%1")
+
+    env = subprocess_env()
+
+    assert "TMUX" not in env
+    assert "TMUX_PANE" not in env
+    assert os.path.isdir(env["TMUX_TMPDIR"])
+
+
+@pytest.mark.asyncio
+async def test_user_shell_macro_keeps_tmux_but_model_tool_isolates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The user typed `!tmux ...` inside their own tmux, so a user-authored shell
+    # macro keeps $TMUX; a model-driven bash call gets the isolated env.
+    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,7,0")
+    monkeypatch.setenv("TMUX_PANE", "%4")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    probe = {"cmd": "/usr/bin/env | grep -E '^TMUX=' || true"}
+    try:
+        model = await registry.execute(ToolCall("model", "bash", probe))
+        assert "TMUX=" not in model["structuredContent"]["stdout"]
+
+        call = ToolCall(
+            "user",
+            "bash",
+            {"command": "/usr/bin/env | grep -E '^TMUX=' || true", "timeout": 10},
+        )
+        macro = await run_shell_macro(
+            registry,
+            call,
+            tmp_path / "macro.log",
+            stream_sink=lambda event: None,
+            lifecycle_sink=lambda kind: None,
+        )
+    finally:
+        await registry.close()
+    assert "TMUX=/private/tmp/tmux-501/default,7,0" in macro.structured_content["stdout"]
 
 
 @pytest.mark.asyncio

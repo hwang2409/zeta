@@ -37,6 +37,7 @@ from ..core.store._step_delivery import (
     PromptInput,
     StagedDelivery,
     TerminalIntent,
+    TerminalSettlement,
     validate_delivery_input,
 )
 from ..protocol.types import ErrorInfo, Message, MessageOrigin, StreamEvent
@@ -686,6 +687,26 @@ class StepDeliveryFlow:
             self._edges.add("prompt")
         self._active = None
         self._active_steering = None
+
+    async def settle_terminal(self) -> TerminalSettlement:
+        """Settle a terminal run: deliver a prompt, or close admission and fold.
+
+        One atomic store command classifies, acks and closes every staged input,
+        so there is no admit-vs-commit window to re-check. The edges are updated
+        to match: a pending prompt keeps the delivery branch; otherwise the run
+        finalizes.
+        """
+
+        self._require_owner_loop()
+        await self.initialize()
+        settled = await self.store.settle_step_delivery_terminal(
+            frozenset(self._suppressed_ids)
+        )
+        if settled.prompt_pending:
+            self._edges.add("prompt")
+        else:
+            self._edges.clear()
+        return settled
 
     async def admit_terminal(self, intent: TerminalIntent) -> TerminalResult:
         """Atomically decide whether terminal processing has durable input."""
