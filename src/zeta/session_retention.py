@@ -52,11 +52,12 @@ def is_retention_pinned(directory_fd: int) -> bool:
         fd = open_session_file(directory_fd, RETENTION_PIN_FILENAME, os.O_RDONLY)
     except FileNotFoundError:
         try:
-            return any(
-                name.startswith(f".{RETENTION_PIN_FILENAME}.")
-                and name.endswith(".tmp")
-                for name in os.listdir(directory_fd)
-            )
+            with os.scandir(directory_fd) as entries:
+                return any(
+                    entry.name.startswith(f".{RETENTION_PIN_FILENAME}.")
+                    and entry.name.endswith(".tmp")
+                    for entry in entries
+                )
         except OSError:
             return True
     except (OSError, SessionError):
@@ -258,17 +259,7 @@ class _ClosureBudget:
 
     def iter_entries(self, directory_fd):
         """Yield directory entries through the shared bounded scanner."""
-        try:
-            with os.scandir(directory_fd) as entries:
-                for entry in entries:
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                        self.charge(info.st_size if stat.S_ISREG(info.st_mode) else 0)
-                    except OSError as exc:
-                        raise RetentionPlannerError("unsafe retention entry") from exc
-                    yield entry
-        except OSError as exc:
-            raise RetentionPlannerError("unsafe retention directory") from exc
+        yield from _iter_entries(directory_fd, self)
 
     def charge(self, size: int) -> None:
         bounds, budget = self.budget.bounds, self.budget
@@ -524,10 +515,10 @@ class RetentionPlanner:
     def _closure_reason(self, home_fd, sessions_fd, flight, sweep, scan) -> str | None:
         return _ClosureAuthority(self, home_fd, sessions_fd, flight, sweep, scan).classify()
 
-    def _authority_sent_reason(self, flight) -> str | None:
+    def _authority_sent_reason(self, flight, scan) -> str | None:
         for comps in flight.store_dirs:
             with _descend(flight.root_fd, comps) as directory_fd:
-                reason = _sent_file_reason(directory_fd)
+                reason = _sent_file_reason(directory_fd, scan)
                 if reason is not None:
                     return reason
         return None
@@ -602,8 +593,8 @@ class _ClosureAuthority:
                 ids.add(root_id + ":" + ":".join(child_parts))
         checks = (
             lambda: "session is being deleted" if _reservation_present(self.home_fd, root_id) else None,
-            lambda: _authority_store_reason(self.flight),
-            lambda: self.planner._authority_sent_reason(self.flight),
+            lambda: _authority_store_reason(self.flight, self.scan),
+            lambda: self.planner._authority_sent_reason(self.flight, self.scan),
             lambda: "pinned" if self.planner._pinned(self.sessions_fd, self.flight.root_fd, root_id) else None,
             lambda: _authority_inbox_reason(self.home_fd, ids, self.scan),
             lambda: _authority_dependents(self.sessions_fd, root_id, self.scan),
@@ -622,16 +613,32 @@ _TIMESTAMP_FIELDS = ("created_at", "updated_at", "started_at", "finished_at")
 
 
 def _discover_roots(home_fd) -> tuple[str, ...]:
-    """Every root directory id at sweep start, in sorted order."""
+    """Snapshot root directory ids at sweep start through the bounded iterator."""
     try:
         with child_directory(home_fd, "sessions") as sessions_fd:
-            names = sorted(os.listdir(sessions_fd))
             return tuple(
-                name for name in names
-                if not name.startswith(".") and _is_directory(sessions_fd, name)
+                entry.name
+                for entry in _iter_entries(sessions_fd)
+                if not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False)
             )
     except FileNotFoundError:
         return ()
+
+
+def _iter_entries(directory_fd, scan=None):
+    """Yield no-follow directory entries without materializing a listing."""
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if scan is not None:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise RetentionPlannerError("unsafe retention entry") from exc
+                    scan.charge(info.st_size if stat.S_ISREG(info.st_mode) else 0)
+                yield entry
+    except OSError as exc:
+        raise RetentionPlannerError("unsafe retention directory") from exc
 
 
 def _is_directory(directory_fd, name) -> bool:
@@ -668,7 +675,7 @@ def _walk_directory(flight: _InFlight, walk: _Walk):
         raise RetentionPlannerError("child store appeared during walk")
     with _descend(flight.root_fd, comps) as dfd:
         info = os.fstat(dfd)
-        names = sorted(os.listdir(dfd), reverse=True)
+        names = [entry.name for entry in _iter_entries(dfd)]
     walk.fingerprints.append(["/".join(comps), info.st_dev, info.st_ino, info.st_mtime_ns])
     walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
     return comps, names
@@ -712,8 +719,8 @@ def _failure_reason(exc: BaseException) -> str:
     return _bounded_reason(str(exc))
 
 
-def _sent_file_reason(directory_fd) -> str | None:
-    value = _read_json(directory_fd, "project-inbox-sent.json")
+def _sent_file_reason(directory_fd, scan) -> str | None:
+    value = _read_json(directory_fd, "project-inbox-sent.json", scan)
     if value is None:
         return None
     if not isinstance(value, dict) or not isinstance(value.get("records"), list):
@@ -733,20 +740,20 @@ def _sent_file_reason(directory_fd) -> str | None:
     return None
 
 
-def _authority_store_reason(flight: _InFlight) -> str | None:
+def _authority_store_reason(flight: _InFlight, scan: _ClosureBudget) -> str | None:
     """Store-local blockers; also folds metadata timestamps into activity."""
     for comps in flight.store_dirs:
         with _descend(flight.root_fd, comps) as dfd:
-            if _read_json(dfd, _PENDING_LINK_NAME) is not None:
+            if _read_json(dfd, _PENDING_LINK_NAME, scan) is not None:
                 return "pending project link"
-            if _authority_directory_nonempty(dfd, _PENDING_CHILD_LINKS_DIRNAME):
+            if _authority_directory_nonempty(dfd, _PENDING_CHILD_LINKS_DIRNAME, scan):
                 return "pending child link"
-            if _has_child_marker(dfd):
+            if _has_child_marker(dfd, scan):
                 return "live or recoverable child"
-            lifecycle = _read_json(dfd, _LIFECYCLE_NAME)
+            lifecycle = _read_json(dfd, _LIFECYCLE_NAME, scan)
             if comps and not _lifecycle_terminal(lifecycle):
                 return "live or recoverable child"
-            metadata = _read_json(dfd, _METADATA_NAME)
+            metadata = _read_json(dfd, _METADATA_NAME, scan)
             if not comps and not _valid_metadata(metadata):
                 raise RetentionPlannerError("malformed metadata")
             for value in (metadata, lifecycle):
@@ -754,8 +761,8 @@ def _authority_store_reason(flight: _InFlight) -> str | None:
     return None
 
 
-def _has_child_marker(directory_fd) -> bool:
-    value = _read_json(directory_fd, _SESSION_STATE_NAME)
+def _has_child_marker(directory_fd, scan) -> bool:
+    value = _read_json(directory_fd, _SESSION_STATE_NAME, scan)
     if value is None:
         return False
     if type(value) is not dict:
@@ -835,11 +842,11 @@ def _authority_inbox_dirs(home_fd):
         projects_fd = _open_dir(stack, home_fd, "projects")
         if projects_fd is None:
             return
-        for project in sorted(os.listdir(projects_fd)):
-            info = os.stat(project, dir_fd=projects_fd, follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode):
+        for entry in _iter_entries(projects_fd):
+            project = entry.name
+            if entry.is_symlink():
                 raise RetentionPlannerError("unsafe project directory")
-            if not stat.S_ISDIR(info.st_mode):
+            if not entry.is_dir(follow_symlinks=False):
                 continue  # e.g. projects/.lock
             with ExitStack() as inner:
                 project_fd = _open_dir(inner, projects_fd, project)
@@ -878,18 +885,16 @@ def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | N
                     attention_fd = None
                 if attention_fd is not None:
                     try:
-                        with os.scandir(attention_fd) as entries:
-                            for entry in entries:
-                                scan.charge(entry.stat(follow_symlinks=False).st_size)
-                                if not entry.name.endswith(".json"):
-                                    continue
-                                value = _read_json(attention_fd, entry.name, scan)
-                                try:
-                                    record = AttentionRecord.from_dict(value)
-                                except (TypeError, ValueError, KeyError) as exc:
-                                    raise RetentionPlannerError("malformed attention record") from exc
-                                if record.fork_session_id == root_id:
-                                    return "published top-level dependent"
+                        for entry in scan.iter_entries(attention_fd):
+                            if not entry.name.endswith(".json"):
+                                continue
+                            value = _read_json(attention_fd, entry.name, scan)
+                            try:
+                                record = AttentionRecord.from_dict(value)
+                            except (TypeError, ValueError, KeyError) as exc:
+                                raise RetentionPlannerError("malformed attention record") from exc
+                            if record.fork_session_id == root_id:
+                                return "published top-level dependent"
                     finally:
                         os.close(attention_fd)
         except FileNotFoundError:
@@ -920,18 +925,15 @@ def _authority_store_dirs(root_fd, prefix=()):
         raise RetentionPlannerError("tree is too deep")
     try:
         with _descend(root_fd, (*prefix, _AGENTS_DIRNAME)) as agents_fd:
-            entries = []
-            with os.scandir(agents_fd) as scanned:
-                for entry in scanned:
-                    if entry.is_dir(follow_symlinks=False):
-                        entries.append(entry.name)
-            entries.sort()
+            entries = _iter_entries(agents_fd)
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                comps = (*prefix, _AGENTS_DIRNAME, entry.name)
+                yield comps
+                yield from _authority_store_dirs(root_fd, comps)
     except (FileNotFoundError, NotADirectoryError):
         return
-    for name in entries:
-        comps = (*prefix, _AGENTS_DIRNAME, name)
-        yield comps
-        yield from _authority_store_dirs(root_fd, comps)
 
 
 def _reservation_present(home_fd, root_id) -> bool:
@@ -947,10 +949,12 @@ def _reservation_present(home_fd, root_id) -> bool:
     return False
 
 
-def _authority_directory_nonempty(directory_fd, name) -> bool:
+def _authority_directory_nonempty(directory_fd, name, scan) -> bool:
     with ExitStack() as stack:
         fd = _open_dir(stack, directory_fd, name)
-        return fd is not None and any(not entry.startswith(".") for entry in os.listdir(fd))
+        return fd is not None and any(
+            not entry.name.startswith(".") for entry in scan.iter_entries(fd)
+        )
 
 
 def _classify_inbox_record(record, ids) -> bool:
