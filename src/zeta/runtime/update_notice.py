@@ -67,23 +67,32 @@ def _checkout_revision(package_dir: Path) -> str | None:
 
 
 def source_revision(package_file: str | Path) -> str | None:
-    """Return the checkout revision containing package_file, or a source fingerprint."""
+    """Return the checkout revision, or a bounded installed-source fingerprint."""
     package_dir = Path(package_file).resolve().parent
-    if revision := _checkout_revision(package_dir):
-        return revision
+    checkout_marker = next(
+        (directory / ".git" for directory in (package_dir, *package_dir.parents)
+         if (directory / ".git").exists()),
+        None,
+    )
+    if checkout_marker is not None:
+        return _checkout_revision(package_dir)
     try:
         digest = hashlib.sha256()
-        for path in sorted(package_dir.rglob("*.py")):
+        for count, path in enumerate(package_dir.rglob("*.py")):
+            if count >= 512:
+                break
             stat = path.stat()
             digest.update(str(path.relative_to(package_dir)).encode())
             digest.update(f"{stat.st_mtime_ns}:{stat.st_size}".encode())
+        # shortcut: 512 files, enough for an installed package and bounded so a
+        # damaged or hostile tree cannot make polling expensive.
         return digest.hexdigest()
     except OSError:
         return None
 
 
 class UpdateChecker:
-    """Poll the imported package revision and report the first change once."""
+    """Poll the imported package revision and report each distinct change."""
 
     def __init__(
         self,
@@ -99,6 +108,7 @@ class UpdateChecker:
         self._read_revision = read_revision
         self._initial = read_revision(package_file)
         self._task: asyncio.Task[None] | None = None
+        self._last_seen = self._initial
         self._reported = False
 
     def start(self) -> None:
@@ -116,15 +126,17 @@ class UpdateChecker:
 
     async def tick(self) -> bool:
         """Check once; this seam lets tests trigger a check without sleeping."""
-        if self._reported or self._initial is None:
+        if self._last_seen is None:
             return False
         current = await asyncio.to_thread(self._read_revision, self._package_file)
-        if current is None or current == self._initial:
+        if current is None or current == self._last_seen or current == self._initial:
             return False
+        old = self._initial
+        self._last_seen = current
         self._reported = True
         on_update = self._on_update
         if on_update is not None:
-            await on_update(self._initial, current)
+            await on_update(old, current)
         return True
 
     async def _run(self) -> None:
@@ -137,3 +149,40 @@ class UpdateChecker:
             except Exception:  # noqa: BLE001, S112 - checks are best effort
                 # A transient checkout/read failure must not affect the TUI.
                 continue
+
+
+class ProcessUpdateMonitor:
+    """One process-owned checker shared by all visible surfaces."""
+
+    def __init__(self, package_file: str | Path) -> None:
+        self._subscribers: set[Callable[[str, str], Awaitable[None]]] = set()
+        self._checker = UpdateChecker(package_file, self._publish)
+
+    def subscribe(self, callback: Callable[[str, str], Awaitable[None]]) -> Callable[[], None]:
+        self._subscribers.add(callback)
+        return lambda: self._subscribers.discard(callback)
+
+    def start(self) -> None:
+        self._checker.start()
+
+    async def close(self) -> None:
+        await self._checker.close()
+        self._subscribers.clear()
+
+    async def tick(self) -> bool:
+        return await self._checker.tick()
+
+    async def _publish(self, old: str, new: str) -> None:
+        for callback in tuple(self._subscribers):
+            await callback(old, new)
+
+
+_process_monitor: ProcessUpdateMonitor | None = None
+
+
+def process_update_monitor(package_file: str | Path) -> ProcessUpdateMonitor:
+    """Return the single monitor for this interpreter process."""
+    global _process_monitor
+    if _process_monitor is None:
+        _process_monitor = ProcessUpdateMonitor(package_file)
+    return _process_monitor

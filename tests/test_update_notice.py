@@ -9,6 +9,36 @@ from zeta.server.protocol import EventDescriptor
 from zeta.tui import layout
 
 
+def test_checker_reports_each_transition_from_running_revision() -> None:
+    revisions = iter(("old", "new", "newer"))
+    updates: list[tuple[str, str]] = []
+
+    async def on_update(old: str, new: str) -> None:
+        updates.append((old, new))
+
+    checker = UpdateChecker(
+        Path("/not-used"), on_update, read_revision=lambda _: next(revisions)
+    )
+    assert asyncio.run(checker.tick())
+    assert asyncio.run(checker.tick())
+    assert updates == [("old", "new"), ("old", "newer")]
+
+
+def test_checker_silently_retries_a_failed_read() -> None:
+    revisions = iter(("old", None, "new"))
+    updates: list[tuple[str, str]] = []
+
+    async def on_update(old: str, new: str) -> None:
+        updates.append((old, new))
+
+    checker = UpdateChecker(
+        Path("/not-used"), on_update, read_revision=lambda _: next(revisions)
+    )
+    assert not asyncio.run(checker.tick())
+    assert asyncio.run(checker.tick())
+    assert updates == [("old", "new")]
+
+
 def test_checker_reports_one_revision_change_without_sleep() -> None:
     revisions = iter(("old", "new", "new"))
     updates: list[tuple[str, str]] = []

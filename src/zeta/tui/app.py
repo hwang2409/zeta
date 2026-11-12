@@ -54,7 +54,7 @@ from ..protocol.types import (
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
-from ..runtime.update_notice import UpdateChecker
+from ..runtime.update_notice import process_update_monitor
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, render, theme
@@ -229,7 +229,8 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
-        self._update_checker = UpdateChecker(zeta.__file__ or "", self._handle_update)
+        self._update_monitor = process_update_monitor(zeta.__file__ or "")
+        self._update_unsubscribe = self._update_monitor.subscribe(self._handle_update)
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -1156,8 +1157,7 @@ class TUIApp(
             if observer_host is not None and (error := await observer_host.start_or_close()):
                 self.observer_host = None  # optional endpoint: never stops the TUI or a fork
                 self._handle_background_notice(f"remote observer unavailable: {error}")
-            if (update_checker := getattr(self, "_update_checker", None)) is not None:
-                update_checker.start()
+            self._update_monitor.start()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
