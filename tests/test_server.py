@@ -13227,6 +13227,9 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 ]
                 owner = record.publication_owner
                 assert owner is not None and not owner.done()
+                # The forced order must make the intended task own publication,
+                # so the external-first row cannot silently become a 50/50 race.
+                assert (owner is record.settlement) is settlement_owns_first
                 owner.cancel()
                 await asyncio.wait_for(history_cancelled.wait(), timeout=10)
             approval_owner = (
