@@ -24,7 +24,7 @@ async def _yield_until(predicate: Callable[[], bool], *, what: str) -> None:
             return
         waker = loop.create_future()
         loop.call_soon(waker.set_result, None)
-        await waker
+        await asyncio.wait_for(waker, 10)
     raise AssertionError(f"{what} did not happen")
 
 
