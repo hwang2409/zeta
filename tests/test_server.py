@@ -2662,8 +2662,10 @@ async def test_background_event_overflow_records_approval_for_reconnect(
         overflowed.set()
         original_overflow()
 
+    # test-contract: seam hold semantic handling and fill its exact boundary
     monkeypatch.setattr(server.control, "_event", hold_first)
     monkeypatch.setattr(server.control._background_events, "publish", publish_at_limit)
+    # test-contract: seam observe the real slow-controller policy starting
     monkeypatch.setattr(server.connections, "overflow_controller", observe_overflow)
     reconnect_writer: asyncio.StreamWriter | None = None
     try:
