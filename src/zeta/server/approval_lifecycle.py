@@ -781,7 +781,15 @@ class ApprovalLifecycle:
             and token == current.token
         )
         if resolution is None:
-            if owns_record and decision == "abort" and self.state.health is not None:
+            delegated = isinstance(target.key, tuple)
+            # A delegated child store torn down during cleanup cannot take the
+            # durable write, but the parent session is healthy: publish the end
+            # live-only (WRITE_FAILED) instead of failing the whole session.
+            if (
+                owns_record
+                and decision == "abort"
+                and (self.state.health is not None or delegated)
+            ):
                 synthetic = {
                     "request_id": target.store_request_id,
                     "decision": "abort",

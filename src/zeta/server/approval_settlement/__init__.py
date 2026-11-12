@@ -53,6 +53,12 @@ async def persist_durably(
         if resolution is None:
             raise
         return SettlementResult(resolution)
+    except ValueError as exc:
+        # A child store torn down during cleanup rejects writes with this exact
+        # message; treat it as an unavailable durable write, not a crash.
+        if str(exc) != "session store is closed":
+            raise
+        return SettlementResult(store.approval_resolution_data(request_id))
     except OSError:
         resolution = store.approval_resolution_data(request_id)
         if resolution is not None:
