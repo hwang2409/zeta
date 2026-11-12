@@ -22,9 +22,10 @@ if TYPE_CHECKING:
     from zeta.project_registry import ProjectRegistry
 
 from zeta.core.checkpoints import ConversationEntry, active_branch
+from zeta.core.store import TranscriptLoadError
 from zeta.core.store._log import PersistedAppend
+from zeta.core.transcript_recovery.runtime import format_repair_transcript_command
 from zeta.transcript_search.source import (
-    CorruptTranscriptSource,
     _Cursor,
     _prefix_digest,
     _read_transcript,
@@ -149,6 +150,11 @@ class SearchHit:
         return self.unit.unit_id
 
 
+def _skip_message(session_id: str, error: TranscriptLoadError) -> str:
+    """Name one skipped corrupt session with #1100's wording and repair hint."""
+    return f"skipped {error}; run {format_repair_transcript_command(session_id)}"
+
+
 @dataclass(frozen=True, slots=True)
 class IndexStatus:
     project_id: str
@@ -233,7 +239,8 @@ class TranscriptIndex:
                 return
             self.building_path.touch(mode=0o600)
             try:
-                self._rebuild_locked(sources)
+                for message in self._rebuild_locked(sources).skipped:
+                    logger.warning("transcript index backfill %s", message)
             finally:
                 self._clear_building_path()
 
@@ -260,10 +267,8 @@ class TranscriptIndex:
                 for source in sources:
                     try:
                         replacement._append_locked(source, force_full=True)
-                    except CorruptTranscriptSource as corrupt:
-                        skipped.append(
-                            f"skipped corrupt session {source.session_id}: {corrupt}"
-                        )
+                    except TranscriptLoadError as corrupt:
+                        skipped.append(_skip_message(source.session_id, corrupt))
                 self._publish(temporary_path)
                 return replace(self._status(), skipped=tuple(skipped))
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
@@ -486,6 +491,7 @@ class TranscriptIndex:
             source.conversation_path,
             cursor,
             None if force_full else source.append_receipts,
+            session_id=source.session_id,
         )
         if (
             not read.full
@@ -493,7 +499,9 @@ class TranscriptIndex:
             and cursor is not None
             and read.rows[0].get("parent_id") != cursor.last_entry_id
         ):
-            read = _read_transcript(source.conversation_path, None)
+            read = _read_transcript(
+                source.conversation_path, None, session_id=source.session_id
+            )
         prior_tail = () if read.full or cursor is None else cursor.active_tail
         render_rows = prior_tail + read.rows
         units = render_transcript_units(self.project_id, source.session_id, render_rows)

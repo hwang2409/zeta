@@ -324,12 +324,11 @@ def test_rebuild_skips_corrupt_session_and_names_it(tmp_path: Path) -> None:
         ],
     )
     bad = _source(sessions, "bad", [_row(1, "user", "doomed")])
-    # A newline-terminated invalid row mid-file is the corruption that blocked
-    # the whole project's rebuild on main with a raw "Expecting property name".
-    bad.conversation_path.write_text(
-        json.dumps(_row(1, "user", "doomed")) + "\n" + "{not json}\n",
-        encoding="utf-8",
-    )
+    # A newline-terminated invalid row after a valid one is the corruption that
+    # blocked the whole project's rebuild on main with a raw "Expecting property
+    # name".
+    with bad.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write("{not json}\n")
     index = TranscriptIndex(tmp_path / "project", PROJECT_A)
 
     try:
@@ -601,8 +600,8 @@ def test_missing_receipts_verify_bounded_prefix_then_read_only_tail(
     observed: list[object] = []
     original_read = index_module._read_transcript
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         observed.append(result)
         return result
 
@@ -637,8 +636,8 @@ def test_prefix_mutation_without_receipts_forces_full_rebuild(
     original_read = index_module._read_transcript
     observed: list[object] = []
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         observed.append(result)
         return result
 
@@ -696,8 +695,8 @@ def test_unverified_append_rereads_and_matches_rebuild(
     original_read = index_module._read_transcript
     reads: list[object] = []
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         reads.append(result)
         return result
 

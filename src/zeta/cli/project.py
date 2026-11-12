@@ -125,13 +125,7 @@ def run(
                 raise ProjectRegistryError("no project associated with directory")
             value = project.to_dict()
         elif args.project_verb == "index":
-            value = _run_index(args, registry)
-            skipped = value.get("skipped") if isinstance(value, dict) else None
-            if skipped:
-                print(json.dumps(value, indent=2, sort_keys=True), file=out)
-                for message in skipped:
-                    print(f"zeta: {message}", file=err)
-                return 1
+            return _run_index(args, registry, out, err)
         elif args.project_verb == "memory":
             if args.project == "accept":
                 if getattr(args, "reason", None) is not None:
@@ -370,7 +364,12 @@ def run(
     return 0
 
 
-def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
+def _run_index(
+    args: argparse.Namespace,
+    registry: ProjectRegistry,
+    out: IO[str],
+    err: IO[str],
+) -> int:
     from ..transcript_search.index import (
         TranscriptIndex,
         linked_transcript_sources,
@@ -385,13 +384,16 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
     registry.ensure_memory_supported(project.project_id)
     if args.index_action == "rebuild":
         index = TranscriptIndex(registry.root / project.project_id, project.project_id)
-        status = index.rebuild(
-            linked_transcript_sources(registry, project.project_id)
-        )
-        return _status_value(status)
+        status = index.rebuild(linked_transcript_sources(registry, project.project_id))
+        print(json.dumps(_status_value(status), indent=2, sort_keys=True), file=out)
+        if status.skipped:
+            for message in status.skipped:
+                print(f"zeta: {message}", file=err)
+            return 1
+        return 0
     index = open_project_index(registry, project.project_id)
     if args.index_action == "search":
-        return [
+        value: object = [
             {
                 "unit_id": hit.unit_id,
                 "session_id": hit.unit.session_id,
@@ -404,17 +406,19 @@ def _run_index(args: argparse.Namespace, registry: ProjectRegistry) -> object:
             }
             for hit in index.search(" ".join(args.query), limit=args.limit)
         ]
-    return _status_value(index.status())
+    else:
+        value = _status_value(index.status())
+    print(json.dumps(value, indent=2, sort_keys=True), file=out)
+    return 0
 
 
 def _status_value(status: Any) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "project_id": status.project_id,
         "schema_version": status.schema_version,
         "sanitizer_version": status.sanitizer_version,
         "ready": status.ready,
         "detail": status.detail,
-        "skipped": list(status.skipped),
         "generation": status.generation,
         "unit_count": status.unit_count,
         "session_count": status.session_count,
@@ -422,6 +426,9 @@ def _status_value(status: Any) -> dict[str, object]:
         "path": str(status.path),
         "size_bytes": status.size_bytes,
     }
+    if status.skipped:
+        value["skipped"] = list(status.skipped)
+    return value
 
 
 def _run_memory_sync(
