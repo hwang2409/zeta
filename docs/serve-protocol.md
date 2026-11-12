@@ -939,11 +939,15 @@ All examples below use the common event envelope:
 Background child events are written to a connection in the order the server's
 background event sink receives them. A later child event is not written while
 an earlier child event is still completing its delegated-history work. This
-keeps `child_run_events` history gap-free and ordered on the wire. The pending
-background stream shares the connection's limit of 256 frames or 4 MiB. If it
-reaches either limit, serve applies the normal slow-controller policy: it sends
-`-32011` when possible and closes the controller instead of blocking a turn or
-retaining more events.
+keeps `child_run_events` history gap-free and ordered on the wire. The semantic
+FIFO and the connection output queue are independent bounded stages with
+independent accounting. The semantic stage estimates each event from its
+session ID and payload and reserves one frame for overflow; the connection
+stage counts encoded JSON-RPC frames. Each stage applies a limit of 256 frames
+or 4 MiB. If the semantic stage reaches either limit, serve switches that drain
+to record-only mode and applies the normal slow-controller policy: it sends
+`-32011` when possible and closes the controller. State and history continue in
+FIFO order, but no more live delivery is retained for that controller.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}

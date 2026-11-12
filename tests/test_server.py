@@ -2608,8 +2608,148 @@ async def test_background_event_backlog_overflow_drops_slow_controller(
     finally:
         release.set()
         await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        assert published_sessions[-1] == "other"
         server.connections = None
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_background_event_overflow_records_approval_for_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    agent = ToolCall(
+        "agent-one",
+        "agent",
+        {"prompt": "read", "description": "child", "background": True},
+    )
+    backend = DelegatedApprovalBackend(
+        agent,
+        ToolCall("child-call", "read", {"path": str(target)}),
+        child_prompt="read",
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    overflowed = asyncio.Event()
+    original_event = server.control._event
+    original_publish = server.control._background_events.publish
+    original_overflow = server.connections.overflow_controller
+
+    async def hold_first(event: StreamEvent, **kwargs: object) -> None:
+        if event.delta == "blocked":
+            started.set()
+            await await_or_fail(release.wait(), what="semantic event release")
+        await original_event(event, **kwargs)
+
+    def publish_at_limit(session_id: str, event: StreamEvent) -> None:
+        if event.type is StreamEventType.TOOL_APPROVAL_START:
+            while server.control._background_events._frames < 255:
+                original_publish(
+                    session_id,
+                    StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fill"),
+                )
+        original_publish(session_id, event)
+
+    def observe_overflow() -> None:
+        overflowed.set()
+        original_overflow()
+
+    monkeypatch.setattr(server.control, "_event", hold_first)
+    monkeypatch.setattr(server.control._background_events, "publish", publish_at_limit)
+    monkeypatch.setattr(server.connections, "overflow_controller", observe_overflow)
+    reconnect_writer: asyncio.StreamWriter | None = None
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["approval_reconnect"],
+            },
+        )
+        session = (
+            await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]
+        session_id = session["session_id"]
+        server.control._publish_background_event(
+            session_id,
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="blocked"),
+        )
+        await await_or_fail(started.wait(), what="first semantic event")
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        await await_or_fail(overflowed.wait(), what="controller overflow")
+        release.set()
+        await await_or_fail(
+            server.control.flush_background_events(),
+            what="background event recording",
+        )
+        await asyncio.wait_for(reader.read(), TIMEOUT)
+        assert reader.at_eof(), "overflow must disconnect the slow controller"
+
+        reconnect_reader, reconnect_writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
+        )
+        await _request(
+            reconnect_reader,
+            reconnect_writer,
+            4,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "role": "controller",
+                "features": ["approval_reconnect"],
+            },
+        )
+        status = (await _request(reconnect_reader, reconnect_writer, 5, "status"))[
+            -1
+        ]["result"]
+        pending = status["pending_approvals"]
+        assert len(pending) == 1, "overflowing approval must remain recoverable"
+        approval = pending[0]
+        history = (
+            await _request(
+                reconnect_reader,
+                reconnect_writer,
+                6,
+                "session_history",
+                {"session_id": session_id},
+            )
+        )[-1]["result"]["messages"]
+        assert any(
+            row.get("event") == "approval_request"
+            and row.get("request_id") == approval["request_id"]
+            for row in history
+        )
+        assert server.runtime.loop is not None
+        child_watcher = server.runtime.loop._background_owner._watchers[
+            approval["agent_instance_id"]
+        ]
+        await _request(
+            reconnect_reader,
+            reconnect_writer,
+            7,
+            "approve",
+            {"request_id": approval["request_id"]},
+        )
+        await await_or_fail(asyncio.shield(child_watcher), what="approved child finish")
+        assert len(backend.child.calls) == 2
+    finally:
+        release.set()
+        if reconnect_writer is not None:
+            await close_serve(server, reconnect_writer)
+        else:
+            await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

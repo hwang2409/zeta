@@ -44,6 +44,7 @@ class BackgroundEventPublisher:
         self._task: asyncio.Task[None] | None = None
         self._frames = 0
         self._bytes = 0
+        self._record_only = False
         self._closed = False
 
     def publish(self, session_id: str, event: StreamEvent) -> None:
@@ -56,15 +57,17 @@ class BackgroundEventPublisher:
                 separators=(",", ":"),
             ).encode()
         )
-        if (
+        if not self._record_only and (
             self._frames + 1 > _MAX_PENDING_FRAMES
             or self._bytes + size > _MAX_PENDING_BYTES
         ):
+            self._record_only = True
             self._overflow()
-            return
-        self._frames += 1
-        self._bytes += size
-        self._queue.put_nowait(_QueuedEvent(session_id, event, size))
+        retained_size = 0 if self._record_only else size
+        if retained_size:
+            self._frames += 1
+            self._bytes += retained_size
+        self._queue.put_nowait(_QueuedEvent(session_id, event, retained_size))
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._drain())
 
@@ -84,9 +87,12 @@ class BackgroundEventPublisher:
                     },
                 )
             finally:
-                self._frames -= 1
-                self._bytes -= item.size
+                if item.size:
+                    self._frames -= 1
+                    self._bytes -= item.size
                 self._queue.task_done()
+                if self._queue.empty() and self._frames == 0:
+                    self._record_only = False
 
     async def flush(self) -> None:
         await self._queue.join()
