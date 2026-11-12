@@ -28,6 +28,7 @@ from zeta.core.store import (
     TranscriptLoadError,
     _async_writes,
 )
+from zeta.core.store._delivery_fold import DeliveryFold
 from zeta.core.store._history_index import (
     HistoryIndexError,
     HistoryIndexUnavailableError,
@@ -45,6 +46,7 @@ from zeta.protocol.types import (
     MessageRole,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     with_message_origin,
 )
@@ -1610,10 +1612,10 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     # test-contract: seam observe transcript loading across the async store boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
 
-    original_record_active_entry = ConversationStore._record_active_entry
+    original_record_active_entry = DeliveryFold.apply
 
     def observed_record_active_entry(
-        candidate: ConversationStore,
+        candidate: DeliveryFold,
         entry: ConversationEntry,
         approvals: object | None = None,
     ) -> None:
@@ -1622,9 +1624,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
         original_record_active_entry(candidate, entry, approvals)
 
     # test-contract: seam exercises the store mutation boundary
-    monkeypatch.setattr(
-        ConversationStore, "_record_active_entry", observed_record_active_entry
-    )
+    monkeypatch.setattr(DeliveryFold, "apply", observed_record_active_entry)
     original_detach = ConversationStore._detach_log_state
 
     def observed_detach(candidate: ConversationStore):
@@ -1659,7 +1659,23 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
-    assert store._active_pending_prompt_entries == fresh._active_pending_prompt_entries
+    assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
+
+
+def _detached_states_equal(a: object, b: object) -> bool:
+    """Compare two detached log states, folding in delivery-fold content.
+
+    The delivery fold is immutable after install and compares by identity, so
+    match its containers by value and the remaining fields by the dataclass eq.
+    """
+    fold_fields = DeliveryFold.__slots__
+    if any(
+        getattr(a.delivery_fold, name) != getattr(b.delivery_fold, name)
+        for name in fold_fields
+    ):
+        return False
+    shared = a.delivery_fold
+    return replace(a, delivery_fold=shared) == replace(b, delivery_fold=shared)
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1712,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
     await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store._detach_log_state() == fresh._detach_log_state()
+    assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
     assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
 
 
@@ -1726,7 +1742,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
     await await_or_fail(write, what="test await")
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store._detach_log_state() == fresh._detach_log_state()
+    assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
     assert [item.content[0].text for item in store.messages()] == ["owner", "worker"]
 
 
@@ -1768,7 +1784,7 @@ async def test_async_publish_matches_fresh_load_after_each_owner_worker_race(
         await await_or_fail(write, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert store._detach_log_state() == fresh._detach_log_state()
+        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
 
 
 @pytest.mark.asyncio
@@ -1898,7 +1914,7 @@ async def test_durable_publish_preserves_newer_owner_state(
         await await_or_fail(write, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert store._detach_log_state() == fresh._detach_log_state()
+        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
         assert store.bash_cwd == fresh.bash_cwd
         assert store.todo_items() == fresh.todo_items()
         assert store.todo_dismissed == fresh.todo_dismissed
@@ -1957,7 +1973,7 @@ async def test_off_loop_refresh_preserves_newer_owner_state(
         await await_or_fail(refresh, what="test await")
 
         fresh = ConversationStore(tmp_path, session_id=store.session_id)
-        assert store._detach_log_state() == fresh._detach_log_state()
+        assert _detached_states_equal(store._detach_log_state(), fresh._detach_log_state())
         assert store.bash_cwd == fresh.bash_cwd
         assert store.todo_items() == fresh.todo_items()
         assert store.todo_dismissed == fresh.todo_dismissed
@@ -2262,7 +2278,7 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
     assert store.agent_notifications() == fresh.agent_notifications()
-    assert store._active_pending_prompt_entries == fresh._active_pending_prompt_entries
+    assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
 
 
 @pytest.mark.asyncio
@@ -3452,6 +3468,260 @@ async def test_approval_read_seam_table(
     assert state == (call, None), f"seam must answer from the branch, got {state!r}"
     if scenario != "closed_store":
         store.close()
+
+
+def _delivery_fold_reads(store: ConversationStore) -> dict[str, object]:
+    """Snapshot every public delivery read as plain, comparable values.
+
+    The reads come from the resident DeliveryFold. A cold reopen rebuilds the
+    same fold from a full load, so this snapshot is the oracle each install
+    route must match.
+    """
+
+    fold = store.delivery_fold
+    last_message = fold.last_message
+    delivery_message = fold.delivery_message
+    terminal = fold.last_terminal_transition
+    return {
+        "pending_notifications": [e.id for e in store.agent_notifications()],
+        "all_notifications": [
+            e.id for e in store.agent_notifications(pending_only=False)
+        ],
+        "presented": {
+            e.id: store.is_agent_notification_presented_to_tui(e.id)
+            for e in store.agent_notifications(pending_only=False)
+        },
+        "pending_prompts": [e.id for e in store.pending_prompts()],
+        "receipts": store.active_agent_receipts(),
+        "completions_by_child": {
+            child: e.id
+            for child, e in store.agent_completion_notifications_by_child().items()
+        },
+        "last_turn_end": (lt.id if (lt := store.last_turn_end()) is not None else None),
+        "has_task_exit": store.has_task_exit_notification("task-7"),
+        "agent_tool_result": (
+            r.to_dict()
+            if (r := store.tool_result("agent-call-1")) is not None
+            else None
+        ),
+        "last_message": last_message.to_dict() if last_message is not None else None,
+        "delivery_message": (
+            delivery_message.to_dict() if delivery_message is not None else None
+        ),
+        "terminal_transition": terminal.data if terminal is not None else None,
+    }
+
+
+def _apply_delivery_script(store: ConversationStore) -> None:
+    """Drive one scripted notification/prompt/receipt/task sequence.
+
+    It exercises every DeliveryFold field: completions (including the
+    setdefault keep-first for one child), a child question, a presentation and
+    acknowledgement, pending prompts with their prompt messages (one acked, one
+    retained then canceled), an agent tool call and its result receipt, a
+    task-exit id, a step-delivery message, a turn_end, and a terminal
+    transition. It runs on a worker thread because the pending-prompt lock
+    refuses an event-loop thread.
+    """
+
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("start")]), MessageOrigin.USER
+        )
+    )
+    completion_a = store.append_agent_notification(
+        "child-a",
+        child_session_path="/c/a",
+        description="a",
+        status="completed",
+        text="done a",
+    )
+    store.append_agent_notification(
+        "child-b",
+        child_session_path="/c/b",
+        description="b1",
+        status="completed",
+        text="done b1",
+    )
+    store.append_agent_notification(
+        "child-b",
+        child_session_path="/c/b",
+        description="b2",
+        status="completed",
+        text="done b2",
+    )
+    store.append_child_question(
+        child_instance_id="child-q", question_id="q1", question="why?"
+    )
+    store.mark_agent_notification_presented_to_tui(completion_a.id)
+    store.acknowledge_agent_notification(completion_a.id)
+    prompt_one = store.append_pending_prompt("follow up one")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("answered one")],
+            metadata={"zeta.pending_prompt_id": prompt_one.id},
+        )
+    )
+    store.acknowledge_pending_prompt(prompt_one.id)
+    prompt_two = store.append_pending_prompt("follow up two")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("answered two")],
+            metadata={"zeta.pending_prompt_id": prompt_two.id},
+        )
+    )
+    agent_call = ToolCall("agent-call-1", "agent", {"prompt": "work"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(agent_call)]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                "agent-call-1",
+                "child done",
+                structured_content={
+                    "child_instance_id": "recv-h",
+                    "child_session_path": "/c/recv",
+                },
+            ),
+        )
+    )
+    store.append_task_notification(task_id="task-7", command="sleep 1", exit_code=0)
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [TextContent("delivered")],
+            metadata={"zeta.step_delivery": {"notification_ids": [completion_a.id]}},
+        )
+    )
+    store.append_many([("turn_end", {"turn_id": "a" * 32, "reason": "completed"})])
+    assert store.pending_prompt_queue.cancel_explicit_child()
+
+
+_DELIVERY_ROUTES = (
+    "live_append",
+    "batch_commit",
+    "async_commands",
+    "tail_refresh",
+    "fork_rebuild",
+    "off_loop_refresh",
+)
+
+
+@pytest.mark.parametrize("route", _DELIVERY_ROUTES)
+@pytest.mark.asyncio
+async def test_delivery_fold_install_routes_match_cold_reopen(
+    tmp_path: Path, route: str
+) -> None:
+    # test-contract: every DeliveryFold install route must agree with a cold
+    # full load of the identical bytes. The bug class is "one install route
+    # builds the fold differently" (p08b-1 had five divergent routes). Each row
+    # drives the scripted ops through one install path, then compares the live
+    # resident reads to a reopen of the same session. Dropping the fold swap in
+    # one install function makes that route's row fail (mutation check).
+    root = tmp_path / "sessions"
+    session_id = f"fold-{route}"
+    reader: ConversationStore | None = None
+    writer: ConversationStore | None = None
+    cold: ConversationStore | None = None
+    target: ConversationStore | None = None
+    try:
+        if route == "live_append":
+            target = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, target)
+        elif route == "batch_commit":
+            target = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, target)
+            # Public append_many installs through the checkpoint-mutation path
+            # (_install_appended_entries), the same batch install that
+            # append_many and checkpoint rewrites share.
+            target.append_many(
+                [
+                    (
+                        "message",
+                        {
+                            "message": Message(
+                                MessageRole.ASSISTANT, [TextContent("batched")]
+                            ).to_dict()
+                        },
+                    ),
+                    (
+                        "message",
+                        {
+                            "message": Message(
+                                MessageRole.ASSISTANT,
+                                [TextContent("batched-delivery")],
+                                metadata={
+                                    "zeta.step_delivery": {
+                                        "notification_ids": ["task-7-missing"]
+                                    }
+                                },
+                            ).to_dict()
+                        },
+                    ),
+                ]
+            )
+        elif route == "async_commands":
+            target = ConversationStore(root, session_id=session_id)
+            notification = target.append_agent_notification(
+                "child-a",
+                child_session_path="/c/a",
+                description="a",
+                status="completed",
+                text="done a",
+            )
+            # Async commands install through the worker patch route
+            # (_install_validated_linear_entries).
+            await target.record_agent_notification_delivery_async(
+                notification.id, presented=True, acknowledged=False
+            )
+            prompt = await target.append_pending_prompt_async("async follow up")
+            await target.append_message_async(
+                Message(
+                    MessageRole.ASSISTANT,
+                    [TextContent("answered")],
+                    metadata={"zeta.pending_prompt_id": prompt.id},
+                )
+            )
+            await target.append_turn_end_async("b" * 32, "completed")
+        elif route == "tail_refresh":
+            reader = ConversationStore(root, session_id=session_id)
+            writer = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, writer)
+            # The reader loads the writer's tail through _accept_incremental_entries.
+            await asyncio.to_thread(reader.refresh)
+            target = reader
+        elif route == "fork_rebuild":
+            target = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, target)
+            checkpoint = target.append_checkpoint("cp")
+            target.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("trailing")])
+            )
+            # Forking off an earlier checkpoint is a non-linear append, which
+            # rebuilds the active-branch fold (_rebuild_incremental_validation_state).
+            target.append_fork(str(checkpoint.seq))
+        else:  # off_loop_refresh — the B1 replace_entries route
+            reader = ConversationStore(root, session_id=session_id)
+            writer = ConversationStore(root, session_id=session_id)
+            await asyncio.to_thread(_apply_delivery_script, writer)
+            # _refresh_off_loop installs the external fold by replace_entries;
+            # the immutable fold is installed by reference, not a lost patch.
+            await asyncio.wait_for(reader._refresh_off_loop(), 10)
+            target = reader
+
+        live = await asyncio.to_thread(_delivery_fold_reads, target)
+        cold = ConversationStore(root, session_id=session_id)
+        cold_reads = await asyncio.to_thread(_delivery_fold_reads, cold)
+        assert cold_reads == live, route
+    finally:
+        seen: set[int] = set()
+        for handle in (target, reader, writer, cold):
+            if handle is not None and id(handle) not in seen:
+                seen.add(id(handle))
+                handle.close()
 
 
 def test_resident_store_mutation_off_owner_thread_raises(tmp_path: Path) -> None:

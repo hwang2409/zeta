@@ -102,8 +102,8 @@ def project(store: ConversationStore, entries: list[ConversationEntry]):
 def test_covered_decode_matches_reference_projection_and_tokens(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     try:
-        store._active_pending_prompt_entries["pending-1"] = object()
-        store._active_notifications["notice-1"] = object()
+        store.delivery_fold.active_prompts["pending-1"] = object()
+        store.delivery_fold.active_notifications["notice-1"] = object()
         entries = corpus()
         projected, tokens = project(store, entries)
         reference_assembler = ContextAssembler(store, token_counter=lambda message: len(message.content))
@@ -117,8 +117,8 @@ def test_covered_decode_matches_reference_projection_and_tokens(tmp_path: Path) 
 def test_covered_decode_skips_ordinary_rows(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     try:
-        store._active_pending_prompt_entries["pending-1"] = object()
-        store._active_notifications["notice-1"] = object()
+        store.delivery_fold.active_prompts["pending-1"] = object()
+        store.delivery_fold.active_notifications["notice-1"] = object()
         entries = corpus()
         with patch.object(Message, "from_dict", wraps=Message.from_dict) as decode:
             project(store, entries)

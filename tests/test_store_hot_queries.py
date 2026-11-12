@@ -316,12 +316,12 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        assert list(store._active_notifications) == [
+        assert list(store.delivery_fold.active_notifications) == [
             notification_id
             for notification_id in notifications
             if notification_id not in acknowledgements
         ], operation
-        assert store._active_notification_presentations == presentations, operation
+        assert store.delivery_fold.presented == presentations, operation
         assert [
             entry.id for entry in store.agent_notifications(pending_only=False)
         ] == list(notifications), operation
@@ -343,7 +343,7 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
             result = Message.from_dict(entry.data["message"]).tool_result
             if result is not None:
                 expected_results.setdefault(result.tool_call_id, result)
-        assert store._active_tool_results == expected_results, operation
+        assert store.delivery_fold.tool_results == expected_results, operation
         assert all(
             store.tool_result(tool_call_id) == result
             for tool_call_id, result in expected_results.items()
