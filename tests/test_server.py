@@ -2643,6 +2643,12 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
             await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
         except ValueError as error:
             assert str(error) == "session store is closed"
+        notification_task = server.control._turn_task
+        if notification_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(notification_task), TIMEOUT)
+            except ValueError as error:
+                assert str(error) == "session store is closed"
         await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
         frames = await _request(reader, writer, 4, "status")
         frames += list(_client_buffer(reader))
