@@ -31,8 +31,10 @@ from ..project_registry import ProjectRegistry, ProjectRegistryError
 from ..storage_format import WriterLease, mapping_mutations
 from .session_files import (
     SessionError,
+    SessionReferenceAuthority,
     child_directory,
     open_session_file,
+    reference_publication,
     session_directory,
     write_session_file,
 )
@@ -149,6 +151,29 @@ def persist_pending_root_link(
     *,
     previous_project_id: str | None = None,
 ) -> None:
+    with reference_publication(
+        Path(sessions_dir).parent,
+        lease,
+        installed_ids=(session_id,),
+        referenced_ids=(parent_session_id,) if parent_session_id else (),
+    ) as authority:
+        _persist_pending_root_link(
+            sessions_dir, session_id, project_id, role, parent_session_id, lease,
+            previous_project_id=previous_project_id, authority=authority,
+        )
+
+
+def _persist_pending_root_link(
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    project_id: str,
+    role: str,
+    parent_session_id: str | None,
+    lease: WriterLease,
+    *,
+    previous_project_id: str | None = None,
+    authority: SessionReferenceAuthority,
+) -> None:
     """Durably publish a root-session linkage intent before registry mutation."""
 
     link = {
@@ -158,10 +183,13 @@ def persist_pending_root_link(
         "previous_project_id": previous_project_id,
         "transcript_path": str(Path(sessions_dir) / session_id),
     }
+    referenced_ids = (parent_session_id,) if parent_session_id is not None else ()
     with (
         session_directory(sessions_dir, session_id) as (_, directory_fd),
         project_links_lock(directory_fd),
     ):
+        assert authority is not None
+        authority.validate((session_id, *referenced_ids))
         lease.publish_json(
             directory_fd,
             "project_link_pending.json",
@@ -172,9 +200,25 @@ def persist_pending_root_link(
 
 
 def persist_pending_child_link(
+    root_session_dir: os.PathLike[str] | str,
+    link: dict[str, object],
+    lease: WriterLease,
+) -> None:
+    root = Path(root_session_dir)
+    with reference_publication(
+        root.parent.parent, lease,
+        installed_ids=(str(link["session_id"]),),
+        referenced_ids=tuple(value for value in (link.get("parent_session_id"), root.name) if isinstance(value, str)),
+    ) as authority:
+        _persist_pending_child_link(root_session_dir, link, lease, authority=authority)
+
+
+def _persist_pending_child_link(
     root_session_dir: os.PathLike[str],
     link: dict[str, object],
     lease: WriterLease,
+    *,
+    authority: SessionReferenceAuthority,
 ) -> None:
     """Durably record a child-lineage intent in the ROOT's pending index.
 
@@ -186,22 +230,27 @@ def persist_pending_child_link(
     """
     root = Path(root_session_dir)
     name = _encode_link_name(str(link["session_id"]))
+    installed_ids = (str(link["session_id"]),)
+    referenced_ids = tuple(
+        session_id
+        for session_id in (link.get("parent_session_id"), root.name)
+        if isinstance(session_id, str)
+    )
     with (
         session_directory(root.parent, root.name) as (_, root_fd),
         project_links_lock(root_fd),
         child_directory(root_fd, PENDING_CHILD_LINKS_DIRNAME, create=True) as pending_fd,
     ):
+        assert authority is not None
+        authority.validate((*installed_ids, *referenced_ids))
         # Ensuring the index directory added its entry to the root session dir;
         # fsync root_fd so that directory entry is durable before the registry
-        # append.  Otherwise a crash after this returns but before the append
-        # could lose the whole index -- the JSON publisher below fsyncs the
-        # intent file and the index dir, but never the parent that names it.
+        # append. Otherwise a crash after this returns but before the append
+        # could lose the whole index.
         os.fsync(root_fd)
         lease.publish_json(
             pending_fd, name, mapping_mutations(link), write_session_file
         )
-        # Durably land the new directory entry before the registry append;
-        # the JSON publisher fsyncs the file and its rename, not the dir.
         os.fsync(pending_fd)
 
 
@@ -226,8 +275,28 @@ class ChildLineagePublisher:
 
     def publish(self, link: Mapping[str, object]) -> None:
         value = dict(link)
-        persist_pending_child_link(
-            self._root_session_dir, value, self._storage_lease
+        installed_ids = (str(value["session_id"]),)
+        referenced_ids = tuple(
+            session_id
+            for session_id in (value.get("parent_session_id"), self._root_session_dir.name)
+            if isinstance(session_id, str)
+        )
+        with reference_publication(
+            self._root_session_dir.parent.parent,
+            self._storage_lease,
+            installed_ids=installed_ids,
+            referenced_ids=referenced_ids,
+        ) as authority:
+            self._publish_admitted(value, authority)
+
+    def _publish_admitted(
+        self, value: dict[str, object], authority: SessionReferenceAuthority
+    ) -> None:
+        _persist_pending_child_link(
+            self._root_session_dir,
+            value,
+            self._storage_lease,
+            authority=authority,
         )
         with self._mutex:
             self._generation += 1
@@ -248,6 +317,7 @@ class ChildLineagePublisher:
                     self._root_session_dir.parent,
                     self._root_session_dir.name,
                     ready_collection_started=ready_collection_started,
+                    authority=authority,
                 )
                 if outcome == "failed":
                     raise ProjectRegistryError("child project lineage remains pending")
@@ -267,7 +337,11 @@ class ChildLineagePublisher:
 
 
 def reconcile_child_links(
-    project_registry: ProjectRegistry, sessions_dir: os.PathLike[str] | str, session_id: str
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    *,
+    _reference_authority: SessionReferenceAuthority | None = None,
 ) -> None:
     """Publish durable child-lineage intents from the ROOT's pending index.
 
@@ -280,7 +354,21 @@ def reconcile_child_links(
     crash, a failed append, or a bounded pass is recovered on the next open
     without ever double-recording a link.
     """
-    outcome = _reconcile_child_links_pass(project_registry, sessions_dir, session_id)
+    if _reference_authority is None:
+        with reference_publication(
+            Path(sessions_dir).parent,
+            project_registry._storage_lease,
+            referenced_ids=(session_id,),
+        ) as authority:
+            outcome = _reconcile_child_links_pass(
+                project_registry, sessions_dir, session_id,
+                ready_collection_started=None, authority=authority,
+            )
+    else:
+        outcome = _reconcile_child_links_pass(
+            project_registry, sessions_dir, session_id,
+            ready_collection_started=None, authority=_reference_authority,
+        )
     if outcome == "failed":
         logger.warning("child project linkage reconciliation failed for %s", session_id)
 
@@ -290,6 +378,23 @@ def _reconcile_child_links_pass(
     sessions_dir: os.PathLike[str] | str,
     session_id: str,
     *,
+    ready_collection_started: Callable[[], None] | None = None,
+    authority: SessionReferenceAuthority,
+) -> _ReconcileOutcome:
+    return _reconcile_child_links_pass_admitted(
+        project_registry,
+        sessions_dir,
+        session_id,
+        authority=authority,
+        ready_collection_started=ready_collection_started,
+    )
+
+def _reconcile_child_links_pass_admitted(
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+    *,
+    authority: SessionReferenceAuthority,
     ready_collection_started: Callable[[], None] | None = None,
 ) -> _ReconcileOutcome:
     try:
@@ -318,6 +423,18 @@ def _reconcile_child_links_pass(
         if not intents:
             return "more" if more else "drained"
 
+        authority.validate(
+            tuple(
+                reference
+                for _name, link in intents
+                for reference in (
+                    str(link["session_id"]),
+                    link.get("parent_session_id"),
+                    session_id,
+                )
+                if isinstance(reference, str)
+            )
+        )
         project_ids = {
             str(project_id)
             for _name, link in intents
@@ -592,6 +709,82 @@ def _remove_entry(pending_fd: int, name: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def associate_project(manager, metadata, project_id: str):
+    """Associate metadata and its registry row under one reference authority."""
+    previous_project_id = metadata.project_id
+    registry = manager.project_registry
+    if registry is None:
+        raise ProjectRegistryError("project registry capability is unavailable")
+    registry.show_project(project_id)
+    referenced_ids = tuple(
+        value
+        for value in (metadata.session_id, metadata.parent_session_id)
+        if value is not None
+    )
+    authority_holder: list[SessionReferenceAuthority] = []
+
+    @contextmanager
+    def admission():
+        with reference_publication(
+            manager.home,
+            manager._storage_lease,
+            referenced_ids=referenced_ids,
+        ) as authority:
+            authority_holder.append(authority)
+            yield authority
+
+    def publish(current):
+        publish_project_association(
+            manager,
+            current,
+            project_id=project_id,
+            previous_project_id=previous_project_id,
+            authority=authority_holder[-1],
+        )
+
+    bind = lambda item: setattr(item, "project_id", project_id) or item
+    current = manager._mutate(
+        metadata.session_id,
+        bind,
+        execution_lease=metadata._execution_lease,
+        authority=admission(),
+        before_release=publish,
+    )
+    manager._copy_metadata(metadata, current)
+    return current
+
+
+def publish_project_association(
+    manager,
+    current,
+    *,
+    project_id: str,
+    previous_project_id: str | None,
+    authority: SessionReferenceAuthority,
+) -> None:
+    """Finish the metadata-to-registry handoff under reference authority."""
+    try:
+        _persist_pending_root_link(
+            manager.sessions_dir,
+            current.session_id,
+            project_id,
+            current.project_role or "session",
+            current.parent_session_id,
+            manager._storage_lease,
+            previous_project_id=previous_project_id,
+            authority=authority,
+        )
+    except (SessionError, OSError) as exc:
+        logger.warning("could not persist project linkage intent: %s", exc)
+    manager._reconcile_project_link(current.session_id, _reference_authority=authority)
+    if previous_project_id is not None and previous_project_id != project_id:
+        from ..transcript_search.index import delete_indexed_session
+
+        delete_indexed_session(
+            manager.project_registry.root, previous_project_id, current.session_id
+        )
 
 
 __all__ = [
