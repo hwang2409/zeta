@@ -609,7 +609,9 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
 
     monkeypatch.setattr("zeta.tui.slash_handlers.ProjectInbox", InboxStub)
     monkeypatch.setattr("zeta.server.slash_commands.ProjectInbox", InboxStub)
-    inbox_registry = SimpleNamespace(root=Path("/home/projects"))
+    inbox_registry = SimpleNamespace(
+        root=Path("/home/projects"), observed_storage_epoch=7
+    )
     tui_inbox = SimpleNamespace(
         loop=SimpleNamespace(
             project_registry=inbox_registry,
