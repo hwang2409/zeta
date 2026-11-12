@@ -81,6 +81,7 @@ class ObserverSnapshotMixin:
                 candidate = raw
             for attribute in _FullLoadValidator._STATE_ATTRIBUTES:
                 setattr(self, attribute, getattr(validation.state, attribute))
+            self._resident_rows = validation.state._resident_rows
             delta = (
                 self._installed_delta_from_baseline(self._entries, baseline)
                 if self.on_entries_installed is not None

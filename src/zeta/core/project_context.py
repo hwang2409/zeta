@@ -51,6 +51,7 @@ from ..project_context.projection import (
     ProjectContextHealth,
     ProjectContextProjection,
 )
+from ..project_errors import ProjectRegistryBusyError
 from ..project_memory_history import MemoryContextEntry
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
@@ -74,6 +75,7 @@ APPEND_SYSTEM_FILENAME = "APPEND_SYSTEM.md"
 # 512 KiB is roughly 128k tokens — comfortably below any provider context
 # window, and well above realistic AGENTS.md totals.
 CONTEXT_BYTE_CAP = 512 * 1024
+_PROJECT_DISCOVERY_BUSY_RETRIES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +122,7 @@ class ProjectDiscovery:
     filesystem_root: Path
     eligible: bool
     project: Project | None = None
+    registry_busy: bool = False
 
 
 def _run_discovery_git(
@@ -305,6 +308,8 @@ def _find_or_create_valid_project(
     for name in names:
         try:
             return registry.create_project(name, "git", root, memory_profile="zeta")
+        except ProjectRegistryBusyError:
+            raise
         except ProjectRegistryError:
             project = _project_at_root(registry, root, discovery)
             if project is not None:
@@ -319,29 +324,37 @@ def associate_project_discovery(
 
     if not discovery.eligible:
         return discovery
-    project = _valid_registry_candidate(
-        registry.find_for_directory(discovery.cwd), discovery
-    )
-    if project is None and discovery.primary_root is not None:
-        project = _valid_registry_candidate(
-            registry.find_for_directory(discovery.primary_root), discovery
-        )
-    if project is None and discovery.common_dir is not None:
-        project = next(
-            (
-                candidate
-                for candidate in registry.list_projects()
-                if _valid_registry_candidate(candidate, discovery) is not None
-                and _checkout_common_dir(Path(candidate.canonical_integration_root))
-                == discovery.common_dir
-            ),
-            None,
-        )
-    if project is None and create and discovery.primary_root is not None:
-        project = _find_or_create_valid_project(
-            registry, discovery.primary_root, discovery
-        )
-    return replace(discovery, project=project)
+    for attempt in range(_PROJECT_DISCOVERY_BUSY_RETRIES):
+        try:
+            project = _valid_registry_candidate(
+                registry.find_for_directory(discovery.cwd), discovery
+            )
+            if project is None and discovery.primary_root is not None:
+                project = _valid_registry_candidate(
+                    registry.find_for_directory(discovery.primary_root), discovery
+                )
+            if project is None and discovery.common_dir is not None:
+                project = next(
+                    (
+                        candidate
+                        for candidate in registry.list_projects()
+                        if _valid_registry_candidate(candidate, discovery) is not None
+                        and _checkout_common_dir(
+                            Path(candidate.canonical_integration_root)
+                        )
+                        == discovery.common_dir
+                    ),
+                    None,
+                )
+            if project is None and create and discovery.primary_root is not None:
+                project = _find_or_create_valid_project(
+                    registry, discovery.primary_root, discovery
+                )
+            return replace(discovery, project=project)
+        except ProjectRegistryBusyError:
+            if attempt + 1 == _PROJECT_DISCOVERY_BUSY_RETRIES:
+                return replace(discovery, registry_busy=True)
+    raise AssertionError("project association retry loop did not return")
 
 
 def discover_project_root(cwd: str | Path | None = None) -> Path | None:
@@ -399,17 +412,6 @@ def project_command_view(
         f"root: {project.canonical_integration_root}\n"
         f"memory: {memory}",
     )
-
-
-def discover_or_find_project(
-    registry: ProjectRegistry, cwd: str | Path, user_home: Path
-) -> Project | None:
-    """Discover once and associate an eligible Git project."""
-
-    discovery = associate_project_discovery(
-        discover_project(cwd, user_home=user_home), registry
-    )
-    return discovery.project
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:

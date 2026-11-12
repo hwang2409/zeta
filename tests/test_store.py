@@ -285,7 +285,8 @@ def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
                 return super().__iter__()
 
         entries = CountingEntries(store._entries)
-        store._entries = entries
+        store._resident_rows = type(store._resident_rows).prepared(entries)
+        entries.iterations = 0
         store.commit_compaction_marker(
             "summary", 1, 1, expected_parent_id=first.id
         )
@@ -1448,16 +1449,27 @@ def test_installed_hook_does_not_access_resident_branch(tmp_path: Path) -> None:
     store.on_entries_installed = observed.append
 
     class BranchAccessGuard(list[ConversationEntry]):
+        blocked = False
+
+        def _check(self) -> None:
+            if self.blocked:
+                raise AssertionError("installed hook accessed resident entries")
+
         def __iter__(self):
-            raise AssertionError("installed hook walked the resident branch")
+            self._check()
+            return super().__iter__()
 
         def __len__(self):
-            raise AssertionError("installed hook measured the resident branch")
+            self._check()
+            return super().__len__()
 
         def __getitem__(self, key: object):
-            raise AssertionError("installed hook indexed the resident branch")
+            self._check()
+            return super().__getitem__(key)
 
-    store._entries = BranchAccessGuard(store._entries)
+    guarded_entries = BranchAccessGuard(store._entries)
+    store._resident_rows = type(store._resident_rows).prepared(guarded_entries)
+    guarded_entries.blocked = True
     store._publish_entries_installed((entry,))
 
     assert observed == [(entry,)]
@@ -1577,6 +1589,8 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     owner_thread = threading.get_ident()
     load_threads: list[int] = []
     active_rows_by_thread: dict[int, int] = {}
+    row_fact_threads: list[int] = []
+    observe_row_facts = True
     install_threads: list[int] = []
     loop_entry_accesses = 0
     observe_loop_access = True
@@ -1611,6 +1625,16 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     # test-contract: seam observe transcript loading across the async store boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
+    import zeta.core.store._rows as rows_module
+
+    original_row_facts = rows_module.row_facts
+
+    def observed_row_facts(entry: ConversationEntry) -> object | None:
+        if observe_row_facts:
+            row_fact_threads.append(threading.get_ident())
+        return original_row_facts(entry)
+
+    monkeypatch.setattr(rows_module, "row_facts", observed_row_facts)
 
     original_record_active_entry = DeliveryFold.apply
 
@@ -1644,7 +1668,13 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_install_committed_delta", observed_install)
     # Guard the outgoing resident branch too: the loop detaches it during install.
-    store._entries = ObservedEntries(store._entries)
+    observe_loop_access = False
+    observe_row_facts = False
+    store._resident_rows = type(store._resident_rows).prepared(
+        ObservedEntries(store._entries)
+    )
+    observe_loop_access = True
+    observe_row_facts = True
 
     await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
     observe_loop_access = False
@@ -1655,6 +1685,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert sum(active_rows_by_thread.values()) >= len(rows)
     assert install_threads == [owner_thread, owner_thread]
     assert loop_entry_accesses == 0
+    assert row_fact_threads.count(owner_thread) <= 2
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
@@ -2316,16 +2347,19 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
     event_loop_thread = threading.get_ident()
     mutation_threads: list[int] = []
 
-    class ObservedEntries(list[ConversationEntry]):
-        def append(self, entry: ConversationEntry) -> None:
-            mutation_threads.append(threading.get_ident())
-            super().append(entry)
+    original_append = store._resident_rows.append
+    original_extend = store._resident_rows.extend
 
-        def extend(self, entries: list[ConversationEntry]) -> None:
-            mutation_threads.append(threading.get_ident())
-            super().extend(entries)
+    def observed_append(entry):
+        mutation_threads.append(threading.get_ident())
+        return original_append(entry)
 
-    store._entries = ObservedEntries(store._entries)
+    def observed_extend(entries):
+        mutation_threads.append(threading.get_ident())
+        return original_extend(entries)
+
+    store._resident_rows.append = observed_append
+    store._resident_rows.extend = observed_extend
     store._before_incremental_state_install = lambda: mutation_threads.append(
         threading.get_ident()
     )
