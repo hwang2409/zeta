@@ -4307,6 +4307,7 @@ async def test_rejected_pre_hello_request_closes_connection(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_disconnect_aborts_pending_approval_without_phantom(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call = ToolCall("call-1", "read", {"path": str(tmp_path / "input")})
     backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
@@ -4316,12 +4317,29 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
+    # The disconnect abort is made durable inside the controller-release task,
+    # not synchronously on the read loop. Capture that task so the assertion
+    # waits for the real completion signal instead of a wall-clock sleep.
+    release_started = asyncio.Event()
+    release_tasks: list[asyncio.Task[None]] = []
+    begin_controller_release = server.control.begin_controller_release
+
+    def capture_release(**kwargs: object) -> asyncio.Task[None]:
+        task = begin_controller_release(**kwargs)
+        release_tasks.append(task)
+        release_started.set()
+        return task
+
+    monkeypatch.setattr(server.control, "begin_controller_release", capture_release)
     reader, writer = await _ready(server)
     await _request(reader, writer, 3, "send", {"text": "read it"})
     await _event(reader, "approval_request")
     writer.close()
     await writer.wait_closed()
-    await asyncio.sleep(0.05)
+    await await_or_fail(release_started.wait(), what="controller release start")
+    await await_or_fail(
+        asyncio.shield(release_tasks[0]), what="controller release abort"
+    )
     assert server.runtime.policy is not None
     assert (await server.runtime.policy.pending_requests()) == []
     await server.close()
