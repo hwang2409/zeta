@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import json
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
@@ -793,8 +792,6 @@ class SlashHandlerMixin:
         )
 
     async def slash_inbox(self, args: str) -> str:
-        if args.strip():
-            return "usage: /inbox"
         registry = self.loop.project_registry
         project_id = self.loop.session_metadata.project_id
         if registry is None or project_id is None:
@@ -803,12 +800,14 @@ class SlashHandlerMixin:
             state = await asyncio.to_thread(
                 ProjectInbox(
                     registry, sessions_root=registry.root.parent / "sessions"
-                ).list,
+                ).command,
                 project_id,
+                args,
+                from_session=self.loop.session_metadata.session_id,
             )
         except (InboxError, OSError) as exc:
             return f"project inbox unavailable: {exc}"
-        return json.dumps(state, indent=2, sort_keys=True)
+        return state
 
     def slash_theme(self, args: str) -> str:
         """Show, list, or switch the active TUI theme."""
