@@ -15,6 +15,7 @@ from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
+    associate_project_discovery,
     discover_project,
     load_project_context,
     project_context_projection_for_discovery,
@@ -439,7 +440,27 @@ class ServerRuntime:
             model=model,
         )
         await self._replace(composition)
+        await self._publish_project_registry_notice(composition)
         return self.metadata
+
+    async def _publish_project_registry_notice(
+        self, composition: RuntimeComposition
+    ) -> None:
+        if composition.project_registry_busy:
+            await self.control._event(
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={
+                        "notification_id": f"project-registry-busy:{self.metadata.session_id}",
+                        "kind": "project_registry_busy",
+                        "text": (
+                            "project memory and inbox are off for this session: "
+                            "the project registry was busy; restart to retry"
+                        ),
+                    },
+                ),
+                session_id=self.metadata.session_id,
+            )
 
     def _prepare_new_session(
         self, session_cwd: Path, provider: str | None, model: str | None
@@ -450,6 +471,8 @@ class ServerRuntime:
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         registry = self.manager.project_registry
+        if registry is not None and config.auto_project:
+            discovery = associate_project_discovery(discovery, registry)
         projection = (
             project_context_projection_for_discovery(discovery, registry)
             if registry is not None
@@ -499,6 +522,12 @@ class ServerRuntime:
             project_root=repo_root,
         )
         registry = self.manager.project_registry
+        if (
+            registry is not None
+            and config.auto_project
+            and opened.metadata.project_id is None
+        ):
+            discovery = associate_project_discovery(discovery, registry)
         projection = (
             registry.project_context_projection(opened.metadata.project_id)
             if registry is not None
@@ -548,6 +577,7 @@ class ServerRuntime:
 
         composition = await self._run_setup(session_cwd, session_id=session_id)
         await self._replace(composition)
+        await self._publish_project_registry_notice(composition)
         return self.metadata
 
     @staticmethod

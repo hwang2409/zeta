@@ -122,6 +122,7 @@ class ProjectDiscovery:
     filesystem_root: Path
     eligible: bool
     project: Project | None = None
+    registry_busy: bool = False
 
 
 def _run_discovery_git(
@@ -323,29 +324,37 @@ def associate_project_discovery(
 
     if not discovery.eligible:
         return discovery
-    project = _valid_registry_candidate(
-        registry.find_for_directory(discovery.cwd), discovery
-    )
-    if project is None and discovery.primary_root is not None:
-        project = _valid_registry_candidate(
-            registry.find_for_directory(discovery.primary_root), discovery
-        )
-    if project is None and discovery.common_dir is not None:
-        project = next(
-            (
-                candidate
-                for candidate in registry.list_projects()
-                if _valid_registry_candidate(candidate, discovery) is not None
-                and _checkout_common_dir(Path(candidate.canonical_integration_root))
-                == discovery.common_dir
-            ),
-            None,
-        )
-    if project is None and create and discovery.primary_root is not None:
-        project = _find_or_create_valid_project(
-            registry, discovery.primary_root, discovery
-        )
-    return replace(discovery, project=project)
+    for attempt in range(_PROJECT_DISCOVERY_BUSY_RETRIES):
+        try:
+            project = _valid_registry_candidate(
+                registry.find_for_directory(discovery.cwd), discovery
+            )
+            if project is None and discovery.primary_root is not None:
+                project = _valid_registry_candidate(
+                    registry.find_for_directory(discovery.primary_root), discovery
+                )
+            if project is None and discovery.common_dir is not None:
+                project = next(
+                    (
+                        candidate
+                        for candidate in registry.list_projects()
+                        if _valid_registry_candidate(candidate, discovery) is not None
+                        and _checkout_common_dir(
+                            Path(candidate.canonical_integration_root)
+                        )
+                        == discovery.common_dir
+                    ),
+                    None,
+                )
+            if project is None and create and discovery.primary_root is not None:
+                project = _find_or_create_valid_project(
+                    registry, discovery.primary_root, discovery
+                )
+            return replace(discovery, project=project)
+        except ProjectRegistryBusyError:
+            if attempt + 1 == _PROJECT_DISCOVERY_BUSY_RETRIES:
+                return replace(discovery, registry_busy=True)
+    raise AssertionError("project association retry loop did not return")
 
 
 def discover_project_root(cwd: str | Path | None = None) -> Path | None:
@@ -410,16 +419,10 @@ def discover_or_find_project(
 ) -> Project | None:
     """Discover once and associate an eligible Git project."""
 
-    for attempt in range(_PROJECT_DISCOVERY_BUSY_RETRIES):
-        try:
-            discovery = associate_project_discovery(
-                discover_project(cwd, user_home=user_home), registry
-            )
-            return discovery.project
-        except ProjectRegistryBusyError:
-            if attempt + 1 == _PROJECT_DISCOVERY_BUSY_RETRIES:
-                raise
-    raise AssertionError("project discovery retry loop did not return")
+    discovery = associate_project_discovery(
+        discover_project(cwd, user_home=user_home), registry
+    )
+    return discovery.project
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
