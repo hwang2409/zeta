@@ -223,6 +223,9 @@ class EventDescriptor(StrEnum):
     SESSION_GRANTS_CHANGED = "session_grants_changed"
     REPLAY_STREAM_ENDED = "replay_stream_ended"
     CONFIG_CHANGED = "config_changed"
+    CHILD_STARTED = "child_started"
+    CHILD_PROGRESS = "child_progress"
+    CHILD_ENDED = "child_ended"
     BACKGROUND_TASK_UPDATED = "background_task_updated"
     TODO_UPDATED = "todo_updated"
 
@@ -255,7 +258,8 @@ FEATURES = (
     "session_host_commands",
     "session_history_fidelity",
     "session_replay_seq",
-"child_run_history",
+    "child_run_history",
+    "child_run_events",
     "served_turn_end",
     "content_read",
     "session_grants",
@@ -299,6 +303,7 @@ class MethodDescriptor(Enum):
         Access.READ,
     )
     CHILD_RUN_HISTORY = ("child_run_history", "1.1", "child_run_history", Access.READ)
+    CHILD_RUN_EVENTS = ("child_run_events", "1.1", "child_run_events", Access.READ)
     CONTENT_READ = ("content_read", "1.1", "content_read", Access.READ)
     SWITCH_BRANCH = ("switch_branch", "1.1", None, Access.SESSION_MUTATION)
     FORK_MESSAGE = ("fork_message", "1.1", None, Access.SESSION_MUTATION)
@@ -389,6 +394,17 @@ EVENT_ACCESS = {
     EventDescriptor.BACKGROUND_TASK_UPDATED: Access.CONTROLLER_READ,
     EventDescriptor.TODO_UPDATED: Access.CONTROLLER_READ,
 }
+
+
+CHILD_RUN_EVENTS_PREREQUISITES = frozenset(
+    descriptor.feature
+    for descriptor in (
+        MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE,
+        MethodDescriptor.CHILD_RUN_HISTORY,
+        MethodDescriptor.CHILD_RUN_LIST,
+    )
+    if descriptor.feature is not None
+)
 
 
 _LOGIN_METHODS = frozenset(
@@ -733,6 +749,14 @@ class FrameCodec:
     def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}
         return self._bounded_json(value, request_id=request_id)
+
+    def _result_response(self, request_id: str | int | None, result: object) -> _Frame | None:
+        """The result frame, or None when only an error frame could go out."""
+        try:
+            payload = self._json_bytes({"jsonrpc": "2.0", "id": request_id, "result": result})
+        except (TypeError, UnicodeEncodeError, ValueError, RecursionError):
+            return None
+        return payload if len(payload) <= MAX_FRAME_BYTES else None
 
     def serialized_size(self, value: object) -> int:
         """Return the exact encoded size under this codec's JSON settings."""

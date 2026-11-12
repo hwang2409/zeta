@@ -22,6 +22,7 @@ from ..storage_format import (
 )
 from .agent_progress import (
     live_agent_lifecycle,
+    post_child_progress,
     publish_live_agent_lifecycle,
     remove_live_agent_lifecycle,
 )
@@ -610,6 +611,7 @@ class AgentStateMixin:
             publish_live_agent_lifecycle(
                 self.agent_lifecycle_path, self._agent_lifecycle
             )
+            post_child_progress(self, self._agent_lifecycle)
 
     def update_agent_lifecycle(
         self,
@@ -634,6 +636,10 @@ class AgentStateMixin:
             raise ValueError("agent lifecycle idle timestamp is invalid")
         if self._agent_lifecycle is None:
             return
+        before = (
+            self._agent_lifecycle.get("current_step"),
+            self._agent_lifecycle.get("state"),
+        )
         if current_step is not None:
             self._agent_lifecycle["current_step"] = current_step
         if turns_used is not None:
@@ -646,6 +652,12 @@ class AgentStateMixin:
             self._agent_lifecycle["idle_since"] = idle_since
         self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
         publish_live_agent_lifecycle(self.agent_lifecycle_path, self._agent_lifecycle)
+        # a parent-visible change: a new step or live state, not turns or elapsed
+        if before != (
+            self._agent_lifecycle.get("current_step"),
+            self._agent_lifecycle.get("state"),
+        ):
+            post_child_progress(self, self._agent_lifecycle)
 
     def finish_agent_lifecycle(
         self,
