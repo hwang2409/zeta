@@ -1810,12 +1810,22 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
 
 
 class FinishGateBackend(CompletionBackend):
-    def __init__(self, gate_action: str, *, background_child: bool = False) -> None:
+    def __init__(
+        self,
+        gate_action: str,
+        *,
+        background_child: bool = False,
+        hold_gate_check: bool = False,
+    ) -> None:
         self.gate_action = gate_action
         self.background_child = background_child
+        self.hold_gate_check = hold_gate_check
         self.grandchild_started = asyncio.Event()
         self.release_grandchild = asyncio.Event()
+        self.child_turn_returned = asyncio.Event()
         self.gate_seen = asyncio.Event()
+        self.gate_check_started = asyncio.Event()
+        self.release_gate_check = asyncio.Event()
         self.gate_response_completed = asyncio.Event()
         self.model_bound_reached = asyncio.Event()
         self.child_final_responses: list[str] = []
@@ -1897,6 +1907,12 @@ class FinishGateBackend(CompletionBackend):
             blocks = [TextContent("child canceled unused work and finished")]
         elif gate is not None and not notification:
             self.gate_calls += 1
+            if self.hold_gate_check and self.gate_calls == 1:
+                self.gate_check_started.set()
+                await await_or_fail(
+                    self.release_gate_check.wait(),
+                    what="self.release_gate_check.wait()",
+                )
             self.gate_seen.set()
             gate_text = next(
                 block.text for block in gate.content if isinstance(block, TextContent)
@@ -1954,6 +1970,8 @@ class FinishGateBackend(CompletionBackend):
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        if last_user == "child prompt":
+            self.child_turn_returned.set()
         # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate is not None:
             self.gate_response_completed.set()
@@ -3348,44 +3366,147 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     await loop.close()
 
 
-@pytest.mark.asyncio
-async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
+async def _run_child_finish_gate_order(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch | None,
+    release_order: str | None,
 ) -> None:
-    backend = FinishGateBackend("wait")
+    if release_order is None:
+        release_order = "before_gate"
+    backend = FinishGateBackend("wait", hold_gate_check=monkeypatch is not None)
+    gate_engaged = asyncio.Event()
+    release_gate_engagement = asyncio.Event()
+    if monkeypatch is None:
+        gate_engaged.set()
+        release_gate_engagement.set()
+    original_run_finish_gate = agent_runner_module.run_finish_gate
+
+    async def hold_gate_engagement(*args: object, **kwargs: object) -> FinishGateResult:
+        gate_engaged.set()
+        await await_or_fail(
+            release_gate_engagement.wait(), what="release_gate_engagement.wait()"
+        )
+        return await original_run_finish_gate(*args, **kwargs)
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(agent_runner_module, "run_finish_gate", hold_gate_engagement)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    assert not task.done()
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    gate_message = next(
-        message
-        for message in child_store.messages()
-        if message.metadata.get("zeta_event") == "agent_finish_gate"
-    )
-    assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
-    assert "collect evidence" in next(
-        block.text for block in gate_message.content if isinstance(block, TextContent)
-    )
+    child_store: ConversationStore | None = None
+    expect_gate_call = release_order != "before_end_turn"
 
-    child_store.close()
-    backend.release_grandchild.set()
-    await asyncio.wait_for(task, timeout=10)
+    def dump_order() -> str:
+        if child_store is not None:
+            child_store.refresh()
+        print(
+            "finish-gate order dump",
+            release_order,
+            "lifecycle=",
+            child_store.agent_lifecycle() if child_store is not None else None,
+            "task_done=",
+            task.done(),
+            "running_tasks=",
+            loop.tool_registry.background_tasks.running_count,
+            "registry=",
+            loop.tool_registry.background_tasks.snapshot(),
+            "grandchild_started=",
+            backend.grandchild_started.is_set(),
+            "gate_engaged=",
+            gate_engaged.is_set(),
+            "gate_seen=",
+            backend.gate_seen.is_set(),
+            "child_turn_returned=",
+            backend.child_turn_returned.is_set(),
+        )
+        return "finish-gate order completion"
 
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    lifecycle = child_store.agent_lifecycle()
-    assert lifecycle is not None
-    assert lifecycle["final_result"].startswith("merged result: evidence ready")
-    assert backend.child_final_responses.index("premature child answer") < (
-        backend.child_final_responses.index("merged result: evidence ready")
-    )
-    assert not store.agent_children()
-    child_store.close()
-    await loop.close()
+    try:
+        if release_order == "before_end_turn":
+            await await_or_fail(
+                backend.grandchild_started.wait(), what="grandchild start"
+            )
+            backend.release_grandchild.set()
+            if not gate_engaged.is_set():
+                await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+            release_gate_engagement.set()
+            backend.release_gate_check.set()
+            await await_or_fail(task, what=dump_order)
+        else:
+            await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+            if release_order == "before_gate":
+                await await_or_fail(
+                    backend.grandchild_started.wait(), what="grandchild start"
+                )
+                backend.release_grandchild.set()
+                release_gate_engagement.set()
+                backend.release_gate_check.set()
+                await await_or_fail(task, what=dump_order)
+            else:
+                release_gate_engagement.set()
+                await await_or_fail(
+                    backend.gate_check_started.wait(), what="finish-gate check"
+                )
+                assert not backend.gate_seen.is_set()
+                backend.release_gate_check.set()
+            if expect_gate_call:
+                await await_or_fail(
+                    backend.gate_seen.wait(), what="finish-gate model turn"
+                )
+            assert not task.done() if release_order == "after_gate" else task.done()
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        if expect_gate_call:
+            gate_message = next(
+                message
+                for message in child_store.messages()
+                if message.metadata.get("zeta_event") == "agent_finish_gate"
+            )
+            assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
+            assert "collect evidence" in next(
+                block.text
+                for block in gate_message.content
+                if isinstance(block, TextContent)
+            )
+
+        child_store.close()
+        child_store = None
+        backend.release_grandchild.set()
+        await await_or_fail(task, what="finish-gate completion")
+
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        lifecycle = child_store.agent_lifecycle()
+        assert lifecycle is not None
+        assert lifecycle["final_result"].startswith("merged result: evidence ready")
+        assert backend.child_final_responses.index("premature child answer") < (
+            backend.child_final_responses.index("merged result: evidence ready")
+        )
+        assert not store.agent_children()
+    finally:
+        if child_store is not None:
+            child_store.close()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        store.close()
+        await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_order", ["before_end_turn", "before_gate", "after_gate"])
+async def test_child_finish_gate_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_order: str
+) -> None:
+    await _run_child_finish_gate_order(tmp_path, monkeypatch, release_order)
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
+    tmp_path: Path,
+) -> None:
+    await _run_child_finish_gate_order(tmp_path, None, None)
 
 
 @pytest.mark.asyncio
