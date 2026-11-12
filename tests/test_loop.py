@@ -3405,7 +3405,7 @@ def test_thinking_output_limit_retry_renders_in_tui() -> None:
         StreamEvent(
             StreamEventType.RETRY,
             data={
-                "kind": "thinking_output_limit_recovery",
+                "kind": "output_limit_recovery",
                 "reason": "max_tokens",
                 "text": (
                     "output token limit reached while thinking; asking the model "

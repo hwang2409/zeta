@@ -729,8 +729,7 @@ class AgentLoop(
         self._turn_provider_retry_records = []
         recovery_state = EmptyTurnRecoveryState()
         nudge_turn_pending = False
-        recovering_tool_limit = False
-        recovering_thinking_limit = False
+        recovering_output_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
         provider_retry_budget: CompletionRetryBudget | None = None
@@ -741,8 +740,7 @@ class AgentLoop(
             or step_delivery.has_pending_edge
             or retrying_context
             or nudge_turn_pending
-            or recovering_tool_limit
-            or recovering_thinking_limit
+            or recovering_output_limit
         ):
             if not retrying_context:
                 if self._abort_admitted:
@@ -1111,28 +1109,39 @@ class AgentLoop(
             error = output_limit_error(
                 assistant_message, stop_reason=self._turn_stop_reason
             )
-            if incomplete_tool_name is not None:
-                if recovering_tool_limit:
-                    error = ErrorInfo("max_tokens", OUTPUT_LIMIT_ERROR_MESSAGE)
+            if incomplete_tool_name is not None or (error is not None and not calls):
+                # An output-limit stop with no usable reply gets one recovery
+                # nudge; a second stop in a row ends the run with the error.
+                if recovering_output_limit:
+                    error = error or ErrorInfo("max_tokens", OUTPUT_LIMIT_ERROR_MESSAGE)
                     yield StreamEvent(StreamEventType.ERROR, error=error)
                     if self.agent_instance_id is None:
                         await step_delivery.admit_terminal("foreground_end")
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
+                if incomplete_tool_name is not None:
+                    recovery_message = build_tool_limit_recovery_message(
+                        incomplete_tool_name
+                    )
+                    recovery_text = (
+                        "output token limit reached while writing a "
+                        f"<{incomplete_tool_name[:128]}> call; asking the model "
+                        "to split the work into smaller calls"
+                    )
+                else:
+                    recovery_message = build_thinking_limit_recovery_message()
+                    recovery_text = (
+                        "output token limit reached while thinking; asking the "
+                        "model to think less and reply"
+                    )
                 await step_delivery.admit_terminal("nudge")
-                await self._append_turn_message(
-                    build_tool_limit_recovery_message(incomplete_tool_name)
-                )
+                await self._append_turn_message(recovery_message)
                 yield StreamEvent(
                     StreamEventType.RETRY,
                     data={
                         "kind": "output_limit_recovery",
                         "reason": "max_tokens",
-                        "text": (
-                            "output token limit reached while writing a "
-                            f"<{incomplete_tool_name[:128]}> call; asking the model "
-                            "to split the work into smaller calls"
-                        ),
+                        "text": recovery_text,
                     },
                 )
                 exhausted = (
@@ -1148,50 +1157,9 @@ class AgentLoop(
                 if exhausted:
                     yield StreamEvent(StreamEventType.AGENT_END)
                     return
-                recovering_tool_limit = True
+                recovering_output_limit = True
                 continue
-            recovering_tool_limit = False
-            if error is not None and not calls:
-                if not recovering_thinking_limit:
-                    # First thinking-only output-limit stop: nudge once to think
-                    # less and act, rather than losing the whole run. End with the
-                    # error only if the retry also hits the limit.
-                    await step_delivery.admit_terminal("nudge")
-                    await self._append_turn_message(
-                        build_thinking_limit_recovery_message()
-                    )
-                    yield StreamEvent(
-                        StreamEventType.RETRY,
-                        data={
-                            "kind": "thinking_output_limit_recovery",
-                            "reason": "max_tokens",
-                            "text": (
-                                "output token limit reached while thinking; asking "
-                                "the model to think less and reply"
-                            ),
-                        },
-                    )
-                    exhausted = (
-                        self.child_turn_control.finish_completion()
-                        if self.child_turn_control is not None
-                        else False
-                    )
-                    yield StreamEvent(
-                        StreamEventType.TURN_END,
-                        message=assistant_message,
-                        data={"turn": turn_number, "tool_calls": 0},
-                    )
-                    if exhausted:
-                        yield StreamEvent(StreamEventType.AGENT_END)
-                        return
-                    recovering_thinking_limit = True
-                    continue
-                yield StreamEvent(StreamEventType.ERROR, error=error)
-                if self.agent_instance_id is None:
-                    await step_delivery.admit_terminal("foreground_end")
-                yield StreamEvent(StreamEventType.AGENT_END)
-                return
-            recovering_thinking_limit = False
+            recovering_output_limit = False
             if not calls:
                 transition = await toolless_transition(
                     self,
