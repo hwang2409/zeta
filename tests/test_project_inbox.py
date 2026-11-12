@@ -698,6 +698,101 @@ def test_durable_intent_recovers_exactly_one_delivery_after_crash(
     assert [record["publication"] for record in final_ledger["records"]] == ["published"]
 
 
+def test_sent_view_during_durable_send_does_not_invert_locks(
+    tmp_path: Path,
+) -> None:
+    # A durable send holds the recipient inbox flock and then takes the sender
+    # tracker lock (deliver_tracked -> record_intent). The sent view must not
+    # hold the tracker lock while it waits for that same inbox flock, or the two
+    # invert: the view's flock wait times out (~1 s) and raises InboxBusyError.
+    # This forces exactly that interleaving and asserts the view returns the row.
+    home, registry, project_a, project_b = _epoch_projects(tmp_path)
+    assert registry.observed_storage_epoch >= 8
+    session_id = "a" * 32
+    tracker = SentMessageTracker(
+        home / "sessions", session_id, observed_epoch=registry.observed_storage_epoch
+    )
+    inbox = ProjectInbox(
+        registry, sessions_root=home / "sessions", sent_tracker=tracker
+    )
+
+    def send(title: str) -> str:
+        return inbox.send_user(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="info",
+            title=title,
+            body="body",
+        )
+
+    # One prior tracked send gives the view a row to resolve (and the inbox
+    # flock to contend for). Patches are installed only after it completes.
+    send("one")
+
+    send_holds_inbox = threading.Event()
+    view_reached_inbox = threading.Event()
+
+    real_record_intent = tracker.record_intent
+
+    def gated_record_intent(*args: object, **kwargs: object):
+        # Reached while the sender holds the recipient inbox EX flock, just
+        # before it takes the tracker lock.
+        send_holds_inbox.set()
+        assert view_reached_inbox.wait(timeout=10)
+        return real_record_intent(*args, **kwargs)
+
+    real_read_tracked = inbox._read_tracked_message
+    gated = threading.Event()
+
+    def gated_read_tracked(*args: object, **kwargs: object):
+        # Reached while the view resolves its snapshot, just before it takes the
+        # recipient inbox SH flock. Gate only the first call in this window.
+        if not gated.is_set():
+            gated.set()
+            view_reached_inbox.set()
+            assert send_holds_inbox.wait(timeout=10)
+        return real_read_tracked(*args, **kwargs)
+
+    tracker.record_intent = gated_record_intent  # type: ignore[method-assign]
+    inbox._read_tracked_message = gated_read_tracked  # type: ignore[method-assign]
+
+    results: dict[str, object] = {}
+
+    def run_view() -> None:
+        try:
+            outcome = tracker.sent_view(inbox, project_a.project_id, ())
+            results["view"] = outcome
+        except Exception as exc:  # noqa: BLE001
+            results["view_error"] = exc
+
+    def run_send() -> None:
+        try:
+            results["send"] = send("two")
+        except Exception as exc:  # noqa: BLE001
+            results["send_error"] = exc
+
+    view_thread = threading.Thread(target=run_view)
+    send_thread = threading.Thread(target=run_send)
+    view_thread.start()
+    send_thread.start()
+    view_thread.join(timeout=20)
+    send_thread.join(timeout=20)
+    assert not view_thread.is_alive()
+    assert not send_thread.is_alive()
+
+    # The send completed and delivered; the view returned the tracked row with
+    # healthy history rather than a busy error.
+    assert "send_error" not in results, results.get("send_error")
+    assert "view_error" not in results, results.get("view_error")
+    outcome = results["view"]
+    assert outcome.health.state == "healthy"  # type: ignore[attr-defined]
+    titles = {row["title"] for row in outcome.result}  # type: ignore[attr-defined]
+    assert "one" in titles
+    delivered = {row["title"] for row in inbox.list(project_b.project_id)["new"]}
+    assert delivered == {"one", "two"}
+
+
 def test_below_epoch_keeps_v1_ledger_and_writes_no_generation(
     tmp_path: Path,
 ) -> None:

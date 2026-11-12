@@ -104,6 +104,7 @@ class SentDelivery:
 
         inbox = self._inbox
         failures: list[str] = []
+        lease = inbox.registry._storage_lease
         # shortcut: an intent whose target can never succeed (a removed project,
         # or a caller-supplied id that conflicts) retries every poll for the
         # session's life with degraded health; there is no abandonment path.
@@ -111,13 +112,24 @@ class SentDelivery:
         for envelope in tracker.pending_intents():
             target = envelope["to_project"]
             message_id = envelope["id"]
+            sender = envelope["from"]["session"]
+            to_session = envelope.get("to_session")
             try:
                 body = tracker.resolve_pending_body(message_id, envelope["body"])
                 record = dict(envelope)
                 record["body"] = body
-                with inbox._directories(target, create=True) as dirs:
-                    inbox._publish_outgoing(dirs, message_id, body, record)
-                tracker.record(message_id, target)
+                # The reference gate holds storage authority while the re-publish
+                # and its record run, exactly as the live send does, so the
+                # retention reaper cannot delete the referenced recipient session
+                # mid-publish.
+                with reference_publication(
+                    inbox.registry.root.parent,
+                    lease,
+                    referenced_ids=(sender, to_session) if to_session else (sender,),
+                ):
+                    with inbox._directories(target, create=True) as dirs:
+                        inbox._publish_outgoing(dirs, message_id, body, record)
+                    tracker.record(message_id, target, _storage_lease=lease)
             except (OSError, SessionError, InboxError, ValueError) as exc:
                 failures.append(f"{message_id}: {exc}")
         return failures

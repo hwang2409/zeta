@@ -145,14 +145,20 @@ class SentMessageTracker:
             self._refresh()
             return self._outcome(None)
 
-    def _outcome[T](self, result: T) -> SentLedgerOutcome[T]:
-        if not isinstance(self._state, _Broken):
+    def _outcome[T](
+        self,
+        result: T,
+        state: _Missing | _Loaded | _Broken | None = None,
+    ) -> SentLedgerOutcome[T]:
+        if state is None:
+            state = self._state
+        if not isinstance(state, _Broken):
             return SentLedgerOutcome(result, SentLedgerHealth("healthy", True), "")
         health = SentLedgerHealth(
             "broken",
             False,
-            self._state.reason,
-            str(self._state.path.relative_to(self.sessions_root.parent)),
+            state.reason,
+            str(state.path.relative_to(self.sessions_root.parent)),
         )
         warning = (
             f"sent history is incomplete ({health.reason}) at {health.ledger}; messages sent or replied "
@@ -463,19 +469,30 @@ class SentMessageTracker:
             self._receipts = tuple(receipts)
             self._refresh()
             tracked = tuple(dict(r) for r in reversed(self._records))
-            if isinstance(self._state, _Broken):
-                result = self._projected_broken_sent(inbox, source_project)
-            else:
-                result = inbox.delivery.resolve_tracked_sent(
-                    source_project, self.session_id, tracked
-                )
-            return self._outcome(result)
+            state = self._state
+            receipt_snapshot = self._receipts
+        # Resolve against the inbox after releasing the tracker lock: a durable
+        # send holds the recipient inbox flock and then takes this lock
+        # (deliver_tracked -> record_intent), so the view must never hold this
+        # lock while it waits for that flock, or the two invert and stall.
+        if isinstance(state, _Broken):
+            result = self._projected_broken_sent(
+                inbox, source_project, receipt_snapshot
+            )
+        else:
+            result = inbox.delivery.resolve_tracked_sent(
+                source_project, self.session_id, tracked
+            )
+        return self._outcome(result, state)
 
     def _projected_broken_sent(
-        self, inbox: ProjectInbox, source_project: str
+        self,
+        inbox: ProjectInbox,
+        source_project: str,
+        receipts: tuple[tuple[str, str], ...],
     ) -> list[dict[str, Any]]:
         receipt_map: dict[str, set[str]] = {}
-        for message_id, status in self._receipts:
+        for message_id, status in receipts:
             receipt_map.setdefault(message_id, set()).add(status)
         rows: list[dict[str, Any]] = []
         for target in sorted(
