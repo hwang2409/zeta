@@ -525,9 +525,6 @@ class ApprovalLifecycle:
             if isinstance(record.target.key, tuple)
         )
 
-        # p08b seam: read pending foreground requests from the resident approval
-        # index page (main's removed approval_states_snapshot() full map) and each
-        # delegated request's authoritative state with the sync *_now seam.
         pending: list[tuple[str, ToolCall]] = []
         after_seq = 0
         while True:
@@ -569,6 +566,11 @@ class ApprovalLifecycle:
     ) -> asyncio.Task[object]:
         key = record.target.key if isinstance(record, ApprovalRecord) else record
         return self._task_owner.start(key, operation, kind)
+
+    def _install_abort(self, record: ApprovalRecord, reason: str) -> asyncio.Task[object]:
+        task = self._start_settlement(record, self._settle_record(record, "abort", reason))
+        self._change(record, settlement=task)
+        return task
 
     def _new_record(self, target: _ApprovalTarget) -> ApprovalRecord:
         token = self._next_token()
@@ -624,9 +626,7 @@ class ApprovalLifecycle:
             reason = (
                 "turn_canceled" if record.disposition == "abort" else record.disposition
             )
-            record = self._reserve_record(record, reason)
-            task = self._start_settlement(record, self._settle_record(record, "abort", reason))
-            self._change(record, settlement=task)
+            self._install_abort(self._reserve_record(record, reason), reason)
 
     def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         cleanup = self.transition(CleanupChild(child_instance_id))
@@ -752,7 +752,7 @@ class ApprovalLifecycle:
         record = current
         if record.disposition != "active":
             record = self._reserve_record(record, record.disposition)
-            await self._settle_record(record, "abort", record.disposition)
+            await self._install_abort(record, record.disposition)
             return None
         request = policy.request_from_store(core_key, state[0], label=label)
         record = self._change(record, request=request)
@@ -872,8 +872,7 @@ class ApprovalLifecycle:
             record = reserved
         if record.phase == "starting":
             return record.admitted
-        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
-        self._change(record, settlement=settlement)
+        self._install_abort(record, reason)
         return record.admitted
 
     async def _settle_canceled_approval(
@@ -1157,9 +1156,10 @@ class ApprovalLifecycle:
         payload = self.observe(request, fields=approval_display_fields(request))
         if isinstance(target.key, tuple) and target.history_store is not None:
             try:
-                await target.history_store.append_approval_history_async(
+                write = target.history_store.append_approval_history_async(
                     {"event": "approval_request", **payload}
                 )
+                await asyncio.ensure_future(write)  # structural yield
             except OSError:
                 await self._settle_failed_start(record)
                 return
@@ -1205,10 +1205,7 @@ class ApprovalLifecycle:
             if record.disposition not in {"active", "external"}
             else "turn_canceled"
         )
-        record = self._reserve_record(record, reason)
-        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
-        self._change(record, settlement=settlement)
-        await settlement
+        await self._install_abort(self._reserve_record(record, reason), reason)
 
     async def _end_approval(
         self,
@@ -1288,6 +1285,4 @@ class ApprovalLifecycle:
         record = self._reserve(record, reason)
         if record is None or record.phase == "starting":
             return None
-        settlement = self._start_settlement(record, self._settle_record(record, "abort", reason))
-        self._change(record, settlement=settlement)
-        return settlement
+        return self._install_abort(record, reason)
