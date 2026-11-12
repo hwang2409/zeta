@@ -2126,6 +2126,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     await await_or_fail(release.wait(), what="bare publication")
                 return await original_finish_record(record, resolution, row)
 
+            # test-contract: seam gate the bare one-owner publication mid-flight
             monkeypatch.setattr(
                 server.control._approvals, "_finish_record", gated_bare_finish
             )
