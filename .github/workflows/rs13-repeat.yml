@@ -1,0 +1,20 @@
+name: rs13-repeat
+on: push
+jobs:
+  repeat:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: repeat fresh-prompt tests x40
+        run: |
+          set -e
+          for i in $(seq 1 40); do
+            echo "=== run $i ==="
+            uv run --frozen pytest -q -p no:randomly \
+              tests/test_agent.py::test_consume_run_after_finish_gate_terminal \
+              tests/test_agent.py::test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget
+          done
