@@ -13,6 +13,7 @@ from ...accounts.usage import UsageState, format_usage_lines
 from .. import theme
 
 HINT = "↑/↓ · enter · l login · x logout · r refresh · d default · n rename · esc"
+VIEW_ONLY_HINT = "↑/↓ · r refresh · esc"
 
 
 @dataclass
@@ -25,6 +26,7 @@ class AccountsPicker:
     usages: dict[AccountId, UsageState] | None = None
     unavailable: set[AccountId] | None = None
     switching_unavailable: str | None = None
+    background_notice: str | None = None
     refreshing: bool = False
     logout_confirmation: AccountId | None = None
     index: int = 0
@@ -81,7 +83,14 @@ class AccountsPicker:
             )
         if self.switching_unavailable is not None:
             rows.append(Text(f"view only · {self.switching_unavailable}", style=theme.WARNING))
-        rows.append(Text(HINT, style=theme.AFFORDANCE))
+        elif self.background_notice is not None:
+            rows.append(Text(self.background_notice, style=theme.DIM))
+        rows.append(
+            Text(
+                VIEW_ONLY_HINT if self.switching_unavailable is not None else HINT,
+                style=theme.AFFORDANCE,
+            )
+        )
         return Panel(
             Group(*rows),
             border_style=theme.ACCENT,

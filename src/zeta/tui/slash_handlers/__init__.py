@@ -207,6 +207,7 @@ class SlashHandlerMixin:
             {item.account: item.usage for item in displays},
             {item.account for item in displays if not item.available},
             self._accounts_switching_unavailable(),
+            background_notice=self._accounts_background_notice(),
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -242,6 +243,11 @@ class SlashHandlerMixin:
             return "switching waits until the turn ends"
         context = self.loop.account_context
         return context.switching_unavailable
+
+    def _accounts_background_notice(self) -> str | None:
+        if getattr(self.loop, "background_children_running", False):
+            return "running children keep their account"
+        return None
 
     def _block_account_mutation(self) -> bool:
         picker = self._accounts_picker
@@ -313,6 +319,7 @@ class SlashHandlerMixin:
         if picker is None:
             return
         picker.switching_unavailable = self._accounts_switching_unavailable()
+        picker.background_notice = self._accounts_background_notice()
         unit = self._accounts_picker_unit
         if unit is not None:
             self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
