@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
+import threading
 from io import StringIO
 from pathlib import Path
 
@@ -9,6 +13,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import close_owned_app
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -96,13 +101,15 @@ def test_append_message_fork_rejects_non_user_targets(tmp_path: Path) -> None:
         store.append_message_fork("does-not-exist")
 
 
-def test_message_fork_never_splits_tool_call_result_pair(tmp_path: Path) -> None:
+async def test_message_fork_never_splits_tool_call_result_pair(
+    tmp_path: Path,
+) -> None:
     store = ConversationStore(tmp_path)
     user_message = store.append_message(with_message_origin(_msg(MessageRole.USER, "read the file"), MessageOrigin.USER))
     call = ToolCall("call-1", "read", {"path": "README.md"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
 
-    assert store.has_outstanding_tool_calls(store.replay()) is True
+    assert store.has_outstanding_tool_calls() is True
 
     app = _make_tui(store)
     result = app.slash_fork("1")
@@ -118,10 +125,11 @@ def test_message_fork_never_splits_tool_call_result_pair(tmp_path: Path) -> None
             tool_result=ToolResult(call.id, "contents"),
         )
     )
-    assert store.has_outstanding_tool_calls(store.replay()) is False
-    result = app.slash_fork("1")
+    assert store.has_outstanding_tool_calls() is False
+    result = await app.slash_fork("1")
     assert "forked to user message 1" in result
     assert store.replay()[0].id == user_message.id
+    await close_owned_app(app)
 
 
 def test_message_fork_persists_and_reopens(tmp_path: Path) -> None:
@@ -159,7 +167,7 @@ def test_slash_fork_picker_when_no_user_messages(tmp_path: Path) -> None:
     assert app.slash_fork("") == "no user messages to fork from; run a turn first"
 
 
-def test_slash_fork_by_index_returns_dim_notice(tmp_path: Path) -> None:
+async def test_slash_fork_by_index_returns_dim_notice(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(with_message_origin(_msg(MessageRole.USER, "prompt one"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply one"))
@@ -167,9 +175,10 @@ def test_slash_fork_by_index_returns_dim_notice(tmp_path: Path) -> None:
     store.append_message(_msg(MessageRole.ASSISTANT, "reply two"))
     app = _make_tui(store)
 
-    result = app.slash_fork("1")
+    result = await app.slash_fork("1")
     assert "forked to user message 1 at seq 1" in result
     assert "no workspace snapshot at this message" in result
+    await close_owned_app(app)
 
 
 def test_slash_fork_by_index_out_of_range(tmp_path: Path) -> None:
@@ -217,7 +226,7 @@ def test_slash_tree_shows_branch_points_and_current(tmp_path: Path) -> None:
     assert any("from seq 1" in line for line in branch_lines)
 
 
-def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> None:
+async def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     first = store.append_message(with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER))
     store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
@@ -228,13 +237,14 @@ def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> None:
 
     branches = store.list_branches()
     other = next(b for b in branches if not b.is_current)
-    result = app.slash_tree(str(next(
+    result = await app.slash_tree(str(next(
         index for index, branch in enumerate(branches, start=1)
         if branch.head.id == other.head.id
     )))
     assert result.startswith("switched to branch ")
     replay = store.replay()
     assert replay[-2].id == other.head.id
+    await close_owned_app(app)
 
 
 def test_slash_tree_usage_and_range_errors(tmp_path: Path) -> None:
@@ -511,3 +521,113 @@ def test_slash_tree_soft_caps_long_branch_lists(tmp_path: Path) -> None:
     # Exactly 2 * head_count branch rows survive the cap.
     branch_rows = [line for line in result.splitlines() if "head seq" in line]
     assert len(branch_rows) == 2 * head_count
+
+
+async def test_tree_switch_runs_off_loop_and_cancel_still_finalizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /tree <n> switches the active branch. The switch re-anchors the branch,
+    # which rebuilds the active-branch sidecar and fold (seconds of work on a
+    # long session). This test proves two things that fail on 19eced31, where
+    # the switch ran synchronously on the event loop:
+    #   1. the switch runs off the loop, so a callback scheduled on the loop
+    #      runs while the branch rebuild is held (the fail-first assertion);
+    #   2. cancelling the awaiting task before the result installs still
+    #      finalizes the durable switch and leaves the resident store consistent
+    #      with a cold reopen (FINALIZE_ONCE_SUBMITTED).
+    store = ConversationStore(tmp_path, session_id="offloop")
+    first = store.append_message(
+        with_message_origin(_msg(MessageRole.USER, "first"), MessageOrigin.USER)
+    )
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply 1"))
+    store.append_message(
+        with_message_origin(_msg(MessageRole.USER, "second"), MessageOrigin.USER)
+    )
+    store.append_message(_msg(MessageRole.ASSISTANT, "reply 2"))
+    store.append_message_fork(first.id)
+    app = _make_tui(store)
+
+    # Gate _sync_history_index, which both the synchronous (main) and the
+    # off-loop (this branch) branch-switch paths call during the re-anchor.
+    gate: dict[str, threading.Event | None] = {"reached": None, "release": None}
+    original_sync = ConversationStore._sync_history_index
+
+    def gated_sync(self: ConversationStore, entries: object) -> object:
+        reached = gate["reached"]
+        if reached is not None:
+            gate["reached"] = None
+            release = gate["release"]
+            reached.set()
+            assert release is not None and release.wait(10)
+        return original_sync(self, entries)
+
+    monkeypatch.setattr(
+        ConversationStore, "_sync_history_index", gated_sync, raising=True
+    )
+
+    other = next(b for b in store.list_branches() if not b.is_current)
+    index = next(
+        position
+        for position, branch in enumerate(store.list_branches(), start=1)
+        if branch.head.id == other.head.id
+    )
+
+    reached1 = threading.Event()
+    release1 = threading.Event()
+    callback_ran = threading.Event()
+    observed: dict[str, bool] = {}
+
+    def watcher() -> None:
+        if not reached1.wait(10):
+            observed["during_hold"] = False
+            release1.set()
+            return
+        # The branch rebuild is held. On this branch it is held off the loop, so
+        # the loop is free to run the scheduled callback; on main it is held on
+        # the loop thread, so the callback cannot run until the gate releases.
+        observed["during_hold"] = callback_ran.wait(3)
+        release1.set()
+
+    watcher_thread = threading.Thread(target=watcher)
+    try:
+        watcher_thread.start()
+        gate["reached"], gate["release"] = reached1, release1
+        asyncio.get_running_loop().call_soon(callback_ran.set)
+        result = app.slash_tree(str(index))
+        if inspect.isawaitable(result):
+            result = await asyncio.wait_for(result, 10)
+        watcher_thread.join(15)
+
+        assert observed.get("during_hold"), (
+            "the event loop must run a scheduled callback while the branch "
+            "switch is held: the switch has to run off the loop"
+        )
+        assert isinstance(result, str) and result.startswith("switched to branch ")
+        # The switch re-anchors by appending a fork row parented at the target
+        # leaf, so the target leaf is now second from the tail.
+        assert store.active_branch_snapshot()[-2].id == other.head.id
+
+        # Phase 2: cancel-before-install still finalizes the durable switch.
+        back = next(b for b in store.list_branches() if not b.is_current)
+        reached2 = threading.Event()
+        release2 = threading.Event()
+        gate["reached"], gate["release"] = reached2, release2
+        task = asyncio.ensure_future(store.switch_to_branch_async(back.head.id))
+        assert await asyncio.to_thread(reached2.wait, 10)
+        task.cancel()
+        release2.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+
+        cold = ConversationStore(tmp_path, session_id="offloop")
+        try:
+            assert store.active_branch_head_id() == cold.active_branch_head_id()
+            assert store.active_branch_snapshot()[-2].id == back.head.id
+        finally:
+            cold.close()
+    finally:
+        if gate["release"] is not None:
+            gate["release"].set()
+        if watcher_thread.is_alive():
+            watcher_thread.join(5)
+        await close_owned_app(app)

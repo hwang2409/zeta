@@ -551,7 +551,7 @@ class ContextAssembler(ContextMarkerMixin):
             on_usage=self._record_session_usage,
             on_telemetry=self._record_compaction_telemetry,
         )
-        if self._branch_id(self.store.replay()) != branch_id:
+        if self.store.active_branch_head_id() != branch_id:
             raise StaleBranchError("active branch changed during compaction")
 
         marker_messages = self._marker_messages(source_start, source_end, summary)

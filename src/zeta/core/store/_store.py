@@ -1098,6 +1098,17 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self._active_branch())
 
+    def latest_compaction_marker(self) -> ConversationEntry | None:
+        """Return the newest compaction marker on the active branch (no copy).
+
+        Reverse-scans the resident branch and snapshots only the one hit, so a
+        caller that reads ``marker.data`` never touches resident state.
+        """
+        for entry in reversed(self._active_branch()):
+            if entry.type == "compaction":
+                return self._snapshot_entry(entry)
+        return None
+
     @property
     def closed(self) -> bool:
         """Whether this store instance has been closed (its fd released)."""
@@ -1168,6 +1179,20 @@ class ConversationStore(
             if entry.type == "message":
                 messages.append(Message.from_dict(entry.data["message"]))
         return messages
+
+    def active_branch_contains_message(self, message: Message) -> bool:
+        """Return whether ``message`` is on the active branch (tail-first scan).
+
+        Replaces ``message in self.messages()`` on the interactive delivery
+        path: the message was just appended, so a reverse scan finds it near
+        the tail without copying the whole branch.
+        """
+        for entry in reversed(self._active_branch()):
+            if entry.type != "message":
+                continue
+            if Message.from_dict(entry.data["message"]) == message:
+                return True
+        return False
 
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
