@@ -115,7 +115,6 @@ _STORE_LOCK_NAME = ".lock"
 _RUNTIME_LEASE_NAME = "runtime.lease"
 _AGENTS_DIRNAME = "agents"
 _LIFECYCLE_NAME = "agent_lifecycle.json"
-_TERMINAL_AGENT_STATES = frozenset({"completed", "canceled", "failed"})
 _MAX_JSON_BYTES = 1 << 20
 _MAX_TREE_DEPTH = 64
 _NS_PER_DAY = 86_400 * 1_000_000_000
@@ -729,14 +728,6 @@ def _next_root(sweep: _Sweep) -> str | None:
         return entry.name
     sweep.discovery_done = True
     return None
-
-
-def _is_directory(directory_fd, name) -> bool:
-    try:
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    return stat.S_ISDIR(info.st_mode)
 
 
 def _flock_nb(fd) -> None:
