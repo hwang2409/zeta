@@ -20,6 +20,7 @@ from ..checkpoints.mutation import (
     execute_mutation,
 )
 from ._pending_prompts import PendingPromptWriterReloadedError
+from ._rows import ResidentRows
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -623,12 +624,17 @@ class AsyncDurableWritesMixin:
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
             self._reset_generation += 1
-            self._entries = entries
+            prepared = delta.resident_rows
+            if prepared is None:
+                raise ConversationIntegrityError(
+                    "replace delta missing prepared resident rows"
+                )
+            self._resident_rows = prepared
             self._entry_ids = {entry.id for entry in entries}
         elif entries:
             self._before_incremental_state_install()
             if delta._resident_patch.raw_entries:
-                self._entries.extend(entries)
+                self._resident_rows.extend(entries)
                 self._entry_ids.update(entry.id for entry in entries)
             else:
                 self._install_validated_linear_entries(entries)
@@ -702,11 +708,12 @@ class AsyncDurableWritesMixin:
         )
         if current == baseline.cursor:
             return None
+        entries_to_install = writer._owned_installed_delta(tuple(writer._entries))
         return CommittedDelta(
             generation_before=baseline.generation,
             generation_after=writer.conversation_generation,
             committed_entries=(),
-            entries_to_install=writer._owned_installed_delta(tuple(writer._entries)),
+            entries_to_install=entries_to_install,
             _resident_patch=_ResidentPatch(
                 {field: copy.deepcopy(getattr(writer, field)) for field in _PATCH_FIELDS},
                 baseline.patch,
@@ -716,6 +723,7 @@ class AsyncDurableWritesMixin:
             log_cursor=cursor,
             dedupe_key=None,
             duplicate=False,
+            resident_rows=ResidentRows.prepared(entries_to_install),
         )
 
     def _run_committed_mutation(
@@ -763,6 +771,11 @@ class AsyncDurableWritesMixin:
                 )
             try:
                 delta = execute_mutation(writer, durable_command, generation)
+                if delta._resident_patch.replace_entries:
+                    delta = replace(
+                        delta,
+                        resident_rows=ResidentRows.prepared(delta.entries_to_install),
+                    )
             except BaseException as error:
                 if prelude is None:
                     raise

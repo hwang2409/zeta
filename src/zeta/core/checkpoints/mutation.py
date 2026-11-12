@@ -106,6 +106,7 @@ class CommittedDelta[ResultT]:
     log_cursor: CommittedLogCursor
     dedupe_key: ConversationDedupeKey | None
     duplicate: bool
+    resident_rows: object | None = None
 
 
 class ConversationGenerationConflict(ConversationIntegrityError):
@@ -352,11 +353,11 @@ def _build_append_entries(
         entries.append(entry)
         prior_ids.add(entry_id)
         parent_id = entry_id
-    store._entries.extend(entries)
+    store._resident_rows.extend(entries)
     try:
         store._validate_entries()
     finally:
-        del store._entries[-len(entries) :]
+        store._resident_rows.truncate_to(len(store._entries) - len(entries))
     return entries
 
 
@@ -365,7 +366,7 @@ def _install_appended_entries(
 ) -> None:
     linear = not store._entries or entries[0].parent_id == store._entries[-1].id
     for entry in entries:
-        store._entries.append(entry)
+        store._resident_rows.append(entry)
         store._record_entry_prefix(entry)
         store._entry_ids.add(entry.id)
         store._sent_message_receipts.extend(sent_message_receipts(entry))
