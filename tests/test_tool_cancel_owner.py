@@ -428,7 +428,7 @@ async def durable_inline(h: Harness) -> Outcome:
     h.tasks.append(task)
     await h.all_started()
     loop.abort()
-    loop.finalize_canceled(call.id)
+    loop.finalize_canceled(call)
     task.cancel()
     await h.release_all()
     await await_or_fail(asyncio.wait({task}), what="durable task end")

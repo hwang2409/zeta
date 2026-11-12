@@ -209,7 +209,7 @@ async def test_inbox_preparation_forwards_through_nested_child_policies(
         )
         prepared = await registry.prepare_tool_call(raw)
         assert prepared.arguments["project"] == beta.project_id
-        request = registry.prepare_approval(prepared)
+        request = await registry.prepare_approval(prepared)
         assert request is not None
     finally:
         await registry.close()

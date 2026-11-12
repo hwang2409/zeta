@@ -205,11 +205,11 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
             )
             # Let authorize publish its request before answering.
             await asyncio.sleep(0)
-            requests_before = policy.pending_requests()
+            requests_before = (await policy.pending_requests())
             assert len(requests_before) == 1
             view = await app._slash_commands.dispatch(app, "/permissions")
             assert "with any arguments" in view
-            assert policy.pending_requests() == requests_before
+            assert (await policy.pending_requests()) == requests_before
             await app._handle_prompt_value(f"/always {call.id}")
             assert await asyncio.wait_for(pending, timeout=5) is ApprovalDecision.ALLOW
             policy.forget_ephemeral(call.id)
@@ -372,7 +372,7 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
             )
         grants = policy.session_allow
         entries = store.replay()
-        pending = policy.pending_requests()
+        pending = (await policy.pending_requests())
         settings_bytes = settings_path.read_bytes()
         restrictions = registry.tool_policy
         commands = app._slash_commands
@@ -431,8 +431,8 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
         assert policy.always_allow == {ApprovalRule("bash", "git status*")}
         assert policy.always_ask == {ApprovalRule("bash", "git push*")}
         assert policy.always_deny == {ApprovalRule("bash", "rm *")}
-        assert policy.pending_requests() == pending
-        assert store.approval_states()["approved"][1] == "allow"
+        assert (await policy.pending_requests()) == pending
+        assert (await store.approval_state("approved"))[1] == "allow"
         assert store.replay() == entries
         assert settings_path.read_bytes() == settings_bytes
         assert registry.tool_policy == restrictions

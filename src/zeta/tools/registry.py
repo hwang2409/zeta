@@ -25,7 +25,6 @@ from ..core.abort import AbortGenerationRegistry
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.approval import (
     ApprovalDecision,
-    ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalRule,
@@ -100,6 +99,7 @@ from ._validation import (
     validate_tool_result,
 )
 from ._web_clients import SessionWebClients
+from .approval_gate import ApprovalGate
 
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
@@ -874,20 +874,20 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
             policy.bind_label_resolver(self.approval_label)
 
-    def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
+    async def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
             return None
         if not self.tool_is_allowed(tool_call.name):
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return None
         definition = self._tools.get(tool_call.name)
         if definition is None:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return None
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return None
         if not capability.requires_approval and not self.enforce_approvals:
             return None
@@ -895,9 +895,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             try:
                 _validate_arguments(tool_call.arguments, definition.parameters)
             except (AttributeError, KeyError, TypeError, ValueError):
-                self.abort_approval(tool_call)
+                await self.abort_approval(tool_call)
                 return None
-        return self.approval_policy.prepare(
+        return await self.approval_policy.prepare(
             tool_call,
             capability=capability,
         )
@@ -950,19 +950,19 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             if rejection is not None:
                 return await finalize(_error_result(rejection, kind="terminal_transition"))
         if _boundary_signal is not None and _signal_is_set(_boundary_signal):
-            signal_state, abort_result = self._arbitrate_abort(
+            signal_state, abort_result = await self._arbitrate_abort(
                 tool_call, _boundary_signal, _scope_signal
             )
             if abort_result is not None:
                 return await finalize(abort_result)
         if _signal_is_set(signal_state):
-            signal_state, abort_result = self._arbitrate_abort(
+            signal_state, abort_result = await self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
                 return await finalize(abort_result)
         if not self.tool_is_allowed(tool_call.name):
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"tool not allowed by session tool policy: {tool_call.name}",
@@ -971,7 +971,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             )
         definition = self._tools.get(tool_call.name)
         if definition is None:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"unknown tool: {tool_call.name}",
@@ -981,27 +981,27 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         try:
             tool_call = await self.prepare_tool_call(tool_call)
         except (KeyError, TypeError, ValueError) as exc:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(_error_result(str(exc), kind="invalid_arguments"))
         try:
             capability = self.resolve_call(tool_call.name, tool_call.arguments)
         except UnknownToolAction as exc:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_tool_action")
             )
         except InvalidActionArguments as exc:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
             )
         except (TypeError, ValueError) as exc:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(str(exc), kind="invalid_arguments")
             )
         if not self.tool_policy.allows_call(capability):
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             capability_name = (
                 tool_call.name
                 if capability.action is None
@@ -1020,7 +1020,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 else _coerce_arguments(dict(capability.arguments))
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            self.abort_approval(tool_call)
+            await self.abort_approval(tool_call)
             return await finalize(
                 _error_result(
                     f"invalid arguments: {exc}",
@@ -1028,7 +1028,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 )
             )
         if _signal_is_set(signal_state):
-            signal_state, abort_result = self._arbitrate_abort(
+            signal_state, abort_result = await self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
             )
             if abort_result is not None:
@@ -1139,7 +1139,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             )
         return await finalize(normalized_result)
 
-    def abort_approval(self, tool_call: ToolCall) -> ApprovalDecision | None:
+    async def abort_approval(
+        self, tool_call: ToolCall
+    ) -> ApprovalDecision | None:
         """Abort an unresolved approval without replacing a concurrent decision."""
         if self.approval_policy is None:
             return None
@@ -1152,19 +1154,19 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 pass
             return None
         try:
-            return self.approval_policy.abort_or_winner(
+            return await self.approval_policy.abort_or_winner(
                 tool_call.id, capability=capability
             )
         except RuntimeError:
             return None
 
-    def _arbitrate_abort(
+    async def _arbitrate_abort(
         self,
         tool_call: ToolCall,
         signal_state: ToolAbortSignal,
         scope_signal: ToolAbortSignal | None = None,
     ) -> tuple[ToolAbortSignal, StructuredToolResult | None]:
-        winner = self.abort_approval(tool_call)
+        winner = await self.abort_approval(tool_call)
         if winner is ApprovalDecision.ALLOW:
             signal_state = self._next_abort_generation(signal_state, scope_signal)
             if _signal_is_set(signal_state):

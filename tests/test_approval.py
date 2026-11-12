@@ -10,7 +10,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
     ApprovalDecision,
-    ApprovalGate,
     ApprovalPolicy,
     ApprovalRequest,
     ApprovalRule,
@@ -35,6 +34,7 @@ from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolAbortSignal, ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
+from zeta.tools.approval_gate import ApprovalGate
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -174,15 +174,15 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert first_policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(first_policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not pending_task.done()
     pending_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await pending_task
+        await asyncio.wait_for(pending_task, 10)
 
     restarted_store = ConversationStore(tmp_path, session_id="session")
     restarted_policy = ApprovalPolicy(default="ask", store=restarted_store)
-    pending = restarted_policy.pending_requests()
+    pending = (await asyncio.wait_for(restarted_policy.pending_requests(), 10))
 
     assert pending == [ApprovalRequest(call.id, call)]
     assert restarted_store.entries[-1].type == "message"
@@ -202,7 +202,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is False
     assert result["content"][0]["text"] == "approved"
     assert executed == ["approved"]
-    assert restarted_policy.pending_requests() == []
+    assert (await asyncio.wait_for(restarted_policy.pending_requests(), 10)) == []
 
 
 @pytest.mark.asyncio
@@ -231,11 +231,11 @@ skill_catalog=SkillCatalog.empty(),
     )
 
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     assert policy.deny(call.id)
 
-    result = await task
+    result = await asyncio.wait_for(task, 10)
     assert result["isError"] is True
     assert result["content"][0]["text"] == "tool execution denied"
 
@@ -301,14 +301,14 @@ skill_catalog=SkillCatalog.empty(),
     )
 
     await asyncio.wait_for(approval_published.wait(), timeout=10)
-    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
     events = await asyncio.wait_for(task, timeout=10)
 
     results = [message.tool_result for message in store.messages() if message.tool_result]
     assert results == [ToolResult(call.id, "tool execution canceled", True)]
-    assert policy.pending_requests() == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     assert events[-1].type.value == "agent_end"
     assert [message.role for message in store.messages()] == [
         MessageRole.USER,
@@ -385,7 +385,7 @@ skill_catalog=SkillCatalog.empty(),
         not any(isinstance(block, ToolUseContent) for block in message.content)
         for message in restarted.messages()
     )
-    assert ApprovalPolicy(default="ask", store=restarted).pending_requests() == []
+    assert (await ApprovalPolicy(default="ask", store=restarted).pending_requests()) == []
 
 
 def test_resolution_rejects_a_parent_outside_the_request_ancestry(
@@ -459,8 +459,10 @@ def test_two_stores_do_not_abort_a_request_before_atomic_anchor_append(
         release.set()
         append_task.result(timeout=1)
 
-    assert store_a.approval_states() == store_b.approval_states()
-    assert store_a.approval_states()[call.id] == (call, None)
+    assert asyncio.run(store_a.approval_state(call.id)) == asyncio.run(
+        store_b.approval_state(call.id)
+    )
+    assert asyncio.run(store_a.approval_state(call.id)) == (call, None)
 
 
 def test_two_stores_dedupe_concurrent_duplicate_request_append(
@@ -484,7 +486,7 @@ def test_two_stores_dedupe_concurrent_duplicate_request_append(
 
     reopened = ConversationStore(approval_root, session_id=session_id)
     assert entries[0].id == entries[1].id
-    assert reopened.approval_states() == {call.id: (call, None)}
+    assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
 
 
 @pytest.mark.asyncio
@@ -523,8 +525,8 @@ skill_catalog=SkillCatalog.empty(),
         result = await registry.execute(call)
 
         assert result["isError"] is True
-        assert policy.pending_requests() == []
-        assert store.approval_states()[call.id][1] == "abort"
+        assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
+        assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "abort"
 
 
 @pytest.mark.asyncio
@@ -572,14 +574,14 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     signal.abort()
 
     result = await asyncio.wait_for(task, timeout=10)
     assert result["isError"] is False
     assert result["content"][0]["text"] == "ran"
-    assert store.approval_states()[call.id][1] == "allow"
+    assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "allow"
     assert executed == ["ran"]
 
 
@@ -610,7 +612,7 @@ skill_catalog=SkillCatalog.empty(),
     ) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()
+        await asyncio.wait_for(abort_signal.wait(), 10)
         observed_cancellation.set()
         return "canceled"
 
@@ -632,7 +634,7 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
     await asyncio.wait_for(approval_started.wait(), timeout=10)
-    assert policy.pending_requests() == [ApprovalRequest(call.id, call)]
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == [ApprovalRequest(call.id, call)]
     assert not task.done()
     registry.abort()
     await asyncio.wait_for(started.wait(), timeout=10)
@@ -644,7 +646,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result["isError"] is False
     assert result["content"][0]["text"] == "canceled"
     assert observed_cancellation.is_set()
-    assert store.approval_states()[call.id][1] == "allow"
+    assert (await asyncio.wait_for(store.approval_state(call.id), 10))[1] == "allow"
 
 
 @pytest.mark.asyncio
@@ -793,7 +795,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
         event.type is StreamEventType.TOOL_APPROVAL_START
         for event in approval_events
     )
-    assert {request.request_id for request in policy.pending_requests()} == {
+    assert {request.request_id for request in (await asyncio.wait_for(policy.pending_requests(), 10))} == {
         call.id for call in calls
     }
 
@@ -810,7 +812,7 @@ async def test_parallel_pending_approval_abort_wakes_every_waiter(
         "tool execution canceled",
     ]
     assert all(result is not None and result.is_error for result in results)
-    assert policy.pending_requests() == []
+    assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
 
 
 @pytest.mark.asyncio
@@ -858,7 +860,7 @@ skill_catalog=SkillCatalog.empty(),
     await asyncio.wait_for(approval_claimed.wait(), timeout=10)
     assert not task.done()
     assert executed == []
-    assert changed_policy.pending_requests()
+    assert (await asyncio.wait_for(changed_policy.pending_requests(), 10))
 
     assert changed_policy.approve(call.id)
     result = await asyncio.wait_for(task, timeout=10)
@@ -877,8 +879,10 @@ def test_abandoned_branch_approval_does_not_leak_into_active_branch(
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent("active")]), parent_id=root.id)
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert reopened.pending_approvals() == []
-    assert ApprovalPolicy(default="ask", store=reopened).pending_requests() == []
+    assert asyncio.run(reopened.pending_approval_page()).items == ()
+    assert asyncio.run(
+        ApprovalPolicy(default="ask", store=reopened).pending_requests()
+    ) == []
 
 
 def test_append_superset_preserves_all_approval_requests(
@@ -901,7 +905,9 @@ def test_append_superset_preserves_all_approval_requests(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_same_parent_superset_keeps_the_prior_request(
@@ -924,7 +930,9 @@ def test_same_parent_superset_keeps_the_prior_request(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_append_uses_the_target_parent_branch(
@@ -947,7 +955,9 @@ def test_append_uses_the_target_parent_branch(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert set(reopened.approval_states()) == {call_a.id, call_b.id}
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_append_target_parent_ignores_active_child_requests(
@@ -977,7 +987,9 @@ def test_append_target_parent_ignores_active_child_requests(
 
     assert sibling.data["approval_requests"]
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert set(reopened.approval_states()) == {call.id}
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call.id}
 
 
 def test_abandoned_exact_sibling_is_not_deduped(
@@ -996,7 +1008,7 @@ def test_abandoned_exact_sibling_is_not_deduped(
 
     assert current.id != abandoned.id
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert reopened.approval_states() == {call.id: (call, None)}
+    assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
 
 
 def test_off_branch_duplicate_request_is_not_reused(
@@ -1015,7 +1027,7 @@ def test_off_branch_duplicate_request_is_not_reused(
 
     assert current.id != abandoned.id
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert reopened.approval_states() == {call.id: (call, None)}
+    assert asyncio.run(reopened.approval_state(call.id)) == (call, None)
 
 
 def test_rewound_resolution_reopens_with_active_branch_scope(
@@ -1034,7 +1046,7 @@ def test_rewound_resolution_reopens_with_active_branch_scope(
     store.append_approval_resolution(call.id, "deny", parent_id=rewind.id)
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert reopened.approval_states() == {call.id: (call, "deny")}
+    assert asyncio.run(reopened.approval_state(call.id)) == (call, "deny")
 
 
 def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> None:
@@ -1325,7 +1337,7 @@ skill_catalog=SkillCatalog.empty(),
     assert denied["isError"] is True
     assert denied["content"][0]["text"] == "tool execution denied"
     other = ToolCall("c3", "echo", {"text": "other"})
-    assert registry.prepare_approval(other) == ApprovalRequest(other.id, other)
+    assert await registry.prepare_approval(other) == ApprovalRequest(other.id, other)
 
 
 def test_registry_drops_scoped_rule_for_a_tool_without_a_subject(

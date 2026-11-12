@@ -1,14 +1,10 @@
 tests/support/completion.py::expire_next::91875f221e641c3c::1
 tests/test_agent.py::delayed_setup::fb7b136b4c385206::1
 tests/test_agent.py::test_background_completion_wakes_idle_parent::36dcc57c52d393ca::1
-tests/test_agent.py::test_child_approval_cleanup_removes_pending_requests::4a0363f3054a80ec::1
-tests/test_agent.py::test_child_policy_inherits_scoped_rules_and_delegates_prompts::4a0363f3054a80ec::1
-tests/test_agent.py::test_delegated_approvals_use_child_instance_keys::7190ebcf63d9303c::1
 tests/test_attachments.py::run_ctrl_v::a79607813bbe04a5::1
 tests/test_attachments.py::run_ctrl_v::cb8014d9ad19c14c::1
 tests/test_attachments.py::test_close_cancels_and_awaits_staging_paste::2560082da49342c3::1
 tests/test_attachments.py::test_session_switch_drops_staged_paste::2560082da49342c3::1
-tests/test_bash_cwd.py::test_delegated_shell_approval_uses_persisted_bash_cwd::bfbf4e9068bce0f2::1
 tests/test_child_run_events_slice1.py::run::b00ea5cb929e3bb8::1
 tests/test_mcp_envelope.py::heartbeat::e83f1ce061a3e2cb::1
 tests/test_memory_structured_updater.py::wait::e1a9381f378dd05d::1

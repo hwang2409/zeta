@@ -42,6 +42,7 @@ from ..transcript_recovery import (
     repair_transcript,
 )
 from ..transcript_recovery.stream import TranscriptStream
+from ._incremental_validation import _ApprovalValidationOverlay
 from ._validation import TASK_EXITED_NOTIFICATION_KIND
 
 if TYPE_CHECKING:
@@ -81,8 +82,6 @@ class _DetachedLogState:
     entries: list[ConversationEntry]
     entry_ids: set[str]
     entry_prefix_digest: bytes
-    active_approval_requests: dict[str, ConversationEntry]
-    active_approval_resolutions: dict[str, str]
     active_tool_results: dict[str, ToolResult]
     active_agent_call_ids: set[str]
     active_agent_receipts: list[tuple[str, str]]
@@ -127,8 +126,6 @@ class _FullLoadValidator:
         "_entries",
         "_entry_ids",
         "_entry_prefix_digest",
-        "_active_approval_requests",
-        "_active_approval_resolutions",
         "_active_tool_results",
         "_active_agent_call_ids",
         "_active_agent_receipts",
@@ -305,9 +302,10 @@ class _FullLoadValidator:
         while current is not None:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
+        approvals = _ApprovalValidationOverlay()
         for entry in reversed(branch):
             try:
-                self.state._record_active_entry(entry)
+                self.state._record_active_entry(entry, approvals)
             except ConversationIntegrityError as exc:
                 raise self._error(
                     self.rows_by_id[entry.id],
@@ -393,8 +391,6 @@ class ConversationLogMixin:
             entries=self._entries,
             entry_ids=self._entry_ids,
             entry_prefix_digest=self._entry_prefix_digest,
-            active_approval_requests=self._active_approval_requests,
-            active_approval_resolutions=self._active_approval_resolutions,
             active_tool_results=self._active_tool_results,
             active_agent_call_ids=self._active_agent_call_ids,
             active_agent_receipts=self._active_agent_receipts,
@@ -427,8 +423,6 @@ class ConversationLogMixin:
             state,
             entries=list(state.entries),
             entry_ids=set(state.entry_ids),
-            active_approval_requests=dict(state.active_approval_requests),
-            active_approval_resolutions=dict(state.active_approval_resolutions),
             active_tool_results=dict(state.active_tool_results),
             active_agent_call_ids=set(state.active_agent_call_ids),
             active_agent_receipts=list(state.active_agent_receipts),
@@ -544,8 +538,6 @@ class ConversationLogMixin:
         self.cwd = state.cwd
         self._entry_ids = state.entry_ids
         self._entry_prefix_digest = state.entry_prefix_digest
-        self._active_approval_requests = state.active_approval_requests
-        self._active_approval_resolutions = state.active_approval_resolutions
         self._active_tool_results = state.active_tool_results
         self._active_agent_call_ids = state.active_agent_call_ids
         self._active_agent_receipts = state.active_agent_receipts

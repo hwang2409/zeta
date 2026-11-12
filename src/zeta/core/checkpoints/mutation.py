@@ -384,6 +384,7 @@ def _install_appended_entries(
     else:
         store._validate_entries()
         store._rebuild_incremental_validation_state()
+        store._sync_history_index(store._entries)
     store._record_client_delivery_entries(entries)
 
 
@@ -413,7 +414,9 @@ def _execute_append[ResultT](
         store._write_bytes(
             b"".join(store._encoded_entry_line(entry) for entry in entries)
         )
-        store._apply_history_index_entries(tuple(entries))
+        if not store._entries or entries[0].parent_id == store._entries[-1].id:
+            store._apply_history_index_entries(tuple(entries))
+        # A fork is rebuilt by _install_appended_entries below.
         _install_appended_entries(store, entries)
         generation_after = store.conversation_generation
         committed = tuple(store._snapshot_entry(entry) for entry in entries)

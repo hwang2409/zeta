@@ -32,8 +32,17 @@ def recover_store_approvals(store: ConversationStore, home_epoch: int) -> None:
     under the append lock, so a repeated restart writes nothing.
     """
     reason = restart_abort_reason(home_epoch)
-    for request_id, _tool_call in store.pending_approvals():
-        store.resolve_approval(request_id, "abort", reason=reason)
+    # Every unresolved approval in this store, same semantics as main's removed
+    # ``pending_approvals()``: a resident non-blocking read, paged so no count
+    # is dropped. Resolving a page removes it from the next page's pending set.
+    after_seq = 0
+    while True:
+        page = store.pending_approval_page_now(after_seq)
+        for request_id, _tool_call in page.items:
+            store.resolve_approval(request_id, "abort", reason=reason)
+        if page.next_seq is None:
+            break
+        after_seq = page.next_seq
 
 
 def repair_delegated_child(
@@ -60,7 +69,7 @@ def repair_delegated_child(
             continue
         # Reread the authoritative child resolution. A false resolve result (for
         # example another owner committed first) is never a reason to skip this.
-        resolution = child_store.approval_resolution_data(store_request_id)
+        resolution = child_store.approval_resolution_now(store_request_id)
         if resolution is None:
             continue
         history_store.append_approval_history_end_if_absent(

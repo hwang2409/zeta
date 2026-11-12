@@ -636,14 +636,18 @@ def test_approval_request_carries_resolved_action(tmp_path: Path) -> None:
     policy = ApprovalPolicy(default="ask", store=store)
     registry = _registry(tmp_path, approval_policy=policy)
 
-    request = registry.prepare_approval(
-        ToolCall("call-1", "task", {"action": "start", "command": "pytest"})
+    request = asyncio.run(
+        registry.prepare_approval(
+            ToolCall("call-1", "task", {"action": "start", "command": "pytest"})
+        )
     )
 
     assert request is not None
     assert (
-        registry.prepare_approval(
-            ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+        asyncio.run(
+            registry.prepare_approval(
+                ToolCall("call-2", "task", {"action": "output", "task_id": "1"})
+            )
         )
         is None
     )
@@ -690,7 +694,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     )
     pending: list[ApprovalRequest] = []
     for _ in range(100):
-        pending = policy.pending_requests()
+        pending = (await asyncio.wait_for(policy.pending_requests(), 10))
         if pending:
             break
         await asyncio.sleep(0.01)
@@ -702,7 +706,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     )
     assert approval_record["approval_facts"] == {"action": "start"}
     assert policy.approve(call.id)
-    await events_task
+    await asyncio.wait_for(events_task, 10)
     assert executed == ["pytest"]
 
 
@@ -738,7 +742,7 @@ def test_resumed_subjectless_action_argument_uses_registry_capability(
         },
     )
 
-    pending = policy.pending_requests()
+    pending = asyncio.run(policy.pending_requests())
     assert pending == [ApprovalRequest(call.id, call, action=None)]
     assert policy.remember_allow(pending[0]) == ApprovalRule("inbox")
     assert policy.always_allow == {ApprovalRule("inbox")}
@@ -766,7 +770,7 @@ def test_child_action_approval_uses_resolved_capability(tmp_path: Path) -> None:
         binding=ApprovalBinding.CWD,
     )
 
-    request = child.prepare(call, capability=capability)
+    request = asyncio.run(child.prepare(call, capability=capability))
 
     assert request is not None
     assert request.action == capability.action

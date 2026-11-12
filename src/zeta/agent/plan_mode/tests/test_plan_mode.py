@@ -472,7 +472,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result.is_error is True
     assert "remote:write is not allowed" in result.content
     assert executed is False
-    assert store.pending_approvals() == []
+    assert (await store.pending_approval_page()).items == ()
 
 
 # --- the /plan command -----------------------------------------------------

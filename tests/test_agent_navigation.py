@@ -2590,7 +2590,7 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
     assert "danger" in output.getvalue()
     await app._handle_prompt_value(f"/approve {app.pending_approvals[0].key}")
     assert not app.pending_approvals
-    assert child_store.approval_states()[call.id][1] == "allow"
+    assert (await child_store.approval_state(call.id))[1] == "allow"
     await app.close()
     child_store.close()
 

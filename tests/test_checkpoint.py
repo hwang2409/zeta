@@ -1,3 +1,4 @@
+import asyncio
 import json
 from io import StringIO
 from pathlib import Path
@@ -321,9 +322,11 @@ def test_fork_drops_pending_approval_from_the_abandoned_branch(tmp_path: Path) -
         Message(MessageRole.TOOL_RESULT, [], tool_result=ToolResult(call.id, "done"))
     )
 
-    assert store.pending_approvals() == [(call.id, call)]
+    assert asyncio.run(store.pending_approval_page()).items == (
+        (call.id, call.to_dict()),
+    )
     store.append_fork(str(checkpoint.seq))
-    assert store.pending_approvals() == []
+    assert asyncio.run(store.pending_approval_page()).items == ()
 
 
 def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
