@@ -25,7 +25,7 @@ from .core.session_files import (
     open_session_file,
     reference_publication,
 )
-from .project_errors import ProjectNotFoundError
+from .project_errors import ProjectNotFoundError, ProjectRegistryBusyError
 from .project_inbox_provenance import decorate, delegation_enabled
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
 from .project_inbox_sent.delivery import SentDelivery
@@ -76,6 +76,13 @@ class InboxConflictError(InboxError):
     """A message id already exists at the recipient with different content."""
 
 
+class InboxBusyError(InboxError):
+    """A storage lock was held past the wait deadline; the caller may retry."""
+
+    kind = "inbox_busy"
+    retryable = True
+
+
 class _InboxNotFound(FileNotFoundError):
     """The optional top-level inbox directory does not exist."""
 
@@ -119,6 +126,8 @@ def _storage_errors() -> Iterator[None]:
         yield
     except InboxError:
         raise
+    except ProjectRegistryBusyError as exc:
+        raise InboxBusyError("inbox is busy; retry") from exc
     except (OSError, ProjectRegistryError, SessionError) as exc:
         raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -554,11 +563,8 @@ class ProjectInbox:
             result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
             return result
 
-        try:
-            with self._lock(target.project_id, exclusive=False) as project_fd:
-                return read(project_fd)
-        except (OSError, ProjectRegistryError, SessionError) as exc:
-            raise InboxError("inbox storage is unsafe or unavailable") from exc
+        with _storage_errors(), self._lock(target.project_id, exclusive=False) as project_fd:
+            return read(project_fd)
 
     def _read_tracked_message(
         self,
@@ -592,11 +598,8 @@ class ProjectInbox:
             except _InboxNotFound:
                 return None
 
-        try:
-            with self._lock(target_project, exclusive=False) as project_fd:
-                return read(project_fd)
-        except (OSError, ProjectRegistryError, SessionError) as exc:
-            raise InboxError("inbox storage is unsafe or unavailable") from exc
+        with _storage_errors(), self._lock(target_project, exclusive=False) as project_fd:
+            return read(project_fd)
 
     def new_ids(
         self, project: str, *, session_id: str | None = None

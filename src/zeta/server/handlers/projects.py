@@ -16,7 +16,7 @@ from ...project_errors import (
     ProjectRegistryError,
     UnsupportedMemoryFormatError,
 )
-from ...project_inbox import InboxError, ProjectInbox
+from ...project_inbox import InboxBusyError, InboxError, ProjectInbox
 from ...project_memory_history import PROJECT_MEMORY_FILES
 from ...project_registry import Project, ProjectRegistry
 from ...storage_format import StorageFeature, feature_enabled
@@ -896,7 +896,7 @@ def project_request_error(
         )
     if isinstance(error, RequestValidationError):
         return ErrorDescriptor.INVALID_PARAMS, str(error), None
-    if isinstance(error, ProjectRegistryBusyError):
+    if isinstance(error, (ProjectRegistryBusyError, InboxBusyError)):
         return (
             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
             str(error),

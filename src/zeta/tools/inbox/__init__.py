@@ -7,8 +7,10 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from ...project_errors import ProjectRegistryBusyError
 from ...project_inbox import (
     KINDS,
+    InboxBusyError,
     InboxError,
     ProjectInbox,
 )
@@ -277,6 +279,8 @@ async def _inbox(
 ) -> StructuredToolResult:
     try:
         return await asyncio.to_thread(_run_inbox, registry, arguments)
+    except (InboxBusyError, ProjectRegistryBusyError) as exc:
+        return _error(str(exc), kind="inbox_busy")
     except (
         ProjectRegistryError,
         OSError,

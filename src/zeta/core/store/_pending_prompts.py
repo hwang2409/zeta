@@ -99,6 +99,9 @@ class PendingPromptQueue:
 
     def __init__(self, store: ConversationStore) -> None:
         self._store = weakref.proxy(store)
+        # Set by the terminal drain (off-loop, under the append lock) so a late
+        # notification producer is refused and re-resolves to the live ancestor.
+        self._drained = False
         self._run_ended = False
 
     @contextmanager

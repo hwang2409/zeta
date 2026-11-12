@@ -1119,7 +1119,7 @@ async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
 TRANSITION_AWAITS = (
     ("store", "finalize_background_agent"),
     ("channel", "close_questions"),
-    ("channel", "reroute_questions_from"),
+    ("channel", "drain_terminal"),
     ("channel", "publish_completion"),
 )
 

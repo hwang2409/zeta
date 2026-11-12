@@ -52,31 +52,37 @@ class SentDelivery:
             lease,
             referenced_ids=(session, to_session) if to_session else (session,),
         ):
-            if durable:
-                # A broken sender ledger saves no intent, so there is nothing to
-                # retry; drop the durable promise and let a failed publish
-                # surface the plain error below, which tells the model it may
-                # resend.
-                durable = (
-                    tracker.record_intent(record, _storage_lease=lease).health.state
-                    != "broken"
-                )
-            try:
-                with inbox._directories(target, create=True) as dirs:
-                    inbox._publish_outgoing(dirs, message_id, body, record)
-            except InboxConflictError:
-                raise
-            except (InboxError, OSError, SessionError, StorageFormatError) as exc:
+            # Acquiring the recipient inbox authority can fail with a retryable
+            # InboxBusyError or a plain unsafe InboxError. Let those propagate
+            # before any durable intent exists, so the caller sees the real
+            # retryable/unsafe status and a retry cannot duplicate a message. The
+            # durable intent is written while the lock is held, so a crash
+            # between the intent and the publish still recovers to one delivery.
+            with inbox._directories(target, create=True) as dirs:
                 if durable:
-                    # The intent is already durable; a later poll re-publishes
-                    # it. Tell the caller so the model does not send a duplicate.
-                    # (_directories translates OSError into a generic InboxError.)
-                    raise InboxError(
-                        "inbox message saved; the recipient could not be reached "
-                        "now and delivery will be retried automatically. Do not "
-                        "resend this message."
-                    ) from exc
-                raise
+                    # A broken sender ledger saves no intent, so there is nothing
+                    # to retry; drop the durable promise and let a failed publish
+                    # surface the plain error below, so the model may resend.
+                    durable = (
+                        tracker.record_intent(
+                            record, _storage_lease=lease
+                        ).health.state
+                        != "broken"
+                    )
+                try:
+                    inbox._publish_outgoing(dirs, message_id, body, record)
+                except InboxConflictError:
+                    raise
+                except (InboxError, OSError, SessionError, StorageFormatError) as exc:
+                    if durable:
+                        # The intent is already durable; a later poll re-publishes
+                        # it. Tell the caller so the model does not duplicate it.
+                        raise InboxError(
+                            "inbox message saved; the recipient could not be "
+                            "reached now and delivery will be retried "
+                            "automatically. Do not resend this message."
+                        ) from exc
+                    raise
             if on_visible is not None:
                 try:
                     on_visible()
