@@ -17,6 +17,7 @@ from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
+from ..remote.update import add_remote_parser, run_remote_update
 from ..storage_format import StorageFormatError, advance, writer_epoch
 
 if TYPE_CHECKING:
@@ -432,10 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
-    remote_parser = commands.add_parser("remote", help="manage a remote zeta checkout")
-    remote_commands = remote_parser.add_subparsers(dest="remote_action", required=True)
-    remote_update = remote_commands.add_parser("update", help="update a remote checkout over ssh")
-    remote_update.add_argument("host")
+    add_remote_parser(commands)
     storage_format_parser = commands.add_parser(
         "storage-format", help="manage the home stored-format gate"
     )
@@ -1256,15 +1254,7 @@ def _main(argv: list[str] | None = None) -> int:
             return 130
         return 0
     if args.command == "remote":
-        from ..remote.update import update_remote
-
-        try:
-            result = update_remote(args.host)
-        except (OSError, RuntimeError, ValueError) as exc:
-            print(f"zeta remote update: {exc}", file=sys.stderr)
-            return 2
-        print(result)
-        return 0
+        return run_remote_update(args.host)
     if args.command == "storage-format":
         try:
             advance(
