@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -60,6 +61,17 @@ def forget_macro_display(call_id: str) -> None:
     _trusted_macro_display.pop(call_id, None)
 
 
+def _user_tmux_env() -> dict[str, str]:
+    """TMUX vars the user typed inside, so a user-authored `!tmux ...` reaches
+    their own server. Model-driven tools get the isolated env (no TMUX)."""
+
+    return {
+        name: os.environ[name]
+        for name in ("TMUX", "TMUX_PANE")
+        if name in os.environ
+    }
+
+
 async def run_shell_macro(
     registry: ToolRegistry,
     call: ToolCall,
@@ -83,6 +95,7 @@ async def run_shell_macro(
             _persist_approval=False,
             _log_path=log_path,
             _background=background,
+            _host_environment=_user_tmux_env(),
         )
         result = validate_tool_result(raw_result)
         structured = dict(result["structuredContent"] or {})
@@ -170,6 +183,7 @@ async def run_inline_shell_batch(
                 _persist_approval=False,
                 _capture_output=True,
                 _skip_approval=index > 0,
+                _host_environment=_user_tmux_env(),
                 _lifecycle_sink=(
                     lambda kind, call=call: first_lifecycle(kind, call)
                 )
