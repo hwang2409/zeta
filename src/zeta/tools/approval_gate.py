@@ -48,16 +48,7 @@ class ApprovalGate:
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             slot_acquired = False
-            published = False
-
-            async def publish_pending() -> None:
-                # The gate owns the approval_start order: authorize calls this
-                # back once the request is persisted, so approval_start is never
-                # published before pending_requests can read the request.
-                nonlocal slot_acquired, published
-                if not approval_started or published:
-                    return
-                published = True
+            if approval_started:
                 slot_acquired = await self.policy.acquire_approval_slot()
                 if lifecycle is not None:
                     lifecycle("approval_start")
@@ -72,18 +63,13 @@ class ApprovalGate:
                     kwargs["execution_token"] = execution_token
                 if capability is not None and "capability" in parameters:
                     kwargs["capability"] = capability
-                if "on_pending" in parameters:
-                    kwargs["on_pending"] = publish_pending
-                else:
-                    # Legacy authorize without the callback: keep the old order.
-                    await publish_pending()
                 decision = await authorize(tool_call, signal, **kwargs)
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return ToolResult(
                     tool_call.id, f"approval failed: {exc}", True
                 ), execution_signal
             finally:
-                if published:
+                if approval_started:
                     if lifecycle is not None:
                         lifecycle("approval_end")
                     if slot_acquired:

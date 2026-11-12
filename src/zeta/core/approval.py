@@ -1086,7 +1086,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         *,
         persist_request: bool = True,
         capability: ApprovalCapability,
-        on_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> ApprovalDecision | None:
         store = self._require_store()
         state = store.approval_state_now(tool_call.id)
@@ -1128,12 +1127,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                     None,
                 )
             self._notify_pending_changed()
-
-        # The approval request is now persisted (or captured as ephemeral) and
-        # readable through pending_requests; publish approval_start only now so a
-        # serve client reading pending on that event always sees this request.
-        if on_pending is not None:
-            await on_pending()
 
         async def current() -> tuple[bool, ApprovalDecision | None]:
             ephemeral = self._ephemeral.get(tool_call.id)
