@@ -9,6 +9,7 @@ import io
 import json
 import multiprocessing
 import os
+import select
 import shutil
 import stat
 import subprocess
@@ -27,6 +28,10 @@ from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
 from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
+from zeta.core.session_files import (
+    SessionReferenceGate,
+    reservation_path,
+)
 from zeta.core.store import ConversationStore
 from zeta.memory.entry_store import _KIND_KEY
 from zeta.memory.profiles import memory_profile
@@ -756,6 +761,285 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
 
     assert not (remote / "sessions" / session_id).exists()
     assert not list((remote / "sessions").glob(".*.incoming-*"))
+
+
+def _ssh_session(home: Path, *, parent: str | None = None) -> str:
+    opened = SessionManager(home).create(
+        provider="codex", model="fake", cwd=home, parent_session_id=parent
+    )
+    session_id = opened.store.session_id
+    opened.store.close()
+    return session_id
+
+
+def _set_remote_epoch(remote: Path, epoch: int) -> None:
+    remote.mkdir(parents=True, exist_ok=True)
+    (remote / "storage-format.json").write_text(
+        f'{{"writer_epoch":{epoch}}}\n', encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("reserved", ("destination", "parent"))
+def test_ssh_install_refuses_reserved_reference_and_leaves_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reserved: str
+) -> None:
+    # The SSH installer must join the remote home's SessionReferenceGate at the
+    # feature epoch: a reservation for the installed id or a referenced
+    # parent_session_id refuses the install and never touches the destination.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    parent = "p" * 32 if reserved == "parent" else None
+    session_id = _ssh_session(local, parent=parent)
+    _set_remote_epoch(remote, 8)
+    reserved_id = session_id if reserved == "destination" else parent
+    reservation = reservation_path(remote, reserved_id)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    reservation.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RemoteSyncError, match="session reference unavailable"):
+        push_session(
+            local,
+            SshTransport("fake", str(remote), name="cloud"),
+            session_id=session_id,
+        )
+
+    assert not (remote / "sessions" / session_id).exists()
+
+
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+def test_install_replace_preserves_retention_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    # Replacing a session keeps its retention pin sidecar on every installer.
+    # A snapshot may carry its own pin, so replacement must preserve the
+    # destination pin whether or not the source has one.
+    local = tmp_path / "local"
+    _set_remote_epoch(local, 8)
+    session_id = _ssh_session(local)
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(local, transport, session_id=session_id, force=True)
+    elif kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        push_session(local, LocalTransport(remote), session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(
+                local, LocalTransport(remote), session_id=session_id, force=True
+            )
+    else:  # local-pull
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+
+        def reinstall() -> None:
+            pull_session(
+                puller,
+                LocalTransport(source_remote),
+                session_id=session_id,
+                force=True,
+            )
+
+    pin = destination / ".retention-pin.json"
+    pin.write_text('{"pinned":true,"schema_version":1}\n', encoding="utf-8")
+    pin.chmod(0o600)
+
+    reinstall()
+
+    assert pin.read_text() == '{"pinned":true,"schema_version":1}\n'
+
+
+def test_ssh_install_below_feature_epoch_writes_no_retention_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Below the SESSION_RETENTION feature epoch the installer stays dormant and
+    # writes no reference-generation or domain-lock state.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    session_id = _ssh_session(local)
+    _set_remote_epoch(remote, 7)
+
+    push_session(
+        local,
+        SshTransport("fake", str(remote), name="cloud"),
+        session_id=session_id,
+    )
+
+    assert (remote / "sessions" / session_id).exists()
+    assert not (remote / "session-reference-generation").exists()
+    assert not (remote / ".domain-locks").exists()
+
+
+def test_ssh_install_waits_for_the_exclusive_reference_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SSH installer joins the remote reference gate with a *shared* blocking
+    # lock. While retention holds the exclusive authority the install cannot
+    # land, and it completes only after the authority is released. This covers
+    # the slice-1 acceptance "pause each writer and prove exclusive retention
+    # waits" for the SSH route. The gate is a cross-process flock, so the hold
+    # window below is not a race: the install provably cannot acquire the shared
+    # lock while the exclusive authority is held.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    _set_remote_epoch(remote, 8)
+    session_id = _ssh_session(local)
+    transport = SshTransport("fake", str(remote), name="cloud")
+
+    ready_pipe = tmp_path / "reference-gate-ready"
+    os.mkfifo(ready_pipe)
+    ready_fd = os.open(ready_pipe, os.O_RDWR | os.O_NONBLOCK)
+    anchor = "                fcntl.flock(fd, fcntl.LOCK_SH)"
+    assert anchor in ssh_module._SESSION_INSTALL_SCRIPT
+    instrumented_script = ssh_module._SESSION_INSTALL_SCRIPT.replace(
+        anchor,
+        f'''                with open({str(ready_pipe)!r}, "w", encoding="ascii") as stream:
+                    stream.write("about-to-wait\\n")
+{anchor}''',
+        1,
+    )
+    # test-contract: seam instrumentation must fail loudly if the script changes.
+    monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", instrumented_script)
+    run_ssh = ssh_module.subprocess.run
+
+    def bounded_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        kwargs["timeout"] = 10
+        return run_ssh(*args, **kwargs)
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", bounded_run)
+
+    install_error: list[BaseException] = []
+    install_finished = threading.Event()
+
+    def run_install() -> None:
+        try:
+            push_session(local, transport, session_id=session_id)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            install_error.append(exc)
+        finally:
+            install_finished.set()
+
+    manager = SessionManager(remote)
+    installer = threading.Thread(target=run_install)
+    try:
+        with SessionReferenceGate(remote, manager._storage_lease).exclusive(
+            session_id=session_id
+        ):
+            installer.start()
+            readable, _, _ = select.select([ready_fd], [], [], 10)
+            assert readable, "the SSH install never reached the references lock"
+            assert os.read(ready_fd, 1024) == b"about-to-wait\n"
+            assert not install_finished.is_set(), (
+                "the install landed before the references lock attempt"
+            )
+            assert not (remote / "sessions" / session_id).exists()
+            assert not (remote / "session-reference-generation").exists()
+    finally:
+        installer.join(10)
+        os.close(ready_fd)
+
+    assert not installer.is_alive(), "the SSH install thread did not finish"
+    assert not install_error, repr(install_error[0]) if install_error else ""
+    assert (remote / "sessions" / session_id).exists()
+    assert (
+        remote / "session-reference-generation"
+    ).read_text(encoding="ascii") == "1\n"
+
+
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+@pytest.mark.parametrize("shape", ("symlink", "directory", "fifo", "hardlink"))
+def test_install_refuses_unsafe_destination_pin_and_leaves_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, shape: str
+) -> None:
+    # A destination pin that is a symlink or a non-regular file cannot be copied
+    # forward safely. Skipping it silently unpins the session, so every installer
+    # refuses the replace and leaves the destination unchanged.
+    local = tmp_path / "local"
+    _set_remote_epoch(local, 8)
+    session_id = _ssh_session(local)
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(local, transport, session_id=session_id, force=True)
+    elif kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        push_session(local, LocalTransport(remote), session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(
+                local, LocalTransport(remote), session_id=session_id, force=True
+            )
+    else:  # local-pull
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+
+        def reinstall() -> None:
+            pull_session(
+                puller,
+                LocalTransport(source_remote),
+                session_id=session_id,
+                force=True,
+            )
+
+    pin = destination / ".retention-pin.json"
+    if shape == "symlink":
+        pin.symlink_to(destination / "transfer.json")
+    elif shape == "directory":
+        pin.mkdir()
+    elif shape == "fifo":
+        os.mkfifo(pin)
+    else:
+        pin.write_text('{"pinned":true}\n', encoding="utf-8")
+        os.link(pin, tmp_path / "pin-hardlink")
+    marker = destination / "marker-before-replace"
+    marker.write_text("present\n", encoding="utf-8")
+
+    with pytest.raises(
+        RemoteSyncError, match="retention pin is not a regular single-link file"
+    ):
+        reinstall()
+
+    # The destination is untouched: the unsafe pin and the marker both remain.
+    assert os.path.lexists(pin)
+    if shape == "symlink":
+        assert pin.is_symlink()
+    elif shape == "directory":
+        assert pin.is_dir()
+    elif shape == "fifo":
+        assert stat.S_ISFIFO(pin.lstat().st_mode)
+    else:
+        assert pin.is_file()
+        assert pin.lstat().st_nlink == 2
+    assert marker.read_text(encoding="utf-8") == "present\n"
 
 
 def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(

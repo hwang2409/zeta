@@ -1227,13 +1227,21 @@ def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
     )
 
     class UnreadableEntries(list):
+        blocked = False
+
         def __iter__(self):
-            raise AssertionError("delivery lookup read the conversation log")
+            if self.blocked:
+                raise AssertionError("delivery lookup read the conversation log")
+            return super().__iter__()
 
         def __reversed__(self):
-            raise AssertionError("delivery lookup read the conversation log")
+            if self.blocked:
+                raise AssertionError("delivery lookup read the conversation log")
+            return super().__reversed__()
 
-    store._resident_rows.entries = UnreadableEntries(store._entries)
+    unreadable_entries = UnreadableEntries(store._entries)
+    store._resident_rows = type(store._resident_rows).prepared(unreadable_entries)
+    unreadable_entries.blocked = True
     assert store.client_delivery("indexed").status == "queued"
     store.close()
 

@@ -14748,7 +14748,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
     monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
 
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(rendered[0])
     plain = Text.from_ansi(output.getvalue()).plain
@@ -14770,6 +14770,145 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
         "codex": "codex:second"
     }
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_picker_is_view_only_during_turn_then_switches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    busy = True
+    monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
+
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+    assert app.accounts_picker_active
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "codex:first" in plain
+    assert "codex:second" in plain
+    assert "usage" in plain
+    assert "view only · switching waits until the turn ends" in plain
+    assert "↑/↓ · r refresh · esc" in plain
+
+    app.accounts_picker_move(1)
+    assert app.accounts_picker_select() is None
+    assert app.accounts_picker_default() is None
+    app.accounts_picker_login()
+    assert app.accounts_picker_logout() is None
+    app.accounts_picker_rename()
+    assert await asyncio.to_thread(context.resolve, "codex") == first
+    assert app.accounts_picker_active
+    assert app._accounts_picker.switching_unavailable == (
+        "switching waits until the turn ends"
+    )
+
+    busy = False
+    switched = app.accounts_picker_select()
+    assert switched is not None
+    await asyncio.wait_for(switched, 10)
+    assert await asyncio.to_thread(context.resolve, "codex") == second
+    await app.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_switch_keeps_background_child_account_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    parent_backend = FakeBackend([])
+    loop = AgentLoop(parent_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    monkeypatch.setattr(
+        type(loop), "background_children_running", property(lambda _loop: True)
+    )
+    child_context = await asyncio.to_thread(context.child_snapshot, "codex")
+    child_store = ConversationStore(tmp_path / "child")
+    child_backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("first")], delay=0.2),
+            ScriptedTurn(content=[TextContent("second")]),
+        ]
+    )
+    child_loop = AgentLoop(child_backend, child_store, skill_catalog=SkillCatalog.empty())
+    child_loop.account_context = child_context
+    child_loop.tool_registry.account_context = child_context
+    child_turn = asyncio.create_task(
+        _collect(child_loop.run_turn("child request", origin=MessageOrigin.USER))
+    )
+    try:
+        await wait_until(lambda: len(child_backend.calls) == 1)
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+
+        monkeypatch.setattr(
+            "zeta.tui.slash_handlers.build_backend",
+            lambda *_args, **_kwargs: (parent_backend, "codex"),
+        )
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        assert app._accounts_picker is not None
+        assert app._accounts_picker.background_notice == "running children keep their account"
+        app.accounts_picker_move(1)
+        switch_task = app.accounts_picker_select()
+        assert switch_task is not None
+        await asyncio.wait_for(switch_task, 10)
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+
+        await asyncio.wait_for(child_turn, 10)
+        await asyncio.wait_for(
+            _collect(child_loop.run_turn("child follow-up", origin=MessageOrigin.USER)), 10
+        )
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+    finally:
+        await app.close()
+        await child_loop.close()
+        child_store.close()
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -14805,20 +14944,96 @@ async def test_account_picker_ignores_repeat_select_while_switching(
         nonlocal calls
         calls += 1
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     app.accounts_picker_move(1)
 
     first_task = app.accounts_picker_select()
     assert first_task is not None
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 10)
     assert app.accounts_picker_select() is None
     assert calls == 1
     release.set()
-    await asyncio.wait_for(first_task, 1)
+    await asyncio.wait_for(first_task, 10)
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_switch_serializes_real_prompt_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    initial_backend = FakeBackend([])
+    switched_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    loop = AgentLoop(initial_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._active_session = app._make_session()
+    app._presenter.print_unit = lambda _renderable: None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_switch = SessionAccountContext.switch_active
+    async def held_switch(self, *args: object, **kwargs: object) -> None:
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        await original_switch(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.build_backend",
+        lambda *_args, **_kwargs: (switched_backend, "codex"),
+    )
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        app.accounts_picker_move(1)
+        switch_task = app.accounts_picker_select()
+        assert switch_task is not None
+        await asyncio.wait_for(entered.wait(), 10)
+
+        app._submit_input("hello")
+        await wait_until(lambda: app._submissions.active)
+        assert all(entry.state.value != "dispatched" for entry in app._submissions._entries.values())
+        assert switched_backend.calls == []
+        assert initial_backend.calls == []
+
+        release.set()
+        await asyncio.wait_for(switch_task, 10)
+        await asyncio.sleep(0)
+        assert not app.account_switch_pending
+        assert loop.backend is switched_backend
+        await wait_until(
+            lambda: any(
+                entry.state.value == "dispatched"
+                for entry in app._submissions._entries.values()
+            )
+        )
+        await wait_until(lambda: not app._submissions.active)
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+        assert initial_backend.calls == []
+    finally:
+        release.set()
+        await app.close()
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -14931,6 +15146,7 @@ async def test_account_switch_applies_prepared_compaction_budget(
             original(metadata, account, **kwargs), compaction_budget=1_000_000
         )
 
+    # test-contract: seam this test replaces the manager boundary to verify budget propagation.
     monkeypatch.setattr(manager, "_apply_account_selection", prepare_with_larger_budget)
     try:
         await context.switch_active(
@@ -14981,6 +15197,11 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         del provider, build_backend
         await asyncio.to_thread(checked_switch, selected, boundary=boundary)
 
+    async def switch_account(_account, context, _prepare_backend):
+        await context.switch_active(
+            None, _account, boundary=0, provider="claude", build_backend=None
+        )
+
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
         _account_switch_task=None,
@@ -14996,11 +15217,13 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         model="offline",
         _dismiss_accounts_picker=lambda: None,
         _print_system=lambda _message: None,
+        _switch_account=switch_account,
+        _account_switch_done=lambda _task: None,
     )
 
     task = TUIApp.accounts_picker_select(app)
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
     assert switched == [(account, 0)]
 
@@ -15067,7 +15290,7 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     publisher.start()
     assert publisher_waiting.wait(10)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
@@ -15162,7 +15385,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
@@ -15230,7 +15453,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     holder.start()
     assert locked.wait(1)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await await_or_fail(
             refresh_rendered.wait(), what="busy account refresh render"
@@ -15296,7 +15519,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
     # test-contract: seam no public account-refresh completion event exists
     monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await asyncio.wait_for(refresh_done.wait(), timeout=10)
         # test-contract: seam no public account-refresh executor identity exists
@@ -15506,7 +15729,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
     monkeypatch.setattr(AccountStore, "logout", checked_logout)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
@@ -15518,7 +15741,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
         task = app.accounts_picker_logout()
         assert task is not None
-        await task
+        await asyncio.wait_for(task, 10)
 
         assert off_loop_calls == 1
         assert not await asyncio.to_thread(AccountStore(home).contains, removed)

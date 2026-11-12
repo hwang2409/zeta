@@ -35,6 +35,8 @@ class ForkHost(Protocol):
 
     async def close(self) -> None: ...
 
+    def request_exit(self) -> None: ...
+
     def set_fork_controller(self, controller: ForkStackController | None) -> None: ...
 
     @property
@@ -54,6 +56,12 @@ class ForkHost(Protocol):
 
     @property
     def restart_has_running_work(self) -> bool: ...
+
+    @property
+    def active(self) -> bool: ...
+
+    @property
+    def composer_empty(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +196,7 @@ class ForkStackController:
         self,
         main_app: ForkHost,
         build_fork: Callable[[str], Awaitable[ForkHost]],
+        schedule: Callable[[float, Callable[[], None]], object] | None = None,
     ) -> None:
         self._stack = [main_app]
         self._build_fork = build_fork
@@ -203,6 +212,9 @@ class ForkStackController:
         self._approval_handle_counter = 0
         self.restart_requested = False
         self.restart_cancels_work = False
+        self._restart_when_idle = False
+        self._restart_idle_handle: object | None = None
+        self._schedule = schedule or asyncio.get_running_loop().call_later
         main_app.set_fork_controller(self)
 
     @property
@@ -212,11 +224,58 @@ class ForkStackController:
     def is_visible(self, runtime: ForkHost) -> bool:
         return self.visible is runtime
 
-    def request_restart(self) -> None:
-        self.restart_requested = True
-        self.restart_cancels_work = any(
-            runtime.restart_has_running_work for runtime in self._stack
+    @property
+    def restart_pending(self) -> bool:
+        return self._restart_when_idle
+
+    @property
+    def restart_has_running_work(self) -> bool:
+        return any(
+            runtime.restart_has_running_work or runtime.active for runtime in self._stack
         )
+
+    def _restart_is_idle(self) -> bool:
+        return (
+            not self.restart_has_running_work
+            and not any(runtime.active for runtime in self._stack)
+            and not self.pending_approvals
+            and self.visible.composer_empty
+        )
+
+    def request_restart_when_idle(self) -> None:
+        self._restart_when_idle = True
+        self._schedule_restart_idle_check()
+
+    def _schedule_restart_idle_check(self) -> None:
+        if self._restart_idle_handle is None:
+            self._restart_idle_handle = self._schedule(0.5, self._restart_idle_tick)
+
+    def _restart_idle_tick(self) -> None:
+        self._restart_idle_handle = None
+        self.notify_restart_idle_check()
+        if self._restart_when_idle:
+            self._schedule_restart_idle_check()
+
+    def _cancel_restart_idle_check(self) -> None:
+        handle = self._restart_idle_handle
+        self._restart_idle_handle = None
+        if handle is not None:
+            handle.cancel()
+
+    def cancel_restart(self) -> None:
+        self._restart_when_idle = False
+        self._cancel_restart_idle_check()
+
+    def notify_restart_idle_check(self) -> None:
+        if self._restart_when_idle and self._restart_is_idle():
+            self.request_restart()
+
+    def request_restart(self) -> None:
+        self._restart_when_idle = False
+        self._cancel_restart_idle_check()
+        self.restart_requested = True
+        self.restart_cancels_work = self.restart_has_running_work
+        self.visible.request_exit()
 
     @property
     def pending_approvals(self) -> tuple[OwnedApproval, ...]:
@@ -311,6 +370,7 @@ class ForkStackController:
             raise
 
     async def close(self) -> None:
+        self.cancel_restart()
         first_error: BaseException | None = None
         for runtime in reversed(self._stack):
             try:
