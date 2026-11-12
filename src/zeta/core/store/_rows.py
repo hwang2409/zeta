@@ -115,12 +115,36 @@ class ResidentRows:
         self.branch: tuple[ConversationEntry, ...] = ()
         self.replace(entries)
 
+    def append(self, entry: ConversationEntry) -> None:
+        self.entries.append(entry)
+        self.rows.append(RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry)))
+        self._rebuild_branch()
+
+    def extend(self, entries: Iterable[ConversationEntry]) -> None:
+        additions = list(entries)
+        if not additions:
+            return
+        self.entries.extend(additions)
+        self.rows.extend(
+            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
+            for e in additions
+        )
+        self._rebuild_branch()
+
+    def truncate_to(self, length: int) -> None:
+        del self.entries[length:]
+        del self.rows[length:]
+        self._rebuild_branch()
+
     def replace(self, entries: Iterable[ConversationEntry]) -> None:
         self.entries = list(entries)
         self.rows = [
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in self.entries
         ]
+        self._rebuild_branch()
+
+    def _rebuild_branch(self) -> None:
         by_id = {e.id: e for e in self.entries}
         current = self.entries[-1] if self.entries else None
         branch: list[ConversationEntry] = []
@@ -134,7 +158,10 @@ class ResidentRows:
         self.branch = tuple(reversed(branch))
 
     def entry(self, ref: RowRef) -> ConversationEntry:
-        return self.entries[ref.seq - 1]
+        for entry in self.entries:
+            if entry.seq == ref.seq and entry.id == ref.id:
+                return entry
+        raise KeyError(ref.seq)
 
     def stream_rows(self, refs: Iterable[RowRef], *, batch: int = 256) -> Iterator[ConversationEntry]:
         del batch

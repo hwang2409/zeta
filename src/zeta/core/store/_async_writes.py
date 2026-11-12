@@ -623,12 +623,12 @@ class AsyncDurableWritesMixin:
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
             self._reset_generation += 1
-            self._entries = entries
+            self._resident_rows.replace(entries)
             self._entry_ids = {entry.id for entry in entries}
         elif entries:
             self._before_incremental_state_install()
             if delta._resident_patch.raw_entries:
-                self._entries.extend(entries)
+                self._resident_rows.extend(entries)
                 self._entry_ids.update(entry.id for entry in entries)
             else:
                 self._install_validated_linear_entries(entries)

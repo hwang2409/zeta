@@ -96,8 +96,8 @@ from ._pending_prompts import (
     PendingPromptStoreMixin,
 )
 from ._row_history import RecentRowsMixin, TurnHistoryMixin
+from ._rows import ResidentRows, StartupFactsMixin, sent_message_receipts
 from ._session_state import SessionStatePersistenceMixin
-from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
@@ -129,6 +129,14 @@ class ConversationStore(
     ChildRunStoreMixin,
     SessionStatePersistenceMixin,
 ):
+    @property
+    def _entries(self) -> list[ConversationEntry]:
+        return self._resident_rows.entries
+
+    @_entries.setter
+    def _entries(self, entries: Iterable[ConversationEntry]) -> None:
+        self._resident_rows = ResidentRows(entries)
+
     def __init__(
         self,
         session_dir: str | Path | None = None,
@@ -227,7 +235,7 @@ class ConversationStore(
             self.lock_path = self.session_dir / ".lock"
             self.cwd = str(cwd or Path.cwd())
             self.bash_cwd = str(bash_cwd or self.cwd)
-            self._entries: list[ConversationEntry] = []
+            self._resident_rows = ResidentRows()
             self._entry_prefix_digest = b""
             self._initialize_client_delivery_lifecycle()
             self._collect_persisted_appends = _collect_persisted_appends
@@ -659,17 +667,17 @@ class ConversationStore(
             if touched
             else _ApprovalValidationOverlay()
         )
-        self._entries.extend(entries)
+        self._resident_rows.extend(entries)
         try:
             self._validate_entries(approvals, {entry.id for entry in entries})
         finally:
-            del self._entries[-len(entries) :]
+            self._resident_rows.truncate_to(len(self._entries) - len(entries))
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
         self._write_bytes(encoded)
         self._apply_history_index_entries(tuple(entries))
         fold = self._delivery_fold.staged()
         for entry in entries:
-            self._entries.append(entry)
+            self._resident_rows.append(entry)
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             fold.apply(entry)
@@ -723,11 +731,11 @@ class ConversationStore(
                 # A fork re-selects the active branch, so the active-branch
                 # index cannot seed a sibling branch. Validate the whole
                 # candidate branch before any bytes reach disk.
-                self._entries.append(entry)
+                self._resident_rows.append(entry)
                 try:
                     self._validate_entries()
                 finally:
-                    self._entries.pop()
+                    self._resident_rows.truncate_to(len(self._entries) - 1)
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -739,7 +747,7 @@ class ConversationStore(
         # A fork is rebuilt by _sync_history_index below: skipping the
         # incremental apply leaves the stored boundary behind, so the sync
         # detects the non-contiguous tail and fully rebuilds the active branch.
-        self._entries.append(entry)
+        self._resident_rows.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))

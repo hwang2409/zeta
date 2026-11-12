@@ -127,7 +127,7 @@ class _FullLoadValidator:
         self.baseline = (len(store._entries), store._entry_prefix_digest)
         self._digest_at_baseline: bytes | None = b"" if not store._entries else None
         self.state = copy.copy(store)
-        self.state._entries = []
+        self.state._resident_rows.replace(())
         self.state._entry_prefix_digest = b""
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()
@@ -234,7 +234,7 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
-        self.state._entries.append(entry)
+        self.state._resident_rows.append(entry)
         self.by_id[entry.id] = entry
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
@@ -493,7 +493,7 @@ class ConversationLogMixin:
         self._log_mtime_ns = state.log_mtime_ns
         self._log_prefix_fingerprint = state.log_prefix_fingerprint
         # Publish entries last so readers never see rows without matching indexes.
-        self._entries = state.entries
+        self._resident_rows.replace(state.entries)
         self._transcript_generation += 1
         return previous
 
@@ -588,7 +588,7 @@ class ConversationLogMixin:
                 raise ConversationIntegrityError(
                     f"conversation file is missing: {self.path}"
                 )
-            self._entries = []
+            self._resident_rows.replace(())
             self._entry_prefix_digest = b""
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
