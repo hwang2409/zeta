@@ -138,11 +138,12 @@ async def test_session_mcp_binding_rejects_project_definition(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_session_mcp_binding_rejects_control_header_without_leak(tmp_path: Path) -> None:
     secret = "nul-secret-should-not-appear"
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {"transport": "streamable-http", "url": "http://127.0.0.1:9"}}}))
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
-        error = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer " + secret + "\\x00"}}]}))[-1]
+        error = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer " + secret + chr(0)}}]}))[-1]
         assert error["error"]["code"] == -32602
         assert secret not in json.dumps(error)
     finally:
@@ -159,6 +160,10 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
         session = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer x"}}]}))[-1]["result"]["session"]
         writer.close(); await writer.wait_closed()
         await asyncio.sleep(0)
+        release = server.control._controller_release_task
+        if release is not None:
+            await release
+        assert not server.runtime.loop._mcp_bindings
         reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
         try:
             await _request(reader2, writer2, 3, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
