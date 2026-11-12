@@ -43,6 +43,8 @@ from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
     _buffer as _client_buffer,
+)
+from tests.support.server_client import (
     assert_event_order,
     event_owner,
     frames_for_call,
