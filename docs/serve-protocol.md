@@ -410,6 +410,8 @@ resumes after approval uses the binding that is current at that time.
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123","host_commands":[{"name":"gamma-render","executable":"/opt/gamma/bin/render","summary":"render a file in the web surface","environment":{"GAMMA_SESSION":"s-1"}}]}}
 ```
 
+With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume` supplies the binding again. serve-only: no TUI surface.
+
 ### `resume`
 
 Params: required `session_id`, a non-empty string. The result has `session`
@@ -1875,6 +1877,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
+| `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |

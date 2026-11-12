@@ -257,6 +257,7 @@ FEATURES = (
     "approval_reconnect",
     "session_history_backward",
     "session_host_commands",
+    "session_mcp_bindings",
     "session_history_fidelity",
     "session_replay_seq",
     "child_run_history",

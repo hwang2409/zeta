@@ -7,6 +7,7 @@ import logging
 import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 
 from ..core.abort import AbortSignal
@@ -529,11 +530,16 @@ async def mount_mcp_servers(
     *,
     notice_sink: NoticeSink | None = None,
     home: str | None = None,
+    bindings: dict[str, dict[str, str]] | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
 
     enabled_configs = {
-        name: server_config
+        name: (
+            replace(server_config, headers={**server_config.headers, **bindings[name]})
+            if bindings and name in bindings
+            else server_config
+        )
         for name, server_config in config.configured_servers.items()
         if server_config.enabled
     }

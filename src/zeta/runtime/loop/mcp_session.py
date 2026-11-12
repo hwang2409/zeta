@@ -74,6 +74,7 @@ class MCPSession:
                 config,
                 notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
+                bindings=self._mcp_bindings,
             )
             service.mount = self._mcp_mount
         except (MCPConfigError, MCPManagementError) as exc:
@@ -94,6 +95,16 @@ class MCPSession:
         self._mcp_mount = mount
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+
+    async def set_mcp_bindings(self, bindings: dict[str, dict[str, str]]) -> None:
+        """Set transient per-attachment headers and remount MCP servers."""
+
+        if self._mcp_mount is not None:
+            await self._mcp_mount.close()
+            self._mcp_mount = None
+            self._mcp_mount_task = None
+            self._mcp_mount_attempted = False
+        self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
 
     def set_mcp_scope(
         self,

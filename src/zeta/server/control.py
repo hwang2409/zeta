@@ -142,6 +142,8 @@ class ServeControl:
         self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
+        self._active_mcp_bindings: dict[str, dict[str, str]] = {}
+        self._mcp_binding_required = False
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
@@ -205,7 +207,10 @@ class ServeControl:
         self._approvals.reject_if_unhealthy()
 
     def reject_client_turn_if_detached(self) -> None:
-        if self._host_binding_required and self._active_host_commands is None:
+        if (
+            (self._host_binding_required and self._active_host_commands is None)
+            or (self._mcp_binding_required and not self._active_mcp_bindings)
+        ):
             raise ProtocolError(
                 ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
@@ -389,6 +394,7 @@ class ServeControl:
 
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
+        self._active_mcp_bindings = {}
         if reconnect and self._grace_task is not None:
 
             async def wait_for_grace() -> None:
