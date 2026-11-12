@@ -313,6 +313,33 @@ def test_rebuild_equals_incremental_append(tmp_path: Path) -> None:
     assert rebuilt.status().unit_count == incremental.status().unit_count == 2
 
 
+def test_rebuild_skips_corrupt_session_and_names_it(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    good = _source(
+        sessions,
+        "good",
+        [
+            _row(1, "user", "healthy canary question"),
+            _row(2, "assistant", "answer", state="completed"),
+        ],
+    )
+    bad = _source(sessions, "bad", [_row(1, "user", "doomed")])
+    # A newline-terminated invalid row after a valid one is the corruption that
+    # blocked the whole project's rebuild on main with a raw "Expecting property
+    # name".
+    with bad.conversation_path.open("a", encoding="utf-8") as handle:
+        handle.write("{not json}\n")
+    index = TranscriptIndex(tmp_path / "project", PROJECT_A)
+
+    try:
+        status = index.rebuild((bad, good))
+    except index_module.TranscriptIndexError:
+        status = None
+    assert status is not None, "rebuild aborted instead of skipping the corrupt session"
+    assert _result_ids(index, "canary"), "good session not searchable after rebuild"
+    assert any("bad" in message for message in status.skipped)
+
+
 def test_incremental_state_keeps_only_sanitized_search_evidence(tmp_path: Path) -> None:
     private_key = (
         "-----BEGIN PRIVATE KEY-----\n"
@@ -573,8 +600,8 @@ def test_missing_receipts_verify_bounded_prefix_then_read_only_tail(
     observed: list[object] = []
     original_read = index_module._read_transcript
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         observed.append(result)
         return result
 
@@ -609,8 +636,8 @@ def test_prefix_mutation_without_receipts_forces_full_rebuild(
     original_read = index_module._read_transcript
     observed: list[object] = []
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         observed.append(result)
         return result
 
@@ -668,8 +695,8 @@ def test_unverified_append_rereads_and_matches_rebuild(
     original_read = index_module._read_transcript
     reads: list[object] = []
 
-    def observe(path: Path, cursor, receipts=None):
-        result = original_read(path, cursor, receipts)
+    def observe(path: Path, cursor, receipts=None, *, session_id):
+        result = original_read(path, cursor, receipts, session_id=session_id)
         reads.append(result)
         return result
 

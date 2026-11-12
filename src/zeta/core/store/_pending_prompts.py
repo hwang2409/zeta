@@ -102,6 +102,7 @@ class PendingPromptQueue:
         # Set by the terminal drain (off-loop, under the append lock) so a late
         # notification producer is refused and re-resolves to the live ancestor.
         self._drained = False
+        self._run_ended = False
 
     @contextmanager
     def _lock(self, *, deadline: float | None = None) -> Iterator[None]:
@@ -139,6 +140,8 @@ class PendingPromptQueue:
             ):
                 raise PendingPromptWriterReloadedError
             self._check_deadline(deadline)
+            if self._run_ended:
+                raise PendingPromptsClosedError("run ended")
             if self._queue_closed_unlocked() and (
                 not starts_new_episode or self._terminal_transition_unlocked() is not None
             ):
@@ -181,6 +184,15 @@ class PendingPromptQueue:
         with self._lock():
             if not self._queue_closed_unlocked():
                 self._store._append_row_unlocked("pending_queue_closed", {})
+
+    def end_run(self) -> None:
+        """Seal the queue so a prompt that meets an ended run is refused, not lost.
+
+        The settle and segment_end lock scopes set this atomically for the common
+        exits. The consumer's ``finally`` calls this once more, lock-free and
+        best-effort, for the error and cancel exits.
+        """
+        self._run_ended = True
 
     def accept_explicit_finish(
         self,

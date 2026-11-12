@@ -563,6 +563,10 @@ def _admit_terminal(
             if entry.data.get("display_only") is not True
         ]
         pending = bool(prompts or notifications)
+        if intent == "segment_end" and not pending:
+            # A segment_end pass that finds nothing pending means the run ended
+            # (run_consumer always breaks after it). Refuse any later prompt.
+            store.pending_prompt_queue._run_ended = True
         closed = False
         if (
             not pending
@@ -608,6 +612,7 @@ def _settle_terminal(
             rows.append(("notification_ack", {"notification_id": entry.id}))
         if not store.pending_prompt_queue._queue_closed_unlocked():
             rows.append(("pending_queue_closed", {}))
+        store.pending_prompt_queue._run_ended = True
         if rows:
             store._append_many_unlocked(rows)
         return TerminalSettlement(False, tuple(folded))
