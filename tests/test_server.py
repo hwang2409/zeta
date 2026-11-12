@@ -2758,14 +2758,18 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         monkeypatch.setattr(server.control, "_admit_controller", observe_admit)
         # test-contract: seam observe completion of terminal wire publication
         monkeypatch.setattr(server.control, "_notify", observe_notify)
-        # Force the losing race deterministically: close the grandchild store
-        # before the cancel, so every settlement write hits a closed store.
-        owner._active_stores[grandchild_id][0].close()
+        grandchild_store = owner._active_stores[grandchild_id][0]
+
+        async def reject_settlement(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise ValueError("session store is closed")
+
+        # test-contract: seam force the closed-store result only on settlement writes
+        monkeypatch.setattr(
+            grandchild_store, "resolve_approval_async", reject_settlement
+        )
         assert owner.cancel(child_id)
-        try:
-            await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
-        except ValueError as error:
-            assert str(error) == "session store is closed"
+        await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
         await asyncio.wait_for(server.control.wait_for_approval_settlement(), TIMEOUT)
         notification_task = server.control._turn_task
         if notification_task is not None:
