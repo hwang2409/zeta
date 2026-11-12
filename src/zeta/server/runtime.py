@@ -34,6 +34,7 @@ from ..core.slash import (
 )
 from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..project_context.projection import compose_with_stable_projection
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -472,7 +473,10 @@ class ServerRuntime:
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         registry = self.manager.project_registry
         if registry is not None and config.auto_project:
-            discovery = associate_project_discovery(discovery, registry)
+            try:
+                discovery = associate_project_discovery(discovery, registry)
+            except (ProjectRegistryError, OSError, ValueError):
+                pass
         projection = (
             project_context_projection_for_discovery(discovery, registry)
             if registry is not None
@@ -527,7 +531,10 @@ class ServerRuntime:
             and config.auto_project
             and opened.metadata.project_id is None
         ):
-            discovery = associate_project_discovery(discovery, registry)
+            try:
+                discovery = associate_project_discovery(discovery, registry)
+            except (ProjectRegistryError, OSError, ValueError):
+                pass
         projection = (
             registry.project_context_projection(opened.metadata.project_id)
             if registry is not None
