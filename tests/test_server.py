@@ -2788,17 +2788,31 @@ async def test_background_event_overflow_records_approval_for_reconnect(
     physical_release = asyncio.Event()
     overflowed = asyncio.Event()
     close_overflow = asyncio.Event()
-    controller_release_started = asyncio.Event()
-    original_begin_controller_release = server.control.begin_controller_release
-
-    def observe_controller_release(*, reconnect: bool):
-        result = original_begin_controller_release(reconnect=reconnect)
-        controller_release_started.set()
-        return result
-
-    monkeypatch.setattr(
-        server.control, "begin_controller_release", observe_controller_release
+    old_semantic_release = asyncio.Event()
+    original_event = server.control._event
+    awaitable_publisher = inspect.iscoroutinefunction(
+        server.control._background_events.publish
     )
+    held_old_event = False
+
+    async def hold_old_worker_after_delivery(
+        event: StreamEvent, **kwargs: object
+    ) -> None:
+        nonlocal held_old_event
+        await original_event(event, **kwargs)
+        if (
+            not awaitable_publisher
+            and not held_old_event
+            and kwargs.get("background") is True
+            and event.type is StreamEventType.MESSAGE_UPDATE
+        ):
+            held_old_event = True
+            await await_or_fail(
+                old_semantic_release.wait(), what="old semantic worker release"
+            )
+
+    # test-contract: seam force the old enqueue-first worker to lose reconnect order
+    monkeypatch.setattr(server.control, "_event", hold_old_worker_after_delivery)
     reconnect_writer: asyncio.StreamWriter | None = None
     try:
         await _request(
@@ -2816,6 +2830,27 @@ async def test_background_event_overflow_records_approval_for_reconnect(
             await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         )[-1]["result"]["session"]
         session_id = session["session_id"]
+        assert server.runtime.loop is not None
+        loop = server.runtime.loop
+        original_sink = loop._background_event_sink
+        assert original_sink is not None
+        approval_producer_returned = asyncio.Event()
+
+        def observe_producer(event: StreamEvent):
+            result = original_sink(event)
+            if not inspect.isawaitable(result):
+                if event.type is StreamEventType.TOOL_APPROVAL_START:
+                    approval_producer_returned.set()
+                return None
+
+            async def wait_for_result() -> None:
+                await await_or_fail(result, what="observed approval producer")
+                if event.type is StreamEventType.TOOL_APPROVAL_START:
+                    approval_producer_returned.set()
+
+            return wait_for_result()
+
+        loop.set_background_event_sink(observe_producer)
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         await await_or_fail(backend.child_started.wait(), what="child backend start")
 
@@ -2857,6 +2892,9 @@ async def test_background_event_overflow_records_approval_for_reconnect(
         await await_or_fail(physical_started.wait(), what="blocked physical writer")
         assert not overflowed.is_set(), "the approval must be the crossing event"
         child_release.set()
+        await await_or_fail(
+            approval_producer_returned.wait(), what="approval producer return"
+        )
         await await_or_fail(overflowed.wait(), what="controller output overflow")
 
         physical_release.set()
@@ -2865,9 +2903,6 @@ async def test_background_event_overflow_records_approval_for_reconnect(
         close_overflow.set()
         await await_or_fail(reader.read(), what="overflow disconnect")
         assert reader.at_eof(), "overflow must disconnect only the slow controller"
-        await await_or_fail(
-            controller_release_started.wait(), what="controller reconnect grace"
-        )
 
         reconnect_reader, reconnect_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -2919,6 +2954,7 @@ async def test_background_event_overflow_records_approval_for_reconnect(
     finally:
         child_release.set()
         physical_release.set()
+        old_semantic_release.set()
         close_overflow.set()
         if reconnect_writer is not None:
             await close_serve(server, reconnect_writer)
