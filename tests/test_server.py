@@ -2541,6 +2541,11 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         child_watcher = owner._watchers[child_id]
         assert owner.cancel(child_id)
         await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        frames = await _request(reader, writer, 4, "status")
+        frames.append(await _read(reader))
+        approval_ends = _named_events(frames, "approval_end")
+        assert len(approval_ends) == 1
+        assert approval_ends[0]["request_id"] == approval["request_id"]
         assert len(backend.grandchild.calls) == 1
     finally:
         if child_watcher is not None and not child_watcher.done():
@@ -2589,6 +2594,9 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
                 for event in _named_events(frames, "approval_end")
             ):
                 frames.append(await _read(reader))
+        approval_ends = _named_events(frames, "approval_end")
+        assert len(approval_ends) == 1
+        assert approval_ends[0]["request_id"] == approval["request_id"]
         await _request(reader, writer, 5, "status")
         assert len(backend.grandchild.calls) == 1
     finally:
