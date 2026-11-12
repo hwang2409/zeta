@@ -13440,6 +13440,9 @@ def test_failed_active_draft_is_printed_on_every_exit(
     stderr = stderr_before_restart + capsys.readouterr().err
     assert ("zeta: crashed; details in" in stderr) is (exit_kind == "unexpected_error")
     assert "unexpected failure" not in stderr
+    if exit_kind == "unexpected_error":
+        log = Path(os.environ["ZETA_HOME"]) / "logs" / "tui-errors.jsonl"
+        assert "RuntimeError: unexpected failure" in log.read_text()
     expected_drafts = 2 if with_replaced_draft else 1
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == expected_drafts

@@ -939,9 +939,9 @@ def _run_tui_lifecycle(
             except Exception as exc:
                 if _has_console_message(exc):
                     raise
-                from ..tui.loop_errors import tui_error_log
+                from ..tui.loop_errors import log_tui_crash
 
-                print(f"zeta: crashed; details in {tui_error_log()}", file=sys.stderr)
+                print(f"zeta: crashed; details in {log_tui_crash(exc)}", file=sys.stderr)
                 _print_exit_hint(app)
                 exit_status = 1
                 break

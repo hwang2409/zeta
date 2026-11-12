@@ -56,6 +56,15 @@ def tui_error_log() -> Path:
     return env_home() / "logs" / _TUI_ERROR_LOG
 
 
+def log_tui_crash(error: BaseException) -> Path:
+    """Log a fatal TUI error and return the log path for one short exit line."""
+
+    path = tui_error_log()
+    stack = "".join(traceback.format_exception(error))
+    write_tui_diagnostic(path, {"type": "crash", "traceback": stack})
+    return path
+
+
 def _copy_stderr_to_log(read_fd: int, path: Path) -> None:
     with os.fdopen(read_fd, "rb", buffering=0) as pipe:
         while chunk := pipe.read(65536):
@@ -89,11 +98,6 @@ def stderr_to_log() -> Iterator[None]:
     )
     try:
         yield
-    except Exception as exc:
-        # Logged before the terminal returns, so the caller can print one line.
-        stack = "".join(traceback.format_exception(exc))
-        write_tui_diagnostic(path, {"type": "crash", "traceback": stack})
-        raise
     finally:
         sys.stderr.flush()
         sys.stderr = previous
