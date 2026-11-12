@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -34,6 +35,7 @@ from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
 from ..locking import shape_lock
+from ..session_retention import RETENTION_PIN_FILENAME
 from ..storage_format import WriterLease, open_writer
 from .errors import RemoteSyncError
 from .memory import (
@@ -707,6 +709,7 @@ def _result(manifest: dict[str, object]) -> SessionTransferResult:
 
 
 def _atomic_replace_directory(staging: Path, destination: Path) -> None:
+    _preserve_retention_pin(destination, staging)
     backup = destination.parent / f".{destination.name}.replaced-{os.getpid()}"
     if backup.exists():
         shutil.rmtree(backup)
@@ -720,6 +723,27 @@ def _atomic_replace_directory(staging: Path, destination: Path) -> None:
         raise
     if backup.exists():
         shutil.rmtree(backup)
+
+
+def _preserve_retention_pin(destination: Path, staging: Path) -> None:
+    # The pin sidecar is retention-owned local state. A snapshot may carry its
+    # own pin (the transfer does not exclude it) and the destination may have
+    # one too; copy the destination's pin forward so the result stays pinned
+    # whenever the destination or the snapshot was pinned, never silently
+    # clearing a local pin. A destination pin that exists but is a symlink or
+    # not a regular single-link file cannot be copied safely; skipping it would
+    # silently unpin, so refuse the replace and leave the destination untouched.
+    pin = destination / RETENTION_PIN_FILENAME
+    if not os.path.lexists(pin):
+        return
+    info = pin.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RemoteSyncError(
+            f"destination retention pin is not a regular single-link file: {pin}"
+        )
+    target = staging / RETENTION_PIN_FILENAME
+    shutil.copyfile(pin, target)
+    target.chmod(0o600)
 
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:

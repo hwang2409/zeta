@@ -283,7 +283,7 @@ class CheckpointForkMixin:
 
         with self._append_lock():
             self._load()
-            branch = self.replay()
+            branch = self._active_branch()
             if not self.is_turn_boundary(branch):
                 raise ConversationIntegrityError(
                     "cannot create a checkpoint while a turn is in flight"
@@ -309,7 +309,7 @@ class CheckpointForkMixin:
             raise ValueError("fork requires a checkpoint label or sequence")
         with self._append_lock():
             self._load()
-            branch = self.replay()
+            branch = self._active_branch()
             if not self.is_turn_boundary(branch):
                 raise ConversationIntegrityError(
                     "cannot fork while a turn is in flight"
@@ -352,30 +352,17 @@ class CheckpointForkMixin:
         return not outstanding
 
     def turn_in_flight(self) -> bool:
-        return not self.is_turn_boundary(self.replay())
+        return not self.is_turn_boundary(self._active_branch())
 
-    @staticmethod
-    def has_outstanding_tool_calls(entries: Iterable[ConversationEntry]) -> bool:
-        """Return whether any tool_call lacks a matching tool_result."""
+    def has_outstanding_tool_calls(self) -> bool:
+        """Return whether any tool_call lacks a matching tool_result (O(1))."""
 
-        outstanding: set[str] = set()
-        for entry in entries:
-            if entry.type != "message":
-                continue
-            parsed = Message.from_dict(entry.data["message"])
-            outstanding.update(
-                block.tool_call.id
-                for block in parsed.content
-                if isinstance(block, ToolUseContent)
-            )
-            if parsed.tool_result is not None:
-                outstanding.discard(parsed.tool_result.tool_call_id)
-        return bool(outstanding)
+        return bool(self._delivery_fold.open_tool_calls)
 
     def list_checkpoints(self) -> list[tuple[ConversationEntry, str | None]]:
         """Return active checkpoints with the next message preview."""
 
-        branch = self.replay()
+        branch = self._active_branch()
         result: list[tuple[ConversationEntry, str | None]] = []
         for index, entry in enumerate(branch):
             if entry.type != "checkpoint":
@@ -386,7 +373,7 @@ class CheckpointForkMixin:
                     continue
                 preview = _message_preview(following)
                 break
-            result.append((entry, preview))
+            result.append((self._snapshot_entry(entry), preview))
         return result
 
     def checkpoint_count(self) -> int:
@@ -397,7 +384,7 @@ class CheckpointForkMixin:
     ) -> list[tuple[int, ConversationEntry, str]]:
         """Return ``(index, entry, preview)`` for USER messages on the branch."""
 
-        branch = self.replay()
+        branch = self._active_branch()
         result: list[tuple[int, ConversationEntry, str]] = []
         for entry in branch:
             if entry.type != "message":
@@ -408,7 +395,7 @@ class CheckpointForkMixin:
             if is_passive_harness_message(message):
                 continue
             preview = _message_preview(entry) or ""
-            result.append((len(result) + 1, entry, preview))
+            result.append((len(result) + 1, self._snapshot_entry(entry), preview))
         return result
 
     def append_message_fork(self, entry_id: str) -> ConversationEntry:
@@ -425,7 +412,7 @@ class CheckpointForkMixin:
             raise ValueError("fork requires a user message entry id")
         with self._append_lock():
             self._load()
-            branch = self.replay()
+            branch = self._active_branch()
             source = next(
                 (candidate for candidate in branch if candidate.id == entry_id),
                 None,
@@ -455,7 +442,7 @@ class CheckpointForkMixin:
     def list_branches(self) -> list[BranchInfo]:
         """Enumerate every leaf in the parent-linked tree."""
 
-        return list_branches_from_entries(self.entries)
+        return list_branches_from_entries(self.resident_entries_snapshot())
 
     def switch_to_branch(self, head_entry_id: str) -> ConversationEntry:
         """Re-anchor the active branch on a leaf via a fork entry.
@@ -474,7 +461,7 @@ class CheckpointForkMixin:
             raise ValueError("branch switch requires a head entry id")
         with self._append_lock():
             self._load()
-            current_branch = self.replay()
+            current_branch = self._active_branch()
             by_id = {entry.id: entry for entry in self._entries}
             source = by_id.get(head_entry_id)
             if source is None:

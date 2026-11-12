@@ -329,6 +329,7 @@ class TUIApp(
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
         self._active_session: PromptSession[str] | None = None
+        self._restart_idle_buffers: set[int] = set()
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._init_remote_view()
@@ -1120,6 +1121,12 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
+    def _bind_restart_idle_buffer(self, session: PromptSession[str]) -> None:
+        buffer = getattr(getattr(session, "app", None), "current_buffer", None)
+        if buffer is not None and id(buffer) not in self._restart_idle_buffers:
+            buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            self._restart_idle_buffers.add(id(buffer))
+
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1152,6 +1159,7 @@ class TUIApp(
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
+            self._bind_restart_idle_buffer(session)
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
                 await start_prompt_during_activation(self, session, run_prompt_toolkit)

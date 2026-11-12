@@ -53,7 +53,18 @@ class SessionReferenceUnavailable(SessionError):
 
 
 _READ_RETRIES = 3
-_SESSION_REFERENCE_GENERATION = "session-reference-generation"
+SESSION_REFERENCE_GENERATION = "session-reference-generation"
+REFERENCES_DOMAIN = "references"
+
+
+def reservation_path(home: Path, session_id: str) -> Path:
+    """Durable reservation marker a deleter writes before removing a session."""
+    return home / "session-trash" / "reservations" / f"{session_id}.json"
+
+
+def quarantine_path(home: Path, session_id: str) -> Path:
+    """Directory a deleter moves a session into while removing it."""
+    return home / "session-trash" / session_id
 
 
 @dataclass(frozen=True)
@@ -98,7 +109,7 @@ class SessionReferenceGate:
                     domain_authority(
                         self.home,
                         RETENTION_HOME_ID,
-                        "references",
+                        REFERENCES_DOMAIN,
                         exclusive=exclusive,
                         nonblocking=on_loop,
                     )
@@ -136,8 +147,8 @@ class SessionReferenceGate:
             return
         for session_id in session_ids:
             _component(session_id)
-            reservation = self.home / "session-trash" / "reservations" / f"{session_id}.json"
-            quarantined = self.home / "session-trash" / session_id
+            reservation = reservation_path(self.home, session_id)
+            quarantined = quarantine_path(self.home, session_id)
             if reservation.exists() or quarantined.exists():
                 raise SessionReferenceUnavailable(
                     f"session reference unavailable: {session_id} is being deleted"
@@ -146,10 +157,17 @@ class SessionReferenceGate:
     def bump_generation(self) -> int:
         if not self._enabled():
             return 0
-        path = self.home / _SESSION_REFERENCE_GENERATION
-        value = read_reference_generation(self.home)
-        if value > 2**63 - 2:
-            raise SessionError("session reference generation is out of range")
+        path = self.home / SESSION_REFERENCE_GENERATION
+        try:
+            raw = path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            value = 0
+        else:
+            if not raw.endswith("\n") or not raw[:-1].isdigit():
+                raise SessionError("session reference generation is malformed")
+            value = int(raw[:-1])
+            if value > 2**63 - 2:
+                raise SessionError("session reference generation is out of range")
         value += 1
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -168,14 +186,11 @@ class SessionReferenceGate:
 
 
 def read_reference_generation(home: Path) -> int:
-    """Return the current reference generation without touching the gate.
-
-    A read-only observer used by the dormant retention planner to detect that a
-    reference transaction raced its scan. An absent file is generation zero.
-    """
+    """Return the reference generation without touching its admission gate."""
     try:
         fd = os.open(
-            Path(home) / _SESSION_REFERENCE_GENERATION, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            Path(home) / SESSION_REFERENCE_GENERATION,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
     except FileNotFoundError:
         return 0
