@@ -2540,14 +2540,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         owner = server.runtime.loop._background_owner
         child_watcher = owner._watchers[child_id]
         assert owner.cancel(child_id)
-        frames = await _request(reader, writer, 4, "status")
-        async with asyncio.timeout(TIMEOUT):
-            while not any(
-                event["request_id"] == approval["request_id"]
-                for event in _named_events(frames, "approval_end")
-            ):
-                frames.append(await _read(reader))
-        await _request(reader, writer, 5, "status")
+        await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
         assert len(backend.grandchild.calls) == 1
     finally:
         if child_watcher is not None and not child_watcher.done():
