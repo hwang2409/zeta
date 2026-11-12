@@ -323,7 +323,7 @@ async def test_authorize_polling_interleavings(
             ]
         elif case == "delegation_gone":
             if kind == "nested":
-                assert await harness.root.cleanup_delegated("innermost") is None
+                assert harness.root.cleanup_delegated("innermost") is None
                 tick.released.set()
                 assert await await_or_fail(task, what="removed delegation") is ApprovalDecision.DENY
                 assert (await harness.root.pending_requests()) == []

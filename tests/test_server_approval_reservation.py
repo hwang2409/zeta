@@ -407,7 +407,8 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     gate.install(monkeypatch)
     try:
         if cleanup_first:
-            cleanup = asyncio.ensure_future(policy.cleanup_delegated("child"))
+            cleanup = policy.cleanup_delegated("child")
+            assert cleanup is not None
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
                 await server.control.resolve_approval("approve", wire_id)
@@ -420,7 +421,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
                 server.control.resolve_approval("approve", wire_id)
             )
             await _wait_thread_gate(gate)
-            assert await policy.cleanup_delegated("child") is None
+            assert policy.cleanup_delegated("child") is None
             gate.release.set()
             result = await asyncio.wait_for(approve, 10)
             assert result["decision"] == "approve"
@@ -1573,8 +1574,8 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         )
         policy.register_delegated(late_request, late, child_instance_id="late-child")
         await server.control.wait_for_approval_settlement()
-        assert (await late.approval_resolution(late_call.id))["decision"] == "abort"
-        await policy.cleanup_delegated("late-child")
+        assert late.approval_resolution_now(late_call.id)["decision"] == "abort"
+        policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
     finally:
         await close_serve(server, writer)
