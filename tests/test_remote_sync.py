@@ -910,6 +910,7 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
         about_to_install.set()
         real_install(self, ident, source, expected)
 
+    # test-contract: seam trace the install boundary to prove the held gate blocks it
     monkeypatch.setattr(SshTransport, "_install_session", traced_install)
 
     install_error: list[BaseException] = []
