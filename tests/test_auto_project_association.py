@@ -8,11 +8,13 @@ import os
 import subprocess
 import sys
 import threading
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.storage_homes import initialize_storage_home
@@ -21,6 +23,7 @@ from zeta.config.settings import load_settings
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
 from zeta.project_errors import ProjectRegistryBusyError
+from zeta.tui.app import create_app
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     Message,
@@ -121,6 +124,57 @@ def test_concurrent_session_creation_is_unique(tmp_path: Path) -> None:
         )
     assert len({s.metadata.project_id for s in sessions}) == 1
     assert len(m.project_registry.list_projects()) == 1
+
+
+def test_tui_startup_retries_busy_registry_and_links_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = repo(tmp_path)
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    monkeypatch.chdir(root)
+    original = ProjectRegistry._acquire_lock
+    busy_attempts = 3
+
+    def acquire(fd: int, mode: int) -> None:
+        nonlocal busy_attempts
+        if busy_attempts and mode == fcntl.LOCK_EX:
+            busy_attempts -= 1
+            raise ProjectRegistryBusyError()
+        original(fd, mode)
+
+    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    try:
+        metadata = SessionManager(tmp_path / "zeta-home").read_metadata(
+            app.loop.store.session_id
+        )
+        assert metadata.project_id is not None
+    finally:
+        asyncio.run(app.close())
+
+
+def test_tui_busy_registry_notice_renders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = repo(tmp_path)
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+    monkeypatch.chdir(root)
+
+    original = ProjectRegistry._acquire_lock
+
+    def acquire(fd: int, mode: int) -> None:
+        if mode == fcntl.LOCK_EX:
+            raise ProjectRegistryBusyError()
+        original(fd, mode)
+
+    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    app = create_app(build_parser().parse_args(["--provider", "codex"]))
+    app.console = Console(file=StringIO())
+    try:
+        app._present_startup_output()
+        assert "project memory and inbox are off" in app.console.file.getvalue()
+    finally:
+        asyncio.run(app.close())
 
 
 def test_busy_registry_retries_project_discovery(
