@@ -196,6 +196,7 @@ class ForkStackController:
         self,
         main_app: ForkHost,
         build_fork: Callable[[str], Awaitable[ForkHost]],
+        schedule: Callable[[float, Callable[[], None]], object] | None = None,
     ) -> None:
         self._stack = [main_app]
         self._build_fork = build_fork
@@ -212,6 +213,8 @@ class ForkStackController:
         self.restart_requested = False
         self.restart_cancels_work = False
         self._restart_when_idle = False
+        self._restart_idle_handle: object | None = None
+        self._schedule = schedule or asyncio.get_running_loop().call_later
         main_app.set_fork_controller(self)
 
     @property
@@ -242,16 +245,36 @@ class ForkStackController:
     def request_restart_when_idle(self) -> None:
         self._restart_when_idle = True
         self.notify_restart_idle_check()
+        if self._restart_when_idle:
+            self._schedule_restart_idle_check()
+
+    def _schedule_restart_idle_check(self) -> None:
+        if self._restart_idle_handle is None:
+            self._restart_idle_handle = self._schedule(0.5, self._restart_idle_tick)
+
+    def _restart_idle_tick(self) -> None:
+        self._restart_idle_handle = None
+        self.notify_restart_idle_check()
+        if self._restart_when_idle:
+            self._schedule_restart_idle_check()
+
+    def _cancel_restart_idle_check(self) -> None:
+        handle = self._restart_idle_handle
+        self._restart_idle_handle = None
+        if handle is not None:
+            handle.cancel()
 
     def cancel_restart(self) -> None:
         self._restart_when_idle = False
+        self._cancel_restart_idle_check()
 
     def notify_restart_idle_check(self) -> None:
         if self._restart_when_idle and self._restart_is_idle():
-            self._restart_when_idle = False
             self.request_restart()
 
     def request_restart(self) -> None:
+        self._restart_when_idle = False
+        self._cancel_restart_idle_check()
         self.restart_requested = True
         self.restart_cancels_work = self.restart_has_running_work
         self.visible.request_exit()
@@ -351,6 +374,7 @@ class ForkStackController:
             raise
 
     async def close(self) -> None:
+        self.cancel_restart()
         first_error: BaseException | None = None
         for runtime in reversed(self._stack):
             try:

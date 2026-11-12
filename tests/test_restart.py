@@ -414,3 +414,78 @@ async def test_restart_arguments_use_real_slash_dispatch(tmp_path: Path) -> None
         )
     finally:
         await app.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_when_idle_polls_background_task_end(tmp_path: Path) -> None:
+    scheduled: list[tuple[float, object, object]] = []
+
+    def schedule(delay: float, callback: object) -> object:
+        handle = type("Handle", (), {"cancel": lambda self: setattr(self, "cancelled", True)})()
+        handle.cancelled = False
+        scheduled.append((delay, callback, handle))
+        return handle
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions", session_id="root-session"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    controller = ForkStackController(app, lambda _target: asyncio.sleep(0), schedule)
+    task_id, _pid = await app.loop.tool_registry.background_tasks.start(
+        "sleep 10", tmp_path, notify_on_exit=False, owner="macro"
+    )
+    events: list[str] = []
+    app.request_exit = lambda: events.append("restart")
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/restart") == (
+            "restart pending · waiting for running work · /restart now to cancel it"
+        )
+        assert len(scheduled) == 1
+        await app.loop.tool_registry.background_tasks.kill(
+            task_id, cause="test", tui_presented=True
+        )
+        scheduled[0][1]()
+        assert events == ["restart"]
+        assert controller.restart_requested
+        assert controller._restart_idle_handle is None
+    finally:
+        await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_when_idle_cancel_cancels_poll_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduled: list[object] = []
+
+    def schedule(_delay: float, _callback: object) -> object:
+        handle = type("Handle", (), {"cancel": lambda self: setattr(self, "cancelled", True)})()
+        handle.cancelled = False
+        scheduled.append(handle)
+        return handle
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    controller = ForkStackController(app, lambda _target: asyncio.sleep(0), schedule)
+    monkeypatch.setattr(TUIApp, "restart_has_running_work", property(lambda _app: True))
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/restart")
+        assert await app._slash_commands.dispatch_async(app, "/restart cancel") == (
+            "restart canceled"
+        )
+        assert scheduled[0].cancelled
+        assert controller._restart_idle_handle is None
+    finally:
+        await controller.close()
