@@ -244,9 +244,7 @@ class ForkStackController:
 
     def request_restart_when_idle(self) -> None:
         self._restart_when_idle = True
-        self.notify_restart_idle_check()
-        if self._restart_when_idle:
-            self._schedule_restart_idle_check()
+        self._schedule_restart_idle_check()
 
     def _schedule_restart_idle_check(self) -> None:
         if self._restart_idle_handle is None:
@@ -352,7 +350,6 @@ class ForkStackController:
                     ].notification_count()
                     self._stack.append(fork)
                     self.approvals_changed()
-                    self.notify_restart_idle_check()
                     continue
                 if result is RuntimeResult.EXIT:
                     await self.close()
@@ -368,7 +365,6 @@ class ForkStackController:
                 self._owner_tokens.pop(id(current), None)
                 self._resuming.add(id(self.visible))
                 self.approvals_changed()
-                self.notify_restart_idle_check()
         except BaseException:
             await self.close()
             raise
