@@ -50,7 +50,7 @@ class UpdateChecker:
         read_revision: Callable[[str | Path], str | None] = source_revision,
     ) -> None:
         self._package_file = package_file
-        self._on_update = on_update
+        self._on_update: Callable[[str, str], Awaitable[None]] | None = on_update
         self._interval = interval
         self._read_revision = read_revision
         self._initial = read_revision(package_file)
@@ -63,10 +63,12 @@ class UpdateChecker:
 
     async def close(self) -> None:
         if self._task is None:
+            self._on_update = None
             return
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
         self._task = None
+        self._on_update = None
 
     async def tick(self) -> bool:
         """Check once; this seam lets tests trigger a check without sleeping."""
@@ -76,7 +78,9 @@ class UpdateChecker:
         if current is None or current == self._initial:
             return False
         self._reported = True
-        await self._on_update(self._initial, current)
+        on_update = self._on_update
+        if on_update is not None:
+            await on_update(self._initial, current)
         return True
 
     async def _run(self) -> None:

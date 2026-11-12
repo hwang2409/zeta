@@ -1164,7 +1164,9 @@ class TUIApp(
             if observer_host is not None and (error := await observer_host.start_or_close()):
                 self.observer_host = None  # optional endpoint: never stops the TUI or a fork
                 self._handle_background_notice(f"remote observer unavailable: {error}")
-            self._update_checker.start()
+            update_checker = getattr(self, "_update_checker", None)
+            if update_checker is not None:
+                update_checker.start()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
