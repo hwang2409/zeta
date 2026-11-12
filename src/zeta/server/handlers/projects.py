@@ -103,7 +103,10 @@ class ProjectRequests:
         registry: ProjectRegistry,
     ) -> None:
         self.registry = registry
-        self.inbox = ProjectInbox(self.registry, sessions_root=home / "sessions")
+        self.inbox = ProjectInbox(
+            self.registry,
+            sessions_root=home / "sessions",
+        )
         self.runtime = runtime
         self.codec = codec
         self.entry_views = EntryProjectViews(

@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 9
+WRITER_EPOCH: Final = 10
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -37,6 +37,7 @@ class StorageFeature(StrEnum):
     PROJECT_LOCKS = "project_locks"
     APPROVAL_RESTART_REASON = "approval_restart_reason"
     SESSION_RETENTION = "session_retention"
+    INBOX_DURABLE_INTENT = "inbox_durable_intent"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -47,9 +48,11 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_LOCKS: 6,
     StorageFeature.INBOX_DELEGATION: 7,
     StorageFeature.SESSION_RETENTION: 8,
-    # APPROVAL_RESTART_REASON must be a fixed int literal (test_storage_feature_epochs
-    # forbids referencing WRITER_EPOCH here). Recheck main+1 at the final merge.
+    # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
+    # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
+    # Recheck main+1 at the final merge.
     StorageFeature.APPROVAL_RESTART_REASON: 9,
+    StorageFeature.INBOX_DURABLE_INTENT: 10,
 }
 
 
@@ -218,6 +221,28 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "retention_preview": frozenset({"preview_id", "days", "cutoff", "root_ids", "count", "bytes", "created_at"}),
     "retention_reservation": frozenset({"schema_version", "session_id", "transaction_id", "source_path", "trash_path", "device", "inode"}),
     "retention_manifest": frozenset({"schema_version", "session_id", "transaction_id", "device", "inode", "descendants", "bytes", "stage", "generation"}),
+    "sent_message_ledger.v2_root": frozenset({"schema_version", "records"}),
+    "sent_message_ledger.v2_record": frozenset(
+        {"id", "created_at", "target_project", "publication", "envelope", "reported"}
+    ),
+    "sent_message_ledger.envelope": frozenset(
+        {
+            "schema_version",
+            "id",
+            "origin",
+            "from",
+            "to_project",
+            "to_session",
+            "kind",
+            "title",
+            "body",
+            "in_reply_to",
+            "created_at",
+        }
+    ),
+    "sent_message_ledger.from": frozenset({"project", "session"}),
+    "sent_message_ledger.recipient_body_ref": frozenset({"file"}),
+    "sent_message_ledger.sender_spill_ref": frozenset({"file", "length", "sha256"}),
 }
 
 
@@ -268,7 +293,8 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "project.schema_version": frozenset({1}),
     "project.session_role": frozenset({"session", "orchestrator", "worker"}),
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
-    "sent_message_ledger.schema_version": frozenset({1}),
+    "sent_message_ledger.schema_version": frozenset({1, 2}),
+    "sent_message_ledger.publication": frozenset({"pending", "published"}),
     "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
     "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
     "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
