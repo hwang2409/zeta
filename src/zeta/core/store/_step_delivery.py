@@ -542,12 +542,13 @@ def _settle_terminal(
         prompts = store.pending_prompt_queue._pending_unlocked()
         if any(prompt.id not in suppressed_ids for prompt in prompts):
             return TerminalSettlement(True)
-        rows: list[tuple[str, dict[str, Any]]] = [
-            ("pending_prompt_ack", {"prompt_id": prompt.id}) for prompt in prompts
-        ]
+        # Suppressed input (exhausted-budget prompts and notifications) already
+        # got a not-delivered notice and stays durable so the user still sees it;
+        # it is never acked, folded, or delivered here.
+        rows: list[tuple[str, dict[str, Any]]] = []
         folded: list[ConversationEntry] = []
         for entry in store._active_notifications.values():
-            if entry.data.get("display_only") is True:
+            if entry.data.get("display_only") is True or entry.id in suppressed_ids:
                 continue
             disposition = TERMINAL_DISPOSITION[
                 entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
