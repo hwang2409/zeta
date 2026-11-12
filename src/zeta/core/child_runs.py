@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from ..protocol.types import StructuredContentValue, ToolCall
 from .agent_progress import live_agent_lifecycle
@@ -23,7 +24,7 @@ from .child_lifecycle import select_legacy_child_lifecycle
 from .session_execution import execution_owner_state
 from .session_files import child_directory
 from .store import ConversationStore
-from .store._child_runs import parse_child_run_id
+from .store._child_runs import run_row_identity
 
 TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
@@ -349,6 +350,34 @@ def read_agent_status(
     return sorted(children, key=lambda child: str(child["started_at"]))
 
 
+def project_child_run_row(
+    item: dict[str, Any],
+    *,
+    session_id: str,
+    parent_run_id: str | None,
+    accepts_follow_ups: bool,
+) -> dict[str, StructuredContentValue]:
+    return {
+        "run_id": str(item["handle"]),
+        "session_id": session_id,
+        "parent_run_id": parent_run_id,
+        "description": _bounded_text(item["description"], 3_998),
+        "agent_type": _bounded_text(item["agent_type"], 3_998),
+        "status": _bounded_text(item["state"], 3_998),
+        "accepts_follow_ups": accepts_follow_ups,
+        "turns_used": item["turns_used"],
+        "tool_count": item["tool_calls"],
+        "current_step": _bounded_text(item["current_step"], 3_998),
+        "started_at": _bounded_text(item["started_at"], 3_998),
+        "finished_at": (
+            _bounded_text(item["finished_at"], 3_998)
+            if item["finished_at"] is not None
+            else None
+        ),
+        "elapsed_seconds": item["elapsed"],
+    }
+
+
 def child_run_rows(
     store: ConversationStore,
     *,
@@ -363,22 +392,13 @@ def child_run_rows(
     rows: list[dict[str, StructuredContentValue]] = []
     for item in read_agent_status(store, running_handles=running_handles):
         run_id = str(item["handle"])
-        _, parent_run_id = parse_child_run_id(store.session_id, run_id)
+        session_id, parent_run_id = run_row_identity(run_id)
         marker = markers.get(run_id, {})
-        row: dict[str, StructuredContentValue] = {
-            "run_id": run_id,
-            "session_id": store.session_id,
-            "parent_run_id": parent_run_id,
-            "description": item["description"],
-            "agent_type": item["agent_type"],
-            "status": item["state"],
-            "accepts_follow_ups": marker.get("accepts_follow_ups") is True,
-            "turns_used": item["turns_used"],
-            "tool_count": item["tool_calls"],
-            "current_step": item["current_step"],
-            "started_at": item["started_at"],
-            "finished_at": item["finished_at"],
-            "elapsed_seconds": item["elapsed"],
-        }
+        row = project_child_run_row(
+            item,
+            session_id=session_id,
+            parent_run_id=parent_run_id,
+            accepts_follow_ups=marker.get("accepts_follow_ups") is True,
+        )
         rows.append(row)
     return rows
