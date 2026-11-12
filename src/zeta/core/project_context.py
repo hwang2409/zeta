@@ -414,17 +414,6 @@ def project_command_view(
     )
 
 
-def discover_or_find_project(
-    registry: ProjectRegistry, cwd: str | Path, user_home: Path
-) -> Project | None:
-    """Discover once and associate an eligible Git project."""
-
-    discovery = associate_project_discovery(
-        discover_project(cwd, user_home=user_home), registry
-    )
-    return discovery.project
-
-
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
     """Resolve the Git worktree root through shared project discovery."""
 

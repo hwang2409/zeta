@@ -8778,9 +8778,19 @@ async def test_session_swap_project_registry_frames(
         assert "result" in response
         if busy:
             assert len(notices) == 1, frames
-            assert notices[0]["params"]["session_id"] == response["result"][
+            notice = notices[0]
+            assert notice["params"]["event"] == "sub_agent_receipt"
+            assert notice["params"]["session_id"] == response["result"][
                 "session"
             ]["session_id"]
+            assert notice["params"]["data"] == {
+                "notification_id": f"project-registry-busy:{notice['params']['session_id']}",
+                "kind": "project_registry_busy",
+                "text": (
+                    "project memory and inbox are off for this session: "
+                    "the project registry was busy; restart to retry"
+                ),
+            }
         else:
             assert [frame.get("id") for frame in frames] == [2, 3]
     finally:
