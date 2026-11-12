@@ -73,7 +73,8 @@ async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_pat
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             reader, writer = await asyncio.open_connection(request.url.host, request.url.port)
             body = request.content
-            writer.write((f"POST {request.url.raw_path.decode()} HTTP/1.1\r\nHost: {request.url.host}\r\ncontent-length: {len(body)}\r\n" + "\r\n").encode() + body)
+            wire_headers = "".join(f"{name}: {value}\r\n" for name, value in request.headers.items())
+            writer.write((f"POST {request.url.raw_path.decode()} HTTP/1.1\r\n{wire_headers}content-length: {len(body)}\r\n" + "\r\n").encode() + body)
             await writer.drain()
             head = await reader.readuntil(b"\r\n\r\n")
             length = int(dict(line.split(b": ", 1) for line in head.split(b"\r\n")[1:] if b": " in line).get(b"content-length", b"0"))
