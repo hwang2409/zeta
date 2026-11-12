@@ -214,7 +214,7 @@ class AgentLoop(
         self._agent_child_types: dict[str, str] = {}
         self._background_child_cancellers: dict[str, Callable[[], None]] = {}
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
-        self._background_event_sink: Callable[[StreamEvent], None] | None = None
+        self._background_event_sink: Callable[[StreamEvent], Awaitable[None] | None] | None = None
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
@@ -388,7 +388,7 @@ class AgentLoop(
         return self.store.drop_client_steering(reason)
 
     def set_background_event_sink(
-        self, sink: Callable[[StreamEvent], None] | None
+        self, sink: Callable[[StreamEvent], Awaitable[None] | None] | None
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
         self._background_event_sink = sink
@@ -397,9 +397,11 @@ class AgentLoop(
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
 
-    def _publish_background_event(self, event: StreamEvent) -> None:
+    async def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
-            self._background_event_sink(event)
+            result = self._background_event_sink(event)
+            if inspect.isawaitable(result):
+                await result
 
     def _create_task[TaskResult](
         self,
@@ -570,7 +572,7 @@ class AgentLoop(
         request_id: str,
         *,
         prepared: bool = False,
-        event_sink: Callable[[StreamEvent], None] | None = None,
+        event_sink: Callable[[StreamEvent], Awaitable[None] | None] | None = None,
         host_environment: Mapping[str, str] | None = None,
     ) -> ToolResult | None:
         """Finish a durable approval request before starting another turn."""

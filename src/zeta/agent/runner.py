@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
@@ -100,13 +100,13 @@ async def consume_child(
     *,
     origin: MessageOrigin,
     child_path: str,
-    publish: Callable[[str], None],
+    publish: Callable[[str], Awaitable[None]],
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
     record_tool_call: Callable[[], None],
     finish_lifecycle: Callable[[str, str], dict[str, object]],
-    publish_lifecycle: Callable[..., None],
+    publish_lifecycle: Callable[..., Awaitable[None]],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
@@ -148,10 +148,10 @@ async def consume_child(
             return child_loop.agent_depth + 1
         return child_loop.agent_depth
 
-    def emit_lifecycle(
+    async def emit_lifecycle(
         kind: str, event: StreamEvent, *, tool_result: ToolResult | None = None
     ) -> None:
-        publish_lifecycle(
+        await publish_lifecycle(
             kind,
             event.tool_call,
             tool_result=tool_result,
@@ -166,25 +166,25 @@ async def consume_child(
         nonlocal failure_error, failure_message, final_message, last_message, explicit_report
         final_message = None
         async for event in events:
-            forward_nested_agent_start(child_loop, event)
+            await forward_nested_agent_start(child_loop, event)
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
-                publish(status)
+                await publish(status)
             elif await hold_wake.observe(event):
                 if not background and foreground_hold_abandoned(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
-                publish(status)
+                await publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 status = f"turn {child_turns() + 1}: approval pending: {name}"
                 update_step(status)
-                publish(status)
-                emit_lifecycle("approval_start", event)
+                await publish(status)
+                await emit_lifecycle("approval_start", event)
             elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                emit_lifecycle("approval_end", event)
+                await emit_lifecycle("approval_end", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
                 record_tool_call()
                 name = event.tool_call.name if event.tool_call is not None else "tool"
@@ -194,8 +194,8 @@ async def consume_child(
                 summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
                 status = f"turn {child_turns() + 1}: tool: {name} {summary}"
                 update_step(status)
-                publish(status)
-                emit_lifecycle("execution_start", event)
+                await publish(status)
+                await emit_lifecycle("execution_start", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
                 if (
                     event.tool_call is not None
@@ -205,7 +205,7 @@ async def consume_child(
                     and isinstance(event.tool_result.structured_content, dict)
                 ):
                     explicit_report = dict(event.tool_result.structured_content)
-                emit_lifecycle("execution_end", event, tool_result=event.tool_result)
+                await emit_lifecycle("execution_end", event, tool_result=event.tool_result)
             elif event.type is StreamEventType.TURN_END:
                 last_message = event.message
                 turns = child_turns() + 1
@@ -868,12 +868,12 @@ async def run_agent_tool(
         execution_context.lifecycle_sink if execution_context is not None else None
     )
 
-    def publish(status: str) -> None:
+    async def publish(status: str) -> None:
         if background:
             event_data: dict[str, object] = {"stream": "stdout"}
             if loop.agent_instance_id is not None:
                 event_data["agent_instance_id"] = loop.agent_instance_id
-            loop._publish_background_event(
+            await loop._publish_background_event(
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     tool_call=tool_call,
@@ -951,7 +951,7 @@ async def run_agent_tool(
         build_result=child_result,
     )
 
-    def publish_lifecycle(
+    async def publish_lifecycle(
         kind: str,
         call: ToolCall | None,
         *,
@@ -972,7 +972,7 @@ async def run_agent_tool(
         data = {"depth": child_depth if depth is None else depth}
         data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
         if background:
-            loop._publish_background_event(
+            await loop._publish_background_event(
                 StreamEvent(
                     event_type,
                     tool_call=call,

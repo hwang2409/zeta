@@ -413,7 +413,7 @@ class ConversationChannel:
         }
         result = await self.produce_to(None, NotificationInput("child_idle", data))
         for entry in result.entries:
-            child_loop._publish_background_event(
+            await child_loop._publish_background_event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"notification_id": entry.id, **entry.data},

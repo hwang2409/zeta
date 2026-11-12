@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -126,7 +127,7 @@ class ProjectInboxNotificationMixin:
                 if current is not None and current.cancelling():
                     # a cancel reached us as a poll error; honor the shutdown.
                     raise asyncio.CancelledError from exc
-                self._set_project_inbox_health("degraded", str(exc))
+                await self._set_project_inbox_health("degraded", str(exc))
             finally:
                 done = self._project_inbox_poll_done
                 if done is not None:
@@ -156,17 +157,17 @@ class ProjectInboxNotificationMixin:
         if warning:
             # A durable intent could not be re-delivered this poll; the scan
             # still ran. Surface it as degraded without blocking delivery.
-            self._set_project_inbox_health("degraded", warning)
+            await self._set_project_inbox_health("degraded", warning)
         else:
-            self._set_project_inbox_health("healthy")
+            await self._set_project_inbox_health("healthy")
 
-    def _set_project_inbox_health(self, state: str, reason: str | None = None) -> None:
+    async def _set_project_inbox_health(self, state: str, reason: str | None = None) -> None:
         if getattr(self, "_project_inbox_health_state", "healthy") == state:
             return
         self._project_inbox_health_state = state
-        self._publish_project_inbox_health(state, reason)
+        await self._publish_project_inbox_health(state, reason)
 
-    def _publish_project_inbox_health(self, state: str, reason: str | None = None) -> None:
+    async def _publish_project_inbox_health(self, state: str, reason: str | None = None) -> None:
         publish = getattr(self, "_publish_background_event", None)
         if publish is None:
             return
@@ -178,7 +179,9 @@ class ProjectInboxNotificationMixin:
         if reason:
             data["reason"] = _bounded_text(reason, 200)
         try:
-            publish(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data))
+            result = publish(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data))
+            if inspect.isawaitable(result):
+                await result
         except Exception:  # noqa: BLE001 - a health sink cannot own the poller
             return
 
@@ -321,7 +324,7 @@ class ProjectInboxNotificationMixin:
                 _PollResult(tuple(result[0] or ()), tuple(result[1])),
             )
         except (InboxError, OSError, ProjectRegistryError) as exc:
-            self._set_project_inbox_health("degraded", str(exc))
+            await self._set_project_inbox_health("degraded", str(exc))
 
     async def _await_project_inbox_turn_start(self) -> None:
         """Turn start only: signal a poll and wait briefly for it to finish.

@@ -718,15 +718,6 @@ class ConnectionRegistry(ReplayOutput):
         self._begin_overflow(state, enqueue_control=output.phase != "claimed_buffering")
         return False
 
-    def overflow_controller(self) -> None:
-        """Apply the connection's slow-controller policy to semantic backlog."""
-        state = self._controller
-        if state is None or state.output is None:
-            return
-        self._begin_overflow(
-            state,
-            enqueue_control=state.output.phase != "claimed_buffering",
-        )
 
     def _begin_overflow(self, state: _Connection, *, enqueue_control: bool) -> None:
         output = state.output

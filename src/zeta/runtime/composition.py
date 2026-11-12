@@ -41,7 +41,7 @@ from .project_registry_state import ProjectRegistryState
 from .prompt import RuntimePrompt
 
 BackendBuilder = Callable[..., tuple[CompletionBackend, str]]
-BackgroundEventSink = Callable[[StreamEvent], None]
+BackgroundEventSink = Callable[[StreamEvent], Awaitable[None] | None]
 
 
 def _runtime_prompt(context: ProjectContext) -> RuntimePrompt:

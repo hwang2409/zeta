@@ -577,7 +577,7 @@ async def finish_background_child(
     child_turns: Callable[[], int],
     build_result: BuildResult,
     validate_result: Callable[[object, str], ToolResult],
-    publish_event: Callable[[StreamEvent], None],
+    publish_event: Callable[[StreamEvent], Awaitable[None]],
     cleanup: Callable[[], Awaitable[None] | None],
     close_child: Callable[[str], Awaitable[tuple[str, ...]]],
     error_message: Callable[[BaseException], str],
@@ -821,7 +821,7 @@ async def finish_background_child(
         event_data: dict[str, object] = {"notification_id": notification.id}
         if agent_instance_id is not None:
             event_data["agent_instance_id"] = agent_instance_id
-        publish_event(
+        await publish_event(
             StreamEvent(
                 StreamEventType.TOOL_EXECUTION_END,
                 tool_call=tool_call,

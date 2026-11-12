@@ -4,109 +4,162 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..protocol.types import StreamEvent
-from .connections import OUTPUT_MAX_BYTES, OUTPUT_MAX_FRAMES
-from .protocol import ErrorDescriptor, FrameCodec
-
-logger = logging.getLogger(__name__)
 
 PublishEvent = Callable[[str, StreamEvent], Awaitable[None]]
-Overflow = Callable[[], None]
-_OVERFLOW_FRAME_BYTES = len(
-    FrameCodec().error_response(
-        None,
-        ErrorDescriptor.CONTROLLER_OUTPUT_OVERFLOW,
-        ErrorDescriptor.CONTROLLER_OUTPUT_OVERFLOW.meaning,
-    )
-)
-_MAX_PENDING_BYTES = OUTPUT_MAX_BYTES - _OVERFLOW_FRAME_BYTES
-_MAX_PENDING_FRAMES = OUTPUT_MAX_FRAMES - 1
+_MAX_PENDING_BYTES = 4 * 1024 * 1024
+_MAX_PENDING_EVENTS = 255
 
 
-@dataclass(frozen=True, slots=True)
+class BackgroundEventTooLarge(RuntimeError):
+    """One event cannot fit in the semantic publication budget."""
+
+
+@dataclass(slots=True)
 class _QueuedEvent:
     session_id: str
     event: StreamEvent
     size: int
+    result: asyncio.Future[None]
+    admitted: asyncio.Future[None]
 
 
 class BackgroundEventPublisher:
-    """Publish one bounded FIFO without making event producers wait."""
+    """Record one bounded FIFO and report each event's terminal result."""
 
-    def __init__(self, publish_event: PublishEvent, overflow: Overflow) -> None:
+    def __init__(
+        self,
+        publish_event: PublishEvent,
+        *,
+        max_events: int = _MAX_PENDING_EVENTS,
+        max_bytes: int = _MAX_PENDING_BYTES,
+    ) -> None:
         self._publish_event = publish_event
-        self._overflow = overflow
+        self._max_events = max_events
+        self._max_bytes = max_bytes
         self._queue: asyncio.Queue[_QueuedEvent] = asyncio.Queue()
+        self._waiting: deque[_QueuedEvent] = deque()
         self._task: asyncio.Task[None] | None = None
-        self._frames = 0
+        self._events = 0
         self._bytes = 0
-        self._record_only = False
+        self._failures: list[BaseException] = []
+        self._changed = asyncio.Event()
+        self._changed.set()
         self._closed = False
 
-    def publish(self, session_id: str, event: StreamEvent) -> None:
-        if self._closed:
-            return
-        size = len(
+    @staticmethod
+    def _size(session_id: str, event: StreamEvent) -> int:
+        return len(
             json.dumps(
                 {"session_id": session_id, "event": event.to_dict()},
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode()
         )
-        if not self._record_only and (
-            self._frames + 1 > _MAX_PENDING_FRAMES
-            or self._bytes + size > _MAX_PENDING_BYTES
-        ):
-            self._record_only = True
-            self._overflow()
-        retained_size = 0 if self._record_only else size
-        if retained_size:
-            self._frames += 1
-            self._bytes += retained_size
-        self._queue.put_nowait(_QueuedEvent(session_id, event, retained_size))
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._drain())
+
+    async def publish(self, session_id: str, event: StreamEvent) -> None:
+        if self._closed:
+            raise RuntimeError("background event publisher is closed")
+        size = self._size(session_id, event)
+        if size > self._max_bytes:
+            raise BackgroundEventTooLarge(
+                f"background event is {size} bytes; limit is {self._max_bytes}"
+            )
+        loop = asyncio.get_running_loop()
+        item = _QueuedEvent(
+            session_id,
+            event,
+            size,
+            loop.create_future(),
+            loop.create_future(),
+        )
+        self._waiting.append(item)
+        self._admit_waiters()
+        try:
+            await item.admitted
+        except asyncio.CancelledError:
+            if not item.admitted.done():
+                self._waiting.remove(item)
+                self._admit_waiters()
+                self._mark_changed()
+                raise
+
+        cancelled = False
+        while not item.result.done():
+            try:
+                await asyncio.shield(item.result)
+            except asyncio.CancelledError:
+                cancelled = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+        error = item.result.exception()
+        if cancelled:
+            raise asyncio.CancelledError
+        if error is not None:
+            raise error
+
+    def _admit_waiters(self) -> None:
+        while self._waiting:
+            item = self._waiting[0]
+            if self._events >= self._max_events or self._bytes + item.size > self._max_bytes:
+                return
+            self._waiting.popleft()
+            self._events += 1
+            self._bytes += item.size
+            self._queue.put_nowait(item)
+            item.admitted.set_result(None)
+            if self._task is None or self._task.done():
+                self._task = asyncio.create_task(self._drain())
+        self._mark_changed()
+
+    def _mark_changed(self) -> None:
+        self._changed.set()
 
     async def _drain(self) -> None:
         while True:
             item = await self._queue.get()
+            error: BaseException | None = None
             try:
                 await self._publish_event(item.session_id, item.event)
             except asyncio.CancelledError:
                 raise
-            except Exception as error:  # noqa: BLE001 - isolate each event failure
-                logger.error(
-                    "background event publication failed",
-                    extra={
-                        "event_type": item.event.type.value,
-                        "error_type": type(error).__name__,
-                    },
-                )
+            except BaseException as exc:  # noqa: BLE001 - publish failures include cancellation
+                error = exc
+                self._failures.append(exc)
             finally:
-                if item.size:
-                    self._frames -= 1
-                    self._bytes -= item.size
+                self._events -= 1
+                self._bytes -= item.size
                 self._queue.task_done()
-                if self._queue.empty() and self._frames == 0:
-                    self._record_only = False
+                if error is None:
+                    item.result.set_result(None)
+                else:
+                    item.result.set_exception(error)
+                self._admit_waiters()
+                self._mark_changed()
 
     async def flush(self) -> None:
-        await self._queue.join()
+        while self._waiting or self._events:
+            self._changed.clear()
+            if self._waiting or self._events:
+                await self._changed.wait()
+        if self._failures:
+            raise self._failures[0]
 
     async def close(self, timeout: float) -> None:
         self._closed = True
-        task = self._task
-        if task is None:
-            return
+        error: BaseException | None = None
         try:
             await asyncio.wait_for(self.flush(), timeout)
-        except TimeoutError:
-            pass
-        finally:
+        except BaseException as exc:  # noqa: BLE001 - close preserves the first failure
+            error = exc
+        task, self._task = self._task, None
+        if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-            self._task = None
+        if error is not None:
+            raise error

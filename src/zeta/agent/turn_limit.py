@@ -88,9 +88,9 @@ def turn_control_for(
     return None if limit is None else ChildTurnControl(limit, child_session_path)
 
 
-def forward_nested_agent_start(child_loop: AgentLoop, event: StreamEvent) -> None:
+async def forward_nested_agent_start(child_loop: AgentLoop, event: StreamEvent) -> None:
     if event.type is StreamEventType.AGENT_START and child_loop.agent_depth > 1:
-        child_loop._publish_background_event(
+        await child_loop._publish_background_event(
             StreamEvent(
                 StreamEventType.AGENT_START,
                 data={"agent_instance_id": child_loop.agent_instance_id},

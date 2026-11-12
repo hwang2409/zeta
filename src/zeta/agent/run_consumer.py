@@ -292,7 +292,7 @@ async def consume_run(
                         publish_stalled,
                     )
                     if stalled_result == "suppressed" and not ordinary_idle_presented:
-                        child_loop._publish_background_event(
+                        await child_loop._publish_background_event(
                             StreamEvent(
                                 StreamEventType.AGENT_NOTIFICATION,
                                 data={

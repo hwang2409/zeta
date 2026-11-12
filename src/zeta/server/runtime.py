@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,7 +54,7 @@ from ..tools._shared.run_work import background_task_row
 from .protocol import EventDescriptor
 
 BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]]
-SessionEventSink = Callable[[str, StreamEvent], None]
+SessionEventSink = Callable[[str, StreamEvent], Awaitable[None]]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
 RunWorkEventSink = Callable[[str, EventDescriptor, dict[str, object]], None]

@@ -136,8 +136,7 @@ class ServeControl:
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._background_events = BackgroundEventPublisher(
-            self._publish_background_event_to_wire,
-            self._overflow_background_events,
+            self._publish_background_event_to_wire
         )
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
@@ -445,15 +444,17 @@ class ServeControl:
         self._turn_task = None
         self._approvals.prune_ended()
 
-    async def close(self) -> None:
+    async def begin_close(self) -> None:
         self.closing = True
-        await self._background_events.close(CONTROLLER_HANDOFF_DEADLINE_SECONDS)
         task = self._grace_task
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             self._grace_task = None
         await self.controller_released()
+
+    async def close_background_events(self) -> None:
+        await self._background_events.close(CONTROLLER_HANDOFF_DEADLINE_SECONDS)
 
     async def user_message(
         self,
@@ -896,12 +897,15 @@ class ServeControl:
             self._schedule_background_wake(session_id)
 
     async def _publish_config_changed(
-        self, event: StreamEvent, session_id: str | None
+        self,
+        event: StreamEvent,
+        session_id: str | None,
+        send: NotificationSender,
     ) -> None:
         if self.server.connections is None:
             return
         self._end_stale_approvals(session_id)
-        await self._notify(
+        await send(
             event_contract.STREAM_EVENT_WIRE_EVENTS[event.type],
             session_id,
             **event_contract.config_changed_wire_fields(event),
@@ -924,9 +928,10 @@ class ServeControl:
             and session_id is not None
             and state.session_id == session_id
         )
+        send = self._admit_background if background else self._notify
         kind = event.type
         if kind is StreamEventType.CONFIG_CHANGED:
-            await self._publish_config_changed(event, session_id)
+            await self._publish_config_changed(event, session_id, send)
             return
         if foreground:
             state.usage_tracker.record(kind, state.model)
@@ -945,7 +950,7 @@ class ServeControl:
                 delta = getattr(event.content, "text", None)
                 stream_kind = str(getattr(event.content, "type", "content"))
             if delta:
-                await self._notify(
+                await send(
                     wire_event,
                     session_id,
                     delta=bounded(delta),
@@ -958,7 +963,7 @@ class ServeControl:
             usage = event.data.get("usage")
             if foreground and isinstance(usage, Mapping) and usage:
                 state.usage.update(usage)
-                await self._notify(
+                await send(
                     event_contract.AUXILIARY_WIRE_EVENTS[
                         event_contract.AuxiliaryEvent.USAGE
                     ],
@@ -966,7 +971,7 @@ class ServeControl:
                     usage=dict(usage),
                 )
             if event.message is not None:
-                await self._notify(
+                await send(
                     wire_event,
                     session_id,
                     replay_row=RowFacts(seq=self._row_mark()),
@@ -988,10 +993,10 @@ class ServeControl:
                 and turn_id is not None
             ):
                 data["turn_id"] = turn_id
-            await self._notify(wire_event, session_id, data=data)
+            await send(wire_event, session_id, data=data)
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
-            await self._notify(
+            await send(
                 wire_event,
                 session_id,
                 **event_contract.tool_output(event, fidelity=fidelity),
@@ -1000,7 +1005,7 @@ class ServeControl:
         if kind is StreamEventType.TOOL_EXECUTION_START:
             if foreground:
                 state.tool_started()
-            await self._notify(
+            await send(
                 wire_event,
                 session_id,
                 **event_contract.tool_start(event, fidelity=fidelity),
@@ -1013,9 +1018,9 @@ class ServeControl:
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
-                await self._notify(wire_event, session_id, _admitted=True, **fields)
+                await send(wire_event, session_id, _admitted=True, **fields)
                 return
-            await self._notify(
+            await send(
                 wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
             )
             return
@@ -1034,7 +1039,7 @@ class ServeControl:
                 session_id,
                 event.data,
                 self._protocol_version(),
-                self._notify,
+                send,
                 row_seq=event.row_seq,
             )
             return
@@ -1057,7 +1062,7 @@ class ServeControl:
                     error = recovered
                     if offers_login:
                         login_provider = failed_provider
-            await self._notify(
+            await send(
                 wire_event,
                 session_id,
                 error=error,
@@ -1068,14 +1073,14 @@ class ServeControl:
             )
             return
         if kind is StreamEventType.COMPACTION_START:
-            await self._notify(wire_event, session_id, data=dict(event.data))
+            await send(wire_event, session_id, data=dict(event.data))
             return
         if kind is StreamEventType.COMPACTION_END:
-            await self._notify(wire_event, session_id, data=dict(event.data))
+            await send(wire_event, session_id, data=dict(event.data))
             return
         if foreground and kind is StreamEventType.AGENT_END:
             state.turn_finished()
-        await self._notify(wire_event, session_id, data=dict(event.data))
+        await send(wire_event, session_id, data=dict(event.data))
         if kind is StreamEventType.TURN_END:
             self._turn_end_published = True
 
@@ -1096,13 +1101,10 @@ class ServeControl:
     ) -> None:
         await self._event(event, session_id=session_id, background=True)
 
-    def _overflow_background_events(self) -> None:
-        connections = self.server.connections
-        if connections is not None:
-            connections.overflow_controller()
-
-    def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
-        self._background_events.publish(session_id, event)
+    def _publish_background_event(
+        self, session_id: str, event: StreamEvent
+    ) -> Awaitable[None]:
+        return self._background_events.publish(session_id, event)
 
     async def flush_background_events(self) -> None:
         await self._background_events.flush()
@@ -1149,6 +1151,15 @@ class ServeControl:
 
             return Admission("no_controller")
         return connections.try_admit_controller(event, session_id, **fields)
+
+    async def _admit_background(
+        self, event: EventDescriptor, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if fields.pop("_admitted", False):
+            return True
+        if session_id is None and self.server.runtime.opened is not None:
+            session_id = self.server.runtime.session_id
+        return self._admit_controller(event, session_id, **fields).kind == "admitted"
 
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object

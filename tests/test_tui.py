@@ -6,6 +6,7 @@ import base64
 import errno
 import fcntl
 import gc
+import inspect
 import json
 import multiprocessing
 import os
@@ -5425,6 +5426,31 @@ def test_unstructured_agent_error_renders_as_error() -> None:
     assert "failed" in rendered.plain
     assert "error=" not in rendered.plain
     assert "canceled=" not in rendered.plain
+
+
+@pytest.mark.asyncio
+async def test_shared_background_sink_renders_through_tui_presenter(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START,
+        tool_call=ToolCall(
+            "background-nested",
+            "agent",
+            {"prompt": "inspect", "description": "nested research"},
+        ),
+        data={"depth": 2},
+    )
+
+    async with owned_app(app):
+        result = app.loop._publish_background_event(event)
+        if inspect.isawaitable(result):
+            await result
+
+        assert "nested research" in output.getvalue()
+        assert "depth 2" in output.getvalue()
 
 
 def test_background_start_event_reaches_presenter_with_depth(tmp_path: Path) -> None:

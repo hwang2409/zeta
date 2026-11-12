@@ -119,6 +119,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
+from zeta.server.background_events import BackgroundEventPublisher
 from zeta.server.connections import Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
@@ -1027,6 +1028,19 @@ def _named_events(frames: list[dict[str, Any]], name: str) -> list[dict[str, Any
     ]
 
 
+async def _frames_until_error(
+    reader: asyncio.StreamReader, code: int
+) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    while True:
+        line = await await_or_fail(reader.readline(), what=f"protocol error {code}")
+        assert line, f"connection closed before protocol error {code}"
+        frame = json.loads(line)
+        frames.append(frame)
+        if frame.get("error", {}).get("code") == code:
+            return frames
+
+
 async def _frames_until_eof(reader: asyncio.StreamReader) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     while line := await asyncio.wait_for(reader.readline(), TIMEOUT):
@@ -1138,6 +1152,7 @@ class DelegatedApprovalBackend:
         child_call: ToolCall,
         *,
         child_prompt: str,
+        child_release: asyncio.Event | None = None,
     ) -> None:
         self.parent = FakeBackend(
             [
@@ -1152,6 +1167,7 @@ class DelegatedApprovalBackend:
             ]
         )
         self.child_prompt = child_prompt
+        self.child_release = child_release
         self.child_started = asyncio.Event()
 
     @owned_completion
@@ -1167,6 +1183,8 @@ class DelegatedApprovalBackend:
         backend = self.child if is_child else self.parent
         if is_child:
             self.child_started.set()
+            if self.child_release is not None:
+                await await_or_fail(self.child_release.wait(), what="child backend release")
         elif self.parent.calls:
             await asyncio.wait_for(self.child_started.wait(), 10)
         async for event in backend.complete(messages, tool_schemas, control=completion_control()):
@@ -2519,6 +2537,55 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
                 cleanup_error.add_note(f"server cleanup failed: {close_error!r}")
 
 
+async def _publish_background_event(
+    server: ZetaServer, session_id: str, event: StreamEvent
+) -> None:
+    result = server.control._publish_background_event(session_id, event)
+    if inspect.isawaitable(result):
+        await await_or_fail(result, what="background event publication")
+
+
+@pytest.mark.asyncio
+async def test_background_event_emitted_during_runtime_close_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path)
+    )
+    _reader, writer = await _ready(server)
+    assert server.runtime.loop is not None
+    loop = server.runtime.loop
+    cancelled = asyncio.Event()
+    recorded: list[StreamEventType] = []
+    original_event = server.control._event
+
+    async def observe(event: StreamEvent, **kwargs: object) -> None:
+        recorded.append(event.type)
+        assert server.connections is not None
+        await original_event(event, **kwargs)
+
+    async def closing_child() -> None:
+        await await_or_fail(cancelled.wait(), what="runtime child cancellation")
+        await loop._publish_background_event(StreamEvent(StreamEventType.AGENT_END))
+
+    watcher = asyncio.create_task(closing_child())
+    loop._background_owner.register(
+        "closing-child", lambda: cancelled.set(), watcher
+    )
+    # test-contract: seam observe semantic recording during runtime close
+    monkeypatch.setattr(server.control, "_event", observe)
+    try:
+        await await_or_fail(server.close(), what="server close")
+        assert recorded == [StreamEventType.AGENT_END]
+    finally:
+        cancelled.set()
+        await await_or_fail(
+            asyncio.gather(watcher, return_exceptions=True), what="closing child cleanup"
+        )
+        writer.close()
+        await await_or_fail(writer.wait_closed(), what="test writer close")
+
+
 @pytest.mark.asyncio
 async def test_background_event_failure_does_not_stop_fifo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -2538,27 +2605,39 @@ async def test_background_event_failure_does_not_stop_fifo(
         if session_id == "failed":
             raise RuntimeError("secret payload must not be logged")
 
-    # test-contract: seam force one wire publication failure
+    # test-contract: seam force one semantic publication failure
     monkeypatch.setattr(server.control, "_event", publish)
-    server.control._publish_background_event(
-        "failed", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="secret")
+    failed = asyncio.create_task(
+        _publish_background_event(
+            server,
+            "failed",
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="secret"),
+        )
     )
-    server.control._publish_background_event(
-        "continued", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="next")
+    continued = asyncio.create_task(
+        _publish_background_event(
+            server,
+            "continued",
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="next"),
+        )
     )
-    try:
-        try:
-            await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
-        except TimeoutError:
-            pass
-        assert calls == ["failed", "continued"]
-        assert "secret payload" not in caplog.text
-    finally:
-        await server.close()
+    with pytest.raises(RuntimeError, match="secret payload"):
+        await await_or_fail(failed, what="failed background publication")
+    await await_or_fail(continued, what="later background publication")
+    assert calls == ["failed", "continued"]
+    assert "secret payload" not in caplog.text
+    with pytest.raises(RuntimeError, match="secret payload"):
+        await await_or_fail(
+            server.control.flush_background_events(), what="failed semantic flush"
+        )
+    with pytest.raises(RuntimeError, match="secret payload"):
+        await await_or_fail(server.close(), what="failed semantic close")
+    server.control._background_events._failures.clear()
+    await await_or_fail(server.close(), what="server owner cleanup")
 
 
 @pytest.mark.asyncio
-async def test_background_event_backlog_overflow_drops_slow_controller(
+async def test_background_event_bound_waits_without_dropping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = ZetaServer(
@@ -2568,49 +2647,115 @@ async def test_background_event_backlog_overflow_drops_slow_controller(
     )
     started = asyncio.Event()
     release = asyncio.Event()
-    published_sessions: list[str] = []
-    overflows = 0
+    recorded: list[str] = []
 
     async def publish(
         event: StreamEvent, *, session_id: str, background: bool
     ) -> None:
         del event
         assert background
-        published_sessions.append(session_id)
-        if len(published_sessions) == 1:
+        recorded.append(session_id)
+        if len(recorded) == 1:
             started.set()
-            await asyncio.wait_for(release.wait(), TIMEOUT)
+            await await_or_fail(release.wait(), what="semantic event release")
 
-    def overflow_controller() -> None:
-        nonlocal overflows
-        overflows += 1
-
-    # test-contract: seam stall the publisher before connection output
+    # test-contract: seam force semantic work to hold the bounded publisher
     monkeypatch.setattr(server.control, "_event", publish)
-    server.connections = SimpleNamespace(overflow_controller=overflow_controller)
-    server.control._publish_background_event(
-        "slow", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="first")
+    server.control._background_events = BackgroundEventPublisher(
+        server.control._publish_background_event_to_wire,
+        max_events=2,
+        max_bytes=1024,
     )
-    await asyncio.wait_for(started.wait(), TIMEOUT)
-    for index in range(254):
-        server.control._publish_background_event(
-            "slow", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=str(index))
+    entered = [asyncio.Event() for _ in range(3)]
+
+    async def produce(index: int, session_id: str) -> None:
+        entered[index].set()
+        await _publish_background_event(
+            server,
+            session_id,
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=session_id),
         )
-    server.control._publish_background_event(
-        "other", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="not retained")
-    )
+
+    producers = [
+        asyncio.create_task(produce(index, session_id))
+        for index, session_id in enumerate(("first", "second", "waiting"))
+    ]
     try:
-        assert overflows == 1
-        # test-contract: seam the publisher's retained accounting is the bound
-        assert server.control._background_events._frames == 255
-        assert server.control._background_events._bytes <= 4 * 1024 * 1024
-        assert "other" not in published_sessions
+        await await_or_fail(started.wait(), what="first semantic event")
+        await await_or_fail(
+            asyncio.gather(*(event.wait() for event in entered)),
+            what="all producers entered",
+        )
+        publisher = server.control._background_events
+        assert not producers[-1].done(), "the producer beyond the bound must wait"
+        assert publisher._events == 2
+        assert publisher._bytes <= 1024
+        release.set()
+        await await_or_fail(
+            asyncio.gather(*producers), what="bounded background producers"
+        )
+        assert recorded == ["first", "second", "waiting"]
+        assert publisher._events == 0
+        assert publisher._bytes == 0
     finally:
         release.set()
-        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
-        assert published_sessions[-1] == "other"
-        server.connections = None
-        await server.close()
+        await await_or_fail(
+            asyncio.gather(*producers, return_exceptions=True),
+            what="bounded producer cleanup",
+        )
+        await await_or_fail(server.close(), what="server close")
+
+
+@pytest.mark.asyncio
+async def test_background_event_cancellation_after_admission_records_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex", home=tmp_path, socket_path=_socket_path(tmp_path)
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    recorded: list[str] = []
+
+    async def record(
+        event: StreamEvent, *, session_id: str, background: bool
+    ) -> None:
+        del event
+        assert background
+        started.set()
+        await await_or_fail(release.wait(), what="admitted event release")
+        recorded.append(session_id)
+
+    # test-contract: seam hold one admitted event across producer cancellation
+    monkeypatch.setattr(server.control, "_event", record)
+    producer = asyncio.create_task(
+        _publish_background_event(
+            server,
+            "accepted",
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="accepted"),
+        )
+    )
+    try:
+        await await_or_fail(started.wait(), what="accepted event start")
+        producer.cancel()
+        assert not producer.done(), "cancellation must wait for the accepted event"
+        release.set()
+        [result] = await await_or_fail(
+            asyncio.gather(producer, return_exceptions=True),
+            what="deferred producer cancellation",
+        )
+        assert isinstance(result, asyncio.CancelledError)
+        assert recorded == ["accepted"]
+        publisher = server.control._background_events
+        assert publisher._events == 0
+        assert publisher._bytes == 0
+    finally:
+        release.set()
+        await await_or_fail(
+            asyncio.gather(producer, return_exceptions=True),
+            what="cancelled producer cleanup",
+        )
+        await await_or_fail(server.close(), what="server close")
 
 
 @pytest.mark.asyncio
@@ -2619,15 +2764,16 @@ async def test_background_event_overflow_records_approval_for_reconnect(
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
-    agent = ToolCall(
-        "agent-one",
-        "agent",
-        {"prompt": "read", "description": "child", "background": True},
-    )
+    child_release = asyncio.Event()
     backend = DelegatedApprovalBackend(
-        agent,
+        ToolCall(
+            "agent-one",
+            "agent",
+            {"prompt": "read", "description": "child", "background": True},
+        ),
         ToolCall("child-call", "read", {"path": str(target)}),
         child_prompt="read",
+        child_release=child_release,
     )
     server = ZetaServer(
         provider="codex",
@@ -2636,37 +2782,21 @@ async def test_background_event_overflow_records_approval_for_reconnect(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    started = asyncio.Event()
-    release = asyncio.Event()
+    physical_started = asyncio.Event()
+    physical_release = asyncio.Event()
     overflowed = asyncio.Event()
-    original_event = server.control._event
-    original_publish = server.control._background_events.publish
-    original_overflow = server.connections.overflow_controller
+    close_overflow = asyncio.Event()
+    controller_release_started = asyncio.Event()
+    original_begin_controller_release = server.control.begin_controller_release
 
-    async def hold_first(event: StreamEvent, **kwargs: object) -> None:
-        if event.delta == "blocked":
-            started.set()
-            await await_or_fail(release.wait(), what="semantic event release")
-        await original_event(event, **kwargs)
+    def observe_controller_release(*, reconnect: bool):
+        result = original_begin_controller_release(reconnect=reconnect)
+        controller_release_started.set()
+        return result
 
-    def publish_at_limit(session_id: str, event: StreamEvent) -> None:
-        if event.type is StreamEventType.TOOL_APPROVAL_START:
-            while server.control._background_events._frames < 255:
-                original_publish(
-                    session_id,
-                    StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fill"),
-                )
-        original_publish(session_id, event)
-
-    def observe_overflow() -> None:
-        overflowed.set()
-        original_overflow()
-
-    # test-contract: seam hold semantic handling and fill its exact boundary
-    monkeypatch.setattr(server.control, "_event", hold_first)
-    monkeypatch.setattr(server.control._background_events, "publish", publish_at_limit)
-    # test-contract: seam observe the real slow-controller policy starting
-    monkeypatch.setattr(server.connections, "overflow_controller", observe_overflow)
+    monkeypatch.setattr(
+        server.control, "begin_controller_release", observe_controller_release
+    )
     reconnect_writer: asyncio.StreamWriter | None = None
     try:
         await _request(
@@ -2677,30 +2807,68 @@ async def test_background_event_overflow_records_approval_for_reconnect(
             {
                 "protocol_version": "1.2",
                 "role": "controller",
-                "features": ["approval_reconnect"],
+                "features": ["approval_reconnect", "child_run_history", "session_history_fidelity"],
             },
         )
         session = (
             await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         )[-1]["result"]["session"]
         session_id = session["session_id"]
-        server.control._publish_background_event(
-            session_id,
-            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="blocked"),
-        )
-        await await_or_fail(started.wait(), what="first semantic event")
         await _request(reader, writer, 3, "send", {"text": "delegate"})
-        await await_or_fail(overflowed.wait(), what="controller overflow")
-        release.set()
-        await await_or_fail(
-            server.control.flush_background_events(),
-            what="background event recording",
-        )
-        await asyncio.wait_for(reader.read(), TIMEOUT)
-        assert reader.at_eof(), "overflow must disconnect the slow controller"
+        await await_or_fail(backend.child_started.wait(), what="child backend start")
 
-        reconnect_reader, reconnect_writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
+        assert server._client is not None
+        client = server._client
+        original_write = client._write_physical
+
+        async def blocked_write(payload):
+            physical_started.set()
+            await await_or_fail(physical_release.wait(), what="physical writer release")
+            return await original_write(payload)
+
+        # test-contract: seam hold the real controller writer at its output bound
+        monkeypatch.setattr(client, "_write_physical", blocked_write)
+        assert server.connections is not None
+        original_begin_overflow = server.connections._begin_overflow
+
+        def observe_overflow(state, *, enqueue_control):
+            overflowed.set()
+            original_begin_overflow(state, enqueue_control=enqueue_control)
+
+        async def controlled_overflow_deadline() -> None:
+            await await_or_fail(close_overflow.wait(), what="overflow close release")
+
+        # test-contract: seam observe the real output bound and control its deadline
+        monkeypatch.setattr(server.connections, "_begin_overflow", observe_overflow)
+        # test-contract: seam replace time with a deterministic close gate
+        monkeypatch.setattr(
+            "zeta.server.connections._overflow_deadline_wait",
+            controlled_overflow_deadline,
+        )
+
+        for index in range(254):
+            await _publish_background_event(
+                server,
+                session_id,
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=str(index)),
+            )
+        await await_or_fail(physical_started.wait(), what="blocked physical writer")
+        assert not overflowed.is_set(), "the approval must be the crossing event"
+        child_release.set()
+        await await_or_fail(overflowed.wait(), what="controller output overflow")
+
+        physical_release.set()
+        frames = await _frames_until_error(reader, -32011)
+        assert any(frame.get("error", {}).get("code") == -32011 for frame in frames)
+        close_overflow.set()
+        await await_or_fail(reader.read(), what="overflow disconnect")
+        assert reader.at_eof(), "overflow must disconnect only the slow controller"
+        await await_or_fail(
+            controller_release_started.wait(), what="controller reconnect grace"
+        )
+
+        reconnect_reader, reconnect_writer = await asyncio.open_unix_connection(
+            str(server.socket_path)
         )
         await _request(
             reconnect_reader,
@@ -2710,14 +2878,14 @@ async def test_background_event_overflow_records_approval_for_reconnect(
             {
                 "protocol_version": "1.2",
                 "role": "controller",
-                "features": ["approval_reconnect"],
+                "features": ["approval_reconnect", "child_run_history", "session_history_fidelity"],
             },
         )
-        status = (await _request(reconnect_reader, reconnect_writer, 5, "status"))[
-            -1
-        ]["result"]
+        status = (await _request(reconnect_reader, reconnect_writer, 5, "status"))[-1][
+            "result"
+        ]
         pending = status["pending_approvals"]
-        assert len(pending) == 1, "overflowing approval must remain recoverable"
+        assert len(pending) == 1, "the crossing approval must be recorded before overflow"
         approval = pending[0]
         history = (
             await _request(
@@ -2747,7 +2915,9 @@ async def test_background_event_overflow_records_approval_for_reconnect(
         await await_or_fail(asyncio.shield(child_watcher), what="approved child finish")
         assert len(backend.child.calls) == 2
     finally:
-        release.set()
+        child_release.set()
+        physical_release.set()
+        close_overflow.set()
         if reconnect_writer is not None:
             await close_serve(server, reconnect_writer)
         else:
@@ -2779,19 +2949,29 @@ async def test_background_events_keep_slow_approval_end_before_fast_child_event(
 
     # test-contract: seam delegated history is forced slow before the fast child event
     monkeypatch.setattr(server.control, "_end_approval", slow_end)
-    try:
-        server.control._publish_background_event(
+    slow = asyncio.create_task(
+        _publish_background_event(
+            server,
             "session",
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_END, data={"request_id": "slow"}
             ),
         )
-        await asyncio.wait_for(slow_started.wait(), TIMEOUT)
-        server.control._publish_background_event(
-            "session", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fast")
+    )
+    fast: asyncio.Task[None] | None = None
+    try:
+        await await_or_fail(slow_started.wait(), what="slow approval end")
+        fast = asyncio.create_task(
+            _publish_background_event(
+                server,
+                "session",
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fast"),
+            )
         )
         release_slow.set()
-        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        await await_or_fail(
+            asyncio.gather(slow, fast), what="ordered background publications"
+        )
         frames = [await _read(reader), await _read(reader)]
         assert [frame["params"]["event"] for frame in frames] == [
             "approval_end",

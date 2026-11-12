@@ -327,44 +327,49 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
+        errors: list[BaseException] = []
+
+        async def attempt(awaitable: Awaitable[object]) -> None:
+            try:
+                await awaitable
+            except BaseException as error:  # noqa: BLE001 - close preserves first failure
+                errors.append(error)
+
         if self._idle_drain is not None:
             self._idle_drain.cancel()
             await asyncio.wait([self._idle_drain])
             self._idle_drain = None
-        try:
-            if self._client is not None:
-                await self._client.close(graceful=True)
-        finally:
-            self._client = None
-            self._client_active = False
-            try:
-                try:
-                    await self.control.close()
-                finally:
-                    await self._close_foreground_events()
-                try:
-                    if not self._borrowed:
-                        await self.runtime.close()
-                finally:
-                    await self.control.wait_for_approval_settlement(
-                        approval_settlement_timeout
-                    )
-            finally:
-                if self.connections is not None:
-                    await self.connections.aclose()
-                    self.connections = None
-                await self._frame_writes.aclose()
-                try:
-                    if self._websocket is not None:
-                        await self._websocket.close()
-                    if self._unix_listener is not None:
-                        await self._unix_listener.close()
-                    elif self._server is not None:
-                        self._server.close()
-                        await self._server.wait_closed()
-                finally:
-                    self._server = None
-                    self._unix_listener = None
+
+        await attempt(self.control.begin_close())
+        if not self._borrowed:
+            await attempt(self.runtime.close())
+        await attempt(
+            self.control.wait_for_approval_settlement(approval_settlement_timeout)
+        )
+        if not self._borrowed:
+            self.runtime.set_background_event_sink(None)
+        await attempt(self.control.close_background_events())
+
+        await attempt(self._close_foreground_events())
+        if self._client is not None:
+            await attempt(self._client.close(graceful=True))
+        self._client = None
+        self._client_active = False
+        if self.connections is not None:
+            await attempt(self.connections.aclose())
+            self.connections = None
+        await attempt(self._frame_writes.aclose())
+        if self._websocket is not None:
+            await attempt(self._websocket.close())
+        if self._unix_listener is not None:
+            await attempt(self._unix_listener.close())
+        elif self._server is not None:
+            self._server.close()
+            await attempt(self._server.wait_closed())
+        self._server = None
+        self._unix_listener = None
+        if errors:
+            raise errors[0]
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
