@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from io import StringIO
 from typing import TYPE_CHECKING, TypeVar
 
@@ -306,6 +306,20 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def append(self, renderable: RenderableType) -> _TranscriptUnit:
         return self._append_unit(renderable)
+
+    def adopt_units(
+        self, units: Sequence[RenderableType | _ToolUnit | None]
+    ) -> tuple[_TranscriptUnit, ...]:
+        """Adopt one already prepared page without exposing page ownership."""
+
+        adopted = tuple(self._append_unit(value) for value in units)
+        return adopted
+
+    def remove_units(self, units: Sequence[_TranscriptUnit]) -> None:
+        """Remove a page in one caller-visible operation."""
+
+        for unit in tuple(units):
+            self.remove(unit)
 
     def replace(
         self, unit: _TranscriptUnit, renderable: RenderableType
