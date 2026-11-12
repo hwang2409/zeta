@@ -568,3 +568,49 @@ def _opened_lease(home):
         yield lease
     finally:
         lease.close()
+
+
+def test_isolated_all_roots_behavior(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        roots = [_create_closed(manager, stack) for _ in range(40)]
+        for root in roots:
+            _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        result, _ = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+    assert result.complete
+    assert set(result.preview.root_ids) == set(roots)
+
+
+def test_isolated_completed_sweeps_do_not_double_count(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        first, _ = _run_sweep(planner)
+        first_bytes = first.preview.bytes
+        first_id = first.preview.preview_id
+        second, _ = _run_sweep(planner)
+    assert second.complete
+    assert second.preview.preview_id != first_id
+    assert second.preview.bytes == first_bytes
+
+
+def test_isolated_partial_second_sweep_keeps_complete_preview(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(
+            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1), now_ns=_future_ns
+        )
+        complete, _ = _run_sweep(planner)
+        preview_id = complete.preview.preview_id
+        (tmp_path / "sessions" / root / "new-old-file").write_bytes(b"x" * 100)
+        partial = planner.run_pass(days=30)
+        state = json.loads((tmp_path / "retention-state.json").read_text())
+    assert not partial.complete
+    assert state["preview"]["preview_id"] == preview_id
