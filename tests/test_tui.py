@@ -626,7 +626,7 @@ async def _background_event_transcript_count(
     elif event == "session_shutdown":
         assert task_id is not None
         needle = (
-            f"⏺ task {task_id} exited"
+            f"background tasks killed on session exit: {task_id}"
             if owner == "run_background"
             else "⏺ /matrix · canceled"
         )
