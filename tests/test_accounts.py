@@ -2567,7 +2567,7 @@ def test_api_key_mode_skips_named_accounts(
     app._presenter.print_unit = rendered.append
     app._handle_slash_output(asyncio.run(app.slash_accounts("")))
     assert rendered[0].plain == (
-        "system · this session uses an API key; account switching is unavailable"
+        "system · no accounts; run zeta login <provider> --account <name>"
     )
     opened.store.close()
 
