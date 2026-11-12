@@ -152,6 +152,12 @@ def _true_tree_bytes(session_dir) -> int:
     return total
 
 
+def _planner(stack, *args, **kwargs):
+    planner = RetentionPlanner(*args, **kwargs)
+    stack.callback(getattr(planner, "close", lambda: None))
+    return planner
+
+
 def test_closure_reasons_table(tmp_path):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
@@ -186,6 +192,7 @@ def test_closure_reasons_table(tmp_path):
         inbox = _create_closed(manager, stack)
         new_dir = tmp_path / "projects" / "p_x" / "inbox" / "new"
         new_dir.mkdir(parents=True)
+        (tmp_path / "projects" / ".lock").write_text("")  # real homes have one
         (new_dir / "m.json").write_text(
             json.dumps({"from": {"project": "p", "session": inbox}, "to_session": None})
         )
@@ -271,10 +278,10 @@ def test_resume_completes_over_passes_with_exact_bytes(tmp_path):
         expected = _true_tree_bytes(tmp_path / "sessions" / root)
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = stack.enter_context(RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
+        planner = _planner(
+            stack, tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
             now_ns=lambda: _future_ns(),
-        ))
+        )
         passes = 0
         result = planner.run_pass(days=30)
         while not result.complete:
@@ -298,10 +305,10 @@ def test_touched_completed_directory_is_rewalked(tmp_path):
         (child / ".lock").write_text("")
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = stack.enter_context(RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
+        planner = _planner(
+            stack, tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
             now_ns=lambda: _future_ns(),
-        ))
+        )
         first = planner.run_pass(days=30)
         assert first.complete is False  # root directory completed, walk suspended
         # A new file lands in the already-walked root directory.
@@ -320,13 +327,14 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
     with ExitStack() as stack:
         root = _create_closed(manager, stack)
         root_dir = tmp_path / "sessions" / root
+        _age_tree(root_dir)
         lease = stack.enter_context(_opened_lease(tmp_path))
         bounds = RetentionBounds(entries_per_root=1)
-        planner_a = stack.enter_context(
-            RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
+        planner_a = _planner(
+            stack, tmp_path, lease, bounds=bounds, now_ns=_future_ns
         )
         assert planner_a.run_pass(days=30).complete is False
-        planner_a.close()  # process exit: the walked root directory is not rewalked
+        getattr(planner_a, "close", lambda: None)()  # process exit: the walked root directory is not rewalked
         # A file in the already-listed root directory changes; the directory
         # mtime does not, so only a fresh walk can see it.
         walked = min(p for p in root_dir.iterdir() if p.is_file())
@@ -335,8 +343,8 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
         recent = _future_ns() - _DAY_NS
         os.utime(walked, ns=(recent, recent))
 
-        planner_b = stack.enter_context(
-            RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
+        planner_b = _planner(
+            stack, tmp_path, lease, bounds=bounds, now_ns=_future_ns
         )
         result, reasons = _run_sweep(planner_b)
     assert reasons[root] == (False, "not old enough")
@@ -388,6 +396,20 @@ def test_in_flight_walk_keeps_conforming_writers_out(tmp_path):
     assert result.preview.root_ids == (root,)
 
 
+def test_inherited_pin_blocks_descendant(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        parent = _create_closed(manager, stack)
+        child = _create_closed(manager, stack, parent_session_id=parent)
+        with session_root(tmp_path / "sessions" / parent) as parent_fd:
+            write_retention_pin(parent_fd)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        result, reasons = _run_sweep(planner)
+    assert reasons[child] == (False, "pinned")
+    assert child not in result.preview.root_ids
+
+
 def test_unreadable_entry_blocks_only_its_root(tmp_path):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
@@ -398,7 +420,8 @@ def test_unreadable_entry_blocks_only_its_root(tmp_path):
         stack.callback(blocked.chmod, 0o700)
         lease = stack.enter_context(_opened_lease(tmp_path))
         planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
-        result, reasons = _run_sweep(planner)
+        result, reasons = _run_sweep_without_error(planner)
+    assert result is not None
     assert reasons[ids[0]] == (False, "unreadable entry: Permission denied")
     assert reasons[ids[1]] == (True, None)
     assert result.preview.root_ids == (ids[1],)
@@ -414,8 +437,8 @@ def test_bounds_are_checked_per_entry_and_per_record(tmp_path):
             (spill / f"{index}.txt").write_text("s" * (index + 1))
         expected = _true_tree_bytes(tmp_path / "sessions" / big)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=4), now_ns=_future_ns
+        planner = _planner(
+            stack, tmp_path, lease, bounds=RetentionBounds(entries_per_root=4), now_ns=_future_ns
         )
         planner.run_pass(days=30)
         walked = json.loads((tmp_path / "retention-state.json").read_text())["entry_count"]
@@ -425,8 +448,8 @@ def test_bounds_are_checked_per_entry_and_per_record(tmp_path):
         inbox.mkdir(parents=True)
         for index in range(3):
             (inbox / f"{index}.json").write_text(json.dumps({"to_session": "other"}))
-        bounded = RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(reference_records_per_root=2),
+        bounded = _planner(
+            stack, tmp_path, lease, bounds=RetentionBounds(reference_records_per_root=2),
             now_ns=_future_ns,
         )
         _, bounded_reasons = _run_sweep(bounded)
@@ -529,6 +552,13 @@ def _run_sweep(planner, days=30):
         if result.complete:
             return result, reasons
     raise AssertionError("sweep did not complete in 500 passes")
+
+
+def _run_sweep_without_error(planner, days=30):
+    try:
+        return _run_sweep(planner, days)
+    except OSError:
+        return None, {}
 
 
 @contextmanager

@@ -766,6 +766,11 @@ def _inbox_status_dirs(home_fd):
         if projects_fd is None:
             return
         for project in sorted(os.listdir(projects_fd)):
+            info = os.stat(project, dir_fd=projects_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise RetentionPlannerError("unsafe project directory")
+            if not stat.S_ISDIR(info.st_mode):
+                continue  # e.g. projects/.lock
             with ExitStack() as inner:
                 project_fd = _open_dir(inner, projects_fd, project)
                 inbox_fd = _open_dir(inner, project_fd, "inbox") if project_fd is not None else None
