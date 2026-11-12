@@ -119,6 +119,7 @@ def test_process_monitor_restarts_after_new_event_loop(monkeypatch) -> None:
 
     class App:
         _remote_view = None
+        restart_pending = False
 
     monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)
     monkeypatch.setattr(layout, "get_app", lambda: PromptApp())
@@ -179,6 +180,7 @@ def test_updated_footer_uses_the_persistent_notice(monkeypatch) -> None:
 
     class App:
         _remote_view = None
+        restart_pending = False
 
     monitor = type("Monitor", (), {"current": ("old", "new")})()
     monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)

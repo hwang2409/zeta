@@ -502,7 +502,10 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
             text += " · disconnected"
         return [("class:status-bar", text.ljust(width)[:width])]
     if process_update_monitor(zeta.__file__ or "").current is not None:
-        return [("class:status-bar", "zeta updated · /restart".ljust(width)[:width])]
+        text = "zeta updated · /restart"
+        if app.restart_pending:
+            text = "restart pending · " + text
+        return [("class:status-bar", text.ljust(width)[:width])]
     usage = dict(app._usage)
     usage.setdefault(
         "cache_read_input_tokens",
