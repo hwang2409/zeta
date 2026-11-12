@@ -129,7 +129,6 @@ class SlashHandlerMixin:
         return build_slash_status(self._status_snapshot())
 
     def _status_snapshot(self) -> SlashStatusSnapshot:
-        self._submissions.seed_pending_approvals_now()
         pending = tuple(
             f"{request.key} ({request.label or request.tool_call.name})"
             for request in self.pending_approvals

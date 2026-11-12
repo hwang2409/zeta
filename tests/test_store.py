@@ -3280,8 +3280,8 @@ def test_incremental_tail_payload_validation_matches_full_load(
     assert not incremental_accepted
 
 
-def test_approval_validation_ignores_failed_sidecar_seed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_approval_validation_rejects_duplicate_without_the_sidecar(
+    tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall("duplicate", "bash", {"cmd": "pwd"})
@@ -3290,12 +3290,10 @@ def test_approval_validation_ignores_failed_sidecar_seed(
         [(call.id, call)],
     )
 
-    def fail_derived_query(_request_ids: set[str]) -> dict[str, str | None]:
-        raise RuntimeError("corrupt sidecar")
-
-    setattr(store, "_active_" + "approval_requests", {})
-    # test-contract: seam forces derived-state failure at the validation boundary
-    monkeypatch.setattr(store, "_approval_relations", fail_derived_query, raising=False)
+    # Approval-row validation reads the authoritative branch, never the derived
+    # sidecar: with the index unavailable, the duplicate is still rejected.
+    if store._history_index is not None:
+        store._history_index._mark_unavailable()
     with pytest.raises(
         ConversationIntegrityError, match="duplicate approval request: duplicate"
     ):
@@ -3312,8 +3310,6 @@ async def test_approval_policy_ignores_legacy_resident_maps(tmp_path: Path) -> N
     foreign.append_approval_request(call.id, call)
 
     resident._install_log_state(foreign._snapshot_log_state())
-    setattr(resident, "_active_" + "approval_requests", {})
-    setattr(resident, "_active_" + "approval_resolutions", {})
     policy = ApprovalPolicy(default="ask", store=resident)
     assert await asyncio.wait_for(policy.pending_requests(), 10) == [
         ApprovalRequest(call.id, call)
@@ -3393,7 +3389,6 @@ def installed(delta):
 resident.on_entries_installed = installed
 import asyncio
 pending = asyncio.run(resident.pending_approval_page())
-resident.refresh()
 resident.refresh()
 print(json.dumps({
     "observed": observed,

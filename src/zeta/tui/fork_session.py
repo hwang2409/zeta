@@ -121,7 +121,6 @@ class ForkRuntimeMixin:
         if self._fork_controller is not None:
             self._fork_controller.approvals_changed()
             return
-        self._submissions.seed_pending_approvals_now()
         self.sync_visible_approvals(
             tuple(
                 OwnedApproval(self, request) for request in self.local_pending_approvals
