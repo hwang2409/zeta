@@ -531,12 +531,19 @@ async def mount_mcp_servers(
     notice_sink: NoticeSink | None = None,
     home: str | None = None,
     bindings: dict[str, dict[str, str]] | None = None,
+    binding_configs: dict[str, MCPServerConfig] | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
 
     enabled_configs = {
         name: (
-            replace(server_config, headers={**server_config.headers, **bindings[name]})
+            replace(
+                (binding_configs or {}).get(name, server_config),
+                headers={
+                    **(binding_configs or {}).get(name, server_config).headers,
+                    **bindings[name],
+                },
+            )
             if bindings and name in bindings
             else server_config
         )

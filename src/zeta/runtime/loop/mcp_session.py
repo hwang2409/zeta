@@ -14,6 +14,7 @@ from ...mcp import (
     mount_mcp_servers,
     tool_prefix,
 )
+from ...mcp.config import MCPServerConfig
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
@@ -70,11 +71,16 @@ class MCPSession:
             service = self._mcp_management
             config = await service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
+                self.tool_registry, config, notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
-                bindings=self._mcp_bindings,
+                **(
+                    {
+                        "bindings": self._mcp_bindings,
+                        "binding_configs": self._mcp_binding_configs,
+                    }
+                    if self._mcp_bindings
+                    else {}
+                ),
             )
             service.mount = self._mcp_mount
         except (MCPConfigError, MCPManagementError) as exc:
@@ -96,15 +102,27 @@ class MCPSession:
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
 
-    async def set_mcp_bindings(self, bindings: dict[str, dict[str, str]]) -> None:
+    async def set_mcp_bindings(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig] | None = None,
+    ) -> None:
         """Set transient per-attachment headers and remount MCP servers."""
+        await self.clear_mcp_bindings()
+        self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
+        self._mcp_binding_configs = dict(configs or {})
 
+    async def clear_mcp_bindings(self) -> None:
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            self._mcp_mount_task.cancel()
+            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
         if self._mcp_mount is not None:
             await self._mcp_mount.close()
             self._mcp_mount = None
-            self._mcp_mount_task = None
-            self._mcp_mount_attempted = False
-        self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
+        self._mcp_mount_task = None
+        self._mcp_mount_attempted = False
+        self._mcp_bindings = {}
+        self._mcp_binding_configs = {}
 
     def set_mcp_scope(
         self,

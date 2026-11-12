@@ -395,9 +395,17 @@ class ServeControl:
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         self._active_mcp_bindings = {}
+
+        async def clear_mcp() -> None:
+            loop = self.server.runtime.loop
+            if loop is not None:
+                await loop.clear_mcp_bindings()
+
+        clear_task = asyncio.create_task(clear_mcp())
         if reconnect and self._grace_task is not None:
 
             async def wait_for_grace() -> None:
+                await asyncio.shield(clear_task)
                 assert self._grace_task is not None
                 await asyncio.shield(self._grace_task)
 
@@ -407,6 +415,7 @@ class ServeControl:
             self._grace_task = asyncio.create_task(self._expire_grace())
 
             async def start_grace() -> None:
+                await asyncio.shield(clear_task)
                 if self.server.approval_reconnect_grace == 0:
                     assert self._grace_task is not None
                     await self._grace_task
@@ -414,6 +423,7 @@ class ServeControl:
             return start_grace()
 
         async def disconnect() -> None:
+            await asyncio.shield(clear_task)
             await self._terminate_pending_approvals(suppress_write_errors=True)
             await self._disconnect_turn()
 

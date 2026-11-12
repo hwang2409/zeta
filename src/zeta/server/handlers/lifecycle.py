@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.session_execution import SessionOwnedError
 from ...core.session_files import SessionIdAmbiguousError, SessionNotFoundError
+from ...mcp.config import (
+    MCPServerConfig,
+    home_config_path,
+    load_mcp_config,
+    load_mcp_config_overlay,
+)
 from ...mcp.management import MCPManagementService
 from .. import model_selection
 from ..host_commands import SessionHostCommands
@@ -44,12 +50,15 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 await model_selection.apply_rpc(
                     self.server.runtime, initial_model, initial_mode
                 )
-            await self.server.runtime.loop.set_mcp_bindings(bindings)
+            if bindings is not None:
+                headers, configs = bindings
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_required = bool(headers)
+            elif self.server.runtime.loop is not None:
+                self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
-            self.server.control._active_mcp_bindings = bindings
-            self.server.control._mcp_binding_required = (
-                "session_mcp_bindings" in self.features and bool(bindings)
-            )
             self.server.control._host_binding_required = (
                 "session_host_commands" in self.features
             )
@@ -124,12 +133,15 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-            await self.server.runtime.loop.set_mcp_bindings(bindings)
+            if bindings is not None:
+                headers, configs = bindings
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_required = bool(headers)
+            elif self.server.runtime.loop is not None:
+                self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
-            self.server.control._active_mcp_bindings = bindings
-            self.server.control._mcp_binding_required = (
-                "session_mcp_bindings" in self.features and bool(bindings)
-            )
             self.server.control._host_binding_required = (
                 "session_host_commands" in self.features
             )
@@ -145,11 +157,18 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         raise
 
 
-async def mcp_bindings(self, params: dict[str, Any]) -> dict[str, dict[str, str]]:
+async def mcp_bindings(
+    self, params: dict[str, Any]
+) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
     if "mcp_bindings" not in params:
-        return {}
+        return None
     validation.require_feature(self, "session_mcp_bindings", "mcp_bindings")
-    raw = params["mcp_bindings"]
+    parsed = parse_mcp_bindings(params["mcp_bindings"])
+    configs = await resolve_mcp_bindings(self, parsed, params.get("cwd"))
+    return parsed, configs
+
+
+def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
     if type(raw) is not list:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "mcp_bindings must be a list")
     result: dict[str, dict[str, str]] = {}
@@ -158,35 +177,57 @@ async def mcp_bindings(self, params: dict[str, Any]) -> dict[str, dict[str, str]
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
         name = item["server"]
         headers = item.get("headers")
-        if name in result or type(headers) is not dict:
+        if name in result or type(headers) is not dict or len(headers) > 64:
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
         parsed: dict[str, str] = {}
-        if len(headers) > 64:
-            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
         for header, value in headers.items():
             if (
-                type(header) is not str
-                or type(value) is not str
-                or not header
-                or "\r" in header
-                or "\n" in header
-                or "\r" in value
-                or "\n" in value
-                or len(header) > 256
-                or len(value) > 8192
+                type(header) is not str or type(value) is not str or not header
+                or any(ord(char) < 33 or ord(char) > 126 for char in header)
+                or any(ord(char) < 32 and char not in "\t" for char in value)
+                or any(ord(char) > 126 for char in value)
+                or len(header.encode()) > 256 or len(value.encode()) > 8192
             ):
                 raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
             parsed[header] = value
         result[name] = parsed
-    config = await MCPManagementService(home=self.server.runtime.home).runtime_config()
-    for name in result:
+    return result
+
+
+async def resolve_mcp_bindings(
+    self, bindings: dict[str, dict[str, str]], project_dir: object = None
+) -> dict[str, MCPServerConfig]:
+    home_path = home_config_path(self.server.runtime.home)
+    loop = self.server.runtime.loop
+    project_dir = (
+        loop.tool_registry.cwd
+        if loop is not None and project_dir is None
+        else project_dir if project_dir is not None else self.server.runtime.cwd
+    )
+    config, effective = await asyncio.gather(
+        asyncio.to_thread(load_mcp_config, home_path),
+        asyncio.to_thread(
+            load_mcp_config_overlay,
+            home=self.server.runtime.home,
+            project_dir=project_dir,
+        ),
+    )
+    resolved: dict[str, MCPServerConfig] = {}
+    for name in bindings:
         source = config.sources.get(name, config.path)
-        if name not in config.configured_servers or source != config.path:
+        server = config.configured_servers.get(name)
+        effective_source = effective.sources.get(name, effective.path)
+        if (
+            server is None
+            or source.resolve() != config.path.resolve()
+            or effective_source.resolve() != config.path.resolve()
+        ):
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
                 f"MCP server is not a trusted global server: {name}",
             )
-    return result
+        resolved[name] = server
+    return resolved
 
 
 def host_commands(self, params: dict[str, Any]) -> SessionHostCommands:

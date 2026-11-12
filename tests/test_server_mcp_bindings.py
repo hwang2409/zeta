@@ -122,14 +122,29 @@ async def test_session_mcp_bindings_requires_negotiation_and_global_server(tmp_p
 async def test_session_mcp_binding_rejects_project_definition(tmp_path: Path) -> None:
     project = tmp_path / "project"
     (project / ".zeta").mkdir(parents=True)
-    (project / ".zeta" / "mcp.json").write_text(json.dumps({"servers": {"project": {"transport": "streamable-http", "url": "http://127.0.0.1:9"}}}))
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {"transport": "streamable-http", "url": "http://127.0.0.1:8"}}}))
+    (project / ".zeta" / "mcp.json").write_text(json.dumps({"servers": {"page": {"transport": "streamable-http", "url": "http://127.0.0.1:9"}}}))
     server = ZetaServer(home=tmp_path, cwd=project, port=0, provider="codex")
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
-        error = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "project", "headers": {}}]}))[-1]
+        error = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {}}]}))[-1]
         assert error["error"]["code"] == -32602
         assert not list((tmp_path / "sessions").glob("*"))
+    finally:
+        writer.close(); await writer.wait_closed(); await server.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_rejects_control_header_without_leak(tmp_path: Path) -> None:
+    secret = "nul-secret-should-not-appear"
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
+        error = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer " + secret + "\\x00"}}]}))[-1]
+        assert error["error"]["code"] == -32602
+        assert secret not in json.dumps(error)
     finally:
         writer.close(); await writer.wait_closed(); await server.close()
 
