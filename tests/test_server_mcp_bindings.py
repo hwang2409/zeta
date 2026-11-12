@@ -20,6 +20,7 @@ SECRET = "page-secret-never-persisted"
 class LocalMCP:
     def __init__(self) -> None:
         self.headers: list[str | None] = []
+        self.auth_received = asyncio.Event()
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> int:
@@ -38,6 +39,8 @@ class LocalMCP:
             body = await reader.readexactly(length)
             request = json.loads(body)
             self.headers.append(headers.get("authorization"))
+            if headers.get("authorization") is not None:
+                self.auth_received.set()
             method = request["method"]
             if method == "initialize":
                 result = {"protocolVersion": "2025-03-26", "capabilities": {}}
@@ -91,7 +94,7 @@ async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_pat
             frames += await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
             session = (await _request(reader, writer, 2, "new_session", {"provider": "codex", "mcp_bindings": [{"server": "page", "headers": {"Authorization": f"Bearer {SECRET}"}}]}))[-1]["result"]["session"]
             frames += await _request(reader, writer, 3, "send", {"text": "use echo"})
-            assert await asyncio.wait_for(_wait_for_auth(mcp), TIMEOUT)
+            await asyncio.wait_for(mcp.auth_received.wait(), TIMEOUT)
             assert all(value == f"Bearer {SECRET}" for value in mcp.headers if value is not None)
             assert all(SECRET not in json.dumps(frame) for frame in frames)
             assert all(SECRET not in path.read_text(errors="ignore") for path in tmp_path.rglob("*") if path.is_file())
@@ -100,12 +103,6 @@ async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_pat
             writer.close(); await writer.wait_closed(); await server.close()
     finally:
         await mcp.close()
-
-
-async def _wait_for_auth(mcp: LocalMCP) -> bool:
-    while not mcp.headers:
-        await asyncio.sleep(0)
-    return True
 
 
 @pytest.mark.asyncio
