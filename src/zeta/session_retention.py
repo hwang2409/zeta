@@ -899,12 +899,14 @@ def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | N
                 return "unreadable possible dependent"
             if not _valid_metadata(meta):
                 raise RetentionPlannerError("malformed metadata")
-        if fork is not None and (
-            type(fork) is not dict
-            or set(fork) != {"forked_from_session", "forked_at_entry", "attention_id"}
-            or any(type(fork.get(key)) is not str or not fork[key] for key in fork)
-        ):
-            raise RetentionPlannerError("malformed attention fork")
+        if fork is not None:
+            if type(fork) is not dict:
+                raise RetentionPlannerError("malformed attention fork")
+            # allowlist row: session_retention._authority_dependents, transient fork schema
+            if set(fork) != {"forked_from_session", "forked_at_entry", "attention_id"} or any(
+                type(fork.get(key)) is not str or not fork[key] for key in fork
+            ):
+                raise RetentionPlannerError("malformed attention fork")
         if (meta or {}).get("parent_session_id") == root_id:
             return "published top-level dependent"
         if (fork or {}).get("forked_from_session") == root_id:
