@@ -32,7 +32,7 @@ from zeta.project_inbox import (
     ProjectInboxScanner,
     SentMessageTracker,
 )
-from zeta.project_registry import ProjectRegistry, ProjectRegistryError
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
     Message,
