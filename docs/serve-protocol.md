@@ -936,6 +936,11 @@ that gets no answer within its own timeout can treat the server as hung.
 
 All examples below use the common event envelope:
 
+The `zeta_updated` event requires the negotiated `zeta_updated` feature and
+contains `data.old_revision` and `data.new_revision`. These values are opaque
+strings: they are a git SHA when the source is in a git checkout, or a source
+hash when it is not. Clients must not parse either value.
+
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```

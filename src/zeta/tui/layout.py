@@ -497,6 +497,8 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         if state.disconnected:
             text += " · disconnected"
         return [("class:status-bar", text.ljust(width)[:width])]
+    if app._zeta_updated:
+        return [("class:status-bar", "zeta updated · /restart".ljust(width)[:width])]
     usage = dict(app._usage)
     usage.setdefault(
         "cache_read_input_tokens",
