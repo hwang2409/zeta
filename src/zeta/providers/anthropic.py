@@ -92,6 +92,40 @@ CLAUDE_CODE_BETA = "claude-code-20250219"
 INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
 DEFAULT_MAX_TOKENS = 16_384
 DEFAULT_THINKING_BUDGET = 8_192
+
+# Published max output tokens per Claude model, from the docs.anthropic.com
+# model overview (read 2026-11-12). Keyed by canonical model ids and the
+# documented dated aliases. An unknown model keeps the conservative
+# DEFAULT_MAX_TOKENS / DEFAULT_THINKING_BUDGET.
+MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "claude-opus-4-5": 64_000,
+    "claude-opus-4-6": 128_000,
+    "claude-opus-4-7": 128_000,
+    "claude-opus-4-8": 128_000,
+    "claude-opus-5": 128_000,
+    "claude-opus-5-5": 128_000,
+    "claude-sonnet-4-5": 64_000,
+    "claude-sonnet-4-6": 128_000,
+    "claude-sonnet-5": 128_000,
+    "claude-haiku-4-5": 64_000,
+    "claude-fable-5": 128_000,
+    # documented dated model ids
+    "claude-sonnet-4-5-20250929": 64_000,
+    "claude-haiku-4-5-20251001": 64_000,
+}
+
+
+def model_output_limits(model: str) -> tuple[int, int]:
+    """Return (max_tokens, thinking_budget) for a Claude model.
+
+    max_tokens is the model's published output limit. thinking_budget is half
+    of it: that leaves the other half for the answer, and keeps the same ratio
+    as the 16,384 / 8,192 fallback used for an unknown model.
+    """
+    limit = MODEL_MAX_OUTPUT_TOKENS.get(model)
+    if limit is None:
+        return DEFAULT_MAX_TOKENS, DEFAULT_THINKING_BUDGET
+    return limit, limit // 2
 OAUTH_SCOPES = (
     "org:create_api_key user:profile user:inference user:sessions:claude_code "
     "user:mcp_servers user:file_upload"
@@ -442,8 +476,8 @@ class AnthropicBackend(CompletionBackend):
         self,
         *,
         model: str = "claude-sonnet-4-6",
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        thinking_budget: int = DEFAULT_THINKING_BUDGET,
+        max_tokens: int | None = None,
+        thinking_budget: int | None = None,
         base_url: str = API_URL,
         token_store: AnthropicCredential | None = None,
         client: httpx.AsyncClient | None = None,
@@ -451,6 +485,13 @@ class AnthropicBackend(CompletionBackend):
         stall_seconds: float = TRANSPORT_IDLE_SECONDS,
         stall_retries: int = MAX_STALL_RETRIES,
     ) -> None:
+        default_max_tokens, default_thinking_budget = model_output_limits(model)
+        if max_tokens is None:
+            max_tokens = default_max_tokens
+            if thinking_budget is None:
+                thinking_budget = default_thinking_budget
+        elif thinking_budget is None:
+            thinking_budget = max_tokens // 2
         _validate_thinking_parameters(max_tokens, thinking_budget)
         self.model = model
         self.max_tokens = max_tokens
