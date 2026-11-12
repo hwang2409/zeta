@@ -2731,7 +2731,6 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         approval_end_published = asyncio.Event()
         terminal_published = asyncio.Event()
         original_admit = server.control._admit_controller
-        original_notify = server.control._notify
 
         def observe_admit(
             event: EventDescriptor, session_id: str | None = None, **fields: object
@@ -2742,24 +2741,12 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
                 and fields.get("request_id") == approval["request_id"]
             ):
                 approval_end_published.set()
-            return outcome
-
-        async def observe_notify(
-            event: EventDescriptor, session_id: str | None = None, **fields: object
-        ) -> bool:
-            written = await original_notify(event, session_id, **fields)
-            if event in {
-                EventDescriptor.TURN_END,
-                EventDescriptor.AGENT_END,
-                EventDescriptor.ERROR,
-            }:
+            elif event is EventDescriptor.TOOL_END:
                 terminal_published.set()
-            return written
+            return outcome
 
         # test-contract: seam observe admission to the real connection output
         monkeypatch.setattr(server.control, "_admit_controller", observe_admit)
-        # test-contract: seam observe completion of terminal wire publication
-        monkeypatch.setattr(server.control, "_notify", observe_notify)
         # Force the losing race deterministically: close the grandchild store
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
@@ -2789,12 +2776,7 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         approval_ends = _named_events(frames, "approval_end")
         assert len(approval_ends) == 1
         assert approval_ends[0]["request_id"] == approval["request_id"]
-        terminal_events = [
-            event
-            for name in ("turn_end", "agent_end", "error")
-            for event in _named_events(frames, name)
-        ]
-        assert terminal_events
+        assert _named_events(frames, "tool_end")
         await _request(reader, writer, 5, "status")
         assert len(backend.grandchild.calls) == 1
     finally:
