@@ -215,7 +215,6 @@ class AgentLoop(
         self._background_child_cancellers: dict[str, Callable[[], None]] = {}
         self._background_child_watchers: dict[str, asyncio.Task[Any]] = {}
         self._background_event_sink: Callable[[StreamEvent], None] | None = None
-        self._restart_idle_callback: Callable[[], None] | None = None
         self._mcp_notice_sink: Callable[[str], None] | None = None
         self._mcp_prompt_refresh: Callable[[MCPMount], None] | None = None
         self._activated = False
@@ -393,13 +392,6 @@ class AgentLoop(
     ) -> None:
         """Set the sink for progress from children that outlive their turn."""
         self._background_event_sink = sink
-
-    def set_restart_idle_callback(self, callback: Callable[[], None] | None) -> None:
-        self._restart_idle_callback = callback
-
-    def notify_restart_idle_check(self) -> None:
-        if self._restart_idle_callback is not None:
-            asyncio.get_running_loop().call_soon(self._restart_idle_callback)
 
     @property
     def background_children_running(self) -> bool:

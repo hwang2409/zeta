@@ -288,7 +288,6 @@ class TurnConsumerMixin:
                     elif event.type is StreamEventType.AGENT_END:
                         self._reset_stream_state()
                         self._loop_state = "idle"
-                        self._maybe_restart_when_idle()
                         if not turn_failed:
                             self._failed_turn = None
                         if not self._turn_had_visible_output and not notification:
@@ -354,7 +353,6 @@ class TurnConsumerMixin:
             spinner_task.cancel()
             await asyncio.gather(spinner_task, return_exceptions=True)
             self._finish_stream_invalidation()
-            asyncio.get_running_loop().call_soon(self._maybe_restart_when_idle)
         return notification_failure
 
     async def _present_agent_notification(
@@ -842,7 +840,6 @@ class SubmissionMixin:
     def _clear_active_task(self, task: asyncio.Task[Any]) -> None:
         if self._active_task is task:
             self._active_task = None
-        self._maybe_restart_when_idle()
 
     async def _handle_prompt_value(self, value: str) -> None:
         if self._input_loop_active:

@@ -504,7 +504,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         try:
             await self._settle_slash(entry, message.task)
         finally:
-            self._host._maybe_restart_when_idle()
             # the command finished after the keypress that started it was drawn; nothing else
             # repaints an idle screen, so its output would wait for the next key.
             self._host._invalidate_prompt()
@@ -765,7 +764,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._record_prompt(entry)
         entry.state = SubmissionState.DISPATCHED
         self._ack_entry(entry)
-        self._host._maybe_restart_when_idle()
 
     def _commit_command_receipts(self) -> None:
         while self._command_order and self._command_order[0] in self._command_results:
@@ -935,7 +933,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
                 entry.state = SubmissionState.READY
         self._ack_entry(self._provider_entry)
         self._provider_entry, self._provider_task = None, None
-        self._host._maybe_restart_when_idle()
 
     async def _wait_for_preprocessing(
         self,

@@ -329,6 +329,7 @@ class TUIApp(
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
         self._active_session: PromptSession[str] | None = None
+        self._restart_idle_buffers: set[int] = set()
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._init_remote_view()
@@ -372,7 +373,6 @@ class TUIApp(
             lambda event: app._handle_background_event(event)
         )
         self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
-        self.loop.set_restart_idle_callback(lambda: app._maybe_restart_when_idle())
         self.loop.set_mcp_notice_sink(
             lambda message: app._handle_background_notice(message)
         )
@@ -822,7 +822,6 @@ class TUIApp(
         self._agent_navigation.request_refresh()
         if not self._defer_startup_notice(notice):
             background_notice(self, notice)
-        self._maybe_restart_when_idle()
 
     def _handle_background_event(self, event: StreamEvent) -> None:
         if not self._defer_startup_runtime_event(event):
@@ -843,7 +842,6 @@ class TUIApp(
         }:
             self._handle_tool_event(event)
             self._finish_background_invalidation()
-            self._maybe_restart_when_idle()
             return
         if event.data.get("agent_instance_id") is not None:
             return
@@ -858,7 +856,6 @@ class TUIApp(
             if presentation is not None and presentation.visible_output:
                 if event.type is StreamEventType.TOOL_EXECUTION_END:
                     self._finish_background_invalidation()
-                    self._maybe_restart_when_idle()
                 else:
                     self._invalidate_background_prompt()
 
@@ -869,7 +866,6 @@ class TUIApp(
             self._startup_wake_pending = True
             return
         self._submissions.wake()
-        self._maybe_restart_when_idle()
 
     def _discard_tool_region(self) -> None:
         self._presenter.discard_tool_region()
@@ -1125,6 +1121,12 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
+    def _bind_restart_idle_buffer(self, session: PromptSession[str]) -> None:
+        buffer = getattr(getattr(session, "app", None), "current_buffer", None)
+        if buffer is not None and id(buffer) not in self._restart_idle_buffers:
+            buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            self._restart_idle_buffers.add(id(buffer))
+
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1157,9 +1159,7 @@ class TUIApp(
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
-            buffer = getattr(getattr(session, "app", None), "current_buffer", None)
-            if buffer is not None:
-                buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            self._bind_restart_idle_buffer(session)
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
                 await start_prompt_during_activation(self, session, run_prompt_toolkit)
