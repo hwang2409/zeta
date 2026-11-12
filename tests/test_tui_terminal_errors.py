@@ -59,6 +59,31 @@ def _run_pty_python(code: str, env: dict[str, str], timeout: float = 10) -> tupl
         os.close(master_fd)
 
 
+def _run_pty_python_with_stderr_pipe(
+    code: str, env: dict[str, str], timeout: float = 10
+) -> tuple[bytes, bytes, int]:
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=subprocess.PIPE,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    output = bytearray()
+    try:
+        _drain_until_eof(master_fd, output, timeout)
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        return bytes(output), stderr, reap_process(process, timeout=timeout)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            reap_process(process, timeout=timeout)
+        os.close(master_fd)
+
+
 def _capture_env(home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -104,6 +129,117 @@ with stderr_to_log():
 
     assert returncode == 0
     assert b"ZATEXIT-LEAK" not in terminal
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 1
+    assert b"ZATEXIT-LEAK" in logs[0].read_bytes()
+
+
+def test_four_mib_stderr_flood_is_exact(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    code = """
+import os
+import zeta.tui.stderr_capture as sc
+if hasattr(sc, "_open_log"):
+    original = sc._open_log
+    def delayed(path):
+        os.write(int(os.environ["READY_FD"]), b"ready")
+        os.read(int(os.environ["RELEASE_FD"]), 1)
+        return original(path)
+    sc._open_log = delayed
+expected = b"".join(bytes([i]) * 65536 for i in range(64))
+with sc.stderr_to_log():
+    os.write(2, expected)
+"""
+    env = _capture_env(home) | {
+        "READY_FD": str(ready_write),
+        "RELEASE_FD": str(release_read),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], env=env, pass_fds=(ready_write, release_read)
+    )
+    os.close(ready_write)
+    os.close(release_read)
+    selector = selectors.DefaultSelector()
+    selector.register(ready_read, selectors.EVENT_READ)
+    try:
+        events = selector.select(10)
+        ready = os.read(ready_read, 5) if events else b""
+        if ready:
+            assert ready == b"ready"
+            os.write(release_write, b"x")
+        assert process.wait(timeout=10) == 0
+    finally:
+        selector.close()
+        if process.poll() is None:
+            try:
+                os.write(release_write, b"x")
+            except BrokenPipeError:
+                pass
+            reap_process(process, timeout=10)
+        os.close(ready_read)
+        os.close(release_write)
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    expected = b"".join(bytes([i]) * 65536 for i in range(64))
+    assert len(logs) == 1
+    assert logs[0].read_bytes() == expected
+
+
+def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    code = """
+import os, sys
+from zeta.tui.stderr_capture import stderr_to_log
+with stderr_to_log():
+    os.write(2, (sys.argv[1] + "\\n").encode())
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, f"ZMARKER-{index:02d}"],
+            env=_capture_env(home),
+        )
+        for index in range(20)
+    ]
+    assert [process.wait(timeout=20) for process in processes] == [0] * 20
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 20
+    contents = [path.read_text() for path in logs]
+    for index in range(20):
+        marker = f"ZMARKER-{index:02d}"
+        assert sum(marker in content for content in contents) == 1
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in logs)
+    assert (home / "logs" / "tui-stderr").stat().st_mode & 0o777 == 0o700
+
+
+def test_capture_fails_cleanly_when_home_and_temp_logs_are_unavailable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "zeta-home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "tui-stderr").write_text("not a directory")
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    (fallback / "zeta-tui-stderr").write_text("not a directory")
+    sentinel = tmp_path / "lifecycle-called"
+    code = f"""
+from pathlib import Path
+from zeta.cli import main
+main._run_tui_lifecycle_captured = lambda *args: Path({str(sentinel)!r}).write_text('called')
+raise SystemExit(main._main([]))
+"""
+    terminal, stderr, returncode = _run_pty_python_with_stderr_pipe(
+        code, _capture_env(home) | {"TMPDIR": str(fallback)}
+    )
+    lines = stderr.decode().splitlines()
+    assert returncode == 1
+    assert len(lines) == 1
+    assert lines[0].startswith(
+        "zeta: could not start TUI; stderr log unavailable: "
+    )
+    assert "Traceback" not in stderr.decode()
+    assert b"zeta: could not start TUI" not in terminal
+    assert not sentinel.exists()
 
 
 def test_startup_retention_skips_locked_logs(tmp_path: Path) -> None:

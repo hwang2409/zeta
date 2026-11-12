@@ -21,8 +21,6 @@ _TUI_STDERR_MAX_BYTES = 50 * 1024 * 1024
 _SETUP = False
 _LOCK_FD: int | None = None
 _TERMINAL_FD: int | None = None
-_LOG_FD: int | None = None
-_LOG_PATH: Path | None = None
 
 
 class CaptureInstallError(RuntimeError):
@@ -32,11 +30,7 @@ class CaptureInstallError(RuntimeError):
 
 
 def _log_path(directory: Path) -> Path:
-    return directory / f"{time_ns()}-{os.getpid()}.log"
-
-
-def time_ns() -> int:
-    return time.time_ns()
+    return directory / f"{time.time_ns()}-{os.getpid()}.log"
 
 
 def _retain_logs(directory: Path) -> None:
@@ -87,7 +81,7 @@ def _open_capture(path: Path) -> int:
 
 
 def _restore() -> None:
-    global _SETUP, _LOCK_FD, _LOG_FD
+    global _SETUP, _LOCK_FD
     if _TERMINAL_FD is not None:
         try:
             os.dup2(_TERMINAL_FD, 2)
@@ -100,7 +94,6 @@ def _restore() -> None:
         except OSError:
             pass
         _LOCK_FD = None
-    _LOG_FD = None
     _SETUP = False
 
 
@@ -132,7 +125,10 @@ def run_tui_lifecycle(args: Any, parser: Any, lifecycle: Any) -> tuple[int, str 
         try:
             _setup()
         except CaptureInstallError as exc:
-            print(f"zeta: could not start TUI; stderr log unavailable: {exc.path}")
+            print(
+                f"zeta: could not start TUI; stderr log unavailable: {exc.path}",
+                file=sys.stderr,
+            )
             return 1, None
         return lifecycle(args, parser)
     return lifecycle(args, parser)
@@ -143,7 +139,7 @@ def sys_isatty() -> bool:
 
 
 def _setup() -> None:
-    global _SETUP, _TERMINAL_FD, _LOG_FD, _LOCK_FD, _LOG_PATH
+    global _SETUP, _TERMINAL_FD, _LOCK_FD
     if _SETUP:
         return
     primary = env_home() / "logs" / "tui-stderr"
@@ -160,9 +156,7 @@ def _setup() -> None:
             log_fd = _open_capture(path)
         os.dup2(log_fd, 2)
         _TERMINAL_FD = terminal_fd
-        _LOG_FD = log_fd
         _LOCK_FD = log_fd
-        _LOG_PATH = path
         _SETUP = True
     except BaseException as exc:
         if log_fd is not None:
