@@ -5363,8 +5363,10 @@ async def test_child_finish_gate_model_bound_waits_for_grandchild(
     root_run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await backend.gate_seen.wait()
-    await backend.gate_response_completed.wait()
+    await await_or_fail(backend.gate_seen.wait(), what="gate seen")
+    await await_or_fail(
+        backend.gate_response_completed.wait(), what="gate response completed"
+    )
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -5379,7 +5381,7 @@ async def test_child_finish_gate_model_bound_waits_for_grandchild(
 
     child_store.close()
     backend.release_grandchild.set()
-    await root_run
+    await await_or_fail(root_run, what="root finish-gate run")
     await wait_background_owner(loop)
     assert (
         store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
