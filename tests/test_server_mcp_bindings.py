@@ -162,7 +162,7 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
         await asyncio.sleep(0)
         release = server.control._controller_release_task
         if release is not None:
-            await release
+            await asyncio.wait_for(asyncio.shield(release), 10)
         assert not server.runtime.loop._mcp_bindings
         reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
         try:
