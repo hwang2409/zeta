@@ -38,6 +38,28 @@ def _session(home: Path, project_id: str):
     )
 
 
+def _install_poll_watcher(app) -> tuple[list[int], asyncio.Event]:
+    """Record the supervisor's wake-driven inbox polls on this app's loop.
+
+    The minimal TUI loops here carry no project to scan, so a wake is the
+    observable the user sees: the publication reached the owner's poller.
+    """
+    wakes: list[int] = []
+    wake_event = asyncio.Event()
+
+    async def record_poll() -> None:
+        wakes.append(1)
+        wake_event.set()
+
+    # test-contract: seam count the supervisor's wake-driven inbox poll
+    app.loop._poll_project_inbox_once = record_poll
+    # a real owner is mid-turn when the publication arrives, so the 2-second
+    # idle tick is suppressed and only the wake polls; the count then fails if
+    # the wake is removed and never flakes from a stray tick.
+    app.loop._turn_active = True
+    return wakes, wake_event
+
+
 def _request(opened, project_id: str, title: str, *, kind: str = "decision"):
     return AttentionStore(opened.store.session_dir, writer_epoch=5).request(
         session_id=opened.store.session_id,
@@ -94,7 +116,7 @@ async def _make_app(
     if app.loop._project_inbox_publication_event is None:
         app.loop._project_inbox_owner_loop = asyncio.get_running_loop()
         app.loop._project_inbox_publication_event = asyncio.Event()
-        watcher = asyncio.create_task(app.loop._watch_project_inbox())
+        watcher = asyncio.create_task(app.loop._project_inbox_supervisor())
         app.loop._tracked_tasks.add(watcher)
         watcher.add_done_callback(app.loop._tracked_tasks.discard)
     if open_panel:
@@ -352,14 +374,7 @@ async def test_tui_batches_three_answers_only_on_last_enter_and_wakes_once(
         what="create attention records",
     )
     app = await _make_app(tmp_path, owner, owner.store.session_id)
-    wakes: list[bool] = []
-    wake_event = asyncio.Event()
-
-    async def record_wake(*, periodic: bool = False) -> None:
-        wakes.append(True)
-        wake_event.set()
-
-    app.loop._check_project_inbox = record_wake
+    wakes, wake_event = _install_poll_watcher(app)
     try:
         app._active_session.app.output = _FixedOutput()
         screen = Screen()
@@ -428,14 +443,7 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
         _request, owner, project.project_id, "Status", kind="answer"
     )
     app = await _make_app(tmp_path, owner, owner.store.session_id)
-    wakes: list[bool] = []
-    wake_event = asyncio.Event()
-
-    async def record_wake(*, periodic: bool = False) -> None:
-        wakes.append(True)
-        wake_event.set()
-
-    app.loop._check_project_inbox = record_wake
+    wakes, wake_event = _install_poll_watcher(app)
 
     # Force the real race deterministically: the second decision's stage runs in
     # a worker thread that is descheduled (blocked) until escape is pressed, so
@@ -538,11 +546,6 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
     release = threading.Event()
     worker_started = threading.Event()
     worker_done = threading.Event()
-    loop = app.loop
-    checks: list[bool] = []
-
-    async def count_check(*, periodic: bool = False) -> None:
-        checks.append(periodic)
 
     real_send = ProjectInbox.send
 
@@ -556,8 +559,7 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
 
     # test-contract: seam hold the real TUI worker before durable publication
     monkeypatch.setattr(ProjectInbox, "send", blocked_send)
-    # test-contract: seam count admission owned by the project-inbox watcher
-    monkeypatch.setattr(loop, "_check_project_inbox", count_check)
+    wakes, wake_event = _install_poll_watcher(app)
     try:
         replies = app._attention_replies(owner.store.session_id)
         task = asyncio.create_task(
@@ -571,18 +573,16 @@ async def test_cancelled_tui_adapter_still_checks_late_publication(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
-        assert checks == []
+        # the publication has not completed, so nothing has woken the supervisor.
+        assert wakes == []
         release.set()
         assert await await_or_fail(
             asyncio.to_thread(worker_done.wait, 10), what="TUI worker finish"
         )
-        for _ in range(10):
-            if checks:
-                break
-            await asyncio.sleep(0)
-        assert checks.count(False) == 1, (
-            "cancelled TUI adapter lost its late publication check"
-        )
+        # the late durable publication still wakes the owner's supervisor even
+        # though the adapter task was cancelled.
+        await await_or_fail(wake_event.wait(), what="cancelled TUI adapter late wake")
+        assert len(wakes) == 1
     finally:
         release.set()
         owner.store.close()

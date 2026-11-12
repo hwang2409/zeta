@@ -369,19 +369,23 @@ async def test_publication_callback_only_signals_watcher_on_event_loop() -> None
         def __init__(self) -> None:
             self._project_inbox_owner_loop = asyncio.get_running_loop()
             self._project_inbox_publication_event = asyncio.Event()
-            self.calls: list[tuple[bool, int]] = []
+            # mid-turn, so the 2-second idle tick is suppressed and only the
+            # threadsafe signal drives a poll; the test then fails if the
+            # callback stops signalling the watcher.
+            self._turn_active = True
+            self.calls: list[int] = []
             self.started = asyncio.Event()
             self.release = asyncio.Event()
             self.finished = asyncio.Event()
 
-        async def _check_project_inbox(self, *, periodic: bool = False) -> None:
-            self.calls.append((periodic, threading.get_ident()))
+        async def _poll_project_inbox_once(self) -> None:
+            self.calls.append(threading.get_ident())
             self.started.set()
             await asyncio.wait_for(self.release.wait(), 10)
             self.finished.set()
 
     owner = Owner()
-    watcher = asyncio.create_task(owner._watch_project_inbox())
+    watcher = asyncio.create_task(owner._project_inbox_supervisor())
     notifier_thread = 0
 
     def publish_burst() -> None:
@@ -393,7 +397,7 @@ async def test_publication_callback_only_signals_watcher_on_event_loop() -> None
         await await_or_fail(asyncio.to_thread(publish_burst), what="signal publication")
         await await_or_fail(owner.started.wait(), what="watcher inbox check start")
         assert notifier_thread != threading.get_ident()
-        assert owner.calls == [(False, threading.get_ident())]
+        assert owner.calls == [threading.get_ident()]
         owner.release.set()
         await await_or_fail(owner.finished.wait(), what="watcher inbox check finish")
         await asyncio.sleep(0)

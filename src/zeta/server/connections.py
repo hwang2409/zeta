@@ -83,6 +83,7 @@ EVENT_FEATURES = {
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
+    EventDescriptor.PROJECT_INBOX_HEALTH: NO_FEATURE,
     EventDescriptor.CHILD_QUESTION: NO_FEATURE,
     EventDescriptor.CHILD_STARTED: frozenset({"child_run_events"}),
     EventDescriptor.CHILD_PROGRESS: frozenset({"child_run_events"}),
