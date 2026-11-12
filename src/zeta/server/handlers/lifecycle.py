@@ -206,7 +206,7 @@ async def status(
         pending_approvals = baseline["pending_approvals"]
         pending_approvals_truncated = baseline["pending_approvals_truncated"]
     else:
-        pending_approvals = await self.server.control.pending_approvals()
+        pending_approvals = self.server.control.pending_approvals_now(reconnect=False)
         pending_approvals_truncated = None
     loop = runtime.loop
     if loop is None and fallback_config is None:

@@ -200,6 +200,11 @@ class ApprovalLifecycle:
         self._grant_published = grant_published
         self._state = ApprovalMachineState()
         self._task_owner = TaskOwner()
+        # One future per delegated approval whose request row is being written
+        # to the parent history store after its approval_request was published.
+        # A resolve/cancel/expire for that approval awaits this future before it
+        # writes its own row, so the request row is always stored first.
+        self._request_writes: dict[ApprovalKey, asyncio.Future[None]] = {}
 
     @property
     def _settlement_tasks(self) -> dict[asyncio.Task[object], ApprovalKey]:
@@ -899,7 +904,21 @@ class ApprovalLifecycle:
     async def _append_delegated_history(
         self, record: ApprovalRecord, payload: dict[str, object] | None
     ) -> OSError | asyncio.CancelledError | None:
-        if payload is None or not record.history_published:
+        if payload is None:
+            return None
+        # Wait for this approval's request-row write to finish first, so the
+        # end row is stored after the request row even when the resolve, cancel,
+        # or expire arrives before the async request write completes.
+        write_done = self._request_writes.get(record.target.key)
+        if write_done is not None:
+            await write_done
+        # Re-read the record: the request write marks history_published on the
+        # current record, which may have a newer token, and the pending-write
+        # entry is already gone when the write finished before this resolve ran.
+        current = self._state.records.get(record.target.key)
+        if current is not None:
+            record = current
+        if not record.history_published:
             return None
         assert record.target.history_store is not None
         try:
@@ -1089,9 +1108,25 @@ class ApprovalLifecycle:
         generation = record.generation
         target = record.target
 
-        durable_state = await target.store.approval_state(target.store_request_id)
-        # Look the label up before the ownership check, so a stale record is dropped.
-        label = None if durable_state is None else await policy.display_label(durable_state[0])
+        # Read the resident open-approval set first (no off-loop yield), so a
+        # freshly created or forwarded request is readable in this same task
+        # step and its approval_request publishes before the parent's agent_end.
+        # Fall back to the durable store only when it is not resident yet.
+        durable_state = target.store.approval_state_now(target.store_request_id)
+        if durable_state is None:
+            durable_state = await target.store.approval_state(target.store_request_id)
+        # The label is published with the request. A forwarded delegated request
+        # already carries the owner's label (ApprovalRequest.label), so read it
+        # from the resident entry and avoid an off-loop label lookup here: that
+        # keeps the approval_request publish in the same task step as this start,
+        # before the parent's agent_end. Foreground requests have no resident
+        # label, so look it up (that path is resident in its own store already).
+        if durable_state is None:
+            label = None
+        elif target.request is not None:
+            label = target.request.label
+        else:
+            label = await policy.display_label(durable_state[0])
         current = self._state.records.get(key)
         if (
             current is None
@@ -1142,15 +1177,7 @@ class ApprovalLifecycle:
         )
         record = self._change(record, request=request)
         payload = self.observe(request, fields=approval_display_fields(request))
-        if isinstance(target.key, tuple) and target.history_store is not None:
-            try:
-                await target.history_store.append_approval_history_async(
-                    {"event": "approval_request", **payload}
-                )
-            except OSError:
-                await self._settle_failed_start(record)
-                return
-            record = self._change(record, history_published=True)
+        delegated = isinstance(target.key, tuple) and target.history_store is not None
         current = self._state.records.get(target.key)
         if (
             current is None
@@ -1159,18 +1186,33 @@ class ApprovalLifecycle:
         ):
             return
         record = current
-        if record.disposition == "external":
-            resolution = await target.store.approval_resolution(target.store_request_id)
-            if resolution is not None:
-                await asyncio.shield(self._finish_record(record, resolution))
-            else:
-                self._remove(target.key)
-            return
-        if record.disposition in {"grace", "reclaiming"}:
-            record = self._mark_pending(record)
-            self._change(record, settlement=None)
-            return
         if record.disposition != "active":
+            # A request that is already resolved, in grace, or being reclaimed does
+            # not publish, so its request row keeps the original order: persist it
+            # first, then settle or finish. A failed write settles the approval.
+            if delegated and not await self._persist_request_row(record, payload):
+                return
+            current = self._state.records.get(target.key)
+            if (
+                current is None
+                or current.token != token
+                or generation != self._state.generation
+            ):
+                return
+            record = current
+            if record.disposition == "external":
+                resolution = await target.store.approval_resolution(
+                    target.store_request_id
+                )
+                if resolution is not None:
+                    await asyncio.shield(self._finish_record(record, resolution))
+                else:
+                    self._remove(target.key)
+                return
+            if record.disposition in {"grace", "reclaiming"}:
+                record = self._mark_pending(record)
+                self._change(record, settlement=None)
+                return
             record = self._reserve_record(record, record.disposition)
             settlement = self._start_settlement(
                 record, self._settle_record(record, "abort", record.disposition)
@@ -1178,9 +1220,53 @@ class ApprovalLifecycle:
             self._change(record, settlement=settlement)
             await settlement
             return
+        # Active: publish the approval_request synchronously, before the durable
+        # parent-history write, so a client sees the pending approval before the
+        # parent's agent_end. The write runs after and is ordered against any
+        # later resolve, cancel, or expire through the per-approval future.
         record = self._mark_pending(record)
         self._change(record, settlement=None, published=True)
         self._admit(wire_event, session_id, **payload)
+        if delegated:
+            await self._persist_request_row(record, payload)
+
+    async def _persist_request_row(
+        self, record: ApprovalRecord, payload: dict[str, object]
+    ) -> bool:
+        """Write a delegated approval's request row to the parent history store.
+
+        Records a per-approval future so a resolve, cancel, or expire for the
+        same approval waits for this write and keeps the request row first.
+        Returns False and settles the approval if the write fails.
+        """
+        target = record.target
+        assert target.history_store is not None
+        write_done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._request_writes[target.key] = write_done
+        try:
+            await target.history_store.append_approval_history_async(
+                {"event": "approval_request", **payload}
+            )
+        except OSError:
+            logger.warning(
+                "delegated approval request history write failed", exc_info=True
+            )
+            if not write_done.done():
+                write_done.set_result(None)
+            self._request_writes.pop(target.key, None)
+            await self._settle_failed_start(record)
+            return False
+        # Mark the request row written on whatever record is current now: a
+        # resolve, cancel, or expire that arrived while this async write was in
+        # flight may have bumped the token, so a token-guarded change would be
+        # dropped. history_published is a fact about the approval, not a token.
+        current = self._state.records.get(target.key)
+        if current is not None:
+            self._put(replace(current, history_published=True))
+        if not write_done.done():
+            write_done.set_result(None)
+        self._request_writes.pop(target.key, None)
+        return True
 
     async def _settle_failed_start(self, record: ApprovalRecord) -> None:
         current = self._state.records.get(record.target.key)

@@ -906,6 +906,10 @@ class ConnectionRegistry(ReplayOutput):
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
         runtime = connection.server.runtime
         store = validation.active(runtime, params)
+        # Read-your-queued-writes: a client that just saw an event (for example
+        # a delegated approval_request) may reload history at once; wait for the
+        # writes already queued before this read so the row is visible.
+        await store.await_queued_writes()
         features = history_features(self._connections[connection].features)
         return await self.run_read(
             connection,
@@ -962,6 +966,10 @@ class ConnectionRegistry(ReplayOutput):
         runtime = connection.server.runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        # Read-your-queued-writes: wait for writes already queued on the root
+        # store (for example a delegated approval row) before serving a child
+        # history page derived from it.
+        await runtime.opened.store.await_queued_writes()
         features = self._connections[connection].features
         target = (runtime.session_id, runtime.opened.store)
         return await self.run_read(

@@ -4535,7 +4535,7 @@ async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
         del session_id
         notifications.append((event, fields))
 
-    async def ignore_stale_approvals(_session_id: str | None) -> None:
+    def ignore_stale_approvals(_session_id: str | None) -> None:
         return None
 
     client._notify = notify
@@ -4575,7 +4575,7 @@ async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
         del session_id
         notifications.append((event, fields))
 
-    async def ignore_stale_approvals(_session_id: str | None) -> None:
+    def ignore_stale_approvals(_session_id: str | None) -> None:
         return None
 
     client._notify = notify
@@ -12014,7 +12014,7 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
         del session_id
         notifications.append((event, fields))
 
-    async def ignore_stale_approvals(_session_id: str | None) -> None:
+    def ignore_stale_approvals(_session_id: str | None) -> None:
         return None
 
     client._notify = notify
