@@ -37,7 +37,7 @@ def test_shared_reference_gate_publishes_generation_and_rejects_reserved_id(tmp_
 
 
 def test_reference_gate_is_dormant_below_feature_epoch(tmp_path):
-    (tmp_path / "storage-format.json").write_text('{"writer_epoch":6}\n')
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":7}\n')
     lease = open_writer(tmp_path)
 
     async def use_gate() -> None:

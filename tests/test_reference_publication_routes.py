@@ -329,7 +329,7 @@ def test_public_reference_writers_enter_once_refuse_without_partial_publication_
     name: str,
     setup: Callable[[Path, int], Operation],
 ) -> None:
-    refused = setup(tmp_path / f"{name}-refused", 7)
+    refused = setup(tmp_path / f"{name}-refused", 8)
     try:
         reservation = (
             refused.home
@@ -356,7 +356,7 @@ def test_public_reference_writers_enter_once_refuse_without_partial_publication_
     finally:
         refused.close()
 
-    success = setup(tmp_path / f"{name}-success", 7)
+    success = setup(tmp_path / f"{name}-success", 8)
     try:
         calls = []
         with monkeypatch.context() as patch:
@@ -367,7 +367,7 @@ def test_public_reference_writers_enter_once_refuse_without_partial_publication_
         success.close()
 
     if refused.on_loop_na is None:
-        contended = setup(tmp_path / f"{name}-contended", 7)
+        contended = setup(tmp_path / f"{name}-contended", 8)
         acquired = threading.Event()
         release = threading.Event()
 
@@ -400,7 +400,7 @@ def test_public_reference_writers_enter_once_refuse_without_partial_publication_
             assert not holder.is_alive(), "reference holder did not stop"
             contended.close()
 
-    dormant = setup(tmp_path / f"{name}-dormant", 6)
+    dormant = setup(tmp_path / f"{name}-dormant", 7)
     try:
         dormant.run()
         assert not (dormant.home / "session-reference-generation").exists()
