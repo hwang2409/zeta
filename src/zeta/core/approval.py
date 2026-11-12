@@ -1032,6 +1032,49 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return {"request_id": raw_id, "decision": state[1]}
         return await store.approval_resolution(raw_id)
 
+    def durable_resolution_now(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> dict[str, str] | None:
+        """Synchronous durable-resolution read for the pre-approval gate.
+
+        The approval gate runs on the path that registers an ephemeral
+        approval; it must not hop off-loop before the request is visible.
+        """
+        key = (
+            request_id
+            if isinstance(request_id, tuple)
+            else (child_instance_id, request_id)
+            if child_instance_id is not None
+            else None
+        )
+        if key is not None and key in self._delegated_resolutions:
+            return dict(self._delegated_resolutions[key])
+        delegated = self._delegated_entry(request_id, child_instance_id)
+        store = delegated[1] if delegated is not None else self._store
+        raw_id = delegated[0].request_id if delegated is not None else request_id
+        if store is None or isinstance(raw_id, tuple):
+            return None
+        state = store.approval_state_now(raw_id)
+        if state is None or state[1] is None:
+            return None
+        if state[1] != "abort":
+            return {"request_id": raw_id, "decision": state[1]}
+        return store.approval_resolution_now(raw_id)
+
+    def durable_decision_now(
+        self,
+        request_id: str | tuple[str, str],
+        *,
+        child_instance_id: str | None = None,
+    ) -> str | None:
+        resolution = self.durable_resolution_now(
+            request_id, child_instance_id=child_instance_id
+        )
+        return None if resolution is None else resolution["decision"]
+
     async def durable_decision(
         self,
         request_id: str | tuple[str, str],

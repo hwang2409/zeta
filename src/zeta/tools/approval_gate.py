@@ -43,8 +43,16 @@ class ApprovalGate:
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
+            # Ephemeral (inline-shell) approvals are never durable rows, so they
+            # need no store read here; a durable pre-check uses the sync *_now
+            # seam. This keeps the submission-to-registration path free of an
+            # off-loop hop, so concurrent approvals register in submit order.
+            already_decided = (
+                persist_request
+                and self.policy.durable_decision_now(tool_call.id) is not None
+            )
             approval_started = (
-                await self.policy.durable_decision(tool_call.id) is None
+                not already_decided
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             slot_acquired = False
