@@ -2122,6 +2122,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 else read_websocket_json()
             )
             if transport == "websocket" and frame.get("params", {}).get("event") != name:
+                # Record every wire frame in `observed` once at read time; a later
+                # `frames_until` drains it from `pending` without re-recording.
+                observed.append(frame)
                 pending.append(frame)
                 continue
             observed.append(frame)
