@@ -15,7 +15,13 @@ from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
 from .. import memory_migration_plan, project_schema
-from ..locking import RETENTION_HOME_ID
+from ..core.session_files import (
+    REFERENCES_DOMAIN,
+    SESSION_REFERENCE_GENERATION,
+    quarantine_path,
+    reservation_path,
+)
+from ..locking import RETENTION_HOME_ID, domain_lock_name
 from ..storage_format import (
     ACCEPTED_KEY_SETS,
     FEATURE_EPOCHS,
@@ -80,6 +86,8 @@ _LEASE = None
 
 def _reject(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(46)
 
+def _epoch_fail(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(53)
+
 def _has_gated_state(home):
     for pattern in _GATED_HOME_PATHS:
         listed = pattern.endswith("/*")
@@ -114,23 +122,23 @@ def _writer_epoch(home):
     manifest_path = home / "storage-format.json"
     try:
         lock_fd = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError: sys.exit(53)
+    except OSError: _epoch_fail("cannot open the remote stored-format lock")
     try:
         if manifest_path.exists():
             fcntl.flock(lock_fd, fcntl.LOCK_SH)
         else:
             try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError: sys.exit(53)
+            except BlockingIOError: _epoch_fail("another process is initializing the remote home")
             if not manifest_path.exists():
-                if _has_gated_state(home): sys.exit(53)
+                if _has_gated_state(home): _epoch_fail("remote home has gated state but no stored-format manifest")
                 _publish_manifest(home)
             fcntl.flock(lock_fd, fcntl.LOCK_SH)
         manifest = json.loads(manifest_path.read_text())
     except (OSError, ValueError):
-        os.close(lock_fd); sys.exit(53)
-    if type(manifest) is not dict or set(manifest) != {{"writer_epoch"}}: sys.exit(53)
+        os.close(lock_fd); _epoch_fail("remote stored-format manifest is unreadable")
+    if type(manifest) is not dict or set(manifest) != {{"writer_epoch"}}: _epoch_fail("remote stored-format manifest is invalid")
     epoch = manifest.get("writer_epoch")
-    if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: sys.exit(53)
+    if type(epoch) is not int or epoch < 1 or epoch > _WRITER_EPOCH: _epoch_fail(f"remote stored-format epoch {{epoch!r}} is unsupported (this zeta writes epoch {{_WRITER_EPOCH}})")
     _LEASE = (lock_fd, epoch)
     return epoch
 '''
@@ -278,22 +286,31 @@ print(value, end="")
 # authority (RETENTION_HOME_ID), rejects a destination or referenced id that
 # retention is deleting, bumps the durable generation, and holds the lock
 # across the rename. Below the feature epoch it is a passthrough.
+#
+# Every protocol value below is formatted from the real local modules so the
+# remote script cannot drift from the gate it mirrors: the generation filename,
+# the domain lock-file name, and the reservation/quarantine path rule (the
+# "{ident}" placeholder is filled at remote runtime by str.format).
+_RESERVATION_RELATIVE = reservation_path(Path(), "{ident}").as_posix()
+_QUARANTINE_RELATIVE = quarantine_path(Path(), "{ident}").as_posix()
 _SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + rf'''
 _SESSION_RETENTION_EPOCH = {FEATURE_EPOCHS[StorageFeature.SESSION_RETENTION]}
-_RETENTION_HOME_ID = {RETENTION_HOME_ID!r}
-_REFERENCES_DOMAIN = "references"
-_GENERATION_NAME = "session-reference-generation"
+_GENERATION_NAME = {SESSION_REFERENCE_GENERATION!r}
+_REFERENCE_LOCK_NAME = {domain_lock_name(RETENTION_HOME_ID, REFERENCES_DOMAIN)!r}
+_RESERVATION_RELATIVE = {_RESERVATION_RELATIVE!r}
+_QUARANTINE_RELATIVE = {_QUARANTINE_RELATIVE!r}
 
 def _reference_unavailable(ident):
     print(f"session reference unavailable: {{ident}} is being deleted", file=sys.stderr)
     sys.exit(54)
 
 def _validate_reference_ids(home, ids):
-    trash = home / "session-trash"
     for ident in ids:
         if not ident or ident in {{".", ".."}} or "/" in ident or "\x00" in ident:
             _reject(f"session reference id is not one path component: {{ident!r}}")
-        if (trash / "reservations" / f"{{ident}}.json").exists() or (trash / ident).exists():
+        reservation = home / _RESERVATION_RELATIVE.format(ident=ident)
+        quarantined = home / _QUARANTINE_RELATIVE.format(ident=ident)
+        if reservation.exists() or quarantined.exists():
             _reference_unavailable(ident)
 
 def _bump_generation(home):
@@ -335,7 +352,7 @@ def _reference_gate(home, installed_ids, referenced_ids):
         except FileExistsError: pass
         lock_dir_fd = os.open(".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
         try:
-            lock_name = f"{{_RETENTION_HOME_ID.encode('utf-8').hex()}}-{{_REFERENCES_DOMAIN.encode('utf-8').hex()}}.lock"
+            lock_name = _REFERENCE_LOCK_NAME
             fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
             try:
                 info = os.fstat(fd)
@@ -437,10 +454,7 @@ with _reference_gate(home, (ident,), referenced):
 '''
 
 
-def _session_install_script() -> str:
-    """Install a whole session through the shared reference gate."""
-
-    return _SESSION_REFERENCE_GATE + _SESSION_INSTALL_BODY
+_SESSION_INSTALL_SCRIPT = _SESSION_REFERENCE_GATE + _SESSION_INSTALL_BODY
 
 
 _PROJECT_INSTALL_WRAPPER = r"""
@@ -733,7 +747,7 @@ class SshTransport:
             _pack(source, archive)
             with archive.open("rb") as incoming:
                 result = self._run(
-                    _session_install_script(),
+                    _SESSION_INSTALL_SCRIPT,
                     [
                         self._home(),
                         ident,

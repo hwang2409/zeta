@@ -26,6 +26,10 @@ from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
 from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
+from zeta.core.session_files import (
+    SessionReferenceGate,
+    reservation_path,
+)
 from zeta.core.store import ConversationStore
 from zeta.memory.entry_store import _KIND_KEY
 from zeta.memory.profiles import memory_profile
@@ -787,9 +791,9 @@ def test_ssh_install_refuses_reserved_reference_and_leaves_destination(
     session_id = _ssh_session(local, parent=parent)
     _set_remote_epoch(remote, 8)
     reserved_id = session_id if reserved == "destination" else parent
-    reservations = remote / "session-trash" / "reservations"
-    reservations.mkdir(parents=True)
-    (reservations / f"{reserved_id}.json").write_text("{}\n", encoding="utf-8")
+    reservation = reservation_path(remote, reserved_id)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    reservation.write_text("{}\n", encoding="utf-8")
 
     with pytest.raises(RemoteSyncError, match="session reference unavailable"):
         push_session(
@@ -878,6 +882,126 @@ def test_ssh_install_below_feature_epoch_writes_no_retention_state(
     assert (remote / "sessions" / session_id).exists()
     assert not (remote / "session-reference-generation").exists()
     assert not (remote / ".domain-locks").exists()
+
+
+def test_ssh_install_waits_for_the_exclusive_reference_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SSH installer joins the remote reference gate with a *shared* blocking
+    # lock. While retention holds the exclusive authority the install cannot
+    # land, and it completes only after the authority is released. This covers
+    # the slice-1 acceptance "pause each writer and prove exclusive retention
+    # waits" for the SSH route. The gate is a cross-process flock, so the hold
+    # window below is not a race: the install provably cannot acquire the shared
+    # lock while the exclusive authority is held.
+    _install_ssh_shim(tmp_path, monkeypatch)
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    _set_remote_epoch(remote, 8)
+    session_id = _ssh_session(local)
+    transport = SshTransport("fake", str(remote), name="cloud")
+
+    about_to_install = threading.Event()
+    real_install = SshTransport._install_session
+
+    def traced_install(
+        self: SshTransport, ident: str, source: Path, expected: str
+    ) -> None:
+        about_to_install.set()
+        real_install(self, ident, source, expected)
+
+    monkeypatch.setattr(SshTransport, "_install_session", traced_install)
+
+    install_error: list[BaseException] = []
+    install_finished = threading.Event()
+
+    def run_install() -> None:
+        try:
+            push_session(local, transport, session_id=session_id)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            install_error.append(exc)
+        finally:
+            install_finished.set()
+
+    manager = SessionManager(remote)
+    installer = threading.Thread(target=run_install)
+    with SessionReferenceGate(remote, manager._storage_lease).exclusive(
+        session_id=session_id
+    ):
+        installer.start()
+        assert about_to_install.wait(10), "the SSH install never started"
+        assert not install_finished.wait(2), (
+            "the install landed while retention held the exclusive authority"
+        )
+        assert not (remote / "sessions" / session_id).exists()
+        assert not (remote / "session-reference-generation").exists()
+
+    assert install_finished.wait(10), "the install did not finish after release"
+    installer.join(10)
+    assert not installer.is_alive()
+    assert not install_error, repr(install_error[0]) if install_error else ""
+    assert (remote / "sessions" / session_id).exists()
+    assert (
+        remote / "session-reference-generation"
+    ).read_text(encoding="ascii") == "1\n"
+
+
+@pytest.mark.parametrize("kind", ("local-publish", "local-pull"))
+@pytest.mark.parametrize("shape", ("symlink", "directory"))
+def test_install_refuses_unsafe_destination_pin_and_leaves_it(
+    tmp_path: Path, kind: str, shape: str
+) -> None:
+    # A destination pin that is a symlink or a non-regular file cannot be copied
+    # forward safely. Skipping it (the prior behavior) silently unpinned the
+    # session, so the local publish and pull installers refuse the replace and
+    # leave the destination unchanged.
+    local = tmp_path / "local"
+    _set_remote_epoch(local, 8)
+    session_id = _ssh_session(local)
+    if kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        push_session(local, LocalTransport(remote), session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(
+                local, LocalTransport(remote), session_id=session_id, force=True
+            )
+    else:  # local-pull
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+
+        def reinstall() -> None:
+            pull_session(
+                puller,
+                LocalTransport(source_remote),
+                session_id=session_id,
+                force=True,
+            )
+
+    pin = destination / ".retention-pin.json"
+    if shape == "symlink":
+        pin.symlink_to(destination / "transfer.json")
+    else:
+        pin.mkdir()
+    marker = destination / "marker-before-replace"
+    marker.write_text("present\n", encoding="utf-8")
+
+    with pytest.raises(
+        RemoteSyncError, match="retention pin is not a regular single-link file"
+    ):
+        reinstall()
+
+    # The destination is untouched: the unsafe pin and the marker both remain.
+    assert os.path.lexists(pin)
+    assert pin.is_symlink() if shape == "symlink" else pin.is_dir()
+    assert marker.read_text(encoding="utf-8") == "present\n"
 
 
 def test_fetch_local_project_digest_matches_concurrent_sync_state_snapshot(

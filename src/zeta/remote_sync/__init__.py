@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import tomllib
@@ -725,11 +726,21 @@ def _atomic_replace_directory(staging: Path, destination: Path) -> None:
 
 
 def _preserve_retention_pin(destination: Path, staging: Path) -> None:
-    # The pin sidecar is retention-owned local state; a replacing snapshot never
-    # carries it, so copy it forward so a replace does not silently unpin.
+    # The pin sidecar is retention-owned local state. A snapshot may carry its
+    # own pin (the transfer does not exclude it) and the destination may have
+    # one too; copy the destination's pin forward so the result stays pinned
+    # whenever the destination or the snapshot was pinned, never silently
+    # clearing a local pin. A destination pin that exists but is a symlink or
+    # not a regular single-link file cannot be copied safely; skipping it would
+    # silently unpin, so refuse the replace and leave the destination untouched.
     pin = destination / RETENTION_PIN_FILENAME
-    if not pin.is_file() or pin.is_symlink():
+    if not os.path.lexists(pin):
         return
+    info = pin.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RemoteSyncError(
+            f"destination retention pin is not a regular single-link file: {pin}"
+        )
     target = staging / RETENTION_PIN_FILENAME
     shutil.copyfile(pin, target)
     target.chmod(0o600)
