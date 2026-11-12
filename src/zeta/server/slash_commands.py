@@ -250,10 +250,6 @@ class ServerSlashSession:
             return ()
         return self._approval_control.pending_approval_labels()
 
-    async def approval_pending_now(self) -> bool:
-        control = self._approval_control
-        return control is not None and control.has_pending_approvals()
-
     def set_plan_mode(self, enabled: bool):
         if self._runtime.loop is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")

@@ -488,9 +488,6 @@ class PlanSession:
     def set_plan_mode(self, enabled: bool) -> None:
         self.plan_mode = enabled
 
-    async def approval_pending_now(self) -> bool:
-        return bool(self.pending_approvals)
-
     def _invalidate_prompt(self) -> None:
         return None
 

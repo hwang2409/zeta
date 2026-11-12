@@ -758,27 +758,6 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         """Return strict pending state for decisions and server actions."""
         return await self._collect_pending_requests()
 
-    async def pending_requests_for_display(self) -> list[ApprovalRequest]:
-        """Return pending state for TUI display and key filters."""
-        return await self._collect_pending_requests()
-
-    async def has_pending_approval(self) -> bool:
-        """Capped authoritative busy check: is any approval awaiting a decision?
-
-        Deciding guards (model swap, account switch, plan mode) call this on
-        their async path instead of reading the display cache. It reads in-memory
-        ephemeral and delegated state, then one capped durable page.
-        """
-        if any(decision is None for _request, decision in self._ephemeral.values()):
-            return True
-        if self._delegated:
-            return True
-        store = self._store
-        if store is None:
-            return False
-        page = await store.pending_approval_page(after_seq=0, limit=1)
-        return bool(page.items)
-
     @staticmethod
     async def _pending_for_store(
         store: ConversationStore,

@@ -89,17 +89,6 @@ class ForkRuntimeMixin:
             approval.request for approval in self._fork_controller.pending_approvals
         )
 
-    async def approval_pending_now(self) -> bool:
-        """Authoritative busy check for deciding guards (store-backed, capped).
-
-        Deciding guards read this on their async path, not the display cache,
-        so a durable approval present before the first refresh still blocks.
-        """
-        if self._fork_controller is not None:
-            return bool(self._fork_controller.pending_approvals)
-        policy = self._approval_policy
-        return policy is not None and await policy.has_pending_approval()
-
     @property
     def first_pending_approval_key(self) -> str | None:
         if self._fork_controller is not None:
