@@ -388,7 +388,13 @@ class RetentionPlanner:
         self.close()
 
     def close(self) -> None:
-        """Release the in-flight root's lease set; the next pass rewalks it."""
+        """Release all live cursors and leases owned by this planner."""
+        self._close_flight()
+        if self._sweep is not None and self._sweep.root_scan is not None:
+            self._sweep.root_scan.close()
+        self._sweep = None
+
+    def _close_flight(self) -> None:
         flight, self._flight = self._flight, None
         if flight is not None:
             if flight.walk.listing is not None:
@@ -419,8 +425,6 @@ class RetentionPlanner:
         sweep = self._sweep
         if sweep is None or sweep.days != days:
             self.close()
-            if sweep is not None and sweep.root_scan is not None:
-                sweep.root_scan.close()
             sweep = self._sweep = _Sweep(days, self._now_ns())
         reasons = self._advance(home_fd, sweep, budget)
         complete = (
@@ -501,7 +505,7 @@ class RetentionPlanner:
         except (OSError, SessionError, RetentionPlannerError) as exc:
             reason = _failure_reason(exc)
         bytes_ = self._flight.walk.bytes if reason is None else 0
-        self.close()
+        self._close_flight()
         return RootOutcome(root_id, reason is None, reason, bytes_)
 
     def _hold(self, sessions_fd, root_id, scan) -> _InFlight:
@@ -512,7 +516,7 @@ class RetentionPlanner:
             if (info.st_dev, info.st_ino) != (flight.device, flight.inode):
                 raise RetentionPlannerError("session changed during walk")
             return flight
-        self.close()
+        self._close_flight()
         stack = ExitStack()
         try:
             try:
@@ -635,7 +639,7 @@ class _ClosureAuthority:
 
     def classify(self) -> str | None:
         root_id = self.flight.root_id
-        generation = read_reference_generation(self.planner.home)
+        generation = _generation_value(self.planner.home, self.scan)
         ids = {root_id}
         for comps in self.flight.store_dirs:
             if comps:
@@ -653,7 +657,7 @@ class _ClosureAuthority:
             return reason
         if min(self.flight.walk.max_activity, self.sweep.anchor) >= self.sweep.cutoff_ns:
             return "not old enough"
-        if read_reference_generation(self.planner.home) != generation:
+        if _generation_value(self.planner.home, self.scan) != generation:
             return "references changed during scan"
         return None
 
@@ -801,12 +805,11 @@ def _sent_file_reason(directory_fd, scan) -> str | None:
         return None
     tracker = object.__new__(SentMessageTracker)
     tracker.path = Path("project-inbox-sent.json")
-    state = tracker._classify_value(value)
+    state = tracker._classify_value(value, charge_record=lambda: scan.charge(0))
     if isinstance(state, _Broken):
         return "broken sent tracker"
     assert isinstance(state, _Loaded)
     for record in state.records:
-        scan.charge(0)
         if "done" not in record["reported"]:
             return "unacknowledged sent message"
     return None
@@ -871,9 +874,14 @@ def _canonical_metadata(value, session_id: str) -> SessionMetadata:
     if type(value) is not dict:
         raise RetentionPlannerError("malformed metadata")
     try:
-        return SessionMetadata.from_dict(value, path=Path("sessions") / session_id / _METADATA_NAME)
+        metadata = SessionMetadata.from_dict(
+            value, path=Path("sessions") / session_id / _METADATA_NAME
+        )
     except (TypeError, ValueError, SessionError) as exc:
         raise RetentionPlannerError("malformed metadata") from exc
+    if metadata.session_id != session_id:
+        raise RetentionPlannerError("metadata id does not match directory")
+    return metadata
 
 
 def _metadata_activity(value) -> int:
@@ -910,13 +918,14 @@ def _authority_parent_id(sessions_fd, session_id, scan) -> str | None:
 
 
 def _authority_inbox_reason(home_fd, ids, scan: _ClosureBudget) -> str | None:
-    for status_fd in _authority_inbox_dirs(home_fd, scan):
-        for entry in scan.iter_entries(status_fd):
-            name = entry.name
-            if name.endswith(".json") and _classify_inbox_record(
-                _read_json(status_fd, name, scan), name, ids
-            ):
-                return "pending inbox reference"
+    for status_fd, bodies_fd in _authority_inbox_dirs(home_fd, scan):
+        with scan.iter_entries(status_fd) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.endswith(".json") and _classify_inbox_record(
+                    _read_json(status_fd, name, scan), name, ids, bodies_fd
+                ):
+                    return "pending inbox reference"
     return None
 
 
@@ -936,10 +945,11 @@ def _authority_inbox_dirs(home_fd, scan):
                 with ExitStack() as inner:
                     project_fd = _open_dir(inner, projects_fd, project)
                     inbox_fd = _open_dir(inner, project_fd, "inbox") if project_fd is not None else None
+                    bodies_fd = _open_dir(inner, inbox_fd, "bodies") if inbox_fd is not None else None
                     for status in ("new", "claimed") if inbox_fd is not None else ():
                         status_fd = _open_dir(inner, inbox_fd, status)
                         if status_fd is not None:
-                            yield status_fd
+                            yield status_fd, bodies_fd
 
 
 def _open_dir(stack, directory_fd, name) -> int | None:
@@ -1026,6 +1036,12 @@ def _authority_store_dirs(root_fd, scan, prefix=()):
         return
 
 
+def _generation_value(home, scan) -> int:
+    value = read_reference_generation(home)
+    scan.charge(0)
+    return value
+
+
 def _reservation_present(home_fd, root_id, scan) -> bool:
     with ExitStack() as stack:
         trash_fd = _open_dir(stack, home_fd, "session-trash")
@@ -1070,9 +1086,9 @@ def _pending_child_link(directory_fd, scan) -> bool:
     return False
 
 
-def _classify_inbox_record(record, name, ids) -> bool:
+def _classify_inbox_record(record, name, ids, bodies_fd) -> bool:
     try:
-        record = validate_inbox_record(record, name)
+        record = validate_inbox_record(record, name, bodies_fd=bodies_fd)
     except (InboxError, TypeError, ValueError) as exc:
         raise RetentionPlannerError("malformed inbox record") from exc
     sender = record["from"]

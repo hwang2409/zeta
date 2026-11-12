@@ -581,13 +581,19 @@ class SentMessageTracker:
             return _Broken(path, "invalid_json")
         return self._classify_value(value)
 
-    def _classify_value(self, value: object) -> _Loaded | _Broken:
+    def _classify_value(self, value: object, *, charge_record=None) -> _Loaded | _Broken:
         path = self.path
         try:
             version = value.get("schema_version") if isinstance(value, dict) else None
             require_closed_variant("sent_message_ledger.schema_version", version)
         except (ValueError, AttributeError):
             return _Broken(path, "unsupported_schema")
+        records_value = value.get("records")
+        if not isinstance(records_value, list):
+            return _Broken(path, "invalid_records")
+        if charge_record is not None:
+            for _record in records_value:
+                charge_record()
         if version == _v2.V2_SCHEMA_VERSION:
             try:
                 decoded = _v2.decode_root(value)

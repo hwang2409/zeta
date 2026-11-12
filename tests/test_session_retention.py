@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import stat
@@ -766,8 +767,7 @@ def _generation_reader(monkeypatch):
     monkeypatch.setattr("zeta.session_retention.read_reference_generation", read)
 
 
-@pytest.mark.parametrize(("kind", "mode"), _MATRIX_ROWS)
-def test_closure_authority_matrix(tmp_path, monkeypatch, kind, mode):
+def _check_authority_case(tmp_path, monkeypatch, kind, mode):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
         root = _create_closed(manager, stack)
@@ -856,8 +856,7 @@ def _setup_over_bound_tail(home, manager, stack, root, kind, count):
             (spill / str(index)).write_text("x")
 
 
-@pytest.mark.parametrize("kind", _OVER_BOUND_KINDS)
-def test_closure_authority_over_bound_matrix(tmp_path, kind):
+def _check_over_bound_case(tmp_path, kind):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
         root = _create_closed(manager, stack)
@@ -882,3 +881,77 @@ def test_closure_authority_over_bound_matrix(tmp_path, kind):
     else:
         assert reasons[root] == (False, "references not fully scanned")
         assert root not in result.preview.root_ids
+
+_DEADLINE_TARGETS = {
+    "reservation": ("_reservation_present", None),
+    "session_state": ("_has_child_marker", "session_state.json"),
+    "child_lifecycle": ("_authority_store_reason", "agent_lifecycle.json"),
+    "pending_link": ("_authority_store_reason", "project_link_pending.json"),
+    "pending_child_link": ("_pending_child_link", None),
+    "sent_root": ("_sent_file_reason", "project-inbox-sent.json"),
+    "inbox": ("_authority_inbox_reason", None),
+    "dependent_meta": ("_authority_dependents", "meta.json"),
+    "dependent_fork": ("_authority_dependents", "attention_fork.json"),
+    "source_attention": ("_attention_reference", None),
+    "child_sent": ("_sent_file_reason", "project-inbox-sent.json"),
+    "child_inbox": ("_authority_inbox_reason", None),
+    "pin": ("is_retention_pinned", None),
+    "age": ("_authority_store_reason", "meta.json"),
+    "generation": ("_generation_value", None),
+    "discovery": ("_next_root", None),
+    "walk": ("_walk", None),
+}
+
+
+class _DeadlineClock:
+    def __init__(self, target):
+        self.function, self.filename = _DEADLINE_TARGETS[target]
+        self.hit = False
+
+    def __call__(self):
+        frames = inspect.stack()
+        functions = {frame.function for frame in frames}
+        names = {frame.frame.f_locals.get("name") for frame in frames}
+        matched = self.function in functions and (
+            self.filename is None or self.filename in names
+        )
+        if matched:
+            self.hit = True
+            return _future_ns() + 60_000_000_000
+        return _future_ns()
+
+
+def _check_deadline_case(tmp_path, kind):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        mode = "present" if kind in {
+            "reservation", "pending_link", "pending_child_link"
+        } else "absent"
+        _setup_authority(tmp_path, manager, stack, root, kind, mode)
+        clock = _DeadlineClock(kind)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = RetentionPlanner(tmp_path, lease, now_ns=clock)
+        result = planner.run_pass(days=30)
+        planner.close()
+    assert clock.hit, f"deadline did not cross inside {kind}"
+    assert not result.complete
+    assert result.preview is None
+    assert not any(row.root_id == root and row.closed for row in result.reasons)
+
+_RUN_PASS_ROWS = [
+    *_MATRIX_ROWS,
+    *((kind, "deadline") for kind in _MATRIX_KINDS),
+    *((kind, "over_bound") for kind in _OVER_BOUND_KINDS),
+]
+
+
+@pytest.mark.parametrize(("kind", "case"), _RUN_PASS_ROWS)
+def test_closure_authority_run_pass_matrix(tmp_path, monkeypatch, kind, case):
+    if case == "deadline":
+        _check_deadline_case(tmp_path, kind)
+    elif case == "over_bound":
+        _check_over_bound_case(tmp_path, kind)
+    else:
+        _check_authority_case(tmp_path, monkeypatch, kind, case)
