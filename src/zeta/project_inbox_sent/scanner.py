@@ -39,6 +39,12 @@ class ProjectInboxScanner:
         self._activation_sent_outcome: SentLedgerOutcome[None] | None = None
         self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
 
+    def poll(self) -> tuple[tuple[str, ...] | None, tuple[dict[str, Any], ...]]:
+        """Return one complete incoming and sent snapshot for a supervisor."""
+        message_ids = self.scan()
+        sent = self.scan_sent()
+        return message_ids, sent
+
     def scan(self) -> tuple[str, ...] | None:
         current = self._directory_fingerprint()
         if self._fingerprint is not None and current == self._fingerprint:

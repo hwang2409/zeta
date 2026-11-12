@@ -68,22 +68,45 @@ _MUTATION_ONLY_KINDS = {
     "question_answer_ack",
 }
 
-type TerminalDisposition = Literal["keep", "fold", "ack_moot"]
+type SettleOutcome = Literal["keep", "fold", "ack_moot"]
+type LateOutcome = Literal["reroute", "keep", "ack_moot"]
 
-# Every durable notification kind -> what a terminal (finish-gate-concluded) run
-# does with it. "keep" leaves it durable for finalize to reroute; "fold" merges
-# its report into this run's receipt and acks it; "ack_moot" acks it because the
-# information survives elsewhere. There is no default: a kind outside this map
-# cannot load, and a stray lookup raises KeyError (never ack-and-drop).
-TERMINAL_DISPOSITION: Mapping[str, TerminalDisposition] = MappingProxyType(
+
+class TerminalTargetSealedError(LookupError):
+    """A notification met a run whose store the drain already sealed.
+
+    Internal only. The producer catches it and re-resolves to the live
+    ancestor; it never reaches a client.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalRoute:
+    """What a terminal run does with one notification kind, by window.
+
+    ``settle`` is window A (staged before the settle command): "keep" leaves it
+    durable for the drain, "fold" merges its report into this run's receipt and
+    acks it, "ack_moot" acks it because the information survives elsewhere.
+    ``late`` is window C (at the drain and any commit after it): "reroute" moves
+    it to the live ancestor, "keep" leaves it, "ack_moot" acks it.
+    """
+
+    settle: SettleOutcome
+    late: LateOutcome
+
+
+# Every durable notification kind -> its terminal route. There is no default: a
+# kind outside this map cannot load, and a stray lookup raises KeyError (never
+# ack-and-drop).
+TERMINAL_DISPOSITION: Mapping[str, TerminalRoute] = MappingProxyType(
     {
-        AGENT_COMPLETION_NOTIFICATION_KIND: "fold",
-        CHILD_QUESTION_NOTIFICATION_KIND: "keep",
-        CHILD_IDLE_NOTIFICATION_KIND: "keep",
-        CHILD_HOLD_NOTIFICATION_KIND: "keep",
-        PROJECT_INBOX_NOTIFICATION_KIND: "keep",
-        TASK_EXITED_NOTIFICATION_KIND: "ack_moot",
-        CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND: "ack_moot",
+        AGENT_COMPLETION_NOTIFICATION_KIND: TerminalRoute("fold", "reroute"),
+        CHILD_QUESTION_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
+        CHILD_IDLE_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
+        CHILD_HOLD_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
+        PROJECT_INBOX_NOTIFICATION_KIND: TerminalRoute("keep", "keep"),
+        TASK_EXITED_NOTIFICATION_KIND: TerminalRoute("ack_moot", "ack_moot"),
+        CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND: TerminalRoute("ack_moot", "ack_moot"),
     }
 )
 if set(TERMINAL_DISPOSITION) != set(NOTIFICATION_KINDS):
@@ -188,18 +211,43 @@ def _commit_delivery_input(
     with store._append_lock(deadline=item.deadline):
         store.pending_prompt_queue._check_deadline(item.deadline)
         if (
+            store.pending_prompt_queue._drained
+            and TERMINAL_DISPOSITION[durable_kind].late == "reroute"
+        ):
+            # The drain sealed this dead run's store; the producer re-resolves to
+            # the live ancestor. Prompts are refused elsewhere; "keep" and
+            # "ack_moot" kinds still commit here.
+            raise TerminalTargetSealedError(str(data.get("child_instance_id")))
+        if (
             kind == "child_idle"
             and data.get("child_instance_id") in store._active_completion_notifications
         ):
             return ProducerResult((), False)
         existing = _existing_notification(store, kind, data, item.dedupe_key)
         if existing is not None:
-            if item.tui_presented and not store.is_agent_notification_presented_to_tui(existing.id):
-                store._append_row_unlocked(
-                    "notification_tui_presented", {"notification_id": existing.id}
+            if (
+                existing.data.get("display_only") is True
+                and data.get("display_only") is not True
+            ):
+                # Upgrade the root's display-only mirror to the model-visible
+                # report (the drain or a sealed retry moved the completion to
+                # root). Ack the mirror and append the real row in one batch.
+                _ack, entry = store._append_many_unlocked(
+                    [
+                        ("notification_ack", {"notification_id": existing.id}),
+                        ("notification", data),
+                    ]
                 )
-            result_entries = (store._snapshot_entry(existing),)
-            default_changed = False
+                result_entries = (store._snapshot_entry(entry),)
+                default_changed = True
+                added = 1
+            else:
+                if item.tui_presented and not store.is_agent_notification_presented_to_tui(existing.id):
+                    store._append_row_unlocked(
+                        "notification_tui_presented", {"notification_id": existing.id}
+                    )
+                result_entries = (store._snapshot_entry(existing),)
+                default_changed = False
         elif kind == "inbox" and (
             pending := next(
                 (
@@ -556,7 +604,7 @@ def _settle_terminal(
                 continue
             disposition = TERMINAL_DISPOSITION[
                 entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
-            ]
+            ].settle
             if disposition == "keep":
                 continue
             if disposition == "fold":
@@ -568,6 +616,35 @@ def _settle_terminal(
         if rows:
             store._append_many_unlocked(rows)
         return TerminalSettlement(False, tuple(folded))
+
+
+def _drain_terminal(store: ConversationStore) -> tuple[ConversationEntry, ...]:
+    """Seal a terminal run's store and return notifications that must reroute.
+
+    Sets ``_drained`` under the append lock, so any later notification producer
+    is refused (``TerminalTargetSealedError``) and re-resolves to the live
+    ancestor. Pending notifications are routed by ``TERMINAL_DISPOSITION[...]``.
+    ``late``: "ack_moot" kinds are acked here; "reroute" kinds are returned for
+    the channel to re-publish and then ack; "keep" kinds are left durable.
+    """
+
+    with store.pending_prompt_queue._lock():
+        store.pending_prompt_queue._drained = True
+        rerouted: list[ConversationEntry] = []
+        ack_rows: list[tuple[str, dict[str, Any]]] = []
+        for entry in store._active_notifications.values():
+            if entry.data.get("display_only") is True:
+                continue
+            late = TERMINAL_DISPOSITION[
+                entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+            ].late
+            if late == "reroute":
+                rerouted.append(store._snapshot_entry(entry))
+            elif late == "ack_moot":
+                ack_rows.append(("notification_ack", {"notification_id": entry.id}))
+        if ack_rows:
+            store._append_many_unlocked(ack_rows)
+        return tuple(rerouted)
 
 
 def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
@@ -658,3 +735,6 @@ class StepDeliveryStoreMixin:
         self, suppressed_ids: frozenset[str]
     ) -> TerminalSettlement:
         return _settle_terminal(self, suppressed_ids)
+
+    def _drain_step_delivery_terminal(self) -> tuple[ConversationEntry, ...]:
+        return _drain_terminal(self)
