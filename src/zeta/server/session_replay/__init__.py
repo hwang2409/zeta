@@ -49,7 +49,7 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 ErrorDescriptor.NO_ACTIVE_SESSION,
                 "session is not active",
             )
-        connections.begin_replay_join(client, ReplayScopeId.top(session_id))
+        await connections.begin_replay_join(client, ReplayScopeId.top(session_id))
         read = await connections.read_replay_history(
             client, session_id, params.get("history_validator")
         )

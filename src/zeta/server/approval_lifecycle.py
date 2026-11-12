@@ -28,6 +28,7 @@ from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
     ProtocolError,
+    bound_reconnect_approvals,
 )
 from .session_replay.rows import DELEGATED, WRITE_FAILED, RowFacts
 
@@ -444,8 +445,7 @@ class ApprovalLifecycle:
         ]
         if not reconnect:
             return visible
-        truncated = len(visible) > 64
-        bounded = visible[:64]
+        bounded, truncated = bound_reconnect_approvals(visible)
         return (bounded, truncated) if include_truncated else bounded
 
     @staticmethod
