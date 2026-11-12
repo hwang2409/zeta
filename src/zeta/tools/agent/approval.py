@@ -328,6 +328,12 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         async def current() -> tuple[bool, ApprovalDecision | None]:
             state = await self.child_store.approval_state(tool_call.id)
             if state is None or state[1] is None:
+                if self.child_store.closed:
+                    # A closed child store can never resolve this delegated
+                    # approval (the parent's abort is published live-only, never
+                    # written to the torn-down store), so stop polling and let
+                    # the turn finish, as main did when the closed read raised.
+                    return True, None
                 return False, None
             if state[1] == ApprovalDecision.ALLOW.value:
                 return True, self._consume_allow_binding(

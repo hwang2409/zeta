@@ -1142,6 +1142,10 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             state = await store.approval_state(tool_call.id)
             if state is not None and state[1] is not None:
                 return True, _resolved_decision(state[1])
+            if store.closed:
+                # A closed store can never resolve this approval; stop polling
+                # and let the turn finish, as main did when the closed read raised.
+                return True, None
             return False, None
 
         return await _poll_approval_resolution(

@@ -1105,6 +1105,11 @@ class ConversationStore(
     def compaction_marker_count(self) -> int:
         return sum(entry.type == "compaction" for entry in self._active_branch())
 
+    @property
+    def closed(self) -> bool:
+        """Whether this store instance has been closed (its fd released)."""
+        return self._closed
+
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""
         return self._entries[-1].id if self._entries else None
