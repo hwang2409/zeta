@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Mapping
 
 # These names cover the sensitive-name basket used by auth redaction, plus
@@ -100,11 +101,25 @@ def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
 
 
 def _tmux_tmpdir() -> str:
-    """Return a private, per-home tmux socket dir, creating it 0700."""
+    """Return a private, per-home tmux socket dir, creating it 0700.
+
+    On any filesystem error (read-only home, a symlink or file at the path, an
+    unowned dir) fall back to a per-process temp dir so a tool spawn never
+    fails and still never reaches the host tmux server.
+    """
 
     from .session import env_home
 
-    path = env_home() / "run" / "tmux"
-    path.mkdir(parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return str(path)
+    try:
+        path = env_home() / "run" / "tmux"
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        return str(path)
+    except OSError:
+        global _FALLBACK_TMUX_TMPDIR
+        if _FALLBACK_TMUX_TMPDIR is None:
+            _FALLBACK_TMUX_TMPDIR = tempfile.mkdtemp(prefix="zeta-tmux-")
+        return _FALLBACK_TMUX_TMPDIR
+
+
+_FALLBACK_TMUX_TMPDIR: str | None = None

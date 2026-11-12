@@ -443,6 +443,12 @@ def isolate_zeta_home(
             "CLAUDE_CONFIG_DIR",
             "CODEX_HOME",
             "WIKI_AGENT_RUNTIME_DIR",
+            # A test that inherits TMUX/TMUX_TMPDIR from the agent shell could
+            # drive (and kill) the agent's live tmux server; keep every test
+            # off it. Tests that exercise tmux set these explicitly.
+            "TMUX",
+            "TMUX_PANE",
+            "TMUX_TMPDIR",
         ):
             monkeypatch.delenv(name, raising=False)
 
