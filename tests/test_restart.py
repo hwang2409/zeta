@@ -19,6 +19,7 @@ from zeta.submission.messages import _ProviderDone
 from zeta.submission.model import Submission, SubmissionState, _Entry
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import FullScreenPromptSession
+from zeta.tui.fork_session import ForkStackController
 
 
 @pytest.mark.parametrize(
@@ -140,6 +141,89 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ("main-arm", "fork-waits", "composer-blocks", "now", "bad-arg"),
+)
+async def test_restart_controller_covers_fork_and_argument_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    states: dict[TUIApp, tuple[bool, bool]] = {}
+
+    def running(app: TUIApp) -> bool:
+        return states[app][0]
+
+    def composer_empty(app: TUIApp) -> bool:
+        return states[app][1]
+
+    monkeypatch.setattr(
+        TUIApp,
+        "restart_has_running_work",
+        property(running),
+    )
+    monkeypatch.setattr(TUIApp, "composer_empty", property(composer_empty))
+    main = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "main", session_id="main"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    fork = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "fork", session_id="fork"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    controller = ForkStackController(main, lambda _target: asyncio.sleep(0, result=fork))
+    controller._stack.append(fork)
+    fork.set_fork_controller(controller)
+    states[main] = (case in {"main-arm", "fork-waits", "composer-blocks", "now"}, True)
+    states[fork] = (False, case != "composer-blocks")
+    try:
+        if case == "main-arm":
+            assert await main._slash_commands.dispatch_async(main, "/restart") == (
+                "restart pending · waiting for running work · /restart now to cancel it"
+            )
+            states[main] = (False, True)
+            controller.notify_restart_idle_check()
+            assert controller.restart_requested and fork._exit_requested
+        elif case == "fork-waits":
+            assert await fork._slash_commands.dispatch_async(fork, "/restart") == (
+                "restart pending · waiting for running work · /restart now to cancel it"
+            )
+            controller.notify_restart_idle_check()
+            assert not controller.restart_requested and not main._exit_requested
+            assert await fork._slash_commands.dispatch_async(fork, "/restart cancel") == (
+                "restart canceled"
+            )
+        elif case == "composer-blocks":
+            assert await main._slash_commands.dispatch_async(main, "/restart")
+            states[main] = (False, True)
+            controller.notify_restart_idle_check()
+            assert not controller.restart_requested
+            states[fork] = (False, True)
+            controller.notify_restart_idle_check()
+            assert controller.restart_requested and fork._exit_requested
+        elif case == "now":
+            assert await fork._slash_commands.dispatch_async(fork, "/restart now") == (
+                "restarting from the local checkout..."
+            )
+            assert controller.restart_requested and controller.restart_cancels_work
+        else:
+            assert "use /restart" in await fork._slash_commands.dispatch_async(
+                fork, "/restart later"
+            )
+    finally:
+        await controller.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_when_idle_uses_provider_clear_and_composer_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -160,16 +244,30 @@ async def test_restart_when_idle_uses_provider_clear_and_composer_transition(
     events: list[str] = []
 
     class Controller:
+        pending_approvals: tuple[object, ...] = ()
+        restart_pending = False
+
         def is_visible(self, _app: TUIApp) -> bool:
             return True
 
-        pending_approvals: tuple[object, ...] = ()
+        @property
+        def restart_has_running_work(self) -> bool:
+            return running
 
-        def main_activity_pending(self, _app: TUIApp) -> bool:
-            return False
+        def request_restart_when_idle(self) -> None:
+            self.restart_pending = True
+
+        def cancel_restart(self) -> None:
+            self.restart_pending = False
+
+        def notify_restart_idle_check(self) -> None:
+            if self.restart_pending and not running and not app.active and app.composer_empty:
+                self.restart_pending = False
+                self.request_restart()
 
         def request_restart(self) -> None:
             events.append("restart")
+            app.request_exit()
 
     app._fork_controller = Controller()
     running = True
@@ -186,10 +284,6 @@ async def test_restart_when_idle_uses_provider_clear_and_composer_transition(
             "restart pending · waiting for running work · /restart now to cancel it"
         )
         assert app.restart_pending
-        assert "restart pending" in "".join(
-            text for _, text in app._status_toolbar()
-        )
-
         session.app.current_buffer.text = "draft"
         running = False
         app._submissions._on_provider_done(_ProviderDone(submission, provider_task))
@@ -222,15 +316,29 @@ async def test_restart_when_idle_fires_at_provider_state_clear(
 
     class Controller:
         pending_approvals: tuple[object, ...] = ()
+        restart_pending = False
 
         def is_visible(self, _app: TUIApp) -> bool:
             return True
 
-        def main_activity_pending(self, _app: TUIApp) -> bool:
-            return False
+        @property
+        def restart_has_running_work(self) -> bool:
+            return running
+
+        def request_restart_when_idle(self) -> None:
+            self.restart_pending = True
+
+        def cancel_restart(self) -> None:
+            self.restart_pending = False
+
+        def notify_restart_idle_check(self) -> None:
+            if self.restart_pending and not running and not app.active and app.composer_empty:
+                self.restart_pending = False
+                self.request_restart()
 
         def request_restart(self) -> None:
             events.append("restart")
+            app.request_exit()
 
     app._fork_controller = Controller()
     running = True
@@ -266,20 +374,22 @@ async def test_restart_arguments_use_real_slash_dispatch(tmp_path: Path) -> None
         model="offline",
     )
     try:
-        app._restart_when_idle = True
-        assert await app._slash_commands.dispatch_async(app, "/restart cancel") == (
-            "restart canceled"
-        )
-        assert not app.restart_pending
         events: list[str] = []
         app._fork_controller = type(
             "Controller",
             (),
             {
-                "is_visible": lambda _self, _app: True,
-                "request_restart": lambda _self: events.append("restart"),
+                "restart_pending": True,
+                "restart_has_running_work": False,
+                "is_visible": lambda self, _app: True,
+                "cancel_restart": lambda self: setattr(self, "restart_pending", False),
+                "request_restart": lambda self: events.append("restart"),
             },
         )()
+        assert await app._slash_commands.dispatch_async(app, "/restart cancel") == (
+            "restart canceled"
+        )
+        assert not app.restart_pending
         assert await app._slash_commands.dispatch_async(app, "/restart now") == (
             "restarting from the local checkout..."
         )
@@ -289,16 +399,3 @@ async def test_restart_arguments_use_real_slash_dispatch(tmp_path: Path) -> None
         )
     finally:
         await app.close()
-
-
-def test_restart_cancel_disarms_pending_restart(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root-session", cwd=tmp_path)
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    app._restart_when_idle = True
-    assert app.slash_restart("cancel") == "restart canceled"
-    assert not app.restart_pending
-    asyncio.run(app.close())

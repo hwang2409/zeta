@@ -35,6 +35,8 @@ class ForkHost(Protocol):
 
     async def close(self) -> None: ...
 
+    def request_exit(self) -> None: ...
+
     def set_fork_controller(self, controller: ForkStackController | None) -> None: ...
 
     @property
@@ -54,6 +56,12 @@ class ForkHost(Protocol):
 
     @property
     def restart_has_running_work(self) -> bool: ...
+
+    @property
+    def active(self) -> bool: ...
+
+    @property
+    def composer_empty(self) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +211,7 @@ class ForkStackController:
         self._approval_handle_counter = 0
         self.restart_requested = False
         self.restart_cancels_work = False
+        self._restart_when_idle = False
         main_app.set_fork_controller(self)
 
     @property
@@ -212,11 +221,38 @@ class ForkStackController:
     def is_visible(self, runtime: ForkHost) -> bool:
         return self.visible is runtime
 
+    @property
+    def restart_pending(self) -> bool:
+        return self._restart_when_idle
+
+    @property
+    def restart_has_running_work(self) -> bool:
+        return any(runtime.restart_has_running_work for runtime in self._stack)
+
+    def _restart_is_idle(self) -> bool:
+        return (
+            not self.restart_has_running_work
+            and not any(runtime.active for runtime in self._stack)
+            and not self.pending_approvals
+            and self.visible.composer_empty
+        )
+
+    def request_restart_when_idle(self) -> None:
+        self._restart_when_idle = True
+        self.notify_restart_idle_check()
+
+    def cancel_restart(self) -> None:
+        self._restart_when_idle = False
+
+    def notify_restart_idle_check(self) -> None:
+        if self._restart_when_idle and self._restart_is_idle():
+            self._restart_when_idle = False
+            self.request_restart()
+
     def request_restart(self) -> None:
         self.restart_requested = True
-        self.restart_cancels_work = any(
-            runtime.restart_has_running_work for runtime in self._stack
-        )
+        self.restart_cancels_work = self.restart_has_running_work
+        self.visible.request_exit()
 
     @property
     def pending_approvals(self) -> tuple[OwnedApproval, ...]:
@@ -291,6 +327,7 @@ class ForkStackController:
                     ].notification_count()
                     self._stack.append(fork)
                     self.approvals_changed()
+                    self.notify_restart_idle_check()
                     continue
                 if result is RuntimeResult.EXIT:
                     await self.close()
@@ -306,6 +343,7 @@ class ForkStackController:
                 self._owner_tokens.pop(id(current), None)
                 self._resuming.add(id(self.visible))
                 self.approvals_changed()
+                self.notify_restart_idle_check()
         except BaseException:
             await self.close()
             raise

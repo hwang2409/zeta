@@ -253,7 +253,6 @@ class TUIApp(
         self._next_image_token = 1
         self._composer_insertions: list[str] = []
         self._exit_requested = False
-        self._restart_when_idle = False
         self._terminal_restored = False
         self._loop_state = "idle"
         self._usage: dict[str, Any] = {}
