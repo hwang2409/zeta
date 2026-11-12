@@ -87,11 +87,16 @@ class StartupFactsMixin:
         return tuple(self._sent_message_receipts)
 
     def context_calibration_records(self) -> tuple[ContextCalibrationRecord, ...]:
-        return tuple(
-            record
-            for entry in tuple(self.entry(ref) for ref in self.branch_refs())
-            if (record := context_calibration_record(entry)) is not None
-        )
+        records: list[ContextCalibrationRecord] = []
+        for ref in self._resident_rows.branch_refs():
+            facts = ref.facts
+            if (
+                isinstance(facts, tuple)
+                and facts
+                and isinstance(facts[0], ContextCalibrationRecord)
+            ):
+                records.append(facts[0])
+        return tuple(records)
 
 
 def row_facts(entry: ConversationEntry) -> object | None:

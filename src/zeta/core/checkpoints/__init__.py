@@ -442,7 +442,8 @@ class CheckpointForkMixin:
     def list_branches(self) -> list[BranchInfo]:
         """Enumerate every leaf in the parent-linked tree."""
 
-        return list_branches_from_entries(tuple(self.entry(ref) for ref in self.branch_refs()))
+        all_rows = tuple(self._resident_rows.entry(ref) for ref in self._resident_rows.rows)
+        return list_branches_from_entries(all_rows)
 
     def switch_to_branch(self, head_entry_id: str) -> ConversationEntry:
         """Re-anchor the active branch on a leaf via a fork entry.

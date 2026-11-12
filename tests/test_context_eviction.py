@@ -2163,9 +2163,9 @@ async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> 
         store, token_budget=700, retained_tail=1
     )
     planning_finished = False
-    replay_calls_after_planning = 0
+    branch_reads_after_planning = 0
     real_plan = assembler._plan_eviction
-    real_replay = store.replay
+    real_branch_refs = store.branch_refs
 
     def tracked_plan(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal planning_finished
@@ -2173,19 +2173,19 @@ async def test_revalidation_does_not_replay_unchanged_branch(tmp_path: Path) -> 
         planning_finished = True
         return plan
 
-    def tracked_replay():  # type: ignore[no-untyped-def]
-        nonlocal replay_calls_after_planning
+    def tracked_branch_refs():  # type: ignore[no-untyped-def]
+        nonlocal branch_reads_after_planning
         if planning_finished:
-            replay_calls_after_planning += 1
-        return real_replay()
+            branch_reads_after_planning += 1
+        return real_branch_refs()
 
     with (
         patch.object(assembler, "_plan_eviction", side_effect=tracked_plan),
-        patch.object(store, "replay", side_effect=tracked_replay),
+        patch.object(store, "branch_refs", side_effect=tracked_branch_refs),
     ):
         await assembler.assemble_context()
 
-    assert replay_calls_after_planning == 0
+    assert branch_reads_after_planning == 0
 
 
 @pytest.mark.asyncio

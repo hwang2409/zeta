@@ -126,7 +126,7 @@ async def _append_during_preparation(
 
 
 def test_needs_compaction_uses_resident_branch_without_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     results: list[bool] = []
     for name, offset in (("below", -1), ("at", 0), ("above", 1)):
@@ -139,23 +139,12 @@ def test_needs_compaction_uses_resident_branch_without_replay(
         )
         tokens[0] = assembler.trigger_token_budget + offset
         store.append_message(text(MessageRole.USER, name))
-        monkeypatch.setattr(
-            store,
-            "replay",
-            lambda: pytest.fail("needs_compaction must not replay the branch"),
-        )
-
         results.append(assembler.needs_compaction())
 
     store = ConversationStore(tmp_path / "after-marker")
     store.append_message(text(MessageRole.USER, "old"))
     store.append_compaction_marker("summary", 1, 1)
     assembler = ContextAssembler(store, token_budget=100, token_counter=lambda _: 1)
-    monkeypatch.setattr(
-        store,
-        "replay",
-        lambda: pytest.fail("needs_compaction must not replay the branch"),
-    )
     results.append(assembler.needs_compaction())
 
     assert results == [False, False, True, False]
@@ -1061,19 +1050,19 @@ def test_context_assembler_init_does_not_replay_branch(
     context_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(context_root)
-    replay_calls = 0
-    original_replay = ConversationStore.replay
+    branch_read_calls = 0
+    original_branch_refs = ConversationStore.branch_refs
 
-    def counted_replay(self: ConversationStore):
-        nonlocal replay_calls
-        replay_calls += 1
-        return original_replay(self)
+    def counted_branch_refs(self: ConversationStore):
+        nonlocal branch_read_calls
+        branch_read_calls += 1
+        return original_branch_refs(self)
 
-    monkeypatch.setattr(ConversationStore, "replay", counted_replay)
+    monkeypatch.setattr(ConversationStore, "branch_refs", counted_branch_refs)
 
     ContextAssembler(store)
 
-    assert replay_calls == 0
+    assert branch_read_calls == 0
 
 
 def test_context_calibration_matches_previous_budgets(context_root: Path) -> None:

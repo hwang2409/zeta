@@ -113,7 +113,7 @@ def test_approval_queries_use_incremental_state_without_replay(tmp_path: Path) -
         [(pending.id, pending), (resolved.id, resolved)],
     )
     assert store.resolve_approval(resolved.id, "deny")
-    store.replay = _unexpected_history_scan  # type: ignore[method-assign]
+    store.branch_refs = _unexpected_history_scan  # type: ignore[method-assign]
 
     page = asyncio.run(store.pending_approval_page())
     assert page.items == ((pending.id, pending.to_dict()),)
@@ -252,7 +252,7 @@ def test_tool_result_query_uses_incremental_state_without_replay(tmp_path: Path)
     result = ToolResult("call-1", "done")
     store.append_message(with_message_origin(Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER))
     store.append_message(with_message_origin(Message(MessageRole.USER, [], tool_result=result), MessageOrigin.USER))
-    store.replay = _unexpected_history_scan  # type: ignore[method-assign]
+    store.branch_refs = _unexpected_history_scan  # type: ignore[method-assign]
 
     assert store.tool_result("call-1") == result
     assert store.tool_result("missing") is None
@@ -275,7 +275,7 @@ def test_notification_queries_use_incremental_state_without_branch_scan(
     assert [entry.id for entry in store.agent_notifications(pending_only=False)] == [
         notification.id
     ]
-    store._active_branch = _unexpected_history_scan  # type: ignore[method-assign]
+    store.branch_refs = _unexpected_history_scan  # type: ignore[method-assign]
 
     assert store.agent_notifications() == []
     assert store.is_agent_notification_presented_to_tui(notification.id)

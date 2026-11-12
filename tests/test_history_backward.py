@@ -49,6 +49,9 @@ class _HistoryStore:
     def branch_refs(self) -> list[object]:
         return list(self.entries)
 
+    def entry(self, ref):
+        return ref
+
 
 def _runtime(store: object) -> SimpleNamespace:
     return SimpleNamespace(opened=SimpleNamespace(store=store))
