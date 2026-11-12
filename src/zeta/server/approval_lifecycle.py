@@ -530,10 +530,13 @@ class ApprovalLifecycle:
             if isinstance(record.target.key, tuple)
         )
 
+        # Read the resident approval index, not the durable log: a status call
+        # must not reparse stored rows. The resident page already holds every
+        # pending foreground request, and delegated requests come from records.
         pending: list[tuple[str, ToolCall]] = []
         after_seq = 0
         while True:
-            page = await foreground.pending_approval_page(after_seq)
+            page = foreground.pending_approval_page_now(after_seq)
             pending.extend((k, ToolCall.from_dict(dict(v))) for k, v in page.items)
             if page.next_seq is None:
                 break
@@ -545,7 +548,7 @@ class ApprovalLifecycle:
             for request_id, tool_call in pending
         ]
         for target in delegated:
-            state = await target.store.approval_state(target.store_request_id)
+            state = target.store.approval_state_now(target.store_request_id)
             if state is not None and state[1] is None and target.request is not None:
                 requests.append(target.request)
         return [
@@ -1243,10 +1246,17 @@ class ApprovalLifecycle:
         assert target.history_store is not None
         write_done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._request_writes[target.key] = write_done
-        try:
-            await target.history_store.append_approval_history_async(
+        # Submit the write to the store's async writer and await its future. The
+        # hop exists by construction, so a concurrent resolve, cancel, or cleanup
+        # runs during the write and a failure surfaces from this await, the same
+        # in tests and in production.
+        write = asyncio.ensure_future(
+            target.history_store.append_approval_history_async(
                 {"event": "approval_request", **payload}
             )
+        )
+        try:
+            await write
         except OSError:
             logger.warning(
                 "delegated approval request history write failed", exc_info=True
