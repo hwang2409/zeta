@@ -560,10 +560,6 @@ class AsyncDurableWritesMixin:
         self._durable_writer: ConversationStore | None = None
         self._durable_writer_snapshot: tuple[int, _DetachedLogState] | None = None
         self._address_commit_waiters = 0
-        # Resolves when the most recently queued off-loop write finishes. A
-        # durable read awaits it so it observes its own queued writes
-        # (read-your-queued-writes); it waits only for writes queued before it.
-        self._write_tail: asyncio.Future[None] | None = None
 
     @property
     def conversation_generation(self: ConversationStore) -> int:
@@ -892,54 +888,33 @@ class AsyncDurableWritesMixin:
     async def _commit_storage_command(
         self: ConversationStore, command: _StoreMutationCommand
     ) -> Any:
-        done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._write_tail = done
-        try:
-            async with self._async_write_lock:
-                command = replace(
-                    command,
-                    baseline_count=len(self._entries),
-                    baseline_digest=self._entry_prefix_digest,
-                    baseline_patch=_snapshot_patch_fields(self, command.patch_fields),
+        async with self._async_write_lock:
+            command = replace(
+                command,
+                baseline_count=len(self._entries),
+                baseline_digest=self._entry_prefix_digest,
+                baseline_patch=_snapshot_patch_fields(self, command.patch_fields),
+            )
+            resident_generation = self.conversation_generation
+            try:
+                delta = await self._commit_async_unlocked(command, resident_generation)
+            except ConversationGenerationConflict:
+                if command.accept_external_generation:
+                    raise
+                if self.conversation_generation != resident_generation:
+                    command = replace(
+                        command,
+                        baseline_count=len(self._entries),
+                        baseline_digest=self._entry_prefix_digest,
+                        baseline_patch=_snapshot_patch_fields(
+                            self, command.patch_fields
+                        ),
+                    )
+                delta = await self._commit_async_unlocked(
+                    replace(command, accept_external_generation=True),
+                    self.conversation_generation,
                 )
-                resident_generation = self.conversation_generation
-                try:
-                    delta = await self._commit_async_unlocked(
-                        command, resident_generation
-                    )
-                except ConversationGenerationConflict:
-                    if command.accept_external_generation:
-                        raise
-                    if self.conversation_generation != resident_generation:
-                        command = replace(
-                            command,
-                            baseline_count=len(self._entries),
-                            baseline_digest=self._entry_prefix_digest,
-                            baseline_patch=_snapshot_patch_fields(
-                                self, command.patch_fields
-                            ),
-                        )
-                    delta = await self._commit_async_unlocked(
-                        replace(command, accept_external_generation=True),
-                        self.conversation_generation,
-                    )
-                return delta.result
-        finally:
-            if not done.done():
-                done.set_result(None)
-
-    async def await_queued_writes(self: ConversationStore) -> None:
-        """Wait for every off-loop write queued before this call to finish.
-
-        A durable read calls this before it reads so it observes its own
-        queued writes (read-your-queued-writes). The wait is bounded: it waits
-        only for the write queued most recently before it, which the single
-        write lock orders after all earlier queued writes, and returns at once
-        when nothing is in flight.
-        """
-        tail = self._write_tail
-        if tail is not None and not tail.done():
-            await asyncio.shield(tail)
+            return delta.result
 
     async def _refresh_off_loop(self: ConversationStore) -> None:
         await self._commit_storage_command(

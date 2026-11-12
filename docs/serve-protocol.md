@@ -1397,7 +1397,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
     matching response arrives.
 11. A session replacement closes the old loop before publishing the new
     session. Events from old background children keep the old session id.
-    Background events do not change the foreground `status.state`.
+    Background events do not change the foreground `status.state`. Events from
+    background children, including a delegated `approval_request`, have no order
+    relative to the parent turn's events such as `agent_end`.
 
 ## size and pagination rules
 

@@ -86,11 +86,19 @@ class ServeClient:
             self._events.append(reply)
 
     async def event(self, name: str) -> dict[str, Any]:
+        # A frame the caller is not waiting for (for example agent_end arriving
+        # before a delegated approval_request) must not be dropped: keep it
+        # buffered so a later event() call for it still finds it.
+        for index, frame in enumerate(self._events):
+            if frame.get("params", {}).get("event") == name:
+                del self._events[index]
+                return frame["params"]
         while True:
-            frame = self._events.popleft() if self._events else await self._receive()
+            frame = await self._receive()
             params = frame.get("params", {})
             if params.get("event") == name:
                 return params
+            self._events.append(frame)
 
     async def close(self) -> None:
         if self._websocket is not None:
