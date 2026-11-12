@@ -165,7 +165,9 @@ async def test_message_fork_cancellation_restores_workspace_and_transcript(
         nonlocal transcript_rebuilt
         transcript_rebuilt = True
 
+    # test-contract: seam hold the submitted store command.
     monkeypatch.setattr(ConversationStore, "append_message_fork_async", held_append)
+    # test-contract: seam patch the composite operation's workspace restore.
     monkeypatch.setattr("zeta.tui.checkpoints._restore_workspace", restore_workspace)
     # test-contract: seam patch the composite operation's post-commit rebuild.
     monkeypatch.setattr(app, "_rebuild_transcript", rebuild_transcript)
