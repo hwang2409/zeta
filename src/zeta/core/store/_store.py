@@ -133,13 +133,6 @@ class ConversationStore(
     def _entries(self) -> list[ConversationEntry]:
         return self._resident_rows.entries
 
-    @_entries.setter
-    def _entries(self, entries: Iterable[ConversationEntry]) -> None:
-        if isinstance(entries, list) and hasattr(self, "_resident_rows"):
-            self._resident_rows.entries = entries
-            return
-        self._resident_rows = ResidentRows(entries)
-
     def __init__(
         self,
         session_dir: str | Path | None = None,

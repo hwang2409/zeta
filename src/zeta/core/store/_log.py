@@ -110,7 +110,6 @@ class _FullLoadValidator:
 
     _STATE_ATTRIBUTES = (
         "cwd",
-        "_entries",
         "_entry_ids",
         "_entry_prefix_digest",
         "_delivery_fold",
@@ -335,6 +334,7 @@ class _FullLoadValidator:
                 self.store._reset_generation += 1
             for attribute in self._STATE_ATTRIBUTES:
                 setattr(self.store, attribute, getattr(self.state, attribute))
+            self.store._resident_rows = self.state._resident_rows
 
     @property
     def resets_resident_rows(self) -> bool:

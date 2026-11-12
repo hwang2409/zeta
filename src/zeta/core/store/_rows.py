@@ -136,9 +136,14 @@ class ResidentRows:
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in additions
         )
-        if (previous is None and additions[0].parent_id is None) or (
-            previous is not None and additions[0].parent_id == previous.id
-        ):
+        parent = previous.id if previous is not None else None
+        linear = True
+        for entry in additions:
+            if entry.parent_id != parent:
+                linear = False
+                break
+            parent = entry.id
+        if linear:
             self.branch.extend(additions)
         else:
             self._rebuild_branch()
@@ -148,13 +153,22 @@ class ResidentRows:
         del self.rows[length:]
         self._rebuild_branch()
 
-    def replace(self, entries: Iterable[ConversationEntry]) -> None:
-        self.entries = list(entries)
-        self.rows = [
+    @classmethod
+    def prepared(cls, entries: Iterable[ConversationEntry]) -> ResidentRows:
+        rows = cls.__new__(cls)
+        rows.entries = list(entries)
+        rows.rows = [
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
-            for e in self.entries
+            for e in rows.entries
         ]
-        self._rebuild_branch()
+        rows._rebuild_branch()
+        return rows
+
+    def replace(self, entries: Iterable[ConversationEntry]) -> None:
+        prepared = type(self).prepared(entries)
+        self.entries = prepared.entries
+        self.rows = prepared.rows
+        self.branch = prepared.branch
 
     def _rebuild_branch(self) -> None:
         by_id = {self.entries[index].id: self.entries[index] for index in range(len(self.entries))}

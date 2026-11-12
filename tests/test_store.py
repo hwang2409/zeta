@@ -285,7 +285,7 @@ def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
                 return super().__iter__()
 
         entries = CountingEntries(store._entries)
-        store._entries = entries
+        store._resident_rows.entries = entries
         store.commit_compaction_marker(
             "summary", 1, 1, expected_parent_id=first.id
         )
@@ -1457,7 +1457,7 @@ def test_installed_hook_does_not_access_resident_branch(tmp_path: Path) -> None:
         def __getitem__(self, key: object):
             raise AssertionError("installed hook indexed the resident branch")
 
-    store._entries = BranchAccessGuard(store._entries)
+    store._resident_rows.entries = BranchAccessGuard(store._entries)
     store._publish_entries_installed((entry,))
 
     assert observed == [(entry,)]
@@ -1577,6 +1577,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     owner_thread = threading.get_ident()
     load_threads: list[int] = []
     active_rows_by_thread: dict[int, int] = {}
+    row_fact_threads: list[int] = []
     install_threads: list[int] = []
     loop_entry_accesses = 0
     observe_loop_access = True
@@ -1611,6 +1612,15 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
 
     # test-contract: seam observe transcript loading across the async store boundary
     monkeypatch.setattr(ConversationStore, "_load_full", observed_load_full)
+    import zeta.core.store._rows as rows_module
+
+    original_row_facts = rows_module.row_facts
+
+    def observed_row_facts(entry: ConversationEntry) -> object | None:
+        row_fact_threads.append(threading.get_ident())
+        return original_row_facts(entry)
+
+    monkeypatch.setattr(rows_module, "row_facts", observed_row_facts)
 
     original_record_active_entry = DeliveryFold.apply
 
@@ -1644,7 +1654,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     # test-contract: seam exercises the store mutation boundary
     monkeypatch.setattr(ConversationStore, "_install_committed_delta", observed_install)
     # Guard the outgoing resident branch too: the loop detaches it during install.
-    store._entries = ObservedEntries(store._entries)
+    store._resident_rows.entries = ObservedEntries(store._entries)
 
     await store.append_message_async(message(MessageRole.ASSISTANT, "kept"))
     observe_loop_access = False
@@ -1655,6 +1665,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert sum(active_rows_by_thread.values()) >= len(rows)
     assert install_threads == [owner_thread, owner_thread]
     assert loop_entry_accesses == 0
+    assert row_fact_threads.count(owner_thread) <= 2
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
     assert store.messages() == fresh.messages()
@@ -2325,7 +2336,7 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
             mutation_threads.append(threading.get_ident())
             super().extend(entries)
 
-    store._entries = ObservedEntries(store._entries)
+    store._resident_rows.entries = ObservedEntries(store._entries)
     store._before_incremental_state_install = lambda: mutation_threads.append(
         threading.get_ident()
     )

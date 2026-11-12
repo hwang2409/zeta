@@ -106,6 +106,7 @@ class CommittedDelta[ResultT]:
     log_cursor: CommittedLogCursor
     dedupe_key: ConversationDedupeKey | None
     duplicate: bool
+    resident_rows: object | None = None
 
 
 class ConversationGenerationConflict(ConversationIntegrityError):

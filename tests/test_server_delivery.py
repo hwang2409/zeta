@@ -1231,7 +1231,7 @@ def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
         def __reversed__(self):
             raise AssertionError("delivery lookup read the conversation log")
 
-    store._entries = UnreadableEntries(store._entries)
+    store._resident_rows.entries = UnreadableEntries(store._entries)
     assert store.client_delivery("indexed").status == "queued"
     store.close()
 
