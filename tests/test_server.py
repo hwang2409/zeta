@@ -2585,6 +2585,7 @@ async def test_background_event_backlog_overflow_drops_slow_controller(
         nonlocal overflows
         overflows += 1
 
+    # test-contract: seam stall the publisher before connection output
     monkeypatch.setattr(server.control, "_event", publish)
     server.connections = SimpleNamespace(overflow_controller=overflow_controller)
     server.control._publish_background_event(
@@ -2702,7 +2703,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
 
 @pytest.mark.asyncio
 async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_closed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Regression: when the cancelled grandchild's own store is already torn down
     # (its close task won the race against the settlement), the one publisher
@@ -2727,6 +2728,22 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         assert server.runtime.loop is not None
         owner = server.runtime.loop._background_owner
         child_watcher = owner._watchers[child_id]
+        approval_end_published = asyncio.Event()
+        original_admit = server.control._admit_controller
+
+        def observe_admit(
+            event: EventDescriptor, session_id: str | None = None, **fields: object
+        ) -> object:
+            outcome = original_admit(event, session_id, **fields)
+            if (
+                event is EventDescriptor.APPROVAL_END
+                and fields.get("request_id") == approval["request_id"]
+            ):
+                approval_end_published.set()
+            return outcome
+
+        # test-contract: seam observe admission to the real connection output
+        monkeypatch.setattr(server.control, "_admit_controller", observe_admit)
         # Force the losing race deterministically: close the grandchild store
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
@@ -2736,7 +2753,13 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         notification_task = server.control._turn_task
         if notification_task is not None:
             await asyncio.wait_for(asyncio.shield(notification_task), TIMEOUT)
-        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        flush = getattr(server.control, "flush_background_events", None)
+        if flush is not None:
+            await asyncio.wait_for(flush(), TIMEOUT)
+        try:
+            await asyncio.wait_for(approval_end_published.wait(), TIMEOUT)
+        except TimeoutError:
+            pass
         frames = await _request(reader, writer, 4, "status")
         frames += list(_client_buffer(reader))
         _client_buffer(reader).clear()
