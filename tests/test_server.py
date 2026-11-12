@@ -2699,6 +2699,12 @@ async def test_background_event_bound_waits_without_dropping(
         assert recorded == ["first", "second", "waiting"]
         assert publisher._events == 0
         assert publisher._bytes == 0
+        with pytest.raises(RuntimeError, match="limit is 1024"):
+            await _publish_background_event(
+                server,
+                "oversized",
+                StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="x" * 2048),
+            )
     finally:
         release.set()
         await await_or_fail(
@@ -2706,6 +2712,12 @@ async def test_background_event_bound_waits_without_dropping(
             what="bounded producer cleanup",
         )
         await await_or_fail(server.close(), what="server close")
+    with pytest.raises(RuntimeError, match="publisher is closed"):
+        await _publish_background_event(
+            server,
+            "post-close",
+            StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="late"),
+        )
 
 
 @pytest.mark.asyncio
