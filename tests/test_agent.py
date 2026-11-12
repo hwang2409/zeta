@@ -10203,6 +10203,250 @@ def _task_exit_input(task_id: str) -> pending_delivery_module.NotificationInput:
     )
 
 
+_GC = "run:1"
+_GC_PATH = "/tmp/run-gc"
+_GC_QUESTION_ID = "gc-question"
+_GC_COMPLETION_TEXT = "grandchild report that no model has seen yet"
+_PROMPT_TEXT = {"user_prompt": "user follow-up", "agent_send": "agent follow-up"}
+
+
+async def _stage_terminal_edge(
+    flow: "pending_delivery_module.StepDeliveryFlow",
+    store: "ConversationStore",
+    kind: str,
+) -> None:
+    """Stage one pending input of ``kind`` on a child flow through the real store."""
+
+    if kind == "user_prompt":
+        await flow.produce(
+            pending_delivery_module.PromptInput(
+                _PROMPT_TEXT[kind], MessageOrigin.AGENT_PROMPT, None
+            )
+        )
+    elif kind == "agent_send":
+        await flow.produce(
+            pending_delivery_module.PromptInput(
+                _PROMPT_TEXT[kind], MessageOrigin.AGENT_SEND, None
+            )
+        )
+    elif kind == "task_exit":
+        await flow.produce(_task_exit_input("late-edge"))
+    elif kind == "child_idle":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_idle",
+                {
+                    "child_instance_id": _GC,
+                    "child_session_path": _GC_PATH,
+                    "description": "grandchild",
+                    "status": "child_idle",
+                    "text": "grandchild idle",
+                },
+                dedupe_key=_GC,
+            )
+        )
+    elif kind == "child_hold":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_hold",
+                {
+                    "child_instance_id": _GC,
+                    "child_session_path": _GC_PATH,
+                    "description": "grandchild",
+                    "status": "held",
+                    "reason": "rate_limit",
+                    "until": "soon",
+                    "provider": "test",
+                    "text": "grandchild held",
+                    "account": None,
+                    "retry_after": 60,
+                },
+                dedupe_key=_GC,
+            )
+        )
+    elif kind == "child_question":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_question",
+                {
+                    "child_instance_id": _GC,
+                    "question_id": _GC_QUESTION_ID,
+                    "description": "grandchild question",
+                    "status": "pending",
+                    "question": "wait?",
+                    "text": "grandchild asks: wait?",
+                },
+                dedupe_key=_GC_QUESTION_ID,
+            )
+        )
+    elif kind == "child_completion":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                store._agent_notification_data(
+                    _GC,
+                    child_session_path=_GC_PATH,
+                    description="grandchild",
+                    status="completed",
+                    text=_GC_COMPLETION_TEXT,
+                ),
+                dedupe_key=_GC,
+            )
+        )
+    else:
+        raise AssertionError(f"unknown terminal-edge kind {kind!r}")
+
+
+# kind -> outcome after the finish gate admitted a terminal, for both windows.
+#   delivered: supersedes the finished request and earns one model turn.
+#   rerouted:  kept durable so finalize's reroute_questions_from moves it.
+#   folded:    folded into this child's receipt (the effective parent reads it).
+#   moot:      acked -- the output survives elsewhere, nothing reaches a model.
+_TERMINAL_EDGE_OUTCOME = {
+    "user_prompt": "delivered",
+    "agent_send": "delivered",
+    "child_question": "rerouted",
+    "child_completion": "folded",
+    "task_exit": "moot",
+    "child_idle": "moot",
+    "child_hold": "moot",
+}
+
+
+@pytest.mark.parametrize("window", ["before", "admit_window"])
+@pytest.mark.parametrize("kind", sorted(_TERMINAL_EDGE_OUTCOME))
+@pytest.mark.asyncio
+async def test_consume_run_after_finish_gate_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    window: str,
+) -> None:
+    """Every staged input kind has a defined, non-dropping outcome after terminal.
+
+    The finish gate runs its own bounded loop to a terminal (handed off,
+    completed, task safety expired) and sets ``terminal_admitted``. The request
+    that terminal turn consumed is acked when the turn ends, so it leaves no
+    prompt edge. After that, ``consume_run`` must give every pending input a
+    defined outcome in two windows -- pending before the guard (``before``) and
+    committed between the guard's settle snapshot and ``admit_terminal``
+    (``admit_window``) -- and never silently drop a model-visible one:
+
+    * a user prompt or agent_send follow-up supersedes the finished request and
+      earns exactly one model turn (``delivered``);
+    * a grandchild question stays durable so finalize reroutes it to the
+      effective parent (``rerouted``);
+    * a grandchild completion report is folded into this child's receipt, which
+      the effective parent reads, then acked (``folded``);
+    * a task exit, a grandchild idle and a grandchild hold are moot -- their
+      output survives in the archive or re-publishes to the adopting parent -- so
+      they are acked and start no turn (``moot``).
+
+    ``child_question_close``/``_reroute``/``question_answer_ack`` are mutation-only
+    and never enter the model-visible pending set, so they have no row; ``inbox``
+    and ``macro_completion`` are not delivered to children.
+    """
+
+    from zeta.agent import runner as agent_runner
+
+    outcome = _TERMINAL_EDGE_OUTCOME[kind]
+    child_store = ConversationStore(tmp_path, session_id="run")
+    gate_state = FinishGateState()
+    calls = 0
+    seen_prompts: list[str] = []
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        nonlocal calls
+        calls += 1
+        flow = await child_loop._ensure_step_delivery()
+        if calls == 1:
+            # The gate ran its own loop and admitted the terminal for this run.
+            gate_state.terminal_admitted = True
+            if window == "before":
+                await _stage_terminal_edge(flow, child_store, kind)
+        else:
+            # A delivered turn: consume whatever was staged, recording any prompt
+            # the model was shown, then ack the fixed suffix as a real turn does.
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+            if prepared.prompt_id is not None:
+                seen_prompts.append(prepared.messages[-1].content[0].text)
+            if prepared.has_active_delivery:
+                await flow.acknowledge_active()
+        return {
+            "content": [{"type": "text", "text": "done"}],
+            "isError": False,
+            "structuredContent": {"status": "completed"},
+        }
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    flow = await child_loop._ensure_step_delivery()
+    if window == "admit_window":
+        # Force the race deterministically: commit the input inside the first
+        # admit_terminal call, after the guard's settle snapshot read it as empty.
+        real_admit = flow.admit_terminal
+        injected = False
+
+        async def admit_with_injection(intent: str):
+            nonlocal injected
+            if not injected:
+                injected = True
+                await _stage_terminal_edge(flow, child_store, kind)
+            return await real_admit(intent)
+
+        flow.admit_terminal = admit_with_injection  # type: ignore[method-assign]
+    try:
+        result = await agent_runner.consume_run(
+            child_loop,
+            "initial",
+            child_store=child_store,
+            finish_gate_state=gate_state,
+        )
+        assert result["isError"] is False
+        extra_turns = calls - 1
+        flow = await child_loop._ensure_step_delivery()
+        receipt_text = result["content"][0]["text"]
+        questions = {
+            entry.data.get("question_id")
+            for entry in child_store.agent_notifications()
+            if entry.data.get("kind") == "child_question"
+        }
+        if outcome == "delivered":
+            # Exactly one model turn, and the model saw this prompt and nothing
+            # else. On the admit-window race the unfixed guard finalized without
+            # delivering it, so the model saw no prompt.
+            assert extra_turns == 1
+            assert seen_prompts == [_PROMPT_TEXT[kind]]
+            assert flow.pending_ids() == ()
+        elif outcome == "rerouted":
+            # No model turn here; the question stays durable for finalize to move.
+            # The unfixed guard acked it, so it was gone from agent_notifications.
+            assert extra_turns == 0
+            assert seen_prompts == []
+            assert _GC_QUESTION_ID in questions
+        elif outcome == "folded":
+            # No model turn; the report rides out in this child's receipt and the
+            # entry is acked. The unfixed guard acked it without folding, so the
+            # report reached no model.
+            assert extra_turns == 0
+            assert seen_prompts == []
+            assert _GC_COMPLETION_TEXT in receipt_text
+            assert flow.pending_ids() == ()
+        else:  # moot
+            assert extra_turns == 0
+            assert seen_prompts == []
+            assert flow.pending_ids() == ()
+    finally:
+        await child_loop.close()
+        child_store.close()
+
+
+
 @pytest.mark.asyncio
 async def test_agent_send_reaches_running_child_at_next_step_boundary(
     tmp_path: Path,
@@ -11449,107 +11693,6 @@ async def test_consume_run_keeps_pending_entry_when_delivery_fails(
     assert terminal.closed_empty
     with pytest.raises(PendingPromptsClosedError):
         await asyncio.to_thread(child_store.append_pending_prompt, "after failure")
-
-
-@pytest.mark.parametrize(
-    "late_input", ["none", "consumed_prompt", "new_prompt", "late_notification"]
-)
-@pytest.mark.asyncio
-async def test_consume_run_after_finish_gate_terminal(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    late_input: str,
-) -> None:
-    """After the finish gate admits a terminal, consume_run finalizes.
-
-    The finish gate runs its own bounded loop to a terminal (handed off,
-    completed, task safety expired) and sets ``terminal_admitted``. The request
-    that terminal turn consumed is acked when the turn ends, at
-    ``flow.acknowledge_active()`` (src/zeta/agent/notifications.py), so it leaves
-    no prompt edge and starts no further turn.
-
-    What reaches ``consume_run`` after the terminal splits two ways:
-
-    * a genuinely new user prompt supersedes the finished request and still gets
-      exactly one turn, and the model sees it;
-    * a notification-only edge -- a task exit or a sub-agent completion -- is moot
-      once the run is terminal. Delivering it re-enters the concluded gate or
-      re-exposes the already-consumed request to the model, which never ends. So
-      it starts no turn; nothing is lost because the request it would re-expose
-      was already acked.
-    """
-
-    from zeta.agent import runner as agent_runner
-
-    child_store = ConversationStore(tmp_path, session_id="run")
-    gate_state = FinishGateState()
-    calls = 0
-    seen_prompts: list[str] = []
-
-    async def fake_consume_child(child_loop, prompt, **kwargs):
-        nonlocal calls
-        calls += 1
-        flow = await child_loop._ensure_step_delivery()
-        if calls == 1:
-            # The gate ran its own loop and admitted the terminal for this run.
-            gate_state.terminal_admitted = True
-            if late_input == "consumed_prompt":
-                # A prompt the terminal turn already delivered and acked.
-                await asyncio.to_thread(child_store.append_pending_prompt, "consumed")
-                await flow.prepare_request("terminal_fallback", [], None)
-                await flow.acknowledge_active()
-            elif late_input == "new_prompt":
-                await flow.produce(
-                    pending_delivery_module.PromptInput(
-                        "new follow-up", MessageOrigin.AGENT_SEND, None
-                    )
-                )
-            elif late_input == "late_notification":
-                await flow.produce(_task_exit_input("late-edge"))
-        else:
-            # A delivered turn: consume whatever was staged, recording any prompt
-            # the model was shown. On the buggy path this drains the edge so the
-            # run ends and the test asserts the exact (too-high) turn count.
-            prepared = await flow.prepare_request("terminal_fallback", [], None)
-            if prepared.prompt_id is not None:
-                seen_prompts.append(prepared.messages[-1].content[0].text)
-            if prepared.has_active_delivery:
-                await flow.acknowledge_active()
-        return {
-            "content": [{"type": "text", "text": "done"}],
-            "isError": False,
-            "structuredContent": {"status": "completed"},
-        }
-
-    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
-
-    child_loop = AgentLoop(
-        FakeBackend([]),
-        child_store,
-        skill_catalog=SkillCatalog.empty(),
-    )
-    try:
-        result = await agent_runner.consume_run(
-            child_loop,
-            "initial",
-            child_store=child_store,
-            finish_gate_state=gate_state,
-        )
-        # Only a new user prompt earns an extra turn after the terminal.
-        extra_turns = calls - 1
-        assert extra_turns == (1 if late_input == "new_prompt" else 0)
-        assert result["isError"] is False
-        # That new prompt is the only late input the model is shown.
-        assert seen_prompts == (
-            ["new follow-up"] if late_input == "new_prompt" else []
-        )
-        # Nothing is left pending for a resume to re-deliver: a moot
-        # notification was durably acked, a delivered prompt was consumed.
-        flow = await child_loop._ensure_step_delivery()
-        assert flow.pending_ids() == ()
-    finally:
-        await child_loop.close()
-        child_store.close()
 
 
 @pytest.mark.asyncio

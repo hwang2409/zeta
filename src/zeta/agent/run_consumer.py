@@ -7,7 +7,11 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from ..core.checkpoints import _now
-from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.store import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
+    MAX_AGENT_NOTIFICATION_TEXT,
+    ConversationStore,
+)
 from ..protocol.types import (
     MessageOrigin,
     StreamEvent,
@@ -54,6 +58,72 @@ def _transition_idle(child_store: ConversationStore) -> None:
     )
 
 
+_MOOT_TERMINAL_KINDS = ("task_exited", "child_idle", "child_hold")
+
+
+def _terminal_edge_disposition(
+    flow: object,
+) -> tuple[tuple[str, ...], tuple[str, ...], list[str]]:
+    """Split a terminal run's pending edge into settle, fold and keep groups.
+
+    After the finish gate admits a terminal, a notification-only edge starts no
+    model turn, but model-visible descendant input is never silently dropped:
+
+    * a task exit, a grandchild idle and a grandchild hold are moot -- the task
+      output stays in the archive, idle and hold re-publish to the adopting
+      parent -- so they are acked;
+    * a grandchild completion report is folded into this child's receipt (which
+      the effective parent reads) and then acked, so the report reaches a model
+      exactly once;
+    * a grandchild question is left durable so finalize's ``reroute_questions_from``
+      moves it to the effective parent, as on main.
+
+    Only non-suppressed ids are touched: suppressed exhausted-budget input stays
+    durable and is rerouted at finalize.
+    """
+
+    moot_ids: list[str] = []
+    completion_ids: list[str] = []
+    completion_texts: list[str] = []
+    store = flow.store
+    for entry_id in flow.pending_ids():
+        entry = store._active_notifications.get(entry_id)
+        if entry is None:
+            continue  # a durable pending-prompt id; no moot prompt reaches here
+        kind = entry.data.get("kind")
+        if kind == AGENT_COMPLETION_NOTIFICATION_KIND:
+            completion_ids.append(entry_id)
+            text = entry.data.get("text")
+            if isinstance(text, str) and text.strip():
+                completion_texts.append(text.strip())
+        elif kind == "child_question":
+            continue  # kept durable for reroute_questions_from at finalize
+        elif kind in _MOOT_TERMINAL_KINDS:
+            moot_ids.append(entry_id)
+        # any other kind stays durable; nothing is dropped by default.
+    return tuple(moot_ids), tuple(completion_ids), completion_texts
+
+
+def _terminal_block_pending(flow: object) -> bool:
+    """Report pending input that still needs a settle pass after a terminal.
+
+    A kept grandchild question stays durable forever (finalize reroutes it), so
+    it must not loop the terminal block. Anything else -- a prompt that committed
+    in the admit window, or a grandchild completion/task-exit/idle/hold that
+    arrived after the settle snapshot -- needs another settle pass before finalize
+    so it is folded, acked or delivered rather than dropped.
+    """
+
+    store = flow.store
+    for entry_id in flow.pending_ids():
+        entry = store._active_notifications.get(entry_id)
+        if entry is None:
+            return True  # a durable pending prompt committed in the window
+        if entry.data.get("kind") != "child_question":
+            return True
+    return False
+
+
 def _finalize_result(
     result: dict[str, object],
     *,
@@ -64,6 +134,7 @@ def _finalize_result(
     child_turns: object,
     tool_call_id: str,
     max_receipt_bytes: int,
+    extra_receipt_text: str = "",
 ) -> dict[str, object]:
     if isinstance(result.get("explicitFinishReport"), dict):
         return result
@@ -92,6 +163,8 @@ def _finalize_result(
         if segment_reports and len(segment_reports) > 1
         else raw_text
     )
+    if extra_receipt_text:
+        reply = f"{reply}{extra_receipt_text}" if reply else extra_receipt_text
     return build_agent_receipt(
         state,
         reply,
@@ -158,6 +231,7 @@ async def consume_run(
     terminal_result: dict[str, object] | None = None
     delivered_follow_up = False
     segment_reports: list[str] = []
+    folded_completion_reports: list[str] = []
     ordinary_idle_presented = False
     kwargs["record_report"] = segment_reports.append
     kwargs["child_store"] = child_store
@@ -194,37 +268,25 @@ async def consume_run(
                     await asyncio.gather(safety_task, return_exceptions=True)
                     safety_task = None
             finish_gate_state = kwargs["finish_gate_state"]
-            if (
+            terminal_finalize = (
                 isinstance(finish_gate_state, FinishGateState)
                 and finish_gate_state.terminal_admitted
-                and not flow.has_prompt_edge
-            ):
-                # The finish gate reached a terminal. A new user prompt still
-                # supersedes the finished request and gets its turn below, but a
-                # notification-only edge (a task exit, a sub-agent completion) is
-                # moot once the run is terminal: delivering one re-enters the
-                # concluded gate or re-exposes the already-consumed request to the
-                # model, which never ends. The consumed request was acked when its
-                # turn ended, so nothing is lost. Durably settle the moot
-                # notifications -- the task was killed, the sub-agent is adopted by
-                # the parent -- so they are not re-delivered on resume, then close
-                # the queue and finalize.
-                stale = flow.pending_ids()
-                if stale:
-                    await flow.store.acknowledge_staged_delivery(None, stale)
-                await flow.admit_terminal("segment_end")
-                terminal_result = _finalize_result(
-                    result,
-                    segment_reports=segment_reports,
-                    receipt_components=receipt_components,
-                    delivered_follow_up=delivered_follow_up,
-                    child_store=child_store,
-                    child_turns=child_turns,
-                    tool_call_id=tool_call_id,
-                    max_receipt_bytes=max_receipt_bytes,
-                )
-                return terminal_result
-            if flow.has_pending_edge:
+                and not flow.has_pending_prompt
+            )
+            if terminal_finalize:
+                # The finish gate reached a terminal and no new user prompt is
+                # durably pending. A notification-only edge is moot once the run
+                # is terminal: delivering one re-enters the concluded gate or
+                # re-exposes the already-consumed request to the model, which
+                # never ends. Settle the moot edge (see _terminal_edge_disposition)
+                # and fall through to the terminal block below, which finalizes
+                # even though a kept grandchild question keeps the edge pending.
+                moot_ids, completion_ids, texts = _terminal_edge_disposition(flow)
+                folded_completion_reports.extend(texts)
+                settle = moot_ids + completion_ids
+                if settle:
+                    await flow.store.acknowledge_staged_delivery(None, settle)
+            if flow.has_pending_edge and not terminal_finalize:
                 delivered_follow_up = delivered_follow_up or flow.has_prompt_edge
                 flow.reset_stalled_episode()
                 ordinary_idle_presented = False
@@ -351,7 +413,14 @@ async def consume_run(
                 )
                 continue
             terminal = await flow.admit_terminal("segment_end")
-            if terminal.pending:
+            if terminal.pending and (
+                not terminal_finalize or _terminal_block_pending(flow)
+            ):
+                # Normal terminal: loop while any input is pending. Terminal
+                # finalize: loop only for input that still needs settling (a
+                # windowed prompt gets its turn; a windowed completion/moot item
+                # is folded or acked next pass). A kept grandchild question does
+                # not block finalize -- it is rerouted to the effective parent.
                 continue
             terminal_result = _finalize_result(
                 result,
@@ -362,6 +431,12 @@ async def consume_run(
                 child_turns=child_turns,
                 tool_call_id=tool_call_id,
                 max_receipt_bytes=max_receipt_bytes,
+                extra_receipt_text=(
+                    "\n\nsub-agent completions received after this agent finished:\n"
+                    + "\n".join(folded_completion_reports)
+                    if folded_completion_reports
+                    else ""
+                ),
             )
             return terminal_result
         terminal_result = _finalize_result(

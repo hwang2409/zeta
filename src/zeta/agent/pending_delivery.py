@@ -664,6 +664,21 @@ class StepDeliveryFlow:
         )
         return tuple(item_id for item_id in ids if item_id not in self._suppressed_ids)
 
+    @property
+    def has_pending_prompt(self) -> bool:
+        """Report a durable, non-suppressed pending prompt (level, not edge).
+
+        ``admit_terminal`` arms both edges whenever anything is pending, so the
+        ``prompt`` edge flag is set even for a notification-only edge. A terminal
+        run only re-opens for a real pending prompt, so key that decision on the
+        durable store level instead of the edge flag.
+        """
+
+        return any(
+            entry_id not in self._suppressed_ids
+            for entry_id in self.store._active_pending_prompt_entries
+        )
+
     def suppress_pending(self, staged_ids: tuple[str, ...]) -> None:
         """Keep exhausted input durable without repeatedly waking the model."""
 
