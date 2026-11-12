@@ -203,6 +203,7 @@ class TurnConsumerMixin:
         self._abort_requested = False
         self._turn_had_visible_output = False
         self._loop_state = "streaming"
+        self._repaint_accounts_picker()
         self._streaming = True
         self._spinner_active = True
         turn_abort_signal = (
@@ -348,6 +349,7 @@ class TurnConsumerMixin:
             self._abort_requested = False
             self._streaming = False
             self._spinner_active = False
+            self._repaint_accounts_picker()
             if self._standalone_abort_signal is turn_abort_signal:
                 self._standalone_abort_signal = None
             spinner_task.cancel()

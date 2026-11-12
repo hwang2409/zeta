@@ -411,16 +411,21 @@ def descend_directory(parent_fd: int, components: tuple[str, ...]):
         yield directory_fd
 
 
-@contextmanager
-def child_directory(parent_fd: int, name: str, *, create: bool = False):
-    """Pin a child without following symbolic links, including during creation."""
+def _open_child_directory(parent_fd: int, name: str, *, create: bool = False) -> int:
+    """Open one validated child without following symbolic links."""
     _component(name)
     if create:
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             pass
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+
+@contextmanager
+def child_directory(parent_fd: int, name: str, *, create: bool = False):
+    """Pin a child without following symbolic links, including during creation."""
+    fd = _open_child_directory(parent_fd, name, create=create)
     try:
         yield fd
     finally:
@@ -437,12 +442,22 @@ def session_root(path: Path, *, create: bool = False):
     anchor = Path(*parts[:split])
     if create:
         anchor.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as cleanup:
-        fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
-        cleanup.callback(os.close, fd)
+    fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
         for name in parts[split:]:
-            fd = cleanup.enter_context(child_directory(fd, name, create=create))
+            child_fd = _open_child_directory(fd, name, create=create)
+            parent_fd = fd
+            fd = child_fd
+            try:
+                os.close(parent_fd)
+            except OSError:
+                try:
+                    os.close(parent_fd)
+                finally:
+                    raise
         yield fd
+    finally:
+        os.close(fd)
 
 
 def read_session_file(directory_fd: int, name: str) -> bytes:
