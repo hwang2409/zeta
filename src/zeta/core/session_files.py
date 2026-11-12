@@ -417,7 +417,7 @@ def session_root(path: Path, *, create: bool = False):
             fd = child_fd
             try:
                 os.close(parent_fd)
-            except BaseException:
+            except OSError:
                 try:
                     os.close(parent_fd)
                 finally:
