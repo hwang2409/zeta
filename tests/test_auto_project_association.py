@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import multiprocessing
 import os
@@ -19,6 +20,7 @@ from zeta.cli.main import build_parser
 from zeta.config.settings import load_settings
 from zeta.core.project_context import associate_project_discovery, discover_project
 from zeta.core.session import SessionManager
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     Message,
@@ -119,6 +121,30 @@ def test_concurrent_session_creation_is_unique(tmp_path: Path) -> None:
         )
     assert len({s.metadata.project_id for s in sessions}) == 1
     assert len(m.project_registry.list_projects()) == 1
+
+
+def test_busy_registry_retries_project_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = repo(tmp_path)
+    m = manager(tmp_path)
+    original = ProjectRegistry._acquire_lock
+    busy_attempts = 3
+
+    def acquire(fd: int, mode: int) -> None:
+        nonlocal busy_attempts
+        if busy_attempts and mode == fcntl.LOCK_EX:
+            busy_attempts -= 1
+            raise ProjectRegistryBusyError()
+        original(fd, mode)
+
+    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    opened = m.create(provider="codex", model="test", cwd=root)
+    try:
+        assert opened.metadata.project_id is not None
+        assert len(m.project_registry.list_projects()) == 1
+    finally:
+        opened.store.close()
 
 
 def test_registry_failure_is_nonfatal_and_warns(

@@ -52,6 +52,7 @@ from ..project_context.projection import (
     ProjectContextProjection,
 )
 from ..project_memory_history import MemoryContextEntry
+from ..project_errors import ProjectRegistryBusyError
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
     load_identity_fragment,
@@ -74,6 +75,7 @@ APPEND_SYSTEM_FILENAME = "APPEND_SYSTEM.md"
 # 512 KiB is roughly 128k tokens — comfortably below any provider context
 # window, and well above realistic AGENTS.md totals.
 CONTEXT_BYTE_CAP = 512 * 1024
+_PROJECT_DISCOVERY_BUSY_RETRIES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +307,8 @@ def _find_or_create_valid_project(
     for name in names:
         try:
             return registry.create_project(name, "git", root, memory_profile="zeta")
+        except ProjectRegistryBusyError:
+            raise
         except ProjectRegistryError:
             project = _project_at_root(registry, root, discovery)
             if project is not None:
@@ -406,10 +410,16 @@ def discover_or_find_project(
 ) -> Project | None:
     """Discover once and associate an eligible Git project."""
 
-    discovery = associate_project_discovery(
-        discover_project(cwd, user_home=user_home), registry
-    )
-    return discovery.project
+    for attempt in range(_PROJECT_DISCOVERY_BUSY_RETRIES):
+        try:
+            discovery = associate_project_discovery(
+                discover_project(cwd, user_home=user_home), registry
+            )
+            return discovery.project
+        except ProjectRegistryBusyError:
+            if attempt + 1 == _PROJECT_DISCOVERY_BUSY_RETRIES:
+                raise
+    raise AssertionError("project discovery retry loop did not return")
 
 
 def discover_repo_root(cwd: str | Path | None = None) -> Path:
