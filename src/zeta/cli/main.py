@@ -887,6 +887,17 @@ def _create_tui_app(
         return None
 
 
+def _run_tui_session(
+    app: Any,
+    args: argparse.Namespace,
+    patch_stdout: Any,
+) -> tuple[bool, bool]:
+    from ..tui.loop_errors import stderr_to_log
+
+    with patch_stdout(raw=True), stderr_to_log():
+        return asyncio.run(_run_tui(app, args))
+
+
 def _run_tui_lifecycle(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -911,20 +922,17 @@ def _run_tui_lifecycle(
                 from prompt_toolkit.patch_stdout import (
                     patch_stdout as default_patch_stdout,
                 )
-
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
-                from ..tui.loop_errors import stderr_to_log
 
                 patch_stdout = globals().get("patch_stdout") or default_patch_stdout
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
-                with patch_stdout(raw=True), stderr_to_log():
-                    restart_requested, restart_cancels_work = asyncio.run(
-                        _run_tui(run_app, args)
-                    )
+                restart_requested, restart_cancels_work = _run_tui_session(
+                    run_app, args, patch_stdout
+                )
                 new_session_requested = run_app.new_session_requested
                 if new_session_requested:
                     _retain_active_draft(app, retained_drafts)

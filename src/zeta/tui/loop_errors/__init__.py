@@ -23,6 +23,9 @@ from ..render import render_event
 
 _TUI_ERROR_LOG = "tui-errors.jsonl"
 _DIAGNOSTIC_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = queue.Queue(maxsize=32)
+_STDERR_QUEUE: queue.Queue[tuple[Path, bytes] | None] = queue.Queue(maxsize=32)
+_STDERR_DROPPED = 0
+_STDERR_DROPPED_LOCK = threading.Lock()
 _DIAGNOSTIC_WORKER_LOCK = threading.Lock()
 _DIAGNOSTIC_WORKER_STARTED = False
 
@@ -65,12 +68,34 @@ def log_tui_crash(error: BaseException) -> Path:
     return path
 
 
+def _write_stderr_queue() -> None:
+    global _STDERR_DROPPED
+    while item := _STDERR_QUEUE.get():
+        path, chunk = item
+        with _STDERR_DROPPED_LOCK:
+            dropped = _STDERR_DROPPED
+            _STDERR_DROPPED = 0
+        record = {"type": "stderr", "text": chunk.decode("utf-8", "replace")}
+        if dropped:
+            record["dropped_bytes"] = dropped
+        try:
+            write_tui_diagnostic(path, record)
+        except Exception:  # noqa: BLE001, S110 - diagnostics must never affect the TUI
+            pass
+        finally:
+            _STDERR_QUEUE.task_done()
+
+
 def _copy_stderr_to_log(read_fd: int, path: Path) -> None:
+    # stderr draining never waits for disk I/O; a full queue drops and counts bytes.
+    global _STDERR_DROPPED
     with os.fdopen(read_fd, "rb", buffering=0) as pipe:
         while chunk := pipe.read(65536):
-            write_tui_diagnostic(
-                path, {"type": "stderr", "text": chunk.decode("utf-8", "replace")}
-            )
+            try:
+                _STDERR_QUEUE.put_nowait((path, chunk))
+            except queue.Full:
+                with _STDERR_DROPPED_LOCK:
+                    _STDERR_DROPPED += len(chunk)
 
 
 @contextmanager
@@ -85,6 +110,10 @@ def stderr_to_log() -> Iterator[None]:
     path = tui_error_log()
     sys.stderr.flush()
     read_fd, write_fd = os.pipe()
+    writer = threading.Thread(
+        target=_write_stderr_queue, name="zeta-tui-stderr-writer", daemon=True
+    )
+    writer.start()
     reader = threading.Thread(
         target=_copy_stderr_to_log, args=(read_fd, path), name="zeta-tui-stderr", daemon=True
     )
@@ -105,6 +134,7 @@ def stderr_to_log() -> Iterator[None]:
         os.close(terminal_fd)
         # Children that still hold the pipe keep logging; do not wait for them.
         reader.join(timeout=1)
+        _STDERR_QUEUE.join()
 
 
 async def start_prompt_during_activation(
