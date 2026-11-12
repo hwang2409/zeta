@@ -51,8 +51,8 @@ from ..project_context.projection import (
     ProjectContextHealth,
     ProjectContextProjection,
 )
-from ..project_memory_history import MemoryContextEntry
 from ..project_errors import ProjectRegistryBusyError
+from ..project_memory_history import MemoryContextEntry
 from ..project_registry import Project, ProjectRegistry, ProjectRegistryError
 from ..prompts import (
     load_identity_fragment,
