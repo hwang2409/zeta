@@ -82,7 +82,7 @@ def require_mutable(
     loop = runtime.loop
     if loop is not None and (
         loop.background_children_running
-        or loop.store.has_outstanding_tool_calls(loop.store.replay())
+        or loop.store.has_outstanding_tool_calls()
         or has_pending_approvals
     ):
         raise ProtocolError(

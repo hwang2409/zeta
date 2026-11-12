@@ -89,7 +89,11 @@ async def rename(
 
 def tree(runtime: ServerRuntime) -> dict:
     store = runtime.opened.store
-    entries = store.entries
+    # Read resident entries once as a shallow snapshot instead of the
+    # deep-copying ``entries`` property: this read runs off the loop (via
+    # run_read) and only inspects ids/parents, so a per-row copy of a 17k-row
+    # branch is wasted.
+    entries = store.resident_entries()
     children: dict[str, int] = {}
     for entry in entries:
         if entry.parent_id:

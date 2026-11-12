@@ -226,21 +226,17 @@ class CheckpointTranscriptMixin:
         after = self.loop.store.compaction_marker_count()
         if after == before:
             return "compact: nothing to compact"
-        marker = next(
-            entry
-            for entry in reversed(self.loop.store.replay())
-            if entry.type == "compaction"
-        )
+        marker = self.loop.store.latest_compaction_marker()
         return (
             "compacted entries "
             f"{marker.data['source_seq_start']}–{marker.data['source_seq_end']}; "
             f"tokens after: {context.token_count}"
         )
 
-    def slash_fork(self, args: str) -> str:
+    def slash_fork(self, args: str) -> str | Awaitable[str]:
         if self.active:
             return "fork unavailable while a turn is running"
-        if self.loop.store.has_outstanding_tool_calls(self.loop.store.replay()):
+        if self.loop.store.has_outstanding_tool_calls():
             return "fork unavailable while a tool call is pending"
         if self.loop.background_children_running:
             return "fork unavailable while background agents are running"
@@ -281,7 +277,9 @@ class CheckpointTranscriptMixin:
         )
         return "\n".join(lines)
 
-    def _fork_from_message_index(self, index: int, forced: bool) -> str:
+    def _fork_from_message_index(
+        self, index: int, forced: bool
+    ) -> str | Awaitable[str]:
         forkpoints = self.loop.store.list_user_message_forkpoints()
         if index < 1 or index > len(forkpoints):
             return (
@@ -294,49 +292,67 @@ class CheckpointTranscriptMixin:
             dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
             if dirty_warning is not None:
                 return dirty_warning
-        try:
-            entry = self.loop.store.append_message_fork(source.id)
-        except (ValueError, ConversationIntegrityError) as exc:
-            return f"fork failed: {exc}"
-        _, restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
+        return self._complete_message_fork(
+            index, source, snapshots, target_snapshot, forced
         )
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        header = (
-            f"forked to user message {index} at seq {source.seq} "
-            f"(label '{entry.data['label']}')"
-        )
-        if restore_note:
-            return f"{header} ({restore_note})"
-        return f"{header} · conversation-only, no workspace snapshot at this message"
 
-    def _fork_from_checkpoint_label(self, selector: str, forced: bool) -> str:
+    async def _complete_message_fork(
+        self, index, source, snapshots, target_snapshot, forced
+    ) -> str:
+        async def commit_and_rebuild() -> str:
+            try:
+                entry = await self.loop.store.append_message_fork_async(source.id)
+            except (ValueError, ConversationIntegrityError) as exc:
+                return f"fork failed: {exc}"
+            _, restore_note = _restore_workspace(
+                snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
+            )
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            header = (
+                f"forked to user message {index} at seq {source.seq} "
+                f"(label '{entry.data['label']}')"
+            )
+            if restore_note:
+                return f"{header} ({restore_note})"
+            return f"{header} · conversation-only, no workspace snapshot at this message"
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
+
+    def _fork_from_checkpoint_label(
+        self, selector: str, forced: bool
+    ) -> str | Awaitable[str]:
         snapshots = self._snapshots()
         # With no snapshots this fork only changes the conversation.
         if snapshots.snapshots:
             dirty_warning = _dirty_guard(snapshots, self.loop.store.bash_cwd, forced)
             if dirty_warning is not None:
                 return dirty_warning
-        try:
-            entry = self.loop.store.append_fork(selector)
-        except ValueError as exc:
-            return f"fork failed: {exc}"
-        target_snapshot = _resolve_fork_snapshot(snapshots, entry)
-        _, restore_note = _restore_workspace(
-            snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
-        )
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        message = (
-            f"forked to checkpoint '{entry.data['label']}' at seq "
-            f"{entry.data['from_seq']}"
-        )
-        if restore_note:
-            return f"{message} ({restore_note})"
-        return message
+        return self._complete_checkpoint_fork(selector, snapshots, forced)
 
-    def slash_tree(self, args: str) -> str:
+    async def _complete_checkpoint_fork(self, selector, snapshots, forced) -> str:
+        async def commit_and_rebuild() -> str:
+            try:
+                entry = await self.loop.store.append_fork_async(selector)
+            except ValueError as exc:
+                return f"fork failed: {exc}"
+            target_snapshot = _resolve_fork_snapshot(snapshots, entry)
+            _, restore_note = _restore_workspace(
+                snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
+            )
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            message = (
+                f"forked to checkpoint '{entry.data['label']}' at seq "
+                f"{entry.data['from_seq']}"
+            )
+            if restore_note:
+                return f"{message} ({restore_note})"
+            return message
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
+
+    def slash_tree(self, args: str) -> str | Awaitable[str]:
         if self.active:
             return "tree unavailable while a turn is running"
         tokens = args.split()
@@ -345,7 +361,7 @@ class CheckpointTranscriptMixin:
             return _render_branch_tree(branches)
         if len(tokens) != 1 or not tokens[0].isdigit():
             return "tree: usage /tree [n]"
-        if self.loop.store.has_outstanding_tool_calls(self.loop.store.replay()):
+        if self.loop.store.has_outstanding_tool_calls():
             return "tree unavailable while a tool call is pending"
         if self.loop.background_children_running:
             return "tree unavailable while background agents are running"
@@ -355,13 +371,33 @@ class CheckpointTranscriptMixin:
         target = branches[index - 1]
         if target.is_current:
             return f"tree: already on branch {index}"
-        try:
-            self.loop.store.switch_to_branch(target.head.id)
-        except (ValueError, ConversationIntegrityError) as exc:
-            return f"tree: switch failed: {exc}"
-        self._rebuild_transcript()
-        self._fork_rebuilt = True
-        return f"switched to branch {index} (head seq {target.head.seq})"
+        return self._switch_to_branch(index, target)
+
+    async def _switch_to_branch(self, index, target) -> str:
+        async def commit_and_rebuild() -> str:
+            try:
+                await self.loop.store.switch_to_branch_async(target.head.id)
+            except (ValueError, ConversationIntegrityError) as exc:
+                return f"tree: switch failed: {exc}"
+            self._rebuild_transcript()
+            self._fork_rebuilt = True
+            return f"switched to branch {index} (head seq {target.head.seq})"
+
+        return await self._await_committed_branch_operation(commit_and_rebuild())
+
+    async def _await_committed_branch_operation(
+        self, operation: Awaitable[str]
+    ) -> str:
+        task = asyncio.create_task(operation)
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return task.result()
 
     def slash_undo(self, args: str) -> str:
         return self._navigate_snapshot(args, verb="undo", past="undone")

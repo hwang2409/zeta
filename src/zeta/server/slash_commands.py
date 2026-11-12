@@ -367,11 +367,7 @@ class ServerSlashSession:
         state.usage_tracker.record_compaction(state.model)
         if after == before:
             return "compact: nothing to compact"
-        marker = next(
-            entry
-            for entry in reversed(loop.store.replay())
-            if entry.type == "compaction"
-        )
+        marker = loop.store.latest_compaction_marker()
         return (
             "compacted entries "
             f"{marker.data['source_seq_start']}–{marker.data['source_seq_end']}; "

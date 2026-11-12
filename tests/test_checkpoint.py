@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import close_owned_app
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
@@ -362,7 +363,7 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
     assert "ago" in picker
 
 
-def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
+async def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     call = ToolCall("read-1", "read", {"path": "README.md"})
     store.append_message(with_message_origin(message(MessageRole.USER, "inspect the readme"), MessageOrigin.USER))
@@ -386,11 +387,12 @@ def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     )
     app._active_session = app._make_session()
 
-    app.slash_fork("saved")
+    await app.slash_fork("saved")
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "read" in rendered
     assert "README.md" in rendered
+    await close_owned_app(app)
 
 
 @pytest.mark.parametrize(
@@ -586,7 +588,7 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
     assert replay_bytes == live_bytes
 
 
-def test_fork_rejects_running_background_agents_then_allows_completion(
+async def test_fork_rejects_running_background_agents_then_allows_completion(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
@@ -606,7 +608,8 @@ def test_fork_rejects_running_background_agents_then_allows_completion(
     )
 
     app.loop._background_child_cancellers.clear()
-    assert app.slash_fork("saved") == "forked to checkpoint 'saved' at seq 3"
+    assert await app.slash_fork("saved") == "forked to checkpoint 'saved' at seq 3"
+    await close_owned_app(app)
 
 
 def _count_meta_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:

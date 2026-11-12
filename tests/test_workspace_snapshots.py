@@ -11,6 +11,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import close_owned_app
 from zeta.core.checkpoints import workspace as workspace_module
 from zeta.core.checkpoints.workspace import (
     DEFAULT_SNAPSHOT_CAP,
@@ -279,7 +280,7 @@ def test_slash_checkpoint_captures_workspace(git_repo: Path, tmp_path: Path) -> 
     assert "1 files" in result
 
 
-def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
+async def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
     from zeta.protocol.types import Message, MessageRole, TextContent
 
     store = _make_store(tmp_path / "session", git_repo)
@@ -289,9 +290,10 @@ def test_slash_fork_restores_tree(git_repo: Path, tmp_path: Path) -> None:
     app.slash_checkpoint("baseline")
 
     (git_repo / "tracked.txt").write_text("post-checkpoint edit")
-    result = app.slash_fork("baseline --force")
+    result = await app.slash_fork("baseline --force")
     assert "workspace restored" in result
     assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
+    await close_owned_app(app)
 
 
 def test_slash_fork_refuses_dirty_workspace_without_force(
@@ -1151,7 +1153,7 @@ def test_corruption_warning_resolves_only_undo_target(
     store.close()
 
 
-def test_corrupt_undo_advice_names_damaged_target_before_healthy_history(
+async def test_corrupt_undo_advice_names_damaged_target_before_healthy_history(
     git_repo: Path, tmp_path: Path,
 ) -> None:
     conversation = _make_store(tmp_path / "session", git_repo)
@@ -1178,10 +1180,11 @@ def test_corrupt_undo_advice_names_damaged_target_before_healthy_history(
     assert (git_repo / "tracked.txt").read_text() == "unsaved work\n"
     assert reopened._snapshots().current_id == state["current_id"]
     # /undo accepts no selector; /fork can explicitly select the healthy checkpoint.
-    assert "workspace restored" in reopened.slash_fork("healthy --force")
+    assert "workspace restored" in await reopened.slash_fork("healthy --force")
     assert (git_repo / "tracked.txt").read_text() == "initial tracked\n"
     assert reopened._snapshots().current_id == state["snapshots"][0]["id"]
     assert path.read_bytes() == original
+    await close_owned_app(reopened)
 
 
 def test_restore_resolver_classifies_nul_root_as_damaged(
