@@ -361,10 +361,6 @@ def _reference_gate(home, installed_ids, referenced_ids):
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     _reject("session reference authority is unsafe")
-                ready_hook = os.environ.get("ZETA_TEST_REFERENCE_GATE_READY")
-                if ready_hook:
-                    with open(ready_hook, "w", encoding="ascii") as stream:
-                        stream.write("about-to-wait\n")
                 fcntl.flock(fd, fcntl.LOCK_SH)
                 try:
                     _validate_reference_ids(home, (*installed_ids, *referenced_ids))

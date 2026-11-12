@@ -9,6 +9,7 @@ import io
 import json
 import multiprocessing
 import os
+import select
 import shutil
 import stat
 import subprocess
@@ -902,18 +903,18 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
 
     ready_pipe = tmp_path / "reference-gate-ready"
     os.mkfifo(ready_pipe)
-    ready_seen = threading.Event()
-
-    def read_ready() -> None:
-        with ready_pipe.open(encoding="ascii") as stream:
-            assert stream.readline() == "about-to-wait\n"
-            ready_seen.set()
-
-    # test-contract: the generated script reports immediately before its
-    # blocking references flock; production has no hook environment variable.
-    monkeypatch.setenv("ZETA_TEST_REFERENCE_GATE_READY", str(ready_pipe))
-    ready_reader = threading.Thread(target=read_ready)
-    ready_reader.start()
+    ready_fd = os.open(ready_pipe, os.O_RDWR | os.O_NONBLOCK)
+    anchor = "                fcntl.flock(fd, fcntl.LOCK_SH)"
+    assert anchor in ssh_module._SESSION_INSTALL_SCRIPT
+    instrumented_script = ssh_module._SESSION_INSTALL_SCRIPT.replace(
+        anchor,
+        f'''                with open({str(ready_pipe)!r}, "w", encoding="ascii") as stream:
+                    stream.write("about-to-wait\\n")
+{anchor}''',
+        1,
+    )
+    # test-contract: seam instrumentation must fail loudly if the script changes.
+    monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", instrumented_script)
 
     install_error: list[BaseException] = []
     install_finished = threading.Event()
@@ -928,22 +929,24 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
 
     manager = SessionManager(remote)
     installer = threading.Thread(target=run_install)
-    with SessionReferenceGate(remote, manager._storage_lease).exclusive(
-        session_id=session_id
-    ):
-        installer.start()
-        assert ready_seen.wait(10), "the SSH install never reached the references lock"
-        assert not install_finished.is_set(), (
-            "the install landed before the references lock attempt"
-        )
-        assert not (remote / "sessions" / session_id).exists()
-        assert not (remote / "session-reference-generation").exists()
+    try:
+        with SessionReferenceGate(remote, manager._storage_lease).exclusive(
+            session_id=session_id
+        ):
+            installer.start()
+            readable, _, _ = select.select([ready_fd], [], [], 10)
+            assert readable, "the SSH install never reached the references lock"
+            assert os.read(ready_fd, 1024) == b"about-to-wait\n"
+            assert not install_finished.is_set(), (
+                "the install landed before the references lock attempt"
+            )
+            assert not (remote / "sessions" / session_id).exists()
+            assert not (remote / "session-reference-generation").exists()
+    finally:
+        installer.join(10)
+        os.close(ready_fd)
 
-    assert install_finished.wait(10), "the install did not finish after release"
-    installer.join(10)
-    ready_reader.join(10)
-    assert not installer.is_alive()
-    assert not ready_reader.is_alive()
+    assert not installer.is_alive(), "the SSH install thread did not finish"
     assert not install_error, repr(install_error[0]) if install_error else ""
     assert (remote / "sessions" / session_id).exists()
     assert (
