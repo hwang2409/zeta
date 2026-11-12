@@ -747,7 +747,11 @@ class ApprovalLifecycle:
         record = current
         if record.disposition != "active":
             record = self._reserve_record(record, record.disposition)
-            await self._settle_record(record, "abort", record.disposition)
+            settlement = self._start_settlement(
+                record, self._settle_record(record, "abort", record.disposition)
+            )
+            self._change(record, settlement=settlement)
+            await settlement
             return None
         request = policy.request_from_store(core_key, state[0], label=label)
         record = self._change(record, request=request)

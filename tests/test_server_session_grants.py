@@ -1871,6 +1871,9 @@ async def test_turn_end_send_ready_orders(
             "abort_during_finish", "during_finish", id="abort_during_finish"
         ),
         pytest.param("store_decision", "none", id="store_decision"),
+        pytest.param(
+            "store_decision_duplicate", "none", id="store_decision_duplicate"
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -2102,6 +2105,52 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert duplicate["error"]["code"] == -32006, duplicate
             snapshot = (await request(5, "session_grants", {}))[-1]
             assert snapshot["result"]["session_grants"] == []
+            assert not server.control._approvals.state.records
+            return
+        if case == "store_decision_duplicate":
+            # Another writer decides call-1; while the bare runtime publication is
+            # mid-flight (record reserved to settling), a duplicate approve must
+            # not start a second settlement. Deleting the pending->settling reserve
+            # in _settlement_for_end lets the approve re-reserve the pending record.
+            assert server.runtime.opened is not None
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            original_finish_record = server.control._approvals._finish_record
+
+            async def gated_bare_finish(
+                record: Any, resolution: dict[str, str], row: Any = None
+            ) -> None:
+                if record.target.key == "call-1" and not entered.is_set():
+                    # test-contract: seam pause the bare publication after the reserve
+                    entered.set()
+                    await await_or_fail(release.wait(), what="bare publication")
+                return await original_finish_record(record, resolution, row)
+
+            monkeypatch.setattr(
+                server.control._approvals, "_finish_record", gated_bare_finish
+            )
+            await server.runtime.opened.store.resolve_approval_async("call-1", "allow")
+            await await_or_fail(entered.wait(), what="bare publication gate")
+            duplicate = (
+                await request(4, "approve", {"request_id": "call-1"})
+            )[-1]
+            assert duplicate.get("error", {}).get("code") == -32006, duplicate
+            release.set()
+            await frames_until("turn_end")
+            approval_ends = [
+                frame
+                for frame in observed
+                if frame.get("params", {}).get("event") == "approval_end"
+                and frame.get("params", {}).get("request_id") == "call-1"
+            ]
+            assert len(approval_ends) == 1, approval_ends
+            durable_ends = [
+                entry
+                for entry in server.runtime.opened.store.replay()
+                if entry.type == "approval_resolution"
+                and entry.data.get("request_id") == "call-1"
+            ]
+            assert len(durable_ends) == 1, durable_ends
             assert not server.control._approvals.state.records
             return
         if case == "abort_during_finish":
