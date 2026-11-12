@@ -447,7 +447,12 @@ class StreamableHTTPMCPClient(MCPClient):
                 yield response
         except httpx.HTTPError as exc:
             # transport exceptions can include complete request headers
-            raise MCPHTTPError(0, "MCP transport request failed") from exc
+            message = str(exc)
+            secrets = (*self.config.headers.values(), self.config.auth_token)
+            for secret in secrets:
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+            raise MCPHTTPError(0, message or "MCP transport request failed") from exc
 
     async def _send(
         self,
