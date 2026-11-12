@@ -10510,6 +10510,193 @@ async def test_terminal_reroute_moves_running_grandchild_idle_to_effective_paren
         child_store.close()
 
 
+@pytest.mark.asyncio
+async def test_drain_terminal_reroutes_late_grandchild_completion_to_root(
+    tmp_path: Path,
+) -> None:
+    """A grandchild completion that lands after its parent settled reaches root.
+
+    In window C the grandchild's completion commits into the dead child's store
+    (its direct parent) with a display-only mirror on root. On main
+    ``reroute_questions_from`` moves only questions/idle/hold, so the completion
+    reaches no model and the effective parent's marker for the grandchild never
+    clears. ``drain_terminal`` reroutes the completion to the live ancestor,
+    upgrading the root mirror to the model-visible report, and finishes the
+    stale marker.
+    """
+
+    root_store = ConversationStore(tmp_path / "root", session_id="root")
+    child_store = ConversationStore(tmp_path / "child", session_id="child")
+    owner = BackgroundAgentOwner(root_store)
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(root_store)
+    )
+    channel.register_delivery_flow(
+        "child", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    # "child" is alive, so the grandchild's completion resolves to the child
+    # store (its direct parent), not straight to root.
+    channel.register_loop("child")
+    gc_watcher: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    gc_watcher.set_result(None)
+    owner.register(
+        "gc",
+        lambda: None,
+        gc_watcher,  # type: ignore[arg-type]
+        parent_store=child_store,
+        parent_instance_id="child",
+    )
+    # finalize transferred the grandchild marker to the effective parent (root).
+    root_store.register_agent_child(
+        ToolCall("call-gc", "agent", {}),
+        child_session_path=_GC_PATH,
+        description="grandchild",
+        background=True,
+        child_instance_id="gc",
+    )
+    completion_kwargs: dict[str, Any] = dict(
+        child_instance_id="gc",
+        marker_key="gc",
+        child_session_path=_GC_PATH,
+        description="grandchild",
+        status="completed",
+        text="grandchild done",
+        stats=None,
+        killed_task_ids=None,
+        killed_task_count=None,
+        killed_task_ids_truncated=False,
+    )
+    try:
+        await await_or_fail(
+            channel.publish_completion(**completion_kwargs),
+            what="window-C grandchild completion",
+        )
+        # The model-visible completion is in the dead child store; root has only
+        # the display-only mirror.
+        assert any(
+            entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == "gc"
+            for entry in child_store.agent_notifications()
+        )
+        owner.adopt("gc", root_store, None)
+        moved = await await_or_fail(
+            channel.drain_terminal(child_store), what="drain_terminal"
+        )
+        assert moved == 1
+        root_completions = [
+            entry
+            for entry in root_store.agent_notifications()
+            if entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == "gc"
+        ]
+        # Exactly one model-visible completion on root (the upgraded mirror);
+        # agent_notifications() excludes display-only rows.
+        assert len(root_completions) == 1
+        assert root_completions[0].data.get("display_only") is not True
+        # The dead store no longer holds the completion...
+        assert not any(
+            entry.data.get("kind") == "agent_completion"
+            for entry in child_store.agent_notifications()
+        )
+        # ...and the effective parent's stale marker is cleared.
+        assert "gc" not in root_store.agent_children()
+    finally:
+        root_store.close()
+        child_store.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_terminal_seals_store_so_late_completion_retries_to_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completion that commits after the drain is refused and retries to root.
+
+    Production order: the grandchild's completion resolves to the child store,
+    then finalize transfers the marker, adopts the grandchild to root, and drains
+    the child store. The parked completion then commits. On main the commit lands
+    in the drained store and reaches no model; the fix seals the store, so the
+    commit is refused and the producer re-resolves to the live ancestor (root),
+    upgrading the display-only mirror and finishing the stale marker.
+    """
+
+    root_store = ConversationStore(tmp_path / "root", session_id="root")
+    child_store = ConversationStore(tmp_path / "child", session_id="child")
+    owner = BackgroundAgentOwner(root_store)
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(root_store)
+    )
+    channel.register_delivery_flow(
+        "child", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    channel.register_loop("child")
+    gc_watcher: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    gc_watcher.set_result(None)
+    owner.register(
+        "gc",
+        lambda: None,
+        gc_watcher,  # type: ignore[arg-type]
+        parent_store=child_store,
+        parent_instance_id="child",
+    )
+    root_store.register_agent_child(
+        ToolCall("call-gc", "agent", {}),
+        child_session_path=_GC_PATH,
+        description="grandchild",
+        background=True,
+        child_instance_id="gc",
+    )
+    # Park the completion's commit into the child store, after it resolved to the
+    # child but before it writes, so the drain runs first.
+    orig_commit = child_store.commit_delivery_input
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_commit(item, *, return_committed_on_cancel=False):
+        parked.set()
+        await await_or_fail(release.wait(), what="release parked child commit")
+        return await orig_commit(
+            item, return_committed_on_cancel=return_committed_on_cancel
+        )
+
+    monkeypatch.setattr(child_store, "commit_delivery_input", gated_commit)
+    completion_kwargs: dict[str, Any] = dict(
+        child_instance_id="gc",
+        marker_key="gc",
+        child_session_path=_GC_PATH,
+        description="grandchild",
+        status="completed",
+        text="grandchild done",
+        stats=None,
+        killed_task_ids=None,
+        killed_task_count=None,
+        killed_task_ids_truncated=False,
+    )
+    try:
+        publish = asyncio.ensure_future(channel.publish_completion(**completion_kwargs))
+        await await_or_fail(parked.wait(), what="parked completion commit")
+        owner.adopt("gc", root_store, None)
+        await await_or_fail(channel.drain_terminal(child_store), what="drain_terminal")
+        release.set()
+        await await_or_fail(publish, what="completion retry to root")
+        root_completions = [
+            entry
+            for entry in root_store.agent_notifications()
+            if entry.data.get("kind") == "agent_completion"
+            and entry.data.get("child_instance_id") == "gc"
+        ]
+        assert len(root_completions) == 1
+        assert root_completions[0].data.get("display_only") is not True
+        assert not any(
+            entry.data.get("kind") == "agent_completion"
+            for entry in child_store.agent_notifications()
+        )
+        assert "gc" not in root_store.agent_children()
+    finally:
+        root_store.close()
+        child_store.close()
+
 
 @pytest.mark.asyncio
 async def test_agent_send_reaches_running_child_at_next_step_boundary(
