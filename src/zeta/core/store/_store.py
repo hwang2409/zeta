@@ -1125,18 +1125,8 @@ class ConversationStore(
     def _row_index(self) -> ResidentRows:
         """Return the store-owned row index, refreshing it after an append."""
         rows = self._resident_rows
-        cached = rows.entries
-        current = self._entries
-        changed = len(cached) != len(current)
-        if cached and current and not changed:
-            changed = (
-                cached[0].id != current[0].id
-                or cached[0].parent_id != current[0].parent_id
-                or cached[-1].id != current[-1].id
-                or cached[-1].parent_id != current[-1].parent_id
-            )
-        if changed:
-            rows.replace(current)
+        if rows.entries != self._entries:
+            rows.replace(self._entries)
         return rows
 
     def _active_branch(self) -> tuple[ConversationEntry, ...]:
