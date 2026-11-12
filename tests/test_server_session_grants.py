@@ -2824,7 +2824,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             )
             wire_ends = [
                 frame
-                for frame in observed
+                for frame in wire
                 if frame.get("params", {}).get("event") == "approval_end"
                 and frame.get("params", {}).get("request_id") == "call-1"
             ]
