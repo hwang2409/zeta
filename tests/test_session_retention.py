@@ -610,7 +610,7 @@ def test_isolated_partial_second_sweep_keeps_complete_preview(tmp_path):
         complete, _ = _run_sweep(planner)
         preview_id = complete.preview.preview_id
         (tmp_path / "sessions" / root / "new-old-file").write_bytes(b"x" * 100)
-        partial = planner.run_pass(days=30)
+        planner.run_pass(days=30)
         state = json.loads((tmp_path / "retention-state.json").read_text())
     assert state["preview"]["preview_id"] == preview_id
 
@@ -626,5 +626,5 @@ def test_isolated_sent_ledger_states(tmp_path, reported, expected):
         _age_tree(tmp_path / "sessions" / root)
         _write_sent_ledger(tmp_path, root, reported)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        result, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+        _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
     assert reasons[root][0] is expected
