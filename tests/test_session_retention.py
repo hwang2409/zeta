@@ -158,94 +158,6 @@ def _planner(stack, *args, **kwargs):
     return planner
 
 
-def test_closure_reasons_table(tmp_path):
-    manager = _manager(tmp_path)
-    with ExitStack() as stack:
-        # One root per blocker in design §3.2 (1-7) plus age, unsafe, reserved,
-        # and one genuinely closed, old, unreferenced candidate.
-        held = manager.create(
-            provider="codex", model="gpt-5.6-sol", cwd=str(tmp_path), auto_project=False
-        )
-        stack.callback(held.store.close)
-        held_id = held.metadata.session_id
-
-        live_child = _create_closed(manager, stack)
-        child_dir = tmp_path / "sessions" / live_child / "agents" / "1"
-        child_dir.mkdir(parents=True)
-        (child_dir / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "running", "started_at": _OLD, "finished_at": None})
-        )
-        (child_dir / ".lock").write_text("")
-
-        pinned = _create_closed(manager, stack)
-        with session_root(tmp_path / "sessions" / pinned) as fd:
-            write_retention_pin(fd)
-
-        pending = _create_closed(manager, stack)
-        (tmp_path / "sessions" / pending / "project_link_pending.json").write_text(
-            json.dumps({"project_id": "p", "role": "session"})
-        )
-
-        parent = _create_closed(manager, stack)
-        dependent = _create_closed(manager, stack, parent_session_id=parent)
-
-        inbox = _create_closed(manager, stack)
-        new_dir = tmp_path / "projects" / "p_x" / "inbox" / "new"
-        new_dir.mkdir(parents=True)
-        (tmp_path / "projects" / ".lock").write_text("")  # real homes have one
-        (new_dir / "m.json").write_text(
-            json.dumps({"from": {"project": "p", "session": inbox}, "to_session": None})
-        )
-
-        reserved = _create_closed(manager, stack)
-        reservations = tmp_path / "session-trash" / "reservations"
-        reservations.mkdir(parents=True)
-        (reservations / f"{reserved}.json").write_text("{}")
-
-        unsafe = _create_closed(manager, stack)
-        os.symlink("meta.json", tmp_path / "sessions" / unsafe / "danger")
-
-        pinned_child = _create_closed(manager, stack, parent_session_id=pinned)
-
-        marker = _create_closed(manager, stack)
-        (tmp_path / "sessions" / marker / "session_state.json").write_text(
-            json.dumps({"agent_children": {"call_1": {"run_id": "r"}}})
-        )
-
-        sent_done = _create_closed(manager, stack)
-        _write_sent_ledger(tmp_path, sent_done, ["claimed", "done"])
-        sent_open = _create_closed(manager, stack)
-        _write_sent_ledger(tmp_path, sent_open, ["claimed"])
-        sent_broken = _create_closed(manager, stack)
-        _write_sent_ledger(tmp_path, sent_broken, "done")
-
-        candidate = _create_closed(manager, stack)
-        selected = (dependent, sent_done, candidate)
-        expected_bytes = sum(_true_tree_bytes(tmp_path / "sessions" / i) for i in selected)
-
-        lease = stack.enter_context(_opened_lease(tmp_path))
-        future = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
-        result, reasons = _run_sweep(future)
-
-    assert reasons[held_id] == (False, "session is open or in use")
-    assert reasons[live_child] == (False, "live or recoverable child")
-    assert reasons[pinned] == (False, "pinned")
-    assert reasons[pinned_child] == (False, "pinned")
-    assert reasons[pending] == (False, "pending project link")
-    assert reasons[parent] == (False, "published top-level dependent")
-    assert reasons[inbox] == (False, "pending inbox reference")
-    assert reasons[reserved] == (False, "session is being deleted")
-    assert reasons[unsafe] == (False, "unsafe entry in tree")
-    assert reasons[marker] == (False, "live or recoverable child")
-    assert reasons[sent_open] == (False, "unacknowledged sent message")
-    assert reasons[sent_broken] == (False, "broken sent tracker")
-    assert reasons[sent_done] == (True, None)
-    assert reasons[dependent] == (True, None)
-    assert reasons[candidate] == (True, None)
-    assert sorted(result.preview.root_ids) == sorted(selected)
-    assert result.preview.bytes == expected_bytes
-
-
 def test_not_old_blocks_under_real_clock(tmp_path):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
@@ -271,7 +183,7 @@ def test_resume_completes_over_passes_with_exact_bytes(tmp_path):
         child = tmp_path / "sessions" / root / "agents" / "1"
         child.mkdir(parents=True)
         (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
+            json.dumps({"handle": "child", "state": "completed", "started_at": _OLD, "finished_at": _OLD})
         )
         (child / "conversation.jsonl").write_text("x" * 100)
         (child / ".lock").write_text("")
@@ -300,7 +212,7 @@ def test_touched_completed_directory_is_rewalked(tmp_path):
         child = tmp_path / "sessions" / root / "agents" / "1"
         child.mkdir(parents=True)
         (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
+            json.dumps({"handle": "child", "state": "completed", "started_at": _OLD, "finished_at": _OLD})
         )
         (child / ".lock").write_text("")
 
@@ -383,7 +295,7 @@ def test_in_flight_walk_keeps_conforming_writers_out(tmp_path):
         child = tmp_path / "sessions" / root / "agents" / "1"
         child.mkdir(parents=True)
         (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
+            json.dumps({"handle": "child", "state": "completed", "started_at": _OLD, "finished_at": _OLD})
         )
         _age_tree(tmp_path / "sessions" / root)
         lease = stack.enter_context(_opened_lease(tmp_path))
@@ -633,100 +545,340 @@ def test_isolated_sent_ledger_states(tmp_path, reported, expected):
     assert reasons[root][0] is expected
 
 
-_MATRIX_KINDS = ("pending_link", "sent_root", "inbox", "dependent_meta", "dependent_fork", "source_attention", "child_sent", "child_inbox")
+_MATRIX_KINDS = (
+    "reservation", "session_state", "child_lifecycle", "pending_link",
+    "pending_child_link", "sent_root", "inbox", "dependent_meta",
+    "dependent_fork", "source_attention", "child_sent", "child_inbox",
+    "pin", "age", "generation", "discovery", "walk",
+)
 _MATRIX_MODES = ("absent", "present", "malformed")
-_DEADLINE_KINDS = ("inbox", "dependent_meta", "source_attention", "child_sent")
-_MATRIX_ROWS = [(kind, mode) for mode in _MATRIX_MODES for kind in _MATRIX_KINDS]
-_MATRIX_ROWS.extend((kind, "deadline") for kind in _DEADLINE_KINDS)
+_MATRIX_ROWS = [(kind, mode) for kind in _MATRIX_KINDS for mode in _MATRIX_MODES]
 
 
-def _build_authority_row(tmp_path, kind, mode):
-    manager = _manager(tmp_path)
-    stack = ExitStack()
-    root = _create_closed(manager, stack)
-    root_dir = tmp_path / "sessions" / root
-    _age_tree(root_dir)
+def _valid_inbox(session_id):
+    return {
+        "schema_version": 1, "id": "b" * 32,
+        "from": {"project": "p_x", "session": "c" * 32},
+        "to_project": "p_x", "to_session": session_id, "kind": "question",
+        "title": "title", "body": "", "in_reply_to": None, "created_at": _OLD,
+    }
+
+
+def _valid_attention(session_id, fork_session_id=None):
+    return {
+        "id": "a" * 32, "created_at": _OLD, "session_id": session_id,
+        "project_id": None, "entry_id": None, "entry_seq": None,
+        "lane": "default", "title": "title", "why": "why", "options": [],
+        "recommendation": None, "status": "open", "fork_session_id": fork_session_id,
+    }
+
+
+def _valid_pending(session_id=None):
+    value = {
+        "project_id": "p_x", "role": "session", "transcript_path": "conversation.jsonl",
+        "parent_session_id": None, "previous_project_id": None,
+    }
+    if session_id is not None:
+        value["session_id"] = session_id
+    return value
+
+
+def _child_store(root_dir, state="completed"):
+    child = root_dir / "agents" / "1"
+    child.mkdir(parents=True)
+    lifecycle = {
+        "handle": "child", "state": state, "started_at": _OLD,
+        "finished_at": _OLD if state in {"completed", "canceled", "failed"} else None,
+    }
+    (child / "agent_lifecycle.json").write_text(json.dumps(lifecycle))
+    (child / ".lock").write_text("")
+    return child
+
+
+def _write_inbox(home, payload, *, name=None):
+    inbox = home / "projects" / "p_x" / "inbox" / "new"
+    inbox.mkdir(parents=True, exist_ok=True)
+    message_name = name or f"{payload.get('id', 'record')}.json"
+    (inbox / message_name).write_text(json.dumps(payload))
+
+
+def _setup_reservation(home, root, mode):
+    reservations = home / "session-trash" / "reservations"
+    reservations.mkdir(parents=True)
+    target = root if mode != "absent" else "d" * 32
+    value = {
+        "schema_version": 1, "session_id": target, "transaction_id": "tx",
+        "source_path": f"sessions/{target}", "trash_path": f"session-trash/tx/{target}",
+        "device": 1, "inode": 1,
+    }
+    if mode == "malformed":
+        value = {"schema_version": 1, "session_id": root}
+    (reservations / f"{target}.json").write_text(json.dumps(value))
+
+
+def _setup_session_state(root_dir, mode):
+    path = root_dir / "session_state.json"
     if mode == "absent":
-        return stack, root, True
+        return
+    if mode == "malformed":
+        path.write_text("{}")
+        return
+    value = json.loads(path.read_text())
+    value["agent_children"] = {
+        "call": {
+            "tool_call": {"id": "call", "name": "agent", "arguments": {}},
+            "child_session_path": "/child", "description": "child",
+        }
+    }
+    path.write_text(json.dumps(value))
+
+
+def _setup_pending(root_dir, root, kind, mode):
     if kind == "pending_link":
-        if mode == "present":
-            (root_dir / "project_link_pending.json").write_text('{"project_id":"p"}')
-        else:
-            (root_dir / "project_link_pending.json").write_text("{}")
-    elif kind == "sent_root":
-        _write_sent_ledger(tmp_path, root, ["claimed", "done"] if mode == "present" else "done")
-    elif kind == "inbox":
-        inbox = tmp_path / "projects" / "p_x" / "inbox" / "new"
-        inbox.mkdir(parents=True)
-        (inbox / "record.json").write_text(
-            json.dumps({"to_session": root}) if mode == "present" else "{}"
-        )
-    elif kind == "dependent_meta":
-        other = _create_closed(manager, stack, parent_session_id=root)
-        _age_tree(tmp_path / "sessions" / other)
+        value = _valid_pending() if mode != "malformed" else {"project_id": "p_x"}
+        if mode != "absent":
+            (root_dir / "project_link_pending.json").write_text(json.dumps(value))
+        return
+    pending = root_dir / "pending_child_links"
+    pending.mkdir()
+    if mode == "absent":
+        return
+    value = _valid_pending(f"{root}:1") if mode != "malformed" else {"session_id": f"{root}:1"}
+    (pending / "child.json").write_text(json.dumps(value))
+
+
+def _setup_dependent(manager, stack, home, root, kind, mode):
+    other = _create_closed(manager, stack)
+    other_dir = home / "sessions" / other
+    _age_tree(other_dir)
+    if kind == "dependent_meta":
+        meta = json.loads((other_dir / "meta.json").read_text())
+        meta["parent_session_id"] = root if mode == "present" else None
         if mode == "malformed":
-            (tmp_path / "sessions" / other / "meta.json").write_text("{}")
+            meta["parent_session_id"] = 7
+        (other_dir / "meta.json").write_text(json.dumps(meta))
     elif kind == "dependent_fork":
-        other = _create_closed(manager, stack)
-        _age_tree(tmp_path / "sessions" / other)
-        payload = {"forked_from_session": root, "forked_at_entry": "e", "attention_id": "a"}
-        (tmp_path / "sessions" / other / "attention_fork.json").write_text(
-            json.dumps(payload if mode == "present" else {})
-        )
-    elif kind == "source_attention":
-        other = _create_closed(manager, stack)
-        _age_tree(tmp_path / "sessions" / other)
-        attention = tmp_path / "sessions" / other / "attention"
+        value = {
+            "forked_from_session": root if mode == "present" else "e" * 32,
+            "forked_at_entry": "entry", "attention_id": "a" * 32,
+        }
+        if mode == "malformed":
+            value = {"forked_from_session": root}
+        (other_dir / "attention_fork.json").write_text(json.dumps(value))
+    else:
+        attention = other_dir / "attention"
         attention.mkdir()
-        payload = {"id": "a" * 32, "created_at": _OLD, "session_id": other,
-                   "project_id": None, "entry_id": None, "entry_seq": None,
-                   "lane": "default", "title": "title", "why": "why", "options": [],
-                   "recommendation": None, "status": "open", "fork_session_id": root}
-        (attention / ("a" * 32 + ".json")).write_text(json.dumps(payload if mode == "present" else {}))
-    elif kind == "child_sent":
-        child = root_dir / "agents" / "1"
-        child.mkdir(parents=True)
-        (child / "agent_lifecycle.json").write_text(json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD}))
-        (child / ".lock").write_text("")
+        value = _valid_attention(other, root if mode == "present" else None)
+        name = "a" * 32 + ".json"
+        if mode == "malformed":
+            name = "b" * 32 + ".json"
+        (attention / name).write_text(json.dumps(value))
+
+
+def _setup_child_authority(home, root, root_dir, kind, mode):
+    state = "running" if kind == "child_lifecycle" and mode == "present" else "completed"
+    child = _child_store(root_dir, state)
+    if kind == "child_lifecycle":
+        if mode == "malformed":
+            (child / "agent_lifecycle.json").write_text('{"state":"completed"}')
+        return
+    if kind == "child_sent":
+        _write_sent_ledger(home, root, ["claimed"] if mode == "present" else ["done"])
+        ledger = home / "sessions" / root / "project-inbox-sent.json"
+        (child / "project-inbox-sent.json").write_text(ledger.read_text())
+        ledger.unlink()
+        if mode == "malformed":
+            (child / "project-inbox-sent.json").write_text(
+                '{"records":[{"id":"x","reported":["done"]}]}'
+            )
+        return
+    payload = _valid_inbox(f"{root}:1" if mode == "present" else "f" * 32)
+    if mode == "malformed":
+        payload = {"title": "x"}
+    _write_inbox(home, payload)
+
+
+def _setup_authority(tmp_path, manager, stack, root, kind, mode):
+    root_dir = tmp_path / "sessions" / root
+    if kind == "reservation":
+        _setup_reservation(tmp_path, root, mode)
+    elif kind == "session_state":
+        _setup_session_state(root_dir, mode)
+    elif kind in {"child_lifecycle", "child_sent", "child_inbox"}:
+        _setup_child_authority(tmp_path, root, root_dir, kind, mode)
+    elif kind in {"pending_link", "pending_child_link"}:
+        _setup_pending(root_dir, root, kind, mode)
+    elif kind == "sent_root":
+        reported = ["done"] if mode == "absent" else ["claimed"]
+        _write_sent_ledger(tmp_path, root, reported)
+        if mode == "malformed":
+            (root_dir / "project-inbox-sent.json").write_text(
+                '{"records":[{"id":"x","reported":["done"]}]}'
+            )
+    elif kind == "inbox":
+        payload = _valid_inbox(root if mode == "present" else "f" * 32)
+        if mode == "malformed":
+            payload = {"title": "x"}
+        _write_inbox(tmp_path, payload)
+    else:
+        _setup_authority_tail(tmp_path, manager, stack, root, kind, mode)
+
+
+def _setup_authority_tail(tmp_path, manager, stack, root, kind, mode):
+    root_dir = tmp_path / "sessions" / root
+    if kind in {"dependent_meta", "dependent_fork", "source_attention"}:
+        _setup_dependent(manager, stack, tmp_path, root, kind, mode)
+    elif kind == "pin" and mode != "absent":
         if mode == "present":
-            _write_sent_ledger(tmp_path, root, ["claimed"])
-            (child / "project-inbox-sent.json").write_text((root_dir / "project-inbox-sent.json").read_text())
+            with session_root(root_dir) as fd:
+                write_retention_pin(fd)
         else:
-            (child / "project-inbox-sent.json").write_text("{}")
-    elif kind == "child_inbox":
-        child = root_dir / "agents" / "1"
-        child.mkdir(parents=True)
-        (child / "agent_lifecycle.json").write_text(json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD}))
-        (child / ".lock").write_text("")
-        inbox = tmp_path / "projects" / "p_x" / "inbox" / "new"
-        inbox.mkdir(parents=True)
-        (inbox / "record.json").write_text(
-            json.dumps({"to_session": f"{root}:1"}) if mode == "present" else "{}"
+            (root_dir / RETENTION_PIN_FILENAME).write_text('{"pinned":false}')
+    elif kind == "age":
+        if mode == "present":
+            recent = _future_ns() - _DAY_NS
+            os.utime(root_dir / "meta.json", ns=(recent, recent))
+        elif mode == "malformed":
+            meta = json.loads((root_dir / "meta.json").read_text())
+            meta["updated_at"] = "not-a-time"
+            (root_dir / "meta.json").write_text(json.dumps(meta))
+    elif kind == "generation":
+        (tmp_path / "session-reference-generation").write_text(
+            "broken" if mode == "malformed" else "0\n"
         )
-    return stack, root, mode == "absent" or (mode == "present" and kind == "sent_root")
+    elif kind == "discovery" and mode == "malformed":
+        (tmp_path / "sessions" / "unsafe-root").symlink_to(root_dir)
+    elif kind == "walk" and mode != "absent":
+        if mode == "present":
+            (root_dir / "unsafe").symlink_to("meta.json")
+        else:
+            os.link(root_dir / "meta.json", root_dir / "hard-linked-meta")
+
+
+def _generation_reader(monkeypatch):
+    calls = 0
+
+    def read(_home):
+        nonlocal calls
+        calls += 1
+        return 0 if calls % 2 else 1
+
+    monkeypatch.setattr("zeta.session_retention.read_reference_generation", read)
 
 
 @pytest.mark.parametrize(("kind", "mode"), _MATRIX_ROWS)
-def test_closure_authority_matrix(tmp_path, kind, mode):
-    stack, root, expected = _build_authority_row(tmp_path, kind, "absent" if mode == "deadline" else mode)
-    if mode != "deadline":
-        with stack:
-            lease = stack.enter_context(_opened_lease(tmp_path))
-            _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
-        assert reasons[root][0] is expected
-        return
-
-    base = time.time_ns() + 60 * _DAY_NS
-    calls = 0
-
-    def now_ns():
-        nonlocal calls
-        calls += 1
-        return base if calls < 12 else base + 31 * 1_000_000_000
-
-    with stack:
+def test_closure_authority_matrix(tmp_path, monkeypatch, kind, mode):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        root_dir = tmp_path / "sessions" / root
+        _age_tree(root_dir)
+        _setup_authority(tmp_path, manager, stack, root, kind, mode)
+        if kind == "generation" and mode == "present":
+            _generation_reader(monkeypatch)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        result = RetentionPlanner(tmp_path, lease, now_ns=now_ns).run_pass(days=30)
-    assert not result.complete
-    assert result.preview is None
-    assert not any(row.root_id == root and row.closed for row in result.reasons)
+        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        result, reasons = _run_sweep(planner) if not (
+            kind == "discovery" and mode == "malformed"
+        ) else (planner.run_pass(days=30), {})
+    if kind == "discovery" and mode == "malformed":
+        assert not result.complete
+        assert result.preview is None
+        return
+    expected_clear = mode == "absent" or (kind == "discovery" and mode == "present")
+    assert reasons[root][0] is expected_clear
+    assert (root in result.preview.root_ids) is expected_clear
+
+_OVER_BOUND_KINDS = (
+    "child_stores", "sent_root", "inbox",
+    "dependent_meta", "source_attention", "child_sent", "discovery", "walk",
+)
+
+
+def _many_sent_records(path, count):
+    records = [
+        {
+            "id": f"{index:032x}", "target_project": "p_x", "created_at": _OLD,
+            "reported": ["done"],
+        }
+        for index in range(count)
+    ]
+    path.write_text(json.dumps({"schema_version": 1, "records": records}))
+
+
+def _setup_over_bound(home, manager, stack, root, kind, count=24):
+    root_dir = home / "sessions" / root
+    if kind == "child_stores":
+        for index in range(count):
+            child = root_dir / "agents" / str(index)
+            child.mkdir(parents=True)
+            (child / "agent_lifecycle.json").write_text(json.dumps({
+                "handle": f"child-{index}", "state": "completed",
+                "started_at": _OLD, "finished_at": _OLD,
+            }))
+            (child / ".lock").write_text("")
+    elif kind == "pending_child_link":
+        pending = root_dir / "pending_child_links"
+        pending.mkdir()
+        for index in range(count):
+            value = _valid_pending(f"{root}:{index}")
+            (pending / f"{index}.json").write_text(json.dumps(value))
+    elif kind in {"sent_root", "child_sent"}:
+        directory = root_dir if kind == "sent_root" else _child_store(root_dir)
+        _many_sent_records(directory / "project-inbox-sent.json", count)
+    elif kind == "inbox":
+        for index in range(count):
+            payload = _valid_inbox("f" * 32)
+            payload["id"] = f"{index:032x}"
+            _write_inbox(home, payload)
+    else:
+        _setup_over_bound_tail(home, manager, stack, root, kind, count)
+
+
+def _setup_over_bound_tail(home, manager, stack, root, kind, count):
+    if kind in {"dependent_meta", "discovery"}:
+        for _ in range(count):
+            other = _create_closed(manager, stack)
+            _age_tree(home / "sessions" / other)
+    elif kind == "source_attention":
+        other = _create_closed(manager, stack)
+        _age_tree(home / "sessions" / other)
+        attention = home / "sessions" / other / "attention"
+        attention.mkdir()
+        for index in range(count):
+            value = _valid_attention(other)
+            value["id"] = f"{index:032x}"
+            (attention / f"{index:032x}.json").write_text(json.dumps(value))
+    elif kind == "walk":
+        spill = home / "sessions" / root / "spill"
+        spill.mkdir()
+        for index in range(count):
+            (spill / str(index)).write_text("x")
+
+
+@pytest.mark.parametrize("kind", _OVER_BOUND_KINDS)
+def test_closure_authority_over_bound_matrix(tmp_path, kind):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        _setup_over_bound(tmp_path, manager, stack, root, kind)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        if kind == "discovery":
+            bounds = RetentionBounds(entries_total=2)
+        elif kind == "walk":
+            bounds = RetentionBounds(entries_per_root=2)
+        else:
+            bounds = RetentionBounds(reference_records_per_root=20)
+        planner = RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
+        if kind in {"discovery", "walk"}:
+            result = planner.run_pass(days=30)
+            reasons = {}
+        else:
+            result, reasons = _run_sweep(planner)
+    if kind in {"discovery", "walk"}:
+        assert not result.complete
+        assert result.preview is None
+    else:
+        assert reasons[root] == (False, "references not fully scanned")
+        assert root not in result.preview.root_ids
