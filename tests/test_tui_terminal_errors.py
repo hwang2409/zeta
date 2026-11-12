@@ -87,6 +87,7 @@ def test_stray_stderr_never_reaches_the_terminal(tmp_path: Path) -> None:
         os.close(master_fd)
 
     terminal = output.decode("utf-8", "replace")
+    # Check the user-visible terminal before checking that capture persisted the noise.
     for text in (*NOISE, "Traceback"):
         assert text not in terminal, f"terminal showed stray stderr: {text}"
     assert "resume with:" in terminal
