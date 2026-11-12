@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING, Any
 
 from ...core.session_execution import SessionOwnedError
@@ -20,6 +21,22 @@ from . import validation
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
+
+
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_RESERVED_HEADERS = frozenset({
+    "connection",
+    "content-length",
+    "expect",
+    "host",
+    "http2-settings",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+_RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-")
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
@@ -76,6 +93,7 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
+        previous_session_id = self.server.runtime.session_id
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
             self.server.connections.replay_session_replaced()
@@ -137,7 +155,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 await self.server.runtime.loop.set_mcp_bindings(headers, configs)
                 self.server.control._active_mcp_bindings = headers
                 self.server.control._mcp_binding_required = bool(headers)
-            elif self.server.runtime.loop is not None:
+            elif previous_session_id != session_id:
                 self.server.control._active_mcp_bindings = {}
                 self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
@@ -182,7 +200,9 @@ def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
         for header, value in headers.items():
             if (
                 type(header) is not str or type(value) is not str or not header
-                or any(ord(char) < 33 or ord(char) > 126 for char in header)
+                or _HEADER_NAME.fullmatch(header) is None
+                or header.casefold() in _RESERVED_HEADERS
+                or header.casefold().startswith(_RESERVED_HEADER_PREFIXES)
                 or any(ord(char) < 32 and char not in "\t" for char in value)
                 or any(ord(char) > 126 for char in value)
                 or len(header.encode()) > 256 or len(value.encode()) > 8192

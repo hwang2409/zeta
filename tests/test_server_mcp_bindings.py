@@ -3,14 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import (
+    FakeBackend,
+    PerActorFakeBackend,
+    ScriptedTurn,
+)
 from tests.test_server import TIMEOUT, _connect, _request
+from zeta.mcp import MCPServerConfig, StreamableHTTPMCPClient
+from zeta.mcp.client import MCPHTTPError
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
 
@@ -18,8 +25,11 @@ SECRET = "page-secret-never-persisted"
 
 
 class LocalMCP:
-    def __init__(self) -> None:
+    def __init__(self, *, error_with_header: bool = False) -> None:
         self.headers: list[str | None] = []
+        self.methods: list[str] = []
+        self.error_with_header = error_with_header
+        self.request_received = asyncio.Event()
         self.auth_received = asyncio.Event()
         self.server: asyncio.AbstractServer | None = None
 
@@ -39,11 +49,28 @@ class LocalMCP:
             body = await reader.readexactly(length)
             request = json.loads(body)
             self.headers.append(headers.get("authorization"))
+            self.request_received.set()
             if headers.get("authorization") is not None:
                 self.auth_received.set()
             method = request["method"]
+            self.methods.append(method)
+            if self.error_with_header:
+                payload = (headers.get("authorization") or "missing").encode()
+                writer.write(
+                    b"HTTP/1.1 500 Internal Server Error\r\n"
+                    b"content-type: text/plain\r\ncontent-length: "
+                    + str(len(payload)).encode()
+                    + b"\r\n\r\n"
+                    + payload
+                )
+                await writer.drain()
+                return
+            if method == "notifications/initialized":
+                writer.write(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n")
+                await writer.drain()
+                return
             if method == "initialize":
-                result = {"protocolVersion": "2025-03-26", "capabilities": {}}
+                result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}}
             elif method == "tools/list":
                 result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}]}
             elif method == "tools/call":
@@ -62,6 +89,56 @@ class LocalMCP:
         assert self.server is not None
         self.server.close()
         await self.server.wait_closed()
+
+
+class LocalTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        mcp_reader, mcp_writer = await asyncio.open_connection(
+            request.url.host, request.url.port
+        )
+        try:
+            body = request.content
+            wire_headers = "".join(
+                f"{name}: {value}\r\n" for name, value in request.headers.items()
+            )
+            mcp_writer.write(
+                (
+                    f"POST {request.url.raw_path.decode()} HTTP/1.1\r\n"
+                    f"{wire_headers}content-length: {len(body)}\r\n\r\n"
+                ).encode()
+                + body
+            )
+            await mcp_writer.drain()
+            head = await mcp_reader.readuntil(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            status = int(lines[0].split()[1])
+            response_headers = dict(
+                line.split(b": ", 1) for line in lines[1:] if b": " in line
+            )
+            length = int(response_headers.get(b"content-length", b"0"))
+            payload = await mcp_reader.readexactly(length)
+            return httpx.Response(
+                status,
+                headers={key.decode(): value.decode() for key, value in response_headers.items()},
+                content=payload,
+                request=request,
+            )
+        finally:
+            mcp_writer.close()
+            await mcp_writer.wait_closed()
+
+
+def allow_local_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_client(
+            *args,
+            transport=LocalTransport(),
+            **{key: value for key, value in kwargs.items() if key != "transport"},
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -178,4 +255,254 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
         finally:
             writer2.close(); await writer2.wait_closed()
     finally:
+        await server.close()
+
+
+async def _wait_for_controller_release(server: ZetaServer) -> None:
+    while server.control._controller_release_task is None:
+        await asyncio.wait_for(asyncio.sleep(0), 10)
+    await asyncio.wait_for(
+        asyncio.shield(server.control._controller_release_task), 10
+    )
+
+
+@pytest.mark.asyncio
+async def test_bound_mcp_tools_are_not_inherited_by_child_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    parent_call = ToolCall(
+        "agent-1", "agent",
+        {"prompt": "inspect child tools", "description": "child", "background": False},
+    )
+    backend = PerActorFakeBackend(
+        [
+            ScriptedTurn([TextContent("mounted")]),
+            ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn([TextContent("done")]),
+        ],
+        {"inspect child tools": [ScriptedTurn([TextContent("child done")])]},
+        parent_prompt={"warm", "delegate"},
+        gated_child_prompts=(),
+        parent_waits_for_children=False,
+    )
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        await _request(reader, writer, 2, "new_session", {
+            "provider": "codex",
+            "mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer child-secret"}}],
+        })
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await asyncio.wait_for(mcp.request_received.wait(), TIMEOUT)
+        await asyncio.wait_for(server.runtime.loop._ensure_mcp_servers(), TIMEOUT)
+        assert server.runtime.loop._mcp_mount.statuses["page"].state == "mounted", repr(
+            server.runtime.loop._mcp_mount.statuses["page"]
+        )
+        assert server.control._turn_task is not None
+        await asyncio.wait_for(asyncio.shield(server.control._turn_task), TIMEOUT)
+        await _request(reader, writer, 4, "send", {"text": "delegate"})
+        async def wait_for_child() -> None:
+            while not backend.children["inspect child tools"].calls:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_child(), TIMEOUT)
+        child_tools = {
+            tool["name"]
+            for tool in backend.children["inspect child tools"].calls[0][1]
+        }
+        assert "page__echo" not in child_tools
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_unbound_disconnect_preserves_ordinary_mcp_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = FakeBackend([ScriptedTurn([TextContent("ready")])])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "mount"})
+        await asyncio.wait_for(mcp.request_received.wait(), TIMEOUT)
+
+        async def wait_for_mount() -> object:
+            while server.runtime.loop._mcp_mount is None:
+                await asyncio.sleep(0)
+            return server.runtime.loop._mcp_mount
+
+        mount = await asyncio.wait_for(wait_for_mount(), TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        assert server.runtime.loop._mcp_mount is mount
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_without_binding_keeps_required_guard(tmp_path: Path) -> None:
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": "http://127.0.0.1:9"
+    }}}))
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        session = (await _request(reader, writer, 2, "new_session", {
+            "mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer x"}}]
+        }))[-1]["result"]["session"]
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            await _request(reader2, writer2, 3, "hello", {"protocol_version": "1.2"})
+            resumed = (await _request(reader2, writer2, 4, "resume", {
+                "session_id": session["session_id"]
+            }))[-1]
+            assert "result" in resumed
+            blocked = (await _request(reader2, writer2, 5, "send", {"text": "blocked"}))[-1]
+            assert blocked.get("error", {}).get("code") == -32003
+        finally:
+            writer2.close()
+            await writer2.wait_closed()
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_bound_http_error_redacts_header_everywhere(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_local_http(monkeypatch)
+    secret = "echoed-bound-secret"
+    mcp = LocalMCP(error_with_header=True)
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    caplog.set_level(logging.DEBUG)
+    frames: list[dict[str, Any]] = []
+    try:
+        frames += await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        frames += await _request(reader, writer, 2, "new_session", {
+            "provider": "codex",
+            "mcp_bindings": [{"server": "page", "headers": {"Authorization": secret}}],
+        })
+        frames += await _request(reader, writer, 3, "send", {"text": "mount"})
+        await asyncio.wait_for(mcp.auth_received.wait(), TIMEOUT)
+
+        async def wait_for_statuses() -> object:
+            while (
+                server.runtime.loop._mcp_mount is None
+                or server.runtime.loop._mcp_mount.statuses["page"].state == "connecting"
+            ):
+                await asyncio.sleep(0)
+            return server.runtime.loop._mcp_mount.statuses
+
+        statuses = await asyncio.wait_for(wait_for_statuses(), TIMEOUT)
+        exposed = json.dumps(frames) + caplog.text + repr(statuses)
+        assert secret not in exposed
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+    monkeypatch.undo()
+
+    async def fail_with_request(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"failed with {secret}", request=request)
+
+    config = MCPServerConfig(
+        "page",
+        "streamable-http",
+        url="https://mcp.test",
+        headers={"Authorization": secret},
+    )
+    client = StreamableHTTPMCPClient(
+        config,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(fail_with_request)),
+    )
+    try:
+        with pytest.raises(MCPHTTPError) as caught:
+            await client.connect()
+        assert secret not in repr(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_rejects_invalid_and_reserved_header_names(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": "http://127.0.0.1:9"
+    }}}))
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        names = (
+            "bad:name", "Host", "Content-Length", "Transfer-Encoding", "Connection",
+            "Upgrade", "TE", "Trailer", "Keep-Alive", "Proxy-Authorization",
+        )
+        errors = []
+        for request_id, name in enumerate(names, 2):
+            errors.append((await _request(reader, writer, request_id, "new_session", {
+                "mcp_bindings": [{"server": "page", "headers": {name: "secret"}}]
+            }))[-1])
+        assert all(
+            error.get("error", {}).get("code") == -32602 for error in errors
+        )
+    finally:
+        writer.close()
+        await writer.wait_closed()
         await server.close()

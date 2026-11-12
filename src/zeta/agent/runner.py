@@ -416,6 +416,7 @@ async def _build_child_loop(
         child_registry = loop.tool_registry.clone_for_session(
             child_store,
             exclude_names=excluded_names,
+            exclude_mcp_servers=set(loop._mcp_bindings),
             profile_tool_allow=profile_tool_allow,
             cwd=cwd_override,
             image_policy=child_image_policy,

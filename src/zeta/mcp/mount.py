@@ -244,11 +244,14 @@ class MCPMount:
         activated: list[str] = []
         rejected: list[str] = []
         for name in dict.fromkeys(names):
-            if name in registry._mcp_excluded_names:
-                rejected.append(f"{name}: excluded from this session")
-                continue
             entry = self._catalog.get(name)
             actor, tool = entry if entry is not None else (None, None)
+            if name in registry._mcp_excluded_names or (
+                actor is not None
+                and actor.config.name in registry._mcp_excluded_servers
+            ):
+                rejected.append(f"{name}: excluded from this session")
+                continue
             if actor is None or tool is None:
                 rejected.append(f"{name}: unavailable")
             elif actor.register_tool_for(registry, tool) or registry.is_mcp_owned(

@@ -319,6 +319,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         # discovery remains available in child sessions without sharing tools.
         self._mcp_mount: Any = None
         self._mcp_excluded_names: frozenset[str] = frozenset()
+        self._mcp_excluded_servers: frozenset[str] = frozenset()
         # MCP definitions are owned per registry so reconnects cannot remove
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
@@ -667,6 +668,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         store: ConversationStore,
         *,
         exclude_names: set[str] | frozenset[str] = frozenset(),
+        exclude_mcp_servers: set[str] | frozenset[str] = frozenset(),
         profile_tool_allow: Sequence[str] | None = None,
         cwd: str | Path | None = None,
         image_policy: ImagePolicy | None = None,
@@ -696,10 +698,21 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         clone._agent_output_cache = OrderedDict()
         clone._agent_output_cache_chars = 0
         clone._mcp_excluded_names = frozenset(exclude_names)
+        clone._mcp_excluded_servers = (
+            self._mcp_excluded_servers | frozenset(exclude_mcp_servers)
+        )
+        excluded_mcp_names = {
+            name
+            for name, (owner, _generation) in self._mcp_owned.items()
+            if getattr(getattr(owner, "config", None), "name", None)
+            in clone._mcp_excluded_servers
+        }
         clone._tools = {
             name: _copy_definition(definition, clone)
             for name, definition in self._tools.items()
-            if name not in exclude_names and definition.binding == "shared"
+            if name not in exclude_names
+            and name not in excluded_mcp_names
+            and definition.binding == "shared"
         }
         clone._mcp_hidden = self._mcp_hidden.intersection(clone._tools)
         clone._mcp_owned = {

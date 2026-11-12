@@ -132,7 +132,11 @@ class MCPDefinitionPublisher:
                     continue
                 base = full[len(prefix) :]
                 tool = tools_by_name.get(base)
-                if tool is None or full in registry._mcp_excluded_names:
+                if (
+                    tool is None
+                    or full in registry._mcp_excluded_names
+                    or self.name in registry._mcp_excluded_servers
+                ):
                     continue
                 self._register_tool(tool, self._generation, registry=registry)
 
