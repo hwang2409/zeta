@@ -98,7 +98,7 @@ class IncrementalValidationMixin:
         than re-running per-entry validation; only the candidate row is checked.
         """
         relations: dict[str, str | None] = {}
-        for entry in self._active_branch():
+        for entry in tuple(self.entry(ref) for ref in self.branch_refs()):
             if entry.type == "message":
                 for request in entry.data.get("approval_requests", ()):
                     request_id = request.get("request_id")

@@ -86,6 +86,6 @@ def capture_slash_status(
             ),
             project_context_health=project_context_health,
         ),
-        transcript_entries=loop.store.resident_entries_snapshot(),
+        transcript_entries=loop.tuple(store.entry(ref) for ref in store.branch_refs()),
         token_counter=context_assembler.token_counter,
     )

@@ -913,7 +913,7 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            current_branch = self._active_branch()
+            current_branch = tuple(self.entry(ref) for ref in self.branch_refs())
             resolved_parent = (
                 parent_id
                 if parent_id is not None
@@ -1071,7 +1071,7 @@ class ConversationStore(
         parent_id: str | None = None,
         reason: str | None = None,
     ) -> ConversationEntry | None:
-        branch = self._active_branch()
+        branch = tuple(self.entry(ref) for ref in self.branch_refs())
         states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
@@ -1100,7 +1100,7 @@ class ConversationStore(
         return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def compaction_marker_count(self) -> int:
-        return sum(entry.type == "compaction" for entry in self._active_branch())
+        return sum(entry.type == "compaction" for entry in tuple(self.entry(ref) for ref in self.branch_refs()))
 
     def latest_compaction_marker(self) -> ConversationEntry | None:
         """Return the newest compaction marker on the active branch (no copy).
@@ -1108,7 +1108,7 @@ class ConversationStore(
         Reverse-scans the resident branch and snapshots only the one hit, so a
         caller that reads ``marker.data`` never touches resident state.
         """
-        for entry in reversed(self._active_branch()):
+        for entry in reversed(self._resident_rows.branch):
             if entry.type == "compaction":
                 return self._snapshot_entry(entry)
         return None
@@ -1126,13 +1126,14 @@ class ConversationStore(
         """Return the active leaf sequence without materializing the branch."""
         return self._entries[-1].seq if self._entries else 0
 
-    def _active_branch(self) -> tuple[ConversationEntry, ...]:
-        """Return resident active-branch entries for store-internal queries."""
+    def branch_refs(self):
+        return self._resident_rows.branch_refs()
 
-        return active_branch(self._entries)
+    def entry(self, ref):
+        return self._resident_rows.entry(ref)
 
-    def replay(self) -> list[ConversationEntry]:
-        return self._snapshot_branch(self._active_branch())
+    def stream_rows(self, refs, *, batch=256):
+        return self._resident_rows.stream_rows(refs, batch=batch)
 
     def active_agent_receipts(self) -> tuple[tuple[str, str], ...]:
         """Return immutable child receipt coordinates from the active branch."""
@@ -1148,29 +1149,6 @@ class ConversationStore(
         for one read.
         """
         return self._delivery_fold
-
-    def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
-        """Return stable resident entries for read-only planning."""
-
-        return self._active_branch()
-
-    def resident_entries_snapshot(self) -> tuple[ConversationEntry, ...]:
-        """Return append-only entry references for work on another thread."""
-
-        self._assert_owner_thread()
-        return tuple(self._entries)
-
-    def resident_entries(self) -> tuple[ConversationEntry, ...]:
-        """Return one immutable snapshot of the resident row list (no row copy).
-
-        Unlike ``resident_entries_snapshot`` this does not assert the owner
-        thread: it is the single-read seam an off-loop reader (``session.tree``
-        via ``run_read``) uses to take one consistent view of the branch tree
-        without the per-row deep copy of the ``entries`` property. The tuple is a
-        new container; the entries inside it are the shared resident objects, so
-        callers read them and never mutate ``entry.data``.
-        """
-        return tuple(self._entries)
 
     @classmethod
     def _snapshot_branch(
@@ -1189,13 +1167,6 @@ class ConversationStore(
             data=copy.deepcopy(entry.data),
         )
 
-    def messages(self) -> list[Message]:
-        messages: list[Message] = []
-        for entry in self.replay():
-            if entry.type == "message":
-                messages.append(Message.from_dict(entry.data["message"]))
-        return messages
-
     def active_branch_contains_message(self, message: Message) -> bool:
         """Return whether ``message`` is on the active branch (tail-first scan).
 
@@ -1203,7 +1174,7 @@ class ConversationStore(
         path: the message was just appended, so a reverse scan finds it near
         the tail without copying the whole branch.
         """
-        for entry in reversed(self._active_branch()):
+        for entry in reversed(self._resident_rows.branch):
             if entry.type != "message":
                 continue
             if Message.from_dict(entry.data["message"]) == message:

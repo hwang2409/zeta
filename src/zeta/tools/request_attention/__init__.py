@@ -22,7 +22,7 @@ async def _request_attention(
     registry: ToolRegistry, arguments: RequestAttentionArguments
 ) -> StructuredToolResult:
     store = registry.session_store
-    branch = store.active_branch_snapshot()
+    branch = tuple(store.entry(ref) for ref in store.branch_refs())
     anchor = branch[-1] if branch else None
     record = AttentionStore(
         store.session_dir,

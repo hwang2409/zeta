@@ -491,7 +491,7 @@ class AgentTranscriptSource:
                 self._stores[path] = store
             else:
                 store.refresh()
-            entries = store.active_branch_snapshot()
+            entries = tuple(store.entry(ref) for ref in store.branch_refs())
         snapshot = self._project(path, entries)
         self._snapshots[path] = snapshot
         return snapshot
@@ -637,7 +637,7 @@ def _read_active_message_tail(path: Path, limit: int) -> tuple[ConversationEntry
     )
     try:
         messages = [
-            entry for entry in store.active_branch_snapshot() if entry.type == "message"
+            entry for entry in tuple(store.entry(ref) for ref in store.branch_refs()) if entry.type == "message"
         ]
         return tuple(messages[-limit:])
     finally:

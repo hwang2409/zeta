@@ -89,7 +89,7 @@ class StartupFactsMixin:
     def context_calibration_records(self) -> tuple[ContextCalibrationRecord, ...]:
         return tuple(
             record
-            for entry in self._active_branch()
+            for entry in tuple(self.entry(ref) for ref in self.branch_refs())
             if (record := context_calibration_record(entry)) is not None
         )
 
@@ -184,6 +184,10 @@ class ResidentRows:
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
         self.branch = list(reversed(branch))
+
+    def branch_refs(self) -> tuple[RowRef, ...]:
+        by_id = {row.id: row for row in self.rows}
+        return tuple(by_id[entry.id] for entry in self.branch)
 
     def entry(self, ref: RowRef) -> ConversationEntry:
         for entry in self.entries:

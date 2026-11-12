@@ -438,7 +438,7 @@ class NotificationStateMixin:
     def tui_replay_entries(self: ConversationStore) -> tuple[TUIReplayEntry, ...]:
         """Project the active branch into detached data needed by TUI replay."""
         projected: list[TUIReplayEntry] = []
-        for entry in self._active_branch():
+        for entry in tuple(self.entry(ref) for ref in self.branch_refs()):
             message = None
             if entry.type == "message":
                 parsed = Message.from_dict(entry.data["message"])
@@ -502,7 +502,7 @@ class NotificationStateMixin:
             self._delivery_fold.active_notifications.values()
             if pending_only
             else (
-                entry for entry in self._active_branch() if entry.type == "notification"
+                entry for entry in tuple(self.entry(ref) for ref in self.branch_refs()) if entry.type == "notification"
             )
         )
         return [

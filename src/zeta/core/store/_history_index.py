@@ -893,7 +893,7 @@ class HistoryPageStoreMixin:
             self._history_index._mark_unavailable()
             return
         try:
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(tuple(self.entry(ref) for ref in self.branch_refs()))
         except (OSError, HistoryIndexError):
             self._history_index._mark_unavailable()
 
@@ -942,7 +942,7 @@ class HistoryPageStoreMixin:
                 self._history_index._mark_unavailable()
             return
         if not self._history_index.available:
-            self._sync_history_index(self.active_branch_snapshot())
+            self._sync_history_index(tuple(self.entry(ref) for ref in self.branch_refs()))
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(
