@@ -1015,13 +1015,23 @@ async def test_closed_child_history_ends_every_child_started(
         pend_child, pend_gc, pend_child_id, pend_gc_id = _seed_nested(
             resumed.runtime.opened.store, session_id, "2", lease=lease
         )
+        # read the child while it is still live (grandchild running): this caches
+        # a projection with no child_ended. Closing writes no log row, so the
+        # generation never changes; the cache must still be rebuilt after close.
+        live = (
+            await controller.request(
+                4, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
+            )
+        )["result"]["messages"]
+        assert _count_event(live, "child_started", pend_gc_id) == 1, live
+        assert _count_event(live, "child_ended", pend_gc_id) == 0, live
         pend_child.finish_agent_lifecycle("completed", final_result="child done")
         pend_child.close()
         pend_gc.close()
 
         pending = (
             await controller.request(
-                4, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
+                5, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
             )
         )["result"]["messages"]
         assert _count_event(pending, "child_started", pend_gc_id) == 1, pending
@@ -1037,7 +1047,7 @@ async def test_closed_child_history_ends_every_child_started(
 
         warmed = (
             await controller.request(
-                5, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
+                6, "child_run_history", {"session_id": session_id, "run_id": pend_child_id}
             )
         )["result"]["messages"]
         assert _count_event(warmed, "child_ended", pend_gc_id) == 1, warmed

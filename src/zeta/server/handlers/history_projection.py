@@ -73,6 +73,7 @@ class HistoryProjection:
 class _CachedProjection:
     generation: Generation
     projection: HistoryProjection
+    closed: bool
 
 
 _cache_creation_lock = threading.Lock()
@@ -102,6 +103,15 @@ def _generation(store: ConversationStore) -> Generation:
         getattr(store, "_log_offset", 0),
         getattr(store, "_entry_prefix_digest", b""),
     )
+
+
+def _closed(store: ConversationStore) -> bool:
+    """Whether the store's own lifecycle has finished. Closing writes
+    ``agent_lifecycle.json`` with no log row, so the generation does not change;
+    the cache must gate on this so a projection built while the child was live is
+    rebuilt (and its orphan child_ended derived) after the child closes."""
+    lifecycle = getattr(store, "_agent_lifecycle", None)
+    return isinstance(lifecycle, dict) and lifecycle.get("finished_at") is not None
 
 
 def _cache(
@@ -279,7 +289,8 @@ def history_projection(
         child_runs=child_runs,
     )
     generation = _generation(store)
-    if cached is not None and cached.generation == generation:
+    closed = _closed(store)
+    if cached is not None and cached.generation == generation and cached.closed == closed:
         return cached.projection
 
     # The store is loop-owned; the serve worker reads its validated snapshot.
@@ -375,7 +386,7 @@ def history_projection(
             served_turn_end=served_turn_end,
             child_runs=child_runs,
         )
-        if cached is None or cached.generation != generation:
+        if cached is None or cached.generation != generation or cached.closed != closed:
             _publish_cache(
                 store,
                 include_delivery_id=include_delivery_id,
@@ -383,7 +394,7 @@ def history_projection(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
-                cached=_CachedProjection(generation, built),
+                cached=_CachedProjection(generation, built, closed),
             )
             return built
         return cached.projection
