@@ -211,7 +211,9 @@ class SentMessageTracker:
                 if existing["target_project"] != project_id:
                     raise ValueError("sent-message tracking record conflicts")
                 if self._at_epoch:
-                    return self._mark_published(existing)
+                    return self._mark_published(
+                        existing, _storage_lease=_storage_lease
+                    )
                 return self._outcome(None)
             record: dict[str, Any] = {
                 "id": message_id,
@@ -229,7 +231,12 @@ class SentMessageTracker:
                 (record,), self._deleted_ids, _storage_lease=_storage_lease
             )
 
-    def record_intent(self, envelope: dict[str, Any]) -> SentLedgerOutcome[None]:
+    def record_intent(
+        self,
+        envelope: dict[str, Any],
+        *,
+        _storage_lease: WriterLease | None = None,
+    ) -> SentLedgerOutcome[None]:
         """Durably record a sender intent before the recipient publish.
 
         Writes a pending schema-v2 record that carries the full recipient
@@ -266,7 +273,9 @@ class SentMessageTracker:
             self._pending.add(message_id)
             self._prune()
             try:
-                return self._persist((record,), self._deleted_ids)
+                return self._persist(
+                    (record,), self._deleted_ids, _storage_lease=_storage_lease
+                )
             except Exception:
                 # The spill is referenced only by the record we failed to
                 # persist, so remove the orphan before re-raising.
@@ -274,7 +283,12 @@ class SentMessageTracker:
                     self._delete_spill(message_id)
                 raise
 
-    def _mark_published(self, record: dict[str, Any]) -> SentLedgerOutcome[None]:
+    def _mark_published(
+        self,
+        record: dict[str, Any],
+        *,
+        _storage_lease: WriterLease | None = None,
+    ) -> SentLedgerOutcome[None]:
         was_published = record.get("publication") == "published"
         had_envelope = "envelope" in record
         spilled = (
@@ -289,7 +303,9 @@ class SentMessageTracker:
         record.pop("envelope", None)
         if was_published and not had_envelope:
             return self._outcome(None)
-        outcome = self._persist((record,), self._deleted_ids)
+        outcome = self._persist(
+            (record,), self._deleted_ids, _storage_lease=_storage_lease
+        )
         # The durable record no longer references the sender spill. Unlink it
         # only after that write commits: a crash then leaves at most an orphan
         # spill, never a ledger that points at a spill already gone (which would
@@ -608,7 +624,9 @@ class SentMessageTracker:
         _storage_lease: WriterLease | None = None,
     ) -> SentLedgerOutcome[None]:
         if self._at_epoch:
-            return self._persist_v2(upserts, delete_ids)
+            return self._persist_v2(
+                upserts, delete_ids, _storage_lease=_storage_lease
+            )
         operation_outcome: SentLedgerOutcome[None] | None = None
 
         def guard_current(raw: object) -> None:
@@ -662,7 +680,11 @@ class SentMessageTracker:
             raise ValueError("sent-message tracking is unsafe or unavailable") from exc
 
     def _persist_v2(
-        self, upserts: Iterable[dict[str, Any]], delete_ids: Iterable[str]
+        self,
+        upserts: Iterable[dict[str, Any]],
+        delete_ids: Iterable[str],
+        *,
+        _storage_lease: WriterLease | None = None,
     ) -> SentLedgerOutcome[None]:
         """Merge the changed schema-v2 rows under the shape lock.
 
@@ -714,7 +736,9 @@ class SentMessageTracker:
 
         try:
             with (
-                open_writer(self.sessions_root.parent) as lease,
+                nullcontext(_storage_lease)
+                if _storage_lease is not None
+                else open_writer(self.sessions_root.parent) as lease,
                 self._session_directory(create=True) as session_fd,
             ):
                 try:

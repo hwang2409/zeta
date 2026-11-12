@@ -922,13 +922,13 @@ def test_published_intent_persists_before_unlinking_sender_spill(
     calls = {"n": 0}
     real_persist = SentMessageTracker._persist
 
-    def flaky(self, upserts, delete_ids):
+    def flaky(self, upserts, delete_ids, *, _storage_lease=None):
         calls["n"] += 1
         # The intent was already written before this patch; this first call is
         # the mark-published write.
         if calls["n"] == 1:
             raise ValueError("sent-message tracking is unsafe or unavailable")
-        return real_persist(self, upserts, delete_ids)
+        return real_persist(self, upserts, delete_ids, _storage_lease=_storage_lease)
 
     # test-contract: durability fail the mark-published durable write via the seam
     monkeypatch.setattr(SentMessageTracker, "_persist", flaky)
@@ -1075,11 +1075,11 @@ def test_v2_sent_ledger_merge_is_monotonic(
     real_persist = SentMessageTracker._persist
     calls = {"n": 0}
 
-    def flaky(self, upserts, delete_ids):
+    def flaky(self, upserts, delete_ids, *, _storage_lease=None):
         calls["n"] += 1
         if calls["n"] == 1:  # the mark-published write
             raise ValueError("sent-message tracking is unsafe or unavailable")
-        return real_persist(self, upserts, delete_ids)
+        return real_persist(self, upserts, delete_ids, _storage_lease=_storage_lease)
 
     # test-contract: durability fail the mark-published write via the ledger seam
     monkeypatch.setattr(SentMessageTracker, "_persist", flaky)

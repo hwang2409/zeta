@@ -57,7 +57,10 @@ class SentDelivery:
                 # retry; drop the durable promise and let a failed publish
                 # surface the plain error below, which tells the model it may
                 # resend.
-                durable = tracker.record_intent(record).health.state != "broken"
+                durable = (
+                    tracker.record_intent(record, _storage_lease=lease).health.state
+                    != "broken"
+                )
             try:
                 with inbox._directories(target, create=True) as dirs:
                     inbox._publish_outgoing(dirs, message_id, body, record)
