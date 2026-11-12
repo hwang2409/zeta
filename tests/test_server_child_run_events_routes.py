@@ -1116,6 +1116,27 @@ async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
 
 # --- cancellation inside the background terminal transition ----------------------
 
+def _coro_name(task: asyncio.Task[Any]) -> str:
+    """Name a task's coroutine; ``get_coro()`` may be None or an object with no ``__qualname__``."""
+    return getattr(task.get_coro(), "__qualname__", "")
+
+
+@pytest.mark.asyncio
+async def test_coro_name_tolerates_a_task_whose_coro_has_no_qualname() -> None:
+    async def gen():
+        yield None
+
+    agen = gen()
+    await agen.__anext__()
+    # an athrow awaitable has no __qualname__; macOS CI saw one from get_coro()
+    task = asyncio.ensure_future(agen.athrow(GeneratorExit))
+    try:
+        assert not hasattr(task.get_coro(), "__qualname__")
+        assert _coro_name(task) == ""
+    finally:
+        await await_or_fail(asyncio.gather(task, return_exceptions=True), what="athrow task")
+
+
 TRANSITION_AWAITS = (
     ("store", "finalize_background_agent"),
     ("channel", "close_questions"),
@@ -1146,7 +1167,7 @@ async def test_cancel_at_each_background_transition_await_still_publishes_one_co
 
     async def gated(self: Any, *args: Any, **kwargs: Any) -> Any:
         current = asyncio.current_task()
-        if current is not None and current.get_coro().__qualname__.endswith("commit_adopt_publish"):
+        if current is not None and _coro_name(current).endswith("commit_adopt_publish"):
             entered.set()
             await await_or_fail(release.wait(), what=f"release {method}")
         return await original(self, *args, **kwargs)
@@ -1168,7 +1189,7 @@ async def test_cancel_at_each_background_transition_await_still_publishes_one_co
         await await_or_fail(entered.wait(), what=f"transition reached {method}")
         [watcher] = [
             task for task in asyncio.all_tasks()
-            if task.get_coro().__qualname__.endswith("finish_background")
+            if _coro_name(task).endswith("finish_background")
         ]
         # the cancel is delivered to the watcher before the held transition resumes
         watcher.cancel()
