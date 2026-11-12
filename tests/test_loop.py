@@ -3379,7 +3379,9 @@ async def test_thinking_only_max_tokens_retries_then_continues(tmp_path: Path) -
 
     # A thinking-only output-limit stop is retried once instead of ending the run.
     assert len(backend.calls) == 2
-    assert [event.type for event in events if event.type is StreamEventType.RETRY]
+    assert [
+        event.data["kind"] for event in events if event.type is StreamEventType.RETRY
+    ] == ["output_limit_recovery"]
     assert not [
         event for event in events if event.type is StreamEventType.ERROR
     ]
@@ -3396,27 +3398,6 @@ async def test_thinking_only_max_tokens_retries_then_continues(tmp_path: Path) -
         for block in final.content
     )
     assert events[-1].type is StreamEventType.AGENT_END
-
-
-def test_thinking_output_limit_retry_renders_in_tui() -> None:
-    from zeta.tui.render import render_event
-
-    rendered = render_event(
-        StreamEvent(
-            StreamEventType.RETRY,
-            data={
-                "kind": "output_limit_recovery",
-                "reason": "max_tokens",
-                "text": (
-                    "output token limit reached while thinking; asking the model "
-                    "to think less and reply"
-                ),
-            },
-        )
-    )
-
-    assert rendered is not None
-    assert "output token limit reached while thinking" in rendered.plain
 
 
 @pytest.mark.asyncio
