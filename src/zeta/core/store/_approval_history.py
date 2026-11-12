@@ -129,24 +129,6 @@ class ApprovalHistoryStoreMixin:
     # view: the sidecar is updated in place by the writer and may be mid-append.
     # It answers approval reads from its resident branch, like main's
     # latency-tolerant display path, without blocking on the writer's lock.
-    def _resident_approval_state(
-        self, request_id: str
-    ) -> tuple[ToolCall, str | None] | None:
-        return self._approval_states_from_branch(
-            list(self._active_branch())
-        ).get(request_id)
-
-    def _resident_approval_resolution(
-        self, request_id: str
-    ) -> Mapping[str, Any] | None:
-        for entry in reversed(self._active_branch()):
-            if (
-                entry.type == "approval_resolution"
-                and entry.data.get("request_id") == request_id
-            ):
-                return dict(entry.data)
-        return None
-
     def _resident_pending_approval_page(
         self, after_seq: int, limit: int
     ) -> IndexedPendingApprovalPage:

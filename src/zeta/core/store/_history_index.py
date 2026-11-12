@@ -834,42 +834,24 @@ def _decide_approval(
     """Answer an approval read from the index when its facts match, else from
     the resident active branch.
 
-    The seam never raises ``StaleHistorySnapshot`` or an fd error to callers: a
-    closed, read-only, or index-less store, an in-flight append by this store,
-    or a stale sidecar after the bounded retries all fall back to ``resident``,
-    the authoritative in-memory branch. ``_mark_unavailable`` runs only for a
-    genuine sidecar mismatch, never for this store's own append.
+    The seam never rebuilds the sidecar and never marks it unavailable: a
+    closed, read-only, or index-less store, an unavailable index (any on-loop
+    append marks it so), or a facts change around the query all fall back to
+    ``resident``, the O(1) memoized in-memory projection. The async caller has
+    already run ``_sync_log_without_waiting`` so resident is current. The
+    sidecar rebuild belongs to the history-page path (``_read_stable_page``),
+    not to an approval read on the hot loop.
     """
     index = store._history_index
-    if store._closed or store._read_only or index is None:
+    if store._closed or store._read_only or index is None or not index.available:
         return resident()
-    rebuilt_facts: dict[str, object] | None = None
-    physical_keys = ("st_dev", "st_ino", "byte_boundary")
-    for attempt in range(_HISTORY_PAGE_ATTEMPTS):
-        if not index.available:
-            try:
-                rebuilt_facts = _rebuild_history_index(store)
-            except (OSError, HistoryIndexError):
-                return resident()
-        facts = rebuilt_facts or store._history_index_facts()
-        rebuilt_facts = None
-        try:
-            result = index_query(index, facts)
-        except (StaleHistorySnapshot, HistoryIndexUnavailableError, OSError):
-            current = store._history_index_facts()
-            if any(current[key] != facts[key] for key in physical_keys):
-                # This store's own in-flight append moved the file; the resident
-                # branch already holds it. Do not rebuild for our own write.
-                return resident()
-            if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-                return resident()
-            index._mark_unavailable()
-            continue
-        if store._history_index_facts() == facts:
-            return result
-        if attempt == _HISTORY_PAGE_ATTEMPTS - 1:
-            return resident()
-        index._mark_unavailable()
+    facts = store._history_index_facts()
+    try:
+        result = index_query(index, facts)
+    except (StaleHistorySnapshot, HistoryIndexUnavailableError, OSError):
+        return resident()
+    if store._history_index_facts() == facts:
+        return result
     return resident()
 
 
@@ -985,7 +967,7 @@ class HistoryPageStoreMixin:
             lambda: _decide_approval(
                 self,
                 index_query,
-                lambda: self._resident_approval_state(request_id),
+                lambda: self.approval_state_now(request_id),
             )
         )
 
@@ -1001,7 +983,7 @@ class HistoryPageStoreMixin:
             lambda: _decide_approval(
                 self,
                 index_query,
-                lambda: self._resident_approval_resolution(request_id),
+                lambda: self.approval_resolution_now(request_id),
             )
         )
 

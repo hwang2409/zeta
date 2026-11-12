@@ -404,7 +404,10 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         self.child_store.resolve_approval(
             request_id, "abort", reason="child_cleanup"
         )
-        state = await self.child_store.approval_state(request_id)
+        # resolve_approval syncs the log under the append lock, so this resident
+        # read is a correct read-after-write with no await suspension point
+        # inside the cancellation handler that reaches here.
+        state = self.child_store.approval_state_now(request_id)
         decision = _approval_decision(state[1] if state is not None else None)
         if decision is ApprovalDecision.ALLOW and state is not None:
             if execution_token is None:
