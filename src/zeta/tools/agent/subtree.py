@@ -179,7 +179,7 @@ class _SubtreeDiscovery:
         return snapshot
 
     def _visit(self, parent: str, parent_store: ConversationStore) -> None:
-        entries = parent_store.replay()
+        entries = parent_store.active_branch_snapshot()
         calls = _active_agent_calls(entries)
         self._add_receipt_edges(parent, parent_store)
         self._add_started_edges(parent, entries, calls)
@@ -244,7 +244,7 @@ class _SubtreeDiscovery:
             calls = (
                 parent_calls
                 if logical_store is parent_store
-                else _active_agent_calls(logical_store.replay())
+                else _active_agent_calls(logical_store.active_branch_snapshot())
             )
             if _authenticated_marker_call(marker, calls) is not None:
                 self._add_edge(
