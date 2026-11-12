@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,37 @@ from prompt_toolkit import PromptSession
 
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import write_tui_diagnostic
+
+_DIAGNOSTIC_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = queue.Queue(maxsize=32)
+_DIAGNOSTIC_WORKER_LOCK = threading.Lock()
+_DIAGNOSTIC_WORKER_STARTED = False
+
+
+def _write_diagnostics() -> None:
+    while True:
+        path, record = _DIAGNOSTIC_QUEUE.get()
+        try:
+            write_tui_diagnostic(path, record)
+        except Exception:  # noqa: BLE001, S110 - diagnostics must never affect the TUI
+            pass
+        finally:
+            _DIAGNOSTIC_QUEUE.task_done()
+
+
+def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
+    global _DIAGNOSTIC_WORKER_STARTED
+    try:
+        with _DIAGNOSTIC_WORKER_LOCK:
+            if not _DIAGNOSTIC_WORKER_STARTED:
+                threading.Thread(
+                    target=_write_diagnostics,
+                    name="zeta-tui-diagnostics",
+                    daemon=True,
+                ).start()
+                _DIAGNOSTIC_WORKER_STARTED = True
+        _DIAGNOSTIC_QUEUE.put_nowait((path, record))
+    except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
+        return
 from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
 from ..composer import FullScreenPromptSession
 from ..render import render_event
