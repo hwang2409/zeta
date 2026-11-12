@@ -87,8 +87,8 @@ def test_stray_stderr_never_reaches_the_terminal(tmp_path: Path) -> None:
         os.close(master_fd)
 
     terminal = output.decode("utf-8", "replace")
-    leaked = [text for text in (*NOISE, "Traceback") if text in terminal]
-    assert leaked == [], f"terminal showed stray stderr: {leaked}"
+    for text in (*NOISE, "Traceback"):
+        assert text not in terminal, f"terminal showed stray stderr: {text}"
     assert "resume with:" in terminal
     log = (home / "logs" / "tui-stderr.log").read_text()
     assert [text for text in NOISE if text not in log] == []
