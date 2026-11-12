@@ -393,7 +393,7 @@ def _publish_projected_page(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
-                cached=_CachedProjection(generation, expanded),
+                cached=_CachedProjection(generation, expanded, cached.closed),
             )
     return result
 
