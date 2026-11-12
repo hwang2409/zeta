@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
@@ -824,7 +824,7 @@ def _cleanup_ephemeral(app: object) -> None:
 
 
 def _tui_print(message: str) -> None:
-    from ..tui.loop_errors import write_terminal
+    from ..tui.stderr_capture import write_terminal
 
     write_terminal(message)
 
@@ -881,7 +881,7 @@ def _create_tui_app(
 
     try:
         if args.force_provider and args.model is None:
-            from ..tui.loop_errors import restore_stderr_for_cli
+            from ..tui.stderr_capture import restore_stderr_for_cli
 
             restore_stderr_for_cli()
         if args.continue_session or args.resume is not None:
@@ -902,29 +902,6 @@ def _create_tui_app(
 
         _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
         return None
-
-
-def _run_tui_session(
-    app: Any,
-    args: argparse.Namespace,
-    patch_stdout: Any,
-) -> tuple[bool, bool]:
-    from ..tui.loop_errors import stderr_to_log
-
-    with patch_stdout(raw=True), stderr_to_log():
-        return asyncio.run(_run_tui(app, args))
-
-
-def _run_tui_lifecycle(
-    args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-) -> tuple[int, str | None]:
-    from ..tui.loop_errors import stderr_to_log
-
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        with stderr_to_log():
-            return _run_tui_lifecycle_captured(args, parser)
-    return _run_tui_lifecycle_captured(args, parser)
 
 
 def _run_tui_lifecycle_captured(
@@ -948,20 +925,17 @@ def _run_tui_lifecycle_captured(
             restart_cancels_work = False
             new_session_requested = False
             try:
-                from prompt_toolkit.patch_stdout import (
-                    patch_stdout as default_patch_stdout,
-                )
-
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
 
-                patch_stdout = globals().get("patch_stdout") or default_patch_stdout
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
-                restart_requested, restart_cancels_work = _run_tui_session(
-                    run_app, args, patch_stdout
+                from ..tui.stderr_capture import run_tui_session
+
+                restart_requested, restart_cancels_work = run_tui_session(
+                    run_app, args, _run_tui
                 )
                 new_session_requested = run_app.new_session_requested
                 if new_session_requested:
@@ -1050,7 +1024,9 @@ def _run_console(run: Callable[[], int]) -> int:
     except Exception as exc:
         if not _has_console_message(exc):
             raise
-        print(f"zeta: {exc}", file=sys.stderr)
+        from ..tui.stderr_capture import write_terminal
+
+        write_terminal(f"zeta: {exc}")
         return 2
 
 
@@ -1060,7 +1036,11 @@ def _run_tui_command(
     entrypoint: str,
     original_argv: list[str],
 ) -> int:
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    from ..tui.stderr_capture import run_tui_lifecycle
+
+    exit_status, restart_session_id = run_tui_lifecycle(
+        args, parser, _run_tui_lifecycle_captured
+    )
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status

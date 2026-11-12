@@ -38,7 +38,7 @@ def _drain_until_eof(master_fd: int, output: bytearray, timeout: float = 30) -> 
 
 
 def test_stderr_flood_does_not_block_event_loop(tmp_path: Path) -> None:
-    code = "import os\nfrom zeta.tui.loop_errors import stderr_to_log\nwith stderr_to_log():\n    os.write(2, b'x' * 1048576)"
+    code = "import os\nfrom zeta.tui.stderr_capture import stderr_to_log\nwith stderr_to_log():\n    os.write(2, b'x' * 1048576)"
     env = os.environ | {"ZETA_HOME": str(tmp_path / "zeta-home")}
     child = subprocess.run([sys.executable, "-c", code], env=env, timeout=10, check=False)
     assert child.returncode == 0

@@ -3,14 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
-import os
-import queue
-import sys
-import threading
 import traceback
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,42 +16,6 @@ from ..composer import FullScreenPromptSession
 from ..render import render_event
 
 _TUI_ERROR_LOG = "tui-errors.jsonl"
-_TUI_STDERR_LOG = "tui-stderr.log"
-_TUI_STDERR_MAX_BYTES = 5 * 1024 * 1024
-_DIAGNOSTIC_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = queue.Queue(maxsize=32)
-_DIAGNOSTIC_WORKER_LOCK = threading.Lock()
-_DIAGNOSTIC_WORKER_STARTED = False
-_STDERR_SETUP_LOCK = threading.Lock()
-_STDERR_SETUP = False
-_TERMINAL_FD: int | None = None
-_PREVIOUS_STDERR: Any = None
-
-
-def _write_diagnostics() -> None:
-    while True:
-        path, record = _DIAGNOSTIC_QUEUE.get()
-        try:
-            write_tui_diagnostic(path, record)
-        except Exception:  # noqa: BLE001, S110 - diagnostics must never affect the TUI
-            pass
-
-
-def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
-    global _DIAGNOSTIC_WORKER_STARTED
-    try:
-        with _DIAGNOSTIC_WORKER_LOCK:
-            if not _DIAGNOSTIC_WORKER_STARTED:
-                threading.Thread(
-                    target=_write_diagnostics,
-                    name="zeta-tui-diagnostics",
-                    daemon=True,
-                ).start()
-                _DIAGNOSTIC_WORKER_STARTED = True
-        _DIAGNOSTIC_QUEUE.put_nowait((path, record))
-    except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
-        return
-
-
 def tui_error_log() -> Path:
     return env_home() / "logs" / _TUI_ERROR_LOG
 
@@ -71,88 +28,6 @@ def log_tui_crash(error: BaseException) -> Path:
     write_tui_diagnostic(path, {"type": "crash", "traceback": stack})
     return path
 
-
-def terminal_fd() -> int | None:
-    """Return the saved terminal for intentional messages after TUI capture."""
-    return _TERMINAL_FD
-
-
-def write_terminal(message: str) -> None:
-    if _PREVIOUS_STDERR is not None and not _PREVIOUS_STDERR.isatty():
-        print(message, file=_PREVIOUS_STDERR)
-        return
-    fd = _TERMINAL_FD
-    if fd is None:
-        print(message, file=sys.stderr)
-        return
-    try:
-        os.write(fd, (message + "\n").encode())
-    except OSError:
-        pass
-
-
-def _restore_stderr() -> None:
-    fd = _TERMINAL_FD
-    if fd is not None:
-        try:
-            os.dup2(fd, 2)
-        except OSError:
-            pass
-
-
-def _open_stderr_log(path: Path) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    if path.exists() and path.stat().st_size > _TUI_STDERR_MAX_BYTES:
-        rotated = path.with_name(path.name + ".1")
-        rotated.unlink(missing_ok=True)
-        path.replace(rotated)
-    return os.open(
-        path,
-        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
-        0o600,
-    )
-
-
-def restore_stderr_for_cli() -> None:
-    if _TERMINAL_FD is not None:
-        os.dup2(_TERMINAL_FD, 2)
-    if _PREVIOUS_STDERR is not None:
-        sys.stderr = _PREVIOUS_STDERR
-
-
-def _setup_stderr() -> None:
-    global _STDERR_SETUP, _TERMINAL_FD, _PREVIOUS_STDERR
-    with _STDERR_SETUP_LOCK:
-        if not _STDERR_SETUP:
-            path = env_home() / "logs" / _TUI_STDERR_LOG
-            _PREVIOUS_STDERR = sys.stderr
-            terminal_fd = os.dup(2)
-            log_fd = _open_stderr_log(path)
-            os.dup2(log_fd, 2)
-            os.close(log_fd)
-            _TERMINAL_FD = terminal_fd
-            _STDERR_SETUP = True
-            atexit.register(_restore_stderr)
-        sys.stderr = open(  # noqa: SIM115 - lives for the process lifetime
-            2, "w", buffering=1, encoding="utf-8", errors="backslashreplace", closefd=False
-        )
-        sys.__stderr__ = sys.stderr
-
-
-@contextmanager
-def stderr_to_log() -> Iterator[None]:
-    """Keep TUI stderr on one bounded append-only process log until exit."""
-    _setup_stderr()
-    try:
-        yield
-    finally:
-        # test runners capture stderr with a non-terminal stream; do not poison
-        # the rest of an in-process test suite while real TUI processes persist it.
-        if _PREVIOUS_STDERR is not None and not _PREVIOUS_STDERR.isatty():
-            global _STDERR_SETUP
-            restore_stderr_for_cli()
-            _STDERR_SETUP = False
 
 
 async def start_prompt_during_activation(
