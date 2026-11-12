@@ -801,23 +801,59 @@ def test_ssh_install_refuses_reserved_reference_and_leaves_destination(
     assert not (remote / "sessions" / session_id).exists()
 
 
-def test_ssh_install_replace_preserves_retention_pin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+def test_install_replace_preserves_retention_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    # Replacing a remote session keeps its retention pin sidecar, which the
-    # transferred snapshot never carries.
-    _install_ssh_shim(tmp_path, monkeypatch)
+    # Replacing a session keeps its retention pin sidecar on every installer.
+    # The transferred snapshot never carries the sidecar, so each install path
+    # must copy it forward; before this fix the SSH, local publish, and local
+    # pull replacements all silently unpinned the destination.
     local = tmp_path / "local"
-    remote = tmp_path / "remote"
+    _set_remote_epoch(local, 8)
     session_id = _ssh_session(local)
-    _set_remote_epoch(remote, 8)
-    transport = SshTransport("fake", str(remote), name="cloud")
-    push_session(local, transport, session_id=session_id)
-    pin = remote / "sessions" / session_id / ".retention-pin.json"
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(local, transport, session_id=session_id, force=True)
+    elif kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        push_session(local, LocalTransport(remote), session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(
+                local, LocalTransport(remote), session_id=session_id, force=True
+            )
+    else:  # local-pull
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+
+        def reinstall() -> None:
+            pull_session(
+                puller,
+                LocalTransport(source_remote),
+                session_id=session_id,
+                force=True,
+            )
+
+    pin = destination / ".retention-pin.json"
     pin.write_text('{"pinned":true,"schema_version":1}\n', encoding="utf-8")
     pin.chmod(0o600)
 
-    push_session(local, transport, session_id=session_id, force=True)
+    reinstall()
 
     assert pin.read_text() == '{"pinned":true,"schema_version":1}\n'
 

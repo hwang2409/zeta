@@ -34,6 +34,7 @@ from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
 from ..locking import shape_lock
+from ..session_retention import RETENTION_PIN_FILENAME
 from ..storage_format import WriterLease, open_writer
 from .errors import RemoteSyncError
 from .memory import (
@@ -707,6 +708,7 @@ def _result(manifest: dict[str, object]) -> SessionTransferResult:
 
 
 def _atomic_replace_directory(staging: Path, destination: Path) -> None:
+    _preserve_retention_pin(destination, staging)
     backup = destination.parent / f".{destination.name}.replaced-{os.getpid()}"
     if backup.exists():
         shutil.rmtree(backup)
@@ -720,6 +722,17 @@ def _atomic_replace_directory(staging: Path, destination: Path) -> None:
         raise
     if backup.exists():
         shutil.rmtree(backup)
+
+
+def _preserve_retention_pin(destination: Path, staging: Path) -> None:
+    # The pin sidecar is retention-owned local state; a replacing snapshot never
+    # carries it, so copy it forward so a replace does not silently unpin.
+    pin = destination / RETENTION_PIN_FILENAME
+    if not pin.is_file() or pin.is_symlink():
+        return
+    target = staging / RETENTION_PIN_FILENAME
+    shutil.copyfile(pin, target)
+    target.chmod(0o600)
 
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:
