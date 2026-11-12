@@ -8,7 +8,7 @@ import warnings
 from collections.abc import Callable
 from pathlib import Path
 
-from tests.support.branch_reads import branch_messages
+from zeta.protocol.types import Message
 from zeta.storage_format import WRITER_EPOCH, advance
 
 _SESSION_NAME = "format-roundtrip-predecessor"
@@ -35,8 +35,10 @@ def _missing_api(family: str, owner: object, names: tuple[str, ...]) -> bool:
 def _message_texts(store: object) -> list[str]:
     return [
         part.text
-        for message in branch_messages(store)
-        for part in message.content
+        for ref in store.branch_refs()  # type: ignore[attr-defined]
+        for entry in [store.entry(ref)]  # type: ignore[attr-defined]
+        if entry.type == "message"
+        for part in Message.from_dict(entry.data["message"]).content
         if hasattr(part, "text")
     ]
 
