@@ -2070,7 +2070,7 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         assert await asyncio.to_thread(planning_started.wait, 10)
         assembly.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await assembly
+            await asyncio.wait_for(assembly, 10)
         release_planner.set()
         assert await asyncio.to_thread(planning_finished.wait, 10)
 

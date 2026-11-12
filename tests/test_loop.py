@@ -1434,7 +1434,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
 
     task = asyncio.create_task(consume())
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
     results = {
         message.tool_result.tool_call_id: message.tool_result
@@ -1470,14 +1470,14 @@ async def test_parallel_cancellation_keeps_call_order(
     async def first(arguments: dict[str, object]) -> str:
         started[0].set()
         if aborted_index == 0:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         completed.set()
         return "one"
 
     async def second(arguments: dict[str, object]) -> str:
         started[1].set()
         if aborted_index == 1:
-            await asyncio.Event().wait()
+            await asyncio.wait_for(asyncio.Event().wait(), 10)
         completed.set()
         return "two"
 
@@ -1485,14 +1485,14 @@ async def test_parallel_cancellation_keeps_call_order(
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await started[0].wait()
-    await started[1].wait()
-    await completed.wait()
+    await asyncio.wait_for(started[0].wait(), 10)
+    await asyncio.wait_for(started[1].wait(), 10)
+    await asyncio.wait_for(completed.wait(), 10)
     await asyncio.sleep(0)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
     results = [
         message.tool_result
@@ -1613,12 +1613,12 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
 
     async def first(arguments: dict[str, object]) -> str:
         first_started.set()
-        await first_release.wait()
+        await asyncio.wait_for(first_release.wait(), 10)
         return "one"
 
     async def second(arguments: dict[str, object]) -> str:
         second_started.set()
-        await second_release.wait()
+        await asyncio.wait_for(second_release.wait(), 10)
         return "two"
 
     registry.register("first", first, parallel_safe=True)
@@ -1626,11 +1626,11 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await first_started.wait()
-    await second_started.wait()
+    await asyncio.wait_for(first_started.wait(), 10)
+    await asyncio.wait_for(second_started.wait(), 10)
     second_release.set()
     first_release.set()
-    await task
+    await asyncio.wait_for(task, 10)
 
     results = [
         message.tool_result
@@ -1789,7 +1789,7 @@ async def test_aclose_during_active_tool_persists_canceled_result(tmp_path: Path
     async def blocked(arguments: dict[str, object]) -> str:
         del arguments
         started.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return "unreachable"
 
     stream = AgentLoop(
@@ -1801,7 +1801,7 @@ skill_catalog=SkillCatalog.empty(),
     ).run_turn("start", origin=MessageOrigin.USER)
     async for event in stream:
         if event.type is StreamEventType.TOOL_EXECUTION_START:
-            await started.wait()
+            await asyncio.wait_for(started.wait(), 10)
             await stream.aclose()
             break
 
@@ -1877,7 +1877,7 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
     assert backend.completion_close_count == 1
     assert len(branch_messages(store)) == 2
     assert branch_messages(store)[-1].role is MessageRole.ASSISTANT

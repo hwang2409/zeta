@@ -378,7 +378,7 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
 
     await app._handle_prompt_value("please $review this branch")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     expected = "review body\n\nUser request:\nplease $review this branch"
     sent = next(

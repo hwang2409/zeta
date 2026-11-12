@@ -1275,10 +1275,10 @@ async def test_unmapped_durable_approval_is_finalized(
         assert {request.key for request in app.pending_approvals} == {inline_key}
 
         await app._handle_prompt_value(f"/approve {inline_key}")
-        await submission_task
-        await app._preprocessing_task
+        await asyncio.wait_for(submission_task, 10)
+        await asyncio.wait_for(app._preprocessing_task, 10)
         app._preprocessing_task = None
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
         assert backend.calls
         user_message = next(
             message
@@ -1307,7 +1307,7 @@ async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
     async def block(arguments: dict[str, object], abort_signal: object) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()  # type: ignore[attr-defined]
+        await asyncio.wait_for(abort_signal.wait(), 10)  # type: ignore[attr-defined]
         return "unreachable"
 
     app = TUIApp(
@@ -1367,7 +1367,7 @@ async def test_submission_waits_for_resumed_durable_tool_result(
     async def block(arguments: dict[str, object], abort_signal: object) -> str:
         del arguments, abort_signal
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return "done"
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("later reply")])])
@@ -2010,7 +2010,7 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         assert "command=printf approved-now" in output.getvalue()
         assert branch_messages(store) == []
         assert policy.approve(app.pending_approvals[0].key)
-        await task
+        await asyncio.wait_for(task, 10)
         assert branch_messages(store) == []
 
 

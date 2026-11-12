@@ -3687,7 +3687,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
             for line in self.lines:
                 yield line
             if self.wait_after:
-                await never.wait()
+                await asyncio.wait_for(never.wait(), 10)
 
     class Stream:
         def __init__(self, response):
@@ -3743,10 +3743,10 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     task = asyncio.create_task(
         consume_loop_turn(loop, thinking_started)
     )
-    await thinking_started.wait()
+    await asyncio.wait_for(thinking_started.wait(), 10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, 10)
 
     messages = branch_messages(store)
     assert len(messages) == 1

@@ -2394,10 +2394,10 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
 
     registry = ToolRegistry(tmp_path, pre_execute_hook=hook, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     await asyncio.sleep(0.05)
     registry.abort()
-    await task
+    await asyncio.wait_for(task, 10)
 
     results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert [result.content for result in results] == [

@@ -11059,7 +11059,9 @@ async def test_failed_wake_turn_keeps_durable_notification_input(
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
+        for _ in range(10000):
+            if server.runtime.loop.notification_turn_state == "idle":
+                break
             await asyncio.sleep(0)
         assert backend.calls == 1
         assert [entry.data["text"] for entry in store.agent_notifications()] == ["done"]
@@ -11110,7 +11112,9 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
         frames = await _request(reader, writer, 5, "abort", {"scope": "foreground"})
         assert frames[-1]["result"]["aborted"] is True
         await _frames_until_event(reader, "agent_end")
-        while store.agent_notifications():
+        for _ in range(10000):
+            if not store.agent_notifications():
+                break
             await asyncio.sleep(0)
         assert len(backend.calls) == 2
         assert store.agent_notifications() == []
@@ -11337,7 +11341,9 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         writer.close()
         await writer.wait_closed()
-        while server._client_active:
+        for _ in range(10000):
+            if not server._client_active:
+                break
             await asyncio.sleep(0)
         assert len(store.agent_notifications()) == 1
 

@@ -2505,9 +2505,11 @@ async def test_background_completion_wakes_idle_parent(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
-    while wake_task is None:
+    for _ in range(10000):
+        if wake_task is not None:
+            break
         await asyncio.sleep(0)
-    await wake_task
+    await asyncio.wait_for(wake_task, 10)
 
     receipt = next(
         event
@@ -2805,7 +2807,7 @@ async def test_aborted_notification_wake_commits_durable_notifications(
 
     wake_task = asyncio.create_task(consume())
     with pytest.raises(asyncio.CancelledError):
-        await wake_task
+        await asyncio.wait_for(wake_task, 10)
     try:
         assert [entry.data["text"] for entry in store.agent_notifications()] == [
             "done 2"
@@ -5660,7 +5662,7 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
         ) == ["1", "2"]
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
         await loop.close()
         store.close()
 

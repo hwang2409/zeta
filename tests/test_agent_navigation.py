@@ -1122,7 +1122,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     async def reject(*args: object, **kwargs: object) -> str:
         del args, kwargs
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return "child finished"
 
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
@@ -1343,7 +1343,7 @@ async def test_child_send_double_enter_queues_once(
         nonlocal calls
         calls += 1
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)

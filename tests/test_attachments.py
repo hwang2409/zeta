@@ -850,7 +850,7 @@ async def test_image_token_numbering_resets_after_send(tmp_path: Path) -> None:
 
     await app._handle_prompt_value("inspect [Image #1]")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert app._next_image_token == 1
     assert app._pending_attachment_tokens == {}
@@ -876,7 +876,7 @@ async def test_cancelled_image_token_removes_staged_file_on_send(
 
     await app._handle_prompt_value("send")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert not staged.exists()
     assert branch_messages(store)[0].content == [TextContent("send")]
@@ -904,7 +904,7 @@ async def test_cancelled_image_token_keeps_delivered_staged_file(
 
     await app._handle_prompt_value("send [Image #2]")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     assert not cancelled.exists()
     assert delivered.exists()
@@ -1214,7 +1214,7 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
 
     await app._handle_prompt_value("use @./prompt.txt")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     message = branch_messages(store)[0]
     assert message.content[0] == TextContent("use @./prompt.txt")
@@ -1237,7 +1237,7 @@ async def test_missing_path_like_reference_sends_without_notice(tmp_path: Path) 
     await app._handle_prompt_value("read @./missing.txt")
 
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     assert branch_messages(store)[0].content == [TextContent("read @./missing.txt")]
     assert notices == []
     await app.loop.close()
@@ -1259,7 +1259,7 @@ async def test_unusable_reference_sends_with_notice(tmp_path: Path) -> None:
     await app._handle_prompt_value("inspect @./folder")
 
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     assert branch_messages(store)[0].content == [TextContent("inspect @./folder")]
     assert notices == ["@./folder not attached: directory"]
     await app.loop.close()
@@ -1282,7 +1282,7 @@ async def test_missing_path_sends_pending_paste(tmp_path: Path) -> None:
     await app._handle_prompt_value("read @./missing.txt")
 
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     user = next(
         message for message in branch_messages(store) if message.role is MessageRole.USER
     )
@@ -1313,10 +1313,10 @@ async def test_deleted_pending_paste_is_dropped_once(tmp_path: Path) -> None:
 
     await app._handle_prompt_value("first")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
     await app._handle_prompt_value("second")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     users = [
         message for message in branch_messages(store) if message.role is MessageRole.USER

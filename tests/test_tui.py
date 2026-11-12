@@ -3766,7 +3766,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     ) -> str:
         del arguments, abort_signal
         publisher.publish("first\n", "stdout")
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return "unreachable"
 
     store = ConversationStore(tmp_path)
@@ -3789,7 +3789,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
 
     await wait_until(lambda: app._tool_region is not None)
     app.abort_active()
-    await task
+    await asyncio.wait_for(task, 10)
 
     expected = render_event(
         StreamEvent(
@@ -11779,7 +11779,7 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
 
     async def block(arguments: dict[str, object]) -> str:
         tool_started.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return "unreachable"
 
     store = ConversationStore(tmp_path / "sessions")
@@ -11795,7 +11795,7 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
-        await tool_started.wait()
+        await asyncio.wait_for(tool_started.wait(), 10)
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
@@ -11805,7 +11805,7 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, 10)
 
     result = branch_messages(store)[-1].tool_result
     assert result is not None
@@ -11834,7 +11834,7 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
-        await backend.tool_update.wait()
+        await asyncio.wait_for(backend.tool_update.wait(), 10)
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
@@ -11843,7 +11843,7 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
             )
         )
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, 10)
 
     messages = branch_messages(store)
     calls = [
