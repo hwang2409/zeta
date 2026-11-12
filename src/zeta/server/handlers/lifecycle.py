@@ -93,7 +93,8 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
-        previous_session_id = self.server.runtime.session_id
+        state = self.server.runtime.state
+        previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
             self.server.connections.replay_session_replaced()

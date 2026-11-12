@@ -314,8 +314,9 @@ async def test_bound_mcp_tools_are_not_inherited_by_child_agents(
         await asyncio.wait_for(asyncio.shield(server.control._turn_task), TIMEOUT)
         await _request(reader, writer, 4, "send", {"text": "delegate"})
         async def wait_for_child() -> None:
-            while not backend.children["inspect child tools"].calls:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(TIMEOUT):
+                while not backend.children["inspect child tools"].calls:
+                    await asyncio.sleep(0)
 
         await asyncio.wait_for(wait_for_child(), TIMEOUT)
         child_tools = {
@@ -353,8 +354,9 @@ async def test_unbound_disconnect_preserves_ordinary_mcp_mount(
         await asyncio.wait_for(mcp.request_received.wait(), TIMEOUT)
 
         async def wait_for_mount() -> object:
-            while server.runtime.loop._mcp_mount is None:
-                await asyncio.sleep(0)
+            async with asyncio.timeout(TIMEOUT):
+                while server.runtime.loop._mcp_mount is None:
+                    await asyncio.sleep(0)
             return server.runtime.loop._mcp_mount
 
         mount = await asyncio.wait_for(wait_for_mount(), TIMEOUT)
@@ -436,11 +438,12 @@ async def test_bound_http_error_redacts_header_everywhere(
         await asyncio.wait_for(mcp.auth_received.wait(), TIMEOUT)
 
         async def wait_for_statuses() -> object:
-            while (
-                server.runtime.loop._mcp_mount is None
-                or server.runtime.loop._mcp_mount.statuses["page"].state == "connecting"
-            ):
-                await asyncio.sleep(0)
+            async with asyncio.timeout(TIMEOUT):
+                while (
+                    server.runtime.loop._mcp_mount is None
+                    or server.runtime.loop._mcp_mount.statuses["page"].state == "connecting"
+                ):
+                    await asyncio.sleep(0)
             return server.runtime.loop._mcp_mount.statuses
 
         statuses = await asyncio.wait_for(wait_for_statuses(), TIMEOUT)
