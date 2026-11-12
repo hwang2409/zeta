@@ -104,6 +104,7 @@ from .empty_turn import (
     OUTPUT_LIMIT_ERROR_MESSAGE,
     DispatchProgress,
     EmptyTurnRecoveryState,
+    build_thinking_limit_recovery_message,
     build_tool_limit_recovery_message,
     complete_empty_turn,
     output_limit_error,
@@ -729,6 +730,7 @@ class AgentLoop(
         recovery_state = EmptyTurnRecoveryState()
         nudge_turn_pending = False
         recovering_tool_limit = False
+        recovering_thinking_limit = False
         consuming_notifications = False
         iteration_consuming_notifications = False
         provider_retry_budget: CompletionRetryBudget | None = None
@@ -740,6 +742,7 @@ class AgentLoop(
             or retrying_context
             or nudge_turn_pending
             or recovering_tool_limit
+            or recovering_thinking_limit
         ):
             if not retrying_context:
                 if self._abort_admitted:
@@ -1149,11 +1152,46 @@ class AgentLoop(
                 continue
             recovering_tool_limit = False
             if error is not None and not calls:
+                if not recovering_thinking_limit:
+                    # First thinking-only output-limit stop: nudge once to think
+                    # less and act, rather than losing the whole run. End with the
+                    # error only if the retry also hits the limit.
+                    await step_delivery.admit_terminal("nudge")
+                    await self._append_turn_message(
+                        build_thinking_limit_recovery_message()
+                    )
+                    yield StreamEvent(
+                        StreamEventType.RETRY,
+                        data={
+                            "kind": "thinking_output_limit_recovery",
+                            "reason": "max_tokens",
+                            "text": (
+                                "output token limit reached while thinking; asking "
+                                "the model to think less and reply"
+                            ),
+                        },
+                    )
+                    exhausted = (
+                        self.child_turn_control.finish_completion()
+                        if self.child_turn_control is not None
+                        else False
+                    )
+                    yield StreamEvent(
+                        StreamEventType.TURN_END,
+                        message=assistant_message,
+                        data={"turn": turn_number, "tool_calls": 0},
+                    )
+                    if exhausted:
+                        yield StreamEvent(StreamEventType.AGENT_END)
+                        return
+                    recovering_thinking_limit = True
+                    continue
                 yield StreamEvent(StreamEventType.ERROR, error=error)
                 if self.agent_instance_id is None:
                     await step_delivery.admit_terminal("foreground_end")
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
+            recovering_thinking_limit = False
             if not calls:
                 transition = await toolless_transition(
                     self,

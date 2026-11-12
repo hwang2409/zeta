@@ -50,6 +50,7 @@ from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.runtime.loop import AgentLoop
 from zeta.runtime.loop.agent import _validated_tool_result
 from zeta.runtime.loop.empty_turn import (
+    THINKING_LIMIT_RECOVERY_EVENT,
     build_nudge_message,
     build_tool_limit_recovery_message,
     empty_turn_error,
@@ -3359,18 +3360,95 @@ async def test_thinking_only_reply_nudged_at_most_once_per_turn(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
+async def test_thinking_only_max_tokens_retries_then_continues(tmp_path: Path) -> None:
     backend = FakeBackend(
-        [ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]
+        [
+            ScriptedTurn(
+                [ThinkingContent("planning", "sig-1")], stop_reason="max_tokens"
+            ),
+            ScriptedTurn([TextContent("here is the answer")]),
+        ]
     )
     store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+    finally:
+        await loop.close()
+        store.close()
 
-    events = await collect(
-        AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER)
+    # A thinking-only output-limit stop is retried once instead of ending the run.
+    assert len(backend.calls) == 2
+    assert [event.type for event in events if event.type is StreamEventType.RETRY]
+    assert not [
+        event for event in events if event.type is StreamEventType.ERROR
+    ]
+    recoveries = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == THINKING_LIMIT_RECOVERY_EVENT
+    ]
+    assert len(recoveries) == 1
+    final = store.messages()[-1]
+    assert final.role is MessageRole.ASSISTANT
+    assert any(
+        isinstance(block, TextContent) and "here is the answer" in block.text
+        for block in final.content
+    )
+    assert events[-1].type is StreamEventType.AGENT_END
+
+
+def test_thinking_output_limit_retry_renders_in_tui() -> None:
+    from zeta.tui.render import render_event
+
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.RETRY,
+            data={
+                "kind": "thinking_output_limit_recovery",
+                "reason": "max_tokens",
+                "text": (
+                    "output token limit reached while thinking; asking the model "
+                    "to think less and reply"
+                ),
+            },
+        )
     )
 
-    # Truncated at the output-token limit: surfaced as a terminal error, not nudged.
-    assert len(backend.calls) == 1
+    assert rendered is not None
+    assert "output token limit reached while thinking" in rendered.plain
+
+
+@pytest.mark.asyncio
+async def test_thinking_only_max_tokens_errors_when_retry_also_limited(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [ThinkingContent("planning", "sig-1")], stop_reason="max_tokens"
+            ),
+            ScriptedTurn(
+                [ThinkingContent("still planning", "sig-2")], stop_reason="max_tokens"
+            ),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
+    finally:
+        await loop.close()
+        store.close()
+
+    # One bounded retry: the second output-limit stop surfaces the terminal error.
+    assert len(backend.calls) == 2
+    recoveries = [
+        message
+        for message in store.messages()
+        if message.metadata.get("zeta_event") == THINKING_LIMIT_RECOVERY_EVENT
+    ]
+    assert len(recoveries) == 1
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
     assert events[-2].error.code == "max_tokens"
@@ -3380,9 +3458,6 @@ async def test_thinking_only_max_tokens_is_not_nudged(tmp_path: Path) -> None:
         for message in store.messages()
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
-    assistant = store.messages()[-1]
-    assert assistant.role is MessageRole.ASSISTANT
-    assert assistant.metadata["stop_reason"] == "max_tokens"
     assert events[-1].type is StreamEventType.AGENT_END
 
 
