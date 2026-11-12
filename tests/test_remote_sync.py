@@ -915,6 +915,13 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
     )
     # test-contract: seam instrumentation must fail loudly if the script changes.
     monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", instrumented_script)
+    run_ssh = ssh_module.subprocess.run
+
+    def bounded_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        kwargs["timeout"] = 10
+        return run_ssh(*args, **kwargs)
+
+    monkeypatch.setattr(ssh_module.subprocess, "run", bounded_run)
 
     install_error: list[BaseException] = []
     install_finished = threading.Event()
