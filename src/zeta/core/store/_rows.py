@@ -82,6 +82,18 @@ def context_calibration_record(entry: ConversationEntry) -> ContextCalibrationRe
     )
 
 
+class StartupFactsMixin:
+    def sent_message_receipts(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self._sent_message_receipts)
+
+    def context_calibration_records(self) -> tuple[ContextCalibrationRecord, ...]:
+        return tuple(
+            record
+            for entry in self._active_branch()
+            if (record := context_calibration_record(entry)) is not None
+        )
+
+
 def row_facts(entry: ConversationEntry) -> object | None:
     if entry.type == "message":
         return (context_calibration_record(entry), sent_message_receipts(entry))

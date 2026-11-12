@@ -95,9 +95,8 @@ from ._pending_prompts import (
     PendingPromptStoreMixin,
 )
 from ._row_history import RecentRowsMixin, TurnHistoryMixin
-from ._rows import ResidentRows
+from ._rows import ResidentRows, StartupFactsMixin, sent_message_receipts
 from ._session_state import SessionStatePersistenceMixin
-from ._startup_facts import StartupFactsMixin, sent_message_receipts
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
