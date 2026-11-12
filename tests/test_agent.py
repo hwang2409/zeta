@@ -3454,8 +3454,7 @@ async def _run_child_finish_gate_order(
     if release_order is None:
         release_order = "before_gate"
     backend = FinishGateBackend("wait", hold_gate_check=monkeypatch is not None)
-    if release_order == "before_end_turn":
-        backend.request_limit = 6
+    backend.request_limit = 6
     original_finish_lifecycle = ConversationStore.finish_agent_lifecycle
 
     def finish_lifecycle_barrier(
