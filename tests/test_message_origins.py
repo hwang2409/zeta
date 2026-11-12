@@ -206,6 +206,9 @@ async def test_plan_preserves_exact_typed_input_as_nested_user_evidence() -> Non
         def _invalidate_prompt(self) -> None:
             pass
 
+        async def approval_pending_now(self) -> bool:
+            return bool(self.pending_approvals)
+
     typed = "/plan   inspect this exact branch"
     envelope = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
         Session(), typed
@@ -311,6 +314,9 @@ class _AuditSlashSession(SlashHandlerMixin):
 
     def _invalidate_prompt(self) -> None:
         pass
+
+    async def approval_pending_now(self) -> bool:
+        return bool(self.pending_approvals)
 
     async def slash_mcp_prompt(self, name: str, arguments: dict[str, str]) -> str:
         return f"resolved {name} {arguments['topic']}"

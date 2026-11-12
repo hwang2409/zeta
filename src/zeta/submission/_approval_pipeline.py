@@ -27,7 +27,7 @@ class ApprovalPipelineMixin:
             self._approval_owners[message.call.id] = entry.submission
             if entry.state is SubmissionState.PREPROCESSING:
                 entry.state = SubmissionState.AWAITING_APPROVAL
-            await self.refresh_pending_approvals()
+            self.seed_pending_approvals_now()
             self._host._present_pending_approvals()
             return
         self._approval_owners = {
@@ -37,7 +37,7 @@ class ApprovalPipelineMixin:
         }
         if entry.state is SubmissionState.AWAITING_APPROVAL:
             entry.state = SubmissionState.PREPROCESSING
-        await self.refresh_pending_approvals()
+        self.seed_pending_approvals_now()
         self._host._present_pending_approvals()
 
     async def refresh_pending_approvals(self) -> None:

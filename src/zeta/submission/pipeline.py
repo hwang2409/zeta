@@ -78,7 +78,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._pending_change_seq = 0
         self._pending_applied_seq = -1
         self._pending_refresh_task: asyncio.Task[None] | None = None
-        self._pending_primed = False
         self._preprocessing_waiters: dict[int, asyncio.Task[None]] = {}
         self._command_order: deque[int] = deque()
         self._command_results: dict[int, str | None] = {}
@@ -422,14 +421,6 @@ class SubmissionPipeline(ApprovalPipelineMixin):
             return message
 
     async def _consume(self) -> None:
-        if not self._pending_primed:
-            # Prime the display cache once, off-loop: durable approvals from a
-            # resumed session are not announced by the policy change hook. The
-            # consumer must not block on this store read; it coalesces through
-            # the same off-loop refresh owner, so message processing is not
-            # delayed (the consumer exits on an empty queue and restarts here).
-            self._pending_primed = True
-            self._request_pending_refresh()
         while not self._shutting_down:
             try:
                 message = self._next_message()
