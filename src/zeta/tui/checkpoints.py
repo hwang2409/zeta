@@ -389,11 +389,15 @@ class CheckpointTranscriptMixin:
         self, operation: Awaitable[str]
     ) -> str:
         task = asyncio.create_task(operation)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.shield(task)
-            raise
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return task.result()
 
     def slash_undo(self, args: str) -> str:
         return self._navigate_snapshot(args, verb="undo", past="undone")
