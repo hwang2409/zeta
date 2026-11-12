@@ -764,6 +764,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._record_prompt(entry)
         entry.state = SubmissionState.DISPATCHED
         self._ack_entry(entry)
+        self._host._maybe_restart_when_idle()
 
     def _commit_command_receipts(self) -> None:
         while self._command_order and self._command_order[0] in self._command_results:
