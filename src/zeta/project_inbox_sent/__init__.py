@@ -189,6 +189,13 @@ class SentMessageTracker:
             yield session_fd
 
     def record(self, message_id: str, project_id: str) -> SentLedgerOutcome[None]:
+        """Record a delivered send after its recipient publish.
+
+        Below the durable-intent epoch this writes the schema-v1 ledger row, as
+        before. At or above the epoch a pending intent for this id already
+        exists, and this marks it published (and converts a spilled body to the
+        recipient reference); if no intent exists it records a published row.
+        """
         message_id = _id(message_id)
         project_id = _text(project_id, "target project")
         with self._lock:
@@ -199,13 +206,17 @@ class SentMessageTracker:
             if existing is not None:
                 if existing["target_project"] != project_id:
                     raise ValueError("sent-message tracking record conflicts")
+                if self._at_epoch:
+                    return self._mark_published(existing)
                 return self._outcome(None)
-            record = {
+            record: dict[str, Any] = {
                 "id": message_id,
                 "target_project": project_id,
                 "created_at": _now(),
                 "reported": [],
             }
+            if self._at_epoch:
+                record["publication"] = "published"
             self._records.append(record)
             self._records.sort(key=self._chronology)
             self._pending.add(message_id)
@@ -245,28 +256,21 @@ class SentMessageTracker:
             self._prune()
             return self._persist((record,), self._deleted_ids)
 
-    def mark_published(self, message_id: str) -> SentLedgerOutcome[None]:
-        """Mark the recipient publish durable for a recorded intent (epoch only)."""
-        message_id = _id(message_id)
-        with self._lock:
-            self._refresh()
-            if isinstance(self._state, _Broken):
-                return self._outcome(None)
-            record = next((r for r in self._records if r["id"] == message_id), None)
-            if record is None:
-                return self._outcome(None)
-            changed = record.get("publication") != "published"
-            record["publication"] = "published"
-            envelope = record.get("envelope")
-            if envelope is not None and isinstance(envelope.get("body"), dict) and (
-                "sha256" in envelope["body"]
-            ):
-                envelope["body"] = {"file": _v2.recipient_body_name(message_id)}
-                self._delete_spill(message_id)
-                changed = True
-            if changed:
-                return self._persist((record,), self._deleted_ids)
-            return self._outcome(None)
+    def _mark_published(self, record: dict[str, Any]) -> SentLedgerOutcome[None]:
+        changed = record.get("publication") != "published"
+        record["publication"] = "published"
+        envelope = record.get("envelope")
+        if (
+            envelope is not None
+            and isinstance(envelope.get("body"), dict)
+            and "sha256" in envelope["body"]
+        ):
+            envelope["body"] = {"file": _v2.recipient_body_name(record["id"])}
+            self._delete_spill(record["id"])
+            changed = True
+        if changed:
+            return self._persist((record,), self._deleted_ids)
+        return self._outcome(None)
 
     def pending_intents(self) -> list[dict[str, Any]]:
         """Return recipient envelopes whose publish is not yet durable."""
