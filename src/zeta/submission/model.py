@@ -76,6 +76,9 @@ class SubmissionHost(Protocol):
     _approval_policy: ApprovalPolicy | None
     _input_loop_active: bool
     _exit_requested: bool
+    account_switch_pending: bool
+
+    async def wait_for_account_switch(self) -> None: ...
 
     def _handle_tool_event(self, event: StreamEvent) -> bool: ...
     def _present_pending_approvals(self) -> None: ...

@@ -306,6 +306,9 @@ class TUIApp(
         self._accounts_picker: AccountsPicker | None = None
         self._accounts_picker_unit: Any = None
         self._account_switch_task: asyncio.Task[None] | None = None
+        self._account_switch_pending = False
+        self._account_switch_finished = asyncio.Event()
+        self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
@@ -770,12 +773,14 @@ class TUIApp(
                 self._agent_navigation.exit_navigation()
             self._reset_stream_state()
             self._loop_state = "approval"
+            self._repaint_accounts_picker()
             self._present_pending_approvals()
             return False
         if event.type is StreamEventType.TOOL_APPROVAL_END:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_finished(event.tool_call)
             self._loop_state = "streaming"
+            self._repaint_accounts_picker()
             self._present_pending_approvals()
             return False
         if event.data.get("agent_instance_id") is not None:
