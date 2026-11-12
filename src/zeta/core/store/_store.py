@@ -909,7 +909,7 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            current_branch = self._active_branch()
+            current_branch = self._row_index().branch
             resolved_parent = (
                 parent_id
                 if parent_id is not None
@@ -1067,7 +1067,7 @@ class ConversationStore(
         parent_id: str | None = None,
         reason: str | None = None,
     ) -> ConversationEntry | None:
-        branch = self._active_branch()
+        branch = self._row_index().branch
         states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
@@ -1096,7 +1096,7 @@ class ConversationStore(
         return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def compaction_marker_count(self) -> int:
-        return sum(entry.type == "compaction" for entry in self._active_branch())
+        return sum(entry.type == "compaction" for entry in self._row_index().branch)
 
     def latest_compaction_marker(self) -> ConversationEntry | None:
         """Return the newest compaction marker on the active branch (no copy).
@@ -1104,7 +1104,7 @@ class ConversationStore(
         Reverse-scans the resident branch and snapshots only the one hit, so a
         caller that reads ``marker.data`` never touches resident state.
         """
-        for entry in reversed(self._active_branch()):
+        for entry in reversed(self._row_index().branch):
             if entry.type == "compaction":
                 return self._snapshot_entry(entry)
         return None
@@ -1144,7 +1144,7 @@ class ConversationStore(
         return self._row_index().branch
 
     def replay(self) -> list[ConversationEntry]:
-        return self._snapshot_branch(self._active_branch())
+        return self._snapshot_branch(self._row_index().branch)
 
     def active_agent_receipts(self) -> tuple[tuple[str, str], ...]:
         """Return immutable child receipt coordinates from the active branch."""
@@ -1214,7 +1214,7 @@ class ConversationStore(
         path: the message was just appended, so a reverse scan finds it near
         the tail without copying the whole branch.
         """
-        for entry in reversed(self._active_branch()):
+        for entry in reversed(self._row_index().branch):
             if entry.type != "message":
                 continue
             if Message.from_dict(entry.data["message"]) == message:
