@@ -49,7 +49,11 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 ErrorDescriptor.NO_ACTIVE_SESSION,
                 "session is not active",
             )
-        connections.begin_replay_join(client, ReplayScopeId.top(session_id))
+        # No swap guard here: serve installs the resumed runtime (`self._state`)
+        # at server/runtime.py `_replace` ONLY after `_run_setup` -> compose_runtime
+        # -> recovery returns, so a join cannot read the store mid-recovery. The
+        # session_replay area is owned by lead :1 (#1175); keep edits minimal.
+        await connections.begin_replay_join(client, ReplayScopeId.top(session_id))
         read = await connections.read_replay_history(
             client, session_id, params.get("history_validator")
         )

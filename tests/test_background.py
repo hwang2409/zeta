@@ -780,7 +780,10 @@ async def test_background_task_owner_state_table(
             child_pid = await read_pid_file(child_ready)
             try:
                 await await_or_fail(probe_entered.wait(), what="live group probe")
-                assert probed_pids == [leader_pid]
+                # the drain loop re-probes the leader every 10 ms, so under load it
+                # can record the leader pid more than once before this task resumes;
+                # every probe must still target the leader group and no other pid.
+                assert probed_pids and set(probed_pids) == {leader_pid}
                 lifecycle = owner.lifecycle
                 assert lifecycle is not None
                 lifecycle.cancel()
@@ -3364,16 +3367,19 @@ async def test_background_task_stays_running_for_detached_group_member(
 ) -> None:
     ready = tmp_path / "detached-ready"
     terminated = tmp_path / "detached-terminated"
+    # The handler sleeps before writing so the kill must honour the full term
+    # grace for the detached member. Without that grace the member is SIGKILLed
+    # mid-handler and `terminated` is never written (the CI flake).
     child = (
         "import os,pathlib,signal,time; "
         f"ready=pathlib.Path({str(ready)!r}); "
         f"terminated=pathlib.Path({str(terminated)!r}); "
         "signal.signal(signal.SIGTERM, lambda *_: "
-        "(terminated.write_text(str(os.getpid())), exit())[1]); "
+        "(time.sleep(3.0), terminated.write_text(str(os.getpid())), os._exit(0))); "
         "ready.write_text(str(os.getpid())); "
         "time.sleep(300)"
     )
-    tasks = BackgroundTaskRegistry()
+    tasks = BackgroundTaskRegistry(term_grace=10.0)
     task_id, pid = await tasks.start(
         _python(
             "import subprocess,sys; "

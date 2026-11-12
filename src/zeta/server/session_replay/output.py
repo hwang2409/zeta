@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from .. import event_contract
 from ..handlers import lifecycle, validation
 from ..handlers.history import replay_history
 from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
@@ -195,20 +196,20 @@ class ReplayOutput:
                     return runtime.opened.store
         return None
 
-    def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        self.invalidate_replay_connection(connection, reason="rejoined")
+    async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         runtime = connection.server.runtime
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
             store = validation.active(runtime, {"session_id": scope.value})
-        status = lifecycle.live_status_baseline(connection)
-        self.replay.begin_join(
+        self.invalidate_replay_connection(connection, reason="rejoined")
+        pending = self.replay.begin_join(
             connection,
             scope,
             None if store is None else store.reset_generation(),
-            status,
+            {},
         )
+        pending.status = await lifecycle.live_status_baseline(connection)
 
     def finish_replay_join(
         self,
@@ -550,4 +551,26 @@ class ReplayOutput:
 
         result = await self.run_read(connection, read)
         assert isinstance(result, tuple)
-        return result
+        history, *rest = result
+        shaped = self._strip_restart_reason(connection, history)
+        if shaped is history:
+            return result
+        return (shaped, *rest)
+
+    def _strip_restart_reason(self, connection: Any, history: object) -> object:
+        """Strip ``server_restarted`` from projected approval rows for a legacy
+        connection (no ``approval_restart_reason`` feature). One output seam for
+        every history page; returns the same object when nothing is stripped."""
+        if "approval_restart_reason" in self._connections[connection].features:
+            return history
+        if not isinstance(history, dict):
+            return history
+        rows = history.get("messages")
+        if not isinstance(rows, list):
+            return history
+        shaped = event_contract.shape_approval_history_rows(
+            rows, include_restart_reason=False
+        )
+        if shaped is rows:
+            return history
+        return {**history, "messages": shaped}

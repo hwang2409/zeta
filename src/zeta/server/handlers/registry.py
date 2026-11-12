@@ -150,7 +150,7 @@ async def child_run_events(client, request_id, params):
     if client.server.runtime.session_id != params["session_id"]:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
     try:
-        connections.begin_replay_join(client, ReplayScopeId.child(params["run_id"]))
+        await connections.begin_replay_join(client, ReplayScopeId.child(params["run_id"]))
         history, frontier_seq, row = await connections.read_child_run_events(client, params)
         result = connections.finish_replay_join(client, history, frontier_seq, None)
         current = connections.child_runs.current(params["run_id"])

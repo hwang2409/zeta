@@ -5,12 +5,23 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...protocol.types import Message, MessageOrigin, MessageRole, TextContent
 from ..checkpoints import ConversationEntry
 from ._pending_prompts import PENDING_PROMPT_ID_METADATA
-from ._validation import validate_notification_data
+from ._validation import (
+    AGENT_COMPLETION_NOTIFICATION_KIND,
+    CHILD_HOLD_NOTIFICATION_KIND,
+    CHILD_IDLE_NOTIFICATION_KIND,
+    CHILD_QUESTION_NOTIFICATION_KIND,
+    CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND,
+    NOTIFICATION_KINDS,
+    PROJECT_INBOX_NOTIFICATION_KIND,
+    TASK_EXITED_NOTIFICATION_KIND,
+    validate_notification_data,
+)
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
@@ -56,6 +67,40 @@ _MUTATION_ONLY_KINDS = {
     "child_question_reroute",
     "question_answer_ack",
 }
+
+type TerminalDisposition = Literal["keep", "fold", "ack_moot"]
+
+# Every durable notification kind -> what a terminal (finish-gate-concluded) run
+# does with it. "keep" leaves it durable for finalize to reroute; "fold" merges
+# its report into this run's receipt and acks it; "ack_moot" acks it because the
+# information survives elsewhere. There is no default: a kind outside this map
+# cannot load, and a stray lookup raises KeyError (never ack-and-drop).
+TERMINAL_DISPOSITION: Mapping[str, TerminalDisposition] = MappingProxyType(
+    {
+        AGENT_COMPLETION_NOTIFICATION_KIND: "fold",
+        CHILD_QUESTION_NOTIFICATION_KIND: "keep",
+        CHILD_IDLE_NOTIFICATION_KIND: "keep",
+        CHILD_HOLD_NOTIFICATION_KIND: "keep",
+        PROJECT_INBOX_NOTIFICATION_KIND: "keep",
+        TASK_EXITED_NOTIFICATION_KIND: "ack_moot",
+        CHILD_QUESTION_WITHDRAWN_NOTIFICATION_KIND: "ack_moot",
+    }
+)
+if set(TERMINAL_DISPOSITION) != set(NOTIFICATION_KINDS):
+    raise RuntimeError("classify every notification kind in TERMINAL_DISPOSITION")
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalSettlement:
+    """Outcome of settling one terminal pass.
+
+    ``prompt_pending`` means a non-suppressed prompt waits: the caller delivers
+    one model turn instead of finalizing. ``folded`` are acked agent_completion
+    snapshots to merge into this run's receipt.
+    """
+
+    prompt_pending: bool
+    folded: tuple[ConversationEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +526,45 @@ def _admit_terminal(
         return pending, closed
 
 
+def _settle_terminal(
+    store: ConversationStore, suppressed_ids: frozenset[str]
+) -> TerminalSettlement:
+    """Classify, ack and close every staged input of a terminal run atomically.
+
+    One command under ``_append_lock`` removes the admit-vs-commit race: input
+    commits either before this read (settled here) or after it (window C, a
+    pre-existing gap). A non-suppressed prompt wins and is delivered a turn;
+    otherwise every pending input is settled by ``TERMINAL_DISPOSITION`` and the
+    prompt queue is closed, so the run finalizes.
+    """
+
+    with store.pending_prompt_queue._lock():
+        prompts = store.pending_prompt_queue._pending_unlocked()
+        if any(prompt.id not in suppressed_ids for prompt in prompts):
+            return TerminalSettlement(True)
+        # Suppressed input (exhausted-budget prompts and notifications) already
+        # got a not-delivered notice and stays durable so the user still sees it;
+        # it is never acked, folded, or delivered here.
+        rows: list[tuple[str, dict[str, Any]]] = []
+        folded: list[ConversationEntry] = []
+        for entry in store._active_notifications.values():
+            if entry.data.get("display_only") is True or entry.id in suppressed_ids:
+                continue
+            disposition = TERMINAL_DISPOSITION[
+                entry.data.get("kind", AGENT_COMPLETION_NOTIFICATION_KIND)
+            ]
+            if disposition == "keep":
+                continue
+            if disposition == "fold":
+                folded.append(store._snapshot_entry(entry))
+            rows.append(("notification_ack", {"notification_id": entry.id}))
+        if not store.pending_prompt_queue._queue_closed_unlocked():
+            rows.append(("pending_queue_closed", {}))
+        if rows:
+            store._append_many_unlocked(rows)
+        return TerminalSettlement(False, tuple(folded))
+
+
 def validate_delivery_input(item: DeliveryInput) -> DeliverySource:
     if isinstance(item, PromptInput):
         if not item.text.strip():
@@ -564,3 +648,8 @@ class StepDeliveryStoreMixin:
         self, intent: TerminalIntent
     ) -> tuple[bool, bool]:
         return _admit_terminal(self, intent)
+
+    def _settle_step_delivery_terminal(
+        self, suppressed_ids: frozenset[str]
+    ) -> TerminalSettlement:
+        return _settle_terminal(self, suppressed_ids)

@@ -868,14 +868,22 @@ unhealthy because approval persistence failed, `state` remains `"idle"` and
 `send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
 separate error and does not change the unhealthy status behavior.
 
-With the negotiated `approval_reconnect` feature, `pending_approvals` is the
-server's live projection and is limited to 64 entries. The result also contains
+With the negotiated `approval_reconnect` feature, `pending_approvals` is the live
+projection merged with the durable store projection by `request_id` (a live row
+wins on overlap, keeping its `resolution_pending`), limited to 64 entries. The
+durable projection covers a session resumed after a serve restart, when the loop
+holds no live approval records yet, and any approval that is only durable while
+another is settling live, so an approval persisted before the restart stays
+visible (still bounded to 64). The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Read-only observers receive the same live baseline as the controller,
 but approval mutations still return `-32008`. Without the feature, the status
 shape and unbounded strict durable projection are unchanged, and observers
-receive the same rows as the controller.
+receive the same rows as the controller. A `session_history_and_subscribe` join
+status gets this same merged baseline even for clients without
+`approval_reconnect`, so a join during the settling window lists both the
+settling and the still-durable approvals.
 
 With the negotiated `served_turn_end` feature, the result also contains
 `last_turn_outcome`. It is `null` when the active branch has no durable whole-turn
@@ -1000,9 +1008,23 @@ and `data`. When a durable outcome is stored, `data.decision` is `allow`, `deny`
 or `abort`, and an abort also sets `data.reason`. `data` can carry other
 loop-provided fields, and it is `{}` when there are none and no outcome is
 stored. Emitted reasons
-are `controller_disconnected`, `turn_canceled`, `child_cleanup`, or
-`grace_expired`. For delegated approvals, the request ID is an opaque
-server-issued key, even when the parent and child use the same raw tool call ID.
+are `controller_disconnected`, `turn_canceled`, `child_cleanup`,
+`grace_expired`, or `server_restarted`. For delegated approvals, the request ID
+is an opaque server-issued key, even when the parent and child use the same raw
+tool call ID.
+
+`server_restarted` is emitted only to a client that negotiated the
+`approval_restart_reason` feature. On start, before the server admits any
+session join, the owner durably closes every approval request that a restarted
+process cannot answer by writing one idempotent `approval_end` with
+`data.decision: "abort"` and `data.reason: "server_restarted"`. A client that
+did not negotiate `approval_restart_reason` still receives the terminal
+`approval_end` (so it learns the request is closed), but the `server_restarted`
+reason is removed from both the top-level `reason` and `data.reason`; this
+applies to live events and to every history, replay, and child-run history
+page. The home's stored-format epoch gates the durable reason: at or above the
+`approval_restart_reason` writer epoch the recovery records `server_restarted`,
+and below it a reasonless `abort` that older readers accept.
 
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"approval_request","session_id":"abc123","request_id":"tool-call-1","delegated":false,"tool_call":{"id":"tool-call-1","name":"bash","arguments":{"command":"ls"}}}}
@@ -1854,6 +1876,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 | `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
+| `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

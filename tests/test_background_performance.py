@@ -10,6 +10,7 @@ from tests.support.owned import await_or_fail
 from zeta.agent.background_lifecycle import _recover_nested_children
 from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolResult
+from zeta.storage_format import WRITER_EPOCH
 
 
 @pytest.mark.asyncio
@@ -132,7 +133,7 @@ def test_nested_recovery_uses_indexed_tool_result_lookup() -> None:
             self.finished.append(marker_key)
 
     store = Store()
-    _recover_nested_children(store, store, {})  # type: ignore[arg-type]
+    _recover_nested_children(store, store, store, {}, WRITER_EPOCH)  # type: ignore[arg-type]
 
     assert store.messages_calls == 0
     assert store.tool_result_calls == len(tool_calls)

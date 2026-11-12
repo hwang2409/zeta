@@ -267,6 +267,7 @@ FEATURES = (
     "child_runs",
     "delivery_session_guard",
     "run_work",
+    "approval_restart_reason",
 )
 
 
@@ -444,6 +445,8 @@ MAX_FRAME_BYTES = 1_048_576
 MAX_REQUEST_ID_BYTES = 128
 MAX_NUMERIC_ID_DIGITS = 128
 TOOL_OUTPUT_MAX_BYTES = 8_000
+# A reconnecting client is given at most this many pending-approval rows.
+RECONNECT_APPROVAL_LIMIT = 64
 
 
 def hello_result(
@@ -991,6 +994,16 @@ def bounded(value: str, limit: int = TOOL_OUTPUT_MAX_BYTES) -> str:
     return f"{retained}... [truncated: {len(raw) - limit} bytes]"
 
 
+def bound_reconnect_approvals(
+    rows: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], bool]:
+    """Cap a reconnecting client's pending-approval rows at RECONNECT_APPROVAL_LIMIT;
+    the flag says the list was truncated. One owner for the bound so the live
+    projection and the durable-store fallback cut off at the same place."""
+
+    return rows[:RECONNECT_APPROVAL_LIMIT], len(rows) > RECONNECT_APPROVAL_LIMIT
+
+
 __all__ = [
     "FEATURES",
     "MAX_FRAME_BYTES",
@@ -1001,6 +1014,7 @@ __all__ = [
     "TOOL_OUTPUT_MAX_BYTES",
     "FrameCodec",
     "ProtocolError",
+    "bound_reconnect_approvals",
     "bounded",
     "negotiate_protocol_version",
 ]

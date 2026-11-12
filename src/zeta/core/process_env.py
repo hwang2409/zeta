@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Mapping
 
 # These names cover the sensitive-name basket used by auth redaction, plus
@@ -85,6 +86,40 @@ def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
     environment.setdefault("DEBIAN_FRONTEND", "noninteractive")
     environment.setdefault("PAGER", "cat")
     environment.setdefault("GIT_PAGER", "cat")
+    # A tool shell inherits the user's $TMUX/$TMUX_PANE, so a bare `tmux ...`
+    # (including `kill-server`) controls the host server that hosts every zeta
+    # session. Drop those and point tmux at a private per-home socket dir so a
+    # bare agent tmux only reaches its own server. To drive the host server on
+    # purpose, target it explicitly, e.g. `tmux -S /private/tmp/tmux-$(id -u)/default`.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    if "TMUX_TMPDIR" not in environment:
+        environment["TMUX_TMPDIR"] = _tmux_tmpdir()
     if overrides is not None:
         environment.update(overrides)
     return environment
+
+
+def _tmux_tmpdir() -> str:
+    """Return a private, per-home tmux socket dir, creating it 0700.
+
+    On any filesystem error (read-only home, a symlink or file at the path, an
+    unowned dir) fall back to a per-process temp dir so a tool spawn never
+    fails and still never reaches the host tmux server.
+    """
+
+    from .session import env_home
+
+    try:
+        path = env_home() / "run" / "tmux"
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        return str(path)
+    except OSError:
+        global _FALLBACK_TMUX_TMPDIR
+        if _FALLBACK_TMUX_TMPDIR is None:
+            _FALLBACK_TMUX_TMPDIR = tempfile.mkdtemp(prefix="zeta-tmux-")
+        return _FALLBACK_TMUX_TMPDIR
+
+
+_FALLBACK_TMUX_TMPDIR: str | None = None

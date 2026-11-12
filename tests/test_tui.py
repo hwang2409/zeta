@@ -9065,7 +9065,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_steps = 0
     gated_once = False
 
-    def gated_recovery(loop: AgentLoop, **kwargs: object) -> object:
+    def gated_recovery(loop: AgentLoop, home_epoch: int, **kwargs: object) -> object:
         nonlocal gated_once, recovery_steps
         children_before = len(loop.store.agent_children())
         should_stop = kwargs.get("should_stop")
@@ -9084,7 +9084,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
                     time.sleep(0.01)
             return bool(should_stop and should_stop())
 
-        recover_agent_children(loop, should_stop=observed_stop)
+        recover_agent_children(loop, home_epoch, should_stop=observed_stop)
         recovery_steps += children_before - len(loop.store.agent_children())
 
     # test-contract: seam recovery must stop while the TUI is shutting down.
@@ -14299,22 +14299,21 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
         model="offline",
     )
 
-    app._submissions.wake()
-    app._submissions.submit("user submission", steer=False)
-    for _ in range(100):
-        if backend.calls:
-            break
-        await asyncio.sleep(0.01)
-    backend.release_first.set()
-    for _ in range(100):
-        if not app._submissions.active:
-            break
-        await asyncio.sleep(0.01)
+    try:
+        app._submissions.wake()
+        app._submissions.submit("user submission", steer=False)
+        await wait_until(lambda: backend.calls >= 1)
+        backend.release_first.set()
+        await wait_until(
+            lambda: backend.calls == 2 and not app._submissions.active
+        )
 
-    assert backend.calls == 2
-    assert backend.max_active == 1
-    await app._submissions.close()
-    await app.loop.close()
+        assert backend.calls == 2
+        assert backend.max_active == 1
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

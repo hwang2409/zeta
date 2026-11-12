@@ -528,14 +528,22 @@ class ConversationChannel:
         return parent_store
 
     async def reroute_questions_from(self, dead_parent: ConversationStore) -> int:
-        """Move unanswered descendant questions to their next live ancestor."""
+        """Move a dead child's live descendant input to the next live ancestor.
+
+        An unanswered descendant question, and the idle or hold notice of a still
+        running grandchild, would otherwise reach no model once their direct
+        parent ends. Each is re-published to the next live ancestor; idle and hold
+        are then acked in the dead store (a question is acked by its reroute).
+        """
 
         from .pending_delivery import NotificationInput
 
         moved = 0
         dead_parent_id = self._target_for_store(dead_parent)
+        settled_ids: list[str] = []
         for entry in dead_parent.agent_notifications():
-            if entry.data.get("kind") != "child_question":
+            kind = entry.data.get("kind")
+            if kind not in ("child_question", "child_idle", "child_hold"):
                 continue
             child_id = entry.data.get("child_instance_id")
             if type(child_id) is not str or not self._owner.owns_running(child_id):
@@ -543,27 +551,36 @@ class ConversationChannel:
             target, parent_id = self._live_parent(child_id)
             if target is dead_parent:
                 continue
-            data = dict(entry.data)
-            data["routing_note"] = (
-                "direct parent is no longer alive; routed to the next live ancestor"
-            )
-            await self.produce_to(
-                parent_id,
-                NotificationInput(
-                    "child_question", data, dedupe_key=str(data["question_id"])
-                ),
-            )
-            await self.produce_to(
-                dead_parent_id,
-                NotificationInput(
-                    "question_answer_ack",
-                    {
-                        "child_instance_id": child_id,
-                        "question_id": str(data["question_id"]),
-                    },
-                ),
-            )
+            if kind == "child_question":
+                data = dict(entry.data)
+                data["routing_note"] = (
+                    "direct parent is no longer alive; routed to the next live ancestor"
+                )
+                await self.produce_to(
+                    parent_id,
+                    NotificationInput(
+                        "child_question", data, dedupe_key=str(data["question_id"])
+                    ),
+                )
+                await self.produce_to(
+                    dead_parent_id,
+                    NotificationInput(
+                        "question_answer_ack",
+                        {
+                            "child_instance_id": child_id,
+                            "question_id": str(data["question_id"]),
+                        },
+                    ),
+                )
+            else:
+                # Re-publish the idle/hold with its payload unchanged: both
+                # validators are strict, so adding a routing note would be
+                # rejected. Then ack it in the dead store.
+                await self.produce_to(parent_id, NotificationInput(kind, dict(entry.data)))
+                settled_ids.append(entry.id)
             moved += 1
+        if settled_ids:
+            await dead_parent.acknowledge_staged_delivery(None, tuple(settled_ids))
         return moved
 
     def question_answered(self, child_instance_id: str, question_id: str) -> None:

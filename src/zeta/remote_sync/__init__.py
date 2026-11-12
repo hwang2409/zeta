@@ -24,7 +24,12 @@ from typing import Protocol
 
 from ..core.session import SessionManager
 from ..core.session_execution import RUNTIME_LEASE_NAME
-from ..core.session_files import SessionError, SessionInUseError, session_directory
+from ..core.session_files import (
+    SessionError,
+    SessionInUseError,
+    reference_publication,
+    session_directory,
+)
 from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
@@ -96,8 +101,18 @@ class LocalTransport:
         return _machine_id(self.home)
 
     def publish_session(self, snapshot: Path, *, force: bool) -> Path:
-        with open_writer(self.home):
-            return self._publish_session(snapshot, force=force)
+        with open_writer(self.home) as lease:
+            manifest = _read_manifest(snapshot)
+            installed_ids, referenced_ids = _snapshot_reference_ids(
+                snapshot, str(manifest["session_id"])
+            )
+            with reference_publication(
+                self.home,
+                lease,
+                installed_ids=installed_ids,
+                referenced_ids=referenced_ids,
+            ):
+                return self._publish_session(snapshot, force=force)
 
     def _publish_session(self, snapshot: Path, *, force: bool) -> Path:
         manifest = _read_manifest(snapshot)
@@ -290,13 +305,19 @@ def _pull_session(
                 direction="pull",
             )
         destination = sessions / safe_id
+        installed_ids, referenced_ids = _snapshot_reference_ids(snapshot, safe_id)
         lease = (
             session_directory(sessions, safe_id, exclusive=True)
             if destination.exists()
             else nullcontext()
         )
         try:
-            with lease:
+            with reference_publication(
+                local_home,
+                storage_lease,
+                installed_ids=installed_ids,
+                referenced_ids=referenced_ids,
+            ), lease:
                 if destination.exists():
                     source_state = _tree_state(snapshot)
                     destination_state = _tree_state(destination)
@@ -602,6 +623,18 @@ def _validate_snapshot(
                 store.close()
     except (OSError, ValueError) as exc:
         raise RemoteSyncError(f"session transcript is invalid: {target_label}") from exc
+
+
+def _snapshot_reference_ids(
+    snapshot: Path, session_id: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    metadata = _read_json(snapshot / "meta.json")
+    parent = metadata.get("parent_session_id")
+    if parent is None:
+        return (session_id,), ()
+    if type(parent) is not str:
+        raise RemoteSyncError("session parent id is invalid")
+    return (session_id,), (_safe_component(parent, "parent session id"),)
 
 
 def _snapshot_transcripts(
