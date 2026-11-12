@@ -684,7 +684,13 @@ class SlashHandlerMixin:
 
     def _restart_is_idle(self) -> bool:
         session = self._active_session
-        composer_empty = session is None or not session.default_buffer.text
+        application = None if session is None else getattr(session, "app", None)
+        buffer = (
+            getattr(application, "current_buffer", None)
+            if application is not None
+            else None
+        )
+        composer_empty = buffer is None or not buffer.text
         return (
             not self.restart_has_running_work
             and not self.active

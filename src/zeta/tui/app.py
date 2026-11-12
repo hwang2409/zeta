@@ -1157,7 +1157,9 @@ class TUIApp(
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
-            session.default_buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            buffer = getattr(getattr(session, "app", None), "current_buffer", None)
+            if buffer is not None:
+                buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
                 await start_prompt_during_activation(self, session, run_prompt_toolkit)
