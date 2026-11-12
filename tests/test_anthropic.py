@@ -442,6 +442,68 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
 
 
 @pytest.mark.asyncio
+async def test_request_body_uses_model_output_limit(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        model="claude-opus-4-8", client=client, token_store=store
+    )
+    _ = [
+        event
+        async for event in backend.complete(
+            [Message(MessageRole.USER, [TextContent("hi")])],
+            [],
+            control=completion_control(),
+        )
+    ]
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 128_000
+    assert payload["thinking"]["budget_tokens"] == 64_000
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_body_keeps_default_limit_for_unknown_model(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        model="claude-unknown-9", client=client, token_store=store
+    )
+    _ = [
+        event
+        async for event in backend.complete(
+            [Message(MessageRole.USER, [TextContent("hi")])],
+            [],
+            control=completion_control(),
+        )
+    ]
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 16_384
+    assert payload["thinking"]["budget_tokens"] == 8_192
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_oauth_compat_is_opt_in_and_adds_only_oauth_headers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
