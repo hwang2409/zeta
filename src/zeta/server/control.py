@@ -46,6 +46,7 @@ from .approval_lifecycle import (
     Start,
     Terminate,
 )
+from .background_events import BackgroundEventPublisher
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
 from .protocol import (
@@ -134,8 +135,10 @@ class ServeControl:
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
-        self._background_events: asyncio.Queue[tuple[str, StreamEvent] | None] = asyncio.Queue()
-        self._background_event_task: asyncio.Task[None] | None = None
+        self._background_events = BackgroundEventPublisher(
+            self._publish_background_event_to_wire,
+            self._overflow_background_events,
+        )
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -444,14 +447,7 @@ class ServeControl:
 
     async def close(self) -> None:
         self.closing = True
-        try:
-            await asyncio.wait_for(self.flush_background_events(), CONTROLLER_HANDOFF_DEADLINE_SECONDS)
-        except TimeoutError:
-            pass
-        finally:
-            task = self._background_event_task
-            if task is not None:
-                task.cancel(); await asyncio.gather(task, return_exceptions=True); self._background_event_task = None
+        await self._background_events.close(CONTROLLER_HANDOFF_DEADLINE_SECONDS)
         task = self._grace_task
         if task is not None:
             task.cancel()
@@ -1095,20 +1091,21 @@ class ServeControl:
         )
         return controller.protocol_version if controller is not None else "1.0"
 
-    async def _drain_background_events(self) -> None:
-        while True:
-            item = await self._background_events.get()
-            if item is None: return
-            try: await self._event(item[1], session_id=item[0], background=True)
-            finally: self._background_events.task_done()
+    async def _publish_background_event_to_wire(
+        self, session_id: str, event: StreamEvent
+    ) -> None:
+        await self._event(event, session_id=session_id, background=True)
+
+    def _overflow_background_events(self) -> None:
+        connections = self.server.connections
+        if connections is not None:
+            connections.overflow_controller()
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
-        if not self.closing:
-            if self._background_event_task is None: self._background_event_task = asyncio.create_task(self._drain_background_events())
-            self._background_events.put_nowait((session_id, event))
+        self._background_events.publish(session_id, event)
 
     async def flush_background_events(self) -> None:
-        await asyncio.sleep(0); await self._background_events.join()
+        await self._background_events.flush()
 
     def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
         connections = self.server.connections

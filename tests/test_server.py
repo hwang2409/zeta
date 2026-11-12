@@ -2520,6 +2520,98 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 
 
 @pytest.mark.asyncio
+async def test_background_event_failure_does_not_stop_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+    )
+    calls: list[str] = []
+
+    async def publish(
+        event: StreamEvent, *, session_id: str, background: bool
+    ) -> None:
+        assert background
+        calls.append(session_id)
+        if session_id == "failed":
+            raise RuntimeError("secret payload must not be logged")
+
+    # test-contract: seam force one wire publication failure
+    monkeypatch.setattr(server.control, "_event", publish)
+    server.control._publish_background_event(
+        "failed", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="secret")
+    )
+    server.control._publish_background_event(
+        "continued", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="next")
+    )
+    try:
+        try:
+            await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        except TimeoutError:
+            pass
+        assert calls == ["failed", "continued"]
+        assert "secret payload" not in caplog.text
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_background_event_backlog_overflow_drops_slow_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    published_sessions: list[str] = []
+    overflows = 0
+
+    async def publish(
+        event: StreamEvent, *, session_id: str, background: bool
+    ) -> None:
+        del event
+        assert background
+        published_sessions.append(session_id)
+        if len(published_sessions) == 1:
+            started.set()
+            await asyncio.wait_for(release.wait(), TIMEOUT)
+
+    def overflow_controller() -> None:
+        nonlocal overflows
+        overflows += 1
+
+    monkeypatch.setattr(server.control, "_event", publish)
+    server.connections = SimpleNamespace(overflow_controller=overflow_controller)
+    server.control._publish_background_event(
+        "slow", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="first")
+    )
+    await asyncio.wait_for(started.wait(), TIMEOUT)
+    for index in range(254):
+        server.control._publish_background_event(
+            "slow", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=str(index))
+        )
+    server.control._publish_background_event(
+        "other", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="not retained")
+    )
+    try:
+        assert overflows == 1
+        # test-contract: seam the publisher's retained accounting is the bound
+        assert server.control._background_events._frames == 255
+        assert server.control._background_events._bytes <= 4 * 1024 * 1024
+        assert "other" not in published_sessions
+    finally:
+        release.set()
+        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        server.connections = None
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_background_events_keep_slow_approval_end_before_fast_child_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2639,16 +2731,11 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
         assert owner.cancel(child_id)
-        try:
-            await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
-        except ValueError as error:
-            assert str(error) == "session store is closed"
+        await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        await asyncio.wait_for(server.control.wait_for_approval_settlement(), TIMEOUT)
         notification_task = server.control._turn_task
         if notification_task is not None:
-            try:
-                await asyncio.wait_for(asyncio.shield(notification_task), TIMEOUT)
-            except ValueError as error:
-                assert str(error) == "session store is closed"
+            await asyncio.wait_for(asyncio.shield(notification_task), TIMEOUT)
         await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
         frames = await _request(reader, writer, 4, "status")
         frames += list(_client_buffer(reader))
@@ -2656,6 +2743,7 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         approval_ends = _named_events(frames, "approval_end")
         assert len(approval_ends) == 1
         assert approval_ends[0]["request_id"] == approval["request_id"]
+        assert len(_named_events(frames, "error")) == 1
         await _request(reader, writer, 5, "status")
         assert len(backend.grandchild.calls) == 1
     finally:
