@@ -941,10 +941,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
     ) -> bool:
         delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            aborted = delegated[1].resolve_approval(
+            return delegated[1].resolve_approval(
                 delegated[0].request_id, "abort", reason=reason
             )
-            return aborted
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
@@ -952,8 +951,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             self._ephemeral[request_id] = (ephemeral[0], "abort")
             return True
         store = self._require_store()
-        aborted = store.resolve_approval(request_id, "abort", reason=reason)
-        return aborted
+        return store.resolve_approval(request_id, "abort", reason=reason)
 
     async def abort_or_winner(
         self,
@@ -1032,10 +1030,9 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             raise ValueError("approval resolution must allow or deny")
         delegated = self._delegated_entry(request_id, child_instance_id)
         if delegated is not None:
-            resolved_ok = delegated[1].resolve_approval(
+            return delegated[1].resolve_approval(
                 delegated[0].request_id, resolved.value
             )
-            return resolved_ok
         if isinstance(request_id, tuple):
             return False
         ephemeral = self._ephemeral.get(request_id)
@@ -1043,8 +1040,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             self._ephemeral[request_id] = (ephemeral[0], resolved.value)
             return True
         store = self._require_store()
-        resolved_ok = store.resolve_approval(request_id, resolved.value)
-        return resolved_ok
+        return store.resolve_approval(request_id, resolved.value)
 
     def _delegated_entry(
         self,

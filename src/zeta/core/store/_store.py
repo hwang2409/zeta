@@ -649,9 +649,15 @@ class ConversationStore(
             entries.append(entry)
             parent_id = entry_id
         # Validate the complete candidate sequence before authoritative bytes
-        # reach disk. Approval relations use only a touched-id overlay; later
-        # p08b slices move the other relation sets behind the same seam.
-        approvals = self._full_branch_approval_overlay()
+        # reach disk. The authoritative approval overlay is built only when the
+        # batch actually touches an approval row (one scan), like the single-row
+        # and incremental paths; otherwise an empty overlay skips that scan.
+        touched = _ApprovalValidationOverlay.touched(entries)
+        approvals = (
+            self._full_branch_approval_overlay()
+            if touched
+            else _ApprovalValidationOverlay()
+        )
         self._entries.extend(entries)
         try:
             self._validate_entries(approvals, {entry.id for entry in entries})

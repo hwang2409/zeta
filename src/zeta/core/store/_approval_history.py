@@ -132,14 +132,21 @@ class ApprovalHistoryStoreMixin:
     def _resident_pending_approval_page(
         self, after_seq: int, limit: int
     ) -> IndexedPendingApprovalPage:
-        rows = [
-            row
-            for row in self._approval_now_snapshot().pending
-            if row[0] > after_seq
-        ][:limit]
+        pending = [
+            row for row in self._approval_now_snapshot().pending if row[0] > after_seq
+        ]
+        # Requests of one message share a seq; the cursor is that seq with a
+        # strict ``>``. Ending a page inside a message would skip its remaining
+        # requests forever, so a page stops only at a message boundary (and
+        # always holds at least the first message, even past ``limit``).
+        page: list[tuple[int, str, Mapping[str, object]]] = []
+        for row in pending:
+            if len(page) >= limit and row[0] != page[-1][0]:
+                break
+            page.append(row)
         return IndexedPendingApprovalPage(
-            tuple((request_id, tool_call) for _seq, request_id, tool_call in rows),
-            rows[-1][0] if len(rows) == limit else None,
+            tuple((request_id, tool_call) for _seq, request_id, tool_call in page),
+            page[-1][0] if len(page) < len(pending) else None,
         )
 
     # One resident projection of the active branch, memoized by the active-leaf

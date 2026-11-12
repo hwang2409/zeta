@@ -727,18 +727,30 @@ class HistoryIndex:
     ) -> IndexedPendingApprovalPage:
         if not 1 <= limit <= self.PAGE_LIMIT:
             raise InvalidHistoryPageRequest("invalid pending approval page limit")
+        # ``limit`` bounds distinct message seqs, not rows: a page returns every
+        # pending request of the first ``limit`` pending messages after
+        # ``after_seq``. The cursor is a seq with a strict ``>``, so ending a
+        # page inside a message would skip its remaining requests forever.
         rows = self._approval_query(
             facts,
             "SELECT r.request_id,r.request_seq,r.tool_call "
             "FROM active_approval_requests r "
             "LEFT JOIN active_approval_resolutions s USING(request_id) "
-            "WHERE s.request_id IS NULL AND r.request_seq>? "
-            "ORDER BY r.request_seq LIMIT ?",
+            "WHERE s.request_id IS NULL AND r.request_seq IN ("
+            "  SELECT seq FROM ("
+            "    SELECT DISTINCT r2.request_seq AS seq "
+            "    FROM active_approval_requests r2 "
+            "    LEFT JOIN active_approval_resolutions s2 ON s2.request_id=r2.request_id "
+            "    WHERE s2.request_id IS NULL AND r2.request_seq>? "
+            "    ORDER BY seq LIMIT ?"
+            "  )"
+            ") ORDER BY r.request_seq",
             (after_seq, limit),
         )
+        seqs = {row[1] for row in rows}
         return IndexedPendingApprovalPage(
             tuple((request_id, json.loads(tool_call)) for request_id, _seq, tool_call in rows),
-            int(rows[-1][1]) if len(rows) == limit else None,
+            int(rows[-1][1]) if len(seqs) == limit else None,
         )
 
     def _mark_unavailable(self) -> None:
