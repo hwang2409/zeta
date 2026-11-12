@@ -851,7 +851,7 @@ def test_resume_renders_removed_automation_session_fixture(
     assert "No automations found." in rendered
     assert "Automation interrupted; not automatically replayed." in rendered
     assert "saved automation prompt" in rendered
-    messages = resumed.loop.branch_messages(store)
+    messages = branch_messages(resumed.loop.store)
     assert any(
         message.metadata.get("response_state") == "synthetic" for message in messages
     )
@@ -1764,7 +1764,7 @@ async def test_removed_browser_tool_session_loads_renders_and_resumes(
         assert "browser" not in {
             schema["name"] for schema in resumed.loop.tool_registry.schemas
         }
-        messages = resumed.loop.branch_messages(store)
+        messages = branch_messages(resumed.loop.store)
         browser_call = next(
             block.tool_call
             for message in messages
@@ -2871,15 +2871,15 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
     await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=10)
 
     assert app.pending_approvals == ()
-    assert opened.branch_messages(store)[-1].tool_result is not None
-    assert opened.branch_messages(store)[-1].tool_result.content == "tool execution canceled"
+    assert branch_messages(opened.store)[-1].tool_result is not None
+    assert branch_messages(opened.store)[-1].tool_result.content == "tool execution canceled"
     await app._handle_prompt_value(f"/approve {call.id}")
     assert executed == []
     assert (
         len(
             [
                 message
-                for message in opened.branch_messages(store)
+                for message in branch_messages(opened.store)
                 if message.tool_result is not None
             ]
         )
@@ -2984,7 +2984,7 @@ async def test_resume_pending_tool_executes_and_persists_result(
     result = await loop.resume_pending_tool(call.id, event_sink=events.append)
 
     assert result is not None
-    assert opened.branch_messages(store)[-1].tool_result == result
+    assert branch_messages(opened.store)[-1].tool_result == result
     assert executed == (["done"] if decision == "allow" else [])
     assert [event.type for event in events] == (
         [StreamEventType.TOOL_EXECUTION_START, StreamEventType.TOOL_EXECUTION_END]
@@ -3032,10 +3032,10 @@ async def test_resumed_tool_abort_active_persists_canceled_result(
     await asyncio.wait_for(started.wait(), timeout=1)
     app.abort_active()
     await asyncio.wait_for(approval_task, timeout=10)
-    await wait_until(lambda: opened.branch_messages(store)[-1].tool_result is not None)
+    await wait_until(lambda: branch_messages(opened.store)[-1].tool_result is not None)
 
-    assert opened.branch_messages(store)[-1].tool_result is not None
-    assert opened.branch_messages(store)[-1].tool_result.content == "tool execution canceled"
+    assert branch_messages(opened.store)[-1].tool_result is not None
+    assert branch_messages(opened.store)[-1].tool_result.content == "tool execution canceled"
 
 
 @pytest.mark.asyncio
@@ -3077,8 +3077,8 @@ async def test_resumed_tool_direct_cancel_persists_canceled_result(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=10)
 
-    assert opened.branch_messages(store)[-1].tool_result is not None
-    assert opened.branch_messages(store)[-1].tool_result.content == "tool execution canceled"
+    assert branch_messages(opened.store)[-1].tool_result is not None
+    assert branch_messages(opened.store)[-1].tool_result.content == "tool execution canceled"
     assert [event.type for event in events] == [
         StreamEventType.TOOL_EXECUTION_START,
         StreamEventType.TOOL_EXECUTION_END,
@@ -3119,7 +3119,7 @@ async def test_resumed_tool_immediate_abort_persists_canceled_result(
 
     assert result is not None
     assert result.content == "tool execution canceled"
-    assert opened.branch_messages(store)[-1].tool_result == result
+    assert branch_messages(opened.store)[-1].tool_result == result
 
 
 def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
@@ -3137,7 +3137,7 @@ def test_finalize_canceled_is_idempotent(tmp_path: Path) -> None:
 
     results = [
         message.tool_result
-        for message in opened.branch_messages(store)
+        for message in branch_messages(opened.store)
         if message.tool_result is not None
     ]
     assert first is not None
@@ -3166,7 +3166,7 @@ def test_completion_edge_idempotence_preserves_success(tmp_path: Path) -> None:
     result = loop.finalize_canceled(call)
     results = [
         message.tool_result
-        for message in opened.branch_messages(store)
+        for message in branch_messages(opened.store)
         if message.tool_result is not None
     ]
 
@@ -3474,7 +3474,7 @@ async def test_resume_replays_historical_agent_wait_call_with_scripted_backend(
     loop = AgentLoop(backend, resumed.store, skill_catalog=SkillCatalog.empty())
     [event async for event in loop.run_turn("continue", origin=MessageOrigin.USER)]
 
-    assert resumed.branch_messages(store)[-1].content[0].text == "resumed"
+    assert branch_messages(resumed.store)[-1].content[0].text == "resumed"
     assert historical.name == "agent_wait"
 
 
@@ -3956,7 +3956,7 @@ async def test_server_runtime_resumes_legacy_summary_history_and_context(
         assert runtime.opened is not None
         summary_entries = [
             entry
-            for entry in runtime.opened.branch_entries(store)
+            for entry in branch_entries(runtime.opened.store)
             if entry.type == "compaction"
         ]
         assert [entry.data["summary"] for entry in summary_entries] == [

@@ -272,7 +272,7 @@ async def test_plan_mode_filters_and_rejects_actions_with_one_policy(
     assert executed == []
     result = next(
         message.tool_result
-        for message in loop.branch_messages(store)
+        for message in branch_messages(loop.store)
         if message.tool_result is not None
     )
     assert result.is_error is True

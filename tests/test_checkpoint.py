@@ -97,7 +97,7 @@ def test_replay_uses_codex_message_metadata_after_provider_switch(
     )
 
     rendered: list[object] = []
-    for message in opened.branch_messages(store):
+    for message in branch_messages(opened.store):
         render_replayed_message(
             message,
             presenter=object(),

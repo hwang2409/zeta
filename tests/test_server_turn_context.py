@@ -627,7 +627,7 @@ async def test_turn_context_is_persisted_as_non_user_notification_input(
 
         persisted = [
             message
-            for message in server.runtime.opened.branch_messages(store)
+            for message in branch_messages(server.runtime.opened.store)
             if CONTEXT in str(message.to_dict())
         ]
         assert len(persisted) == 1

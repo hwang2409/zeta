@@ -444,7 +444,7 @@ async def test_real_socket_branch_during_read_returns_current_branch(
             asyncio.to_thread(wait_for_page), what="history index page"
         )
         server.runtime.opened.store.append_message_fork(
-            server.runtime.opened.branch_entries(store)[0].id
+            branch_entries(server.runtime.opened.store)[0].id
         )
         release_page.set()
         response = (await await_or_fail(pending, what="history request"))[-1]
@@ -464,7 +464,7 @@ async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: p
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         assert first["messages"][0]["content"][0]["text"].startswith("message-")
-        user_id = server.runtime.opened.branch_entries(store)[0].id
+        user_id = branch_entries(server.runtime.opened.store)[0].id
         fork = (await request(reader, writer, 4, "fork_message", {"session_id": session_id, "message_id": user_id}))[-1]
         assert "error" not in fork
         response = (await request(reader, writer, 5, "session_history", {

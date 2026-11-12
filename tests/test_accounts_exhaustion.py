@@ -1087,7 +1087,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
         assert requests == 1
         assert not any(
             isinstance(block, TextContent) and block.text
-            for message in opened.branch_messages(store)
+            for message in branch_messages(opened.store)
             if message.role is MessageRole.ASSISTANT
             for block in message.content
         )
@@ -1110,7 +1110,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
             ),
         )
 
-        boundary = opened.branch_entries(store)[-1].seq
+        boundary = branch_entries(opened.store)[-1].seq
         await context.switch_active(
             loop,
             second,

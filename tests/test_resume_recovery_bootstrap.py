@@ -312,7 +312,7 @@ async def test_resume_recovery_restores_durable_completion(tmp_path: Path) -> No
         assert runtime.opened.store.agent_children() == {}
         results = [
             message.tool_result
-            for message in runtime.opened.branch_messages(store)
+            for message in branch_messages(runtime.opened.store)
             if message.tool_result is not None
         ]
         assert [result.tool_call_id for result in results] == ["call-0"]

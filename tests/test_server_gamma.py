@@ -1023,7 +1023,7 @@ async def test_cancelled_send_images_publishes_nothing(
             await asyncio.wait_for(request, 10)
         await asyncio.wait_for(asyncio.to_thread(worker_finished.wait), 10)
 
-        assert server.runtime.opened.branch_messages(store) == []
+        assert branch_messages(server.runtime.opened.store) == []
         assert not (server.runtime.opened.store.session_dir / "attachments").exists()
     finally:
         release_worker.set()

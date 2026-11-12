@@ -776,7 +776,7 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     assert any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
-        for message in app.loop.branch_messages(store)
+        for message in branch_messages(app.loop.store)
     )
 
 
@@ -795,13 +795,13 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     entries = app.loop.store.entries
     assert [entry.type for entry in entries].count("notification_ack") == 0
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
+        sum(message.role is MessageRole.SYSTEM for message in branch_messages(app.loop.store))
         == 1
     )
     assert not any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
-        for message in app.loop.branch_messages(store)
+        for message in branch_messages(app.loop.store)
     )
 
     timers[0][1].fire()
@@ -812,7 +812,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     assert timers[1][0] == 2.0
     assert app.console.file.getvalue().count("provider stopped") == 1
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
+        sum(message.role is MessageRole.SYSTEM for message in branch_messages(app.loop.store))
         == 1
     )
 
@@ -825,14 +825,14 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     # test-contract: seam provider call count proves the successful retry dispatched once
     assert len(backend.calls) == 3
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
+        sum(message.role is MessageRole.SYSTEM for message in branch_messages(app.loop.store))
         == 1
     )
     assert (
         sum(
             message.role is MessageRole.ASSISTANT
             and not message.metadata.get("turn_failed")
-            for message in app.loop.branch_messages(store)
+            for message in branch_messages(app.loop.store)
         )
         == 1
     )

@@ -1593,7 +1593,7 @@ def test_finalize_tool_results(
     assert [result.is_error for result in results] == expected_errors
     persisted = [
         message.tool_result
-        for message in loop.branch_messages(store)
+        for message in branch_messages(loop.store)
         if message.tool_result is not None
     ]
     assert [result.content for result in persisted] == expected_contents

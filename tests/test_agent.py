@@ -3209,7 +3209,7 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
         ] == [StreamEventType.TURN_START, StreamEventType.TURN_END]
         assert len(backend.calls) == 2
         assert next_reply in json.dumps(
-            [message.to_dict() for message in loop.branch_messages(store)]
+            [message.to_dict() for message in branch_messages(loop.store)]
         )
     finally:
         allow_request_preparation.set()

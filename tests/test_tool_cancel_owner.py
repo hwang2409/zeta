@@ -185,7 +185,7 @@ class Harness:
     def transcript(self) -> tuple[str, ...]:
         return tuple(
             summarize(message.tool_result)
-            for message in self.branch_messages(store)
+            for message in branch_messages(self.store)
             if message.tool_result is not None
         )
 
@@ -436,7 +436,7 @@ async def durable_inline(h: Harness) -> Outcome:
     await await_or_fail(asyncio.wait({task}), what="durable task end")
     results = tuple(
         summarize(message.tool_result)
-        for message in opened.branch_messages(store)
+        for message in branch_messages(opened.store)
         if message.tool_result is not None
     )
     return h.outcome(results)

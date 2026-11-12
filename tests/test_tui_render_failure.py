@@ -157,7 +157,7 @@ def test_render_failure_exits_without_input_and_restores_session(
         assert f"resume with: zeta --resume {store.session_id}" in error
         reopened = manager.open(store.session_id)
         try:
-            assert reopened.branch_messages(store) == [saved]
+            assert branch_messages(reopened.store) == [saved]
             assert DraftPersistence(reopened.store.session_dir / "draft").load() == "unsent draft"
         finally:
             reopened.store.close()

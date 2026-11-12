@@ -5052,7 +5052,7 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     await await_or_fail(task, what="draft response completion")
 
     assert session.app.current_buffer.text == "draft while streaming"
-    failed_message = app.loop.branch_messages(store)[-1]
+    failed_message = branch_messages(app.loop.store)[-1]
     assert failed_message.metadata["turn_failed"] is True
 
 

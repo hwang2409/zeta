@@ -93,7 +93,7 @@ async def test_permissions_shows_effective_policy_without_changing_it(
     try:
         settings_before = settings_path.read_bytes()
         rules_before = (policy.always_deny, policy.always_ask, policy.always_allow)
-        entries_before = app.loop.branch_entries(store)
+        entries_before = branch_entries(app.loop.store)
         capabilities = [
             registry.resolve_call("bash", {"command": command})
             for command in ("rm file", "git push", "git status", "echo hello")
@@ -131,7 +131,7 @@ async def test_permissions_shows_effective_policy_without_changing_it(
         ) == rules_before
         assert [policy.decide(call) for call in capabilities] == expected
         assert settings_path.read_bytes() == settings_before
-        assert app.loop.branch_entries(store) == entries_before
+        assert branch_entries(app.loop.store) == entries_before
         assert not backend.calls
 
         commands = app._slash_commands

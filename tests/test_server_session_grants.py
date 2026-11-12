@@ -2149,7 +2149,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert len(approval_ends) == 1, approval_ends
             durable_ends = [
                 entry
-                for entry in server.runtime.opened.branch_entries(store)
+                for entry in branch_entries(server.runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]
@@ -2687,7 +2687,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     assert server.runtime.opened is not None
                     history = [
                         entry.data
-                        for entry in server.runtime.opened.branch_entries(store)
+                        for entry in branch_entries(server.runtime.opened.store)
                         if entry.type == "approval_history"
                     ]
                     assert [row["event"] for row in history] == ["approval_end"]
@@ -2867,7 +2867,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert server.runtime.opened is not None
             durable_ends = [
                 entry
-                for entry in server.runtime.opened.branch_entries(store)
+                for entry in branch_entries(server.runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]

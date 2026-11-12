@@ -344,7 +344,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
             "duplicate": True,
         }
         assert backend.calls == 1
-        assert len(server.runtime.opened.branch_messages(store)) == 1
+        assert len(branch_messages(server.runtime.opened.store)) == 1
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
@@ -418,7 +418,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         assert delivered[-1]["result"]["status"] == "delivered"
         texts = [
             block.text
-            for message in server.runtime.opened.branch_messages(store)
+            for message in branch_messages(server.runtime.opened.store)
             if message.role is MessageRole.USER
             for block in message.content
             if isinstance(block, TextContent)
@@ -1395,7 +1395,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
                 isinstance(block, TextContent) and block.text == "later"
                 for block in message.content
             )
-            for message in resumed.runtime.opened.branch_messages(store)
+            for message in branch_messages(resumed.runtime.opened.store)
         )
     finally:
         await close_serve(resumed, writer)

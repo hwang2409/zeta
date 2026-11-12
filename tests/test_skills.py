@@ -389,7 +389,7 @@ async def test_duplicate_live_skill_retains_catalog_and_reports_once(
 
     notices = [
         block.text
-        for message in loop.branch_messages(store)
+        for message in branch_messages(loop.store)
         for block in message.content
         if isinstance(block, TextContent) and "skill discovery failed:" in block.text
     ]

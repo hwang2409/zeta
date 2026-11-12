@@ -2225,7 +2225,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
                     ).tool_result
                     is not None
                     and message.tool_result.tool_call_id == call.id
-                    for entry in server.runtime.opened.branch_entries(store)
+                    for entry in branch_entries(server.runtime.opened.store)
                 )
             return await original_notify(event, session_id, **fields)
 
@@ -2380,7 +2380,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert server.runtime.opened is not None
         assert any(
             isinstance(block, TextContent) and block.text == "parent done"
-            for message in server.runtime.opened.branch_messages(store)
+            for message in branch_messages(server.runtime.opened.store)
             for block in message.content
         )
         child_store = ConversationStore(
@@ -3421,7 +3421,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert canceled_tool_end["tool_call"]["id"] == call.id
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
-        history = server.runtime.opened.branch_messages(store)
+        history = branch_messages(server.runtime.opened.store)
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
@@ -3451,7 +3451,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert [
             name for name in next_names if name in {"turn_start", "turn_end"}
         ] == ["turn_start", "turn_end"]
-        history = server.runtime.opened.branch_messages(store)
+        history = branch_messages(server.runtime.opened.store)
         assert next_reply in json.dumps([message.to_dict() for message in history])
     finally:
         allow_approval_end.set()
@@ -4421,7 +4421,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    messages = server.runtime.manager.open(session_id).branch_messages(store)
+    messages = branch_messages(server.runtime.manager.open(session_id).store)
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -5583,8 +5583,8 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         restored = (await rpc("session_history"))["result"]["messages"]
         assert restored == history["messages"]
         reopened = SessionManager(tmp_path).open(sid)
-        assert [m.to_dict() for m in reopened.branch_messages(store)] == [
-            m.to_dict() for m in server.runtime.loop.branch_messages(store)
+        assert [m.to_dict() for m in branch_messages(reopened.store)] == [
+            m.to_dict() for m in branch_messages(server.runtime.loop.store)
         ]
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
@@ -6525,7 +6525,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
         assert not (server.runtime.opened.store.session_dir / "attachments").exists()
         assert (await send([image]))["result"]["accepted"]
         await _event(reader, "agent_end")
-        message = server.runtime.loop.branch_messages(store)[0]
+        message = branch_messages(server.runtime.loop.store)[0]
         attachment = next(
             block for block in message.content if isinstance(block, ImageContent)
         )
@@ -6546,7 +6546,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
             "size": len(png),
         }
         assert "data" not in history[0]["content"][1]
-        assert SessionManager(tmp_path).open(sid).branch_messages(store)[0] == message
+        assert branch_messages(SessionManager(tmp_path).open(sid).store)[0] == message
     finally:
         await close_serve(server, writer)
 
@@ -6876,7 +6876,7 @@ async def test_attachment_failure_removes_entire_batch(
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
         assert all(path.read_bytes() == png for path in before if path.is_file())
-        assert runtime.opened.branch_messages(store) == []
+        assert branch_messages(runtime.opened.store) == []
     finally:
         await runtime.close()
 
@@ -6950,7 +6950,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
                 MessageOrigin.USER,
             )
         )
-        history = opened.branch_messages(store)
+        history = branch_messages(opened.store)
         runtime.usage["input_tokens"] = 123
         with monkeypatch.context() as patch:
             if failure == "metadata":
@@ -6976,7 +6976,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
         assert (
             runtime.state is state and runtime.loop is loop and runtime.opened is opened
         )
-        assert opened.branch_messages(store) == history
+        assert branch_messages(opened.store) == history
         assert runtime.usage == {"input_tokens": 123}
         if failure:
             assert response["error"]["code"] == -32000
@@ -7003,7 +7003,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
             }
             await _request(reader, writer, 4, "send", {"text": "use new backend"})
             await _event(reader, "agent_end")
-            assert runtime.opened.branch_messages(store)[-1].content == [TextContent("codex")]
+            assert branch_messages(runtime.opened.store)[-1].content == [TextContent("codex")]
             await _request(reader, writer, 5, "resume", {"session_id": sid})
             assert runtime.provider == "codex" and runtime.model == "gpt-5.4"
             assert runtime.loop.context_assembler.token_budget == expected
