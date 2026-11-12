@@ -180,8 +180,8 @@ async def mcp_bindings(self, params: dict[str, Any]) -> dict[str, dict[str, str]
         result[name] = parsed
     config = await MCPManagementService(home=self.server.runtime.home).runtime_config()
     for name in result:
-        source = config.sources.get(name, config.path).resolve()
-        if name not in config.configured_servers or source != config.path.resolve():
+        source = config.sources.get(name, config.path)
+        if name not in config.configured_servers or source != config.path:
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
                 f"MCP server is not a trusted global server: {name}",
