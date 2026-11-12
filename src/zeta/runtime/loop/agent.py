@@ -207,6 +207,7 @@ class AgentLoop(
         self._configure_transcript_index()
         self._background_owner = background_owner or BackgroundAgentOwner(store)
         self._tracked_tasks: set[asyncio.Task[Any]] = set()
+        self._transcript_refresh_tasks: set[asyncio.Task[Any]] = set()
         self._agent_child_stores: dict[str, ConversationStore] = {}
         self._agent_child_turns: dict[str, int] = {}
         self._agent_child_types: dict[str, str] = {}
@@ -479,6 +480,7 @@ class AgentLoop(
         if self.agent_depth == 0:
             self._background_owner.set_wake_callback(None)
         try:
+            await self._drain_transcript_refreshes()
             if cancel_background and self.agent_depth == 0:
                 self.tool_registry.background_tasks.begin_shutdown(
                     background_task_cause

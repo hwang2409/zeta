@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from ...protocol.types import (
     is_visible_harness_notice,
 )
 from ..checkpoints import ConversationEntry
+from ..transcript_recovery import recovery_status
 
 _HISTORY_PAGE_ATTEMPTS = 16
 
@@ -782,7 +784,7 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
                 if not store._history_index.catch_up_validated(
                     facts, observer._entries
                 ):
-                    observer._sync_history_index(observer._entries)
+                    observer._sync_history_index(observer.active_branch_snapshot())
                 return facts
         finally:
             observer.close()
@@ -792,7 +794,7 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
         with writer._append_lock():
             facts = store._history_index_facts()
             if not store._history_index.catch_up_validated(facts, store._entries):
-                store._sync_history_index(store._entries)
+                store._sync_history_index(store.active_branch_snapshot())
             return facts
     finally:
         writer.close()
@@ -881,6 +883,95 @@ def _read_stable_approval(store: ConversationStore, query: object) -> object:
 
 
 class HistoryPageStoreMixin:
+    def _refresh_repair_generation(self: ConversationStore) -> None:
+        record = recovery_status(self.directory_fd, self._repair_target).latest_committed
+        self._repair_generation = record.quarantine_id if record is not None else None
+
+    def _initialize_history_index(
+        self: ConversationStore, *, observer: bool
+    ) -> None:
+        if self._history_index is None:
+            self._history_index = HistoryIndex(
+                self.session_dir, self.directory_fd, observer=observer
+            )
+        if not self._history_index_owner or observer:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._history_index._mark_unavailable()
+            return
+        try:
+            self._sync_history_index(self.active_branch_snapshot())
+        except (OSError, HistoryIndexError):
+            self._history_index._mark_unavailable()
+
+    def _history_index_facts(self: ConversationStore) -> dict[str, object]:
+        stat = os.stat(
+            "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
+        )
+        last = self._entries[-1] if self._entries else None
+        return {
+            "st_dev": stat.st_dev,
+            "st_ino": stat.st_ino,
+            "byte_boundary": stat.st_size,
+            "last_seq": last.seq if last else 0,
+            "last_id": last.id if last else None,
+            "last_parent": last.parent_id if last else None,
+            "prefix_digest": self._entry_prefix_digest.hex(),
+            "repair_generation": self._repair_generation,
+        }
+
+    def _sync_history_index(
+        self: ConversationStore, entries: Iterable[ConversationEntry]
+    ) -> None:
+        if self._history_index is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._history_index.sync_validated(self._history_index_facts(), entries)
+        else:
+            self._history_index._mark_unavailable()
+
+    def _apply_history_index_entries(
+        self: ConversationStore,
+        entries: tuple[ConversationEntry, ...],
+        *,
+        leave_stale_on_loop: bool = False,
+    ) -> None:
+        if self._history_index is None or not entries:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            if not leave_stale_on_loop:
+                self._history_index._mark_unavailable()
+            return
+        if not self._history_index.available:
+            self._sync_history_index(self.active_branch_snapshot())
+        digest = self._entry_prefix_digest
+        for entry in entries:
+            digest = self._next_entry_prefix_digest(
+                digest, encode_json(entry.to_dict()) + b"\n"
+            )
+        facts = self._history_index_facts()
+        last = entries[-1]
+        facts.update(
+            last_seq=last.seq,
+            last_id=last.id,
+            last_parent=last.parent_id,
+            prefix_digest=digest.hex(),
+        )
+        try:
+            self._history_index.apply_committed(facts, entries)
+        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
+            self._history_index._mark_unavailable()
+
     @property
     def repair_generation(self: ConversationStore) -> str | None:
         return self._repair_generation

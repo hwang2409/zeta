@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
@@ -20,6 +19,7 @@ from collections.abc import (  # noqa: F401 - re-exported by store facade
     Mapping,
 )
 from contextlib import (  # noqa: F401 - re-exported by the store facade
+    AbstractContextManager,
     ExitStack,
     contextmanager,
     nullcontext,
@@ -69,7 +69,6 @@ from ..todo import TodoItem, parse_todo_items
 from ..transcript_recovery import (
     RepairResult,
     RepairTarget,
-    recovery_status,
     repair_target_for_session_dir,
 )
 from ._approval_display import ApprovalAuditRequest, normalize_approval_requests
@@ -78,7 +77,7 @@ from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
 from ._execution_owner import ExecutionOwnerStoreMixin
-from ._history_index import HistoryIndex, HistoryIndexError, HistoryPageStoreMixin
+from ._history_index import HistoryIndex, HistoryPageStoreMixin
 from ._incremental_validation import (
     IncrementalValidationMixin,
     _ApprovalValidationOverlay,
@@ -149,6 +148,9 @@ class ConversationStore(
         _mutation_target: bool = False,
         _repair_explicit: bool = False,
         _repair_target: RepairTarget | None = None,
+        _initialization_authority: AbstractContextManager[object] | None = None,
+        _initialization_execution_ranked: bool = True,
+        _on_initialized: Callable[[ConversationStore], None] | None = None,
         _history_index: HistoryIndex | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
@@ -239,6 +241,7 @@ class ConversationStore(
             self._agent_canceled: dict[str, Any] | None = None
             self._agent_lifecycle: dict[str, Any] | None = None
             self._write_deadline: float | None = None
+            self._rank_execution = _initialization_execution_ranked
             self.pending_prompt_queue = PendingPromptQueue(self)
             with ExitStack() as lease:
                 _, self.directory_fd = lease.enter_context(
@@ -264,7 +267,16 @@ class ConversationStore(
                     if _validated_log_state is not None:
                         self._install_log_state(_validated_log_state)
                         self._strict_snapshot_sync = True
-                    with self._append_lock(deadline=_lock_deadline):
+                    with self._append_lock(
+                        deadline=_lock_deadline,
+                        rank_execution=_initialization_execution_ranked,
+                        nested_authority=_initialization_authority,
+                        after_shape=(
+                            None
+                            if _on_initialized is None
+                            else lambda: _on_initialized(self)
+                        ),
+                    ):
                         self._load_session_state()
                         self._refresh_repair_generation()
                         self._initialize_history_index(observer=False)
@@ -280,88 +292,6 @@ class ConversationStore(
             storage_ownership.pop_all()
         if not _read_only and not _mutation_target:
             register_conversation_target(self)
-
-    def _refresh_repair_generation(self) -> None:
-        record = recovery_status(self.directory_fd, self._repair_target).latest_committed
-        self._repair_generation = record.quarantine_id if record is not None else None
-
-    def _initialize_history_index(self, *, observer: bool) -> None:
-        if self._history_index is None:
-            self._history_index = HistoryIndex(
-                self.session_dir, self.directory_fd, observer=observer
-            )
-        if not self._history_index_owner or observer:
-            return
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            self._history_index._mark_unavailable()
-            return
-        try:
-            self._sync_history_index(self._entries)
-        except (OSError, HistoryIndexError):
-            self._history_index._mark_unavailable()
-
-    def _history_index_facts(self) -> dict[str, object]:
-        stat = os.stat(
-            "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
-        )
-        last = self._entries[-1] if self._entries else None
-        return {
-            "st_dev": stat.st_dev,
-            "st_ino": stat.st_ino,
-            "byte_boundary": stat.st_size,
-            "last_seq": last.seq if last else 0,
-            "last_id": last.id if last else None,
-            "last_parent": last.parent_id if last else None,
-            "prefix_digest": self._entry_prefix_digest.hex(),
-            "repair_generation": self._repair_generation,
-        }
-
-    def _sync_history_index(self, entries: Iterable[ConversationEntry]) -> None:
-        if self._history_index is None:
-            return
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            self._history_index.sync_validated(self._history_index_facts(), entries)
-        else:
-            self._history_index._mark_unavailable()
-
-    def _apply_history_index_entries(
-        self,
-        entries: tuple[ConversationEntry, ...],
-    ) -> None:
-        if self._history_index is None or not entries:
-            return
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        else:
-            self._history_index._mark_unavailable()
-            return
-        if not self._history_index.available:
-            self._sync_history_index(self._entries)
-        digest = self._entry_prefix_digest
-        for entry in entries:
-            digest = self._next_entry_prefix_digest(
-                digest, encode_json(entry.to_dict()) + b"\n"
-            )
-        facts = self._history_index_facts()
-        last = entries[-1]
-        facts.update(
-            last_seq=last.seq,
-            last_id=last.id,
-            last_parent=last.parent_id,
-            prefix_digest=digest.hex(),
-        )
-        try:
-            self._history_index.apply_committed(facts, entries)
-        except Exception:  # noqa: BLE001 -- derived state cannot fail authority
-            self._history_index._mark_unavailable()
 
     @property
     def last_repair_result(self) -> RepairResult | None:
@@ -798,11 +728,7 @@ class ConversationStore(
             self._write_line(entry.to_dict())
         finally:
             self._write_deadline = previous_deadline
-        if linear:
-            self._apply_history_index_entries((entry,))
-        # A fork is rebuilt by _sync_history_index below: skipping the
-        # incremental apply leaves the stored boundary behind, so the sync
-        # detects the non-contiguous tail and fully rebuilds the active branch.
+        self._apply_history_index_entries((entry,), leave_stale_on_loop=not linear)
         self._entries.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -815,7 +741,7 @@ class ConversationStore(
                 _ApprovalValidationOverlay(), {row.id for row in self._entries}
             )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self._entries)
+            self._sync_history_index(self.active_branch_snapshot())
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         if (
