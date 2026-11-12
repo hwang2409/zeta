@@ -14,7 +14,14 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from zeta.core.store._history_index import HistoryIndex
 from zeta.storage_format import WRITER_EPOCH, StorageFormatError, compare_registry_dumps
+
+# The history index is disposable derived state: every zeta version rebuilds it to
+# its own sidecar schema on open, so an older reader rewrites a newer sidecar (and
+# vice versa). The design guarantees only the sidecar may differ across versions,
+# authoritative bytes stay identical, so the compatibility digest ignores it.
+_DISPOSABLE_SIDECAR = HistoryIndex._NAME
 
 PROBE_PATHS = ("src/zeta/storage_format.py", "tests/compatibility/storage_probe.py")
 ROUNDTRIP = Path(__file__).resolve().parents[1] / "tests/compatibility/storage_roundtrip.py"
@@ -89,6 +96,7 @@ def _digest_tree(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
         and path.name != ".storage-format.lock"
+        and not path.name.startswith(_DISPOSABLE_SIDECAR)
         and ".storage-format-shape-locks" not in path.parts
     }
 

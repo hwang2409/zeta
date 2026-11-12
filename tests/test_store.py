@@ -3347,6 +3347,7 @@ async def test_approval_resolution_never_mutates_resident_store_off_owner(
     store.bind_owner_thread()
 
     assert await store.approval_resolution(call.id) is None
+    store.close()
 
 
 def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:

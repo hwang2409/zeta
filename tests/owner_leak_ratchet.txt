@@ -3857,8 +3857,6 @@ tests/test_store.py::test_append_rejects_non_boolean_display_only[None]::Convers
 tests/test_store.py::test_append_rejects_non_boolean_display_only[yes]::ConversationStore=1
 tests/test_store.py::test_append_replay_round_trip_and_parent_links::ConversationStore=2
 tests/test_store.py::test_appends_do_not_reread_the_full_log::ConversationStore=1
-tests/test_store.py::test_approval_resolution_never_mutates_resident_store_off_owner::ConversationStore=1
-tests/test_store.py::test_approval_state_uses_history_index::ConversationStore=2
 tests/test_store.py::test_async_append_defers_repeated_cancellation_until_fsync[2]::ConversationStore=2
 tests/test_store.py::test_async_append_defers_repeated_cancellation_until_fsync[5]::ConversationStore=2
 tests/test_store.py::test_async_append_does_not_mutate_resident_store_off_loop::ConversationStore=2
