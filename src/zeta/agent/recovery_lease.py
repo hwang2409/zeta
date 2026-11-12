@@ -17,6 +17,7 @@ class AgentLoopForRecovery(Protocol):
     store: ConversationStore
     _background_owner: Any
     _children_recovered: bool
+    manager: Any
 
     def _canceled_agent_result(
         self, tool_call_id: str, **kwargs: Any
@@ -101,12 +102,21 @@ def acquire_recovery_subtree(
     )
 
 
-def bootstrap_agent_children(loop: AgentLoopForRecovery) -> None:
-    """Repair restart state before the opened store reaches the event loop."""
+def bootstrap_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> None:
+    """Repair restart state before the opened store reaches the event loop.
+
+    The child tree is repaired post-order: a resumed child is canceled and is
+    never re-presented, so its unresolved approvals are stale and are aborted,
+    and the delegated end is written on the root session history. The resumed session's own
+    foreground approvals are NOT touched here: the runtime re-presents every
+    durable unresolved foreground request from the store
+    (``_pending_approvals_projection`` in server/approval_lifecycle.py), so they
+    stay open and answerable after resume.
+    """
 
     from .background_lifecycle import recover_agent_children
 
-    recover_agent_children(loop)
+    recover_agent_children(loop, home_epoch)
     loop._children_recovered = True
 
 
@@ -129,6 +139,12 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
 
     root = loop.store
     notification = loop._background_owner.notification_store
+    # The whole recovered tree shares the root writer lease, so one observed
+    # home epoch (from the session manager) selects every restart reason. A loop
+    # built without a manager (test builders) aborts reasonlessly, which is the
+    # safe old behavior.
+    manager = getattr(loop, "manager", None)
+    home_epoch = manager.observed_storage_epoch if manager is not None else 0
 
     stop_recovery = threading.Event()
 
@@ -145,6 +161,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             if notification is root:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_root),
+                    home_epoch,
                     should_stop=stop_recovery.is_set,
                 )
             with ConversationStore(
@@ -156,6 +173,7 @@ async def recover_agent_children_off_loop(loop: AgentLoopForRecovery) -> None:
             ) as worker_notification:
                 return _recover_agent_children(
                     _DetachedRecoveryLoop(loop, worker_root, worker_notification),
+                    home_epoch,
                     should_stop=stop_recovery.is_set,
                 )
 

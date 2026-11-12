@@ -371,6 +371,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
     from zeta.agent.background_lifecycle import recover_agent_children
     from zeta.agent.pending_delivery import StepDeliveryFlow
     from zeta.protocol.types import ToolCall
+    from zeta.storage_format import WRITER_EPOCH
     from zeta.tools.agent_send import send_to_run
 
     manager = SessionManager(tmp_path / "home")
@@ -432,7 +433,7 @@ def test_recovery_and_send_release_borrowed_child_stores(
             channel=channel,
         ) is None
         resident_child.close()
-        await asyncio.to_thread(recover_agent_children, loop)
+        await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
         await loop.close()
 
     asyncio.run(exercise())

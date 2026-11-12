@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 8
+WRITER_EPOCH: Final = 9
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -35,6 +35,7 @@ class StorageFeature(StrEnum):
     ATTENTION_KINDS = "attention_kinds"
     INBOX_DELEGATION = "inbox_delegation"
     PROJECT_LOCKS = "project_locks"
+    APPROVAL_RESTART_REASON = "approval_restart_reason"
     SESSION_RETENTION = "session_retention"
 
 
@@ -46,12 +47,43 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_LOCKS: 6,
     StorageFeature.INBOX_DELEGATION: 7,
     StorageFeature.SESSION_RETENTION: 8,
+    # APPROVAL_RESTART_REASON must be a fixed int literal (test_storage_feature_epochs
+    # forbids referencing WRITER_EPOCH here). Recheck main+1 at the final merge.
+    StorageFeature.APPROVAL_RESTART_REASON: 9,
 }
 
 
 def feature_enabled(home_epoch: int, feature: StorageFeature) -> bool:
     """Return whether a home can use the feature's stored shapes."""
     return home_epoch >= FEATURE_EPOCHS[feature]
+
+
+# Abort reasons a stored approval resolution may carry. `grace_expired` is
+# reserved for the approval reconnect grace (not emitted yet). `server_restarted`
+# is written by restart recovery at or above APPROVAL_RESTART_REASON's epoch.
+# This is the one owner; _incremental_validation and the registry import it.
+APPROVAL_RESOLUTION_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "controller_disconnected",
+        "turn_canceled",
+        "child_cleanup",
+        "grace_expired",
+        "server_restarted",
+    }
+)
+
+
+def restart_abort_reason(home_epoch: int) -> str | None:
+    """Pick the restart-recovery abort reason for a home at ``home_epoch``.
+
+    One selector for every store in a recovered tree. All stores share the root
+    writer lease, so they share this one observed home epoch.
+    """
+    return (
+        "server_restarted"
+        if feature_enabled(home_epoch, StorageFeature.APPROVAL_RESTART_REASON)
+        else None
+    )
 
 
 def writer_epoch() -> int:
@@ -196,6 +228,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "approval.resolution_reason": APPROVAL_RESOLUTION_REASONS,
     "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),
     "account_registry.version": frozenset({1}),
