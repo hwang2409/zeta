@@ -4820,6 +4820,14 @@ async def test_session_swap_rejects_pending_notification_handoff(
         {"prompt": "wait", "description": "child", "background": True},
     )
     child_call = ToolCall("child-call", "read", {"path": str(tmp_path / "input")})
+    # Hold the parent's second turn until the client has read the delegated
+    # approval_request. On main the child's approval_request and the parent's
+    # agent_end have no order (the child event is a free task), so without this
+    # gate agent_end can be published first; ServeClient.event then drops it
+    # while reading approval_request and the later event("agent_end") hangs. The
+    # gate makes the test deterministic without asserting a non-contract order.
+    parent_second_started = asyncio.Event()
+    release_parent_second = asyncio.Event()
     backend = PerActorFakeBackend(
         [
             ScriptedTurn(tool_calls=[parent_call]),
@@ -4827,6 +4835,8 @@ async def test_session_swap_rejects_pending_notification_handoff(
         ],
         {"wait": [ScriptedTurn(tool_calls=[child_call])]},
         parent_prompt="start",
+        parent_second_started=parent_second_started,
+        release_parent_second=release_parent_second,
     )
     server = ZetaServer(
         provider="codex",
@@ -4883,6 +4893,10 @@ async def test_session_swap_rejects_pending_notification_handoff(
         )
         approval = await asyncio.wait_for(client.event("approval_request"), TIMEOUT)
         assert approval["delegated"] is True
+        await await_or_fail(
+            parent_second_started.wait(), what="parent second turn started"
+        )
+        release_parent_second.set()
         await asyncio.wait_for(agent_end_published.wait(), timeout=TIMEOUT)
 
         rejected = await asyncio.wait_for(
@@ -4931,6 +4945,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
             for message in history["result"]["messages"]
         )
     finally:
+        release_parent_second.set()
         release_agent_end.set()
         release_notification.set()
         if notification_turn is not None:
