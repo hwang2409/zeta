@@ -42,6 +42,7 @@ from tests.support.processes import wait_for_path_command
 from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient
 from tests.support.server_client import (
+    _buffer as _client_buffer,
     assert_event_order,
     event_owner,
     frames_for_call,
@@ -2517,6 +2518,53 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 
 
 @pytest.mark.asyncio
+async def test_background_events_keep_slow_approval_end_before_fast_child_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+    )
+    reader, writer = await _ready(server)
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    async def slow_end(
+        key: str, session_id: str | None, *, data: dict[str, object]
+    ) -> None:
+        del key, data
+        slow_started.set()
+        await asyncio.wait_for(release_slow.wait(), TIMEOUT)
+        await server.control._notify(
+            EventDescriptor.APPROVAL_END, session_id, request_id="slow"
+        )
+
+    # test-contract: seam delegated history is forced slow before the fast child event
+    monkeypatch.setattr(server.control, "_end_approval", slow_end)
+    try:
+        server.control._publish_background_event(
+            "session",
+            StreamEvent(
+                StreamEventType.TOOL_APPROVAL_END, data={"request_id": "slow"}
+            ),
+        )
+        await asyncio.wait_for(slow_started.wait(), TIMEOUT)
+        server.control._publish_background_event(
+            "session", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="fast")
+        )
+        release_slow.set()
+        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
+        frames = [await _read(reader), await _read(reader)]
+        assert [frame["params"]["event"] for frame in frames] == [
+            "approval_end",
+            "assistant_delta",
+        ]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
     tmp_path: Path,
 ) -> None:
@@ -2541,8 +2589,10 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         child_watcher = owner._watchers[child_id]
         assert owner.cancel(child_id)
         await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
         frames = await _request(reader, writer, 4, "status")
-        frames.append(await _read(reader))
+        frames += list(_client_buffer(reader))
+        _client_buffer(reader).clear()
         approval_ends = _named_events(frames, "approval_end")
         assert len(approval_ends) == 1
         assert approval_ends[0]["request_id"] == approval["request_id"]
@@ -2587,13 +2637,11 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
         assert owner.cancel(child_id)
+        await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        await asyncio.wait_for(server.control.flush_background_events(), TIMEOUT)
         frames = await _request(reader, writer, 4, "status")
-        async with asyncio.timeout(TIMEOUT):
-            while not any(
-                event["request_id"] == approval["request_id"]
-                for event in _named_events(frames, "approval_end")
-            ):
-                frames.append(await _read(reader))
+        frames += list(_client_buffer(reader))
+        _client_buffer(reader).clear()
         approval_ends = _named_events(frames, "approval_end")
         assert len(approval_ends) == 1
         assert approval_ends[0]["request_id"] == approval["request_id"]

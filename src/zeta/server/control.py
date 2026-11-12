@@ -134,6 +134,10 @@ class ServeControl:
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
+        self._background_events: asyncio.Queue[tuple[str, StreamEvent] | None] = (
+            asyncio.Queue()
+        )
+        self._background_event_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -442,6 +446,17 @@ class ServeControl:
 
     async def close(self) -> None:
         self.closing = True
+        try:
+            async with asyncio.timeout(CONTROLLER_HANDOFF_DEADLINE_SECONDS):
+                await self.flush_background_events()
+        except TimeoutError:
+            pass
+        finally:
+            task = self._background_event_task
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self._background_event_task = None
         task = self._grace_task
         if task is not None:
             task.cancel()
@@ -1085,12 +1100,30 @@ class ServeControl:
         )
         return controller.protocol_version if controller is not None else "1.0"
 
+    async def _drain_background_events(self) -> None:
+        while True:
+            item = await self._background_events.get()
+            try:
+                if item is None:
+                    return
+                session_id, event = item
+                await self._event(event, session_id=session_id, background=True)
+            finally:
+                self._background_events.task_done()
+
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
-        """Schedule child events from the loop's synchronous sink."""
+        """Queue child events for ordered publication from the loop's sink."""
         if not self.closing:
-            asyncio.create_task(
-                self._event(event, session_id=session_id, background=True)
-            )
+            if self._background_event_task is None:
+                self._background_event_task = asyncio.create_task(
+                    self._drain_background_events()
+                )
+            self._background_events.put_nowait((session_id, event))
+
+    async def flush_background_events(self) -> None:
+        """Wait until all currently queued child events are published."""
+        await asyncio.sleep(0)
+        await self._background_events.join()
 
     def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
         connections = self.server.connections

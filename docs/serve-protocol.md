@@ -936,6 +936,11 @@ that gets no answer within its own timeout can treat the server as hung.
 
 All examples below use the common event envelope:
 
+Background child events are written to a connection in the order the server's
+background event sink receives them. A later child event is not written while
+an earlier child event is still completing its delegated-history work. This
+keeps `child_run_events` history gap-free and ordered on the wire.
+
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
