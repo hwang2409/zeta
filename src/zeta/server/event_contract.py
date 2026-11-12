@@ -102,6 +102,10 @@ NOTIFICATION_WIRE_EVENTS = {
     "child_question_withdrawn": EventDescriptor.CHILD_QUESTION_WITHDRAWN,
 }
 
+# Notification kinds that ride the notification wire but are never persisted,
+# so they have no store validator and are absent from NOTIFICATION_KINDS.
+LIVE_NOTIFICATION_KINDS = frozenset({"project_inbox_health"})
+
 
 def notification_wire_event(kind: object, protocol_version: str) -> EventDescriptor:
     """Preserve the legacy notification event until protocol 1.2."""
