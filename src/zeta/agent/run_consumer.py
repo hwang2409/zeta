@@ -197,25 +197,16 @@ async def consume_run(
             if (
                 isinstance(finish_gate_state, FinishGateState)
                 and finish_gate_state.terminal_admitted
+                and not flow.has_prompt_edge
             ):
-                # The finish gate owns whether the run is over. Once it admits a
-                # terminal (completed / handed_off / task_safety_expired), the gate
-                # has already run its own bounded post-cap loop to that terminal, so
-                # run_consumer must not start another model turn: delivering a late
-                # pending edge here re-runs the finished segment (duplicate provider
-                # spend) and, with an unexpired child bound, never ends. Settle the
-                # queue durably; input that arrived after the terminal decision is
-                # reported, not silently lost or re-delivered.
-                if (await flow.admit_terminal("segment_end")).pending:
-                    from ..runtime.loop.empty_turn import not_delivered_text
-
-                    await child_loop._background_owner.conversation_channel.publish_not_delivered(
-                        child_loop,
-                        not_delivered_text(
-                            "the agent run ended at the finish gate",
-                            waits_for_input=False,
-                        ),
-                    )
+                # The finish gate reached a terminal. A new user prompt still
+                # supersedes the finished request and gets its turn below, but a
+                # notification-only edge (a task exit, a sub-agent completion) is
+                # moot once the run is terminal: delivering one re-enters the
+                # concluded gate or re-exposes the already-consumed request to the
+                # model, which never ends. The consumed request was acked when its
+                # turn ended, so nothing is lost; settle the queue and finalize.
+                await flow.admit_terminal("segment_end")
                 terminal_result = _finalize_result(
                     result,
                     segment_reports=segment_reports,
