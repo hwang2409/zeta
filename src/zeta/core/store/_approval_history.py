@@ -7,7 +7,7 @@ from typing import Any
 
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
-from ._history_index import IndexedPendingApprovalPage
+from ._history_index import HistoryIndex, IndexedPendingApprovalPage
 
 
 def validate_approval_history_data(data: Mapping[str, Any]) -> None:
@@ -173,3 +173,12 @@ class ApprovalHistoryStoreMixin:
             tuple((request_id, tool_call) for _seq, request_id, tool_call in rows),
             rows[-1][0] if len(rows) == limit else None,
         )
+
+    # The display seed at resume needs the pending page in the same task step,
+    # with no off-loop yield, matching approval_state_now. The async
+    # pending_approval_page reconciles later off-loop.
+    def pending_approval_page_now(
+        self, after_seq: int = 0, limit: int = HistoryIndex.PAGE_LIMIT
+    ) -> IndexedPendingApprovalPage:
+        self._sync_log_without_waiting()
+        return self._resident_pending_approval_page(after_seq, limit)

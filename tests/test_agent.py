@@ -2602,6 +2602,7 @@ async def test_notification_wake_waits_for_resumed_durable_tool(
 
     host = SimpleNamespace(
         loop=loop,
+        _approval_policy=None,
         _start_turn=lambda *_args, **_kwargs: asyncio.create_task(provider_turn()),
     )
     pipeline = SubmissionPipeline(host)

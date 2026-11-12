@@ -55,6 +55,21 @@ class ApprovalPipelineMixin:
             self._pending_approvals = pending
             self._pending_applied_seq = started
 
+    def seed_pending_approvals_now(self) -> None:
+        """Refresh the display cache from the resident snapshot, no off-loop yield.
+
+        Presentation reads the cache, but an approval registered on the same task
+        step (serve inbox loop, provider tool) has not been picked up by the
+        off-loop refresh yet. This reads the same authoritative pending state
+        synchronously (like approval_state_now) so the card shows at once.
+        """
+        policy = self._host._approval_policy
+        self._pending_approvals = (
+            ()
+            if policy is None
+            else tuple(policy.pending_requests_for_display_now())
+        )
+
     def _request_pending_refresh(self) -> None:
         """Schedule one off-loop refresh; coalesce bursts into a single rerun.
 

@@ -807,25 +807,64 @@ class ApprovalPolicy(ApprovalAbortPolicy):
                 return pending
             after_seq = page.next_seq
 
+    def _display_request(
+        self, request_id: str, tool_call: ToolCall
+    ) -> ApprovalRequest:
+        action = None
+        capability_resolved = self._capability_resolver is None
+        if self._capability_resolver is not None:
+            try:
+                action = self._capability_resolver(tool_call).action
+                capability_resolved = True
+            except (KeyError, TypeError, ValueError):
+                capability_resolved = False
+        return ApprovalRequest(
+            request_id,
+            tool_call,
+            action=action,
+            capability_resolved=capability_resolved,
+        )
+
+    def pending_requests_for_display_now(self) -> list[ApprovalRequest]:
+        """Synchronous resident snapshot of pending approvals for display.
+
+        A resumed session's durable approvals are not announced by the policy
+        change hook, and the first off-loop refresh has not run yet. This reads
+        the resident branch with no off-loop yield (like approval_state_now), so
+        the card shows at once; the async refresh reconciles.
+        """
+        requests: list[ApprovalRequest] = []
+        store = self._store
+        if store is not None:
+            after_seq = 0
+            while True:
+                page = store.pending_approval_page_now(after_seq)
+                requests.extend(
+                    self._display_request(request_id, ToolCall.from_dict(dict(tool_call)))
+                    for request_id, tool_call in page.items
+                )
+                if page.next_seq is None:
+                    break
+                after_seq = page.next_seq
+        for (_child_id, request_id), (
+            request,
+            delegated_store,
+        ) in list(self._delegated.items()):
+            state = delegated_store.approval_state_now(request_id)
+            if state is not None and state[1] is None:
+                requests.append(request)
+        requests.extend(
+            request
+            for request, decision in self._ephemeral.values()
+            if decision is None
+        )
+        return requests
+
     async def _collect_pending_requests(self) -> list[ApprovalRequest]:
         store = self._require_store()
         requests: list[ApprovalRequest] = []
         for request_id, tool_call in (await self._pending_for_store(store)).items():
-            action = None
-            capability_resolved = self._capability_resolver is None
-            if self._capability_resolver is not None:
-                try:
-                    action = self._capability_resolver(tool_call).action
-                    capability_resolved = True
-                except (KeyError, TypeError, ValueError):
-                    capability_resolved = False
-            request = ApprovalRequest(
-                request_id,
-                tool_call,
-                action=action,
-                capability_resolved=capability_resolved,
-            )
-            requests.append(request)
+            requests.append(self._display_request(request_id, tool_call))
         delegated_pending: dict[ConversationStore, dict[str, ToolCall]] = {}
         for (child_id, request_id), (request, delegated_store) in list(
             self._delegated.items()
