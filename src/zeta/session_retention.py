@@ -908,12 +908,12 @@ def _metadata_activity(value) -> int:
 
 
 def _authority_parent_id(sessions_fd, session_id, scan) -> str | None:
-    """The canonical metadata parent id; missing ancestors end the chain."""
+    """Return the canonical parent id; a missing chain member is unsafe."""
     try:
         with child_directory(sessions_fd, session_id) as session_fd:
             meta = _read_json(session_fd, _METADATA_NAME, scan)
-    except FileNotFoundError:
-        return None
+    except FileNotFoundError as exc:
+        raise RetentionPlannerError("missing metadata ancestor") from exc
     if meta is None:
         raise RetentionPlannerError("malformed metadata")
     return _canonical_metadata(meta, session_id).parent_session_id
