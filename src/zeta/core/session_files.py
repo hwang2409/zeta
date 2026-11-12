@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import fcntl
 import json
 import os
 import stat
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass, fields
 from pathlib import Path
 
-from ..locking import shape_lock
-from ..storage_format import drain_releases
+from ..locking import RETENTION_HOME_ID, domain_authority, execution_lock, shape_lock
+from ..storage_format import (
+    StorageFeature,
+    WriterLease,
+    drain_releases,
+    feature_enabled,
+)
 
 
 class SessionError(ValueError):
@@ -40,8 +48,267 @@ class SessionInUseError(SessionError):
     """Raised when an open store or metadata operation prevents deletion."""
 
 
-_READ_RETRIES = 3
+class SessionReferenceUnavailable(SessionError):
+    """Raised when retention is removing a referenced session."""
 
+
+_READ_RETRIES = 3
+_SESSION_REFERENCE_GENERATION = "session-reference-generation"
+
+
+@dataclass(frozen=True)
+class SessionReferenceAuthority:
+    """Proof that one outer publication owns reference admission."""
+
+    gate: SessionReferenceGate
+    session_ids: frozenset[str]
+    def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
+        self.gate.validate(session_ids)
+
+
+class SessionReferenceGate:
+    """Coordinate all durable session references with retention."""
+
+    def __init__(self, home: Path, lease: WriterLease) -> None:
+        self.home = Path(home)
+        self.lease = lease
+
+    def _enabled(self) -> bool:
+        return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
+
+    @contextmanager
+    def _locked(self, *, exclusive: bool, unavailable_id: str | None = None):
+        if not self._enabled():
+            yield self
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop = False
+        else:
+            on_loop = True
+        if exclusive and on_loop:
+            raise SessionError(
+                "exclusive session reference authority requested on an asyncio event-loop thread"
+            )
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with ExitStack() as authority:
+            try:
+                authority.enter_context(
+                    domain_authority(
+                        self.home,
+                        RETENTION_HOME_ID,
+                        "references",
+                        exclusive=exclusive,
+                        nonblocking=on_loop,
+                    )
+                )
+            except BlockingIOError as exc:
+                session_id = unavailable_id or "unknown"
+                raise SessionReferenceUnavailable(
+                    f"session reference unavailable: {session_id} is being deleted"
+                ) from exc
+            except OSError as exc:
+                raise SessionError(
+                    "session reference authority is unsafe or unavailable"
+                ) from exc
+            yield self
+
+    @contextmanager
+    def _shared(
+        self,
+        *,
+        installed_ids: tuple[str, ...],
+        referenced_ids: tuple[str, ...],
+    ):
+        ids = (*installed_ids, *referenced_ids)
+        with self._locked(exclusive=False, unavailable_id=ids[0] if ids else None):
+            self.validate(ids)
+            if installed_ids:
+                self.bump_generation()
+            yield SessionReferenceAuthority(self, frozenset(ids))
+
+    def exclusive(self, *, session_id: str | None = None):
+        return self._locked(exclusive=True, unavailable_id=session_id)
+
+    def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
+        if not self._enabled():
+            return
+        for session_id in session_ids:
+            _component(session_id)
+            reservation = self.home / "session-trash" / "reservations" / f"{session_id}.json"
+            quarantined = self.home / "session-trash" / session_id
+            if reservation.exists() or quarantined.exists():
+                raise SessionReferenceUnavailable(
+                    f"session reference unavailable: {session_id} is being deleted"
+                )
+
+    def bump_generation(self) -> int:
+        if not self._enabled():
+            return 0
+        path = self.home / _SESSION_REFERENCE_GENERATION
+        try:
+            raw = path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            value = 0
+        else:
+            if not raw.endswith("\n") or not raw[:-1].isdigit():
+                raise SessionError("session reference generation is malformed")
+            value = int(raw[:-1])
+            if value > 2**63 - 2:
+                raise SessionError("session reference generation is out of range")
+        value += 1
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, f"{value}\n".encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        directory_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return value
+
+
+@contextmanager
+def reference_publication(
+    home: Path,
+    lease: WriterLease,
+    *,
+    installed_ids: tuple[str, ...] = (),
+    referenced_ids: tuple[str, ...] = (),
+):
+    """Enter reference admission once for one complete public transaction."""
+    gate = SessionReferenceGate(home, lease)
+    with gate._shared(
+        installed_ids=installed_ids,
+        referenced_ids=referenced_ids,
+    ) as authority:
+        yield authority
+
+
+def retained_reference_publication(
+    home: Path,
+    lease: WriterLease,
+    stack: ExitStack | None,
+    authorities: list[SessionReferenceAuthority] | None,
+    **publication_ids,
+):
+    """Keep execution and reference admission alive for a larger transaction."""
+    if stack is None:
+        return execution_lock(), reference_publication(home, lease, **publication_ids)
+    stack.enter_context(execution_lock())
+    authority = stack.enter_context(
+        reference_publication(home, lease, **publication_ids)
+    )
+    if authorities is not None:
+        authorities.append(authority)
+    return nullcontext(), nullcontext(authority)
+
+
+def copy_session_metadata(target, source) -> None:
+    for metadata_field in fields(source):
+        if metadata_field.name != "_execution_lease":
+            setattr(
+                target,
+                metadata_field.name,
+                copy.deepcopy(getattr(source, metadata_field.name)),
+            )
+
+
+def mutate_session_metadata(
+    manager,
+    session_id: str,
+    update,
+    *,
+    lock_timeout: float | None,
+    execution_lease,
+    authority,
+    before_release,
+):
+    updated = None
+
+    def release() -> None:
+        if before_release is not None:
+            assert updated is not None
+            before_release(updated)
+
+    with (
+        manager._execution_owner(session_id, execution_lease),
+        manager._metadata_lock(
+            session_id,
+            timeout=lock_timeout,
+            authority=authority,
+            after_shape=release,
+        ) as directory_fd,
+    ):
+        current = manager._read(session_id, directory_fd=directory_fd)
+        updated = update(current)
+        manager._write_unlocked(updated, directory_fd=directory_fd)
+    assert updated is not None
+    return updated
+
+
+@contextmanager
+def session_metadata_lock(
+    sessions_dir: Path,
+    session_id: str,
+    *,
+    blocking: bool,
+    timeout: float | None,
+    authority,
+    after_shape: Callable[[], None] | None,
+    loop_error: type[SessionError],
+):
+    if blocking:
+        require_off_loop_lock("session metadata", loop_error)
+    if timeout is not None:
+        deadline = time.monotonic() + timeout
+        while True:
+            with session_metadata_lock(
+                sessions_dir,
+                session_id,
+                blocking=False,
+                timeout=None,
+                authority=authority,
+                after_shape=after_shape,
+                loop_error=loop_error,
+            ) as directory_fd:
+                if directory_fd is not None:
+                    yield directory_fd
+                    return
+            if time.monotonic() >= deadline:
+                raise SessionError("session metadata lock acquisition timed out")
+            time.sleep(min(0.05, deadline - time.monotonic()))
+    with (
+        authority or nullcontext(),
+        session_root(sessions_dir) as root_fd,
+        child_directory(root_fd, session_id) as directory_fd,
+    ):
+        try:
+            lock_fd = open_session_file(
+                directory_fd, ".meta.lock", os.O_RDWR | os.O_CREAT
+            )
+        except OSError as exc:
+            raise SessionError("session metadata lock could not be opened") from exc
+        try:
+            try:
+                fcntl.flock(
+                    lock_fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                )
+            except BlockingIOError:
+                yield None
+                return
+            with shape_lock():
+                yield directory_fd
+            if after_shape is not None:
+                after_shape()
+        finally:
+            os.close(lock_fd)
 
 def require_off_loop_lock(
     kind: str, error: Callable[[str], BaseException] = RuntimeError
