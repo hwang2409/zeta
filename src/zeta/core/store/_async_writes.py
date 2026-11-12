@@ -264,6 +264,12 @@ class _SettleStepDeliveryTerminalCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _DrainStepDeliveryTerminalCommand(_StoreMutationCommand):
+    def apply(self, store: Any) -> Any:
+        return store._drain_step_delivery_terminal()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _AcceptExplicitFinishCommand(_StoreMutationCommand):
     report: dict[str, object]
     notification_ids: frozenset[str]
@@ -979,6 +985,11 @@ class AsyncDurableWritesMixin:
         return await self._commit_storage_command(
             _SettleStepDeliveryTerminalCommand(suppressed_ids=suppressed_ids)
         )
+
+    async def drain_step_delivery_terminal(
+        self: ConversationStore,
+    ) -> tuple[ConversationEntry, ...]:
+        return await self._commit_storage_command(_DrainStepDeliveryTerminalCommand())
 
     async def accept_explicit_finish(
         self: ConversationStore,
