@@ -8,6 +8,7 @@ import logging
 import weakref
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -217,3 +218,24 @@ def process_update_monitor(package_file: str | Path) -> ProcessUpdateMonitor:
     if _process_monitor is None:
         _process_monitor = ProcessUpdateMonitor(package_file)
     return _process_monitor
+
+
+def subscribe_tui_update_notice(app: Any) -> None:
+    """Connect the process monitor to the TUI without coupling it to TUI imports."""
+    import zeta
+
+    package_file = zeta.__file__ or ""
+    async def handle_update(old_revision: str, new_revision: str) -> None:
+        app._invalidate_prompt()
+        observer_host = app.observer_host
+        if observer_host is not None:
+            await observer_host.publish_update(old_revision, new_revision)
+
+    app._update_notice_callback = handle_update
+    process_update_monitor(package_file).subscribe(handle_update)
+
+
+def start_tui_update_notice() -> None:
+    import zeta
+
+    process_update_monitor(zeta.__file__ or "").start()

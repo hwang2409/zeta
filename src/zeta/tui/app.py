@@ -24,8 +24,6 @@ from rich.console import Console, RenderableType
 from rich.padding import Padding
 from rich.text import Text
 
-import zeta
-
 from ..config.settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
@@ -54,7 +52,7 @@ from ..protocol.types import (
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
-from ..runtime.update_notice import process_update_monitor
+from ..runtime.update_notice import start_tui_update_notice, subscribe_tui_update_notice
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, render, theme
@@ -229,8 +227,7 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
-        update_monitor = process_update_monitor(zeta.__file__ or "")
-        update_monitor.subscribe(self._handle_update)
+        subscribe_tui_update_notice(self)
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -827,10 +824,6 @@ class TUIApp(
         stop_after_tool = presentation is not None and presentation.stop_after_tool
         self._abort_requested = False
         return stop_after_tool
-    async def _handle_update(self, old_revision: str, new_revision: str) -> None:
-        self._invalidate_prompt()
-        if (observer_host := self.observer_host) is not None:
-            await observer_host.publish_update(old_revision, new_revision)
     def _handle_background_notice(self, notice: object) -> None:
         self._agent_navigation.request_refresh()
         if not self._defer_startup_notice(notice):
@@ -1169,7 +1162,7 @@ class TUIApp(
             if observer_host is not None and (error := await observer_host.start_or_close()):
                 self.observer_host = None  # optional endpoint: never stops the TUI or a fork
                 self._handle_background_notice(f"remote observer unavailable: {error}")
-            process_update_monitor(zeta.__file__ or "").start()
+            start_tui_update_notice()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
