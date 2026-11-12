@@ -472,7 +472,7 @@ skill_catalog=SkillCatalog.empty(),
     assert result.is_error is True
     assert "remote:write is not allowed" in result.content
     assert executed is False
-    assert asyncio.run(store.pending_approval_page()).items == ()
+    assert (await store.pending_approval_page()).items == ()
 
 
 # --- the /plan command -----------------------------------------------------
@@ -487,6 +487,9 @@ class PlanSession:
 
     def set_plan_mode(self, enabled: bool) -> None:
         self.plan_mode = enabled
+
+    async def approval_pending_now(self) -> bool:
+        return bool(self.pending_approvals)
 
     def _invalidate_prompt(self) -> None:
         return None

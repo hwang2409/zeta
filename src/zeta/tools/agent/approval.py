@@ -267,7 +267,7 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
         capability: ApprovalCapability,
         on_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> ApprovalDecision | None:
-        state = await self.child_store.approval_state(tool_call.id)
+        state = self.child_store.approval_state_now(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")

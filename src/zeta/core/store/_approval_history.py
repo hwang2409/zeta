@@ -126,6 +126,17 @@ class ApprovalHistoryStoreMixin:
             list(self._active_branch())
         ).get(request_id)
 
+    # The owner's write path (ApprovalPolicy.authorize) needs the request it is
+    # about to publish to be readable in the same task step, with no off-loop
+    # yield before it. This is a resident, non-blocking scan (no sqlite on the
+    # loop): it pulls any external append without waiting, then reads the
+    # resident branch, matching main's synchronous approval_states() read.
+    def approval_state_now(
+        self, request_id: str
+    ) -> tuple[ToolCall, str | None] | None:
+        self._sync_log_without_waiting()
+        return self._resident_approval_state(request_id)
+
     def _resident_approval_resolution(
         self, request_id: str
     ) -> Mapping[str, Any] | None:

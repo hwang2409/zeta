@@ -1089,7 +1089,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         on_pending: Callable[[], Awaitable[None]] | None = None,
     ) -> ApprovalDecision | None:
         store = self._require_store()
-        state = await store.approval_state(tool_call.id)
+        state = store.approval_state_now(tool_call.id)
         if state is not None:
             if state[0] != tool_call:
                 raise ValueError(f"approval request tool call mismatch: {tool_call.id}")
