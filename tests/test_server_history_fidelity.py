@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -679,7 +681,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
                 store.root_dir, session_id=session_id, _must_exist=True
             )
             try:
-                return reopened.replay()
+                return branch_entries(reopened)
             finally:
                 reopened.close()
 

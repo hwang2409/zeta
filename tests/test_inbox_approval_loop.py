@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import ast
 import asyncio
 import contextlib
@@ -82,7 +84,7 @@ def _loop(tmp_path: Path, projects, alpha, store, policy, backend) -> AgentLoop:
 def _persisted_calls(store: ConversationStore, call_id: str) -> list[ToolCall]:
     return [
         block.tool_call
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.ASSISTANT
         for block in message.content
         if isinstance(block, ToolUseContent) and block.tool_call.id == call_id
@@ -92,7 +94,7 @@ def _persisted_calls(store: ConversationStore, call_id: str) -> list[ToolCall]:
 def _results(store: ConversationStore, call_id: str) -> list:
     return [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None and message.tool_result.tool_call_id == call_id
     ]
 

@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 import threading
@@ -388,7 +389,7 @@ async def test_duplicate_live_skill_retains_catalog_and_reports_once(
 
     notices = [
         block.text
-        for message in loop.store.messages()
+        for message in loop.branch_messages(store)
         for block in message.content
         if isinstance(block, TextContent) and "skill discovery failed:" in block.text
     ]
@@ -467,7 +468,7 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
 
     _ = [event async for event in loop.run_turn("load it", origin=MessageOrigin.USER)]
 
-    messages = store.messages()
+    messages = branch_messages(store)
     tool_use_index = next(
         index
         for index, message in enumerate(messages)
@@ -492,7 +493,7 @@ async def test_unknown_skill_tool_refresh_keeps_tool_batch_adjacent(
     _ = [event async for event in loop.run_turn("next", origin=MessageOrigin.USER)]
     notices = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         for block in message.content
         if isinstance(block, TextContent)
         and block.text.startswith("[zeta] skill refresh:")

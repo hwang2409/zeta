@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import json
 import os
@@ -195,7 +197,7 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
     assert all(schema["name"] != "agent" for schema in backend.calls[0][1])
     result = next(
         message.tool_result
-        for message in loop.store.messages()
+        for message in loop.branch_messages(store)
         if message.tool_result
         and message.tool_result.tool_call_id == "blocked-specialist"
     )

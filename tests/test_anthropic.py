@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 
 from tests.support.owned import await_or_fail
 from zeta.skills import SkillCatalog
@@ -2875,7 +2876,7 @@ async def test_anthropic_failure_persists_signed_empty_thinking_through_loop(
     ]
     persisted = next(
         entry.data["message"]
-        for entry in reversed(conversation.replay())
+        for entry in reversed(branch_entries(conversation))
         if entry.type == "message"
     )
     assert persisted["metadata"]["turn_failed"] is True
@@ -3746,7 +3747,7 @@ async def test_cancel_mid_thinking_drops_partial_block_before_resume(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    messages = store.messages()
+    messages = branch_messages(store)
     assert len(messages) == 1
     assert calls == 1
     events = [event async for event in loop.run_turn("resume", origin=MessageOrigin.USER)]
@@ -4157,7 +4158,7 @@ async def test_anthropic_stop_reason_persisted_on_assistant_message(
     ).run_turn("hi", origin=MessageOrigin.USER):
         pass
 
-    assistant = store.messages()[-1]
+    assistant = branch_messages(store)[-1]
     assert assistant.role is MessageRole.ASSISTANT
     assert assistant.metadata["stop_reason"] == "end_turn"
     assert assistant.metadata["output_tokens"] == 4
@@ -4397,7 +4398,7 @@ async def test_max_tokens_mid_tool_call_recovers_and_next_response_runs(
     assert "split the work into smaller calls" in recovery_text
     assert "create a smaller file, then edit/append" in recovery_text
     assistant_messages = [
-        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+        message for message in branch_messages(store) if message.role is MessageRole.ASSISTANT
     ]
     assert assistant_messages[0].content == [TextContent("preparing the file")]
     assert not any(
@@ -4453,7 +4454,7 @@ async def test_two_consecutive_max_tokens_mid_tool_calls_end_with_max_tokens(
     assert "output-token limit" in errors[-1].message
     assert all(error.code != "stream_error" for error in errors)
     assert not any(
-        message.metadata.get("provider_retries") for message in store.messages()
+        message.metadata.get("provider_retries") for message in branch_messages(store)
     )
     await client.aclose()
 
@@ -4494,7 +4495,7 @@ async def test_max_tokens_mid_tool_call_has_no_provider_retry_record(
         for event in events
     )
     assert not any(
-        message.metadata.get("provider_retries") for message in store.messages()
+        message.metadata.get("provider_retries") for message in branch_messages(store)
     )
     await client.aclose()
 
@@ -4544,9 +4545,9 @@ async def test_real_anthropic_stream_disconnect_still_retries(
     )
     provider_retries = [
         record
-        for message in store.messages()
+        for message in branch_messages(store)
         for record in message.metadata.get("provider_retries", [])
     ]
     assert len(provider_retries) == 1
-    assert store.messages()[-1].content == [TextContent("done")]
+    assert branch_messages(store)[-1].content == [TextContent("done")]
     await client.aclose()

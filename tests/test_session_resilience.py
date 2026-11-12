@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import os
 from pathlib import Path
 
@@ -378,7 +379,7 @@ def test_preview_reads_bounded_prefix(tmp_path: Path) -> None:
         Message(MessageRole.USER, [TextContent("active branch message")]),
         MessageOrigin.USER,
     ))
-    assert store.messages()[0].content[0].text == "active branch message"
+    assert branch_messages(store)[0].content[0].text == "active branch message"
     with store.path.open("ab") as conversation:
         conversation.write(b"not json\n" * 5_000)
 

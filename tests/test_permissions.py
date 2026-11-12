@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 from io import StringIO
 from pathlib import Path
@@ -91,7 +93,7 @@ async def test_permissions_shows_effective_policy_without_changing_it(
     try:
         settings_before = settings_path.read_bytes()
         rules_before = (policy.always_deny, policy.always_ask, policy.always_allow)
-        entries_before = app.loop.store.replay()
+        entries_before = app.loop.branch_entries(store)
         capabilities = [
             registry.resolve_call("bash", {"command": command})
             for command in ("rm file", "git push", "git status", "echo hello")
@@ -129,7 +131,7 @@ async def test_permissions_shows_effective_policy_without_changing_it(
         ) == rules_before
         assert [policy.decide(call) for call in capabilities] == expected
         assert settings_path.read_bytes() == settings_before
-        assert app.loop.store.replay() == entries_before
+        assert app.loop.branch_entries(store) == entries_before
         assert not backend.calls
 
         commands = app._slash_commands
@@ -371,7 +373,7 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
                 ApprovalRequest("grant", ToolCall("grant", tool, {}), action=action)
             )
         grants = policy.session_allow
-        entries = store.replay()
+        entries = branch_entries(store)
         pending = (await policy.pending_requests())
         settings_bytes = settings_path.read_bytes()
         restrictions = registry.tool_policy
@@ -433,7 +435,7 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
         assert policy.always_deny == {ApprovalRule("bash", "rm *")}
         assert (await policy.pending_requests()) == pending
         assert (await store.approval_state("approved"))[1] == "allow"
-        assert store.replay() == entries
+        assert branch_entries(store) == entries
         assert settings_path.read_bytes() == settings_bytes
         assert registry.tool_policy == restrictions
         assert not registry.tool_policy.allows("read")

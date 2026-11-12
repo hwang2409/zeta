@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import hashlib
 import json
@@ -166,7 +168,7 @@ async def _unset_child_snapshot(
             rendered = Text.from_ansi(tui_output.getvalue()).plain
             serve_rows = [
                 row
-                for entry in store.replay()
+                for entry in branch_entries(store)
                 if entry.type in {"message", "notification"}
                 for row in _history_entry_rows(entry, {}, fidelity=True)
             ]
@@ -182,7 +184,7 @@ async def _unset_child_snapshot(
                     if message.tool_result is not None
                     else None,
                 }
-                for message in child.messages()
+                for message in branch_messages(child)
             ]
             def stable(value: object) -> object:
                 text = json.dumps(value)
@@ -241,7 +243,7 @@ async def _unset_child_snapshot(
                 },
                 "notice_count": sum(
                     message.metadata.get("zeta_event") == "child_turn_limit"
-                    for message in child.messages()
+                    for message in branch_messages(child)
                 ),
                 "marker": "[zeta:turn-limit" in result.content,
                 "handoff": (child_path / "turn-limit-handoff.md").exists(),

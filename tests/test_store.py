@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import fcntl
 import hashlib
@@ -945,10 +946,10 @@ def test_append_replay_round_trip_and_parent_links(tmp_path: Path) -> None:
 
     reopened = ConversationStore(tmp_path, session_id="session-1")
 
-    assert [entry.id for entry in reopened.replay()] == [first.id, second.id]
+    assert [entry.id for entry in branch_entries(reopened)] == [first.id, second.id]
     assert reopened.active_branch_head_sequence() == second.seq
     assert second.parent_id == first.id
-    assert [item.content[0].text for item in reopened.messages()] == ["hello", "hi"]
+    assert [item.content[0].text for item in branch_messages(reopened)] == ["hello", "hi"]
     assert reopened.session_id == "session-1"
     assert reopened.cwd == "/work"
 
@@ -1102,7 +1103,7 @@ def test_flock_install_paths_allow_reentrant_callback_append(tmp_path: Path) -> 
         store.on_entries_installed = installed
         action()
         assert len(observed) == 1
-        assert store.messages()[-1].content[0].text == "inner"
+        assert branch_messages(store)[-1].content[0].text == "inner"
 
     appended = ConversationStore(tmp_path, session_id="installed-path-append")
     run_reentrant(
@@ -1668,7 +1669,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert row_fact_threads.count(owner_thread) <= 2
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
-    assert store.messages() == fresh.messages()
+    assert branch_messages(store) == branch_messages(fresh)
     assert store.agent_notifications() == fresh.agent_notifications()
     assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
 
@@ -1708,7 +1709,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_after_commit(
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
-    assert [item.content[0].text for item in store.messages()] == ["worker", "owner"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["worker", "owner"]
 
 
 @pytest.mark.asyncio
@@ -1738,7 +1739,7 @@ async def test_async_publish_matches_fresh_load_when_owner_writes_before_commit(
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store._detach_log_state() == fresh._detach_log_state()
-    assert [item.content[0].text for item in store.messages()] == ["owner", "worker"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["owner", "worker"]
 
 
 @pytest.mark.asyncio
@@ -2066,7 +2067,7 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert refreshes == 1
     assert store.entries == fresh.entries
-    assert [item.content[0].text for item in store.messages()] == [
+    assert [item.content[0].text for item in branch_messages(store)] == [
         "worker",
         *(f"owner {index}" for index in range(20)),
         "stream 1",
@@ -2271,7 +2272,7 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert store.entries == fresh.entries
-    assert store.messages() == fresh.messages()
+    assert branch_messages(store) == branch_messages(fresh)
     assert store.agent_notifications() == fresh.agent_notifications()
     assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
 
@@ -2521,7 +2522,7 @@ def test_abandoned_branch_semantic_failure_is_ignored(tmp_path: Path) -> None:
         tmp_path, session_id="abandoned-semantic-failure", _read_only=True
     )
 
-    assert [entry.id for entry in reopened.replay()] == [root.id, active.id]
+    assert [entry.id for entry in branch_entries(reopened)] == [root.id, active.id]
     reopened.close()
 
 
@@ -2553,7 +2554,7 @@ def test_full_load_validates_the_final_branch_once(
     reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
 
     assert len(reopened.entries) == 119
-    assert len(reopened.replay()) == 2
+    assert len(branch_entries(reopened)) == 2
     assert validations == 2
     reopened.close()
 
@@ -2600,7 +2601,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     with pytest.warns(RuntimeWarning, match="torn"):
         reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    assert [item.content[0].text for item in reopened.messages()] == ["kept"]
+    assert [item.content[0].text for item in branch_messages(reopened)] == ["kept"]
     assert reopened.entries[-1].type == "warning"
     assert reopened.entries[-1].data["kind"] == "transcript_recovery"
     quarantine_id = reopened.entries[-1].data["quarantine_id"]
@@ -2790,12 +2791,12 @@ def test_append_and_replay_use_data_snapshots(tmp_path: Path) -> None:
 
     arguments["nested"]["value"] = 2
     entry.data["message"]["content"][0]["tool_call"]["arguments"]["nested"]["value"] = 4
-    replay = store.replay()
+    replay = branch_entries(store)
     replay[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
         "value"
     ] = 3
 
-    fresh = store.replay()
+    fresh = branch_entries(store)
     assert (
         fresh[0].data["message"]["content"][0]["tool_call"]["arguments"]["nested"][
             "value"
@@ -2867,8 +2868,8 @@ def test_compaction_marker_persists(tmp_path: Path) -> None:
     marker = store.append_compaction_marker("summary", 1, 4)
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    assert reopened.replay()[-1].id == marker.id
-    assert reopened.replay()[-1].data == {
+    assert branch_entries(reopened)[-1].id == marker.id
+    assert branch_entries(reopened)[-1].data == {
         "summary": "summary",
         "source_seq_start": 1,
         "source_seq_end": 4,
@@ -2939,7 +2940,7 @@ asyncio.run(main())
     )
 
     reopened = ConversationStore(tmp_path, session_id="shutdown-drain")
-    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+    assert [item.content[0].text for item in branch_messages(reopened)] == ["durable"]
 
 
 @pytest.mark.asyncio
@@ -2972,7 +2973,7 @@ async def test_async_append_defers_repeated_cancellation_until_fsync(
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(append, what="test await")
 
-    assert [item.content[0].text for item in store.messages()] == ["durable"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["durable"]
 
 
 @pytest.mark.asyncio
@@ -3045,7 +3046,7 @@ async def test_close_on_event_loop_drains_worker_without_deadlock(
             assert not release.is_alive(), "release timer did not finish"
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
-    assert [item.content[0].text for item in reopened.messages()] == ["durable"]
+    assert [item.content[0].text for item in branch_messages(reopened)] == ["durable"]
 
 
 def test_sessions_are_isolated(tmp_path: Path) -> None:
@@ -3059,8 +3060,8 @@ def test_sessions_are_isolated(tmp_path: Path) -> None:
     )
 
     assert first.path != second.path
-    assert [item.content[0].text for item in first.messages()] == ["one"]
-    assert [item.content[0].text for item in second.messages()] == ["two"]
+    assert [item.content[0].text for item in branch_messages(first)] == ["one"]
+    assert [item.content[0].text for item in branch_messages(second)] == ["two"]
 
 
 def test_concurrent_constructors_write_one_header(tmp_path: Path) -> None:
@@ -3172,7 +3173,7 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     store._entries[0] = replace(first, parent_id=second.id)
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
-        store.replay()
+        branch_entries(store)
 
 
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
@@ -3226,7 +3227,7 @@ def test_live_store_tail_syncs_external_append_without_full_read(
     first.append_message(message(MessageRole.ASSISTANT, "local"))
 
     assert first._full_reload_count == full_reloads
-    assert [item.content[0].text for item in first.messages()] == [
+    assert [item.content[0].text for item in branch_messages(first)] == [
         "external",
         "local",
     ]
@@ -3891,7 +3892,7 @@ resident.refresh()
 print(json.dumps({
     "observed": observed,
     "pending": [item[0] for item in pending.items],
-    "last_text": resident.messages()[-1].content[0].text,
+    "last_text": Message.from_dict(resident.entry(resident.branch_refs()[-1]).data["message"]).content[0].text,
 }))
 '''.strip()
     )
@@ -3936,7 +3937,7 @@ def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:
 
     store.refresh()
 
-    assert [item.content[0].text for item in store.messages()] == ["external"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["external"]
 
 
 def test_live_store_separates_external_complete_unterminated_row(
@@ -3955,7 +3956,7 @@ def test_live_store_separates_external_complete_unterminated_row(
     first.append_message(message(MessageRole.ASSISTANT, "after"))
 
     reopened = ConversationStore(tmp_path, session_id="live-unterminated")
-    assert [item.content[0].text for item in reopened.messages()] == [
+    assert [item.content[0].text for item in branch_messages(reopened)] == [
         "external",
         "after",
     ]
@@ -3997,7 +3998,7 @@ def test_live_store_full_reloads_after_file_replacement(tmp_path: Path) -> None:
     store.append_message(message(MessageRole.ASSISTANT, "after"))
 
     assert store._full_reload_count == reloads + 1
-    assert [item.content[0].text for item in store.messages()] == ["kept", "after"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["kept", "after"]
 
 
 def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
@@ -4016,7 +4017,7 @@ def test_live_store_reloads_same_size_rewrite_with_restored_mtime(
 
     store.refresh()
 
-    assert [item.content[0].text for item in store.messages()] == ["new"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["new"]
 
 
 def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> None:
@@ -4031,7 +4032,7 @@ def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> Non
     store.refresh()
 
     assert store.entries == fresh.entries
-    assert [item.content[0].text for item in store.messages()] == ["kept"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["kept"]
 
 
 def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
@@ -4054,11 +4055,11 @@ def test_live_store_bounded_fingerprint_does_not_detect_old_prefix_rewrite(
     resident.refresh()
     reopened = ConversationStore(tmp_path, session_id=resident.session_id)
 
-    assert [item.content[0].text for item in resident.messages()][::2] == [
+    assert [item.content[0].text for item in branch_messages(resident)][::2] == [
         "old",
         "appended",
     ]
-    assert [item.content[0].text for item in reopened.messages()][::2] == [
+    assert [item.content[0].text for item in branch_messages(reopened)][::2] == [
         "new",
         "appended",
     ]
@@ -4078,7 +4079,7 @@ def test_live_store_full_reloads_after_truncation(tmp_path: Path) -> None:
     )
 
     assert store._full_reload_count == reloads + 1
-    assert [item.content[0].text for item in store.messages()] == ["after"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["after"]
 
 
 def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:
@@ -4248,13 +4249,13 @@ def test_store_accepts_and_reopens_new_history_shapes(
         try:
             accepted = any(
                 row.type == entry_type and row.data == data
-                for row in reopened.active_branch_snapshot()
+                for row in branch_entries(reopened)
             )
             if entry_type == "client_delivery":
                 reopened.append_client_delivery(
                     "legacy-steer", "steer", "queued", {"accepted": True}
                 )
-                legacy = reopened.active_branch_snapshot()[-1]
+                legacy = branch_entries(reopened)[-1]
                 assert "accepted_message" not in legacy.data
             else:
                 for invalid in (
@@ -4326,7 +4327,7 @@ def test_observer_snapshot_keeps_prefix_during_active_append(tmp_path: Path) -> 
             _observer_snapshot=True,
         )
         try:
-            assert [item.content[0].text for item in observed.messages()] == ["complete"]
+            assert [item.content[0].text for item in branch_messages(observed)] == ["complete"]
         finally:
             observed.close()
     finally:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 from io import StringIO
 from pathlib import Path
@@ -155,7 +157,7 @@ def test_render_failure_exits_without_input_and_restores_session(
         assert f"resume with: zeta --resume {store.session_id}" in error
         reopened = manager.open(store.session_id)
         try:
-            assert reopened.store.messages() == [saved]
+            assert reopened.branch_messages(store) == [saved]
             assert DraftPersistence(reopened.store.session_dir / "draft").load() == "unsent draft"
         finally:
             reopened.store.close()

@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 
 from tests.support.owned import await_or_fail
 from zeta.providers.completion import owned_completion
@@ -613,7 +614,7 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     assert assembled_result.content.startswith("head")
     assert "tail\n[output truncated for context:" in assembled_result.content
     assert "full output is in the session log at seq 3" in assembled_result.content
-    assert store.messages()[2].tool_result == original_result
+    assert branch_messages(store)[2].tool_result == original_result
 
     anthropic = build_messages_payload(
         first.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
@@ -978,7 +979,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     messages = await assembler.assemble()
     replayed = await assembler.assemble()
 
-    assert [entry.type for entry in store.replay()] == [
+    assert [entry.type for entry in branch_entries(store)] == [
         "message",
         "message",
         "message",
@@ -1051,7 +1052,7 @@ async def test_removed_automation_session_fixture_evicts(tmp_path: Path) -> None
     )
     assert any(
         message.metadata.get("response_state") == "synthetic"
-        for message in reopened.messages()
+        for message in branch_messages(reopened)
     )
 
 
@@ -2303,7 +2304,7 @@ async def test_ephemeral_host_instruction_counts_toward_context_budget_without_p
 
     assert assembled.messages[0].content[-1].text.endswith(instruction)
     assert assembled.token_count >= len(instruction)
-    assert all(instruction not in json.dumps(entry.data) for entry in store.replay())
+    assert all(instruction not in json.dumps(entry.data) for entry in branch_entries(store))
 
 
 TOOL_SCHEMAS = ({"name": "probe", "description": "d", "input_schema": {}},)
@@ -2430,7 +2431,7 @@ async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
         [
             # Replaced marker ids are random per store; their count must match.
             {**entry.data, "replaces": len(entry.data.get("replaces", []))}
-            for entry in store.replay()
+            for entry in branch_entries(store)
             if entry.type == "compaction"
         ]
         for store in stores

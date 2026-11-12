@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import fcntl
 import functools
@@ -496,7 +498,7 @@ def test_read_only_store_is_lease_free(tmp_path: Path) -> None:
         manager.open(session_id).store as owner,
         manager.open(session_id, _read_only=True).store as observer,
     ):
-        assert observer.messages() == owner.messages()
+        assert branch_messages(observer) == branch_messages(owner)
         assert observer._runtime_lease is None
         with pytest.raises(Exception, match="read-only"):
             observer.append_pending_prompt("no")

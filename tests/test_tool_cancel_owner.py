@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import gc
 import logging
@@ -183,7 +185,7 @@ class Harness:
     def transcript(self) -> tuple[str, ...]:
         return tuple(
             summarize(message.tool_result)
-            for message in self.store.messages()
+            for message in self.branch_messages(store)
             if message.tool_result is not None
         )
 
@@ -434,7 +436,7 @@ async def durable_inline(h: Harness) -> Outcome:
     await await_or_fail(asyncio.wait({task}), what="durable task end")
     results = tuple(
         summarize(message.tool_result)
-        for message in opened.store.messages()
+        for message in opened.branch_messages(store)
         if message.tool_result is not None
     )
     return h.outcome(results)

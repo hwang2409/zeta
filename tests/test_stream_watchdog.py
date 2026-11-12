@@ -8,6 +8,8 @@ stall RETRY event; and headless/settings surface areas.
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import io
 import json
@@ -793,7 +795,7 @@ async def test_agent_loop_reset_on_stall_retry_drops_pre_stall_partial(
 
     persisted = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.ASSISTANT
     ]
     assert len(persisted) == 1
@@ -849,7 +851,7 @@ async def test_agent_loop_stall_after_message_end_keeps_completed_message(
 
     persisted = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.ASSISTANT
     ]
     assert len(persisted) == 1
@@ -887,7 +889,7 @@ async def test_agent_loop_stall_exhaustion_persists_partial_as_failed_turn(
     assert any(event.type is StreamEventType.ERROR for event in events)
     persisted = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.ASSISTANT
     ]
     assert len(persisted) == 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import os
 import threading
@@ -190,7 +192,7 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     await flow.initialize()
     try:
         assert reloads == 0
-        assert resident.messages()[-1].content == [TextContent("external")]
+        assert branch_messages(resident)[-1].content == [TextContent("external")]
     finally:
         await asyncio.to_thread(resident.close)
 
@@ -310,7 +312,7 @@ async def test_resume_recovery_restores_durable_completion(tmp_path: Path) -> No
         assert runtime.opened.store.agent_children() == {}
         results = [
             message.tool_result
-            for message in runtime.opened.store.messages()
+            for message in runtime.opened.branch_messages(store)
             if message.tool_result is not None
         ]
         assert [result.tool_call_id for result in results] == ["call-0"]

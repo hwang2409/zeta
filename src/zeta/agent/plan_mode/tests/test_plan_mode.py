@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -270,7 +272,7 @@ async def test_plan_mode_filters_and_rejects_actions_with_one_policy(
     assert executed == []
     result = next(
         message.tool_result
-        for message in loop.store.messages()
+        for message in loop.branch_messages(store)
         if message.tool_result is not None
     )
     assert result.is_error is True
@@ -422,7 +424,7 @@ skill_catalog=SkillCatalog.empty(),
 
     child_result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     )
     assert child_result.is_error is False
@@ -466,7 +468,7 @@ skill_catalog=SkillCatalog.empty(),
 
     result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     )
     assert result.is_error is True

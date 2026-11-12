@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 import random
@@ -2033,7 +2034,7 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
     assembler._request_budget.calibration.provider_token_total = 4321
     assembler.last_compaction_telemetry = {"existing": True}
     assembler.last_usage = {"input_tokens": 91}
-    before_entries = store.replay()
+    before_entries = branch_entries(store)
     before_state = (
         assembler.last_context,
         assembler._request_budget.calibration.provider_token_total,
@@ -2073,8 +2074,8 @@ async def test_cancel_during_offloop_plan_leaves_no_marker_or_state(
         release_planner.set()
         assert await asyncio.to_thread(planning_finished.wait, 10)
 
-    assert store.replay() == before_entries
-    assert not any(entry.type == "compaction" for entry in store.replay())
+    assert branch_entries(store) == before_entries
+    assert not any(entry.type == "compaction" for entry in branch_entries(store))
     assert (
         assembler.last_context,
         assembler._request_budget.calibration.provider_token_total,
@@ -2464,7 +2465,7 @@ async def test_long_single_user_turn_evicts_consumed_results_without_summary(
     assert policy.calls == 0
     assert any(
         entry.type == "compaction" and entry.data.get("kind") == "evict"
-        for entry in store.replay()
+        for entry in branch_entries(store)
     )
     assert "semantic read digest" in rendered_text(context.messages)
 
@@ -2565,8 +2566,8 @@ async def test_cancelled_partial_response_does_not_make_fresh_result_evictable(
 ) -> None:
     store, output = await _cancel_partial_after_fresh_agent_result(tmp_path)
 
-    assert store.messages()[-1].content == [TextContent("canceled partial")]
-    assert store.messages()[-1].metadata["response_state"] == "aborted"
+    assert branch_messages(store)[-1].content == [TextContent("canceled partial")]
+    assert branch_messages(store)[-1].metadata["response_state"] == "aborted"
     assert "FRESH_RESULT_NEEDLE" in output
     assert "orchestration result receipt" not in output
 
@@ -2581,9 +2582,9 @@ async def test_discarded_assistant_reset_attempt_not_a_consumption_boundary(
 
     assert all(
         message.content != [TextContent("discarded attempt")]
-        for message in store.messages()
+        for message in branch_messages(store)
     )
-    assert store.messages()[-1].metadata["response_state"] == "aborted"
+    assert branch_messages(store)[-1].metadata["response_state"] == "aborted"
     assert "FRESH_RESULT_NEEDLE" in output
     assert "orchestration result receipt" not in output
 
@@ -3138,7 +3139,7 @@ async def _pinned_request_eviction(
     context = await assembler.assemble_context()
 
     assert context.compacted
-    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    marker = next(entry for entry in branch_entries(store) if entry.type == "compaction")
     return [message.to_dict() for message in context.messages], marker.data
 
 
@@ -3201,7 +3202,7 @@ async def test_latest_user_message_never_evicted(tmp_path: Path) -> None:
         and message.tool_result.tool_call_id == "read-new"
     )
     assert request_index < answer_index
-    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    marker = next(entry for entry in branch_entries(store) if entry.type == "compaction")
     expected_pinned = text(
         MessageRole.USER, "latest request verbatim"
     ).to_dict()
@@ -3320,7 +3321,7 @@ async def test_eviction_replay_deterministic_with_new_rules(tmp_path: Path) -> N
     assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in first.messages
     ]
-    assert len([entry for entry in store.replay() if entry.type == "compaction"]) == 1
+    assert len([entry for entry in branch_entries(store) if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
@@ -3339,7 +3340,7 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
 
     assembled = [await assembler.assemble_context() for _ in range(4)]
 
-    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    markers = [entry for entry in branch_entries(store) if entry.type == "compaction"]
     assert len(markers) == 1
     assert markers[0].data["kind"] == "evict"
     assert all(
@@ -3360,7 +3361,7 @@ async def test_hysteresis_replay_identity_pinned_user_and_reopen(tmp_path: Path)
     assert [message.to_dict() for message in replayed.messages] == [
         message.to_dict() for message in assembled[0].messages
     ]
-    assert len([entry for entry in reopened.replay() if entry.type == "compaction"]) == 1
+    assert len([entry for entry in branch_entries(reopened) if entry.type == "compaction"]) == 1
 
 
 class EmptyEvictionPolicy(CompactionPolicy):
@@ -3483,7 +3484,7 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
     assert "next request" in rendered_text(refreshed.messages)
     assert all(
         entry.data.get("kind") == "evict"
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "compaction"
     )
 
@@ -3506,7 +3507,7 @@ async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
     ).assemble_context()
 
     assert policy.calls == 0
-    markers = [entry for entry in store.replay() if entry.type == "compaction"]
+    markers = [entry for entry in branch_entries(store) if entry.type == "compaction"]
     assert markers[-1].data["kind"] == "evict"
     assert markers[-1].data["replaces"] == [markers[0].id]
 
@@ -3531,7 +3532,7 @@ async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
 
     assert context.compacted is True
     assert policy.calls == 0
-    marker = next(entry for entry in store.replay() if entry.type == "compaction")
+    marker = next(entry for entry in branch_entries(store) if entry.type == "compaction")
     assert marker.data["kind"] == "evict"
 
 
@@ -3572,7 +3573,7 @@ async def test_eviction_that_fits_budget_does_not_require_target_or_summary(
     assert policy.calls == 0
     assert [
         entry.data.get("kind")
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "compaction"
     ] == ["evict"]
 
@@ -3660,7 +3661,7 @@ async def test_eviction_falls_back_to_existing_summary(tmp_path: Path) -> None:
 
     assert policy.calls == 1
     assert "fallback summary" in rendered_text(context.messages)
-    assert [entry.data.get("kind", "summary") for entry in store.replay() if entry.type == "compaction"] == ["summary"]
+    assert [entry.data.get("kind", "summary") for entry in branch_entries(store) if entry.type == "compaction"] == ["summary"]
 
 
 def test_recall_tool_is_registered_and_children_inherit(tmp_path: Path) -> None:
@@ -3820,7 +3821,7 @@ async def test_view_with_nested_compaction_rows_is_valid(tmp_path: Path) -> None
         else 100,
     )
 
-    visible = assembler._visible_items(store.replay())
+    visible = assembler._visible_items(branch_entries(store))
     context = await assembler.assemble_context(
         force=True, bypass_eviction_hysteresis=True
     )
@@ -3829,7 +3830,7 @@ async def test_view_with_nested_compaction_rows_is_valid(tmp_path: Path) -> None
         item.message.metadata.get("eviction_view_invalid") for item in visible
     )
     assert context.token_count < sum(estimated_tokens(item.message) for item in visible)
-    third = ContextAssembler._active_markers(store.replay())[0]
+    third = ContextAssembler._active_markers(branch_entries(store))[0]
     assert third.id != second.id
     assert third.data["source_seq_start"] == source.seq
     assert third.data["source_seq_end"] >= second.seq
@@ -3874,7 +3875,7 @@ async def test_invalid_view_falls_back_to_fresh_eviction(tmp_path: Path) -> None
 
     assert context.token_count < 100
     assert "kept raw" in rendered_text(context.messages)
-    active_markers = ContextAssembler._active_markers(store.replay())
+    active_markers = ContextAssembler._active_markers(branch_entries(store))
     assert len(active_markers) == 1
     assert active_markers[0].id != marker.id
     assert marker.id in active_markers[0].data["replaces"]

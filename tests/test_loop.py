@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import base64
@@ -94,7 +95,7 @@ async def test_empty_completion_ends_with_classification(
     )
     nudges = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     if stop_reason == "end_turn":
@@ -649,11 +650,11 @@ async def test_single_turn_without_tools(tmp_path: Path) -> None:
     events = await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
     assert events[-1].type is StreamEventType.AGENT_END
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
-    assert store.messages()[-1].metadata["response_state"] == "completed"
+    assert branch_messages(store)[-1].metadata["response_state"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -807,7 +808,7 @@ async def test_unsigned_thinking_is_not_persisted_with_assistant_message(
 
     await collect(AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()).run_turn("hi", origin=MessageOrigin.USER))
 
-    assert store.messages()[-1].content == [TextContent("answer")]
+    assert branch_messages(store)[-1].content == [TextContent("answer")]
 
 
 @pytest.mark.asyncio
@@ -823,7 +824,7 @@ async def test_header_only_thinking_is_persisted_with_assistant_message(
 
     # Header-only thinking stays durable even though the empty turn is nudged.
     assert any(
-        message.content == [ThinkingContent("")] for message in store.messages()
+        message.content == [ThinkingContent("")] for message in branch_messages(store)
     )
 
 
@@ -963,7 +964,7 @@ async def test_agent_loop_preserves_mixed_tool_blocks(tmp_path: Path) -> None:
 
     await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.content == (
         "answer\n[image block] media_type=image/png dimensions=1x1 bytes=70\n"
@@ -1004,12 +1005,12 @@ async def test_agent_loop_rejects_invalid_block_metadata_before_persistence(
 
     await collect(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.is_error is True
     assert "unsupported fields" in result.content
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
-    assert reopened.messages()[2].tool_result is not None
+    assert branch_messages(reopened)[2].tool_result is not None
 
 
 @pytest.mark.asyncio
@@ -1050,15 +1051,15 @@ async def test_tool_call_then_next_completion(tmp_path: Path) -> None:
         StreamEventType.AGENT_END,
     ]
 
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL_RESULT,
         MessageRole.TOOL_RESULT,
         MessageRole.ASSISTANT,
     ]
-    assert store.messages()[1].metadata["response_state"] == "completed"
-    assert store.messages()[-1].metadata["response_state"] == "completed"
+    assert branch_messages(store)[1].metadata["response_state"] == "completed"
+    assert branch_messages(store)[-1].metadata["response_state"] == "completed"
     assert [message.tool_result.content for message in backend.calls[1][0][-2:] if message.tool_result] == [
         "one",
         "two",
@@ -1107,7 +1108,7 @@ async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> 
 
     results = [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     ]
     assert len(results) == 1
@@ -1251,7 +1252,7 @@ async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -
     )
     assert tool_events[end_index].tool_result.is_error is True
     assert tool_events[end_index].tool_result.content == "tool execution canceled"
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert len(results) == 1
     assert results[0].content == "tool execution canceled"
     assert "tool_execution_update" not in json.dumps(
@@ -1437,7 +1438,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
 
     results = {
         message.tool_result.tool_call_id: message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     }
     assert results[first_call.id].content == "one"
@@ -1495,7 +1496,7 @@ async def test_parallel_cancellation_keeps_call_order(
 
     results = [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     ]
     assert [result.tool_call_id for result in results] == [call.id for call in calls]
@@ -1592,7 +1593,7 @@ def test_finalize_tool_results(
     assert [result.is_error for result in results] == expected_errors
     persisted = [
         message.tool_result
-        for message in loop.store.messages()
+        for message in loop.branch_messages(store)
         if message.tool_result is not None
     ]
     assert [result.content for result in persisted] == expected_contents
@@ -1633,7 +1634,7 @@ async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
 
     results = [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     ]
     assert [result.tool_call_id for result in results] == [
@@ -1656,7 +1657,7 @@ async def test_tool_error_is_a_result_and_loop_continues(tmp_path: Path) -> None
 
     events = await collect(AgentLoop(backend, store, tools={"fail": fail}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None and result.is_error
     assert "tool broke" in result.content
     assert events[-1].type is StreamEventType.AGENT_END
@@ -1675,7 +1676,7 @@ async def test_wrong_tool_result_id_becomes_expected_error_result(tmp_path: Path
 
     await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.tool_call_id == "expected"
     assert result.is_error
@@ -1695,12 +1696,12 @@ async def test_wrong_typed_tool_result_becomes_valid_error_result(tmp_path: Path
 
     await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.tool_call_id == call.id
     assert result.is_error
     assert "invalid tool result" in result.content
-    assert ConversationStore(tmp_path, session_id=store.session_id).messages()
+    assert branch_messages(ConversationStore(tmp_path, session_id=store.session_id))
 
 
 @pytest.mark.parametrize("output", [None, 123, {"value": "bad"}])
@@ -1720,7 +1721,7 @@ async def test_invalid_tool_handler_output_becomes_error_result(
 
     await collect(AgentLoop(backend, store, tools={"echo": echo}, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.tool_call_id == call.id
     assert result.is_error
@@ -1755,11 +1756,11 @@ async def test_aclose_after_message_update_persists_partial_state(tmp_path: Path
     )
 
     assert backend.completion_close_count == 1
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
     ]
-    assert store.messages()[-1].content[0].text == "partial"
+    assert branch_messages(store)[-1].content[0].text == "partial"
 
 
 @pytest.mark.asyncio
@@ -1775,7 +1776,7 @@ async def test_aclose_after_message_end_persists_complete_state(tmp_path: Path) 
         StreamEventType.MESSAGE_END,
     )
 
-    assert store.messages()[-1].content[0].text == "complete"
+    assert branch_messages(store)[-1].content[0].text == "complete"
 
 
 @pytest.mark.asyncio
@@ -1804,7 +1805,7 @@ skill_catalog=SkillCatalog.empty(),
             await stream.aclose()
             break
 
-    result = store.messages()[-1].tool_result
+    result = branch_messages(store)[-1].tool_result
     assert result is not None
     assert result.content == "tool execution canceled"
     assert result.is_error is True
@@ -1878,8 +1879,8 @@ async def test_cancellation_persists_partial_state(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert backend.completion_close_count == 1
-    assert len(store.messages()) == 2
-    assert store.messages()[-1].role is MessageRole.ASSISTANT
+    assert len(branch_messages(store)) == 2
+    assert branch_messages(store)[-1].role is MessageRole.ASSISTANT
 
 
 @pytest.mark.asyncio
@@ -1988,7 +1989,7 @@ async def test_truncated_stream_persists_stop_reason_metadata(tmp_path: Path) ->
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    partial = store.messages()[-1]
+    partial = branch_messages(store)[-1]
     assert partial.content == [TextContent("partial")]
     assert partial.metadata["stop_reason"] == "max_tokens"
     assert partial.metadata["output_tokens"] == 37
@@ -2031,7 +2032,7 @@ async def test_discarded_partial_is_not_finalized_when_stream_then_ends(
         for event in events
     )
     assert all(
-        message.content != [TextContent("discard me")] for message in store.messages()
+        message.content != [TextContent("discard me")] for message in branch_messages(store)
     )
 
 
@@ -2072,7 +2073,7 @@ async def test_canceled_turn_persists_stop_reason_metadata(tmp_path: Path) -> No
     with pytest.raises(asyncio.CancelledError):
         await await_or_fail(task, what="task")
 
-    partial = store.messages()[-1]
+    partial = branch_messages(store)[-1]
     assert partial.content == [TextContent("partial")]
     assert partial.metadata["stop_reason"] == "max_tokens"
     assert partial.metadata["output_tokens"] == 23
@@ -2097,7 +2098,7 @@ async def test_backend_error_is_typed_and_user_state_is_persisted(tmp_path: Path
     assert events[-2].type is StreamEventType.ERROR
     assert events[-2].error is not None
     assert events[-2].error.code == "backend_error"
-    messages = store.messages()
+    messages = branch_messages(store)
     assert len(messages) == 2
     assert messages[-1].metadata["turn_failed"] is True
     assert messages[-1].metadata["turn_error"]["code"] == "backend_error"
@@ -2357,7 +2358,7 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
     )
 
     assert backend.calls == 2
-    assert [message.content for message in store.messages()] == [
+    assert [message.content for message in branch_messages(store)] == [
         [TextContent("start")],
         [TextContent("final")],
     ]
@@ -2378,7 +2379,7 @@ async def test_retry_after_midstream_request_failed_succeeds(tmp_path: Path) -> 
         and event.content == TextContent("final")
     )
     assert reset_index < final_index
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {
             "attempt": 2,
             "reason": "http_error",
@@ -2471,8 +2472,8 @@ async def test_stall_after_partial_tool_call_delta_is_retried(
 
     assert backend.calls == 2
     assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
-    assert store.messages()[-1].content == [TextContent("recovered")]
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].content == [TextContent("recovered")]
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {
             "attempt": 2,
             "reason": "http_error",
@@ -2532,7 +2533,7 @@ async def test_stall_after_text_delta_is_retried_with_reset(
         if event.type is StreamEventType.MESSAGE_END
     )
     assert reset_index < final_index
-    assert store.messages()[-1].content == [TextContent("keep me")]
+    assert branch_messages(store)[-1].content == [TextContent("keep me")]
 
 
 @pytest.mark.asyncio
@@ -2565,7 +2566,7 @@ async def test_stall_after_completed_tool_call_is_not_retried(tmp_path: Path) ->
     assert backend.calls == 1
     assert not any(event.type is StreamEventType.RETRY for event in events)
     assert events[-2].type is StreamEventType.ERROR
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {"decision": "skipped-after-output", "reason": "tool_call_completed"}
     ]
 
@@ -2602,7 +2603,7 @@ async def test_stall_after_completed_parallel_call_is_not_retried(tmp_path: Path
 
     assert backend.calls == 1
     assert not any(event.type is StreamEventType.RETRY for event in events)
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {"decision": "skipped-after-output", "reason": "tool_call_completed"}
     ]
 
@@ -2636,7 +2637,7 @@ async def test_stall_after_two_partial_parallel_calls_is_retried(tmp_path: Path)
 
     assert backend.calls == 2
     assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
-    assert store.messages()[-1].content == [TextContent("recovered")]
+    assert branch_messages(store)[-1].content == [TextContent("recovered")]
 
 
 @pytest.mark.asyncio
@@ -2681,7 +2682,7 @@ async def test_failure_after_dispatched_tool_call_retries_without_reexecuting(
     assert executions == ["once"]
     assert backend.calls == 3
     assert [event.type for event in events].count(StreamEventType.RETRY) == 1
-    assert store.messages()[-1].content == [TextContent("done")]
+    assert branch_messages(store)[-1].content == [TextContent("done")]
 
 
 @pytest.mark.asyncio
@@ -2720,7 +2721,7 @@ async def test_stall_after_approval_request_is_not_retried(tmp_path: Path) -> No
     assert events[-1].type is StreamEventType.TOOL_APPROVAL_START
     assert not any(event.type is StreamEventType.RETRY for event in events)
     assistant = next(
-        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+        message for message in branch_messages(store) if message.role is MessageRole.ASSISTANT
     )
     assert assistant.content == [ToolUseContent(call)]
 
@@ -2799,7 +2800,7 @@ async def test_abort_during_backoff_keeps_ui_and_store_consistent(
     assert retry.data.get("discard_partial") is not True
     assert any(event.type.value == "assistant_reset" for event in events)
     assert backend.calls == 1
-    assert [message.role for message in store.messages()] == [MessageRole.USER]
+    assert [message.role for message in branch_messages(store)] == [MessageRole.USER]
 
 
 @pytest.mark.asyncio
@@ -2837,7 +2838,7 @@ async def test_retry_budget_exhausted_fails_with_original_error(tmp_path: Path) 
     assert sum(event.type is StreamEventType.RETRY for event in events) == 4
     assert events[-2].error is not None
     assert events[-2].error.message == "first failure"
-    assert store.messages()[-1].metadata["turn_error"]["message"] == "first failure"
+    assert branch_messages(store)[-1].metadata["turn_error"]["message"] == "first failure"
 
 
 @pytest.mark.asyncio
@@ -2957,15 +2958,15 @@ async def test_child_agent_survives_transient_provider_error(tmp_path: Path) -> 
     assert backend.calls == 4
     result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     )
     assert result.is_error is False
     assert result.content.startswith("child survived")
     child_path = Path(result.structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    assert child_store.messages()[-1].content == [TextContent("child survived")]
-    assert child_store.messages()[-1].metadata["provider_retries"][0]["attempt"] == 2
+    assert branch_messages(child_store)[-1].content == [TextContent("child survived")]
+    assert branch_messages(child_store)[-1].metadata["provider_retries"][0]["attempt"] == 2
 
 
 
@@ -2999,11 +3000,11 @@ async def test_provider_error_event_persists_partial_state_and_ends_turn(
         StreamEventType.AGENT_END,
     ]
     assert StreamEventType.TURN_END not in [event.type for event in events]
-    assert [message.content[0].text for message in store.messages()[1:]] == [
+    assert [message.content[0].text for message in branch_messages(store)[1:]] == [
         "partial"
     ]
-    assert store.messages()[-1].metadata["turn_failed"] is True
-    assert store.messages()[-1].metadata["turn_error"]["code"] == "stream_error"
+    assert branch_messages(store)[-1].metadata["turn_failed"] is True
+    assert branch_messages(store)[-1].metadata["turn_error"]["code"] == "stream_error"
 
 
 @pytest.mark.asyncio
@@ -3048,7 +3049,7 @@ async def test_clean_stream_exit_retries_without_duplicate_output(
     assert retry.data["kind"] == "provider_retry"
     assert retry.data["reason"] == "stream_error"
     assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
-    assert [message.content for message in store.messages()] == [
+    assert [message.content for message in branch_messages(store)] == [
         [TextContent("start")],
         [TextContent("keep me")],
     ]
@@ -3089,7 +3090,7 @@ async def test_clean_stream_exit_after_completed_tool_call_is_not_retried(
     assert events[-2].error == ErrorInfo(
         "stream_error", "provider stream ended before completion"
     )
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {"decision": "skipped-after-output", "reason": "tool_call_completed"}
     ]
 
@@ -3127,7 +3128,7 @@ async def test_clean_stream_exit_exhausts_normal_retry_budget(
     assert events[-2].error == ErrorInfo(
         "stream_error", "provider stream ended before completion"
     )
-    assert store.messages()[-1].metadata["turn_error"]["message"] == (
+    assert branch_messages(store)[-1].metadata["turn_error"]["message"] == (
         "provider stream ended before completion"
     )
 
@@ -3148,7 +3149,7 @@ async def test_no_output_failure_closes_turn_and_persists_marker(tmp_path: Path)
     store = ConversationStore(tmp_path)
     await collect(AgentLoop(BrokenBackend(), store, skill_catalog=SkillCatalog.empty()).run_turn("start", origin=MessageOrigin.USER))
 
-    messages = store.messages()
+    messages = branch_messages(store)
     assert messages[-1].content == []
     assert messages[-1].metadata["turn_failed"] is True
     assert store.turn_in_flight() is False
@@ -3164,7 +3165,7 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
     assert events[-1].type is StreamEventType.AGENT_END
     results = [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     ]
     assert [result.tool_call_id for result in results] == [
@@ -3174,10 +3175,10 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
     assert results[0].is_error
     assert "child connection dropped" in results[0].content
     assert results[1].content.startswith("sibling complete")
-    assert store.messages()[-1].content[0].text == "parent survived"
+    assert branch_messages(store)[-1].content[0].text == "parent survived"
     child_path = Path(results[0].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
-    assert child_store.messages()[-1].metadata["turn_failed"] is True
+    assert branch_messages(child_store)[-1].metadata["turn_failed"] is True
 
 
 @pytest.mark.asyncio
@@ -3204,7 +3205,7 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     assert "1" in child_ids
     results = [
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     ]
     assert results[0] is not None and results[0].is_error
@@ -3237,7 +3238,7 @@ async def test_thinking_only_nudge_runs_even_at_max_turns(tmp_path: Path) -> Non
     assert len(backend.calls) == 2
     assert events[-1].type is StreamEventType.AGENT_END
     assert store.turn_in_flight() is False
-    messages = store.messages()
+    messages = branch_messages(store)
     nudge_index = next(
         index
         for index, message in enumerate(messages)
@@ -3287,7 +3288,7 @@ async def test_receipt_echo_reply_is_nudged_like_an_empty_reply(tmp_path: Path) 
     loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     try:
         events = await collect(loop.run_turn("hi", origin=MessageOrigin.USER))
-        messages = store.messages()
+        messages = branch_messages(store)
         nudges = [
             index
             for index, message in enumerate(messages)
@@ -3323,14 +3324,14 @@ async def test_thinking_only_reply_is_nudged_once_and_recovers(tmp_path: Path) -
     assert len(backend.calls) == 2
     nudges = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
     assert nudges[0].role is MessageRole.SYSTEM
     assert nudges[0].content[0].text.startswith("[zeta] empty-turn recovery:")
     # The nudged completion delivered the visible reply as the final message.
-    assert store.messages()[-1].content == [TextContent("here is the answer")]
+    assert branch_messages(store)[-1].content == [TextContent("here is the answer")]
 
 
 @pytest.mark.asyncio
@@ -3351,7 +3352,7 @@ async def test_thinking_only_reply_nudged_at_most_once_per_turn(tmp_path: Path) 
     assert len(backend.calls) == 2
     nudges = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
@@ -3388,11 +3389,11 @@ async def test_thinking_only_max_tokens_retries_then_continues(tmp_path: Path) -
     ]
     recoveries = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == THINKING_LIMIT_RECOVERY_EVENT
     ]
     assert len(recoveries) == 1
-    final = store.messages()[-1]
+    final = branch_messages(store)[-1]
     assert final.role is MessageRole.ASSISTANT
     assert any(
         isinstance(block, TextContent) and "here is the answer" in block.text
@@ -3429,7 +3430,7 @@ async def test_thinking_only_max_tokens_errors_when_retry_also_limited(
 
     recoveries = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == THINKING_LIMIT_RECOVERY_EVENT
     ]
     assert len(recoveries) == 1
@@ -3439,7 +3440,7 @@ async def test_thinking_only_max_tokens_errors_when_retry_also_limited(
     assert "output-token limit" in events[-2].error.message
     assert not [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert events[-1].type is StreamEventType.AGENT_END

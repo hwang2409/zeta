@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import base64
 import binascii
@@ -583,7 +584,7 @@ def test_image_tool_result_persists_and_replays_byte_identically(tmp_path: Path)
     persisted = message.to_dict()
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
-    replayed = reopened.messages()[0]
+    replayed = branch_messages(reopened)[0]
     assert replayed.to_dict() == persisted
     assert replayed.tool_result is not None
     assert replayed.tool_result.content_blocks == message.tool_result.content_blocks
@@ -637,7 +638,7 @@ def test_corrupt_stored_image_block_keeps_receipt(
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    result = reopened.messages()[0].tool_result
+    result = branch_messages(reopened)[0].tool_result
     assert result is not None
     assert result.content == (
         "filename=screenshot.png bytes=70 format=png\n"

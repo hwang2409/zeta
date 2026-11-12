@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import threading
 
@@ -229,7 +231,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
         assert len(backend.calls) == 1
         persisted = [
             message
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.metadata.get("zeta_event") == "agent_notifications"
         ]
         assert len(persisted) == 1
@@ -328,7 +330,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         assert CONTEXT not in _context_messages(backend, 1)[-1].content[0].text
         persisted_context = [
             message
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.metadata.get("turn_context")
         ]
         assert len(persisted_context) == 1
@@ -397,7 +399,7 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
         assert CONTEXT in _context_messages(backend, 0)[0].content[0].text
         persisted = [
             message
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.metadata.get("turn_context")
         ]
         assert len(persisted) == 1
@@ -625,7 +627,7 @@ async def test_turn_context_is_persisted_as_non_user_notification_input(
 
         persisted = [
             message
-            for message in server.runtime.opened.store.messages()
+            for message in server.runtime.opened.branch_messages(store)
             if CONTEXT in str(message.to_dict())
         ]
         assert len(persisted) == 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import io
 import json
@@ -1691,7 +1693,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     index = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
     assert any(
         entry.data["message"]["content"][0]["text"] == "durableretrycanary"
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "message"
     )
     assert index.search("first indexed question")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import os
 import shutil
@@ -342,7 +344,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
             "duplicate": True,
         }
         assert backend.calls == 1
-        assert len(server.runtime.opened.store.messages()) == 1
+        assert len(server.runtime.opened.branch_messages(store)) == 1
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
@@ -416,7 +418,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         assert delivered[-1]["result"]["status"] == "delivered"
         texts = [
             block.text
-            for message in server.runtime.opened.store.messages()
+            for message in server.runtime.opened.branch_messages(store)
             if message.role is MessageRole.USER
             for block in message.content
             if isinstance(block, TextContent)
@@ -809,7 +811,7 @@ def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) 
         message=message,
     )
     assert store.client_delivery("send-atomic").status == "delivered"
-    assert [item.content[0].text for item in store.messages()] == ["hello"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["hello"]
     store.close()
 
 
@@ -1050,7 +1052,7 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
         {"accepted": True},
     )
 
-    (delivery,) = store.replay()
+    (delivery,) = branch_entries(store)
     assert delivery.type == "client_delivery"
     assert delivery.data == {
         "delivery_id": "compat-steer",
@@ -1058,7 +1060,7 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
         "status": "queued",
         "outcome": {"accepted": True},
     }
-    assert all(entry.type not in {"message", "warning"} for entry in store.replay())
+    assert all(entry.type not in {"message", "warning"} for entry in branch_entries(store))
     store.close()
 
 
@@ -1201,7 +1203,7 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
                 "print(zeta.__file__); "
                 "store = ConversationStore(Path(__import__('sys').argv[1]), "
                 "session_id=__import__('sys').argv[2]); "
-                "rows = store.replay(); store.close(); "
+                "rows = branch_entries(store); store.close(); "
                 "print('old reader replayed', len(rows), 'rows')"
             ),
             str(session_root),
@@ -1393,7 +1395,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
                 isinstance(block, TextContent) and block.text == "later"
                 for block in message.content
             )
-            for message in resumed.runtime.opened.store.messages()
+            for message in resumed.runtime.opened.branch_messages(store)
         )
     finally:
         await close_serve(resumed, writer)

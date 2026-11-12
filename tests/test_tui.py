@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import ast
 import asyncio
 import base64
@@ -3827,7 +3829,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     assert "  ↳ [stdout] first" not in tool_region
     assert app._loop_state == "interrupted"
     results = [
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     ]
     assert len(results) == 1
     assert results[0] is not None
@@ -4710,7 +4712,7 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
     assert app._active_task is not None
     await asyncio.wait_for(app._active_task, 10)
 
-    messages = store.messages()
+    messages = branch_messages(store)
     assert [message.role for message in messages] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
@@ -4813,7 +4815,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
     await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -4853,7 +4855,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
             Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER
         )
     )
-    baseline = [entry.id for entry in store.replay()]
+    baseline = [entry.id for entry in branch_entries(store)]
     backend = PartialThenErrorBackend()
     assembler = ContextAssembler(
         store,
@@ -4882,7 +4884,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     assert "provider failure · stream_error" in rendered
     assert "compaction stream aborted" in rendered
     assert store.compaction_marker_count() == 0
-    assert [entry.id for entry in store.replay()][: len(baseline)] == baseline
+    assert [entry.id for entry in branch_entries(store)][: len(baseline)] == baseline
     assert store.turn_in_flight() is False
 
     app.retry_failed_turn()
@@ -4890,7 +4892,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -4926,7 +4928,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         "".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8"
     )
     store = ConversationStore(root, session_id=store.session_id)
-    historical = store.messages()[0]
+    historical = branch_messages(store)[0]
     output = StringIO()
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
@@ -4949,7 +4951,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     await asyncio.wait_for(app._active_task, 10)
 
     users = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert users == [historical]
     assert users[0].metadata == {}
@@ -5050,7 +5052,7 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     await await_or_fail(task, what="draft response completion")
 
     assert session.app.current_buffer.text == "draft while streaming"
-    failed_message = app.loop.store.messages()[-1]
+    failed_message = app.loop.branch_messages(store)[-1]
     assert failed_message.metadata["turn_failed"] is True
 
 
@@ -5152,7 +5154,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     assert first_image.exists()
     assert second_image.exists()
     user_messages = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert user_messages[0].content[1].path == str(first_image)
     assert user_messages[1].content[1].path == str(second_image)
@@ -6218,7 +6220,7 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
     )
     await loop.activate()
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
@@ -11510,19 +11512,19 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
         await await_or_fail(backend.started.wait(), what="queued response start")
         pipe.send_text("second\r")
         backend.release.set()
-        await wait_until(lambda: len(store.messages()) == 4)
+        await wait_until(lambda: len(branch_messages(store)) == 4)
         pipe.send_text("\x04")
         await await_or_fail(run_task, what="queued TUI run")
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
     ]
     assert user_texts == ["first", "second"]
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.USER,
@@ -11589,7 +11591,7 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
 
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11622,7 +11624,7 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
 
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11664,7 +11666,7 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     assert [request.key for request in app.pending_approvals] == [call.id]
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11694,7 +11696,7 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11726,7 +11728,7 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11798,15 +11800,15 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
+                len(branch_messages(store)) == 3
+                and branch_messages(store)[-1].tool_result is not None
             )
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
         await run_task
 
-    result = store.messages()[-1].tool_result
+    result = branch_messages(store)[-1].tool_result
     assert result is not None
     assert result.tool_call_id == call.id
     assert result.content == "tool execution canceled"
@@ -11837,14 +11839,14 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
+                len(branch_messages(store)) == 3
+                and branch_messages(store)[-1].tool_result is not None
             )
         )
         pipe.send_text("\x04")
         await run_task
 
-    messages = store.messages()
+    messages = branch_messages(store)
     calls = [
         block.tool_call
         for block in messages[1].content
@@ -13928,7 +13930,7 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     assert app._active_task is not None
     await asyncio.wait_for(app._active_task, 10)
 
-    message = store.messages()[0]
+    message = branch_messages(store)[0]
     assert message.content == [
         TextContent(f"@./{secret.name} $ARGUMENTS !`echo unsafe`")
     ]
@@ -14130,7 +14132,7 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     await asyncio.wait_for(app._active_task, 10)
 
     user_messages = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert isinstance(user_messages[-1].content[1], ImageContent)
     assert user_messages[-1].content[1].data == base64.b64encode(PNG).decode()

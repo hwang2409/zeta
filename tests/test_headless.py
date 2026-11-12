@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import argparse
 import io
 import json
@@ -406,7 +408,7 @@ def test_headless_waits_for_cross_model_agent(
     args = build_parser().parse_args(["--provider", "codex", "--format", "json", "-p", "go"])
 
     assert run_headless(args, args.prompt) == 0
-    result = next(message.tool_result for message in store.messages() if message.tool_result)
+    result = next(message.tool_result for message in branch_messages(store) if message.tool_result)
     assert result.content.startswith("implemented ·")
     assert child_backend.calls
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
@@ -590,7 +592,7 @@ async def test_headless_hook_rejection_does_not_show_yolo_hint(tmp_path: Path) -
     # Hook denial is distinct from approval-required denial. Headless must not
     # falsely suggest --yolo unlocks it — that only unlocks the approval path.
     assert "--yolo" not in err
-    tool_results = [message.tool_result for message in store.messages() if message.tool_result]
+    tool_results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert tool_results[0].content == "tool execution denied by hook"
 
 
@@ -811,7 +813,7 @@ async def test_headless_denies_ask_tool_and_writes_stderr_note(tmp_path: Path) -
     assert "recovered" in out
     assert "denied tool call 'danger'" in err
     assert "--yolo" in err
-    tool_results = [message.tool_result for message in store.messages() if message.tool_result]
+    tool_results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert tool_results[0].content == DENIAL_MARKER
 
 
@@ -921,7 +923,7 @@ def test_cli_headless_resume_reuses_persisted_session(
     resumed = ConversationStore(manager.sessions_dir, session_id=session_id)
     user_texts = [
         "".join(block.text for block in message.content if isinstance(block, TextContent))
-        for message in resumed.messages()
+        for message in branch_messages(resumed)
         if message.role.value == "user"
     ]
     assert "first turn" in user_texts

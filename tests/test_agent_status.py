@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import gc
 import json
@@ -118,7 +119,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     await _collect(loop.run_turn("start foreground", origin=MessageOrigin.USER))
     foreground_result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result
         and message.tool_result.tool_call_id == foreground_call.id
     )
@@ -141,7 +142,7 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     await _collect(loop.run_turn("start background", origin=MessageOrigin.USER))
     background_result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result
         and message.tool_result.structured_content is not None
         and message.tool_result.structured_content.get("status") == "running"
@@ -259,7 +260,7 @@ async def test_agent_status_reports_child_while_finish_is_being_published(
         await asyncio.wait_for(finish_accepted.wait(), timeout=10)
         running_result = next(
             message.tool_result
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.tool_result is not None
             and message.tool_result.tool_call_id == run_call.id
         )

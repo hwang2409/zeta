@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import contextlib
 import json
@@ -56,7 +57,7 @@ async def _collect(events):
 def _result(store: ConversationStore, call_id: str) -> ToolResult:
     return next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
         and message.tool_result.tool_call_id == call_id
     )
@@ -1360,7 +1361,7 @@ def test_terminal_receipt_round_trips_after_store_reopen(tmp_path: Path) -> None
     )
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    saved = reopened.messages()[0].tool_result
+    saved = branch_messages(reopened)[0].tool_result
     assert saved is not None
     assert saved.content == result["content"][0]["text"]
     assert saved.structured_content == result["structuredContent"]

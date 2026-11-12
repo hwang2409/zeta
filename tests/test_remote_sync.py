@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import ast
 import asyncio
 import concurrent.futures
@@ -378,7 +380,7 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
         remote / "sessions", session_id=result.session_id, _read_only=True
     )
     try:
-        assert any(entry.type == "child_run_started" for entry in transferred.replay())
+        assert any(entry.type == "child_run_started" for entry in branch_entries(transferred))
     finally:
         transferred.close()
     assert not (remote / "oauth.json").exists()

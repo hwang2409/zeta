@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import gc
@@ -443,7 +444,7 @@ async def test_context_overflow_compacts_and_retries_same_turn(
     assert sum(event.type is StreamEventType.TURN_END for event in events) == 1
     assert any(event.type is StreamEventType.RETRY for event in events)
     assert not any(event.type is StreamEventType.ERROR for event in events)
-    assert not any(message.metadata.get("turn_failed") for message in store.messages())
+    assert not any(message.metadata.get("turn_failed") for message in branch_messages(store))
     await loop.close()
 
 
@@ -502,7 +503,7 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
         map(assembler.token_counter, backend.calls[0])
     )
     assert assembler.calibration_ratio == pytest.approx(1.5)
-    completed = store.messages()[-1]
+    completed = branch_messages(store)[-1]
     assert completed.metadata["context_calibration_ratio"] == pytest.approx(1.5)
     assert not any(event.type is StreamEventType.ERROR for event in events)
     await loop.close()
@@ -553,7 +554,7 @@ async def test_context_overflow_retry_failure_persists_turn_once(
     events = await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
 
     assert len(backend.calls) == 2
-    messages = store.messages()
+    messages = branch_messages(store)
     assert (
         sum(
             message.role is MessageRole.USER
@@ -2458,7 +2459,7 @@ async def test_background_agent_returns_handle_and_parent_continues(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
@@ -2531,7 +2532,7 @@ async def test_background_completion_wakes_idle_parent(
     assert terminal.tool_result.content.count("error=false") == 1
     wake_message = next(
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "agent_notifications"
     )
     assert wake_message.role is MessageRole.SYSTEM
@@ -2670,7 +2671,7 @@ async def test_cancel_before_tool_dispatch_persists_canceled_receipt(
 
     assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     messages = [
-        message for message in store.messages() if message.tool_result is not None
+        message for message in branch_messages(store) if message.tool_result is not None
     ]
     assert len(messages) == len(calls)
     assert {message.tool_result.tool_call_id for message in messages} == {
@@ -2723,7 +2724,7 @@ async def test_generator_exit_before_tool_dispatch_persists_canceled_receipts(
 
     assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     receipts = [
-        message for message in store.messages() if message.tool_result is not None
+        message for message in branch_messages(store) if message.tool_result is not None
     ]
     assert len(receipts) == len(calls)
     assert {message.tool_result.tool_call_id for message in receipts} == {
@@ -2812,7 +2813,7 @@ async def test_aborted_notification_wake_commits_durable_notifications(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -2846,7 +2847,7 @@ async def test_failed_notification_wake_commits_durable_batch(
     assert (
         sum(
             message.metadata.get("zeta_event") == "agent_notifications"
-            for message in store.messages()
+            for message in branch_messages(store)
         )
         == 1
     )
@@ -3208,7 +3209,7 @@ async def test_abort_during_next_request_preparation_skips_provider_dispatch(
         ] == [StreamEventType.TURN_START, StreamEventType.TURN_END]
         assert len(backend.calls) == 2
         assert next_reply in json.dumps(
-            [message.to_dict() for message in loop.store.messages()]
+            [message.to_dict() for message in loop.branch_messages(store)]
         )
     finally:
         allow_request_preparation.set()
@@ -3364,7 +3365,7 @@ async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     gate_message = next(
         message
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.metadata.get("zeta_event") == "agent_finish_gate"
     )
     assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
@@ -4294,7 +4295,7 @@ async def test_top_level_loop_stops_repeated_no_progress_notification_turns(
         assert store.agent_notifications() == []
         assert sum(
             message.metadata.get("zeta_event") == "agent_notifications"
-            for message in store.messages()
+            for message in branch_messages(store)
         ) == 1
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
@@ -4348,7 +4349,7 @@ async def test_no_progress_dispatches_between_committed_items_never_stop(
         )
         assert [event.error for event in events if event.type is StreamEventType.ERROR] == []
         assert backend.calls == cycles + 1
-        assert store.messages()[-1].content == [TextContent("answered")]
+        assert branch_messages(store)[-1].content == [TextContent("answered")]
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
         store.close()
@@ -4400,7 +4401,7 @@ async def test_completion_retries_do_not_count_as_no_progress_calls(
         )
         assert backend.calls == 3
         assert not [event for event in events if event.type is StreamEventType.ERROR]
-        assert store.messages()[-1].content == [TextContent("answered")]
+        assert branch_messages(store)[-1].content == [TextContent("answered")]
     finally:
         await await_or_fail(loop.close(), what="agent loop close")
         store.close()
@@ -4540,7 +4541,7 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
         child_store = flow.store
         stopped = [
             message.metadata[FAILED_TURN_ERROR]["code"]
-            for message in child_store.messages()
+            for message in branch_messages(child_store)
             if FAILED_TURN_ERROR in message.metadata
         ]
         if timeouts == "every_fresh_call":
@@ -5201,7 +5202,7 @@ async def test_top_level_finish_is_not_gated_by_background_child(
 
     assert not any(
         message.metadata.get("zeta_event") == "agent_finish_gate"
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     assert loop._background_owner.running
     backend.release_child.set()
@@ -5224,7 +5225,7 @@ async def test_background_and_foreground_tools_mix_in_one_turn(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     results = [
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     ]
     assert len(results) == 2
     assert any(
@@ -5647,7 +5648,7 @@ async def test_parallel_agent_calls_overlap_and_keep_child_results(
             message.tool_result.tool_call_id: message.tool_result.content.split(
                 " · ", 1
             )[0]
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.tool_result is not None
         }
         assert results == {
@@ -5747,7 +5748,7 @@ async def test_parent_abort_cancels_all_parallel_children(tmp_path: Path) -> Non
     await asyncio.wait_for(task, timeout=30)
 
     results = [
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     ]
     assert len(results) == 2
     assert all(
@@ -5877,16 +5878,16 @@ async def test_agent_returns_child_text_and_persists_child_session(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.content.startswith("done")
     child_dir = store.session_dir / "agents" / "1"
     assert (child_dir / "conversation.jsonl").exists()
     assert [
         message.role
-        for message in ConversationStore(
+        for message in branch_messages(ConversationStore(
             store.session_dir / "agents", session_id="1"
-        ).messages()
+        ))
     ] == [MessageRole.USER, MessageRole.ASSISTANT]
     assert "agent" in {schema["name"] for schema in backend.calls[1][1]}
     assert {schema["name"] for schema in backend.calls[1][1]} == {
@@ -6117,9 +6118,9 @@ async def test_explore_child_has_read_only_tools_and_rejects_exec(
         "skill",
         "websearch",
     }
-    child_messages = ConversationStore(
+    child_messages = branch_messages(ConversationStore(
         store.session_dir / "agents", session_id="1"
-    ).messages()
+    ))
     child_result = next(
         message.tool_result for message in child_messages if message.tool_result
     )
@@ -6185,9 +6186,9 @@ async def test_restricted_child_cannot_use_mounted_mcp_write_tool(
     assert mount_calls == 1
     child_result = next(
         message.tool_result
-        for message in ConversationStore(
+        for message in branch_messages(ConversationStore(
             store.session_dir / "agents", session_id="1"
-        ).messages()
+        ))
         if message.tool_result
     )
     assert child_result.is_error
@@ -6250,7 +6251,7 @@ async def test_typed_child_exceeds_former_turn_cap_and_completes(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None and not result.is_error
     assert result.content.startswith("child complete")
@@ -6555,14 +6556,14 @@ async def test_nested_profile_resolves_tools_hidden_by_parent_profile(
         store.session_dir / "agents" / "1" / "agents", session_id="1"
     )
     bash_result = next(
-        message.tool_result for message in lead_store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(lead_store) if message.tool_result
     )
     assert not bash_result.is_error
     assert "nested-ok" in bash_result.content
     orchestrator_store = ConversationStore(store.session_dir / "agents", session_id="1")
     denied_result = next(
         message.tool_result
-        for message in orchestrator_store.messages()
+        for message in branch_messages(orchestrator_store)
         if message.tool_result and message.tool_result.is_error
     )
     assert (
@@ -6803,9 +6804,9 @@ async def test_child_registry_preserves_parent_pre_execution_hook(
     )
 
     assert observed[-1] == "bash"
-    child_messages = ConversationStore(
+    child_messages = branch_messages(ConversationStore(
         store.session_dir / "agents", session_id="1"
-    ).messages()
+    ))
     denied = next(
         message.tool_result for message in child_messages if message.tool_result
     )
@@ -7367,9 +7368,9 @@ async def test_child_loop_inherits_argument_scoped_approval_rules(
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    child_messages = ConversationStore(
+    child_messages = branch_messages(ConversationStore(
         store.session_dir / "agents", session_id="1"
-    ).messages()
+    ))
     results = {
         message.tool_result.tool_call_id: message.tool_result
         for message in child_messages
@@ -7589,9 +7590,9 @@ async def test_custom_profile_can_grant_itself_delegation(tmp_path: Path) -> Non
 
     child_result = next(
         message.tool_result
-        for message in ConversationStore(
+        for message in branch_messages(ConversationStore(
             store.session_dir / "agents", session_id="1"
-        ).messages()
+        ))
         if message.tool_result
     )
     assert not child_result.is_error
@@ -7664,7 +7665,7 @@ async def test_explicit_agent_profile_starts_at_its_depth_cap(tmp_path: Path) ->
         "agent error: maximum agent nesting depth is 1"
     )
     child_result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert not child_result.is_error
     assert child_result.content.startswith("capped child complete")
@@ -8079,7 +8080,7 @@ async def test_nested_explicit_finisher_does_not_see_lead_sibling_as_owned_work(
         stack.callback(child_a_store.close)
         finish_result = next(
             message.tool_result
-            for message in child_a_store.messages()
+            for message in branch_messages(child_a_store)
             if message.tool_result is not None
             and message.tool_result.tool_call_id == "finish-a"
         )
@@ -8113,14 +8114,14 @@ async def test_nested_and_parallel_children_do_not_share_a_terminating_budget(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None and not result.is_error
     assert result.content.startswith("child complete")
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     child_results = [
         message.tool_result
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.tool_result is not None
     ]
     assert len(child_results) == 2
@@ -8174,7 +8175,7 @@ async def test_background_grandchild_keeps_its_own_notification(tmp_path: Path) 
         assert not root_woke.is_set()
         nested_result = next(
             message.tool_result
-            for message in child_store.messages()
+            for message in branch_messages(child_store)
             if message.tool_result
         )
         assert nested_result.structured_content is not None
@@ -8396,26 +8397,26 @@ async def test_child_approval_uses_parent_policy(tmp_path: Path) -> None:
             assert all(
                 message.tool_result is None
                 or message.tool_result.tool_call_id != child_call.id
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             policy.deny(child_call.id)
 
     assert any(event.type is StreamEventType.TOOL_APPROVAL_END for event in events)
     assert not (await asyncio.wait_for(policy.pending_requests(), 10))
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL_RESULT,
     ]
     assert child_call.id not in {
         block.tool_call.id
-        for message in store.messages()
+        for message in branch_messages(store)
         for block in message.content
         if isinstance(block, ToolUseContent)
     }
-    child_messages = ConversationStore(
+    child_messages = branch_messages(ConversationStore(
         store.session_dir / "agents", session_id="1"
-    ).messages()
+    ))
     denied = next(
         message.tool_result for message in child_messages if message.tool_result
     )
@@ -8476,7 +8477,7 @@ async def test_grandchild_approval_composes_with_parent_policy(
     )
     bash_result = next(
         message.tool_result
-        for message in grandchild_store.messages()
+        for message in branch_messages(grandchild_store)
         if message.tool_result is not None
     )
     assert expected in bash_result.content
@@ -8498,7 +8499,7 @@ async def test_agent_result_metadata_survives_parent_replay(tmp_path: Path) -> N
 
     replayed = ConversationStore(tmp_path, session_id=store.session_id)
     result = next(
-        message.tool_result for message in replayed.messages() if message.tool_result
+        message.tool_result for message in branch_messages(replayed) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["turns_used"] == 1
@@ -8528,7 +8529,7 @@ async def test_agent_normal_completion_reports_all_child_turns(tmp_path: Path) -
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["turns_used"] == 2
@@ -8558,7 +8559,7 @@ async def test_typed_child_type_survives_completion_and_reopen(tmp_path: Path) -
         "status": "finished",
     }
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["agent_type"] == "explore"
@@ -8578,7 +8579,7 @@ async def test_empty_child_final_message_returns_error(tmp_path: Path) -> None:
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.is_error
     assert "empty final assistant message" in result.content
@@ -8604,7 +8605,7 @@ async def test_child_answer_with_cancellation_prefix_is_success(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert result.is_error is False
@@ -8625,7 +8626,7 @@ async def test_failed_agent_receipt_stats_match_is_error(tmp_path: Path) -> None
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert result.is_error is True
@@ -8705,7 +8706,7 @@ async def test_multibyte_agent_receipt_stays_within_response_limit(
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    persisted = next(message for message in store.messages() if message.tool_result)
+    persisted = next(message for message in branch_messages(store) if message.tool_result)
     result = persisted.tool_result
     assert result is not None
     assert (
@@ -8753,7 +8754,7 @@ async def test_parent_abort_cancels_child(tmp_path: Path) -> None:
 
     events = await await_or_fail(task, what="task")
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.content.startswith("tool execution canceled")
     assert "error=false" in result.content
@@ -8812,7 +8813,7 @@ async def test_parent_abort_after_child_turn_reports_completed_turns(
             loop.abort()
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content == {
         "turns_used": 1,
@@ -8859,7 +8860,7 @@ async def test_typed_child_type_survives_cancellation_and_reopen(
     await await_or_fail(task, what="canceled typed child turn")
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["agent_type"] == "explore"
@@ -8894,7 +8895,7 @@ async def test_parent_result_append_precedes_marker_cleanup(
         FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty()
     ).activate()
     results = [
-        message.tool_result for message in replayed.messages() if message.tool_result
+        message.tool_result for message in branch_messages(replayed) if message.tool_result
     ]
     assert len(results) == 1
     assert results[0].content.startswith("done")
@@ -8953,7 +8954,7 @@ async def test_resume_reuses_exact_foreground_terminal_receipt(
         FakeBackend([]), replayed, max_turns=1, skill_catalog=SkillCatalog.empty()
     ).activate()
     recovered = [
-        message.tool_result for message in replayed.messages() if message.tool_result
+        message.tool_result for message in branch_messages(replayed) if message.tool_result
     ]
     assert len(recovered) == 1
     assert recovered[0].content == original_receipts[0]
@@ -9078,7 +9079,7 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     child = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child.agent_lifecycle()
@@ -9111,7 +9112,7 @@ async def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     await loop.activate()
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.content.startswith("tool execution canceled")
     assert result.structured_content == {
@@ -9147,7 +9148,7 @@ async def test_resume_preserves_typed_child_receipt(tmp_path: Path) -> None:
     await loop.activate()
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["agent_type"] == "explore"
@@ -9252,7 +9253,7 @@ async def test_persisted_assistant_turn_records_backend_model(tmp_path: Path) ->
 
         assistant = next(
             message
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.role is MessageRole.ASSISTANT
         )
         assert assistant.metadata["model"] == "gpt-5.6-sol"
@@ -9279,7 +9280,7 @@ async def test_agent_without_a_model_still_inherits_the_parent_backend(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.content.startswith("done")
     # Parent and child both ran on the one backend, so it saw both turns.
@@ -9305,7 +9306,7 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
 
     assert requested == [("codex", "gpt-5.4")]
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.content.startswith("codex done")
     # The child talked to the substitute, never to the parent's backend.
@@ -9424,7 +9425,7 @@ async def test_agent_model_implies_background(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
@@ -9499,7 +9500,7 @@ async def test_child_turn_retries_after_credential_lock_timeout(
         await _collect(child_loop.run_turn("finish", origin=MessageOrigin.USER))
         assert [
             assistant_text(message)
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.role is MessageRole.ASSISTANT
         ] == ["done"]
     finally:
@@ -9555,7 +9556,7 @@ async def test_agent_reports_a_missing_provider_login(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.is_error
     assert "not logged in to codex" in result.content
@@ -9590,7 +9591,7 @@ async def test_background_start_text_names_handle_and_polling_tools(
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     handle = result.structured_content["child_instance_id"]
@@ -9650,7 +9651,7 @@ async def test_delegated_turn_count_stays_accurate_without_a_denominator(
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assert child_store.agent_lifecycle()["turns_used"] == turns + 1
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None and not result.is_error
     assert result.content.startswith("child done")
@@ -10081,7 +10082,7 @@ async def test_a_run_goes_to_the_background_without_being_asked(
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result.structured_content is not None
     assert result.structured_content["status"] == "running"
@@ -11402,7 +11403,7 @@ async def test_early_close_commits_staged_delivery_only_after_successful_retry(
     assert (
         sum(
             message.metadata.get("zeta.pending_prompt_id") == prompt_id
-            for message in store.messages()
+            for message in branch_messages(store)
         )
         == 1
     )
@@ -11487,7 +11488,7 @@ async def test_cancel_during_early_close_backoff_keeps_staged_delivery_pending(
     assert (
         sum(
             message.metadata.get("zeta.pending_prompt_id") == prompt.entries[0].id
-            for message in store.messages()
+            for message in branch_messages(store)
         )
         == 1
     )
@@ -12108,7 +12109,7 @@ async def test_agent_send_in_window_c_is_refused_not_lost(
         child_store = next(iter(loop._agent_child_stores.values()))
         rows_before = [
             entry.type
-            for entry in child_store.replay()
+            for entry in branch_entries(child_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ]
         assert loop._background_owner.controls_child(store, handle) is True
@@ -12123,7 +12124,7 @@ async def test_agent_send_in_window_c_is_refused_not_lost(
         assert "no live run/child" in rejected["content"][0]["text"]
         assert [
             entry.type
-            for entry in child_store.replay()
+            for entry in branch_entries(child_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ] == rows_before
     finally:
@@ -12530,7 +12531,7 @@ async def test_a_queued_prompt_stays_out_of_the_run_context(tmp_path: Path) -> N
 def _run_handle_from_receipt(store: ConversationStore) -> str:
     """Return the child_instance_id a real model would receive for the run."""
 
-    for message in store.messages():
+    for message in branch_messages(store):
         result = message.tool_result
         if result is None:
             continue
@@ -12692,7 +12693,7 @@ async def test_agent_send_rejects_every_real_terminal_child_without_revival(
         child_store = ConversationStore(child_path)
         rows_before = [
             entry.type
-            for entry in child_store.replay()
+            for entry in branch_entries(child_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ]
         calls_before = backend.child_calls
@@ -12710,7 +12711,7 @@ async def test_agent_send_rejects_every_real_terminal_child_without_revival(
         assert wakes == wakes_before
         assert [
             entry.type
-            for entry in child_store.replay()
+            for entry in branch_entries(child_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ] == rows_before
     finally:
@@ -12763,7 +12764,7 @@ async def test_agent_send_rejects_child_after_owner_lease_is_lost(
         assert child_status["reason"] == "lost: owner process exited"
         rows_before = [
             entry.type
-            for entry in observed.replay()
+            for entry in branch_entries(observed)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ]
         calls_before = len(backend.calls)
@@ -12783,7 +12784,7 @@ async def test_agent_send_rejects_child_after_owner_lease_is_lost(
         assert wakes == wakes_before
         assert [
             entry.type
-            for entry in observed.replay()
+            for entry in branch_entries(observed)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ] == rows_before
     finally:
@@ -12950,7 +12951,7 @@ async def test_child_thinking_only_reply_with_pending_notification_is_nudged(
 
     nudges = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
@@ -13025,7 +13026,7 @@ async def test_context_retry_of_notification_consumption_is_never_nudged(
 
     assert not any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     assert len(backend.calls) == 3
     await loop.close()
@@ -13079,7 +13080,7 @@ async def test_context_retry_of_ordinary_empty_reply_still_nudged_once(
 
     nudges = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "empty_turn_nudge"
     ]
     assert len(nudges) == 1
@@ -13138,7 +13139,7 @@ async def test_notification_consumption_reply_is_never_nudged(tmp_path: Path) ->
 
     assert not any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     assert len(backend.calls) == 2
     await loop.close()
@@ -13236,7 +13237,7 @@ async def test_subagent_empty_reply_after_tool_names_last_tool(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert result.is_error
@@ -13289,7 +13290,7 @@ async def test_subagent_empty_after_tools_stops_at_recovery_cap(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert result.is_error
@@ -13374,7 +13375,7 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
         message.tool_result is not None
         and message.tool_result.is_error
         and "empty final assistant message" in message.tool_result.content
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     assert len(backend.calls) == 9
     assert any(
@@ -13383,7 +13384,7 @@ async def test_subagent_pending_delivery_wins_at_recovery_cap(
     )
     assert any(
         message.metadata.get("zeta_event") == "agent_notifications"
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     await loop.close()
 
@@ -13421,7 +13422,7 @@ async def test_subagent_tool_recovery_works_after_earlier_empty_nudge(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert not result.is_error
@@ -13453,7 +13454,7 @@ async def test_subagent_thinking_only_reply_is_nudged_before_failing(
     )
 
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     assert result is not None
     assert not result.is_error
@@ -14675,7 +14676,7 @@ async def test_child_consumes_pending_task_notification_before_completing(
     assert child_store.agent_notifications() == []
     assert any(
         message.metadata.get("zeta_event") == "agent_notifications"
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
     )
     await child.close()
     await root.close()
@@ -14748,7 +14749,7 @@ async def test_root_task_exit_wakes_idle_loop_into_notification_turn(
     assert order and order[0] is True
     notif_message = next(
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.metadata.get("zeta_event") == "agent_notifications"
     )
     text = notif_message.content[0].text
@@ -14851,7 +14852,7 @@ class ChildCwdBackend(CompletionBackend):
 
 def _first_tool_result(store: ConversationStore) -> ToolResult:
     return next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
 
 
@@ -15210,7 +15211,7 @@ async def test_agent_cwd_applies_to_read_and_edit(tmp_path: Path) -> None:
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    child_messages = _child_store_for(store).messages()
+    child_messages = branch_messages(_child_store_for(store))
     results = {
         message.tool_result.tool_call_id: message.tool_result
         for message in child_messages
@@ -15407,7 +15408,7 @@ async def test_parent_abort_cancels_child_waiting_on_task_output_cleanly(
             isinstance(block, ToolUseContent) and block.tool_call.name == "task_output"
             for block in message.content
         )
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
     )
 
     try:
@@ -15496,7 +15497,7 @@ async def test_child_generator_close_after_allowed_edit_does_not_crash(
     assert target.read_text(encoding="utf-8") == "after"
     results = [
         message.tool_result
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.tool_result is not None
         and message.tool_result.tool_call_id == call.id
     ]
@@ -15527,7 +15528,7 @@ async def test_agent_cwd_with_explore_preset(tmp_path: Path) -> None:
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    child_messages = _child_store_for(store).messages()
+    child_messages = branch_messages(_child_store_for(store))
     read_result = next(
         message.tool_result
         for message in child_messages
@@ -16092,7 +16093,7 @@ async def test_child_assignment_origin_is_agent_prompt(tmp_path: Path) -> None:
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     assignment = next(
         message
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.role is MessageRole.USER
     )
     assert assignment.metadata["zeta.origin"] == MessageOrigin.AGENT_PROMPT.value
@@ -16129,7 +16130,7 @@ async def test_run_followup_message_row_origin_is_agent_send(tmp_path: Path) -> 
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     followup = next(
         message
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if any(
             isinstance(block, TextContent) and block.text == "also check the tests"
             for block in message.content
@@ -16405,7 +16406,7 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
     assert len(backend.calls) == 2
     assert not any(
         message.metadata.get("zeta_event") == "empty_turn_nudge"
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     assert len(notifications) == 1
     notification = notifications[0]
@@ -16500,7 +16501,7 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
         assert accepted is not None and not accepted.is_error
         assert not any(
             message.metadata.get("zeta_event") == "empty_turn_nudge"
-            for message in store.messages()
+            for message in branch_messages(store)
         )
     finally:
         loop._background_owner.unregister("root:1:1")
@@ -16561,7 +16562,7 @@ async def test_explicit_finish_ends_after_other_tool_in_same_batch(
         assert finish_result is not None and not finish_result.is_error
         assert not any(
             message.metadata.get("zeta_event") == "empty_turn_nudge"
-            for message in store.messages()
+            for message in branch_messages(store)
         )
     finally:
         await loop.close()
@@ -19170,7 +19171,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         )
         all_appends = [
             message.content[0].text
-            for message in observed.messages()
+            for message in branch_messages(observed)
             if message.role is MessageRole.USER
             and len(message.content) == 1
             and isinstance(message.content[0], TextContent)
@@ -19211,7 +19212,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         assert busy_notice_ids <= pending_notice_ids
         acknowledged_notice_ids = {
             entry.data["notification_id"]
-            for entry in root.replay()
+            for entry in branch_entries(root)
             if entry.type == "notification_ack"
         }
         assert busy_notice_ids.isdisjoint(acknowledged_notice_ids)
@@ -19236,7 +19237,7 @@ async def test_recovery_skips_child_owned_by_other_process(tmp_path: Path) -> No
         assert observed.agent_canceled() is None
         all_appends = [
             message.content[0].text
-            for message in observed.messages()
+            for message in branch_messages(observed)
             if message.role is MessageRole.USER
             and len(message.content) == 1
             and isinstance(message.content[0], TextContent)
@@ -19594,7 +19595,7 @@ async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
         assert (
             sum(
                 entry.type == "terminal_transition"
-                for entry in child_store.active_branch_snapshot()
+                for entry in branch_entries(child_store)
             )
             == 1
         )
@@ -19704,7 +19705,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
         assert (
             sum(
                 entry.type == "terminal_transition"
-                for entry in child_store.active_branch_snapshot()
+                for entry in branch_entries(child_store)
             )
             == 1
         )
@@ -20078,7 +20079,7 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
                 entry.type == "notification"
                 and entry.data.get("kind") == "child_question"
                 and entry.data.get("status") == "pending"
-                for entry in child_store.replay()
+                for entry in branch_entries(child_store)
             )
         if child_store is not None:
             child_store.close()
@@ -20444,7 +20445,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert marker["accepts_follow_ups"] is True
         assert lead_handle in loop._background_owner.active_instance_ids
         assert not any(
-            entry.type == "pending_queue_closed" for entry in lead_store.replay()
+            entry.type == "pending_queue_closed" for entry in branch_entries(lead_store)
         )
 
         lead_idle.clear()
@@ -20475,7 +20476,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
             ToolCall("lead-status", "agent_status", {"handle": lead_handle})
         )
         assert status["structuredContent"]["children"][0]["state"] == "idle"
-        assert any(entry.type == "pending_queue_closed" for entry in lead_store.replay())
+        assert any(entry.type == "pending_queue_closed" for entry in branch_entries(lead_store))
 
         backend.lead_follow_up_seen.clear()
         lead_idle.clear()
@@ -20496,7 +20497,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
         questions = [
             entry
-            for entry in lead_store.replay()
+            for entry in branch_entries(lead_store)
             if entry.type == "notification"
             and entry.data.get("kind") == "child_question"
         ]
@@ -20504,7 +20505,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert questions[0].data.get("routing_note") is None
         assert not any(
             entry.type == "notification" and entry.data.get("kind") == "child_question"
-            for entry in store.replay()
+            for entry in branch_entries(store)
         )
 
         canceled = await loop.tool_registry.execute(
@@ -20518,7 +20519,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert terminal["structuredContent"]["children"][0]["state"] != "idle"
         rows_before = [
             entry.type
-            for entry in lead_store.replay()
+            for entry in branch_entries(lead_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ]
         calls_before = backend.calls["lead"]
@@ -20536,7 +20537,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert wakes == wakes_before
         assert [
             entry.type
-            for entry in lead_store.replay()
+            for entry in branch_entries(lead_store)
             if entry.type in {"pending_prompt", "pending_queue_closed"}
         ] == rows_before
     finally:
@@ -20784,7 +20785,7 @@ async def test_finish_accepted_after_follow_up_attempt_is_accepted(
                 isinstance(block, TextContent) and block.text == "first follow-up"
                 for block in message.content
             )
-            for message in child_store.messages()
+            for message in branch_messages(child_store)
         )
         == 1
     )
@@ -20828,10 +20829,10 @@ async def test_unread_follow_up_still_blocks_finish(
         message.tool_result is not None
         and message.tool_result.is_error
         and "pending notification" in message.tool_result.content
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
     ), [
         message.tool_result.content
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.tool_result is not None
     ]
     await loop.close()
@@ -20885,7 +20886,7 @@ async def test_ask_parent_answer_does_not_block_finish(
     assert await asyncio.to_thread(child_store.pending_prompts) == []
     refusals = [
         message
-        for message in child_store.messages()
+        for message in branch_messages(child_store)
         if message.tool_result is not None
         and message.tool_result.is_error
         and "pending notification" in message.tool_result.content
@@ -21068,7 +21069,7 @@ async def test_resume_legacy_interrupted_send_row_delivers_once(
 
     user_rows = [
         message
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         and any(
             isinstance(block, TextContent) and block.text == "legacy follow-up"
@@ -21375,7 +21376,7 @@ async def test_retry_before_provider_event_leaves_prompt_pending(
 
     persisted_prompt = next(
         message
-        for message in child.messages()
+        for message in branch_messages(child)
         if message.metadata.get("zeta.pending_prompt_id") == pending.id
     )
     capture_backend = CapturePromptBackend()
@@ -21394,7 +21395,7 @@ async def test_retry_before_provider_event_leaves_prompt_pending(
     assert (
         sum(
             message.metadata.get("zeta.pending_prompt_id") == pending.id
-            for message in child.messages()
+            for message in branch_messages(child)
         )
         == 1
     )
@@ -22831,7 +22832,7 @@ async def test_idle_child_wake_tool_count_is_cumulative(
         child_store = loop._agent_child_stores.get(child_call.id)
         if child_store is not None:
             failure.add_note(f"child lifecycle: {child_store.agent_lifecycle()!r}")
-            failure.add_note(f"child transcript tail: {child_store.replay()[-8:]!r}")
+            failure.add_note(f"child transcript tail: {branch_entries(child_store)[-8:]!r}")
         raise
     finally:
         backend.release_children.set()

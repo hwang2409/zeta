@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import gc
 import json
@@ -163,7 +165,7 @@ def test_dedupe_survives_compaction_marker(tmp_path: Path) -> None:
 
         assert duplicate.duplicate
         assert duplicate.committed_entries == first.committed_entries
-        assert store.replay() == [*first.committed_entries, marker]
+        assert branch_entries(store) == [*first.committed_entries, marker]
     finally:
         store.close()
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import argparse
 import asyncio
 import io
@@ -1838,7 +1840,7 @@ async def test_claim_note_not_redelivered_after_fork_before_note(tmp_path: Path)
     await _collect_turn(loop, "before send")
     forkpoint = next(
         entry
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "message"
         and Message.from_dict(entry.data["message"]).role is MessageRole.USER
     )
@@ -1898,7 +1900,7 @@ async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
     assert (
         sum(
             message.metadata.get("zeta_event") == "project_inbox_sent_status"
-            for message in store.messages()
+            for message in branch_messages(store)
         )
         == 1
     )
@@ -1914,7 +1916,7 @@ async def test_claim_note_delivered_once_across_resume(tmp_path: Path) -> None:
         assert (
             sum(
                 message.metadata.get("zeta_event") == "project_inbox_sent_status"
-                for message in resumed_store.messages()
+                for message in branch_messages(resumed_store)
             )
             == 1
         )
@@ -2222,7 +2224,7 @@ async def test_cancel_after_status_note_persisted_does_not_duplicate(
 
         persisted = [
             message
-            for message in store.messages()
+            for message in branch_messages(store)
             if message.metadata.get("zeta_event") == "project_inbox_sent_status"
         ]
         assert len(persisted) == 1

@@ -1,6 +1,8 @@
 """Exercise real stored-family readers and writers in a supplied temporary home."""
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import argparse
 import asyncio
 import json
@@ -34,7 +36,7 @@ def _missing_api(family: str, owner: object, names: tuple[str, ...]) -> bool:
 def _message_texts(store: object) -> list[str]:
     return [
         part.text
-        for message in store.messages()
+        for message in branch_messages(store)
         for part in message.content
         if hasattr(part, "text")
     ]

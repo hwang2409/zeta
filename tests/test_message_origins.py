@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import json
 import subprocess
@@ -885,7 +887,7 @@ def test_historical_unmarked_user_row_still_replays_and_reconciles_as_harness_un
 
     reopened = ConversationStore(tmp_path, session_id="historical-session")
 
-    assert reopened.messages() == [
+    assert branch_messages(reopened) == [
         Message(MessageRole.USER, [TextContent("historical text")])
     ]
     assert _label(reopened.entries[-1].to_dict()) == "harness_unknown"

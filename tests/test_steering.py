@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import errno
 import os
@@ -214,10 +216,10 @@ async def test_steer_delivers_between_tool_pair_and_next_provider_call(
     backend.release_turn1.set()
     await asyncio.wait_for(task, 10)
 
-    roles = [message.role for message in store.messages()]
+    roles = [message.role for message in branch_messages(store)]
     texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -283,7 +285,7 @@ async def test_multiple_steers_deliver_in_order_at_one_boundary(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -774,7 +776,7 @@ async def test_new_wake_after_permanent_failure_dispatches_normally(
     assert any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
-        for message in app.loop.store.messages()
+        for message in app.loop.branch_messages(store)
     )
 
 
@@ -793,13 +795,13 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     entries = app.loop.store.entries
     assert [entry.type for entry in entries].count("notification_ack") == 0
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
         == 1
     )
     assert not any(
         message.role is MessageRole.ASSISTANT
         and not message.metadata.get("turn_failed")
-        for message in app.loop.store.messages()
+        for message in app.loop.branch_messages(store)
     )
 
     timers[0][1].fire()
@@ -810,7 +812,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     assert timers[1][0] == 2.0
     assert app.console.file.getvalue().count("provider stopped") == 1
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
         == 1
     )
 
@@ -823,14 +825,14 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     # test-contract: seam provider call count proves the successful retry dispatched once
     assert len(backend.calls) == 3
     assert (
-        sum(message.role is MessageRole.SYSTEM for message in app.loop.store.messages())
+        sum(message.role is MessageRole.SYSTEM for message in app.loop.branch_messages(store))
         == 1
     )
     assert (
         sum(
             message.role is MessageRole.ASSISTANT
             and not message.metadata.get("turn_failed")
-            for message in app.loop.store.messages()
+            for message in app.loop.branch_messages(store)
         )
         == 1
     )
@@ -972,7 +974,7 @@ async def test_pipeline_routes_default_submission_as_steer(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -1031,7 +1033,7 @@ async def test_backslash_prefix_defers_to_after_turn_end(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -1155,7 +1157,7 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -1237,7 +1239,7 @@ async def test_steer_submitted_as_provider_finishes_is_delivered_once(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -1279,7 +1281,7 @@ async def test_toolless_turn_delivers_two_late_steers_in_order(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -1697,7 +1699,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue(
             isinstance(block, TextContent) and block.text == oversized
             for block in message.content
         )
-        for message in store.messages()
+        for message in branch_messages(store)
     )
     if app._active_task is not None:
         await _drive(app._active_task)

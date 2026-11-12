@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import json
 import multiprocessing
@@ -209,7 +211,7 @@ def test_discussion_fork_copy_loads_start_row(tmp_path: Path) -> None:
         assert any(e.type == "child_run_started" for e in fork.entries)
         row = next(e for e in fork.entries if e.type == "child_run_started")
         assert row.data["run_id"] == "source:4"
-        fork.replay()
+        branch_entries(fork)
     finally:
         fork.close()
 
@@ -219,7 +221,7 @@ def test_pre_feature_session_loads_unchanged(tmp_path: Path) -> None:
     store.close()
     reopened = ConversationStore(tmp_path, session_id="old", _read_only=True)
     try:
-        assert list(reopened.replay()) == []
+        assert list(branch_entries(reopened)) == []
         assert reopened.entries == []
     finally:
         reopened.close()
@@ -243,7 +245,7 @@ def test_store_full_and_incremental_validation_accept_start_row(tmp_path: Path) 
 
     reopened = ConversationStore(tmp_path, session_id="session", _read_only=True)
     try:
-        assert [entry.type for entry in reopened.replay()] == [
+        assert [entry.type for entry in branch_entries(reopened)] == [
             "message",
             "child_run_started",
             "message",

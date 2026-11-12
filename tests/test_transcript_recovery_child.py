@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,7 +87,7 @@ async def test_corrupt_child_stays_unavailable_until_tui_repair_then_reopens(
                 MessageOrigin.USER,
             )
         )
-        assert [message.content[0].text for message in reopened.messages()] == [
+        assert [message.content[0].text for message in branch_messages(reopened)] == [
             "retained",
             "usable",
         ]

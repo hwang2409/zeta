@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import contextlib
 import errno
@@ -2229,7 +2230,7 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
         async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it", origin=MessageOrigin.USER)
     ]
 
-    result_message = store.messages()[2]
+    result_message = branch_messages(store)[2]
     assert result_message.role is MessageRole.TOOL_RESULT
     assert result_message.tool_result is not None
     assert result_message.tool_result.content == "from registry"
@@ -2275,7 +2276,7 @@ skill_catalog=SkillCatalog.empty(),
         ).run_turn("go", origin=MessageOrigin.USER)
     ]
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None and result.is_error
     assert "invalid arguments" in result.content
     assert not called
@@ -2305,7 +2306,7 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.content == "unknown tool: bash"
     assert result.is_error
@@ -2329,7 +2330,7 @@ async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path)
             registry.abort()
             aborted = True
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result == ToolResult("call-1", "tool execution canceled", True)
 
@@ -2362,7 +2363,7 @@ async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> No
         AgentLoop(backend, store, tools={"step": step}, skill_catalog=SkillCatalog.empty())
     )
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert [result.content for result in results] == [
         "abort",
         "tool execution canceled",
@@ -2398,7 +2399,7 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
     registry.abort()
     await task
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert [result.content for result in results] == [
         "tool execution canceled",
         "tool execution canceled",

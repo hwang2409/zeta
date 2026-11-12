@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import ast
 import inspect
 import json
@@ -299,7 +300,7 @@ async def test_todo_empty_list_clears_state_and_does_not_pollute_transcript(
     }
     assert reopened.todo_items() == []
     assert "todo_items" not in json.loads(reopened.state_path.read_text())
-    assert reopened.messages() == []
+    assert branch_messages(reopened) == []
 
 
 def test_todo_items_persist_across_store_resume(tmp_path: Path) -> None:

@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 
 import asyncio
 import base64
@@ -1229,7 +1230,7 @@ async def test_midstream_disconnect_without_tool_call_discards_partial_and_retri
     assert successful[-1].message.content == [TextContent("hello")]
     persisted = next(
         entry.data["message"]
-        for entry in reversed(conversation.replay())
+        for entry in reversed(branch_entries(conversation))
         if entry.type == "message"
     )
     assert persisted["content"] == [{"type": "text", "text": "hello"}]
@@ -1272,7 +1273,7 @@ async def test_clean_eof_without_tool_call_discards_partial_and_retries(
     assert len(requests) == 2
     assert any(event.type is StreamEventType.RETRY for event in events)
     assert any(event.type is StreamEventType.ASSISTANT_RESET for event in events)
-    assert [message.content for message in store.messages()] == [
+    assert [message.content for message in branch_messages(store)] == [
         [TextContent("hello")],
         [TextContent("hello")],
     ]
@@ -1346,8 +1347,8 @@ async def test_tool_argument_mismatch_retries_without_executing_bad_call(
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert retry.data["reason"] == "stream_inconsistent"
     assert any(item.type is StreamEventType.ASSISTANT_RESET for item in events)
-    assert store.messages()[-1].content == [TextContent("hello")]
-    assert store.messages()[-1].metadata["provider_retries"][0]["reason"] == (
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].metadata["provider_retries"][0]["reason"] == (
         "stream_inconsistent"
     )
     await client.aclose()
@@ -1395,7 +1396,7 @@ async def test_tool_arguments_done_eof_retries_then_executes_once(
     retries = [item for item in events if item.type is StreamEventType.RETRY]
     assert len(retries) == 1
     assert retries[0].data["reason"] == "stream_inconsistent"
-    assert store.messages()[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
     await client.aclose()
 
 
@@ -1459,7 +1460,7 @@ async def test_tool_eof_after_completed_parallel_item_does_not_reexecute(
     assert executed == [{"path": "README.md"}]
     assert not any(item.type is StreamEventType.RETRY for item in events)
     assert events[-2].type is StreamEventType.ERROR
-    assert store.messages()[-1].metadata["provider_retries"] == [
+    assert branch_messages(store)[-1].metadata["provider_retries"] == [
         {"decision": "skipped-after-output", "reason": "tool_call_completed"}
     ]
     await client.aclose()
@@ -1509,7 +1510,7 @@ async def test_completed_tool_argument_mismatch_retries_without_execution(
     assert executed == []
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert retry.data["reason"] == "stream_inconsistent"
-    assert store.messages()[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
     await client.aclose()
 
 
@@ -1564,7 +1565,7 @@ async def test_completed_tool_metadata_mismatch_retries_without_execution(
     assert executed == []
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert retry.data["reason"] == "stream_inconsistent"
-    assert store.messages()[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
     await client.aclose()
 
 
@@ -1663,7 +1664,7 @@ async def test_incomplete_function_call_recovers_without_execution_on_max_output
     assert "<read> call" in recovery.data["text"]
     assert b"split the work into smaller calls" in requests[1].content
     assistants = [
-        message for message in store.messages() if message.role is MessageRole.ASSISTANT
+        message for message in branch_messages(store) if message.role is MessageRole.ASSISTANT
     ]
     assert assistants[0].content == []
     assert assistants[0].metadata["stop_reason"] == "max_tokens"
@@ -1751,7 +1752,7 @@ async def test_completed_response_with_incomplete_item_is_retryable(
     assert len(requests) == 2
     retry = next(item for item in events if item.type is StreamEventType.RETRY)
     assert retry.data["reason"] == "stream_inconsistent"
-    assert store.messages()[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
     await client.aclose()
 
 
@@ -1817,7 +1818,7 @@ async def test_completed_function_call_status_retry_executes_second_attempt_once
         item for item in events if item.data.get("tool_call_completed") is True
     ]
     assert len(completed) == 1
-    assert store.messages()[-1].content == [TextContent("hello")]
+    assert branch_messages(store)[-1].content == [TextContent("hello")]
     await client.aclose()
 
 
@@ -1918,7 +1919,7 @@ async def test_open_blocks_completion_retries_and_resets_partial_output(
 
     assert backend.calls == 2
     assert any(item.type is StreamEventType.ASSISTANT_RESET for item in events)
-    assert store.messages()[-1].content == [TextContent("kept")]
+    assert branch_messages(store)[-1].content == [TextContent("kept")]
 
 
 @pytest.mark.asyncio
@@ -2457,7 +2458,7 @@ async def test_completed_output_text_wins_and_is_persisted(tmp_path: Path) -> No
 
     assert events[-2].message is not None
     assert events[-2].message.content == [TextContent("completed answer")]
-    assert store.messages()[-1].content == [TextContent("completed answer")]
+    assert branch_messages(store)[-1].content == [TextContent("completed answer")]
     diagnostic = json.loads((tmp_path / "diagnostics.jsonl").read_text())
     assert diagnostic["provider"] == "codex"
     assert diagnostic["reassembly_mismatches"] == 1
@@ -4474,7 +4475,7 @@ async def test_codex_stop_reason_persisted_on_assistant_message(
     ).run_turn("hi", origin=MessageOrigin.USER):
         pass
 
-    assistant = store.messages()[-1]
+    assistant = branch_messages(store)[-1]
     assert assistant.role is MessageRole.ASSISTANT
     assert assistant.metadata["stop_reason"] == "end_turn"
     assert assistant.metadata["output_tokens"] == 2

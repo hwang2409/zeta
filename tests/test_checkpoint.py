@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 import json
 from io import StringIO
@@ -96,7 +97,7 @@ def test_replay_uses_codex_message_metadata_after_provider_switch(
     )
 
     rendered: list[object] = []
-    for message in opened.store.messages():
+    for message in opened.branch_messages(store):
         render_replayed_message(
             message,
             presenter=object(),
@@ -243,18 +244,18 @@ def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
 
     fork = store.append_fork("saved")
     assert fork.parent_id == checkpoint.id
-    assert [entry.type for entry in store.replay()] == [
+    assert [entry.type for entry in branch_entries(store)] == [
         "message",
         "message",
         "checkpoint",
         "fork",
     ]
-    assert store.replay()[0].id == first.id
-    assert all(entry.id != abandoned.id for entry in store.replay())
+    assert branch_entries(store)[0].id == first.id
+    assert all(entry.id != abandoned.id for entry in branch_entries(store))
     assert len(store.entries) == 6
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
-    assert reopened.replay()[-1].id == fork.id
+    assert branch_entries(reopened)[-1].id == fork.id
 
 
 def test_numeric_checkpoint_labels_are_reserved_for_sequence_selectors(

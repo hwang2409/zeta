@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import fcntl
 import json
@@ -290,7 +292,7 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
             (request_id, ToolCall.from_dict(dict(tool_call)))
             for request_id, tool_call in indexed_page.items
         ]
-        branch = store.replay()
+        branch = branch_entries(store)
         approval_states = store._approval_states_from_branch(branch)
         expected_pending = [
             (request_id, call)

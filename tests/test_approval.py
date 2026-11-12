@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -260,10 +261,10 @@ skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result == ToolResult(call.id, "tool execution denied", True)
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -306,11 +307,11 @@ skill_catalog=SkillCatalog.empty(),
     registry.abort()
     events = await asyncio.wait_for(task, timeout=10)
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert results == [ToolResult(call.id, "tool execution canceled", True)]
     assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     assert events[-1].type.value == "agent_end"
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL_RESULT,
@@ -383,7 +384,7 @@ skill_catalog=SkillCatalog.empty(),
     assert not any(event.type is StreamEventType.TOOL_EXECUTION_START for event in events)
     assert all(
         not any(isinstance(block, ToolUseContent) for block in message.content)
-        for message in restarted.messages()
+        for message in branch_messages(restarted)
     )
     assert (await ApprovalPolicy(default="ask", store=restarted).pending_requests()) == []
 

@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 """Eviction receipts reach providers as harness notes, never as assistant turns."""
 
 import json
@@ -427,7 +428,7 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
         assert any(m.metadata.get("context_evicted") for m in context.messages)
         # history() adds the hybrid and collapsed shapes the assembler did not make here.
         messages = [*context.messages, *history()[1:]]
-        rows_before = [entry.to_dict() for entry in store.replay()]
+        rows_before = [entry.to_dict() for entry in branch_entries(store)]
         file_before = store.path.read_bytes()
         messages_before = [message.to_dict() for message in messages]
         identities = [id(message) for message in messages]
@@ -437,7 +438,7 @@ async def test_building_payloads_changes_no_stored_row_or_message(tmp_path: Path
         build_ollama_messages(messages)
 
         # the TUI and zeta serve read these rows; the projection must not touch them.
-        assert [entry.to_dict() for entry in store.replay()] == rows_before
+        assert [entry.to_dict() for entry in branch_entries(store)] == rows_before
         assert store.path.read_bytes() == file_before
         assert [message.to_dict() for message in messages] == messages_before
         assert [id(message) for message in messages] == identities

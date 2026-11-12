@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import ast
 import asyncio
 import fcntl
@@ -1954,7 +1956,7 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
             raise AssertionError("session_history must not read store.entries")
 
         def messages(self):
-            raise AssertionError("session_history must not read store.messages()")
+            raise AssertionError("session_history must not read branch_messages(store)")
 
     runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
     result = history_module.history(runtime, {}, include_delivery_id=False)
@@ -2223,7 +2225,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
                     ).tool_result
                     is not None
                     and message.tool_result.tool_call_id == call.id
-                    for entry in server.runtime.opened.store.replay()
+                    for entry in server.runtime.opened.branch_entries(store)
                 )
             return await original_notify(event, session_id, **fields)
 
@@ -2378,7 +2380,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert server.runtime.opened is not None
         assert any(
             isinstance(block, TextContent) and block.text == "parent done"
-            for message in server.runtime.opened.store.messages()
+            for message in server.runtime.opened.branch_messages(store)
             for block in message.content
         )
         child_store = ConversationStore(
@@ -2387,7 +2389,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         try:
             assert any(
                 isinstance(block, TextContent) and block.text == "child done"
-                for message in child_store.messages()
+                for message in branch_messages(child_store)
                 for block in message.content
             )
         finally:
@@ -3419,7 +3421,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert canceled_tool_end["tool_call"]["id"] == call.id
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
-        history = server.runtime.opened.store.messages()
+        history = server.runtime.opened.branch_messages(store)
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
@@ -3449,7 +3451,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert [
             name for name in next_names if name in {"turn_start", "turn_end"}
         ] == ["turn_start", "turn_end"]
-        history = server.runtime.opened.store.messages()
+        history = server.runtime.opened.branch_messages(store)
         assert next_reply in json.dumps([message.to_dict() for message in history])
     finally:
         allow_approval_end.set()
@@ -4419,7 +4421,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    messages = server.runtime.manager.open(session_id).store.messages()
+    messages = server.runtime.manager.open(session_id).branch_messages(store)
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -5581,8 +5583,8 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         restored = (await rpc("session_history"))["result"]["messages"]
         assert restored == history["messages"]
         reopened = SessionManager(tmp_path).open(sid)
-        assert [m.to_dict() for m in reopened.store.messages()] == [
-            m.to_dict() for m in server.runtime.loop.store.messages()
+        assert [m.to_dict() for m in reopened.branch_messages(store)] == [
+            m.to_dict() for m in server.runtime.loop.branch_messages(store)
         ]
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
@@ -6307,7 +6309,7 @@ async def test_history_pages_large_messages_with_bounded_tool_arguments(
             }
         assert all(
             message.content[-1].tool_call.arguments == {"content": "x" * 135_000}
-            for message in store.messages()
+            for message in branch_messages(store)
         )
     finally:
         await close_serve(server, writer)
@@ -6341,7 +6343,7 @@ async def test_history_advances_past_single_oversized_persisted_message(tmp_path
         assert [row["id"] for row in page["messages"]] == [oversized.id, following.id]
         assert "truncated" in page["messages"][0]["content"][0]["text"]
         assert page["messages"][1]["content"] == [{"type": "text", "text": "after"}]
-        assert len(store.messages()[0].content) == 140
+        assert len(branch_messages(store)[0].content) == 140
     finally:
         await close_serve(server, writer)
 
@@ -6523,7 +6525,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
         assert not (server.runtime.opened.store.session_dir / "attachments").exists()
         assert (await send([image]))["result"]["accepted"]
         await _event(reader, "agent_end")
-        message = server.runtime.loop.store.messages()[0]
+        message = server.runtime.loop.branch_messages(store)[0]
         attachment = next(
             block for block in message.content if isinstance(block, ImageContent)
         )
@@ -6544,7 +6546,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
             "size": len(png),
         }
         assert "data" not in history[0]["content"][1]
-        assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
+        assert SessionManager(tmp_path).open(sid).branch_messages(store)[0] == message
     finally:
         await close_serve(server, writer)
 
@@ -6874,7 +6876,7 @@ async def test_attachment_failure_removes_entire_batch(
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
         assert all(path.read_bytes() == png for path in before if path.is_file())
-        assert runtime.opened.store.messages() == []
+        assert runtime.opened.branch_messages(store) == []
     finally:
         await runtime.close()
 
@@ -6948,7 +6950,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
                 MessageOrigin.USER,
             )
         )
-        history = opened.store.messages()
+        history = opened.branch_messages(store)
         runtime.usage["input_tokens"] = 123
         with monkeypatch.context() as patch:
             if failure == "metadata":
@@ -6974,7 +6976,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
         assert (
             runtime.state is state and runtime.loop is loop and runtime.opened is opened
         )
-        assert opened.store.messages() == history
+        assert opened.branch_messages(store) == history
         assert runtime.usage == {"input_tokens": 123}
         if failure:
             assert response["error"]["code"] == -32000
@@ -7001,7 +7003,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
             }
             await _request(reader, writer, 4, "send", {"text": "use new backend"})
             await _event(reader, "agent_end")
-            assert runtime.opened.store.messages()[-1].content == [TextContent("codex")]
+            assert runtime.opened.branch_messages(store)[-1].content == [TextContent("codex")]
             await _request(reader, writer, 5, "resume", {"session_id": sid})
             assert runtime.provider == "codex" and runtime.model == "gpt-5.4"
             assert runtime.loop.context_assembler.token_budget == expected
@@ -11064,7 +11066,7 @@ async def test_failed_wake_turn_keeps_durable_notification_input(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11115,7 +11117,7 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11175,7 +11177,7 @@ async def test_session_abort_does_not_retry_notification_turn(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11230,7 +11232,7 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11347,7 +11349,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11853,7 +11855,7 @@ async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None
                     MessageOrigin.USER,
                 )
             )
-            assert [message.content[0].text for message in reopened.messages()] == [
+            assert [message.content[0].text for message in branch_messages(reopened)] == [
                 "retained",
                 "usable",
             ]

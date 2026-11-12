@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import base64
 import faulthandler
@@ -1085,7 +1087,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
         assert requests == 1
         assert not any(
             isinstance(block, TextContent) and block.text
-            for message in opened.store.messages()
+            for message in opened.branch_messages(store)
             if message.role is MessageRole.ASSISTANT
             for block in message.content
         )
@@ -1108,7 +1110,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
             ),
         )
 
-        boundary = opened.store.replay()[-1].seq
+        boundary = opened.branch_entries(store)[-1].seq
         await context.switch_active(
             loop,
             second,

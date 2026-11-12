@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.support.branch_reads import branch_entries, branch_messages
+
 import asyncio
 import json
 from datetime import date
@@ -406,7 +408,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
         await event(reader, "turn_aborted")
         transcript = Transcript(
             SESSION,
-            tuple(entry.to_dict() for entry in server.runtime.opened.store.replay()),
+            tuple(entry.to_dict() for entry in server.runtime.opened.branch_entries(store)),
         )
 
         reconciliation = prepare_request(transcript, {}, as_of=TODAY)
