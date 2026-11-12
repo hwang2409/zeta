@@ -17769,7 +17769,10 @@ async def test_non_explicit_finish_child_gets_no_reminder(
     ):
         if target is _store:
             terminal_write_started.set()
-            await release_terminal_write.wait()
+            await await_or_fail(
+                release_terminal_write.wait(),
+                what="release non-explicit child terminal store write",
+            )
             result = await original_admit(target, intent)
             terminal_write_completed.set()
             return result
