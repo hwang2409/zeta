@@ -256,6 +256,20 @@ class _RootScan:
     records: int = 0
     record_bytes: int = 0
 
+    def iter_entries(self, directory_fd):
+        """Yield directory entries through the shared bounded scanner."""
+        try:
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        self.charge(info.st_size if stat.S_ISREG(info.st_mode) else 0)
+                    except OSError as exc:
+                        raise RetentionPlannerError("unsafe retention entry") from exc
+                    yield entry
+        except OSError as exc:
+            raise RetentionPlannerError("unsafe retention directory") from exc
+
     def charge(self, size: int) -> None:
         bounds, budget = self.budget.bounds, self.budget
         if budget.clock() >= budget.deadline:
@@ -508,30 +522,7 @@ class RetentionPlanner:
         return False
 
     def _closure_reason(self, home_fd, sessions_fd, flight, sweep, scan) -> str | None:
-        """Return the first conservative blocker, or None when the root is closed."""
-        root_id = flight.root_id
-        generation = read_reference_generation(self.home)
-        ids = {root_id}
-        for comps in flight.store_dirs:
-            if comps:
-                child_parts = [part for part in comps if part != _AGENTS_DIRNAME]
-                ids.add(root_id + ":" + ":".join(child_parts))
-        reason = (
-            ("session is being deleted" if _reservation_present(home_fd, root_id) else None)
-            or _store_reason(flight)
-            or self._sent_reason(flight)
-            or ("pinned" if self._pinned(sessions_fd, flight.root_fd, root_id) else None)
-            or _inbox_reason(home_fd, ids, scan)
-            or _dependent_reason(sessions_fd, root_id, scan)
-        )
-        if reason is not None:
-            return reason
-        effective = min(flight.walk.max_activity, sweep.anchor)
-        if effective >= sweep.cutoff_ns:
-            return "not old enough"
-        if read_reference_generation(self.home) != generation:
-            return "references changed during scan"
-        return None
+        return _ClosureAuthority(self, home_fd, sessions_fd, flight, sweep, scan).classify()
 
     def _sent_reason(self, flight) -> str | None:
         for comps in flight.store_dirs:
@@ -588,6 +579,42 @@ class RetentionPlanner:
             "phase": "discover" if flight is None else ("walk" if not walk.done else "references"),
             "preview": self._latest,
         }
+
+
+class _ClosureAuthority:
+    """One owner for candidate closure decisions and bounded references."""
+
+    def __init__(self, planner, home_fd, sessions_fd, flight, sweep, scan):
+        self.planner = planner
+        self.home_fd = home_fd
+        self.sessions_fd = sessions_fd
+        self.flight = flight
+        self.sweep = sweep
+        self.scan = scan
+
+    def classify(self) -> str | None:
+        root_id = self.flight.root_id
+        generation = read_reference_generation(self.planner.home)
+        ids = {root_id}
+        for comps in self.flight.store_dirs:
+            if comps:
+                child_parts = [part for part in comps if part != _AGENTS_DIRNAME]
+                ids.add(root_id + ":" + ":".join(child_parts))
+        checks = (
+            lambda: "session is being deleted" if _reservation_present(self.home_fd, root_id) else None,
+            lambda: _store_reason(self.flight),
+            lambda: self.planner._sent_reason(self.flight),
+            lambda: "pinned" if self.planner._pinned(self.sessions_fd, self.flight.root_fd, root_id) else None,
+            lambda: _inbox_reason(self.home_fd, ids, self.scan),
+            lambda: _dependent_reason(self.sessions_fd, root_id, self.scan),
+        )
+        if (reason := next((item for check in checks if (item := check()) is not None), None)) is not None:
+            return reason
+        if min(self.flight.walk.max_activity, self.sweep.anchor) >= self.sweep.cutoff_ns:
+            return "not old enough"
+        if read_reference_generation(self.planner.home) != generation:
+            return "references changed during scan"
+        return None
 
 
 _descend = descend_directory
