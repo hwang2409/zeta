@@ -35,6 +35,7 @@ from zeta.core.store._history_index import (
     HistoryIndexUnavailableError,
     StaleHistorySnapshot,
 )
+from zeta.core.store._rows import ResidentRows
 from zeta.core.store._step_delivery import PromptInput
 from zeta.core.store._validation import (
     NOTIFICATION_KINDS,
@@ -3170,19 +3171,12 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     second = store.append_message(
         with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
     )
-    rows = store.path.read_text().splitlines()
-    first_row = json.loads(rows[-2])
-    second_row = json.loads(rows[-1])
-    first_row["parent_id"] = second.id
-    second_row["parent_id"] = first.id
-    rows[-2:] = [
-        json.dumps(first_row, separators=(",", ":"), sort_keys=True),
-        json.dumps(second_row, separators=(",", ":"), sort_keys=True),
-    ]
+    first = replace(first, parent_id=second.id)
+    second = replace(second, parent_id=first.id)
     store.close()
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
-        ConversationStore(tmp_path, session_id=store.session_id)
+        ResidentRows.prepared([first, second])
 
 
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
