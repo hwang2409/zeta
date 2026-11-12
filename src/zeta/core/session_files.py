@@ -53,7 +53,18 @@ class SessionReferenceUnavailable(SessionError):
 
 
 _READ_RETRIES = 3
-_SESSION_REFERENCE_GENERATION = "session-reference-generation"
+SESSION_REFERENCE_GENERATION = "session-reference-generation"
+REFERENCES_DOMAIN = "references"
+
+
+def reservation_path(home: Path, session_id: str) -> Path:
+    """Durable reservation marker a deleter writes before removing a session."""
+    return home / "session-trash" / "reservations" / f"{session_id}.json"
+
+
+def quarantine_path(home: Path, session_id: str) -> Path:
+    """Directory a deleter moves a session into while removing it."""
+    return home / "session-trash" / session_id
 
 
 @dataclass(frozen=True)
@@ -98,7 +109,7 @@ class SessionReferenceGate:
                     domain_authority(
                         self.home,
                         RETENTION_HOME_ID,
-                        "references",
+                        REFERENCES_DOMAIN,
                         exclusive=exclusive,
                         nonblocking=on_loop,
                     )
@@ -136,8 +147,8 @@ class SessionReferenceGate:
             return
         for session_id in session_ids:
             _component(session_id)
-            reservation = self.home / "session-trash" / "reservations" / f"{session_id}.json"
-            quarantined = self.home / "session-trash" / session_id
+            reservation = reservation_path(self.home, session_id)
+            quarantined = quarantine_path(self.home, session_id)
             if reservation.exists() or quarantined.exists():
                 raise SessionReferenceUnavailable(
                     f"session reference unavailable: {session_id} is being deleted"
@@ -146,7 +157,7 @@ class SessionReferenceGate:
     def bump_generation(self) -> int:
         if not self._enabled():
             return 0
-        path = self.home / _SESSION_REFERENCE_GENERATION
+        path = self.home / SESSION_REFERENCE_GENERATION
         try:
             raw = path.read_text(encoding="ascii")
         except FileNotFoundError:

@@ -613,7 +613,7 @@ def recall_history(
     if type(offset) is not int or offset < 0:
         raise ValueError("offset must be a nonnegative integer")
     max_chars = min(max_chars, RECALL_HARD_MAX_CHARS)
-    branch = store.replay()
+    branch = store.active_branch_snapshot()
     ranges = active_compacted_ranges(branch)
     hidden = [
         entry
