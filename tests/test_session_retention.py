@@ -328,6 +328,9 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
         root = _create_closed(manager, stack)
         root_dir = tmp_path / "sessions" / root
         _age_tree(root_dir)
+        (root_dir / "bulk").mkdir()
+        for index in range(20):
+            (root_dir / "bulk" / f"{index}.txt").write_text("x")
         lease = stack.enter_context(_opened_lease(tmp_path))
         bounds = RetentionBounds(entries_per_root=1)
         planner_a = _planner(
@@ -625,6 +628,76 @@ def test_isolated_sent_ledger_states(tmp_path, reported, expected):
         root = _create_closed(manager, stack)
         _age_tree(tmp_path / "sessions" / root)
         _write_sent_ledger(tmp_path, root, reported)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+    assert reasons[root][0] is expected
+
+
+_MATRIX_KINDS = ("pending_link", "sent_root", "inbox", "dependent_meta", "dependent_fork", "source_attention", "child_sent")
+_MATRIX_MODES = ("absent", "present", "malformed")
+
+
+def _build_authority_row(tmp_path, kind, mode):
+    manager = _manager(tmp_path)
+    stack = ExitStack()
+    root = _create_closed(manager, stack)
+    root_dir = tmp_path / "sessions" / root
+    _age_tree(root_dir)
+    if mode == "absent":
+        return stack, root, True
+    if kind == "pending_link":
+        if mode == "present":
+            (root_dir / "project_link_pending.json").write_text('{"project_id":"p"}')
+        else:
+            (root_dir / "project_link_pending.json").write_text("{}")
+    elif kind == "sent_root":
+        _write_sent_ledger(tmp_path, root, ["claimed", "done"] if mode == "present" else "done")
+    elif kind == "inbox":
+        inbox = tmp_path / "projects" / "p_x" / "inbox" / "new"
+        inbox.mkdir(parents=True)
+        (inbox / "record.json").write_text(
+            json.dumps({"to_session": root}) if mode == "present" else "{}"
+        )
+    elif kind == "dependent_meta":
+        other = _create_closed(manager, stack, parent_session_id=root)
+        _age_tree(tmp_path / "sessions" / other)
+        if mode == "malformed":
+            (tmp_path / "sessions" / other / "meta.json").write_text("{}")
+    elif kind == "dependent_fork":
+        other = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / other)
+        payload = {"forked_from_session": root, "forked_at_entry": "e", "attention_id": "a"}
+        (tmp_path / "sessions" / other / "attention_fork.json").write_text(
+            json.dumps(payload if mode == "present" else {})
+        )
+    elif kind == "source_attention":
+        other = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / other)
+        attention = tmp_path / "sessions" / other / "attention"
+        attention.mkdir()
+        payload = {"id": "a" * 32, "created_at": _OLD, "session_id": other,
+                   "project_id": None, "entry_id": None, "entry_seq": None,
+                   "lane": "default", "title": "title", "why": "why", "options": [],
+                   "recommendation": None, "status": "open", "fork_session_id": root}
+        (attention / ("a" * 32 + ".json")).write_text(json.dumps(payload if mode == "present" else {}))
+    elif kind == "child_sent":
+        child = root_dir / "agents" / "1"
+        child.mkdir(parents=True)
+        (child / "agent_lifecycle.json").write_text(json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD}))
+        (child / ".lock").write_text("")
+        if mode == "present":
+            _write_sent_ledger(tmp_path, root, ["claimed"])
+            (child / "project-inbox-sent.json").write_text((root_dir / "project-inbox-sent.json").read_text())
+        else:
+            (child / "project-inbox-sent.json").write_text("{}")
+    return stack, root, mode == "absent" or (mode == "present" and kind == "sent_root")
+
+
+@pytest.mark.parametrize("kind", _MATRIX_KINDS)
+@pytest.mark.parametrize("mode", _MATRIX_MODES)
+def test_closure_authority_matrix(tmp_path, kind, mode):
+    stack, root, expected = _build_authority_row(tmp_path, kind, mode)
+    with stack:
         lease = stack.enter_context(_opened_lease(tmp_path))
         _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
     assert reasons[root][0] is expected
