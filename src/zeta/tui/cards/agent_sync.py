@@ -492,12 +492,15 @@ class AgentTranscriptSource:
             else:
                 store.refresh()
             entries = store.active_branch_snapshot()
+            snapshot = self._project(path, entries)
+            self._snapshots[path] = snapshot
+            lifecycle = _read_agent_lifecycle(path)
+            if lifecycle is not None and lifecycle.get("finished_at") is not None:
+                store.close()
+                self._stores.pop(path, None)
+            return snapshot
         snapshot = self._project(path, entries)
         self._snapshots[path] = snapshot
-        lifecycle = _read_agent_lifecycle(path)
-        if lifecycle is not None and lifecycle.get("finished_at") is not None:
-            store.close()
-            self._stores.pop(path, None)
         return snapshot
 
     def _project(

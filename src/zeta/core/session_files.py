@@ -404,12 +404,22 @@ def session_root(path: Path, *, create: bool = False):
     anchor = Path(*parts[:split])
     if create:
         anchor.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as cleanup:
-        fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
-        cleanup.callback(os.close, fd)
+    fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
         for name in parts[split:]:
-            fd = cleanup.enter_context(child_directory(fd, name, create=create))
+            if create:
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+            os.close(fd)
+            fd = child_fd
         yield fd
+    finally:
+        os.close(fd)
 
 
 def read_session_file(directory_fd: int, name: str) -> bytes:
