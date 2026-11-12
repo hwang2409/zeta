@@ -13027,101 +13027,19 @@ async def test_slash_run_mcp_credential_evidence_recovery(
         await close_serve(server, writer)
 
 
-@pytest.mark.asyncio
-async def test_durable_deny_publishes_approval_end_before_tool_and_turn_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "input.txt"
-    target.write_text("approved")
-    call = ToolCall("gated-call", "read", {"path": str(target)})
-    backend = FakeBackend(
-        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("done")])]
-    )
-    server = ZetaServer(
-        provider="codex",
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    persisted = asyncio.Event()
-    runtime_end = asyncio.Event()
-    runtime_end_handled = asyncio.Event()
-    release = asyncio.Event()
-    original = ConversationStore.resolve_approval_async
-    approvals = server.control._approvals
-    original_end = approvals._end_approval
-
-    async def gated_durable(self, request_id, decision, *, reason=None):
-        result = await original(
-            self, request_id, decision, reason=reason
-        )
-        if request_id == "gated-call":
-            persisted.set()
-            await asyncio.wait_for(release.wait(), timeout=10)
-        return result
-
-    async def record_runtime_end(*args, **kwargs):
-        runtime_end.set()
-        await original_end(*args, **kwargs)
-        runtime_end_handled.set()
-
-    # test-contract: seam no public hook exists between durable approval commit and settlement
-    monkeypatch.setattr(ConversationStore, "resolve_approval_async", gated_durable)
-    # test-contract: seam forces the runtime end event before settlement resumes
-    monkeypatch.setattr(approvals, "_end_approval", record_runtime_end)
-    reader, writer = await _ready(server)
-    frames: list[dict[str, Any]] = []
-    try:
-        await _request(reader, writer, 3, "send", {"text": "read it"})
-        approval = await _event(reader, "approval_request")
-        # test-contract: transport raw request must remain pending while settlement gates are exercised
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 4,
-                        "method": "deny",
-                        "params": {"request_id": approval["request_id"]},
-                    }
-                )
-                + "\n"
-            ).encode()
-        )
-        await writer.drain()
-        await asyncio.wait_for(persisted.wait(), timeout=10)
-        await asyncio.wait_for(runtime_end.wait(), timeout=10)
-        await asyncio.wait_for(runtime_end_handled.wait(), timeout=10)
-        release.set()
-        while not _named_events(frames, "turn_end"):
-            frames.append(await asyncio.wait_for(_read(reader), timeout=10))
-        names = [frame.get("params", {}).get("event") for frame in frames]
-        assert len(_named_events(frames, "approval_end")) == 1
-        assert (
-            names.index("approval_end")
-            < names.index("tool_end")
-            < names.index("turn_end")
-        )
-    finally:
-        release.set()
-        await close_serve(server, writer)
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "variant",
-    ["oserror", "cancelled_settlement_owner", "cancelled_external_end_owner"],
+    ["oserror", "cancelled"],
 )
 async def test_delegated_history_failure_still_publishes_approval_end_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
-    failure = "oserror" if variant == "oserror" else "cancelled"
-    # Two tasks race to publish the delegated approval end: the deny settlement
-    # task and the shielded runtime TOOL_APPROVAL_END task. Whichever reaches
-    # _finish_record first becomes record.publication_owner and performs the
-    # history write. The cancellation target must be that owner, not an assumed
-    # task, so force each ownership order deterministically and cancel the owner.
-    settlement_owns_first = variant == "cancelled_settlement_owner"
+    failure = variant
+    # The deny settlement is the one publisher: it writes the delegated history,
+    # so cancel it inside that write. No runtime route publishes in parallel,
+    # so there is no ownership race to force.
     target = tmp_path / "input.txt"
     target.write_text("data")
     agent = ToolCall(
@@ -13162,25 +13080,6 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
         ConversationStore, "append_approval_history_async", fail_terminal_history
     )
 
-    real_finish_record = ApprovalLifecycle._finish_record
-
-    async def ordered_finish_record(self, record, resolution, row=None):
-        # The settlement task runs _finish_record inline; the runtime
-        # TOOL_APPROVAL_END route runs it in a separate shielded task. Hold the
-        # route that must lose the ownership race until the winner owns the
-        # record and is blocked inside the history write (history_write_started).
-        live = self._state.records.get(record.target.key)
-        settlement_task = live.settlement if live is not None else record.settlement
-        is_settlement = asyncio.current_task() is settlement_task
-        if is_settlement != settlement_owns_first:
-            await asyncio.wait_for(history_write_started.wait(), timeout=10)
-        return await real_finish_record(self, record, resolution, row)
-
-    if failure == "cancelled":
-        # test-contract: seam no public hook orders the two publication routes
-        monkeypatch.setattr(
-            ApprovalLifecycle, "_finish_record", ordered_finish_record
-        )
     reader, writer = await _ready(server)
     assert server.connections is not None
     parent_tool_ended = asyncio.Event()
@@ -13242,11 +13141,8 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 record = server.control._approvals.state.records[
                     (approval["agent_instance_id"], child_call.id)
                 ]
-                owner = record.publication_owner
+                owner = record.settlement
                 assert owner is not None and not owner.done()
-                # The forced order must make the intended task own publication,
-                # so the external-first row cannot silently become a 50/50 race.
-                assert (owner is record.settlement) is settlement_owns_first
                 owner.cancel()
                 await asyncio.wait_for(history_cancelled.wait(), timeout=10)
             approval_owner = (
@@ -13345,10 +13241,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     connection = controller.connection
     original_write = connection._write_physical
     original_enqueue = server.connections._enqueue
-    original_finish_record = server.control._approvals._finish_record
-    settlement_finish_started = asyncio.Event()
-    competing_finish_started = asyncio.Event()
-    release_settlement_finish = asyncio.Event()
     tool_end_started = asyncio.Event()
 
     async def gated_write(payload: bytes) -> bool:
@@ -13364,22 +13256,10 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             tool_end_started.set()
         return original_enqueue(output, frame, wake=wake)
 
-    async def gated_finish_record(*args, **kwargs):
-        if not settlement_finish_started.is_set():
-            settlement_finish_started.set()
-            await asyncio.wait_for(release_settlement_finish.wait(), timeout=10)
-        else:
-            competing_finish_started.set()
-        return await original_finish_record(*args, **kwargs)
-
     # test-contract: seam the transport has no public physical-write backpressure hook
     monkeypatch.setattr(connection, "_write_physical", gated_write)
     # test-contract: seam the bounded queue has no public admission hook
     monkeypatch.setattr(server.connections, "_enqueue", record_enqueue)
-    # test-contract: seam approval settlement has no public pre-publication hook
-    monkeypatch.setattr(
-        server.control._approvals, "_finish_record", gated_finish_record
-    )
     frames: list[dict[str, Any]] = []
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
@@ -13400,9 +13280,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
         )
         await writer.drain()
         async with asyncio.timeout(10):
-            await settlement_finish_started.wait()
-            await competing_finish_started.wait()
-            release_settlement_finish.set()
             await write_started.wait()
             await tool_end_started.wait()
             release_write.set()
@@ -13416,7 +13293,6 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
             < names.index("turn_end")
         )
     finally:
-        release_settlement_finish.set()
         release_write.set()
         await close_serve(server, writer)
 

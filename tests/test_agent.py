@@ -10614,19 +10614,40 @@ async def test_drain_terminal_reroutes_late_grandchild_completion_to_root(
         child_store.close()
 
 
+@pytest.mark.parametrize("kind", ["completion", "idle", "hold", "question"])
+@pytest.mark.parametrize("window", ["parent_live", "sealed_retry", "cancel"])
 @pytest.mark.asyncio
-async def test_drain_terminal_seals_store_so_late_completion_retries_to_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_child_to_parent_publisher_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    window: str,
+    kind: str,
 ) -> None:
-    """A completion that commits after the drain is refused and retries to root.
+    """One owner routes every child->parent publisher past a sealed store.
 
-    Production order: the grandchild's completion resolves to the child store,
-    then finalize transfers the marker, adopts the grandchild to root, and drains
-    the child store. The parked completion then commits. On main the commit lands
-    in the drained store and reaches no model; the fix seals the store, so the
-    commit is refused and the producer re-resolves to the live ancestor (root),
-    upgrading the display-only mirror and finishing the stale marker.
+    The grandchild ``gc`` publishes a notice up through its dead direct parent
+    ``child``. Every publisher (completion, idle, hold, question) goes through
+    ``produce_to_live_parent``. Windows:
+
+    - ``parent_live``: the direct parent is alive, so the notice lands in its
+      store exactly once.
+    - ``sealed_retry``: the notice's commit into the child store lands after the
+      drain sealed it (window C). The seal refuses the commit and the owner
+      re-resolves to the live ancestor (root), where the notice lands exactly
+      once. On base ``20a84f78`` idle/hold/question raised
+      ``TerminalTargetSealedError`` out of the producer instead.
+    - ``cancel``: the producer is cancelled while its commit is parked; no
+      model-visible row is committed in either store.
+
+    No notice is ever lost, duplicated, or raised to the producer.
     """
+
+    durable = {
+        "completion": "agent_completion",
+        "idle": "child_idle",
+        "hold": "child_hold",
+        "question": "child_question",
+    }[kind]
 
     root_store = ConversationStore(tmp_path / "root", session_id="root")
     child_store = ConversationStore(tmp_path / "child", session_id="child")
@@ -10646,61 +10667,119 @@ async def test_drain_terminal_seals_store_so_late_completion_retries_to_root(
         lambda: None,
         gc_watcher,  # type: ignore[arg-type]
         parent_store=child_store,
+        description="grandchild",
         parent_instance_id="child",
     )
-    root_store.register_agent_child(
-        ToolCall("call-gc", "agent", {}),
-        child_session_path=_GC_PATH,
-        description="grandchild",
-        background=True,
-        child_instance_id="gc",
-    )
-    # Park the completion's commit into the child store, after it resolved to the
-    # child but before it writes, so the drain runs first.
-    orig_commit = child_store.commit_delivery_input
-    parked = asyncio.Event()
-    release = asyncio.Event()
-
-    async def gated_commit(item, *, return_committed_on_cancel=False):
-        parked.set()
-        await await_or_fail(release.wait(), what="release parked child commit")
-        return await orig_commit(
-            item, return_committed_on_cancel=return_committed_on_cancel
+    # A completion finishes its parent's marker; register it where the completion
+    # lands (root once the grandchild is adopted there, else the live parent).
+    if kind == "completion":
+        marker_store = root_store if window == "sealed_retry" else child_store
+        marker_store.register_agent_child(
+            ToolCall("call-gc", "agent", {}),
+            child_session_path=_GC_PATH,
+            description="grandchild",
+            background=True,
+            child_instance_id="gc",
         )
 
-    monkeypatch.setattr(child_store, "commit_delivery_input", gated_commit)
-    completion_kwargs = {
-        "child_instance_id": "gc",
-        "marker_key": "gc",
-        "child_session_path": _GC_PATH,
-        "description": "grandchild",
-        "status": "completed",
-        "text": "grandchild done",
-        "stats": None,
-        "killed_task_ids": None,
-        "killed_task_count": None,
-        "killed_task_ids_truncated": False,
-    }
-    try:
-        publish = asyncio.ensure_future(channel.publish_completion(**completion_kwargs))
-        await await_or_fail(parked.wait(), what="parked completion commit")
-        owner.adopt("gc", root_store, None)
-        await await_or_fail(channel.drain_terminal(child_store), what="drain_terminal")
-        release.set()
-        await await_or_fail(publish, what="completion retry to root")
-        root_completions = [
-            entry
-            for entry in root_store.agent_notifications()
-            if entry.data.get("kind") == "agent_completion"
+    def publish():
+        if kind == "completion":
+            return channel.publish_completion(
+                child_instance_id="gc",
+                marker_key="gc",
+                child_session_path=_GC_PATH,
+                description="grandchild",
+                status="completed",
+                text="grandchild done",
+                stats=None,
+                killed_task_ids=None,
+                killed_task_count=None,
+                killed_task_ids_truncated=False,
+            )
+        if kind == "idle":
+            return channel.publish_idle(
+                child_instance_id="gc",
+                child_session_path=_GC_PATH,
+                description="grandchild",
+                text="grandchild idle",
+            )
+        if kind == "hold":
+            return channel.publish_hold(
+                child_instance_id="gc",
+                child_session_path=_GC_PATH,
+                description="grandchild",
+                hold={
+                    "limit": "rate",
+                    "until": 2_000_000_000.0,
+                    "provider": "anthropic",
+                    "retry_after": 1.0,
+                },
+                account=None,
+            )
+        return channel.publish_question(
+            child_instance_id="gc",
+            question_id="q1",
+            question="ready?",
+            options=None,
+        )
+
+    def visible(store: ConversationStore) -> int:
+        return sum(
+            1
+            for entry in store.agent_notifications()
+            if entry.data.get("kind") == durable
             and entry.data.get("child_instance_id") == "gc"
-        ]
-        assert len(root_completions) == 1
-        assert root_completions[0].data.get("display_only") is not True
-        assert not any(
-            entry.data.get("kind") == "agent_completion"
-            for entry in child_store.agent_notifications()
         )
-        assert "gc" not in root_store.agent_children()
+
+    try:
+        if window == "parent_live":
+            # The direct parent is alive; the notice lands in its store once and
+            # nothing model-visible reaches root (completion keeps only a
+            # display-only mirror there, which agent_notifications() excludes).
+            await await_or_fail(publish(), what=f"{kind} to live parent")
+            assert visible(child_store) == 1
+            assert visible(root_store) == 0
+            if kind == "completion":
+                assert "gc" not in child_store.agent_children()
+            return
+
+        # sealed_retry and cancel both park the notice's commit into the child
+        # store, after it resolved to the (live) child but before it writes.
+        orig_commit = child_store.commit_delivery_input
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_commit(item, *, return_committed_on_cancel=False):
+            parked.set()
+            await await_or_fail(release.wait(), what="release parked child commit")
+            return await orig_commit(
+                item, return_committed_on_cancel=return_committed_on_cancel
+            )
+
+        monkeypatch.setattr(child_store, "commit_delivery_input", gated_commit)
+        task = asyncio.ensure_future(publish())
+        await await_or_fail(parked.wait(), what=f"parked {kind} commit")
+
+        if window == "sealed_retry":
+            owner.adopt("gc", root_store, None)
+            await await_or_fail(
+                channel.drain_terminal(child_store), what="drain_terminal"
+            )
+            release.set()
+            await await_or_fail(task, what=f"{kind} retry to root")
+            # The notice re-resolved to the live ancestor (root) exactly once and
+            # never landed in the sealed child store.
+            assert visible(root_store) == 1
+            assert visible(child_store) == 0
+            if kind == "completion":
+                assert "gc" not in root_store.agent_children()
+        else:  # cancel
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(task, what=f"{kind} cancel")
+            # The parked commit never ran, so no model-visible row exists.
+            assert visible(child_store) == 0
+            assert visible(root_store) == 0
     finally:
         root_store.close()
         child_store.close()

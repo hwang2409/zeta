@@ -279,23 +279,21 @@ class ConversationChannel:
             self._owner.causal_episodes.associate(entry.id for entry in result.entries)
         return result
 
-    async def produce_to_parent_of(
-        self, child_instance_id: str, item: DeliveryInput, /
-    ) -> ProducerResult:
-        _store, parent_id = self._live_parent(child_instance_id)
-        return await self.produce_to(parent_id, item)
-
-    async def _produce_to_live_parent(
+    async def produce_to_live_parent(
         self,
         child_instance_id: str,
         build: Callable[[ConversationStore], DeliveryInput],
     ) -> tuple[ProducerResult, ConversationStore]:
-        """Produce to the live ancestor, re-resolving past any sealed store.
+        """Single owner for every child->parent publication.
 
-        A completion for a child whose parent has already settled meets the
-        drained parent store and is refused. ``_live_parent`` steps over drained
-        stores, so each retry moves strictly up; root is never drained, so the
-        bounded loop ends there at the latest.
+        Every producer that sends a notice up the tree (idle, hold, question,
+        completion, and the question-answer ack) goes through here, so one place
+        re-resolves past a sealed store. A notice for a child whose parent has
+        already settled meets the drained parent store and is refused;
+        ``_live_parent`` steps over drained stores, so each retry moves strictly
+        up, and root is never drained, so the bounded loop ends there at the
+        latest. ``build`` receives the store the notice will land in, so the
+        payload can reflect the ancestor actually chosen.
         """
 
         for _ in range(len(self._delivery_targets) + 1):
@@ -340,7 +338,6 @@ class ConversationChannel:
 
         from .pending_delivery import NotificationInput
 
-        _parent_store, parent_id = self._live_parent(child_instance_id)
         data: dict[str, Any] = {
             "origin": "notification",
             "kind": "child_idle",
@@ -350,9 +347,8 @@ class ConversationChannel:
             "status": "child_idle",
             "text": text[-MAX_AGENT_NOTIFICATION_TEXT:],
         }
-        result = await self.produce_to(
-            parent_id,
-            NotificationInput("child_idle", data),
+        result, _store = await self.produce_to_live_parent(
+            child_instance_id, lambda _s: NotificationInput("child_idle", data)
         )
         return result.entries[0] if result.entries else None
 
@@ -392,8 +388,9 @@ class ConversationChannel:
                 "account if you cannot wait."
             ),
         }
-        _parent_store, parent_id = self._live_parent(child_instance_id)
-        await self.produce_to(parent_id, NotificationInput("child_hold", data))
+        await self.produce_to_live_parent(
+            child_instance_id, lambda _s: NotificationInput("child_hold", data)
+        )
 
     async def publish_not_delivered(self, child_loop: AgentLoop, text: str) -> None:
         """Show input a stop held back on the root transcript; it wakes no agent."""
@@ -491,7 +488,7 @@ class ConversationChannel:
                 ),
             )
             root_mirror = root_result.entries[0]
-        result, final_store = await self._produce_to_live_parent(
+        result, final_store = await self.produce_to_live_parent(
             child_instance_id, build
         )
         # child_ended fires once, for the receipt actually created in the store
@@ -521,32 +518,36 @@ class ConversationChannel:
     ) -> ConversationStore:
         from .pending_delivery import NotificationInput
 
-        parent_store, parent_id = self._live_parent(child_instance_id)
-        routed = parent_id != self._owner.original_parent_instance_id(child_instance_id)
-        data: dict[str, Any] = {
-            "origin": "notification",
-            "kind": "child_question",
-            "child_instance_id": child_instance_id,
-            "question_id": question_id,
-            "question": question,
-            "description": "child question",
-            "agent_description": self._owner.description(child_instance_id),
-            "status": "pending",
-            "text": (
-                f"child {child_instance_id} asks: {question}\n"
-                f"Answer with agent_send to {child_instance_id}; you can reference "
-                f"question id {question_id} in the message."
-            ),
-        }
-        if options is not None:
-            data["options"] = list(options)
-        if routed:
-            data["routing_note"] = (
-                "direct parent is no longer alive; routed to the next live ancestor"
+        def build(store: ConversationStore) -> NotificationInput:
+            parent_id = self._target_for_store(store)
+            routed = parent_id != self._owner.original_parent_instance_id(
+                child_instance_id
             )
-        await self.produce_to(
-            parent_id,
-            NotificationInput("child_question", data, dedupe_key=question_id),
+            data: dict[str, Any] = {
+                "origin": "notification",
+                "kind": "child_question",
+                "child_instance_id": child_instance_id,
+                "question_id": question_id,
+                "question": question,
+                "description": "child question",
+                "agent_description": self._owner.description(child_instance_id),
+                "status": "pending",
+                "text": (
+                    f"child {child_instance_id} asks: {question}\n"
+                    f"Answer with agent_send to {child_instance_id}; you can reference "
+                    f"question id {question_id} in the message."
+                ),
+            }
+            if options is not None:
+                data["options"] = list(options)
+            if routed:
+                data["routing_note"] = (
+                    "direct parent is no longer alive; routed to the next live ancestor"
+                )
+            return NotificationInput("child_question", data, dedupe_key=question_id)
+
+        _result, parent_store = await self.produce_to_live_parent(
+            child_instance_id, build
         )
         self._pending_questions.setdefault(child_instance_id, set()).add(question_id)
         return parent_store
@@ -585,18 +586,15 @@ class ConversationChannel:
                 continue
             if not self._owner.owns_running(child_id):
                 continue
-            target, parent_id = self._live_parent(child_id)
-            if target is dead_parent:
-                continue
             if kind == "child_question":
                 data = dict(entry.data)
                 data["routing_note"] = (
                     "direct parent is no longer alive; routed to the next live ancestor"
                 )
-                await self.produce_to(
-                    parent_id,
-                    NotificationInput(
-                        "child_question", data, dedupe_key=str(data["question_id"])
+                await self.produce_to_live_parent(
+                    child_id,
+                    lambda _store, d=data: NotificationInput(
+                        "child_question", d, dedupe_key=str(d["question_id"])
                     ),
                 )
                 await self.produce_to(
@@ -613,7 +611,10 @@ class ConversationChannel:
                 # Re-publish the idle/hold with its payload unchanged: both
                 # validators are strict, so adding a routing note would be
                 # rejected. Then ack it in the dead store.
-                await self.produce_to(parent_id, NotificationInput(kind, dict(entry.data)))
+                await self.produce_to_live_parent(
+                    child_id,
+                    lambda _store, k=kind, e=entry: NotificationInput(k, dict(e.data)),
+                )
                 settled_ids.append(entry.id)
             moved += 1
         if settled_ids:
@@ -649,7 +650,7 @@ class ConversationChannel:
                 after_commit=finish_marker,
             )
 
-        await self._produce_to_live_parent(child_instance_id, build)
+        await self.produce_to_live_parent(child_instance_id, build)
 
     def question_answered(self, child_instance_id: str, question_id: str) -> None:
         questions = self._pending_questions.get(child_instance_id)
