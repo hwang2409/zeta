@@ -218,8 +218,8 @@ async def resolve_mcp_bindings(
         effective_source = effective.sources.get(name, effective.path)
         if (
             server is None
-            or source.resolve() != config.path.resolve()
-            or effective_source.resolve() != config.path.resolve()
+            or source != config.path
+            or effective_source != config.path
         ):
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS,
