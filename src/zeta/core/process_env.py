@@ -85,6 +85,26 @@ def subprocess_env(overrides: Mapping[str, str] | None = None) -> dict[str, str]
     environment.setdefault("DEBIAN_FRONTEND", "noninteractive")
     environment.setdefault("PAGER", "cat")
     environment.setdefault("GIT_PAGER", "cat")
+    # A tool shell inherits the user's $TMUX/$TMUX_PANE, so a bare `tmux ...`
+    # (including `kill-server`) controls the host server that hosts every zeta
+    # session. Drop those and point tmux at a private per-home socket dir so a
+    # bare agent tmux only reaches its own server. To drive the host server on
+    # purpose, target it explicitly, e.g. `tmux -S /private/tmp/tmux-$(id -u)/default`.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    if "TMUX_TMPDIR" not in environment:
+        environment["TMUX_TMPDIR"] = _tmux_tmpdir()
     if overrides is not None:
         environment.update(overrides)
     return environment
+
+
+def _tmux_tmpdir() -> str:
+    """Return a private, per-home tmux socket dir, creating it 0700."""
+
+    from .session import env_home
+
+    path = env_home() / "run" / "tmux"
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return str(path)

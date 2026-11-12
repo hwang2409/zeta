@@ -9,6 +9,7 @@ import pty
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -2549,6 +2550,79 @@ async def test_bash_tool_subprocess_sets_tool_marker(
     )
     assert "ZETA_TOOL_SUBPROCESS=1" in output["structuredContent"]["output"]
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_isolates_tmux_env_from_host_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zeta_home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(zeta_home))
+    monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,123,0")
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        result = await registry.execute(
+            ToolCall(
+                "tmux-env",
+                "bash",
+                {"cmd": "/usr/bin/env | grep -E '^TMUX(_PANE|_TMPDIR)?=' || true"},
+            )
+        )
+    finally:
+        await registry.close()
+    lines = result["structuredContent"]["stdout"].splitlines()
+    assert not any(line.startswith("TMUX=") for line in lines)
+    assert not any(line.startswith("TMUX_PANE=") for line in lines)
+    assert f"TMUX_TMPDIR={zeta_home / 'run' / 'tmux'}" in lines
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.asyncio
+async def test_bash_tool_tmux_kill_server_spares_host_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A host tmux server standing in for the user's server, on its own -L
+    # socket so the test never touches the default server.
+    host_socket = f"zeta-tmuxguard-{os.getpid()}"
+    host_session = f"host-{os.getpid()}"
+    subprocess.run(
+        ["tmux", "-L", host_socket, "new-session", "-d", "-s", host_session,
+         "sleep", "600"],
+        check=True,
+    )
+    try:
+        socket_path = subprocess.run(
+            ["tmux", "-L", host_socket, "display-message", "-p", "#{socket_path}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        server_pid = subprocess.run(
+            ["tmux", "-L", host_socket, "display-message", "-p", "#{pid}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        # Reproduce the crash: the tool shell inherits $TMUX pointing at the
+        # host server, so a bare `tmux kill-server` would kill it.
+        monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
+        monkeypatch.setenv("TMUX", f"{socket_path},{server_pid},0")
+        monkeypatch.setenv("TMUX_PANE", "%0")
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+        try:
+            result = await registry.execute(
+                ToolCall(
+                    "tmux-kill",
+                    "bash",
+                    {"cmd": "tmux new-session -d -s agent; tmux kill-server; echo done"},
+                )
+            )
+        finally:
+            await registry.close()
+        assert "done" in result["structuredContent"]["stdout"]
+        alive = subprocess.run(
+            ["tmux", "-L", host_socket, "has-session", "-t", host_session],
+        )
+        assert alive.returncode == 0, "host tmux server was killed by the agent tool"
+    finally:
+        subprocess.run(["tmux", "-L", host_socket, "kill-server"], check=False)
 
 
 @pytest.mark.asyncio
