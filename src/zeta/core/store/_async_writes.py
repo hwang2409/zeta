@@ -256,6 +256,14 @@ class _AdmitStepDeliveryTerminalCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _SettleStepDeliveryTerminalCommand(_StoreMutationCommand):
+    suppressed_ids: frozenset[str]
+
+    def apply(self, store: Any) -> Any:
+        return store._settle_step_delivery_terminal(self.suppressed_ids)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _AcceptExplicitFinishCommand(_StoreMutationCommand):
     report: dict[str, object]
     notification_ids: frozenset[str]
@@ -963,6 +971,13 @@ class AsyncDurableWritesMixin:
     async def admit_step_delivery_terminal(self: ConversationStore, intent: Any) -> Any:
         return await self._commit_storage_command(
             _AdmitStepDeliveryTerminalCommand(intent=intent)
+        )
+
+    async def settle_step_delivery_terminal(
+        self: ConversationStore, suppressed_ids: frozenset[str]
+    ) -> Any:
+        return await self._commit_storage_command(
+            _SettleStepDeliveryTerminalCommand(suppressed_ids=suppressed_ids)
         )
 
     async def accept_explicit_finish(

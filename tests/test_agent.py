@@ -101,6 +101,7 @@ from zeta.runtime.prompt import RuntimePrompt
 from zeta.runtime.tool_setup import select_tool_registry
 from zeta.skills import SkillCatalog, SkillMeta
 from zeta.skills.agent_catalog import AgentCatalog, discover_session_agents
+from zeta.storage_format import WRITER_EPOCH
 from zeta.tools import ToolRegistry
 from zeta.tools._action_metadata import ApprovalBinding, ResolvedCapability
 from zeta.tools.agent import ChildApprovalPolicy, send_to_run
@@ -1975,6 +1976,7 @@ class PostCapBudgetBackend(CompletionBackend):
         self.release_fresh_prompt = asyncio.Event()
         self.fresh_requests: list[list[Message]] = []
         self.gate_calls = 0
+        self.handoff_turns = 0
 
     @owned_completion
     async def complete(
@@ -2024,6 +2026,7 @@ class PostCapBudgetBackend(CompletionBackend):
             blocks = [TextContent("edge complete")]
         elif last_user == "fresh external prompt":
             self.fresh_requests.append(list(messages))
+            self.handoff_turns += 1
             self.fresh_prompt_seen.set()
             if self.hold_fresh_prompt:
                 await await_or_fail(
@@ -4059,6 +4062,17 @@ async def _run_post_cap_tool_cycle(
             )
             assert fresh_response in done
             assert suppressed_response not in done
+            # Force the late-edge order deterministically. While the handoff turn
+            # is held, arm a notification edge on the child so it is pending the
+            # instant the finish gate admits the handoff terminal. Unfixed,
+            # run_consumer delivers that notification turn, which re-exposes the
+            # already-consumed fresh prompt to the model and re-enters the
+            # concluded gate; with the child bound held it never publishes the
+            # terminal. The fix finalizes on the notification-only edge at once.
+            await owner.conversation_channel.produce_to(
+                child_handle, _task_exit_input("late-edge")
+            )
+            assert flow.has_pending_edge
             backend.release_fresh_prompt.set()
 
         if not send_fresh_prompt:
@@ -4106,6 +4120,11 @@ async def test_exhausted_tool_edge_plus_fresh_prompt_starts_new_budget(
         tmp_path, monkeypatch, send_fresh_prompt=True
     )
     assert backend.fresh_prompt_seen.is_set()
+    # The fresh prompt is handled by exactly one model turn. A late pending edge
+    # arriving at/after the finish-gate handoff terminal must not re-run the
+    # finished segment (the re-exposed prompt loops and the terminal never
+    # publishes).
+    assert backend.handoff_turns == 1
 
 
 
@@ -10191,6 +10210,313 @@ def _task_exit_input(task_id: str) -> pending_delivery_module.NotificationInput:
         },
         dedupe_key=task_id,
     )
+
+
+_GC = "run:1"
+_GC_PATH = "/tmp/run-gc"
+_GC_QUESTION_ID = "gc-question"
+# A large grandchild report plus a large own report, with a small receipt budget,
+# proves the fold ordering keeps the child's own report under tail truncation.
+_OWN_CHILD_REPORT = "OWN-CHILD-REPORT " + "c" * 2000
+_GC_COMPLETION_TEXT = "G" * 9500
+_TERMINAL_MAX_RECEIPT_BYTES = 10_000
+
+
+async def _stage_terminal_edge(
+    flow: "pending_delivery_module.StepDeliveryFlow",
+    store: "ConversationStore",
+    kind: str,
+) -> None:
+    """Stage one pending input of ``kind`` on a child flow through the real store."""
+
+    if kind == "task_exit":
+        await flow.produce(_task_exit_input("late-edge"))
+    elif kind == "child_idle":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_idle",
+                {
+                    "child_instance_id": _GC,
+                    "child_session_path": _GC_PATH,
+                    "description": "grandchild",
+                    "status": "child_idle",
+                    "text": "grandchild idle",
+                },
+                dedupe_key=_GC,
+            )
+        )
+    elif kind == "child_hold":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_hold",
+                {
+                    "child_instance_id": _GC,
+                    "child_session_path": _GC_PATH,
+                    "description": "grandchild",
+                    "status": "held",
+                    "reason": "rate_limit",
+                    "until": "soon",
+                    "provider": "test",
+                    "text": "grandchild held",
+                    "account": None,
+                    "retry_after": 60,
+                },
+                dedupe_key=_GC,
+            )
+        )
+    elif kind == "child_question":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_question",
+                {
+                    "child_instance_id": _GC,
+                    "question_id": _GC_QUESTION_ID,
+                    "description": "grandchild question",
+                    "status": "pending",
+                    "question": "wait?",
+                    "text": "grandchild asks: wait?",
+                },
+                dedupe_key=_GC_QUESTION_ID,
+            )
+        )
+    elif kind == "child_question_withdrawn":
+        # Stage a question, then close it: that acks the question and appends a
+        # model-visible child_question_withdrawn row (the round-3 infinite loop).
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_question",
+                {
+                    "child_instance_id": _GC,
+                    "question_id": _GC_QUESTION_ID,
+                    "description": "grandchild question",
+                    "status": "pending",
+                    "question": "wait?",
+                    "text": "grandchild asks: wait?",
+                },
+                dedupe_key=_GC_QUESTION_ID,
+            )
+        )
+        store.close_child_questions(_GC, reason="finished")
+    elif kind == "child_completion":
+        await flow.produce(
+            pending_delivery_module.NotificationInput(
+                "child_completion",
+                store._agent_notification_data(
+                    _GC,
+                    child_session_path=_GC_PATH,
+                    description="grandchild",
+                    status="completed",
+                    text=_GC_COMPLETION_TEXT,
+                ),
+                dedupe_key=_GC,
+            )
+        )
+    else:
+        raise AssertionError(f"unknown terminal-edge kind {kind!r}")
+
+
+# kind -> outcome after the finish gate concluded a terminal run.
+#   kept:   left durable (finalize reroutes it); no model turn here.
+#   folded: folded into this child's receipt (the effective parent reads it).
+#   moot:   acked -- the output survives elsewhere, nothing reaches a model.
+# Prompt delivery is covered by the two named post-cap tests, not this table.
+_TERMINAL_EDGE_OUTCOME = {
+    "task_exit": "moot",
+    "child_question_withdrawn": "moot",
+    "child_question": "kept",
+    "child_idle": "kept",
+    "child_hold": "kept",
+    "child_completion": "folded",
+}
+# staged kind -> durable notification kind that must stay in the store when kept.
+_KEPT_DURABLE_KIND = {
+    "child_question": "child_question",
+    "child_idle": "child_idle",
+    "child_hold": "child_hold",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_TERMINAL_EDGE_OUTCOME))
+@pytest.mark.asyncio
+async def test_consume_run_after_finish_gate_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Every staged input kind has a defined, non-dropping outcome after terminal.
+
+    The finish gate runs its own bounded loop to a terminal (handed off,
+    completed, task safety expired) and sets ``terminal_admitted``. The request
+    that terminal turn consumed is acked when the turn ends, so it leaves no
+    prompt edge. ``settle_terminal`` then classifies every staged input in one
+    atomic store command and never silently drops a model-visible one:
+
+    * a grandchild question, idle or hold stays durable so finalize reroutes it
+      to the effective parent (``kept``);
+    * a grandchild completion report is folded into this child's receipt, which
+      the effective parent reads, then acked (``folded``);
+    * a task exit and a withdrawn-question notice are moot -- the task output
+      survives in the archive, and the withdrawal cancels a question this run
+      will never answer -- so they are acked and start no turn (``moot``).
+
+    No model turn runs for any of them, the prompt queue is closed, and nothing
+    is dropped. Prompt delivery after a terminal is covered by the two named
+    post-cap tests. ``project_inbox`` never reaches a child; ``macro_completion``
+    shares ``agent_completion``; the mutation-only kinds never enter the pending
+    set. The import-time ``TERMINAL_DISPOSITION`` check covers the rest.
+    """
+
+    from zeta.agent import runner as agent_runner
+
+    outcome = _TERMINAL_EDGE_OUTCOME[kind]
+    child_store = ConversationStore(tmp_path, session_id="run")
+    gate_state = FinishGateState()
+    calls = 0
+
+    async def fake_consume_child(child_loop, prompt, **kwargs):
+        nonlocal calls
+        calls += 1
+        flow = await child_loop._ensure_step_delivery()
+        if calls == 1:
+            # The gate ran its own loop and admitted the terminal for this run.
+            gate_state.terminal_admitted = True
+            await _stage_terminal_edge(flow, child_store, kind)
+        else:
+            # A delivered turn (only expected on a bug): consume what was staged
+            # and ack it as a real turn does, so the loop still terminates.
+            prepared = await flow.prepare_request("terminal_fallback", [], None)
+            if prepared.has_active_delivery:
+                await flow.acknowledge_active()
+        own_text = _OWN_CHILD_REPORT if kind == "child_completion" else "done"
+        return {
+            "content": [{"type": "text", "text": own_text}],
+            "isError": False,
+            "structuredContent": {"status": "completed"},
+        }
+
+    monkeypatch.setattr(agent_runner, "consume_child", fake_consume_child)
+
+    child_loop = AgentLoop(
+        FakeBackend([]),
+        child_store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = await await_or_fail(
+            agent_runner.consume_run(
+                child_loop,
+                "initial",
+                child_store=child_store,
+                finish_gate_state=gate_state,
+                max_receipt_bytes=_TERMINAL_MAX_RECEIPT_BYTES,
+            ),
+            what=f"consume_run terminal settle ({kind})",
+        )
+        assert result["isError"] is False
+        # No staged notification ever starts a model turn after terminal.
+        extra_turns = calls - 1
+        assert extra_turns == 0
+        flow = await child_loop._ensure_step_delivery()
+        receipt_text = result["content"][0]["text"]
+        active_kinds = [
+            entry.data.get("kind") for entry in child_store.agent_notifications()
+        ]
+        assert child_store.pending_prompt_queue._queue_closed_unlocked()
+        if outcome == "kept":
+            # Left durable for finalize to reroute; not acked, not delivered.
+            # The unfixed guard acked idle/hold (lost) and main delivered a turn.
+            assert _KEPT_DURABLE_KIND[kind] in active_kinds
+        elif outcome == "folded":
+            # The report rides out in this child's receipt and the entry is acked.
+            # The fold sits at the head, so the child's own report and the trailer
+            # survive tail truncation; the round-3 guard cut the own report.
+            assert flow.pending_ids() == ()
+            assert "OWN-CHILD-REPORT" in receipt_text
+            assert _GC_PATH in receipt_text
+            from zeta.agent.receipt import build_agent_receipt
+
+            stage_two = build_agent_receipt(
+                "completed", receipt_text, None, max_bytes=_TERMINAL_MAX_RECEIPT_BYTES
+            )
+            stage_two_text = stage_two["content"][0]["text"]
+            assert "OWN-CHILD-REPORT" in stage_two_text
+            assert _GC_PATH in stage_two_text
+        else:  # moot
+            assert flow.pending_ids() == ()
+    finally:
+        await child_loop.close()
+        child_store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_reroute_moves_running_grandchild_idle_to_effective_parent(
+    tmp_path: Path,
+) -> None:
+    """A dead child's idle for a still-running grandchild reaches the next parent.
+
+    ``reroute_questions_from`` runs at finalize. On main it moves only questions,
+    so a running grandchild's idle (kept durable by settle_terminal) would reach
+    no model once its direct parent ends. The fix also moves idle and hold to the
+    effective parent, with the payload unchanged, and acks them in the dead store.
+    """
+
+    root_store = ConversationStore(tmp_path / "root", session_id="root")
+    child_store = ConversationStore(tmp_path / "child", session_id="child")
+    owner = BackgroundAgentOwner(root_store)
+    channel = owner.conversation_channel
+    channel.register_delivery_flow(
+        None, pending_delivery_module.StepDeliveryFlow(root_store)
+    )
+    channel.register_delivery_flow(
+        "child", pending_delivery_module.StepDeliveryFlow(child_store)
+    )
+    # The grandchild is still running under the (now dead) child. owns_running
+    # keys on the cancellers map, not the watcher state, so a resolved future
+    # stands in for the live watcher without an indefinite wait.
+    gc_watcher: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    gc_watcher.set_result(None)
+    owner.register(
+        "gc",
+        lambda: None,
+        gc_watcher,  # type: ignore[arg-type]
+        parent_store=child_store,
+        parent_instance_id="child",
+    )
+    try:
+        await channel.produce_to(
+            "child",
+            pending_delivery_module.NotificationInput(
+                "child_idle",
+                {
+                    "child_instance_id": "gc",
+                    "child_session_path": _GC_PATH,
+                    "description": "grandchild",
+                    "status": "child_idle",
+                    "text": "grandchild idle",
+                },
+                dedupe_key="gc",
+            ),
+        )
+        moved = await channel.reroute_questions_from(child_store)
+        assert moved == 1
+        # The idle is now a model-visible notification on the effective parent...
+        root_idle = [
+            entry
+            for entry in root_store.agent_notifications()
+            if entry.data.get("kind") == "child_idle"
+            and entry.data.get("child_instance_id") == "gc"
+        ]
+        assert len(root_idle) == 1
+        assert root_idle[0].data.get("display_only") is not True
+        # ...and acked in the dead child store.
+        assert not any(
+            entry.data.get("kind") == "child_idle"
+            for entry in child_store.agent_notifications()
+        )
+    finally:
+        root_store.close()
+        child_store.close()
+
 
 
 @pytest.mark.asyncio
@@ -21004,7 +21330,7 @@ async def test_completion_recovery_is_durable_for_every_recipient(
 
     async def recover(store: ConversationStore) -> None:
         task = asyncio.create_task(
-            asyncio.to_thread(recover_agent_children, recovery_loop(store))
+            asyncio.to_thread(recover_agent_children, recovery_loop(store), WRITER_EPOCH)
         )
         if scenario == "concurrent live publisher":
             try:
@@ -21099,7 +21425,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     child.close()
     owner = BackgroundAgentOwner(parent)
     loop = SimpleNamespace(store=parent, _background_owner=owner)
-    await asyncio.to_thread(recover_agent_children, loop)
+    await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
     notices = [
         item
         for item in parent.agent_notifications(pending_only=False)
@@ -21107,7 +21433,7 @@ async def test_finish_recovery_after_durable_acceptance_publishes_report_once(
     ]
     assert len(notices) == 1
     assert notices[0].data["summary"] == "recovered"
-    await asyncio.to_thread(recover_agent_children, loop)
+    await asyncio.to_thread(recover_agent_children, loop, WRITER_EPOCH)
     assert (
         len(
             [
