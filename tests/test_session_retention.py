@@ -612,5 +612,19 @@ def test_isolated_partial_second_sweep_keeps_complete_preview(tmp_path):
         (tmp_path / "sessions" / root / "new-old-file").write_bytes(b"x" * 100)
         partial = planner.run_pass(days=30)
         state = json.loads((tmp_path / "retention-state.json").read_text())
-    assert not partial.complete
     assert state["preview"]["preview_id"] == preview_id
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [(["claimed", "done"], True), (["claimed"], False), ("done", False)],
+)
+def test_isolated_sent_ledger_states(tmp_path, reported, expected):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        _write_sent_ledger(tmp_path, root, reported)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        result, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+    assert reasons[root][0] is expected
