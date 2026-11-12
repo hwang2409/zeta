@@ -3734,8 +3734,7 @@ async def test_delivery_fold_install_routes_match_cold_reopen(
                 assert release_reload.wait(10)
                 original_reload(durable)
 
-            # test-contract: seam gates the writer reload so the owner can swap
-            # its fold and an external instance can append inside the window.
+            # test-contract: seam gates the writer reload so the owner can swap its fold and an external instance can append inside the window
             monkeypatch.setattr(
                 ConversationStore,
                 "_reload_durable_writer_if_changed",
