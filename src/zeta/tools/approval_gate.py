@@ -44,12 +44,14 @@ class ApprovalGate:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
             # Ephemeral (inline-shell) approvals are never durable rows, so they
-            # need no store read here; a durable pre-check uses the sync *_now
-            # seam. This keeps the submission-to-registration path free of an
-            # off-loop hop, so concurrent approvals register in submit order.
+            # need no store read here, which keeps the submission-to-registration
+            # path free of an off-loop hop and lets concurrent inline approvals
+            # register in submit order. Durable approvals keep the log-synced
+            # async pre-check, which a delegated child needs to see a resolution
+            # a parent (a different store instance) wrote.
             already_decided = (
                 persist_request
-                and self.policy.durable_decision_now(tool_call.id) is not None
+                and await self.policy.durable_decision(tool_call.id) is not None
             )
             approval_started = (
                 not already_decided
