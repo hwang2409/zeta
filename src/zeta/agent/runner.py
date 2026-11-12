@@ -14,7 +14,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal as ToolAbortSignal
-from ..core.checkpoints import _now
 from ..core.session import env_home
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..media.image_policy import image_policy_for_provider
@@ -78,7 +77,9 @@ from .receipt import (
 from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
 from .turn_limit import (
     ChildTurnControl,
+    append_child_start,
     finalize_exhausted_child,
+    forward_nested_agent_start,
     make_child_progress_callbacks,
     make_finish_limited_child_turn,
     make_publish_child_lifecycle,
@@ -147,6 +148,17 @@ async def consume_child(
             return child_loop.agent_depth + 1
         return child_loop.agent_depth
 
+    def emit_lifecycle(
+        kind: str, event: StreamEvent, *, tool_result: ToolResult | None = None
+    ) -> None:
+        publish_lifecycle(
+            kind,
+            event.tool_call,
+            tool_result=tool_result,
+            depth=lifecycle_depth(event.tool_call),
+            owner=event.data.get("agent_instance_id"),
+        )
+
     async def consume_events(
         events: AsyncIterator[StreamEvent],
         gate_control: FinishGateControl | None = None,
@@ -154,6 +166,7 @@ async def consume_child(
         nonlocal failure_error, failure_message, final_message, last_message, explicit_report
         final_message = None
         async for event in events:
+            forward_nested_agent_start(child_loop, event)
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
@@ -169,17 +182,9 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: approval pending: {name}"
                 update_step(status)
                 publish(status)
-                publish_lifecycle(
-                    "approval_start",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                )
+                emit_lifecycle("approval_start", event)
             elif event.type is StreamEventType.TOOL_APPROVAL_END:
-                publish_lifecycle(
-                    "approval_end",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                )
+                emit_lifecycle("approval_end", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_START:
                 record_tool_call()
                 name = event.tool_call.name if event.tool_call is not None else "tool"
@@ -190,11 +195,7 @@ async def consume_child(
                 status = f"turn {child_turns() + 1}: tool: {name} {summary}"
                 update_step(status)
                 publish(status)
-                publish_lifecycle(
-                    "execution_start",
-                    event.tool_call,
-                    depth=lifecycle_depth(event.tool_call),
-                )
+                emit_lifecycle("execution_start", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
                 if (
                     event.tool_call is not None
@@ -204,12 +205,7 @@ async def consume_child(
                     and isinstance(event.tool_result.structured_content, dict)
                 ):
                     explicit_report = dict(event.tool_result.structured_content)
-                publish_lifecycle(
-                    "execution_end",
-                    event.tool_call,
-                    tool_result=event.tool_result,
-                    depth=lifecycle_depth(event.tool_call),
-                )
+                emit_lifecycle("execution_end", event, tool_result=event.tool_result)
             elif event.type is StreamEventType.TURN_END:
                 last_message = event.message
                 turns = child_turns() + 1
@@ -728,6 +724,7 @@ async def run_agent_tool(
         raise
     loop._background_owner.store_leases.enter_context(child_store)
     loop._background_owner.track_store(child_store)
+    child_store.accepts_follow_ups = follow_up_loop
     child_store.mark_agent_parent(tool_call.id, agent_type=stored_agent_type)
     child_path = str(child_store.session_dir)
     # Persist the parent marker first. A crash after this point is
@@ -759,12 +756,13 @@ async def run_agent_tool(
         except (ProjectRegistryError, OSError, ValueError) as exc:
             logger.warning("could not record child project lineage: %s", exc)
     try:
-        await loop.store.append_child_run_started_async(
+        await append_child_start(
+            loop.store,
             child_instance_id,
             parent_identity if loop.agent_instance_id is not None else None,
             stored_agent_type,
             description,
-            _now(),
+            accepts_follow_ups=follow_up_loop,
         )
     except BaseException:
         loop._background_owner.mark_store_finished(child_store)
@@ -959,6 +957,7 @@ async def run_agent_tool(
         *,
         tool_result: ToolResult | None = None,
         depth: int | None = None,
+        owner: object = None,
     ) -> None:
         if call is None:
             return
@@ -971,7 +970,7 @@ async def run_agent_tool(
         if event_type is None:
             return
         data = {"depth": child_depth if depth is None else depth}
-        data["agent_instance_id"] = child_instance_id
+        data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
         if background:
             loop._publish_background_event(
                 StreamEvent(

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from ..accounts.session import account_provider
+from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType
@@ -26,7 +27,7 @@ def _append_recovery_notification(
     data: dict[str, object],
     *,
     display_only: bool,
-) -> ConversationEntry:
+) -> tuple[ConversationEntry, bool]:
     report = (
         {"status": data["report_status"]}
         | {
@@ -57,7 +58,7 @@ def _append_recovery_notification(
         killed_task_ids_truncated=data.get("killed_task_ids_truncated") is True,
         display_only=display_only,
         report=report,
-    )[0]
+    )
 
 
 def recover_completion_mirrors(
@@ -65,8 +66,13 @@ def recover_completion_mirrors(
     parent_store: ConversationStore,
     child_instance_id: str,
     fallback_data: dict[str, object] | None = None,
+    child_lifecycle: object = None,
 ) -> ConversationEntry | None:
-    """Durably restore each intended completion recipient before cleanup."""
+    """Durably restore each intended completion recipient before cleanup.
+
+    A newly created immediate-parent receipt publishes ``child_ended`` once; an
+    existing receipt or the root display mirror never does.
+    """
 
     root_notification = root_store.sync_agent_completion_notification(
         child_instance_id
@@ -82,17 +88,23 @@ def recover_completion_mirrors(
     data = dict(source.data) if source is not None else fallback_data
     assert data is not None
     if root_notification is None:
-        root_notification = _append_recovery_notification(
+        root_notification, created = _append_recovery_notification(
             root_store,
             data,
             display_only=parent_store is not root_store,
         )
+        if created and parent_store is root_store:
+            publish_child_ended(child_instance_id, root_notification.seq, child_lifecycle)
     if parent_notification is None:
-        parent_notification = _append_recovery_notification(
+        parent_notification, created = _append_recovery_notification(
             parent_store,
             data,
             display_only=False,
         )
+        if created:
+            publish_child_ended(
+                child_instance_id, parent_notification.seq, child_lifecycle
+            )
     return root_notification
 
 
@@ -403,8 +415,13 @@ class ConversationChannel:
         killed_task_count: int | None,
         killed_task_ids_truncated: bool,
         report: dict[str, object] | None = None,
+        child_lifecycle: object = None,
     ) -> ConversationEntry:
-        """Persist a child completion through each resident recipient flow."""
+        """Persist a child completion through each resident recipient flow.
+
+        Only the immediate parent's newly installed receipt publishes ``child_ended``;
+        the root display mirror never does.
+        """
 
         from .pending_delivery import NotificationInput
 
@@ -440,6 +457,8 @@ class ConversationChannel:
                 ),
             )
             notification = result.entries[0]
+            if result.changed:
+                publish_child_ended(child_instance_id, notification.seq, child_lifecycle)
         else:
             root_result = await self.produce_to(
                 None,
@@ -458,6 +477,10 @@ class ConversationChannel:
                     after_commit=finish_parent_marker,
                 ),
             )
+            if result.changed:
+                publish_child_ended(
+                    child_instance_id, result.entries[0].seq, child_lifecycle
+                )
             notification = root_result.entries[0]
         self._owner.causal_episodes.associate_member(
             child_instance_id, (entry.id for entry in result.entries)
