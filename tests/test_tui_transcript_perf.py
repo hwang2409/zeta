@@ -1651,6 +1651,29 @@ async def test_oversized_far_branch_clears_existing_agent_tail(tmp_path: Path) -
     store.close()
 
 
+def test_finished_limited_agent_source_keeps_final_tail(tmp_path: Path) -> None:
+    child = ConversationStore(tmp_path / "agents", session_id="1")
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("final tail")]))
+    child.start_agent_lifecycle(
+        handle="1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="general",
+        description="finished child",
+    )
+    child.finish_agent_lifecycle("completed", final_result="done")
+    child.close()
+    source = agent_sync_module.AgentTranscriptSource(
+        child.session_dir, message_limit=64
+    )
+    try:
+        snapshot = source.refresh().transcript(child.session_dir)
+        assert snapshot is not None
+        assert snapshot.messages[-1][1]["content"][0]["text"] == "final tail"
+    finally:
+        source.close()
+
+
 def test_exhausted_replace_race_keeps_previous_agent_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1683,6 +1706,45 @@ def test_exhausted_replace_race_keeps_previous_agent_snapshot(
         assert replaced_opens == 3
     finally:
         source.close()
+
+
+def test_idle_nested_agent_stores_keep_directory_fds_bounded(
+    tmp_path: Path,
+) -> None:
+    def open_fd_count() -> int:
+        directory = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        return len(os.listdir(directory))
+
+    stores = []
+    baseline = open_fd_count()
+    root = tmp_path / "sessions"
+    parent = ConversationStore(root, session_id="parent")
+    stores.append(parent)
+    try:
+        parent.start_agent_lifecycle(
+            handle="parent",
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="general",
+            description="parent",
+        )
+        for index in range(25):
+            child = ConversationStore(
+                stores[-1].session_dir / "agents", session_id=str(index)
+            )
+            child.start_agent_lifecycle(
+                handle=str(index),
+                started_at="2026-01-01T00:00:00+00:00",
+                depth=index + 2,
+                agent_type="general",
+                description="idle child",
+            )
+            stores.append(child)
+
+        assert open_fd_count() <= baseline + len(stores) * 4
+    finally:
+        for store in reversed(stores):
+            store.close()
 
 
 def test_agent_refresh_surfaces_hardlinked_file_after_snapshot(tmp_path: Path) -> None:
