@@ -1821,6 +1821,7 @@ class FinishGateBackend(CompletionBackend):
         self.background_child = background_child
         self.hold_gate_check = hold_gate_check
         self.grandchild_started = asyncio.Event()
+        self.child_final_attempt_served = asyncio.Event()
         self.grandchild_completion_published = asyncio.Event()
         self.release_grandchild = asyncio.Event()
         self.child_turn_returned = asyncio.Event()
@@ -1835,6 +1836,8 @@ class FinishGateBackend(CompletionBackend):
         self.invalid_handoff_sent = False
         self.handoff_schema_seen = False
         self.handoff_schema_seen_before_gate = False
+        self.request_count = 0
+        self.request_limit: int | None = None
 
     @owned_completion
     async def complete(
@@ -1842,6 +1845,11 @@ class FinishGateBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
+        self.request_count += 1
+        if self.request_limit is not None and self.request_count > self.request_limit:
+            raise AssertionError(
+                f"finish-gate script exceeded {self.request_limit} model requests"
+            )
         last_user = next(
             (
                 block.text
@@ -1899,6 +1907,7 @@ class FinishGateBackend(CompletionBackend):
             await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("evidence ready")]
         elif grandchild_started and gate is None and not notification:
+            self.child_final_attempt_served.set()
             blocks = [TextContent("premature child answer")]
         elif last_user == "child prompt" and gate is None:
             grandchild = _background_agent_call("grandchild")
@@ -3391,15 +3400,15 @@ async def _finish_gate_before_end_turn(
     dump_order: Callable[[], str],
 ) -> None:
     await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
-    backend.release_grandchild.set()
     await await_or_fail(
-        backend.grandchild_completion_published.wait(),
-        what="grandchild completion publication",
+        backend.child_final_attempt_served.wait(), what="child final attempt"
     )
-    assert backend.gate_calls == 0
-    if gate_engaged.is_set():
-        release_gate_engagement.set()
-        backend.release_gate_check.set()
+    await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+    backend.release_grandchild.set()
+    release_gate_engagement.set()
+    backend.release_gate_check.set()
+    await await_or_fail(backend.gate_seen.wait(), what="finish-gate model turn")
+    assert backend.gate_calls >= 1
     await await_or_fail(task, what=dump_order)
 
 
@@ -3445,6 +3454,8 @@ async def _run_child_finish_gate_order(
     if release_order is None:
         release_order = "before_gate"
     backend = FinishGateBackend("wait", hold_gate_check=monkeypatch is not None)
+    if release_order == "before_end_turn":
+        backend.request_limit = 6
     original_finish_lifecycle = ConversationStore.finish_agent_lifecycle
 
     def finish_lifecycle_barrier(
@@ -3559,6 +3570,7 @@ async def _run_child_finish_gate_order(
         )
         assert "Background updates only." in backend.completion_notification_text
         assert "evidence ready" in backend.completion_notification_text
+        assert lifecycle["final_result"].count("evidence ready") == 1
         assert backend.child_final_responses.index("premature child answer") < (
             backend.child_final_responses.index(backend.completion_notification_text)
         )
