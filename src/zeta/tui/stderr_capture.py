@@ -9,6 +9,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import warnings
 from collections.abc import Iterator
@@ -22,20 +23,20 @@ from ..core.session import env_home
 
 _TUI_STDERR_LOG = "tui-stderr.log"
 _TUI_STDERR_MAX_BYTES = 5 * 1024 * 1024
+_FLUSH_TIMEOUT = 2.0
 _QUEUE: queue.Queue[bytes] = queue.Queue(maxsize=32)
 _LOCK = threading.Lock()
 _SETUP = False
 _TERMINAL_FD: int | None = None
 _PREVIOUS_STDERR: Any = None
-_PREVIOUS_STDERR_ISATTY = False
 _WRITER_STARTED = False
-_PREVIOUS_LOG_STREAM: Any = None
 _PREVIOUS_LAST_RESORT: Any = None
 _PREVIOUS_WARNING = None
 _PREVIOUS_THREAD_HOOK = None
 _PREVIOUS_UNRAISABLE_HOOK = None
 _CAPTURE_STREAM: Any = None
 _READER: threading.Thread | None = None
+_DROPPED_ON_SHUTDOWN = 0
 _PERSIST_PROCESS = "pytest" not in sys.modules
 
 def _open_log(path: Path) -> int:
@@ -45,7 +46,14 @@ def _open_log(path: Path) -> int:
         rotated = path.with_name(path.name + ".1")
         rotated.unlink(missing_ok=True)
         path.replace(rotated)
-    return os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        os.chmod(rotated, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 def _writer() -> None:
     path = env_home() / "logs" / _TUI_STDERR_LOG
@@ -113,9 +121,6 @@ def _restore() -> None:
     if _PREVIOUS_UNRAISABLE_HOOK is not None:
         sys.unraisablehook = _PREVIOUS_UNRAISABLE_HOOK
 
-def terminal_fd() -> int | None:
-    return _TERMINAL_FD
-
 def write_terminal(message: str) -> None:
     fd = _TERMINAL_FD
     if fd is None:
@@ -144,12 +149,11 @@ def run_tui_lifecycle(args: Any, parser: Any, lifecycle: Any) -> tuple[int, str 
     return lifecycle(args, parser)
 
 def _setup() -> None:
-    global _SETUP, _TERMINAL_FD, _PREVIOUS_STDERR, _PREVIOUS_STDERR_ISATTY, _WRITER_STARTED, _READER, _PREVIOUS_LOG_STREAM, _PREVIOUS_LAST_RESORT, _PREVIOUS_WARNING, _PREVIOUS_THREAD_HOOK, _PREVIOUS_UNRAISABLE_HOOK, _CAPTURE_STREAM
+    global _SETUP, _TERMINAL_FD, _PREVIOUS_STDERR, _WRITER_STARTED, _READER, _PREVIOUS_LAST_RESORT, _PREVIOUS_WARNING, _PREVIOUS_THREAD_HOOK, _PREVIOUS_UNRAISABLE_HOOK, _CAPTURE_STREAM
     with _LOCK:
         if _SETUP:
             return
         _PREVIOUS_STDERR = sys.stderr
-        _PREVIOUS_STDERR_ISATTY = _PREVIOUS_STDERR.isatty()
         _TERMINAL_FD = os.dup(2)
         pipe_read, pipe_write = os.pipe()
         os.dup2(pipe_write, 2)
@@ -167,7 +171,6 @@ def _setup() -> None:
         sys.stderr = _CAPTURE_STREAM
         sys.__stderr__ = sys.stderr
         _PREVIOUS_LAST_RESORT = logging.lastResort
-        _PREVIOUS_LOG_STREAM = logging.lastResort.stream
         logging.lastResort = logging.StreamHandler(sys.stderr)
         _PREVIOUS_WARNING = warnings.showwarning
         warnings.showwarning = lambda message, category, filename, lineno, file=None, line=None: sys.stderr.write(warnings.formatwarning(message, category, filename, lineno, line))
@@ -177,10 +180,20 @@ def _setup() -> None:
         sys.unraisablehook = lambda hook: sys.stderr.write(f"{hook.exc_type.__name__}: {hook.exc_value}\\n")
         _SETUP = True
         atexit.register(_flush)
-        atexit.register(_restore)
 
 def _flush() -> None:
-    _QUEUE.join()
+    global _DROPPED_ON_SHUTDOWN
+    deadline = time.monotonic() + _FLUSH_TIMEOUT
+    while _QUEUE.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _DROPPED_ON_SHUTDOWN += _QUEUE.unfinished_tasks
+    while True:
+        try:
+            _QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        else:
+            _QUEUE.task_done()
 
 
 @contextmanager

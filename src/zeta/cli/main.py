@@ -1002,6 +1002,9 @@ def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str
 
 
 def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
+    from ..tui.stderr_capture import restore_stderr_for_cli
+
+    restore_stderr_for_cli()
     command = _restart_argv(entrypoint, argv, session_id)
     try:
         os.execv(entrypoint, command)
