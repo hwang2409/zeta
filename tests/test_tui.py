@@ -14745,7 +14745,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
     monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
 
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(rendered[0])
     plain = Text.from_ansi(output.getvalue()).plain
@@ -14800,7 +14800,7 @@ async def test_accounts_picker_is_view_only_during_turn_then_switches(
     busy = True
     monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
 
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     assert app.accounts_picker_active
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(rendered[0])
@@ -14811,11 +14811,16 @@ async def test_accounts_picker_is_view_only_during_turn_then_switches(
     assert "view only · switching waits until the turn ends" in plain
 
     app.accounts_picker_move(1)
-    blocked = app.accounts_picker_select()
-    assert blocked is not None
-    await asyncio.wait_for(blocked, 10)
+    assert app.accounts_picker_select() is None
+    assert app.accounts_picker_default() is None
+    app.accounts_picker_login()
+    assert app.accounts_picker_logout() is None
+    app.accounts_picker_rename()
     assert await asyncio.to_thread(context.resolve, "codex") == first
     assert app.accounts_picker_active
+    assert app._accounts_picker.switching_unavailable == (
+        "switching waits until the turn ends"
+    )
 
     busy = False
     switched = app.accounts_picker_select()
@@ -14859,10 +14864,10 @@ async def test_account_picker_ignores_repeat_select_while_switching(
         nonlocal calls
         calls += 1
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     app.accounts_picker_move(1)
 
     first_task = app.accounts_picker_select()
@@ -15035,6 +15040,11 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         del provider, build_backend
         await asyncio.to_thread(checked_switch, selected, boundary=boundary)
 
+    async def switch_account(_account, context, _prepare_backend):
+        await context.switch_active(
+            None, _account, boundary=0, provider="claude", build_backend=None
+        )
+
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
         _account_switch_task=None,
@@ -15050,6 +15060,8 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         model="offline",
         _dismiss_accounts_picker=lambda: None,
         _print_system=lambda _message: None,
+        _switch_account=switch_account,
+        _account_switch_done=lambda _task: None,
     )
 
     task = TUIApp.accounts_picker_select(app)
@@ -15121,7 +15133,7 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     publisher.start()
     assert publisher_waiting.wait(10)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
@@ -15216,7 +15228,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
@@ -15284,7 +15296,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     holder.start()
     assert locked.wait(1)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await await_or_fail(
             refresh_rendered.wait(), what="busy account refresh render"
@@ -15350,7 +15362,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
     # test-contract: seam no public account-refresh completion event exists
     monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await asyncio.wait_for(refresh_done.wait(), timeout=10)
         # test-contract: seam no public account-refresh executor identity exists
@@ -15560,7 +15572,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
     monkeypatch.setattr(AccountStore, "logout", checked_logout)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()

@@ -102,6 +102,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
         self._deferred: deque[_Message] = deque()
         self._closed = False
         self._shutting_down = False
+        self._account_switch_waiter: asyncio.Task[None] | None = None
 
     @property
     def provider_task(self) -> asyncio.Task[NotificationOutcome] | None:
@@ -773,6 +774,12 @@ class SubmissionPipeline(ApprovalPipelineMixin):
                 self._host._record_macro_receipt(receipt)
 
     def _dispatch_oldest_ready(self) -> None:
+        if self._host.account_switch_pending:
+            if self._account_switch_waiter is None:
+                waiter = asyncio.create_task(self._wait_for_account_switch())
+                self._account_switch_waiter = waiter
+                waiter.add_done_callback(self._account_switch_waiter_done)
+            return
         if self._durable_tasks:
             return
         if any(
@@ -837,6 +844,14 @@ class SubmissionPipeline(ApprovalPipelineMixin):
             self._notification_retry.recovered()
         if not entry.acknowledge_on_provider_done:
             self._ack_entry(entry)
+
+    async def _wait_for_account_switch(self) -> None:
+        await self._host.wait_for_account_switch()
+        self._send(None)
+
+    def _account_switch_waiter_done(self, task: asyncio.Task[None]) -> None:
+        if self._account_switch_waiter is task:
+            self._account_switch_waiter = None
 
     def _dispatch_provider(
         self,

@@ -306,6 +306,9 @@ class TUIApp(
         self._accounts_picker: AccountsPicker | None = None
         self._accounts_picker_unit: Any = None
         self._account_switch_task: asyncio.Task[None] | None = None
+        self._account_switch_pending = False
+        self._account_switch_finished = asyncio.Event()
+        self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
