@@ -6,14 +6,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pytest
 import httpx
+import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.test_server import TIMEOUT, _connect, _request
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.server import ZetaServer
-from zeta.server.protocol import EventDescriptor
 
 SECRET = "page-secret-never-persisted"
 
