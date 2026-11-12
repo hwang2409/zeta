@@ -159,10 +159,14 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
         session = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer x"}}]}))[-1]["result"]["session"]
         writer.close(); await writer.wait_closed()
-        await asyncio.sleep(0)
-        release = server.control._controller_release_task
-        if release is not None:
-            await asyncio.wait_for(asyncio.shield(release), 10)
+        async def wait_for_release() -> None:
+            while server.control._controller_release_task is None:
+                await asyncio.wait_for(asyncio.sleep(0), 10)
+            await asyncio.wait_for(
+                asyncio.shield(server.control._controller_release_task), 10
+            )
+
+        await asyncio.wait_for(wait_for_release(), 10)
         assert not server.runtime.loop._mcp_bindings
         reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
         try:
