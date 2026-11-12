@@ -126,7 +126,7 @@ def _select_notification_delivery(
     token_counter: Callable[[Sequence[Message]], int] | None,
 ) -> tuple[list[ConversationEntry], Message | None, bool]:
     persisted = _reuse_persisted_notification_delivery(
-        store._active_notification_delivery_message,
+        store.delivery_fold.delivery_message,
         pending,
         notification_budget,
         token_counter,

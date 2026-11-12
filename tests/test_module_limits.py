@@ -19,8 +19,10 @@ MAX_FILE_LINES = 1288
 # on 2026-10-09 for the stdlib-only migration-plan seam shipped over SSH, and
 # on 2026-11-03 for the explicit child-lifecycle seam, and on 2026-11-06 for
 # the stored-format gate shared by every persistent writer, and on 2026-11-09
-# for the child-history observer store seam.
-MAX_FILES_PER_DIRECTORY = 23
+# for the child-history observer store seam, and on 2026-11-12 to 24 for the
+# core/store delivery-fold seam (_delivery_fold.py owns the notification /
+# prompt / receipt relations as one immutable fold; p08b-2).
+MAX_FILES_PER_DIRECTORY = 24
 
 
 def test_module_limits() -> None:

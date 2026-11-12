@@ -1131,7 +1131,7 @@ class ContextAssembler(ContextMarkerMixin):
         prompt_id = metadata.get("zeta.pending_prompt_id")
         if (
             type(prompt_id) is str
-            and prompt_id in self.store._active_pending_prompt_entries
+            and prompt_id in self.store.delivery_fold.active_prompts
         ):
             return True
         delivery = metadata.get("zeta.step_delivery")
@@ -1139,7 +1139,7 @@ class ContextAssembler(ContextMarkerMixin):
             delivery.get("notification_ids") if isinstance(delivery, dict) else ()
         )
         return isinstance(notification_ids, list) and any(
-            notification_id in self.store._active_notifications
+            notification_id in self.store.delivery_fold.active_notifications
             for notification_id in notification_ids
         )
 

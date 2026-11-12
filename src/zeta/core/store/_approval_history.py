@@ -138,7 +138,11 @@ class ApprovalHistoryStoreMixin:
         # Requests of one message share a seq; the cursor is that seq with a
         # strict ``>``. Ending a page inside a message would skip its remaining
         # requests forever, so a page stops only at a message boundary (and
-        # always holds at least the first message, even past ``limit``).
+        # always holds at least the first message, even past ``limit``). The
+        # resident page counts rows while the SQL page (``pending_approval_page``)
+        # counts message seqs; both end only at a message boundary, so callers
+        # must loop until ``next_seq is None`` and must not assume one ``limit``
+        # returns every pending request.
         page: list[tuple[int, str, Mapping[str, object]]] = []
         for row in pending:
             if len(page) >= limit and row[0] != page[-1][0]:

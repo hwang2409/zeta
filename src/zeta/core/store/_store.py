@@ -76,6 +76,7 @@ from ._approval_history import ApprovalHistoryStoreMixin
 from ._async_writes import AsyncDurableWritesMixin, _AppendMessageCommand
 from ._child_runs import ChildRunStoreMixin
 from ._client_delivery import ClientDeliveryMixin
+from ._delivery_fold import DeliveryFold
 from ._execution_owner import ExecutionOwnerStoreMixin
 from ._history_index import HistoryIndex, HistoryPageStoreMixin
 from ._incremental_validation import (
@@ -102,7 +103,7 @@ from ._validation import (
     AGENT_COMPLETION_NOTIFICATION_KIND,
     MAX_AGENT_NOTIFICATION_TEXT,  # noqa: F401 - re-exported by store facade
     NOTIFICATION_KINDS,
-    TASK_EXITED_NOTIFICATION_KIND,
+    TASK_EXITED_NOTIFICATION_KIND,  # noqa: F401 - re-exported by store facade
 )
 
 
@@ -666,19 +667,15 @@ class ConversationStore(
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
         self._write_bytes(encoded)
         self._apply_history_index_entries(tuple(entries))
+        fold = self._delivery_fold.staged()
         for entry in entries:
             self._entries.append(entry)
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
-            self._record_active_entry(entry)
+            fold.apply(entry)
             self._sent_message_receipts.extend(sent_message_receipts(entry))
-            if (
-                entry.type == "notification"
-                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-            ):
-                task_id = entry.data.get("task_id")
-                if type(task_id) is str and task_id:
-                    self._task_notification_ids.add(task_id)
+            self._record_physical_entry(entry)
+        self._delivery_fold = fold
         self._record_client_delivery_entries(entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entries[-1].seq)
@@ -747,7 +744,9 @@ class ConversationStore(
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))
         if linear:
-            self._record_active_entry(entry)
+            fold = self._delivery_fold.staged()
+            fold.apply(entry)
+            self._delivery_fold = fold
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries(
@@ -757,13 +756,7 @@ class ConversationStore(
             self._sync_history_index(self._entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
-        if (
-            entry.type == "notification"
-            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-        ):
-            task_id = entry.data.get("task_id")
-            if type(task_id) is str and task_id:
-                self._task_notification_ids.add(task_id)
+        self._record_physical_entry(entry)
         self._publish_entries_installed((entry,))
         return entry
 
@@ -1074,7 +1067,7 @@ class ConversationStore(
         parent_id: str | None = None,
         reason: str | None = None,
     ) -> ConversationEntry | None:
-        branch = self.replay()
+        branch = self._active_branch()
         states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
@@ -1129,7 +1122,17 @@ class ConversationStore(
     def active_agent_receipts(self) -> tuple[tuple[str, str], ...]:
         """Return immutable child receipt coordinates from the active branch."""
 
-        return tuple(self._active_agent_receipts)
+        return tuple(self._delivery_fold.agent_receipts)
+
+    @property
+    def delivery_fold(self) -> DeliveryFold:
+        """Resident notification/prompt/receipt relations for the active branch.
+
+        The returned fold is immutable; callers read its fields and never mutate
+        it. A branch change replaces the whole object, so hold the reference only
+        for one read.
+        """
+        return self._delivery_fold
 
     def active_branch_snapshot(self) -> tuple[ConversationEntry, ...]:
         """Return stable resident entries for read-only planning."""
@@ -1169,7 +1172,7 @@ class ConversationStore(
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
-            return self._active_tool_results.get(tool_call_id)
+            return self._delivery_fold.tool_results.get(tool_call_id)
 
     @property
     def entries(self) -> list[ConversationEntry]:

@@ -220,7 +220,7 @@ def _commit_delivery_input(
             raise TerminalTargetSealedError(str(data.get("child_instance_id")))
         if (
             kind == "child_idle"
-            and data.get("child_instance_id") in store._active_completion_notifications
+            and data.get("child_instance_id") in store._delivery_fold.completions_by_child
         ):
             return ProducerResult((), False)
         existing = _existing_notification(store, kind, data, item.dedupe_key)
@@ -252,7 +252,7 @@ def _commit_delivery_input(
             pending := next(
                 (
                     entry
-                    for entry in store._active_notifications.values()
+                    for entry in store._delivery_fold.active_notifications.values()
                     if entry.data.get("kind") == "project_inbox"
                     and entry.data.get("project_id") == data.get("project_id")
                 ),
@@ -290,7 +290,7 @@ def _existing_notification(
     if kind in {"child_completion", "macro_completion"}:
         child_id = data.get("child_instance_id")
         if type(child_id) is str:
-            return store._active_completion_notifications.get(child_id)
+            return store._delivery_fold.completions_by_child.get(child_id)
     if dedupe_key is None:
         return None
     if kind == "task_exit":
@@ -307,7 +307,7 @@ def _existing_notification(
     return next(
         (
             entry
-            for entry in store._active_notifications.values()
+            for entry in store._delivery_fold.active_notifications.values()
             if entry.data.get(key_field) == data.get(key_field)
             and (
                 kind != "inbox"
@@ -339,7 +339,7 @@ def _question_answer_ack_rows(
 ) -> tuple[list[ConversationEntry], list[tuple[str, dict[str, Any]]]]:
     entries = [
         entry
-        for entry in store._active_notifications.values()
+        for entry in store._delivery_fold.active_notifications.values()
         if entry.data.get("kind") == "child_question"
         and entry.data.get("child_instance_id") == data.get("child_instance_id")
         and entry.data.get("question_id") == data.get("question_id")
@@ -354,7 +354,7 @@ def _child_question_mutation_rows(
     child_id = data.get("child_instance_id")
     entries = [
         entry
-        for entry in store._active_notifications.values()
+        for entry in store._delivery_fold.active_notifications.values()
         if entry.data.get("kind") == "child_question"
         and entry.data.get("child_instance_id") == child_id
     ]
@@ -393,13 +393,13 @@ def _select_prompt_delivery(
     prompt_entry = pending_prompts[0] if pending_prompts else None
     if prompt_entry is None:
         return None, None, False
-    prompt_message = store._active_pending_prompt_messages.get(prompt_entry.id)
+    prompt_message = store._delivery_fold.prompt_messages.get(prompt_entry.id)
     if prompt_message is not None:
         return prompt_entry, prompt_message, True
     origin = MessageOrigin(
         str(prompt_entry.data.get("origin", MessageOrigin.AGENT_SEND.value))
     )
-    trailing = store._active_last_message
+    trailing = store._delivery_fold.last_message
     if trailing is not None and _is_legacy_delivery_row(
         trailing, str(prompt_entry.data["text"]), origin
     ):
@@ -481,7 +481,7 @@ def _stage_delivery_request(
         pending_prompts = store.pending_prompt_queue._pending_unlocked()
         pending_notifications = [
             entry
-            for entry in store._active_notifications.values()
+            for entry in store._delivery_fold.active_notifications.values()
             if entry.data.get("display_only") is not True
         ]
         prompt_entry, prompt_message, prompt_persisted = _select_prompt_delivery(
@@ -526,16 +526,16 @@ def _acknowledge_staged_delivery(
 ) -> DeliveryPublications:
     with store.pending_prompt_queue._lock():
         rows: list[tuple[str, dict[str, JSONValue]]] = []
-        prompt_entry = store._active_pending_prompt_entries.get(prompt_id or "")
+        prompt_entry = store._delivery_fold.active_prompts.get(prompt_id or "")
         if prompt_entry is not None:
             rows.append(("pending_prompt_ack", {"prompt_id": prompt_id}))
         live_ids = {
             entry_id
             for entry_id in notification_ids
-            if entry_id in store._active_notifications
+            if entry_id in store._delivery_fold.active_notifications
         }
         notifications = tuple(
-            store._snapshot_entry(store._active_notifications[entry_id])
+            store._snapshot_entry(store._delivery_fold.active_notifications[entry_id])
             for entry_id in notification_ids
             if entry_id in live_ids
         )
@@ -559,7 +559,7 @@ def _admit_terminal(
         prompts = store.pending_prompt_queue._pending_unlocked()
         notifications = [
             entry
-            for entry in store._active_notifications.values()
+            for entry in store._delivery_fold.active_notifications.values()
             if entry.data.get("display_only") is not True
         ]
         pending = bool(prompts or notifications)
@@ -599,7 +599,7 @@ def _settle_terminal(
         # it is never acked, folded, or delivered here.
         rows: list[tuple[str, dict[str, Any]]] = []
         folded: list[ConversationEntry] = []
-        for entry in store._active_notifications.values():
+        for entry in store._delivery_fold.active_notifications.values():
             if entry.data.get("display_only") is True or entry.id in suppressed_ids:
                 continue
             disposition = TERMINAL_DISPOSITION[
@@ -632,7 +632,7 @@ def _drain_terminal(store: ConversationStore) -> tuple[ConversationEntry, ...]:
         store.pending_prompt_queue._drained = True
         rerouted: list[ConversationEntry] = []
         ack_rows: list[tuple[str, dict[str, Any]]] = []
-        for entry in store._active_notifications.values():
+        for entry in store._delivery_fold.active_notifications.values():
             if entry.data.get("display_only") is True:
                 continue
             late = TERMINAL_DISPOSITION[

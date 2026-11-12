@@ -363,24 +363,18 @@ def _build_append_entries(
 def _install_appended_entries(
     store: ConversationStore, entries: list[ConversationEntry]
 ) -> None:
-    from ..store._incremental_validation import TASK_EXITED_NOTIFICATION_KIND
-
     linear = not store._entries or entries[0].parent_id == store._entries[-1].id
     for entry in entries:
         store._entries.append(entry)
         store._record_entry_prefix(entry)
         store._entry_ids.add(entry.id)
         store._sent_message_receipts.extend(sent_message_receipts(entry))
-        if (
-            entry.type == "notification"
-            and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-        ):
-            task_id = entry.data.get("task_id")
-            if type(task_id) is str and task_id:
-                store._task_notification_ids.add(task_id)
+        store._record_physical_entry(entry)
     if linear:
+        fold = store._delivery_fold.staged()
         for entry in entries:
-            store._record_active_entry(entry)
+            fold.apply(entry)
+        store._delivery_fold = fold
     else:
         store._validate_entries()
         store._rebuild_incremental_validation_state()

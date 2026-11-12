@@ -4552,7 +4552,7 @@ async def test_gate_timeouts_stop_only_repeated_no_progress_calls(
                 "agent error: the model was called 2 times with the same request"
             )
             # the prompt stays saved but no longer wakes the model on its own.
-            (held,) = child_store._active_pending_prompt_entries
+            (held,) = child_store.delivery_fold.active_prompts
             assert held not in flow.pending_ids()
             # the user sees what was held, on the root transcript, durably.
             stop_text = text.split(" · ")[0].removeprefix("agent error: ")
@@ -11164,15 +11164,15 @@ async def test_step_delivery_indexes_remain_pending_only_after_acknowledgements(
         await flow.produce(_task_exit_input(f"task-{index}"))
         await flow.prepare_request("terminal_fallback", [], None)
         await flow.acknowledge_active()
-        assert len(store._active_notifications) == 0
-        assert len(store._active_pending_prompt_entries) == 0
-        assert len(store._active_pending_prompt_messages) == 0
+        assert len(store.delivery_fold.active_notifications) == 0
+        assert len(store.delivery_fold.active_prompts) == 0
+        assert len(store.delivery_fold.prompt_messages) == 0
 
     session_id = store.session_id
     await asyncio.to_thread(store.close)
     reopened = ConversationStore(tmp_path, session_id=session_id, _must_exist=True)
-    assert len(reopened._active_notifications) == 0
-    assert len(reopened._active_pending_prompt_entries) == 0
+    assert len(reopened.delivery_fold.active_notifications) == 0
+    assert len(reopened.delivery_fold.active_prompts) == 0
     snapshot_calls = 0
     original_snapshot_entry = reopened._snapshot_entry
 
@@ -11595,8 +11595,8 @@ async def test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgeme
         nonlocal publication_checked
         assert isinstance(value, pending_delivery_module.DeliveryPublications)
         assert asyncio.get_running_loop() is loop
-        assert prompt.entries[0].id in store._active_pending_prompt_entries
-        assert notification.entries[0].id in store._active_notifications
+        assert prompt.entries[0].id in store.delivery_fold.active_prompts
+        assert notification.entries[0].id in store.delivery_fold.active_notifications
         assert value.delivered_prompt is not None
         assert [entry.id for entry in value.notifications] == [
             notification.entries[0].id
@@ -11614,8 +11614,8 @@ async def test_accepted_delivery_publishes_exact_staged_ids_before_acknowledgeme
     )
     assert publication_checked
     assert events[0].type is StreamEventType.CHILD_MESSAGE_DELIVERED
-    assert prompt.entries[0].id not in store._active_pending_prompt_entries
-    assert notification.entries[0].id not in store._active_notifications
+    assert prompt.entries[0].id not in store.delivery_fold.active_prompts
+    assert notification.entries[0].id not in store.delivery_fold.active_notifications
 
 
 @pytest.mark.asyncio

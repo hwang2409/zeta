@@ -682,7 +682,11 @@ class HistoryIndex:
                 if stored is None or any(
                     stored.get(key) != value for key, value in expected.items()
                 ):
-                    self._available = False
+                    # A facts mismatch around an approval read is transient: the
+                    # caller (_decide_approval) falls back to the resident
+                    # projection. Do not clear _available; only the history-page
+                    # path owns the sidecar rebuild, so clearing it here would
+                    # make the "never marks it unavailable" docstring false.
                     raise StaleHistorySnapshot
                 return connection.execute(query, parameters).fetchall()
             except HistoryIndexError:

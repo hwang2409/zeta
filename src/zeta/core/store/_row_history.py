@@ -155,7 +155,7 @@ def validate_turn_end_data(data: Mapping[str, object]) -> None:
 
 class TurnHistoryMixin:
     def last_turn_end(self: ConversationStore) -> ConversationEntry | None:
-        entry = self._active_last_turn_end
+        entry = self._delivery_fold.last_turn_end
         return self._snapshot_entry(entry) if entry is not None else None
 
     async def append_turn_end_async(
