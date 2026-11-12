@@ -11700,13 +11700,164 @@ async def test_turn_boundary_close_races_agent_send_atomically(
     terminal = await asyncio.wait_for(close, timeout=10)
     assert terminal.pending is False
     assert terminal.closed_empty is True
-    assert await asyncio.wait_for(send, timeout=10) is None
-    assert [
-        entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)
-    ] == ["close first"]
+    # A segment_end pass that finds nothing pending means the run ended
+    # (run_consumer always breaks after it). The seal refuses a send that lands
+    # after it with the existing text, instead of queuing a prompt nothing reads.
+    refusal = await asyncio.wait_for(send, timeout=10)
+    assert refusal is not None and "no live run/child" in refusal
+    assert await asyncio.to_thread(child.pending_prompts) == []
     for watcher in watchers:
         watcher.cancel()
     await asyncio.wait_for(asyncio.gather(*watchers, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_settle_terminal_seal_refuses_racing_agent_send(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A send that lands while settle_terminal closes an ended run is refused.
+
+    settle_terminal seals the queue atomically when it finalizes a run. A
+    follow-up that arrives during that close must get the existing refusal text,
+    not a durable prompt entry that nothing will ever read.
+    """
+    parent = ConversationStore(tmp_path / "parent")
+    owner = BackgroundAgentOwner(parent)
+    handle = "parent:1"
+    child = ConversationStore(parent.session_dir / "agents", session_id="1")
+    parent.register_agent_child(
+        _run_agent_call(),
+        child_session_path=str(child.session_dir),
+        description="run",
+        agent_type="run",
+        background=True,
+        child_instance_id=handle,
+        accepts_follow_ups=True,
+    )
+    owner.conversation_channel.register_delivery_flow(
+        handle, pending_delivery_module.StepDeliveryFlow(child)
+    )
+    # test-contract: seam placeholder task models a live child watcher
+    watcher = asyncio.create_task(asyncio.Event().wait())
+    owner.register(handle, watcher.cancel, watcher, parent_store=parent)
+    try:
+        original_append_many = ConversationStore._append_many_unlocked
+        entered = threading.Event()
+        release = threading.Event()
+
+        def gate_settle_close(self, rows):
+            if self.session_dir == child.session_dir and any(
+                entry_type == "pending_queue_closed" for entry_type, _ in rows
+            ):
+                entered.set()
+                assert release.wait(2)
+            return original_append_many(self, rows)
+
+        # test-contract: seam holds the settle close so a send lands while the run ends
+        monkeypatch.setattr(
+            ConversationStore, "_append_many_unlocked", gate_settle_close
+        )
+        flow = owner.conversation_channel._delivery_targets[handle].flow
+        settle = asyncio.create_task(flow.settle_terminal())
+        assert await asyncio.to_thread(entered.wait, 2)
+        send = asyncio.create_task(
+            pending_delivery_module.send_to_run(
+                parent, handle, "after settle", owner=owner,
+                channel=owner.conversation_channel,
+            )
+        )
+        ticked = asyncio.Event()
+        asyncio.get_running_loop().call_soon(ticked.set)
+        await asyncio.wait_for(ticked.wait(), timeout=10)
+        release.set()
+        settled = await asyncio.wait_for(settle, timeout=10)
+        assert settled.prompt_pending is False
+        refusal = await asyncio.wait_for(send, timeout=10)
+        assert refusal is not None and "no live run/child" in refusal
+        assert await asyncio.to_thread(child.pending_prompts) == []
+    finally:
+        watcher.cancel()
+        await asyncio.wait_for(asyncio.gather(watcher, return_exceptions=True), 10)
+        child.close()
+        parent.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_send_in_window_c_is_refused_not_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agent_send after a background run ends, before cleanup, is refused.
+
+    End to end through the real agent_send tool: the run reaches its normal
+    segment_end, which seals the queue, but cleanup is parked so the owner still
+    controls the child (window C). The send must return the model-visible
+    refusal and leave no new pending_prompt row, instead of silently queuing a
+    follow-up that nothing reads.
+    """
+    backend = TerminalSendBackend("completed")
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend, store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    original_close = AgentLoop.close
+    in_window_c = asyncio.Event()
+    release_close = asyncio.Event()
+    parked = False
+
+    async def gated_close(
+        self,
+        *,
+        cancel_background: bool = True,
+        background_task_cause: str = "session shutdown",
+    ) -> tuple[str, ...]:
+        nonlocal parked
+        if self.agent_depth > 0 and not cancel_background and not parked:
+            parked = True
+            in_window_c.set()
+            await await_or_fail(
+                release_close.wait(), what="window-C close release"
+            )
+        return await original_close(
+            self,
+            cancel_background=cancel_background,
+            background_task_cause=background_task_cause,
+        )
+
+    # test-contract: seam parks the first window-C close so agent_send meets an ended run
+    monkeypatch.setattr(AgentLoop, "close", gated_close)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(backend.child_started.wait(), what="child start")
+        handle = _run_handle_from_receipt(store)
+        backend.release_child.set()
+        await await_or_fail(in_window_c.wait(), what="window C")
+        child_store = next(iter(loop._agent_child_stores.values()))
+        rows_before = [
+            entry.type
+            for entry in child_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ]
+        assert loop._background_owner.controls_child(store, handle) is True
+        rejected = await loop.tool_registry.execute(
+            ToolCall(
+                "send-window-c",
+                "agent_send",
+                {"child_instance_id": handle, "message": "late follow up"},
+            )
+        )
+        assert rejected["isError"] is True
+        assert "no live run/child" in rejected["content"][0]["text"]
+        assert [
+            entry.type
+            for entry in child_store.replay()
+            if entry.type in {"pending_prompt", "pending_queue_closed"}
+        ] == rows_before
+    finally:
+        release_close.set()
+        loop._background_owner.cancel_all()
+        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -20038,11 +20189,13 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         await asyncio.wait_for(lead_idle.wait(), 10)
         assert lead_idle_count >= 2
 
-        # A live explicit-finish consumer stays idle, so no public action closes its
-        # episode now that refused finish checks owned work first. This is the exact
-        # production segment transition that created the historical closed row.
-        segment_flow = pending_delivery_module.StepDeliveryFlow(lead_store)
-        terminal = await segment_flow.admit_terminal("segment_end")
+        # A live explicit-finish consumer stays idle, so no public action closes
+        # its episode. Recreate the historical mid-run closed row with the
+        # non-sealing finish intent (the real child-store mid-run closer): a
+        # close does not seal the run, so the next agent_send must still be
+        # accepted. A closed queue is not an ended run.
+        close_flow = pending_delivery_module.StepDeliveryFlow(lead_store)
+        terminal = await close_flow.admit_terminal("finish")
         assert terminal.closed_empty is True
         status = await loop.tool_registry.execute(
             ToolCall("lead-status", "agent_status", {"handle": lead_handle})
