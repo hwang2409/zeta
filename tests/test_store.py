@@ -3171,11 +3171,19 @@ def test_replay_detects_a_parent_cycle(tmp_path: Path) -> None:
     second = store.append_message(
         with_message_origin(message(MessageRole.USER, "second"), MessageOrigin.USER)
     )
-    store._resident_rows.entries[0] = replace(first, parent_id=second.id)
+    rows = store.path.read_text().splitlines()
+    first_row = json.loads(rows[-2])
+    second_row = json.loads(rows[-1])
+    first_row["parent_id"] = second.id
+    second_row["parent_id"] = first.id
+    rows[-2:] = [
+        json.dumps(first_row, separators=(",", ":"), sort_keys=True),
+        json.dumps(second_row, separators=(",", ":"), sort_keys=True),
+    ]
+    store.close()
 
     with pytest.raises(ConversationIntegrityError, match="cycle"):
-        store._resident_rows._rebuild_branch()
-        branch_entries(store)
+        ConversationStore(tmp_path, session_id=store.session_id)
 
 
 def test_duplicate_ids_are_rejected_on_load(tmp_path: Path) -> None:
