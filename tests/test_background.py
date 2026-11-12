@@ -780,7 +780,10 @@ async def test_background_task_owner_state_table(
             child_pid = await read_pid_file(child_ready)
             try:
                 await await_or_fail(probe_entered.wait(), what="live group probe")
-                assert probed_pids == [leader_pid]
+                # the drain loop re-probes the leader every 10 ms, so under load it
+                # can record the leader pid more than once before this task resumes;
+                # every probe must still target the leader group and no other pid.
+                assert probed_pids and set(probed_pids) == {leader_pid}
                 lifecycle = owner.lifecycle
                 assert lifecycle is not None
                 lifecycle.cancel()
