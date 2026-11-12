@@ -11753,7 +11753,7 @@ async def test_settle_terminal_seal_refuses_racing_agent_send(
                 assert release.wait(2)
             return original_append_many(self, rows)
 
-        # test-contract: hold the settle close so a send lands while the run ends
+        # test-contract: seam holds the settle close so a send lands while the run ends
         monkeypatch.setattr(
             ConversationStore, "_append_many_unlocked", gate_settle_close
         )
@@ -11823,7 +11823,7 @@ async def test_agent_send_in_window_c_is_refused_not_lost(
             background_task_cause=background_task_cause,
         )
 
-    # test-contract: park the first window-C close so agent_send meets an ended run
+    # test-contract: seam parks the first window-C close so agent_send meets an ended run
     monkeypatch.setattr(AgentLoop, "close", gated_close)
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
