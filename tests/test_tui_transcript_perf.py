@@ -1685,6 +1685,37 @@ def test_exhausted_replace_race_keeps_previous_agent_snapshot(
         source.close()
 
 
+def test_finished_agent_transcript_sources_release_directory_leases(
+    tmp_path: Path,
+) -> None:
+    def open_fd_count() -> int:
+        directory = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        return len(os.listdir(directory))
+
+    sources = []
+    baseline = open_fd_count()
+    for index in range(24):
+        child = ConversationStore(tmp_path / "agents", session_id=str(index))
+        child.start_agent_lifecycle(
+            handle=str(index),
+            started_at="2026-01-01T00:00:00+00:00",
+            depth=1,
+            agent_type="general",
+            description="finished child",
+        )
+        child.finish_agent_lifecycle("completed", final_result="done")
+        child.close()
+        source = agent_sync_module.AgentTranscriptSource(child.session_dir)
+        source.refresh()
+        sources.append(source)
+
+    try:
+        assert open_fd_count() <= baseline + 8
+    finally:
+        for source in sources:
+            source.close()
+
+
 def test_agent_refresh_surfaces_hardlinked_file_after_snapshot(tmp_path: Path) -> None:
     from zeta.core.session_files import SessionError
 
