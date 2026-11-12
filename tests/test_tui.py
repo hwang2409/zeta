@@ -13357,7 +13357,7 @@ def test_new_session_continues_after_failed_draft_save(
         ("render_error", False, 1),
         ("restart", False, 0),
         ("keyboard_interrupt", False, None),
-        ("unexpected_error", False, None),
+        ("unexpected_error", False, 1),
         ("render_error", True, 1),
         ("restart", True, 0),
     ),
@@ -13435,12 +13435,11 @@ def test_failed_active_draft_is_printed_on_every_exit(
     if exit_kind == "keyboard_interrupt":
         with pytest.raises(KeyboardInterrupt):
             cli_main_module.main([])
-    elif exit_kind == "unexpected_error":
-        with pytest.raises(RuntimeError, match="unexpected failure"):
-            cli_main_module.main([])
     else:
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
+    assert ("zeta: crashed; details in" in stderr) is (exit_kind == "unexpected_error")
+    assert "unexpected failure" not in stderr
     expected_drafts = 2 if with_replaced_draft else 1
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == expected_drafts
@@ -13451,14 +13450,14 @@ def test_failed_active_draft_is_printed_on_every_exit(
 
 @pytest.mark.parametrize(
     ("exit_kind", "expected_status"),
-    (("render_error", 1), ("restart", 0), ("unexpected_error", None)),
+    (("render_error", 1), ("restart", 0), ("unexpected_error", 1)),
 )
 def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     exit_kind: str,
-    expected_status: int | None,
+    expected_status: int,
 ) -> None:
     names = iter(("old", "new"))
     runs = 0
@@ -13517,12 +13516,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
     )
 
-    if exit_kind == "unexpected_error":
-        with pytest.raises(RuntimeError, match="unexpected failure"):
-            cli_main_module.main([])
-    else:
-        assert cli_main_module.main([]) == expected_status
+    assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
+    assert ("zeta: crashed; details in" in stderr) is (exit_kind == "unexpected_error")
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == 1
     assert "draft one" in stderr
