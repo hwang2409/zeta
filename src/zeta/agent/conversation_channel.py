@@ -13,6 +13,7 @@ from ..accounts.session import account_provider
 from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.store._step_delivery import TerminalTargetSealedError
 from ..protocol.types import StreamEvent, StreamEventType
 from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
 
@@ -284,6 +285,27 @@ class ConversationChannel:
         _store, parent_id = self._live_parent(child_instance_id)
         return await self.produce_to(parent_id, item)
 
+    async def _produce_to_live_parent(
+        self,
+        child_instance_id: str,
+        build: Callable[[ConversationStore], DeliveryInput],
+    ) -> tuple[ProducerResult, ConversationStore]:
+        """Produce to the live ancestor, re-resolving past any sealed store.
+
+        A completion for a child whose parent has already settled meets the
+        drained parent store and is refused. ``_live_parent`` steps over drained
+        stores, so each retry moves strictly up; root is never drained, so the
+        bounded loop ends there at the latest.
+        """
+
+        for _ in range(len(self._delivery_targets) + 1):
+            store, parent_id = self._live_parent(child_instance_id)
+            try:
+                return await self.produce_to(parent_id, build(store)), store
+            except TerminalTargetSealedError:
+                continue
+        raise TerminalTargetSealedError(child_instance_id)
+
     async def wait(self, instance_id: str) -> None:
         _loop, event = self._wakes[instance_id]
         await event.wait()
@@ -425,7 +447,7 @@ class ConversationChannel:
 
         from .pending_delivery import NotificationInput
 
-        parent_store, parent_id = self._live_parent(child_instance_id)
+        parent_store, _parent_id = self._live_parent(child_instance_id)
 
         def data_for(store: ConversationStore, *, display_only: bool) -> dict[str, Any]:
             return store._agent_notification_data(
@@ -442,24 +464,24 @@ class ConversationChannel:
                 report=report,
             )
 
-        def finish_parent_marker() -> bool:
-            parent_store._finish_agent_child_unlocked(marker_key)
-            return True
+        def build(store: ConversationStore) -> NotificationInput:
+            def finish_parent_marker() -> bool:
+                store._finish_agent_child_unlocked(marker_key)
+                return True
 
-        if self._root_store is parent_store:
-            result = await self.produce_to(
-                parent_id,
-                NotificationInput(
-                    "child_completion",
-                    data_for(parent_store, display_only=False),
-                    dedupe_key=child_instance_id,
-                    after_commit=finish_parent_marker,
-                ),
+            return NotificationInput(
+                "child_completion",
+                data_for(store, display_only=False),
+                dedupe_key=child_instance_id,
+                after_commit=finish_parent_marker,
             )
-            notification = result.entries[0]
-            if result.changed:
-                publish_child_ended(child_instance_id, notification.seq, child_lifecycle)
-        else:
+
+        # Mirror a display-only copy onto the root transcript when the effective
+        # parent is not root, so a non-root recipient shows one card and the user
+        # still sees the completion. A sealed retry that lands at root upgrades
+        # this mirror to the model-visible row.
+        root_mirror: ConversationEntry | None = None
+        if self._root_store is not parent_store:
             root_result = await self.produce_to(
                 None,
                 NotificationInput(
@@ -468,20 +490,22 @@ class ConversationChannel:
                     dedupe_key=child_instance_id,
                 ),
             )
-            result = await self.produce_to(
-                parent_id,
-                NotificationInput(
-                    "child_completion",
-                    data_for(parent_store, display_only=False),
-                    dedupe_key=child_instance_id,
-                    after_commit=finish_parent_marker,
-                ),
+            root_mirror = root_result.entries[0]
+        result, final_store = await self._produce_to_live_parent(
+            child_instance_id, build
+        )
+        # child_ended fires once, for the receipt actually created in the store
+        # that finally accepted the completion (the effective parent after any
+        # re-resolution past a sealed store), never for a refused attempt and
+        # never for the root display-only mirror.
+        if result.changed:
+            publish_child_ended(
+                child_instance_id, result.entries[0].seq, child_lifecycle
             )
-            if result.changed:
-                publish_child_ended(
-                    child_instance_id, result.entries[0].seq, child_lifecycle
-                )
-            notification = root_result.entries[0]
+        notification = (
+            result.entries[0] if self._root_store is final_store else root_mirror
+        )
+        assert notification is not None
         self._owner.causal_episodes.associate_member(
             child_instance_id, (entry.id for entry in result.entries)
         )
@@ -527,26 +551,39 @@ class ConversationChannel:
         self._pending_questions.setdefault(child_instance_id, set()).add(question_id)
         return parent_store
 
-    async def reroute_questions_from(self, dead_parent: ConversationStore) -> int:
-        """Move a dead child's live descendant input to the next live ancestor.
+    async def drain_terminal(self, dead_parent: ConversationStore) -> int:
+        """Seal a dead child's store and reroute its late descendant input.
 
-        An unanswered descendant question, and the idle or hold notice of a still
-        running grandchild, would otherwise reach no model once their direct
-        parent ends. Each is re-published to the next live ancestor; idle and hold
-        are then acked in the dead store (a question is acked by its reroute).
+        One store command seals the store and returns the pending notifications
+        that must reroute, so nothing new can land in the dead store between the
+        seal and the acks below. A still-running grandchild's question/idle/hold
+        is re-published to the next live ancestor; a grandchild completion that
+        landed after its parent settled is re-published to that ancestor
+        (upgrading the root mirror) and acked. Each reroute moves to the next
+        live ancestor; idle/hold and completions are acked in the dead store (a
+        question is acked by its reroute).
         """
 
         from .pending_delivery import NotificationInput
 
+        rerouted = await dead_parent.drain_step_delivery_terminal()
+        # Resident flag for _live_parent; the writer flag set in the command is
+        # the authority at commit time.
+        dead_parent.pending_prompt_queue._drained = True
         moved = 0
         dead_parent_id = self._target_for_store(dead_parent)
         settled_ids: list[str] = []
-        for entry in dead_parent.agent_notifications():
+        for entry in rerouted:
             kind = entry.data.get("kind")
-            if kind not in ("child_question", "child_idle", "child_hold"):
-                continue
             child_id = entry.data.get("child_instance_id")
-            if type(child_id) is not str or not self._owner.owns_running(child_id):
+            if type(child_id) is not str:
+                continue
+            if kind == "agent_completion":
+                await self._reroute_completion(entry, child_id)
+                settled_ids.append(entry.id)
+                moved += 1
+                continue
+            if not self._owner.owns_running(child_id):
                 continue
             target, parent_id = self._live_parent(child_id)
             if target is dead_parent:
@@ -582,6 +619,37 @@ class ConversationChannel:
         if settled_ids:
             await dead_parent.acknowledge_staged_delivery(None, tuple(settled_ids))
         return moved
+
+    async def _reroute_completion(
+        self, entry: ConversationEntry, child_instance_id: str
+    ) -> None:
+        """Re-publish a grandchild completion to the dead parent's live ancestor.
+
+        The completion landed in the dead store during window C. Re-publish it to
+        the live ancestor and finish that ancestor's marker for the grandchild
+        (its key is the grandchild's instance id in the transferred marker).
+        """
+
+        from .pending_delivery import NotificationInput
+
+        data = dict(entry.data)
+
+        def build(store: ConversationStore) -> NotificationInput:
+            def finish_marker() -> bool:
+                for key, marker in store.agent_children().items():
+                    if marker.get("child_instance_id") == child_instance_id:
+                        store._finish_agent_child_unlocked(key)
+                        break
+                return True
+
+            return NotificationInput(
+                "child_completion",
+                data,
+                dedupe_key=child_instance_id,
+                after_commit=finish_marker,
+            )
+
+        await self._produce_to_live_parent(child_instance_id, build)
 
     def question_answered(self, child_instance_id: str, question_id: str) -> None:
         questions = self._pending_questions.get(child_instance_id)
@@ -634,7 +702,9 @@ class ConversationChannel:
     ) -> tuple[ConversationStore, str | None]:
         store, parent_id = self._owner.parent_edge(child_instance_id, self._root_store)
         visited = {child_instance_id}
-        while parent_id is not None and parent_id not in self._wakes:
+        while parent_id is not None and (
+            parent_id not in self._wakes or store.pending_prompt_queue._drained
+        ):
             if parent_id in visited:
                 return self._root_store, None
             visited.add(parent_id)
