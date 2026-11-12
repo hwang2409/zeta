@@ -4,30 +4,74 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 CHECK_INTERVAL_SECONDS = 180.0
 
 
-def source_revision(package_file: str | Path) -> str | None:
-    """Return the checkout revision containing package_file, or disable checking."""
+def _git_directory(package_dir: Path) -> tuple[Path, Path] | None:
+    for directory in (package_dir, *package_dir.parents):
+        marker = directory / ".git"
+        try:
+            if marker.is_dir():
+                git_dir = marker
+            elif marker.is_file() and (line := marker.read_text(encoding="utf-8").strip()).startswith(
+                "gitdir: "
+            ):
+                git_dir = (marker.parent / line[8:]).resolve()
+            else:
+                continue
+            common = git_dir
+            commondir = git_dir / "commondir"
+            if commondir.is_file():
+                common = (git_dir / commondir.read_text(encoding="utf-8").strip()).resolve()
+            return git_dir, common
+        except OSError:
+            return None
+    return None
+
+
+def _ref_value(git_dir: Path, common_dir: Path, ref: str) -> str | None:
+    for directory in (git_dir, common_dir):
+        try:
+            value = (directory / ref).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
     try:
-        result = subprocess.run(
-            ["git", "-C", str(Path(package_file).resolve().parent), "rev-parse", "HEAD"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+        packed = (common_dir / "packed-refs").read_text(encoding="utf-8").splitlines()
+    except OSError:
         return None
-    revision = result.stdout.strip()
-    if result.returncode == 0 and revision:
+    for line in packed:
+        if line and not line.startswith("#") and not line.startswith("^"):
+            value, separator, packed_ref = line.partition(" ")
+            if separator and packed_ref == ref:
+                return value
+    return None
+
+
+def _checkout_revision(package_dir: Path) -> str | None:
+    directories = _git_directory(package_dir)
+    if directories is None:
+        return None
+    git_dir, common_dir = directories
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if head.startswith("ref: "):
+        return _ref_value(git_dir, common_dir, head[5:].strip())
+    return head or None
+
+
+def source_revision(package_file: str | Path) -> str | None:
+    """Return the checkout revision containing package_file, or a source fingerprint."""
+    package_dir = Path(package_file).resolve().parent
+    if revision := _checkout_revision(package_dir):
         return revision
     try:
-        package_dir = Path(package_file).resolve().parent
         digest = hashlib.sha256()
         for path in sorted(package_dir.rglob("*.py")):
             stat = path.stat()

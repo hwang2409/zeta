@@ -24,6 +24,39 @@ def test_checker_reports_one_revision_change_without_sleep() -> None:
     assert updates == [("old", "new")]
 
 
+def test_source_revision_reads_detached_and_packed_heads(tmp_path: Path) -> None:
+    package = tmp_path / "src" / "zeta" / "__init__.py"
+    package.parent.mkdir(parents=True)
+    package.write_text("")
+    git_dir = tmp_path / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "refs" / "heads" / "main").write_text("loose\n")
+    assert source_revision(package) == "loose"
+    (git_dir / "refs" / "heads" / "main").unlink()
+    (git_dir / "packed-refs").write_text("# pack-refs with: peeled fully-peeled\npacked refs/heads/main\n")
+    assert source_revision(package) == "packed"
+    (git_dir / "HEAD").write_text("detached\n")
+    assert source_revision(package) == "detached"
+
+
+def test_source_revision_reads_worktree_git_file(tmp_path: Path) -> None:
+    package = tmp_path / "worktree" / "src" / "zeta" / "__init__.py"
+    package.parent.mkdir(parents=True)
+    package.write_text("")
+    common = tmp_path / "common" / ".git"
+    worktree_git = common / "worktrees" / "linked"
+    worktree_git.mkdir(parents=True)
+    (tmp_path / "worktree" / ".git").write_text(
+        f"gitdir: {worktree_git}\n"
+    )
+    (worktree_git / "HEAD").write_text("ref: refs/heads/linked\n")
+    (worktree_git / "commondir").write_text("../..\n")
+    (common / "refs" / "heads").mkdir(parents=True)
+    (common / "refs" / "heads" / "linked").write_text("worktree\n")
+    assert source_revision(package) == "worktree"
+
+
 def test_no_git_checkout_uses_a_source_fingerprint(tmp_path: Path) -> None:
     package = tmp_path / "package.py"
     package.write_text("value = 1")
