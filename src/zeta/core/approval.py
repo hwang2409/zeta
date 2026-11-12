@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import inspect
 import os
 import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -909,14 +908,11 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             store,
         )
 
-    async def cleanup_delegated(self, child_instance_id: str) -> None:
+    def cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         """Resolve and remove all delegated requests owned by one child."""
 
         if self._serve_control is not None:
-            cleanup = self._serve_control.cleanup_delegated(child_instance_id)
-            if inspect.isawaitable(cleanup):
-                await cleanup
-            return
+            return self._serve_control.cleanup_delegated(child_instance_id)
         for key, (request, store) in list(self._delegated.items()):
             if key[0] != child_instance_id:
                 continue
@@ -925,11 +921,13 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             except ValueError:
                 pass
             finally:
-                resolution = await store.approval_resolution(request.request_id)
+                # Same-instance read-after-own-write: resolve_approval just wrote
+                # on this thread, so the resident *_now seam has the resolution.
+                resolution = store.approval_resolution_now(request.request_id)
                 if resolution is not None:
                     self._delegated_resolutions[key] = resolution
                 self._delegated.pop(key, None)
-        return
+        return None
 
     def approve(
         self,

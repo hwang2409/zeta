@@ -1156,10 +1156,9 @@ class ApprovalLifecycle:
         payload = self.observe(request, fields=approval_display_fields(request))
         if isinstance(target.key, tuple) and target.history_store is not None:
             try:
-                write = target.history_store.append_approval_history_async(
+                await target.history_store.append_approval_history_async(
                     {"event": "approval_request", **payload}
                 )
-                await asyncio.ensure_future(write)  # structural yield
             except OSError:
                 await self._settle_failed_start(record)
                 return
