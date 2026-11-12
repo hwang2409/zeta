@@ -1821,6 +1821,7 @@ class FinishGateBackend(CompletionBackend):
         self.background_child = background_child
         self.hold_gate_check = hold_gate_check
         self.grandchild_started = asyncio.Event()
+        self.grandchild_completion_published = asyncio.Event()
         self.release_grandchild = asyncio.Event()
         self.child_turn_returned = asyncio.Event()
         self.gate_seen = asyncio.Event()
@@ -1829,6 +1830,7 @@ class FinishGateBackend(CompletionBackend):
         self.gate_response_completed = asyncio.Event()
         self.model_bound_reached = asyncio.Event()
         self.child_final_responses: list[str] = []
+        self.completion_notification_text: str | None = None
         self.gate_calls = 0
         self.invalid_handoff_sent = False
         self.handoff_schema_seen = False
@@ -1959,7 +1961,16 @@ class FinishGateBackend(CompletionBackend):
             else:
                 blocks = [TextContent("I will wait for the evidence.")]
         elif notification:
-            blocks = [TextContent("merged result: evidence ready")]
+            self.grandchild_completion_published.set()
+            notification_text = next(
+                block.text
+                for message in messages
+                if message.metadata.get("zeta_event") == "agent_notifications"
+                for block in message.content
+                if isinstance(block, TextContent)
+            )
+            self.completion_notification_text = notification_text
+            blocks = [TextContent(notification_text)]
         else:
             blocks = [TextContent("root complete")]
         for block in blocks:
@@ -3341,7 +3352,7 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
     sibling_done = asyncio.Event()
-    sibling_task = asyncio.create_task(sibling_done.wait())
+    sibling_task = asyncio.create_task(asyncio.wait_for(sibling_done.wait(), 10))
     loop._background_owner.register(
         "root:sibling",
         sibling_task.cancel,
@@ -3362,8 +3373,66 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     }
     assert not sibling_task.done()
     loop._background_owner.cancel("root:sibling")
-    await asyncio.gather(sibling_task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(sibling_task, return_exceptions=True),
+        what="sibling task cleanup",
+    )
+    grandchild_store.close()
     await loop.close()
+
+
+async def _finish_gate_before_end_turn(
+    backend: FinishGateBackend,
+    gate_engaged: asyncio.Event,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+    dump_order: Callable[[], str],
+) -> None:
+    await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+    backend.release_grandchild.set()
+    await await_or_fail(
+        backend.grandchild_completion_published.wait(),
+        what="grandchild completion publication",
+    )
+    assert backend.gate_calls == 0
+    if gate_engaged.is_set():
+        release_gate_engagement.set()
+        backend.release_gate_check.set()
+    await await_or_fail(task, what=dump_order)
+
+
+async def _finish_gate_before_gate(
+    backend: FinishGateBackend,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+    dump_order: Callable[[], str],
+) -> None:
+    await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+    backend.release_grandchild.set()
+    await await_or_fail(
+        backend.grandchild_completion_published.wait(),
+        what="grandchild completion publication",
+    )
+    release_gate_engagement.set()
+    backend.release_gate_check.set()
+    await await_or_fail(task, what=dump_order)
+
+
+async def _finish_gate_after_gate(
+    backend: FinishGateBackend,
+    gate_engaged: asyncio.Event,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+) -> None:
+    await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+    release_gate_engagement.set()
+    await await_or_fail(
+        backend.gate_check_started.wait(), what="finish-gate check"
+    )
+    assert not backend.gate_seen.is_set()
+    backend.release_gate_check.set()
+    await await_or_fail(backend.gate_seen.wait(), what="finish-gate model turn")
+    assert not task.done()
 
 
 async def _run_child_finish_gate_order(
@@ -3374,6 +3443,21 @@ async def _run_child_finish_gate_order(
     if release_order is None:
         release_order = "before_gate"
     backend = FinishGateBackend("wait", hold_gate_check=monkeypatch is not None)
+    original_finish_lifecycle = ConversationStore.finish_agent_lifecycle
+
+    def finish_lifecycle_barrier(
+        store: ConversationStore, state: str, **kwargs: object
+    ) -> None:
+        original_finish_lifecycle(store, state, **kwargs)
+        if state == "completed":
+            backend.grandchild_completion_published.set()
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            ConversationStore,
+            "finish_agent_lifecycle",
+            finish_lifecycle_barrier,
+        )
     gate_engaged = asyncio.Event()
     release_gate_engagement = asyncio.Event()
     if monkeypatch is None:
@@ -3425,38 +3509,26 @@ async def _run_child_finish_gate_order(
         return "finish-gate order completion"
 
     try:
-        if release_order == "before_end_turn":
-            await await_or_fail(
-                backend.grandchild_started.wait(), what="grandchild start"
-            )
+        if monkeypatch is None:
             backend.release_grandchild.set()
-            if not gate_engaged.is_set():
-                await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
-            release_gate_engagement.set()
-            backend.release_gate_check.set()
-            await await_or_fail(task, what=dump_order)
-        else:
+            await await_or_fail(task, what="finish-gate completion")
+        elif release_order == "before_end_turn":
+            await _finish_gate_before_end_turn(
+                backend,
+                gate_engaged,
+                release_gate_engagement,
+                task,
+                dump_order,
+            )
+        elif release_order == "before_gate":
             await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
-            if release_order == "before_gate":
-                await await_or_fail(
-                    backend.grandchild_started.wait(), what="grandchild start"
-                )
-                backend.release_grandchild.set()
-                release_gate_engagement.set()
-                backend.release_gate_check.set()
-                await await_or_fail(task, what=dump_order)
-            else:
-                release_gate_engagement.set()
-                await await_or_fail(
-                    backend.gate_check_started.wait(), what="finish-gate check"
-                )
-                assert not backend.gate_seen.is_set()
-                backend.release_gate_check.set()
-            if expect_gate_call:
-                await await_or_fail(
-                    backend.gate_seen.wait(), what="finish-gate model turn"
-                )
-            assert not task.done() if release_order == "after_gate" else task.done()
+            await _finish_gate_before_gate(
+                backend, release_gate_engagement, task, dump_order
+            )
+        else:
+            await _finish_gate_after_gate(
+                backend, gate_engaged, release_gate_engagement, task
+            )
         child_store = ConversationStore(store.session_dir / "agents", session_id="1")
         if expect_gate_call:
             gate_message = next(
@@ -3479,9 +3551,14 @@ async def _run_child_finish_gate_order(
         child_store = ConversationStore(store.session_dir / "agents", session_id="1")
         lifecycle = child_store.agent_lifecycle()
         assert lifecycle is not None
-        assert lifecycle["final_result"].startswith("merged result: evidence ready")
+        assert backend.completion_notification_text is not None
+        assert lifecycle["final_result"].startswith(
+            backend.completion_notification_text
+        )
+        assert "Background updates only." in backend.completion_notification_text
+        assert "evidence ready" in backend.completion_notification_text
         assert backend.child_final_responses.index("premature child answer") < (
-            backend.child_final_responses.index("merged result: evidence ready")
+            backend.child_final_responses.index(backend.completion_notification_text)
         )
         assert not store.agent_children()
     finally:
