@@ -119,6 +119,7 @@ from zeta.server.approval_lifecycle import (
 from zeta.server.connections import Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
+    LIVE_NOTIFICATION_KINDS,
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
     tool_end,
@@ -182,7 +183,8 @@ def _hold_registry_lock_after_start(
 
 def test_every_durable_notification_kind_has_an_explicit_wire_event() -> None:
     assert NOTIFICATION_KINDS
-    assert set(NOTIFICATION_WIRE_EVENTS) == set(NOTIFICATION_KINDS)
+    assert not (set(NOTIFICATION_KINDS) & LIVE_NOTIFICATION_KINDS)
+    assert set(NOTIFICATION_WIRE_EVENTS) == set(NOTIFICATION_KINDS) | LIVE_NOTIFICATION_KINDS
     assert all(
         event != "sub_agent_receipt" or kind == "agent_completion"
         for kind, event in NOTIFICATION_WIRE_EVENTS.items()

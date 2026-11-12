@@ -551,6 +551,14 @@ def render_agent_notification(
         if not isinstance(text, str):
             return Text("project inbox notification unavailable", style=theme.ERROR)
         return Text(text, style=theme.NOTICE, overflow="ellipsis", no_wrap=True)
+    if kind == "project_inbox_health":
+        state = event.data.get("state")
+        reason = event.data.get("reason")
+        if state not in {"healthy", "degraded"}:
+            return Text("project inbox health unavailable", style=theme.ERROR)
+        suffix = f": {reason[:200]}" if isinstance(reason, str) else ""
+        style = theme.RECEIPT if state == "healthy" else theme.WARNING
+        return Text(f"project inbox {state}{suffix}", style=style, overflow="ellipsis", no_wrap=True)
     if kind == "task_exited":
         task_id = event.data.get("task_id", "?")
         note = event.data.get("note")

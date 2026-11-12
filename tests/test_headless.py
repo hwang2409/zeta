@@ -71,7 +71,12 @@ async def _drive(loop: AgentLoop, prompt: str, output_format: str) -> tuple[int,
 @pytest.mark.asyncio
 async def test_headless_thinking_only_max_tokens_is_an_error(tmp_path: Path) -> None:
     loop = AgentLoop(
-        FakeBackend([ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens")]),
+        FakeBackend(
+            [
+                ScriptedTurn([ThinkingContent("planning", "sig-1")], stop_reason="max_tokens"),
+                ScriptedTurn([ThinkingContent("still planning", "sig-2")], stop_reason="max_tokens"),
+            ]
+        ),
         ConversationStore(tmp_path),
         skill_catalog=SkillCatalog.empty(),
     )

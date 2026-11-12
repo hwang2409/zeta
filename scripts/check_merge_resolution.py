@@ -1200,10 +1200,22 @@ def _normalized_python_lines(source: str) -> list[str]:
     return ["".join(line) for line in lines]
 
 
+_NORMALIZED_CACHE: dict[tuple[bool, str], list[str]] = {}
+
+
 def _normalized_lines(path: str, source: str) -> list[str]:
-    return _normalized_python_lines(source) if path.endswith(".py") else [
+    # The same blob is normalized up to four times per path (base/main/branch/merge
+    # often share content), so cache by content for the process lifetime. The result
+    # is only read, never mutated. Tokenizing is the dominant cost on historical merges.
+    key = (path.endswith(".py"), source)
+    cached = _NORMALIZED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = _normalized_python_lines(source) if key[0] else [
         " ".join(line.split()) for line in source.splitlines()
     ]
+    _NORMALIZED_CACHE[key] = result
+    return result
 
 
 def _deleted_intervals(base: list[str], main: list[str]) -> list[tuple[int, int]]:
@@ -1254,13 +1266,19 @@ def _removed_line_findings(
     path: str, base_text: str, main_text: str, branch_text: str, merge_text: str,
     main_range: str, final_text: str | None = None,
 ) -> list[Item]:
+    if base_text == main_text:
+        return []  # main did not touch this file, so it deleted nothing to re-add.
+    if merge_text == main_text:
+        return []  # the merge took main's file verbatim, so every main deletion holds.
     base = _normalized_lines(path, base_text)
     main = _normalized_lines(path, main_text)
+    deleted = _deleted_intervals(base, main)
+    if not deleted:
+        return []  # no main deletions means nothing can be re-added past one.
     branch = _normalized_lines(path, branch_text)
     merge_lines = merge_text.splitlines()
     merge = _normalized_lines(path, merge_text)
     final = _normalized_lines(path, final_text) if final_text is not None else None
-    deleted = _deleted_intervals(base, main)
     replacements = _branch_replacements(base, branch, deleted)
     findings = []
     for base_index, _old_end, replacement in replacements:
