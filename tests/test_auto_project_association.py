@@ -138,6 +138,7 @@ def test_busy_registry_retries_project_discovery(
             raise ProjectRegistryBusyError()
         original(fd, mode)
 
+    # test-contract: seam force a bounded busy-lock interleaving
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
     opened = m.create(provider="codex", model="test", cwd=root)
     try:
