@@ -119,7 +119,6 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
-from zeta.server.background_events import BackgroundEventPublisher
 from zeta.server.connections import Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
@@ -1033,6 +1032,7 @@ async def _frames_until_error(
 ) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     while True:
+        # test-contract: transport read the intentional terminal error and EOF directly
         line = await await_or_fail(reader.readline(), what=f"protocol error {code}")
         assert line, f"connection closed before protocol error {code}"
         frame = json.loads(line)
@@ -2661,11 +2661,13 @@ async def test_background_event_bound_waits_without_dropping(
 
     # test-contract: seam force semantic work to hold the bounded publisher
     monkeypatch.setattr(server.control, "_event", publish)
-    server.control._background_events = BackgroundEventPublisher(
-        server.control._publish_background_event_to_wire,
-        max_events=2,
-        max_bytes=1024,
+    publisher = server.control._background_events
+    # test-contract: seam use one small shared bound on old and new implementations
+    monkeypatch.setattr(
+        "zeta.server.background_events._MAX_PENDING_FRAMES", 2, raising=False
     )
+    publisher._max_events = 2
+    publisher._max_bytes = 1024
     entered = [asyncio.Event() for _ in range(3)]
 
     async def produce(index: int, session_id: str) -> None:

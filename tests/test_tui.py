@@ -5447,7 +5447,7 @@ async def test_shared_background_sink_renders_through_tui_presenter(
     async with owned_app(app):
         result = app.loop._publish_background_event(event)
         if inspect.isawaitable(result):
-            await result
+            await await_or_fail(result, what="TUI background event")
 
         assert "nested research" in output.getvalue()
         assert "depth 2" in output.getvalue()
