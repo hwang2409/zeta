@@ -164,7 +164,9 @@ def _bound(registry: ToolRegistry) -> tuple[ProjectInbox, str, str]:
     tracker = registry.sent_message_tracker
     if tracker is None:
         tracker = SentMessageTracker(
-            projects.root.parent / "sessions", store.session_id
+            projects.root.parent / "sessions",
+            store.session_id,
+            observed_epoch=store.observed_storage_epoch,
         )
         registry.sent_message_tracker = tracker
     return (

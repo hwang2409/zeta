@@ -783,7 +783,8 @@ class ApprovalLifecycle:
             and token == current.token
         )
         if resolution is None:
-            if owns_record and decision == "abort" and self.state.health is not None:
+            # a gone delegated child store publishes live-only, not a session fail
+            if owns_record and decision == "abort" and (self.state.health is not None or isinstance(target.key, tuple)):
                 synthetic = {
                     "request_id": target.store_request_id,
                     "decision": "abort",

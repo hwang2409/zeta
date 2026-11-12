@@ -19,8 +19,10 @@ _DURABILITY_CALLBACKS = {
     ("project_registry.py", "_publish", "atomic_publish_file"),
     ("project_registry.py", "_update_sessions_locked", "atomic_publish_file"),
     ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
+    ("project_inbox_sent/__init__.py", "_write_spill", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
     ("project_inbox.py", "_set_delegation", "atomic_publish_file"),
+    ("project_inbox_sent/generation.py", "advance", "atomic_publish_file"),
     (
         "memory/entry_history.py",
         "_rollback_memory_migration_for_test",
@@ -101,6 +103,7 @@ _RAW_DELETION = {
     ("mcp/management.py", "_atomic_json", "unlink"),
     ("mcp/oauth_store.py", "_publish_locked", "unlink"),
     ("mcp/stderr_log.py", "_rotate", "unlink"),
+    ("project_inbox_sent/__init__.py", "_delete_spill", "unlink"),
     ("memory/auto.py", "_append_diagnostic_record", "unlink"),
     ("memory/entry_access.py", "_refresh_entry_memory_mirror", "unlink"),
     ("memory/entry_history.py", "_rollback_memory_migration_for_test", "unlink"),
