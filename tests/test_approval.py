@@ -905,8 +905,9 @@ def test_append_superset_preserves_all_approval_requests(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert asyncio.run(reopened.approval_state(call_a.id)) is not None
-    assert asyncio.run(reopened.approval_state(call_b.id)) is not None
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_same_parent_superset_keeps_the_prior_request(
@@ -929,8 +930,9 @@ def test_same_parent_superset_keeps_the_prior_request(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert asyncio.run(reopened.approval_state(call_a.id)) is not None
-    assert asyncio.run(reopened.approval_state(call_b.id)) is not None
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_append_uses_the_target_parent_branch(
@@ -953,8 +955,9 @@ def test_append_uses_the_target_parent_branch(
     )
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert asyncio.run(reopened.approval_state(call_a.id)) is not None
-    assert asyncio.run(reopened.approval_state(call_b.id)) is not None
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call_a.id, call_b.id}
 
 
 def test_append_target_parent_ignores_active_child_requests(
@@ -984,7 +987,9 @@ def test_append_target_parent_ignores_active_child_requests(
 
     assert sibling.data["approval_requests"]
     reopened = ConversationStore(approval_root, session_id=store.session_id)
-    assert asyncio.run(reopened.approval_state(call.id)) is not None
+    assert {
+        rid for rid, _ in asyncio.run(reopened.pending_approval_page()).items
+    } == {call.id}
 
 
 def test_abandoned_exact_sibling_is_not_deduped(
