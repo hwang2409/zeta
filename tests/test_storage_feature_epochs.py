@@ -15,7 +15,7 @@ from zeta.memory.auto import AutoMemoryReconciler
 from zeta.project_errors import ProjectRegistryError
 from zeta.project_registry import ProjectRegistry
 from zeta.skills import SkillCatalog
-from zeta.storage_format import StorageFormatError, open_writer
+from zeta.storage_format import StorageFormatError, advance, open_writer
 from zeta.tools.registry import ToolRegistry
 
 
@@ -89,16 +89,17 @@ def test_writer_epoch_token_checker_ignores_strings_and_comments() -> None:
 
 @pytest.mark.parametrize("case", ["repair", "memory", "attention"])
 def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, case):
-    monkeypatch.setattr(storage_format, "WRITER_EPOCH", 6)
+    advance(tmp_path, expected_epoch=0, target_epoch=5)
     opened = _session(tmp_path)
     opened.store.close()
+    monkeypatch.setattr(storage_format, "WRITER_EPOCH", storage_format.WRITER_EPOCH)
 
     if case == "repair":
         # the real conversation-store constructor repairs a torn tail.
         import zeta.core.store._log as log_module
         from zeta.core.store import ConversationStore
 
-        monkeypatch.setattr(log_module, "WRITER_EPOCH", 6, raising=False)
+        monkeypatch.setattr(log_module, "WRITER_EPOCH", storage_format.WRITER_EPOCH, raising=False)
         path = opened.store.path
         with path.open("ab") as handle:
             handle.write(b'{"seq": 99, "id": "torn"')
@@ -113,7 +114,7 @@ def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, ca
         # recovery_committed writes through the real reconciler state path.
         import zeta.memory.auto as auto_module
 
-        monkeypatch.setattr(auto_module, "WRITER_EPOCH", 6, raising=False)
+        monkeypatch.setattr(auto_module, "WRITER_EPOCH", storage_format.WRITER_EPOCH, raising=False)
         registry = ProjectRegistry(tmp_path / "projects")
         project = registry.create_project("memory", "scope", tmp_path)
         registry.initialize_memory(project.project_id)
@@ -145,7 +146,7 @@ def test_epoch5_home_writes_survive_a_new_writer_epoch(tmp_path, monkeypatch, ca
     # request_attention is the real non-decision request path and uses the observed epoch.
     from zeta import attention_records
 
-    monkeypatch.setattr(attention_records, "ATTENTION_KIND_EPOCH", 6, raising=False)
+    monkeypatch.setattr(attention_records, "ATTENTION_KIND_EPOCH", storage_format.WRITER_EPOCH, raising=False)
     attention = _session(tmp_path)
     registry_tools = ToolRegistry(
         tmp_path, session_store=attention.store, skill_catalog=SkillCatalog.empty()
