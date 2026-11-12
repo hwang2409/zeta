@@ -67,6 +67,7 @@ from zeta.storage_format import (
     ACCEPTED_KEY_SETS,
     _read_manifest,
     compare_registry_dumps,
+    reject_unknown_keys,
     validate_retention_arm,
     validate_retention_manifest,
     validate_retention_preview,
@@ -1274,6 +1275,15 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
                 "preview": None,
             },
             ACCEPTED_KEY_SETS["retention_state"],
+        ),
+        ShapeCase(
+            "inbox_delegation",
+            lambda value: (
+                reject_unknown_keys(value, "inbox_delegation"),
+                _exact_dict(value, {"from_project", "kind"}, "inbox_delegation"),
+            ),
+            {"from_project": "p_" + "a" * 32, "kind": "question"},
+            frozenset({"from_project", "kind"}),
         ),
     ]
 

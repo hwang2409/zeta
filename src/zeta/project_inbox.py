@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import stat
 import time
 import uuid
@@ -26,12 +26,19 @@ from .core.session_files import (
     reference_publication,
 )
 from .project_errors import ProjectNotFoundError
+from .project_inbox_provenance import decorate, delegation_enabled
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
+from .project_inbox_sent.scanner import ProjectInboxScanner  # noqa: F401
 from .project_registry import Project, ProjectRegistry, ProjectRegistryError
 from .session_liveness import session_is_live
 from .storage_format import (
     CLOSED_VARIANTS,
+    FEATURE_EPOCHS,
+    StorageFeature,
+    feature_enabled,
     mapping_mutations,
+    open_writer,
+    reject_unknown_keys,
     require_closed_variant,
 )
 
@@ -42,7 +49,9 @@ SENT_PAGE_LIMIT = 100
 _SENT_TRACKING_FILE = "project-inbox-sent.json"
 SENT_STATUS_EVENT = "project_inbox_sent_status"
 KINDS = frozenset(str(value) for value in CLOSED_VARIANTS["inbox.kind"])
-LOCAL_ORIGIN = "local"
+AGENT_ORIGIN = "agent"
+USER_ORIGIN = "user"
+LEGACY_LOCAL_ORIGIN = "local"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
@@ -98,6 +107,16 @@ def _bounded_error(message: str) -> InboxError:
     return InboxError(message)
 
 
+@contextmanager
+def _storage_errors() -> Iterator[None]:
+    try:
+        yield
+    except InboxError:
+        raise
+    except (OSError, ProjectRegistryError, SessionError) as exc:
+        raise InboxError("inbox storage is unsafe or unavailable") from exc
+
+
 def _validate_json_shape(value: object) -> None:
     stack = [(value, 0)]
     nodes = 0
@@ -113,80 +132,6 @@ def _validate_json_shape(value: object) -> None:
         children = current.values() if isinstance(current, dict) else current
         for child in children:
             stack.append((child, depth + 1))
-
-
-class ProjectInboxScanner:
-    """Poll incoming directories and sender-owned sent-message records."""
-
-    def __init__(
-        self,
-        registry: ProjectRegistry,
-        project_id: str,
-        *,
-        sessions_root: Path,
-        session_id: str | None = None,
-        tracker: SentMessageTracker | None = None,
-    ) -> None:
-        if tracker is not None and tracker.session_id != session_id:
-            raise ValueError("sent-message tracker belongs to another session")
-        self.inbox = ProjectInbox(
-            registry, sessions_root=sessions_root, sent_tracker=tracker
-        )
-        self.project_id = project_id
-        self.session_id = session_id
-        self.tracker = tracker or (
-            SentMessageTracker(sessions_root, session_id)
-            if session_id is not None
-            else None
-        )
-        self._activation_sent_outcome: SentLedgerOutcome[None] | None = None
-        self._fingerprint: tuple[tuple[int, int, int, int] | None, ...] | None = None
-
-    def scan(self) -> tuple[str, ...] | None:
-        current = self._directory_fingerprint()
-        if self._fingerprint is not None and current == self._fingerprint:
-            return None
-        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
-        self._fingerprint = (
-            current
-            if any(item is not None for item in current)
-            else self._directory_fingerprint()
-        )
-        return message_ids
-
-    def scan_sent(self) -> tuple[dict[str, Any], ...]:
-        """Read only sender-tracked targets; empty tracking has no inbox I/O."""
-        if self.tracker is None or self.session_id is None:
-            return ()
-        if not self.tracker.broken_cached and not self.tracker._pending:
-            return ()
-        source = self.inbox._resolve_project(self.project_id)
-        outcome = self.tracker.sent_view(
-            self.inbox, source.project_id, self.tracker._receipts
-        )
-        return tuple(
-            item
-            for item in outcome.result
-            if "done" not in item.get("reported", [])
-        )
-
-    def mark_reported(self, statuses: Iterator[tuple[str, str]]) -> None:
-        if self.tracker is not None:
-            self.tracker.mark_reported(statuses)
-
-    def _directory_fingerprint(self) -> tuple[tuple[int, int, int, int] | None, ...]:
-        inbox = self.inbox.registry.root / self.project_id / "inbox"
-        result: list[tuple[int, int, int, int] | None] = []
-        for name in ("new", "claimed"):
-            try:
-                info = (inbox / name).stat(follow_symlinks=False)
-            except FileNotFoundError:
-                result.append(None)
-            else:
-                result.append(
-                    (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
-                )
-        return tuple(result)
 
 
 class ProjectInbox:
@@ -205,11 +150,84 @@ class ProjectInbox:
         self.sent_tracker = sent_tracker
         self.receipts = tuple(receipts)
 
+    def command(self, project: str, args: str, *, from_session: str | None = None) -> str:
+        body = None
+        if args.startswith("send ") and " -- " in args:
+            prefix, body = args.split(" -- ", 1)
+            parts = shlex.split(prefix)
+        else:
+            parts = shlex.split(args)
+        if not parts:
+            return json.dumps(self.list(project), indent=2, sort_keys=True)
+        if parts[0] == "send":
+            if body is None or from_session is None or len(parts) != 4:
+                raise InboxError("usage: /inbox send <recipient-project> <kind> <title> -- <body>")
+            message_id = self.send_user(
+                from_project=project,
+                from_session=from_session,
+                to_project=parts[1],
+                kind=parts[2],
+                title=parts[3],
+                body=body,
+            )
+            return f"inbox message sent: {message_id}"
+        if parts[0] not in {"delegate", "revoke", "delegations"}:
+            raise InboxError("usage: /inbox [send|delegate|revoke|delegations]")
+        if parts[0] == "delegations":
+            if len(parts) != 1:
+                raise InboxError("usage: /inbox delegations")
+            rows = [
+                {"from_project": source, "kind": kind}
+                for source, kind in sorted(self._delegations(self._resolve_project(project).project_id))
+            ]
+            return json.dumps({"delegations": rows}, indent=2, sort_keys=True)
+        if len(parts) != 3:
+            raise InboxError(f"usage: /inbox {parts[0]} <sender-project> <kind>")
+        self.set_delegation(
+            project,
+            parts[1],
+            parts[2],
+            enabled=parts[0] == "delegate",
+        )
+        return f"inbox delegation {parts[0]}d: {parts[1]} {parts[2]}"
+
     def known_projects(self) -> list[dict[str, str]]:
         return [
             {"id": project.project_id, "name": project.name, "scope": project.scope}
             for project in self.registry.list_projects()
         ]
+
+    def _delegations(self, project_id: str) -> set[tuple[str, str]]:
+        path = self.registry.root / project_id / "inbox" / "delegations.json"
+        try:
+            with path.open(encoding="utf-8") as stream:
+                value = json.load(stream)
+        except FileNotFoundError:
+            return set()
+        if not isinstance(value, dict) or set(value) != {"schema_version", "delegations"}:
+            raise InboxError("invalid inbox delegations")
+        if value["schema_version"] != 1 or not isinstance(value["delegations"], list):
+            raise InboxError("invalid inbox delegations")
+        result: set[tuple[str, str]] = set()
+        for item in value["delegations"]:
+            if not isinstance(item, dict):
+                raise InboxError("invalid inbox delegations")
+            try:
+                reject_unknown_keys(item, "inbox_delegation")
+            except ValueError as exc:
+                raise InboxError("invalid inbox delegations") from exc
+            source, kind = item.get("from_project"), item.get("kind")
+            if not isinstance(source, str) or not isinstance(kind, str):
+                raise InboxError("invalid inbox delegations")
+            try:
+                require_closed_variant("inbox.kind", kind)
+            except ValueError as exc:
+                raise InboxError("invalid inbox delegations") from exc
+            result.add((source, kind))
+        return result
+
+    def decorate(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        return decorate(self.registry, project_id, record, self._delegations(project_id))
 
     def send(
         self,
@@ -224,8 +242,11 @@ class ProjectInbox:
         message_id: str | None = None,
         to_session: str | None = None,
         on_visible: Callable[[], None] | None = None,
+        _origin: str = AGENT_ORIGIN,
     ) -> str:
-        message_id, _outcome = self.send_with_outcome(
+        message_id, _outcome = self._deliver(
+            origin=_origin,
+            on_visible=on_visible,
             from_project=from_project,
             from_session=from_session,
             to_project=to_project,
@@ -235,9 +256,60 @@ class ProjectInbox:
             in_reply_to=in_reply_to,
             message_id=message_id,
             to_session=to_session,
-            on_visible=on_visible,
         )
         return message_id
+
+    def set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
+        with open_writer(self.registry.root.parent) as lease, self.registry._lease_context(lease):
+            if not feature_enabled(lease.observed_epoch, StorageFeature.INBOX_DELEGATION):
+                raise InboxError(
+                    "inbox delegations require stored-format epoch "
+                    f"{FEATURE_EPOCHS[StorageFeature.INBOX_DELEGATION]}"
+                )
+            return self._set_delegation(recipient, sender, kind, enabled=enabled)
+
+    def _set_delegation(self, recipient: str, sender: str, kind: str, *, enabled: bool) -> None:
+        recipient_project = self._resolve_project(recipient).project_id
+        sender_project = self._resolve_project(sender).project_id
+        try:
+            require_closed_variant("inbox.kind", kind)
+        except ValueError as exc:
+            raise InboxError(f"unknown message kind: {kind}") from exc
+        with self._lock(recipient_project, exclusive=True) as project_fd:
+            current = self._delegations(recipient_project)
+            key = (sender_project, kind)
+            if enabled:
+                current.add(key)
+            else:
+                current.discard(key)
+            rows = [
+                {"from_project": source, "kind": message_kind}
+                for source, message_kind in sorted(current)
+            ]
+            payload = json.dumps(
+                {"schema_version": 1, "delegations": rows},
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            inbox_fd = os.open(
+                "inbox", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=project_fd
+            )
+            try:
+                atomic_publish_file(inbox_fd, "delegations.json", payload, sync_directory=True)
+            finally:
+                os.close(inbox_fd)
+
+    def send_agent(self, **kwargs: Any) -> str:
+        return self.send(**kwargs, _origin=AGENT_ORIGIN)
+
+    def send_user(self, **kwargs: Any) -> str:
+        return self.send(**kwargs, _origin=USER_ORIGIN)
+
+    def send_agent_with_outcome(self, **kwargs: Any) -> tuple[str, SentLedgerOutcome[None]]:
+        return self.send_with_outcome(**kwargs, _origin=AGENT_ORIGIN)
+
+    def send_user_with_outcome(self, **kwargs: Any) -> tuple[str, SentLedgerOutcome[None]]:
+        return self.send_with_outcome(**kwargs, _origin=USER_ORIGIN)
 
     def send_with_outcome(
         self,
@@ -251,9 +323,10 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
-        on_visible: Callable[[], None] | None = None,
+        _origin: str = AGENT_ORIGIN,
     ) -> tuple[str, SentLedgerOutcome[None]]:
-        return self._send_with_outcome(
+        return self._deliver(
+            origin=_origin,
             from_project=from_project,
             from_session=from_session,
             to_project=to_project,
@@ -263,10 +336,38 @@ class ProjectInbox:
             in_reply_to=in_reply_to,
             message_id=message_id,
             to_session=to_session,
-            on_visible=on_visible,
         )
 
-    def _send_with_outcome(
+    def _deliver(
+        self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
+    ) -> tuple[str, SentLedgerOutcome[None]]:
+        session, target, message_id, to_session, body, record = self._outgoing(**kwargs)
+        # The reference gate holds storage authority while this message (a reference
+        # to one or two sessions) is published and recorded in the sent ledger.
+        with reference_publication(
+            self.registry.root.parent,
+            self.registry._storage_lease,
+            referenced_ids=(session, to_session) if to_session else (session,),
+        ):
+            with self._directories(target, create=True) as dirs:
+                self._publish_outgoing(dirs, message_id, body, record)
+            if on_visible is not None:
+                try:
+                    on_visible()
+                except Exception:  # noqa: BLE001,S110
+                    # The durable record remains authoritative if its wake cannot run.
+                    pass
+            outcome = self._sent_tracker(session).record(
+                message_id, target, _storage_lease=self.registry._storage_lease
+            )
+        return message_id, outcome
+
+    def _sent_tracker(self, session: str) -> SentMessageTracker:
+        if self.sent_tracker is not None and self.sent_tracker.session_id == session:
+            return self.sent_tracker
+        return SentMessageTracker(self.sessions_root, session)
+
+    def _outgoing(
         self,
         *,
         from_project: str,
@@ -278,8 +379,8 @@ class ProjectInbox:
         in_reply_to: str | None = None,
         message_id: str | None = None,
         to_session: str | None = None,
-        on_visible: Callable[[], None] | None = None,
-    ) -> tuple[str, SentLedgerOutcome[None]]:
+        origin: str = AGENT_ORIGIN,
+    ) -> tuple[str, str, str, str | None, str, dict[str, Any]]:
         sender = self._resolve_project(from_project)
         target = self._resolve_project(to_project)
         session = _id(from_session, "session id")
@@ -297,7 +398,6 @@ class ProjectInbox:
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,
-            "origin": LOCAL_ORIGIN,
             "from": {"project": sender.project_id, "session": session},
             "to_project": target.project_id,
             "to_session": to_session,
@@ -307,83 +407,61 @@ class ProjectInbox:
             "in_reply_to": in_reply_to,
             "created_at": _now(),
         }
-        with reference_publication(
-            self.registry.root.parent,
-            self.registry._storage_lease,
-            referenced_ids=(session, to_session) if to_session else (session,),
-        ):
-            self._publish_outgoing(target.project_id, message_id, body, record)
-            if on_visible is not None:
-                try:
-                    on_visible()
-                except Exception:  # noqa: BLE001,S110
-                    # The durable record remains authoritative if its wake cannot run.
-                    pass
-            tracker = (
-                self.sent_tracker
-                if self.sent_tracker is not None
-                and self.sent_tracker.session_id == session
-                else SentMessageTracker(self.sessions_root, session)
-            )
-            outcome = tracker.record(
-                message_id,
-                target.project_id,
-                _storage_lease=self.registry._storage_lease,
-            )
-        return message_id, outcome
+        record.update({"origin": origin}) if delegation_enabled(self.registry) else None
+        return session, target.project_id, message_id, to_session, body, record
 
     def _publish_outgoing(
         self,
-        target_project: str,
+        dirs: tuple[int, int, int, int, int],
         message_id: str,
         body: str,
         record: dict[str, Any],
     ) -> None:
-        with self._directories(target_project, create=True) as dirs:
-            new_fd, _claimed_fd, _done_fd, bodies_fd = dirs[:4]
-            body_bytes = body.encode("utf-8")
-            if len(body_bytes) > BODY_SPILL_BYTES:
-                body_name = f"{message_id}.txt"
-                self._publish_once(bodies_fd, body_name, body_bytes)
-                record["body"] = {"file": f"bodies/{body_name}"}
-            name = f"{message_id}.json"
-            existing = None
-            for directory_fd in (new_fd, _claimed_fd, _done_fd):
-                try:
-                    existing = self._read_record(directory_fd, name, bodies_fd)
-                except FileNotFoundError:
-                    continue
-                break
-            if existing is None:
-                self._publish_record(new_fd, name, record)
-            else:
-                immutable_fields = {
-                    "schema_version",
-                    "id",
-                    "origin",
-                    "from",
-                    "to_project",
-                    "to_session",
-                    "kind",
-                    "title",
-                    "body",
-                    "in_reply_to",
-                }
-                comparable = {
-                    key: (
-                        existing.get(key, LOCAL_ORIGIN)
-                        if key == "origin"
-                        else existing.get(key)
-                        if key == "to_session"
-                        else existing[key]
-                    )
-                    for key in immutable_fields
-                }
-                expected = {key: record[key] for key in immutable_fields}
-                # Decoding resolves spilled bodies, so compare against the caller body.
-                expected["body"] = body
-                if comparable != expected:
-                    raise InboxError("message id already exists with different content")
+        """Publish one message; the caller already holds the target inbox authority."""
+        new_fd, _claimed_fd, _done_fd, bodies_fd = dirs[:4]
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > BODY_SPILL_BYTES:
+            body_name = f"{message_id}.txt"
+            self._publish_once(bodies_fd, body_name, body_bytes)
+            record["body"] = {"file": f"bodies/{body_name}"}
+        name = f"{message_id}.json"
+        existing = None
+        for directory_fd in (new_fd, _claimed_fd, _done_fd):
+            try:
+                existing = self._read_record(directory_fd, name, bodies_fd)
+            except FileNotFoundError:
+                continue
+            break
+        if existing is None:
+            self._publish_record(new_fd, name, record)
+            return
+        immutable_fields = {
+            "schema_version",
+            "id",
+            "origin",
+            "from",
+            "to_project",
+            "to_session",
+            "kind",
+            "title",
+            "body",
+            "in_reply_to",
+        }
+        comparable = {
+            key: (
+                existing.get(key, LEGACY_LOCAL_ORIGIN)
+                if key == "origin"
+                else existing.get(key)
+                if key == "to_session"
+                else existing[key]
+            )
+            for key in immutable_fields
+        }
+        expected = {key: record[key] for key in immutable_fields}
+        # Decoding resolves spilled bodies, so compare against the caller body.
+        expected["body"] = body
+        if comparable != expected:
+            raise InboxError("message id already exists with different content")
 
     def list(
         self, project: str, *, session_id: str | None = None
@@ -413,6 +491,10 @@ class ProjectInbox:
                     if record.get("to_session") in {None, session_id}
                 ]
         result["done"].sort(key=lambda item: item.get("done_at", ""), reverse=True)
+        for status in ("new", "claimed", "done"):
+            result[status] = [
+                decorate(self.registry, target.project_id, item, self._delegations(target.project_id)) for item in result[status]
+            ]
         return result
 
     def sent(
@@ -431,13 +513,7 @@ class ProjectInbox:
         if type(limit) is not int or not 1 <= limit <= SENT_PAGE_LIMIT:
             raise InboxError(f"limit must be an integer from 1 to {SENT_PAGE_LIMIT}")
 
-        tracker = (
-            self.sent_tracker
-            if self.sent_tracker is not None
-            and self.sent_tracker.session_id == session_id
-            else SentMessageTracker(self.sessions_root, session_id)
-        )
-        outcome = tracker.sent_view(
+        outcome = self._sent_tracker(session_id).sent_view(
             self, source.project_id, self._receipts_for_session(session_id)
         )
         sent = outcome.result
@@ -465,11 +541,9 @@ class ProjectInbox:
     ) -> list[dict[str, Any]]:
         invalid: list[dict[str, str]] = []
         rows: list[dict[str, Any]] = []
-        def read(root_fd: int) -> None:
+        def read(project_fd: int) -> None:
             try:
-                with self._directory_handles(
-                    root_fd, project_id, create=False, lock=False
-                ) as dirs:
+                with self._directory_handles(project_fd, create=False) as dirs:
                     for status, directory_fd in zip(("new", "claimed", "done"), dirs[:3]):
                         for record in self._read_directory(
                             directory_fd,
@@ -482,10 +556,16 @@ class ProjectInbox:
                                 "project": source_project,
                                 "session": source_session,
                             }:
-                                rows.append(self._broken_row(record, status, project_id, source_session, receipt_map))
-            except (_InboxNotFound, FileNotFoundError):
+                                rows.append(self._broken_row(record, status, project_id, project_name, source_session, receipt_map))
+            except _InboxNotFound:
                 return
-        self.registry._identity_read(read)
+        # Identity ranks before the inbox lock, so resolve the name first.
+        try:
+            project_name = self.registry.show_project(project_id).name
+        except ProjectNotFoundError:
+            project_name = project_id
+        with self._lock(project_id, exclusive=False) as project_fd:
+            read(project_fd)
         return rows
 
     def _broken_row(
@@ -493,13 +573,10 @@ class ProjectInbox:
         record: dict[str, Any],
         status: str,
         project_id: str,
+        project_name: str,
         source_session: str,
         receipt_map: dict[str, set[str]],
     ) -> dict[str, Any]:
-        try:
-            project_name = self.registry.show_project(project_id).name
-        except ProjectNotFoundError:
-            project_name = project_id
         row = {
             "id": record["id"],
             "status": status,
@@ -571,10 +648,10 @@ class ProjectInbox:
         """Read inbox state without creating storage or recovering claims."""
         target = self._resolve_project(project)
 
-        def read(root_fd: int) -> dict[str, list[dict[str, Any]]]:
+        def read(project_fd: int) -> dict[str, list[dict[str, Any]]]:
             try:
                 with self._directory_handles(
-                    root_fd, target.project_id, create=False, lock=False
+                    project_fd, create=False
                 ) as dirs:
                     invalid: list[dict[str, str]] = []
                     result = {
@@ -595,7 +672,8 @@ class ProjectInbox:
             return result
 
         try:
-            return self.registry._identity_read(read)
+            with self._lock(target.project_id, exclusive=False) as project_fd:
+                return read(project_fd)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -608,32 +686,32 @@ class ProjectInbox:
     ) -> tuple[str, dict[str, Any]] | None:
         name = f"{_id(message_id)}.json"
 
-        def read() -> tuple[str, dict[str, Any]] | None:
+        def read(project_fd: int) -> tuple[str, dict[str, Any]] | None:
             try:
-                with (
-                    self._lock(target_project, exclusive=False) as project_fd,
-                    self._project_directory_handles(project_fd, create=False) as dirs,
-                ):
-                        for index, status in enumerate(("new", "claimed", "done")):
-                            try:
-                                record = self._read_record(
-                                    dirs[index], name, dirs[3], resolve_body=False
-                                )
-                            except FileNotFoundError:
-                                continue
-                            sender = record.get("from")
-                            if not isinstance(sender, dict) or sender != {
-                                "project": source_project,
-                                "session": source_session,
-                            }:
-                                raise InboxError("tracked sent message has another sender")
-                            return status, record
-                        return None
+                with self._directory_handles(
+                    project_fd, create=False
+                ) as dirs:
+                    for index, status in enumerate(("new", "claimed", "done")):
+                        try:
+                            record = self._read_record(
+                                dirs[index], name, dirs[3], resolve_body=False
+                            )
+                        except FileNotFoundError:
+                            continue
+                        sender = record.get("from")
+                        if not isinstance(sender, dict) or sender != {
+                            "project": source_project,
+                            "session": source_session,
+                        }:
+                            raise InboxError("tracked sent message has another sender")
+                        return status, record
+                    return None
             except _InboxNotFound:
                 return None
 
         try:
-            return read()
+            with self._lock(target_project, exclusive=False) as project_fd:
+                return read(project_fd)
         except (OSError, ProjectRegistryError, SessionError) as exc:
             raise InboxError("inbox storage is unsafe or unavailable") from exc
 
@@ -703,6 +781,8 @@ class ProjectInbox:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
+                if delegation_enabled(self.registry) and decorate(self.registry, target.project_id, record, self._delegations(target.project_id))["authority"] != "trusted_assignment":
+                    raise InboxError("inbox message is information, not an authorized assignment")
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:
                     return None
@@ -795,7 +875,7 @@ class ProjectInbox:
         if reply is not None:
             sender = record["from"]
             assert isinstance(sender, dict)
-            _reply_id_value, sent_outcome = self.send_with_outcome(
+            _reply_id_value, sent_outcome = self.send_agent_with_outcome(
                 from_project=target.project_id,
                 from_session=session_id,
                 to_project=str(sender["project"]),
@@ -806,16 +886,6 @@ class ProjectInbox:
                 message_id=reply_id,
             )
         return completed, sent_outcome
-
-    def notice(self, project: str) -> str | None:
-        count = len(self.new_ids(project))
-        if not count:
-            return None
-        return (
-            f"Local project inbox has {count} new message{'s' if count != 1 else ''}; "
-            "use inbox action list. Requests are work to do: claim, do, and mark done. "
-            "You do not need to confirm the sender with the user."
-        )
 
     def _resolve_project(self, value: str) -> Project:
         _text(value, "project")
@@ -843,10 +913,10 @@ class ProjectInbox:
 
     @contextmanager
     def _directory_handles(
-        self, root_fd: int, project_id: str, *, create: bool, lock: bool = True
+        self, project_fd: int, *, create: bool
     ) -> Iterator[tuple[int, int, int, int, int]]:
         with ExitStack() as stack:
-            project_fd = self.registry._project_dir(root_fd, project_id)
+            project_fd = os.dup(project_fd)
             stack.callback(os.close, project_fd)
             try:
                 inbox_fd = stack.enter_context(
@@ -856,18 +926,15 @@ class ProjectInbox:
                 if create:
                     raise
                 raise _InboxNotFound from exc
-            if lock:
-                fcntl.flock(inbox_fd, fcntl.LOCK_EX)
-                stack.callback(fcntl.flock, inbox_fd, fcntl.LOCK_UN)
-            if not any(
-                name in os.listdir(inbox_fd)
-                for name in ("new", "claimed", "done", "bodies", "wake")
-            ):
-                raise _InboxNotFound
-            fds = tuple(
-                stack.enter_context(child_directory(inbox_fd, name, create=create))
-                for name in ("new", "claimed", "done", "bodies", "wake")
-            )
+            try:
+                fds = tuple(
+                    stack.enter_context(child_directory(inbox_fd, name, create=create))
+                    for name in ("new", "claimed", "done", "bodies", "wake")
+                )
+            except FileNotFoundError as exc:
+                if create or set(os.listdir(inbox_fd)) != {".lock"}:
+                    raise
+                raise _InboxNotFound from exc
             yield fds  # type: ignore[misc]
 
     @contextmanager
@@ -885,40 +952,21 @@ class ProjectInbox:
             raise AssertionError(
                 "read operations must use the registry read transaction"
             )
-        try:
-            with self._held_directories(project_id) as fds:
-                yield fds
-        except InboxError:
-            raise
-        except (OSError, ProjectRegistryError, SessionError) as exc:
-            raise InboxError("inbox storage is unsafe or unavailable") from exc
+        with _storage_errors(), self._held_directories(project_id) as fds:
+            yield fds
 
     @contextmanager
     def _held_directories(
         self, project_id: str
     ) -> Iterator[tuple[int, int, int, int, int]]:
+        """Hold the exclusive inbox authority; only acquisition errors are translated."""
         with ExitStack() as stack:
-            project_fd = stack.enter_context(self._lock(project_id, exclusive=True))
-            fds = stack.enter_context(
-                self._project_directory_handles(project_fd, create=True)
-            )
+            with _storage_errors():
+                project_fd = stack.enter_context(self._lock(project_id, exclusive=True))
+                fds = stack.enter_context(
+                    self._directory_handles(project_fd, create=True)
+                )
             yield fds
-
-    @contextmanager
-    def _project_directory_handles(
-        self, project_fd: int, *, create: bool
-    ) -> Iterator[tuple[int, int, int, int, int]]:
-        with ExitStack() as stack:
-            project_fd = os.dup(project_fd)
-            stack.callback(os.close, project_fd)
-            inbox_fd = stack.enter_context(
-                child_directory(project_fd, "inbox", create=create)
-            )
-            fds = tuple(
-                stack.enter_context(child_directory(inbox_fd, name, create=create))
-                for name in ("new", "claimed", "done", "bodies", "wake")
-            )
-            yield fds  # type: ignore[misc]
 
     def _publish_record(
         self,
@@ -1020,7 +1068,7 @@ class ProjectInbox:
         }
         if not required.issubset(value):
             raise InboxError(f"invalid inbox message fields: {name}")
-        origin = value.setdefault("origin", LOCAL_ORIGIN)
+        origin = value.setdefault("origin", LEGACY_LOCAL_ORIGIN)
         _text(origin, "message origin")
         if value.get("to_session") is not None:
             _id(value["to_session"], "target session")

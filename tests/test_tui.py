@@ -41,7 +41,9 @@ from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import HSplit, Layout
 from prompt_toolkit.layout.controls import UIContent
 from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
@@ -130,6 +132,7 @@ from zeta.tui.composer import (
     build_key_bindings,
     parse_input,
 )
+from zeta.tui.overlay_text_field import OverlayTextField
 from zeta.tui.slash_handlers.accounts_picker import AccountsPicker
 
 
@@ -5237,7 +5240,7 @@ def test_decisions_panel_wraps_long_paths_at_a_separator() -> None:
         recommendation=None,
         status="open",
     )
-    panel = DecisionsPanel()
+    panel = DecisionsPanel(OverlayTextField("DECISIONS_ANSWER"))
     panel.set_items([DecisionItem(record.session_id, "p_test", "project", record)])
 
     rendered = _render_overlay_at_80(panel.render_lines())
@@ -6431,7 +6434,6 @@ def test_transcript_navigation_bindings_are_full_screen_only() -> None:
         on_exit=lambda: None,
         on_finder_open=lambda: None,
         finder_active=lambda: False,
-        on_finder_input=lambda _value: None,
         search_active=lambda: False,
         on_search_end=lambda: None,
         on_previous_user=lambda: None,
@@ -6456,12 +6458,14 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
     def open_finder() -> None:
         nonlocal active
         active = True
+        session.app.layout.focus(finder_field.window)
 
     def accept() -> None:
         nonlocal active, accepts
         active = False
         accepts += 1
 
+    finder_field = OverlayTextField("TEST_FINDER", on_text_changed=values.append)
     with create_pipe_input() as pipe:
         session = PromptSession(
             input=pipe,
@@ -6473,11 +6477,14 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
                 on_exit=lambda: None,
                 on_finder_open=open_finder,
                 finder_active=lambda: active,
-                on_finder_input=values.append,
                 on_finder_move=moves.append,
                 on_finder_accept=accept,
                 on_finder_cancel=lambda: None,
             ),
+        )
+        session.app.layout = Layout(
+            HSplit([session.app.layout.container, finder_field.window]),
+            focused_element=session.default_buffer,
         )
         task = asyncio.create_task(session.prompt_async(" > "))
         await asyncio.sleep(0.05)
@@ -6492,7 +6499,102 @@ async def test_finder_captures_typed_text_and_navigation_keys() -> None:
         pipe.send_text("\r")  # Enter accepts and closes the finder.
         await wait_until(lambda: accepts == 1 and not active)
         session.app.exit()
-        await task
+        await asyncio.wait_for(task, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_finder_cancel_keys_close_in_vi_and_emacs() -> None:
+    # Regression for #1205: finder_cancel compared the pressed key against a
+    # nonexistent Keys.ESCAPE, so esc/ctrl+c/ctrl+g in a finder raised
+    # AttributeError and the finder could not be closed. This drives every
+    # finder_cancel key through the real binding path in both editing modes.
+    active = False
+    cancels = 0
+
+    def open_finder() -> None:
+        nonlocal active
+        active = True
+
+    def cancel() -> None:
+        nonlocal active, cancels
+        active = False
+        cancels += 1
+
+    def make_session(pipe: PipeInput, mode: EditingMode) -> PromptSession[str]:
+        field = OverlayTextField("TEST_FINDER")
+        session: PromptSession[str] = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            editing_mode=mode,
+            key_bindings=build_key_bindings(
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+                on_interrupt=lambda: None,
+                on_exit=lambda: None,
+                on_finder_open=open_finder,
+                finder_active=lambda: active,
+                on_finder_cancel=cancel,
+            ),
+        )
+        session.app.layout = Layout(
+            HSplit([session.app.layout.container, field.window]),
+            focused_element=session.default_buffer,
+        )
+        session.app.ttimeoutlen = 0.02
+        session.app.timeoutlen = 0.02
+        return session
+
+    with create_pipe_input() as pipe:
+        session = make_session(pipe, EditingMode.VI)
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await wait_until(lambda: session.app.is_running)
+        session.app.full_screen = True
+
+        pipe.send_text("\x06")  # Ctrl-F opens the finder.
+        await wait_until(lambda: active)
+        assert session.app.vi_state.input_mode is InputMode.INSERT
+
+        # Esc in vi insert switches to navigation mode without cancelling.
+        pipe.send_text("\x1b")
+        await wait_until(
+            lambda: session.app.vi_state.input_mode is InputMode.NAVIGATION
+        )
+        assert active and cancels == 0
+
+        # Esc again (now in navigation) cancels the finder.
+        pipe.send_text("\x1b")
+        await wait_until(lambda: cancels == 1 and not active)
+
+        # Ctrl-C in vi insert cancels.
+        session.app.vi_state.input_mode = InputMode.INSERT
+        open_finder()
+        await wait_until(lambda: active)
+        pipe.send_text("\x03")
+        await wait_until(lambda: cancels == 2 and not active)
+
+        # Ctrl-G in vi insert cancels.
+        session.app.vi_state.input_mode = InputMode.INSERT
+        open_finder()
+        await wait_until(lambda: active)
+        pipe.send_text("\x07")
+        await wait_until(lambda: cancels == 3 and not active)
+
+        session.app.exit()
+        await asyncio.wait_for(task, timeout=10)
+
+    with create_pipe_input() as pipe:
+        session = make_session(pipe, EditingMode.EMACS)
+        task = asyncio.create_task(session.prompt_async(" > "))
+        await wait_until(lambda: session.app.is_running)
+        session.app.full_screen = True
+
+        open_finder()
+        await wait_until(lambda: active)
+        pipe.send_text("\x1b")  # Esc in emacs cancels directly.
+        await wait_until(lambda: cancels == 4 and not active)
+
+        session.app.exit()
+        await asyncio.wait_for(task, timeout=10)
 
 
 def test_long_single_line_read_uses_a_cropped_card() -> None:

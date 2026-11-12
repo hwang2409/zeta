@@ -622,9 +622,9 @@ def _read_stable_page(
             facts = store._history_index_facts()
             page = index.page(request, facts)
         except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+            index._mark_unavailable()
             if store._read_only or attempt == attempts - 1:
                 return None
-            index._mark_unavailable()
             continue
         if store._history_index_facts() == facts:
             return page
