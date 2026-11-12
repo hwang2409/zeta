@@ -121,6 +121,7 @@ def test_metadata_writes_do_not_change_pin(tmp_path):
 
 
 _DAY_NS = 86_400 * 1_000_000_000
+_OLD = "2020-01-01T00:00:00+00:00"
 
 
 def _manager(home):
@@ -162,7 +163,7 @@ def test_closure_reasons_table(tmp_path):
         child_dir = tmp_path / "sessions" / live_child / "agents" / "1"
         child_dir.mkdir(parents=True)
         (child_dir / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "running", "started_at": "t", "finished_at": None})
+            json.dumps({"state": "running", "started_at": _OLD, "finished_at": None})
         )
         (child_dir / ".lock").write_text("")
 
@@ -197,10 +198,10 @@ def test_closure_reasons_table(tmp_path):
         candidate_bytes = _true_tree_bytes(tmp_path / "sessions" / candidate)
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        future = RetentionPlanner(
+        future = stack.enter_context(RetentionPlanner(
             tmp_path, lease, bounds=RetentionBounds(roots_advanced=32),
             now_ns=lambda: _future_ns(),
-        )
+        ))
         result = future.run_pass(days=30)
         reasons = {row.root_id: (row.closed, row.reason) for row in result.reasons}
 
@@ -227,7 +228,7 @@ def test_not_old_blocks_under_real_clock(tmp_path):
         lease = stack.enter_context(_opened_lease(tmp_path))
         import time
 
-        planner = RetentionPlanner(tmp_path, lease, now_ns=time.time_ns)
+        planner = stack.enter_context(RetentionPlanner(tmp_path, lease, now_ns=time.time_ns))
         result = planner.run_pass(days=30)
         reasons = {row.root_id: (row.closed, row.reason) for row in result.reasons}
     assert reasons[fresh] == (False, "not old enough")
@@ -241,17 +242,17 @@ def test_resume_completes_over_passes_with_exact_bytes(tmp_path):
         child = tmp_path / "sessions" / root / "agents" / "1"
         child.mkdir(parents=True)
         (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": "t", "finished_at": "u"})
+            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
         )
         (child / "conversation.jsonl").write_text("x" * 100)
         (child / ".lock").write_text("")
         expected = _true_tree_bytes(tmp_path / "sessions" / root)
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(
+        planner = stack.enter_context(RetentionPlanner(
             tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
             now_ns=lambda: _future_ns(),
-        )
+        ))
         passes = 0
         result = planner.run_pass(days=30)
         while not result.complete:
@@ -270,15 +271,15 @@ def test_touched_completed_directory_is_rewalked(tmp_path):
         child = tmp_path / "sessions" / root / "agents" / "1"
         child.mkdir(parents=True)
         (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": "t", "finished_at": "u"})
+            json.dumps({"state": "completed", "started_at": _OLD, "finished_at": _OLD})
         )
         (child / ".lock").write_text("")
 
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(
+        planner = stack.enter_context(RetentionPlanner(
             tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
             now_ns=lambda: _future_ns(),
-        )
+        ))
         first = planner.run_pass(days=30)
         assert first.complete is False  # root directory completed, walk suspended
         # A new file lands in the already-walked root directory.
@@ -292,36 +293,32 @@ def test_touched_completed_directory_is_rewalked(tmp_path):
     assert result.preview.bytes == expected
 
 
-def test_restart_resets_in_flight_root(tmp_path):
+def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
     manager = _manager(tmp_path)
     with ExitStack() as stack:
         root = _create_closed(manager, stack)
-        child = tmp_path / "sessions" / root / "agents" / "1"
-        child.mkdir(parents=True)
-        (child / "agent_lifecycle.json").write_text(
-            json.dumps({"state": "completed", "started_at": "t", "finished_at": "u"})
-        )
-        (child / ".lock").write_text("")
-        expected = _true_tree_bytes(tmp_path / "sessions" / root)
-
+        root_dir = tmp_path / "sessions" / root
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner_a = RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
-            now_ns=lambda: _future_ns(),
+        bounds = RetentionBounds(entries_per_root=1)
+        planner_a = stack.enter_context(
+            RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
         )
         assert planner_a.run_pass(days=30).complete is False
-        epoch_a = json.loads((tmp_path / "retention-state.json").read_text())["lease_epoch"]
+        planner_a.close()  # process exit: the walked root directory is not rewalked
+        # A file in the already-listed root directory changes; the directory
+        # mtime does not, so only a fresh walk can see it.
+        walked = sorted(p for p in root_dir.iterdir() if p.is_file())[0]
+        with walked.open("ab") as stream:
+            stream.write(b"z" * 17)
+        recent = _future_ns() - _DAY_NS
+        os.utime(walked, ns=(recent, recent))
 
-        planner_b = RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1),
-            now_ns=lambda: _future_ns(),
+        planner_b = stack.enter_context(
+            RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
         )
-        result = planner_b.run_pass(days=30)
-        epoch_b = json.loads((tmp_path / "retention-state.json").read_text())["lease_epoch"]
-        while not result.complete:
-            result = planner_b.run_pass(days=30)
-    assert epoch_b != epoch_a  # a restart does not adopt the prior in-process lease
-    assert result.preview.bytes == expected
+        result, reasons = _run_sweep(planner_b)
+    assert reasons[root] == (False, "not old enough")
+    assert root not in result.preview.root_ids
 
 
 def test_below_feature_epoch_writes_nothing(tmp_path):
@@ -353,6 +350,17 @@ def _future_ns() -> int:
     import time
 
     return time.time_ns() + 60 * _DAY_NS
+
+
+def _run_sweep(planner, days=30):
+    """Run passes to the end of one sweep; return the result and every reason."""
+    reasons = {}
+    for _ in range(500):
+        result = planner.run_pass(days=days)
+        reasons.update({row.root_id: (row.closed, row.reason) for row in result.reasons})
+        if result.complete:
+            return result, reasons
+    raise AssertionError("sweep did not complete in 500 passes")
 
 
 @contextmanager

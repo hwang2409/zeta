@@ -147,16 +147,9 @@ class SessionReferenceGate:
         if not self._enabled():
             return 0
         path = self.home / _SESSION_REFERENCE_GENERATION
-        try:
-            raw = path.read_text(encoding="ascii")
-        except FileNotFoundError:
-            value = 0
-        else:
-            if not raw.endswith("\n") or not raw[:-1].isdigit():
-                raise SessionError("session reference generation is malformed")
-            value = int(raw[:-1])
-            if value > 2**63 - 2:
-                raise SessionError("session reference generation is out of range")
+        value = read_reference_generation(self.home)
+        if value > 2**63 - 2:
+            raise SessionError("session reference generation is out of range")
         value += 1
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -180,11 +173,20 @@ def read_reference_generation(home: Path) -> int:
     A read-only observer used by the dormant retention planner to detect that a
     reference transaction raced its scan. An absent file is generation zero.
     """
-    path = Path(home) / _SESSION_REFERENCE_GENERATION
     try:
-        raw = path.read_text(encoding="ascii")
+        fd = os.open(
+            Path(home) / _SESSION_REFERENCE_GENERATION, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
     except FileNotFoundError:
         return 0
+    except OSError as exc:
+        raise SessionError("session reference generation is unsafe") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SessionError("session reference generation is unsafe")
+        raw = os.read(fd, 32).decode("ascii", "replace")
+    finally:
+        os.close(fd)
     if not raw.endswith("\n") or not raw[:-1].isdigit():
         raise SessionError("session reference generation is malformed")
     return int(raw[:-1])

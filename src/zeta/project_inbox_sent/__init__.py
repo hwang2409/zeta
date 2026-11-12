@@ -137,6 +137,11 @@ class SentMessageTracker:
         return isinstance(self._state, _Broken)
 
     @property
+    def has_unfinished(self) -> bool:
+        """Whether the loaded ledger holds a record without a ``done`` report."""
+        return bool(self._pending)
+
+    @property
     def broken(self) -> bool:
         return self.health().health.state == "broken"
 
