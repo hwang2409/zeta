@@ -1092,9 +1092,19 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             return self._delegated.get(request_id)
         if child_instance_id is not None:
             return self._delegated.get((child_instance_id, request_id))
-        # A bare id always names the foreground store. Delegated requests use
-        # their public ``(child_instance_id, request_id)`` key.
-        return None
+        # A bare id names the foreground store when it owns one; otherwise it may
+        # name a unique delegated request (resident sync read, like main's
+        # approval_states() check, no off-loop yield).
+        if request_id in self._ephemeral:
+            return None
+        if self._store is not None and self._store.approval_state_now(request_id) is not None:
+            return None
+        matches = [
+            delegated
+            for (_child_id, delegated_id), delegated in self._delegated.items()
+            if delegated_id == request_id
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     async def prepare(
         self,
