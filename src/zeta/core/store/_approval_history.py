@@ -148,6 +148,15 @@ class ApprovalHistoryStoreMixin:
                 return dict(entry.data)
         return None
 
+    # The serve stale-approval sweep runs before publishing every event. It must
+    # read the resident resolution in the same task step, with no off-loop yield:
+    # an await here would reorder event delivery (an agent_end could overtake a
+    # concurrent child's approval_request). This matches main's synchronous
+    # approval_resolution_data read.
+    def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
+        self._sync_log_without_waiting()
+        return self._resident_approval_resolution(request_id)
+
     def _resident_pending_approval_page(
         self, after_seq: int, limit: int
     ) -> IndexedPendingApprovalPage:

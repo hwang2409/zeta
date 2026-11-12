@@ -225,10 +225,7 @@ async def _serve_mapping(event: StreamEvent) -> list[tuple[str, dict[str, object
 
     control._notify = notify
 
-    async def _no_stale(_session_id: object) -> None:
-        return None
-
-    control._end_stale_approvals = _no_stale
+    control._end_stale_approvals = lambda _session_id: None
     await control._event(event, session_id="session", background=True)
     return frames
 

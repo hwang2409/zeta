@@ -2598,7 +2598,7 @@ async def test_notification_wake_waits_for_resumed_durable_tool(
 
     async def provider_turn() -> None:
         starts.append(True)
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     host = SimpleNamespace(
         loop=loop,
@@ -2607,7 +2607,7 @@ async def test_notification_wake_waits_for_resumed_durable_tool(
     )
     pipeline = SubmissionPipeline(host)
     durable = asyncio.create_task(asyncio.sleep(0))
-    await durable
+    await asyncio.wait_for(durable, 10)
     pipeline._durable_tasks["approval-1"] = durable
     try:
         pipeline.wake()

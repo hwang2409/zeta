@@ -1221,12 +1221,12 @@ class ApprovalLifecycle:
         if resolution is not None:
             await asyncio.shield(self._finish_record(record, resolution))
 
-    async def _end_stale_approvals(self, session_id: str | None) -> None:
+    def _end_stale_approvals(self, session_id: str | None) -> None:
         del session_id
         for stale in tuple(self._state.records.values()):
             if stale.phase not in {"pending", "settling"} or stale.live_end is not None:
                 continue
-            data = await stale.target.store.approval_resolution(
+            data = stale.target.store.approval_resolution_now(
                 stale.target.store_request_id
             )
             record = self._state.records.get(stale.target.key)
