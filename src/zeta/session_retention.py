@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
+from .attention_records import AttentionRecord
 from .core.session_files import (
     SessionError,
     SessionInUseError,
@@ -32,7 +33,6 @@ from .core.session_files import (
     read_reference_generation,
     unlink_session_file,
 )
-from .project_inbox_sent import SentMessageTracker
 from .storage_format import (
     StorageFeature,
     StorageFormatError,
@@ -258,6 +258,8 @@ class _RootScan:
 
     def charge(self, size: int) -> None:
         bounds, budget = self.budget.bounds, self.budget
+        if budget.clock() >= budget.deadline:
+            raise _Deferred
         self.records += 1
         self.record_bytes += size
         if (
@@ -509,11 +511,15 @@ class RetentionPlanner:
         """Return the first conservative blocker, or None when the root is closed."""
         root_id = flight.root_id
         generation = read_reference_generation(self.home)
-        ids = {root_id, *("/".join(comps) for comps in flight.store_dirs if comps)}
+        ids = {root_id}
+        for comps in flight.store_dirs:
+            if comps:
+                child_parts = [part for part in comps if part != _AGENTS_DIRNAME]
+                ids.add(root_id + ":" + ":".join(child_parts))
         reason = (
             ("session is being deleted" if _reservation_present(home_fd, root_id) else None)
             or _store_reason(flight)
-            or self._sent_reason(root_id)
+            or self._sent_reason(flight)
             or ("pinned" if self._pinned(sessions_fd, flight.root_fd, root_id) else None)
             or _inbox_reason(home_fd, ids, scan)
             or _dependent_reason(sessions_fd, root_id, scan)
@@ -527,16 +533,13 @@ class RetentionPlanner:
             return "references changed during scan"
         return None
 
-    def _sent_reason(self, root_id) -> str | None:
-        try:
-            tracker = SentMessageTracker(
-                self.home / "sessions", root_id, observed_epoch=self.lease.observed_epoch
-            )
-        except ValueError:
-            return "unrecognized session id"
-        if tracker.broken_cached:
-            return "broken sent tracker"
-        return "unacknowledged sent message" if tracker.has_unfinished else None
+    def _sent_reason(self, flight) -> str | None:
+        for comps in flight.store_dirs:
+            with _descend(flight.root_fd, comps) as directory_fd:
+                reason = _sent_file_reason(directory_fd)
+                if reason is not None:
+                    return reason
+        return None
 
     def _pinned(self, sessions_fd, root_fd, root_id) -> bool:
         """Own or inherited pin; an exhausted hop bound pins conservatively."""
@@ -682,6 +685,27 @@ def _failure_reason(exc: BaseException) -> str:
     return _bounded_reason(str(exc))
 
 
+def _sent_file_reason(directory_fd) -> str | None:
+    value = _read_json(directory_fd, "project-inbox-sent.json")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("records"), list):
+        return "broken sent tracker"
+    records = value["records"]
+    ids = set()
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            return "broken sent tracker"
+        if record["id"] in ids or not isinstance(record.get("reported"), list):
+            return "broken sent tracker"
+        ids.add(record["id"])
+        if any(not isinstance(status, str) for status in record["reported"]):
+            return "broken sent tracker"
+        if "done" not in record["reported"]:
+            return "unacknowledged sent message"
+    return None
+
+
 def _store_reason(flight: _InFlight) -> str | None:
     """Store-local blockers; also folds metadata timestamps into activity."""
     for comps in flight.store_dirs:
@@ -695,7 +719,10 @@ def _store_reason(flight: _InFlight) -> str | None:
             lifecycle = _read_json(dfd, _LIFECYCLE_NAME)
             if comps and not _lifecycle_terminal(lifecycle):
                 return "live or recoverable child"
-            for value in (_read_json(dfd, _METADATA_NAME), lifecycle):
+            metadata = _read_json(dfd, _METADATA_NAME)
+            if not comps and not _valid_metadata(metadata):
+                raise RetentionPlannerError("malformed metadata")
+            for value in (metadata, lifecycle):
                 flight.walk.max_activity = max(flight.walk.max_activity, _metadata_activity(value))
     return None
 
@@ -711,6 +738,21 @@ def _has_child_marker(directory_fd) -> bool:
 
 def _lifecycle_terminal(value) -> bool:
     return type(value) is dict and value.get("state") in _TERMINAL_AGENT_STATES
+
+
+def _valid_metadata(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = ("version", "session_id", "created_at", "updated_at", "provider", "model", "cwd")
+    if type(value.get("version")) is not int or any(type(value.get(k)) is not str or not value[k] for k in required[1:]):
+        return False
+    try:
+        for key in _TIMESTAMP_FIELDS:
+            if key in value:
+                datetime.fromisoformat(value[key])
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _metadata_activity(value) -> int:
@@ -754,6 +796,7 @@ def _parent_id(sessions_fd, session_id) -> str | None:
 def _inbox_reason(home_fd, ids, scan: _RootScan) -> str | None:
     for status_fd in _inbox_status_dirs(home_fd):
         for name in sorted(os.listdir(status_fd)):
+            scan.charge(0)
             if name.endswith(".json") and _inbox_names(_read_json(status_fd, name, scan), ids):
                 return "pending inbox reference"
     return None
@@ -795,18 +838,46 @@ def _open_dir(stack, directory_fd, name) -> int | None:
 def _dependent_reason(sessions_fd, root_id, scan: _RootScan) -> str | None:
     """Scan every other root for a published dependent; a bound hit blocks."""
     for other in sorted(os.listdir(sessions_fd)):
+        scan.charge(0)
         if other == root_id or other.startswith(".") or not _is_directory(sessions_fd, other):
             continue
         try:
             with child_directory(sessions_fd, other) as other_fd:
                 meta = _read_json(other_fd, _METADATA_NAME, scan)
                 fork = _read_json(other_fd, _ATTENTION_FORK_NAME, scan)
+                try:
+                    attention_fd = os.open("attention", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=other_fd)
+                except FileNotFoundError:
+                    attention_fd = None
+                if attention_fd is not None:
+                    try:
+                        with os.scandir(attention_fd) as entries:
+                            for entry in entries:
+                                scan.charge(entry.stat(follow_symlinks=False).st_size)
+                                if not entry.name.endswith(".json"):
+                                    continue
+                                value = _read_json(attention_fd, entry.name, scan)
+                                try:
+                                    record = AttentionRecord.from_dict(value)
+                                except (TypeError, ValueError, KeyError) as exc:
+                                    raise RetentionPlannerError("malformed attention record") from exc
+                                if record.fork_session_id == root_id:
+                                    return "published top-level dependent"
+                    finally:
+                        os.close(attention_fd)
         except FileNotFoundError:
             continue
-        if (meta is not None and type(meta) is not dict) or (
-            fork is not None and type(fork) is not dict
+        if meta is not None:
+            if type(meta) is not dict:
+                return "unreadable possible dependent"
+            if not _valid_metadata(meta):
+                raise RetentionPlannerError("malformed metadata")
+        if fork is not None and (
+            type(fork) is not dict
+            or set(fork) != {"forked_from_session", "forked_at_entry", "attention_id"}
+            or any(type(fork.get(key)) is not str or not fork[key] for key in fork)
         ):
-            return "unreadable possible dependent"
+            raise RetentionPlannerError("malformed attention fork")
         if (meta or {}).get("parent_session_id") == root_id:
             return "published top-level dependent"
         if (fork or {}).get("forked_from_session") == root_id:
@@ -820,10 +891,12 @@ def _iter_store_dirs(root_fd, prefix=()):
         raise RetentionPlannerError("tree is too deep")
     try:
         with _descend(root_fd, (*prefix, _AGENTS_DIRNAME)) as agents_fd:
-            entries = [
-                name for name in sorted(os.listdir(agents_fd))
-                if _is_directory(agents_fd, name)
-            ]
+            entries = []
+            with os.scandir(agents_fd) as scanned:
+                for entry in scanned:
+                    if entry.is_dir(follow_symlinks=False):
+                        entries.append(entry.name)
+            entries.sort()
     except (FileNotFoundError, NotADirectoryError):
         return
     for name in entries:
@@ -853,11 +926,16 @@ def _directory_nonempty(directory_fd, name) -> bool:
 
 def _inbox_names(record, ids) -> bool:
     if type(record) is not dict:
-        return False
+        raise RetentionPlannerError("malformed inbox record")
+    if not record:
+        raise RetentionPlannerError("malformed inbox record")
     sender = record.get("from")
-    if isinstance(sender, dict) and sender.get("session") in ids:
-        return True
-    return record.get("to_session") in ids or record.get("claimer_session") in ids
+    if sender is not None and (not isinstance(sender, dict) or not isinstance(sender.get("session"), str)):
+        raise RetentionPlannerError("malformed inbox record")
+    for key in ("to_session", "claimer_session"):
+        if record.get(key) is not None and not isinstance(record.get(key), str):
+            raise RetentionPlannerError("malformed inbox record")
+    return (sender is not None and sender.get("session") in ids) or record.get("to_session") in ids or record.get("claimer_session") in ids
 
 
 def _preview_snapshot(preview) -> PreviewSnapshot | None:
