@@ -388,7 +388,7 @@ def create_discussion_fork(
                     current = attention_store.get(attention_id)
                     if (
                         reopened_source.metadata != source_metadata
-                        or reopened_list(source.store.entry(ref) for ref in source.store.branch_refs()) != branch
+                        or list(reopened_source.store.entry(ref) for ref in reopened_source.store.branch_refs()) != branch
                         or current != record
                         or current.status == "resolved"
                     ):
