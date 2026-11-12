@@ -401,7 +401,6 @@ class ServeControl:
             loop = self.server.runtime.loop
             if loop is not None:
                 await loop.clear_mcp_bindings()
-
         clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
         if reconnect and self._grace_task is not None:
 
