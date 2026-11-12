@@ -2748,7 +2748,10 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         # before the cancel, so every settlement write hits a closed store.
         owner._active_stores[grandchild_id][0].close()
         assert owner.cancel(child_id)
-        await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        try:
+            await asyncio.wait_for(asyncio.shield(child_watcher), TIMEOUT)
+        except ValueError as error:
+            assert str(error) == "session store is closed"
         await asyncio.wait_for(server.control.wait_for_approval_settlement(), TIMEOUT)
         notification_task = server.control._turn_task
         if notification_task is not None:
