@@ -644,16 +644,18 @@ def test_durable_intent_recovers_exactly_one_delivery_after_crash(
     def boom(*_args, **_kwargs):
         raise RuntimeError("crash before recipient publish")
 
-    with mock.patch.object(inbox, "_publish_outgoing", boom):
-        with pytest.raises(RuntimeError):
-            inbox.send_user(
-                from_project=project_a.project_id,
-                from_session=session_id,
-                to_project=project_b.project_id,
-                kind="info",
-                title="pending",
-                body="durable body",
-            )
+    # test-contract: seam force a crash at the recipient-publish seam
+    with mock.patch.object(inbox, "_publish_outgoing", boom), pytest.raises(
+        RuntimeError
+    ):
+        inbox.send_user(
+            from_project=project_a.project_id,
+            from_session=session_id,
+            to_project=project_b.project_id,
+            kind="info",
+            title="pending",
+            body="durable body",
+        )
 
     # The recipient has nothing yet; the sender ledger holds one pending intent.
     assert inbox.list(project_b.project_id)["new"] == []
@@ -855,6 +857,7 @@ def test_generation_gates_scan_and_each_mutation_advances_it(
         reads += 1
         return real_read(*args, **kwargs)
 
+    # test-contract: seam count message/body opens behind the scanner interface
     with mock.patch.object(scanner.inbox, "_read_record", counted_read):
         results = [scanner.poll() for _ in range(10)]
     assert results == [(None, ())] * 10
