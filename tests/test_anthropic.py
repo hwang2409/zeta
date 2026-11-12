@@ -37,6 +37,7 @@ from zeta.providers.anthropic import (
     OAuthTokens,
     build_authorization_url,
     build_messages_payload,
+    model_output_limits,
 )
 from zeta.providers.payload_common import HARNESS_INJECTED_SYSTEM_MESSAGE_MARKER
 from zeta.providers.completion import (
@@ -413,10 +414,10 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         for block in request_payload["system"]
     )
     assert request_payload["model"] == "claude-sonnet-4-6"
-    assert request_payload["max_tokens"] == 16384
+    assert request_payload["max_tokens"] == 128000
     assert request_payload["thinking"] == {
         "type": "enabled",
-        "budget_tokens": 8192,
+        "budget_tokens": 64000,
     }
     assert "interleaved-thinking-2025-05-14" in requests[0].headers["anthropic-beta"]
     assert request_payload["system"][0]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
@@ -438,6 +439,96 @@ async def test_stream_maps_thinking_text_usage_and_stops_at_one_completion(
         TextContent("hello"),
     ]
     assert not (tmp_path / "logs" / "stream-diagnostics.jsonl").exists()
+    await client.aclose()
+
+
+def test_explicit_max_tokens_derives_thinking_budget(tmp_path: Path) -> None:
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    backend = AnthropicBackend(
+        model="claude-opus-4-8",
+        max_tokens=32_768,
+        token_store=store,
+    )
+
+    assert backend.max_tokens == 32_768
+    assert backend.thinking_budget == 16_384
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-sonnet-5-5", (16_384, 8_192)),
+        ("claude-sonnet-5-preview", (16_384, 8_192)),
+        ("claude-opus-4-5-preview", (16_384, 8_192)),
+        ("claude-sonnet-4-5-20250929", (64_000, 32_000)),
+        ("claude-haiku-4-5-20251001", (64_000, 32_000)),
+    ],
+)
+def test_model_output_limits_match_only_known_model_ids(
+    model: str, expected: tuple[int, int]
+) -> None:
+    assert model_output_limits(model) == expected
+
+
+@pytest.mark.asyncio
+async def test_request_body_uses_model_output_limit(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        model="claude-opus-4-8", client=client, token_store=store
+    )
+    _ = [
+        event
+        async for event in backend.complete(
+            [Message(MessageRole.USER, [TextContent("hi")])],
+            [],
+            control=completion_control(),
+        )
+    ]
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 128_000
+    assert payload["thinking"]["budget_tokens"] == 64_000
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_body_keeps_default_limit_for_unknown_model(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=SSE
+        )
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    backend = AnthropicBackend(
+        model="claude-unknown-9", client=client, token_store=store
+    )
+    _ = [
+        event
+        async for event in backend.complete(
+            [Message(MessageRole.USER, [TextContent("hi")])],
+            [],
+            control=completion_control(),
+        )
+    ]
+    payload = json.loads(requests[0].content)
+    assert payload["max_tokens"] == 16_384
+    assert payload["thinking"]["budget_tokens"] == 8_192
     await client.aclose()
 
 

@@ -171,18 +171,19 @@ async def _mutable_store(client, params):
 
 
 async def switch_branch(client, request_id, params):
-    runtime, store = await _mutable_store(client, params)
+    _runtime, store = await _mutable_store(client, params)
     head = validation.required_string(params, "head_id")
-    current = store.replay()
-    if not current or current[-1].id != head:
-        store.switch_to_branch(head)
-    return session.tree(runtime)
+    if store.active_branch_head_id() != head:
+        await store.switch_to_branch_async(head)
+    return await client.connections.read_tree(client, params)
 
 
 async def fork_message(client, request_id, params):
-    runtime, store = await _mutable_store(client, params)
-    store.append_message_fork(validation.required_string(params, "message_id"))
-    return session.tree(runtime)
+    _runtime, store = await _mutable_store(client, params)
+    await store.append_message_fork_async(
+        validation.required_string(params, "message_id")
+    )
+    return await client.connections.read_tree(client, params)
 
 
 async def model_catalog(client, request_id, params):
