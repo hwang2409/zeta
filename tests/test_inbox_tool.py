@@ -41,7 +41,13 @@ def _retain_async_test_writer(tmp_path: Path, request: pytest.FixtureRequest):
     if request.node.get_closest_marker("asyncio") is None:
         yield
         return
-    with open_writer(tmp_path / ".zeta"):
+    home = tmp_path / ".zeta"
+    if request.node.get_closest_marker("below_durable_intent_epoch") is not None:
+        # Pin the home below the durable-intent epoch before the writer caches it,
+        # so the inbox tool exercises the schema-v1 ledger path these tests gate.
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "storage-format.json").write_text('{"writer_epoch": 7}\n')
+    with open_writer(home):
         yield
 
 
@@ -731,6 +737,7 @@ async def _exercise_concurrent_repair(
 
 
 @pytest.mark.asyncio
+@pytest.mark.below_durable_intent_epoch
 @pytest.mark.parametrize(
     "scenario",
     (

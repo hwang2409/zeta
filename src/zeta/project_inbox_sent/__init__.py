@@ -125,7 +125,6 @@ class SentMessageTracker:
         self.path = self.sessions_root / self.session_id / _SENT_TRACKING_FILE
         self._lock = threading.RLock()
         self._deleted_ids: set[str] = set()
-        self._intents: dict[str, tuple[str, str]] = {}
         self._receipts: tuple[tuple[str, str], ...] = ()
         self._state = self._load_state()
         self._records = (
@@ -216,10 +215,9 @@ class SentMessageTracker:
     def record_intent(self, envelope: dict[str, Any]) -> SentLedgerOutcome[None]:
         """Durably record a sender intent before the recipient publish.
 
-        At or above the durable-intent epoch this writes a pending schema-v2
-        record that carries the full recipient envelope, so a crash before the
-        recipient publish recovers to exactly one delivered message. Below the
-        epoch it only retains the in-process intent and writes nothing.
+        Writes a pending schema-v2 record that carries the full recipient
+        envelope, so a crash before the recipient publish recovers to exactly
+        one delivered message. Only the durable-intent epoch reaches this path.
         """
         message_id = _id(envelope["id"])
         target = _text(envelope["to_project"], "target project")
@@ -232,10 +230,6 @@ class SentMessageTracker:
             if existing is not None:
                 if existing["target_project"] != target:
                     raise ValueError("sent-message tracking record conflicts")
-                self._intents[message_id] = (target, created)
-                return self._outcome(None)
-            if not self._at_epoch:
-                self._intents[message_id] = (target, created)
                 return self._outcome(None)
             record = {
                 "id": message_id,
@@ -251,21 +245,13 @@ class SentMessageTracker:
             self._prune()
             return self._persist((record,), self._deleted_ids)
 
-    def mark_published(
-        self, message_id: str, target_project: str
-    ) -> SentLedgerOutcome[None]:
-        """Mark the recipient publish durable for a previously recorded intent."""
+    def mark_published(self, message_id: str) -> SentLedgerOutcome[None]:
+        """Mark the recipient publish durable for a recorded intent (epoch only)."""
         message_id = _id(message_id)
-        target_project = _text(target_project, "target project")
         with self._lock:
             self._refresh()
             if isinstance(self._state, _Broken):
-                self._intents.pop(message_id, None)
                 return self._outcome(None)
-            if not self._at_epoch:
-                created = self._intents.pop(message_id, (target_project, _now()))[1]
-                return self._record_published_v1(message_id, target_project, created)
-            self._intents.pop(message_id, None)
             record = next((r for r in self._records if r["id"] == message_id), None)
             if record is None:
                 return self._outcome(None)
@@ -301,26 +287,6 @@ class SentMessageTracker:
                 )
                 result.append(resolved)
             return result
-
-    def _record_published_v1(
-        self, message_id: str, target_project: str, created: str
-    ) -> SentLedgerOutcome[None]:
-        existing = next((r for r in self._records if r["id"] == message_id), None)
-        if existing is not None:
-            if existing["target_project"] != target_project:
-                raise ValueError("sent-message tracking record conflicts")
-            return self._outcome(None)
-        record = {
-            "id": message_id,
-            "target_project": target_project,
-            "created_at": created,
-            "reported": [],
-        }
-        self._records.append(record)
-        self._records.sort(key=self._chronology)
-        self._pending.add(message_id)
-        self._prune()
-        return self._persist((record,), self._deleted_ids)
 
     def _spill_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
         body = envelope["body"]

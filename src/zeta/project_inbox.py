@@ -347,10 +347,15 @@ class ProjectInbox:
         self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
     ) -> tuple[str, SentLedgerOutcome[None]]:
         session, target, message_id, body, record = self._outgoing(**kwargs)
-        # Durable sender intent precedes the recipient publish, so a crash in
-        # between recovers to exactly one delivered message at the feature epoch.
+        # At the durable-intent epoch a pending record precedes the recipient
+        # publish, so a crash in between recovers to exactly one delivery. Below
+        # the epoch the ledger row is written after the publish, as before.
         tracker = self._sent_tracker(session)
-        tracker.record_intent(record)
+        durable = feature_enabled(
+            self.observed_epoch, StorageFeature.INBOX_DURABLE_INTENT
+        )
+        if durable:
+            tracker.record_intent(record)
         with self._directories(target, create=True) as dirs:
             self._publish_outgoing(dirs, message_id, body, record)
         if on_visible is not None:
@@ -359,7 +364,9 @@ class ProjectInbox:
             except Exception:  # noqa: BLE001,S110
                 # The durable record remains authoritative if its wake cannot run.
                 pass
-        return message_id, tracker.mark_published(message_id, target)
+        if durable:
+            return message_id, tracker.mark_published(message_id)
+        return message_id, tracker.record(message_id, target)
 
     def recover_sent_intents(self, tracker: SentMessageTracker) -> None:
         """Re-publish any durable intent whose recipient publish is not durable."""
@@ -369,7 +376,7 @@ class ProjectInbox:
             record = dict(envelope)
             with self._directories(target, create=True) as dirs:
                 self._publish_outgoing(dirs, message_id, record["body"], record)
-            tracker.mark_published(message_id, target)
+            tracker.mark_published(message_id)
 
     def _sent_tracker(self, session: str) -> SentMessageTracker:
         if self.sent_tracker is not None and self.sent_tracker.session_id == session:
