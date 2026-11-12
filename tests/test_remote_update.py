@@ -11,7 +11,7 @@ def git(cwd: Path, *args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
 
 
-def repo_pair(tmp_path: Path) -> tuple[Path, Path, str, str]:
+def repo_pair(tmp_path: Path, *, dependency_change: bool = True) -> tuple[Path, Path, Path, str, str]:
     source = tmp_path / "source"
     source.mkdir()
     git(source, "init", "--quiet", "-b", "main")
@@ -27,8 +27,10 @@ def repo_pair(tmp_path: Path) -> tuple[Path, Path, str, str]:
     subprocess.run(["git", "clone", "--quiet", "--bare", str(source), str(origin)], check=True)
     remote = tmp_path / "remote checkout with 'quote'"
     subprocess.run(["git", "clone", "--quiet", str(origin), str(remote)], check=True)
+    git(source, "remote", "add", "origin", str(origin))
     (source / "README").write_text("new\n")
-    (source / "uv.lock").write_text("new lock\n")
+    if dependency_change:
+        (source / "uv.lock").write_text("new lock\n")
     git(source, "add", ".")
     git(source, "commit", "--quiet", "-m", "target")
     target = git(source, "rev-parse", "HEAD")
@@ -40,8 +42,9 @@ def repo_pair(tmp_path: Path) -> tuple[Path, Path, str, str]:
         ["git", "--git-dir", str(origin), "update-ref", "refs/heads/main", target],
         check=True,
     )
+    git(source, "fetch", "--quiet", "origin", "main")
     old = git(remote, "rev-parse", "HEAD")
-    return origin, remote, old, target
+    return origin, remote, source, old, target
 
 
 def fake_host(tmp_path: Path, remote: Path, *, fail_uv: bool = False) -> Path:
@@ -79,16 +82,12 @@ def shlex_quote(value: str) -> str:
     return shlex.quote(value)
 
 
-def run_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote: Path, target: str, *, fail_uv: bool = False) -> tuple[int, str, str]:
+def run_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, package: Path, remote: Path, target: str, *, fail_uv: bool = False) -> tuple[int, str, str]:
     from zeta.cli.main import main
+    from zeta.remote import update
 
-    try:
-        from zeta.remote import update
-    except ImportError:
-        update = None
-    if update is not None:
-        # test-contract: seam target revision is supplied by the local checkout in production.
-        monkeypatch.setattr(update, "_target", lambda: (target, "target subject"))
+    # test-contract: seam package directory only; git and ssh run for real.
+    monkeypatch.setattr(update, "_package_dir", lambda: package / "src/zeta")
     home = fake_host(tmp_path, remote, fail_uv=fail_uv)
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path}:{env['PATH']}"
@@ -124,8 +123,8 @@ class _capture:
 
 
 def test_clean_checkout_moves_to_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, old, target = repo_pair(tmp_path)
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, target)
+    _, remote, package, old, target = repo_pair(tmp_path)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target)
     assert code == 0, err
     assert "updated remote zeta" in out and target in out and old in out
     assert git(remote, "rev-parse", "HEAD") == target
@@ -136,43 +135,52 @@ def test_clean_checkout_moves_to_target(tmp_path: Path, monkeypatch: pytest.Monk
     )
 
 
+def test_no_dependency_change_skips_reinstall(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, remote, package, old, target = repo_pair(tmp_path, dependency_change=False)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target)
+    assert code == 0, err
+    assert old in out and target in out and "no reinstall needed" in out
+    assert not (tmp_path / "remote home/uv-install.log").exists()
+
+
 def test_dirty_checkout_is_unchanged_with_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, old, target = repo_pair(tmp_path)
+    _, remote, package, old, target = repo_pair(tmp_path)
     (remote / "pyproject.toml").write_text("dirty\n")
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, target)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target)
     assert code == 2 and "not clean" in err and "updated remote zeta" not in out
     assert git(remote, "rev-parse", "HEAD") == old
 
 
 def test_backwards_update_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, old, target = repo_pair(tmp_path)
-    assert run_cli(monkeypatch, tmp_path, remote, target)[0] == 0
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, old)
+    _, remote, package, old, target = repo_pair(tmp_path)
+    assert run_cli(monkeypatch, tmp_path, package, remote, target)[0] == 0
+    git(package, "update-ref", "refs/remotes/origin/main", old)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, old)
     assert code == 2 and "backwards" in err and "updated remote zeta" not in out
     assert git(remote, "rev-parse", "HEAD") == target
 
 
 def test_up_to_date_exits_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, _, target = repo_pair(tmp_path)
+    _, remote, package, _, target = repo_pair(tmp_path)
     git(remote, "fetch", "origin")
     git(remote, "checkout", "--detach", target)
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, target)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target)
     assert code == 0 and "already up to date" in out and not err
 
 
 def test_target_unreachable_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, old, target = repo_pair(tmp_path)
+    _, remote, package, old, target = repo_pair(tmp_path)
     other = tmp_path / "other.git"
     subprocess.run(["git", "clone", "--quiet", "--bare", str(remote), str(other)], check=True)
     git(remote, "remote", "set-url", "origin", str(other))
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, target)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target)
     assert code == 2 and "not reachable" in err and "updated remote zeta" not in out
     assert git(remote, "rev-parse", "HEAD") == old
 
 
 def test_failed_remote_step_has_no_success_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _, remote, old, target = repo_pair(tmp_path)
-    code, out, err = run_cli(monkeypatch, tmp_path, remote, target, fail_uv=True)
+    _, remote, package, old, target = repo_pair(tmp_path)
+    code, out, err = run_cli(monkeypatch, tmp_path, package, remote, target, fail_uv=True)
     assert code == 2 and "updated remote zeta" not in out and "remote zeta tool" in err
     assert git(remote, "rev-parse", "HEAD") == old
 

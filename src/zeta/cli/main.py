@@ -1234,7 +1234,7 @@ def _main(argv: list[str] | None = None) -> int:
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"zeta remote update: {exc}", file=sys.stderr)
             return 2
-        print(result.output)
+        print(result)
         return 0
     if args.command == "storage-format":
         try:

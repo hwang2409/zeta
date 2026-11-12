@@ -4,12 +4,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True, slots=True)
-class UpdateResult:
-    output: str
+from pathlib import Path
 
 
 def _remote_script(target: str, host: str) -> str:
@@ -57,25 +52,33 @@ printf 'updated remote zeta\\npath: %s\\nold sha: %s\\nnew sha: %s\\n%s\\nundo: 
 """
 
 
-def _target() -> tuple[str, str]:
+def _package_dir():
     import zeta
 
-    package = zeta.__file__
-    root = subprocess.check_output(
-        ["git", "-C", package, "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-    sha = subprocess.check_output(
-        ["git", "-C", root, "rev-parse", "origin/main"], text=True
-    ).strip()
-    subject = subprocess.check_output(
-        ["git", "-C", root, "show", "-s", "--format=%s", sha], text=True
-    ).strip()
+    return Path(zeta.__file__).resolve().parent
+
+
+def _target() -> tuple[str, str]:
+    package = _package_dir()
+    try:
+        root = subprocess.check_output(
+            ["git", "-C", package, "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+        sha = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "origin/main"], text=True
+        ).strip()
+        subject = subprocess.check_output(
+            ["git", "-C", root, "show", "-s", "--format=%s", sha], text=True
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        raise RuntimeError(detail or "could not resolve local origin/main") from None
     return sha, subject
 
 
 def update_remote(
     host: str, *, runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
-) -> UpdateResult:
+) -> str:
     if not host or host.startswith("-") or any(c.isspace() for c in host):
         raise ValueError("invalid HOST")
     target, subject = _target()
@@ -92,4 +95,4 @@ def update_remote(
         if detail:
             output += detail + "\n"
         raise RuntimeError(output.rstrip())
-    return UpdateResult(output.rstrip())
+    return output.rstrip()
