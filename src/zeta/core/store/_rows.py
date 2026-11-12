@@ -96,7 +96,9 @@ class StartupFactsMixin:
 
 def row_facts(entry: ConversationEntry) -> object | None:
     if entry.type == "message":
-        return (context_calibration_record(entry), sent_message_receipts(entry))
+        calibration = context_calibration_record(entry)
+        receipts = sent_message_receipts(entry)
+        return (calibration, receipts) if calibration is not None or receipts else None
     if entry.type == "compaction":
         data = entry.data
         return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))
@@ -156,7 +158,7 @@ class ResidentRows:
     @classmethod
     def prepared(cls, entries: Iterable[ConversationEntry]) -> ResidentRows:
         rows = cls.__new__(cls)
-        rows.entries = list(entries)
+        rows.entries = entries if isinstance(entries, list) else list(entries)
         rows.rows = [
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in rows.entries
