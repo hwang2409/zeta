@@ -14299,22 +14299,21 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
         model="offline",
     )
 
-    app._submissions.wake()
-    app._submissions.submit("user submission", steer=False)
-    for _ in range(100):
-        if backend.calls:
-            break
-        await asyncio.sleep(0.01)
-    backend.release_first.set()
-    for _ in range(100):
-        if not app._submissions.active:
-            break
-        await asyncio.sleep(0.01)
+    try:
+        app._submissions.wake()
+        app._submissions.submit("user submission", steer=False)
+        await wait_until(lambda: backend.calls >= 1)
+        backend.release_first.set()
+        await wait_until(
+            lambda: backend.calls == 2 and not app._submissions.active
+        )
 
-    assert backend.calls == 2
-    assert backend.max_active == 1
-    await app._submissions.close()
-    await app.loop.close()
+        assert backend.calls == 2
+        assert backend.max_active == 1
+    finally:
+        await app._submissions.close()
+        await app.loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
