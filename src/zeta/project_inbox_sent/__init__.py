@@ -288,10 +288,11 @@ class SentMessageTracker:
     def _prune(self) -> None:
         while len(self._records) > SENT_HISTORY_LIMIT:
             terminal = next((r for r in self._records if "done" in r["reported"]), None)
-            removed = terminal or self._records[0]
-            self._records.remove(removed)
-            self._pending.discard(removed["id"])
-            self._deleted_ids.add(removed["id"])
+            if terminal is None:
+                return
+            self._records.remove(terminal)
+            self._pending.discard(terminal["id"])
+            self._deleted_ids.add(terminal["id"])
 
     def _load_state(self) -> _Missing | _Loaded | _Broken:
         path = self.path
