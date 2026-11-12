@@ -767,15 +767,36 @@ class SlashHandlerMixin:
             or self.loop.tool_registry.background_tasks.running_count > 0
         )
 
+    @property
+    def composer_empty(self) -> bool:
+        session = self._active_session
+        application = None if session is None else getattr(session, "app", None)
+        buffer = getattr(application, "current_buffer", None)
+        return buffer is None or not buffer.text
+
+    @property
+    def restart_pending(self) -> bool:
+        return self._fork_controller is not None and self._fork_controller.restart_pending
+
+    def _maybe_restart_when_idle(self) -> None:
+        if self._fork_controller is not None:
+            self._fork_controller.notify_restart_idle_check()
+
     def slash_restart(self, args: str) -> str:
-        if args.strip():
-            return "restart unchanged: /restart does not accept arguments"
+        requested = args.strip()
+        if requested not in {"", "now", "cancel"}:
+            return "restart unchanged: use /restart, /restart now, or /restart cancel"
         if self._ephemeral_root is not None:
             return "restart unavailable: this session is not persistent"
         if self._fork_controller is None:
             return "restart unavailable: no TUI session controller"
+        if requested == "cancel":
+            self._fork_controller.cancel_restart()
+            return "restart canceled"
+        if requested == "" and self._fork_controller.restart_has_running_work:
+            self._fork_controller.request_restart_when_idle()
+            return "restart pending · waiting for running work · /restart now to cancel it"
         self._fork_controller.request_restart()
-        self.request_exit()
         return "restarting from the local checkout..."
 
     def slash_new(self, args: str) -> str:

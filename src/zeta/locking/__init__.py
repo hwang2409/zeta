@@ -85,6 +85,11 @@ def shape_lock() -> AbstractContextManager[None]:
     return ranked_lock(_Rank.SHAPE)
 
 
+def domain_lock_name(project_id: str, domain: str) -> str:
+    """Name of the process-shared lock file for one domain authority."""
+    return f"{project_id.encode('utf-8').hex()}-{domain.encode('utf-8').hex()}.lock"
+
+
 @contextmanager
 def domain_authority(
     home: Path,
@@ -108,10 +113,7 @@ def domain_authority(
             dir_fd=home_fd,
         )
         try:
-            lock_name = (
-                f"{project_id.encode('utf-8').hex()}-"
-                f"{domain.encode('utf-8').hex()}.lock"
-            )
+            lock_name = domain_lock_name(project_id, domain)
             fd = os.open(
                 lock_name,
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
