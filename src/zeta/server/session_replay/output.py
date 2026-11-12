@@ -192,14 +192,14 @@ class ReplayOutput:
                     return runtime.opened.store
         return None
 
-    def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        self.invalidate_replay_connection(connection, reason="rejoined")
+    async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         runtime = connection.server.runtime
         store = validation.active(runtime, {"session_id": scope.value})
-        status = lifecycle.live_status_baseline(connection)
-        self.replay.begin_join(
-            connection, scope, store.reset_generation(), status
+        self.invalidate_replay_connection(connection, reason="rejoined")
+        pending = self.replay.begin_join(
+            connection, scope, store.reset_generation(), {}
         )
+        pending.status = await lifecycle.live_status_baseline(connection)
 
     def finish_replay_join(
         self,

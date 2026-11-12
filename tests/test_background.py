@@ -65,7 +65,7 @@ from zeta.tools._shared.background_output_archive import _BackgroundOutputArchiv
 from zeta.tools._shared.background_spawn import _group_exists, _terminate_process
 from zeta.tools._shared.background_task_types import TaskExitInput, _BackgroundRecord
 from zeta.tools._shared.process import BackgroundTaskRegistry
-from zeta.tui.render import format_status, render_event
+from zeta.tui.render import format_status, render_agent_notification, render_event
 
 
 def _python(*parts: str) -> str:
@@ -334,6 +334,90 @@ async def test_registry_close_persists_specific_kill_cause(
         store.close()
 
 
+def _closed_session_kill_phase_and_line(
+    root_dir: Path, session_id: str
+) -> tuple[str, str]:
+    """Read the persisted kill phase and the rendered task receipt line.
+
+    Reopens the already-closed session so the assertions run against the
+    durable record and the real TUI render path, not in-memory state.
+    """
+    rows = json.loads((root_dir / session_id / "background_tasks.json").read_text())
+    phases = {row["terminal_phase"] for row in rows}
+    assert phases == {rows[0]["terminal_phase"]}, phases
+    reopened = ConversationStore(root_dir, session_id=session_id)
+    try:
+        receipts = [
+            entry
+            for entry in reopened.agent_notifications(pending_only=False)
+            if entry.data.get("kind") == "task_exited"
+        ]
+        assert len(receipts) == 1, receipts
+        rendered = render_agent_notification(
+            StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=receipts[0].data)
+        )
+        assert rendered is not None
+        line = _renderable_plain(rendered).strip()
+    finally:
+        reopened.close()
+    return phases.pop(), line
+
+
+_SESSION_EXIT_LINE = "background tasks killed on session exit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["tui_exit", "serve_close", "finish_gate_kill"])
+async def test_session_close_kill_phase_by_surface(
+    tmp_path: Path, surface: str
+) -> None:
+    """Session close stores session_shutdown and renders the exit line.
+
+    ctrl-d, /new, and serve close all tear down through close_session ->
+    AgentLoop.close; #1193 regressed those paths to phase="task_kill", which
+    hid the session-exit line (render.py) and kept the wrong recovery phase.
+    The finish-gate case still kills tasks as task_kill and renders the plain
+    receipt, so this guards both phases through the public interfaces.
+    """
+    sleep_30 = _python("import time; time.sleep(30)")
+    if surface == "serve_close":
+        from zeta.server.runtime import ServerRuntime
+
+        runtime = ServerRuntime(tmp_path, provider="codex")
+        await runtime.create_session()
+        loop = runtime.loop
+        assert loop is not None
+        root_dir, session_id = loop.store.root_dir, loop.store.session_id
+        await loop.tool_registry.background_tasks.start(sleep_30, tmp_path)
+        await runtime.close()
+    else:
+        from zeta.runtime.cleanup import close_session
+
+        store = ConversationStore(tmp_path / "session")
+        loop = AgentLoop(
+            FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        await loop.activate()
+        root_dir, session_id = store.root_dir, store.session_id
+        await loop.tool_registry.background_tasks.start(sleep_30, tmp_path)
+        if surface == "finish_gate_kill":
+            # The finish gate marks remaining tasks as an explicit kill before
+            # the loop closes; that must stay task_kill, not session_shutdown.
+            loop.tool_registry.background_tasks.begin_shutdown(
+                "finish-gate task safety bound expired", phase="task_kill"
+            )
+        await close_session(loop)
+
+    phase, line = _closed_session_kill_phase_and_line(root_dir, session_id)
+    if surface == "finish_gate_kill":
+        assert phase == "task_kill"
+        assert _SESSION_EXIT_LINE not in line
+        assert "exited" in line
+    else:
+        assert phase == "session_shutdown"
+        assert _SESSION_EXIT_LINE in line
+
+
 @pytest.mark.asyncio
 async def test_task_exit_recovered_after_restart_exactly_once(tmp_path: Path) -> None:
     # S5: a previously-running row with no existing task_exited notification
@@ -455,18 +539,6 @@ async def _cancel_process_wait(registry, owner, monkeypatch) -> None:
     await _cancel_at_gate(owner, install, name="process-wait")
 
 
-async def _cancel_reader_drain(registry, owner, monkeypatch) -> None:
-    original = owner._finish_output_drain.wait
-
-    async def install(hold):
-        async def wait():
-            await hold()
-            return await original()
-        monkeypatch.setattr(owner._finish_output_drain, "wait", wait)
-
-    await _cancel_at_gate(owner, install, name="reader-drain")
-
-
 async def _cancel_writer_close(registry, owner, monkeypatch) -> None:
     original = _OrderedLogWriter.close
 
@@ -574,7 +646,6 @@ async def _cancel_notice(registry, owner, monkeypatch) -> None:
 
 _CANCEL_ROW_HANDLERS = {
     "process-wait": _cancel_process_wait,
-    "reader-drain": _cancel_reader_drain,
     "ordered-writer-close": _cancel_writer_close,
     "archive": _cancel_archive,
     "persist": _cancel_persist,
@@ -809,10 +880,52 @@ async def test_background_task_owner_state_table(
             return
 
         if row.startswith("cancel-"):
+            if row == "cancel-reader-drain":
+                reader_drain_entered = asyncio.Event()
+                reader_drain_release = asyncio.Event()
+                read_blocked = asyncio.Event()
+                original_read_output = registry.background_tasks._read_output
+
+                async def read_output(*args):
+                    await asyncio.wait_for(read_blocked.wait(), 10)
+                    return await original_read_output(*args)
+
+                # test-contract: seam keep the reader pending so the drain race takes the gated branch
+                monkeypatch.setattr(
+                    registry.background_tasks, "_read_output", read_output
+                )
+
+                original_start = owner_module._BackgroundTaskOwner.start
+
+                def gated_start(self) -> None:
+                    original_wait = self._finish_output_drain.wait
+
+                    async def wait() -> bool:
+                        reader_drain_entered.set()
+                        await await_or_fail(
+                            reader_drain_release.wait(), what="reader-drain release"
+                        )
+                        return await original_wait()
+
+                    # test-contract: seam install the drain gate before the owner runs
+                    self._finish_output_drain.wait = wait
+                    return original_start(self)
+
+                monkeypatch.setattr(
+                    owner_module._BackgroundTaskOwner, "start", gated_start
+                )
             task_id = await start_registered(_python("print('cancel-safe', flush=True)"))
             owner = registry.background_tasks._owners[task_id]
-            handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
-            await handler(registry, owner, monkeypatch)
+            if row == "cancel-reader-drain":
+                await _cancel_gate(
+                    owner,
+                    reader_drain_entered,
+                    reader_drain_release,
+                    name="reader-drain",
+                )
+            else:
+                handler = _CANCEL_ROW_HANDLERS[row.removeprefix("cancel-")]
+                await handler(registry, owner, monkeypatch)
             status = await output_registered(task_id)
             assert status["running"] is False
             assert status["exit_code"] in {0, -15, -signal.SIGTERM, -signal.SIGKILL}
@@ -3251,16 +3364,19 @@ async def test_background_task_stays_running_for_detached_group_member(
 ) -> None:
     ready = tmp_path / "detached-ready"
     terminated = tmp_path / "detached-terminated"
+    # The handler sleeps before writing so the kill must honour the full term
+    # grace for the detached member. Without that grace the member is SIGKILLed
+    # mid-handler and `terminated` is never written (the CI flake).
     child = (
         "import os,pathlib,signal,time; "
         f"ready=pathlib.Path({str(ready)!r}); "
         f"terminated=pathlib.Path({str(terminated)!r}); "
         "signal.signal(signal.SIGTERM, lambda *_: "
-        "(terminated.write_text(str(os.getpid())), exit())[1]); "
+        "(time.sleep(3.0), terminated.write_text(str(os.getpid())), os._exit(0))); "
         "ready.write_text(str(os.getpid())); "
         "time.sleep(300)"
     )
-    tasks = BackgroundTaskRegistry()
+    tasks = BackgroundTaskRegistry(term_grace=10.0)
     task_id, pid = await tasks.start(
         _python(
             "import subprocess,sys; "

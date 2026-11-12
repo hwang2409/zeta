@@ -13,7 +13,7 @@ from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path
-from zeta.core.store import ConversationStore
+from zeta.core.store import ConversationStore, ObserverSnapshotChanged
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.server import ZetaServer
 
@@ -564,6 +564,52 @@ async def test_child_history_bounds_persistent_source_change(
             what="bounded child history source-change request",
         )
         assert replies[-1]["error"]["code"] == -32009, replies[-1]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_child_history_warm_reader_serves_snapshot_when_every_refresh_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
+    child = ConversationStore(
+        server.runtime.opened.store.session_dir / "agents",
+        session_id="1",
+        _storage_lease=server.runtime.opened.store._storage_lease,
+    )
+    child.start_agent_lifecycle(
+        handle=f"{session_id}:1",
+        started_at="2026-01-01T00:00:00+00:00",
+        depth=1,
+        agent_type="worker",
+        description="child",
+    )
+    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
+    child.close()
+    params = {"session_id": session_id, "run_id": f"{session_id}:1"}
+    try:
+        # warm the single child reader slot with a successful cold read.
+        first = (await request(reader, writer, 3, "child_run_history", params))[-1]
+        assert "result" in first, first
+        original_refresh = ConversationStore.refresh
+
+        def refresh_always_changes(target: ConversationStore) -> None:
+            if getattr(target, "_child_history_reader", False):
+                raise ObserverSnapshotChanged("child transcript changed during read")
+            original_refresh(target)
+
+        # test-contract: seam makes every warm-reader refresh report a moved
+        # source, so a newest-page read serves a snapshot only when the final
+        # attempt skips the refresh (allow_stale); always refreshing yields -32009.
+        monkeypatch.setattr(ConversationStore, "refresh", refresh_always_changes)
+        during = (await request(reader, writer, 4, "child_run_history", params))[-1]
+        assert "result" in during, during
+        assert [
+            row["content"][0]["text"]
+            for row in during["result"]["messages"]
+            if row["role"] == "assistant"
+        ] == ["complete"]
     finally:
         await close_serve(server, writer)
 
