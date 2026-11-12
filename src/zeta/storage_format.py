@@ -24,7 +24,8 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 6
+WRITER_EPOCH: Final = 7
+P06_FEATURE_EPOCH: Final = 6
 
 
 class StorageFeature(StrEnum):
@@ -32,6 +33,7 @@ class StorageFeature(StrEnum):
     TRANSCRIPT_REPAIR = "transcript_repair"
     PROJECT_WRITES = "project_writes"
     ATTENTION_KINDS = "attention_kinds"
+    INBOX_DELEGATION = "inbox_delegation"
     PROJECT_LOCKS = "project_locks"
 
 
@@ -41,6 +43,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.PROJECT_WRITES: 4,
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
+    StorageFeature.INBOX_DELEGATION: 7,
 }
 
 
@@ -84,6 +87,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "approval_fact": frozenset({"action"}),
     "approval_display": frozenset({"effective_cwd", "resolved_path", "utf8_bytes"}),
     "child_run": frozenset({"run_id", "parent_run_id", "name", "task", "started_at"}),
+    "inbox_delegation": frozenset({"from_project", "kind"}),
     "pending_queue_closed": frozenset(),
     "client_delivery_accepted_outcome": frozenset({"accepted", "session_id"}),
     "client_delivery_steer_accepted_outcome": frozenset({"accepted"}),

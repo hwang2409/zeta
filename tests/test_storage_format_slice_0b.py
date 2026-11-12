@@ -412,7 +412,7 @@ def test_inbox_claim_regression_guard_preserves_unknown_record_fields(
     inbox = ProjectInbox(registry, sessions_root=tmp_path / "sessions")
     message_id = "1" * 32
     session_id = "2" * 32
-    inbox.send(
+    inbox.send_user(
         from_project=sender.project_id,
         from_session=session_id,
         to_project=target.project_id,
@@ -603,19 +603,23 @@ async def test_slash_and_completed_reply_mutations_run_off_loop(
             inbox_calls.append(threading.get_ident())
             return {}
 
+        def command(self, _project_id: str, _args: str, **_kwargs: object) -> str:
+            inbox_calls.append(threading.get_ident())
+            return "{}"
+
     monkeypatch.setattr("zeta.tui.slash_handlers.ProjectInbox", InboxStub)
     monkeypatch.setattr("zeta.server.slash_commands.ProjectInbox", InboxStub)
     inbox_registry = SimpleNamespace(root=Path("/home/projects"))
     tui_inbox = SimpleNamespace(
         loop=SimpleNamespace(
             project_registry=inbox_registry,
-            session_metadata=SimpleNamespace(project_id="project-id"),
+            session_metadata=SimpleNamespace(project_id="project-id", session_id="s"),
         )
     )
     assert await SlashHandlerMixin.slash_inbox(tui_inbox, "") == "{}"
     assert inbox_calls[-1] != loop_thread
     serve_inbox_runtime = SimpleNamespace(
-        opened=SimpleNamespace(metadata=SimpleNamespace(project_id="project-id")),
+        opened=SimpleNamespace(metadata=SimpleNamespace(project_id="project-id", session_id="s")),
         loop=SimpleNamespace(project_registry=inbox_registry),
     )
     assert await ServerSlashSession(serve_inbox_runtime).slash_inbox("") == "{}"

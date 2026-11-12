@@ -579,6 +579,7 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
         )
         monkeypatch.setattr(decisions_module, "open_decisions", hung_open)
         # test-contract: seam timeout is shortened; the toolbar render is unchanged
+        real_scan_timeout = panel_module._SCAN_TIMEOUT
         monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", 0.01, raising=False)
         app.start_decisions_poll()
         await await_or_fail(entered.wait(), what="started decision scan")
@@ -592,6 +593,11 @@ async def test_hung_decisions_scan_stays_single_flight_and_recovers(
         assert calls == 1
         assert "decisions unavailable: TimeoutError" in rendered and "1 attention item" not in rendered
 
+        # The shortened seam was only needed to force the one hung scan over the
+        # timeout; a poll tick or panel open that scans after the hung scan ends
+        # must not transiently time out and flip the status back to "unavailable".
+        # test-contract: seam restored so post-release scans use the real timeout
+        monkeypatch.setattr(panel_module, "_SCAN_TIMEOUT", real_scan_timeout)
         recovered.clear()
         release.set()
         await await_or_fail(recovered.wait(), what="late decision scan recovery")

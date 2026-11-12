@@ -8,6 +8,7 @@ from typing import TypedDict
 from ...attention_forks import validate_attention_fork
 from ...attention_records import AttentionStore
 from ...attention_replies import AttentionReplies
+from ...project_inbox import AGENT_ORIGIN
 from ...protocol.types import StructuredToolResult
 from ...runtime.project_registry_state import ProjectRegistryState
 from .._results import _success_result, text_block
@@ -42,7 +43,12 @@ async def _resolve_attention(
         registry_state=state,
     )
     outcome = await asyncio.to_thread(
-        AttentionReplies(home, validated.record.session_id, registry_state=state).reply,
+        AttentionReplies(
+            home,
+            validated.record.session_id,
+            registry_state=state,
+            origin=AGENT_ORIGIN,
+        ).reply,
         validated.record.id,
         arguments["decision"],
         store.session_id,
