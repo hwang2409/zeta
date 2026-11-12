@@ -15066,7 +15066,7 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
 
     task = TUIApp.accounts_picker_select(app)
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
     assert switched == [(account, 0)]
 
@@ -15584,7 +15584,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
         task = app.accounts_picker_logout()
         assert task is not None
-        await task
+        await asyncio.wait_for(task, 10)
 
         assert off_loop_calls == 1
         assert not await asyncio.to_thread(AccountStore(home).contains, removed)

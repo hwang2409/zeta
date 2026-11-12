@@ -462,12 +462,13 @@ class SlashHandlerMixin:
             return backend
 
         async def switch() -> None:
-            lock = getattr(self, "slash_lock", None)
-            if lock is None:
-                await self._switch_account(account, context, prepare_backend)
-                return
-            async with lock.hold("account switch"):
-                await self._switch_account(account, context, prepare_backend)
+            switch_account = getattr(self, "_switch_account", None)
+            if switch_account is None:
+                await SlashHandlerMixin._switch_account(
+                    self, account, context, prepare_backend
+                )
+            else:
+                await switch_account(account, context, prepare_backend)
 
         self._account_switch_pending = True
         finished = getattr(self, "_account_switch_finished", None)
@@ -475,7 +476,9 @@ class SlashHandlerMixin:
             finished.clear()
         task = asyncio.create_task(switch())
         self._account_switch_task = task
-        task.add_done_callback(self._account_switch_done)
+        done = getattr(self, "_account_switch_done", None)
+        if done is not None:
+            task.add_done_callback(done)
         return task
 
     async def _switch_account(

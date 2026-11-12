@@ -774,7 +774,7 @@ class SubmissionPipeline(ApprovalPipelineMixin):
                 self._host._record_macro_receipt(receipt)
 
     def _dispatch_oldest_ready(self) -> None:
-        if self._host.account_switch_pending:
+        if getattr(self._host, "account_switch_pending", False):
             if self._account_switch_waiter is None:
                 waiter = asyncio.create_task(self._wait_for_account_switch())
                 self._account_switch_waiter = waiter
