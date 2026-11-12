@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
@@ -922,6 +922,7 @@ def _run_tui_lifecycle(
                 from prompt_toolkit.patch_stdout import (
                     patch_stdout as default_patch_stdout,
                 )
+
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
