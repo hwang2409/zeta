@@ -810,9 +810,8 @@ def test_install_replace_preserves_retention_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     # Replacing a session keeps its retention pin sidecar on every installer.
-    # The transferred snapshot never carries the sidecar, so each install path
-    # must copy it forward; before this fix the SSH, local publish, and local
-    # pull replacements all silently unpinned the destination.
+    # A snapshot may carry its own pin, so replacement must preserve the
+    # destination pin whether or not the source has one.
     local = tmp_path / "local"
     _set_remote_epoch(local, 8)
     session_id = _ssh_session(local)
@@ -901,17 +900,20 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
     session_id = _ssh_session(local)
     transport = SshTransport("fake", str(remote), name="cloud")
 
-    about_to_install = threading.Event()
-    real_install = SshTransport._install_session
+    ready_pipe = tmp_path / "reference-gate-ready"
+    os.mkfifo(ready_pipe)
+    ready_seen = threading.Event()
 
-    def traced_install(
-        self: SshTransport, ident: str, source: Path, expected: str
-    ) -> None:
-        about_to_install.set()
-        real_install(self, ident, source, expected)
+    def read_ready() -> None:
+        with ready_pipe.open(encoding="ascii") as stream:
+            assert stream.readline() == "about-to-wait\n"
+            ready_seen.set()
 
-    # test-contract: seam trace the install boundary to prove the held gate blocks it
-    monkeypatch.setattr(SshTransport, "_install_session", traced_install)
+    # test-contract: the generated script reports immediately before its
+    # blocking references flock; production has no hook environment variable.
+    monkeypatch.setenv("ZETA_TEST_REFERENCE_GATE_READY", str(ready_pipe))
+    ready_reader = threading.Thread(target=read_ready)
+    ready_reader.start()
 
     install_error: list[BaseException] = []
     install_finished = threading.Event()
@@ -930,16 +932,18 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
         session_id=session_id
     ):
         installer.start()
-        assert about_to_install.wait(10), "the SSH install never started"
-        assert not install_finished.wait(2), (
-            "the install landed while retention held the exclusive authority"
+        assert ready_seen.wait(10), "the SSH install never reached the references lock"
+        assert not install_finished.is_set(), (
+            "the install landed before the references lock attempt"
         )
         assert not (remote / "sessions" / session_id).exists()
         assert not (remote / "session-reference-generation").exists()
 
     assert install_finished.wait(10), "the install did not finish after release"
     installer.join(10)
+    ready_reader.join(10)
     assert not installer.is_alive()
+    assert not ready_reader.is_alive()
     assert not install_error, repr(install_error[0]) if install_error else ""
     assert (remote / "sessions" / session_id).exists()
     assert (
@@ -947,19 +951,28 @@ def test_ssh_install_waits_for_the_exclusive_reference_authority(
     ).read_text(encoding="ascii") == "1\n"
 
 
-@pytest.mark.parametrize("kind", ("local-publish", "local-pull"))
-@pytest.mark.parametrize("shape", ("symlink", "directory"))
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+@pytest.mark.parametrize("shape", ("symlink", "directory", "fifo", "hardlink"))
 def test_install_refuses_unsafe_destination_pin_and_leaves_it(
-    tmp_path: Path, kind: str, shape: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, shape: str
 ) -> None:
     # A destination pin that is a symlink or a non-regular file cannot be copied
-    # forward safely. Skipping it (the prior behavior) silently unpinned the
-    # session, so the local publish and pull installers refuse the replace and
-    # leave the destination unchanged.
+    # forward safely. Skipping it silently unpins the session, so every installer
+    # refuses the replace and leaves the destination unchanged.
     local = tmp_path / "local"
     _set_remote_epoch(local, 8)
     session_id = _ssh_session(local)
-    if kind == "local-publish":
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+
+        def reinstall() -> None:
+            push_session(local, transport, session_id=session_id, force=True)
+    elif kind == "local-publish":
         remote = tmp_path / "remote"
         _set_remote_epoch(remote, 8)
         push_session(local, LocalTransport(remote), session_id=session_id)
@@ -989,8 +1002,13 @@ def test_install_refuses_unsafe_destination_pin_and_leaves_it(
     pin = destination / ".retention-pin.json"
     if shape == "symlink":
         pin.symlink_to(destination / "transfer.json")
-    else:
+    elif shape == "directory":
         pin.mkdir()
+    elif shape == "fifo":
+        os.mkfifo(pin)
+    else:
+        pin.write_text('{"pinned":true}\n', encoding="utf-8")
+        os.link(pin, tmp_path / "pin-hardlink")
     marker = destination / "marker-before-replace"
     marker.write_text("present\n", encoding="utf-8")
 
@@ -1001,7 +1019,15 @@ def test_install_refuses_unsafe_destination_pin_and_leaves_it(
 
     # The destination is untouched: the unsafe pin and the marker both remain.
     assert os.path.lexists(pin)
-    assert pin.is_symlink() if shape == "symlink" else pin.is_dir()
+    if shape == "symlink":
+        assert pin.is_symlink()
+    elif shape == "directory":
+        assert pin.is_dir()
+    elif shape == "fifo":
+        assert stat.S_ISFIFO(pin.lstat().st_mode)
+    else:
+        assert pin.is_file()
+        assert pin.lstat().st_nlink == 2
     assert marker.read_text(encoding="utf-8") == "present\n"
 
 

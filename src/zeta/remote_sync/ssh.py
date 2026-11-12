@@ -30,6 +30,7 @@ from ..storage_format import (
     writer_epoch,
 )
 from . import (
+    RETENTION_PIN_FILENAME,
     RemoteSyncError,
     _append_resume_hint,
     _copy_tree,
@@ -67,6 +68,7 @@ try:
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
         for path in [root, *sorted(root.rglob("*"))]:
             relative = path.relative_to(root)
+            if path.name == ".retention-pin.json": continue
             if path.is_symlink(): _reject(f"{path.relative_to(home)}: symlink in session")
             if path.name in {".lock", ".spill.lock", "runtime.lease"}: continue
             if path.is_dir() or path.is_file():
@@ -297,6 +299,7 @@ _SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + rf'''
 _SESSION_RETENTION_EPOCH = {FEATURE_EPOCHS[StorageFeature.SESSION_RETENTION]}
 _GENERATION_NAME = {SESSION_REFERENCE_GENERATION!r}
 _REFERENCE_LOCK_NAME = {domain_lock_name(RETENTION_HOME_ID, REFERENCES_DOMAIN)!r}
+_RETENTION_PIN_FILENAME = {RETENTION_PIN_FILENAME!r}
 _RESERVATION_RELATIVE = {_RESERVATION_RELATIVE!r}
 _QUARANTINE_RELATIVE = {_QUARANTINE_RELATIVE!r}
 
@@ -358,6 +361,10 @@ def _reference_gate(home, installed_ids, referenced_ids):
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     _reject("session reference authority is unsafe")
+                ready_hook = os.environ.get("ZETA_TEST_REFERENCE_GATE_READY")
+                if ready_hook:
+                    with open(ready_hook, "w", encoding="ascii") as stream:
+                        stream.write("about-to-wait\n")
                 fcntl.flock(fd, fcntl.LOCK_SH)
                 try:
                     _validate_reference_ids(home, (*installed_ids, *referenced_ids))
@@ -388,6 +395,8 @@ def digest(root):
     value = hashlib.sha256()
     if not root.exists(): return "missing"
     for path in sorted(root.rglob("*")):
+        if path == root / _RETENTION_PIN_FILENAME:
+            continue
         if path.is_symlink(): _reject(f"{path.relative_to(home)}: symlink in session")
         if path.is_file() and path.name not in {".lock", ".memory.lock", ".sessions.lock", ".spill.lock", "runtime.lease"}:
             value.update(path.relative_to(root).as_posix().encode() + b"\0")
@@ -437,10 +446,17 @@ with _reference_gate(home, (ident,), referenced):
         expected_cwd = home / "remote-workspaces" / ident
         if resume_cwd != expected_cwd: _reject("transfer.json: resume_cwd does not match the remote workspace")
         expected_cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
-        pin = destination / ".retention-pin.json"
-        if destination.exists() and pin.is_file() and not pin.is_symlink():
-            shutil.copyfile(pin, staging / ".retention-pin.json")
-            (staging / ".retention-pin.json").chmod(0o600)
+        pin = destination / _RETENTION_PIN_FILENAME
+        # Keep this fail-closed rule identical to _preserve_retention_pin():
+        # lexists plus lstat rejects symlinks, non-regular files, and links.
+        if os.path.lexists(pin):
+            info = os.lstat(pin)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                _reject(
+                    "destination retention pin is not a regular single-link file"
+                )
+            shutil.copyfile(pin, staging / _RETENTION_PIN_FILENAME)
+            (staging / _RETENTION_PIN_FILENAME).chmod(0o600)
         backup = parent / f".{ident}.replaced-{os.getpid()}"
         if backup.exists(): shutil.rmtree(backup)
         if destination.exists(): destination.rename(backup)
