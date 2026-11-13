@@ -147,7 +147,7 @@ class ServeControl:
         self._mcp_binding_servers: frozenset[str] = frozenset()
         self._mcp_binding_required = False
         self._host_binding_required = False
-        self._approval_resume = ApprovalResumeOwner()
+        self._approval_resume = ApprovalResumeOwner(lambda: self.server.runtime.session_id)
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
@@ -320,6 +320,7 @@ class ServeControl:
 
     def clear_approvals(self) -> None:
         self._approvals.clear_approvals()
+
     def session_replaced(self) -> None:
         self._approvals.session_replaced()
 
@@ -394,7 +395,7 @@ class ServeControl:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         if reconnect and had_mcp_bindings:
-            self._approval_resume.mark_mcp_reconnect(self.server.runtime.session_id, self._approvals.active_keys())
+            self._approval_resume.mark_mcp_reconnect(self._approvals.active_keys())
         self._active_mcp_bindings = {}
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
@@ -546,7 +547,7 @@ class ServeControl:
             else None
         )
         if (
-            self._approval_resume.should_resume(self.server.runtime.session_id, core_key, self._turn_task)
+            self._approval_resume.should_resume(core_key, self._turn_task)
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])
