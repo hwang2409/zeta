@@ -82,6 +82,8 @@ async def test_fork_switch_cancels_finder_and_restores_composer(
 
     if finder_kind == "history":
         app._history_finder_open(session.default_buffer)
+        if app._prompt_history.finder_task is not None:
+            await asyncio.wait_for(app._prompt_history.finder_task, 10)
     else:
         app._finder_open()
     assert app._active_finder.finder_active

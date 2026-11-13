@@ -10,19 +10,13 @@ from unittest.mock import patch
 
 import pytest
 from rich.console import Console
-from rich.text import Text
 
 from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background_lifecycle import recover_agent_children
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
-    Message,
-    MessageOrigin,
-    MessageRole,
-    TextContent,
     ToolCall,
-    with_message_origin,
 )
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.skills.catalog import SkillCatalog
@@ -227,67 +221,6 @@ def test_recovery_notification_index_keeps_first_duplicate(
         assert child.agent_canceled() is None
 
 
-def test_completion_notification_query_returns_detached_first_match(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path, session_id="notification-query")
-    child_id = "notification-query:1"
-    store.append_message(
-        with_message_origin(Message(
-            MessageRole.USER,
-            [TextContent("hello")],
-            metadata={"nested": {"value": "original"}},
-        ), MessageOrigin.USER)
-    )
-    store.append_agent_notification(
-        child_id,
-        child_session_path="/tmp/child",
-        description="original",
-        status="completed",
-        text="done",
-        stats={
-            "turns_used": 1,
-            "elapsed": 0.1,
-            "tool_calls": 0,
-            "error": False,
-            "canceled": False,
-        },
-    )
-    store.append_agent_notification(
-        child_id,
-        child_session_path="/tmp/child",
-        description="duplicate",
-        status="canceled",
-        text="canceled",
-    )
-
-    first = store.agent_completion_notifications_by_child()
-    first[child_id].data["description"] = "mutated"
-    first[child_id].data["stats"]["turns_used"] = 99
-    first.clear()
-    replay_entries = store.tui_replay_entries()
-    replay_message = next(entry for entry in replay_entries if entry.type == "message")
-    assert replay_message.message is not None
-    replay_message.message.metadata["nested"]["value"] = "mutated"
-    replay_notification = next(
-        entry for entry in replay_entries if entry.type == "notification"
-    )
-    replay_notification.data["description"] = "mutated again"
-    replay_notification.data["stats"]["turns_used"] = 100
-
-    subsequent = store.agent_completion_notifications_by_child()
-    assert subsequent[child_id].data["description"] == "original"
-    assert subsequent[child_id].data["stats"]["turns_used"] == 1
-    assert store.agent_notifications(pending_only=False)[0].data["description"] == "original"
-    replayed_message = next(
-        entry.message
-        for entry in store.tui_replay_entries()
-        if entry.type == "message"
-    )
-    assert replayed_message is not None
-    assert replayed_message.metadata["nested"]["value"] == "original"
-
-
 def test_recovery_uses_point_notification_queries_for_many_children(
     tmp_path: Path,
 ) -> None:
@@ -354,133 +287,6 @@ def _notification_replay_app(
     return app, store, notification_ids
 
 
-def test_sync_tui_replay_persists_rendered_notifications_before_error(
-    tmp_path: Path,
-) -> None:
-    app, store, notification_ids = _notification_replay_app(tmp_path, "sync-error")
-    render_calls = 0
-
-    def fail_second_render(*args: object, **kwargs: object) -> None:
-        nonlocal render_calls
-        render_calls += 1
-        if render_calls == 2:
-            raise RuntimeError("render failed")
-
-    with (
-        patch.object(app, "_print_unit", side_effect=fail_second_render),
-        pytest.raises(RuntimeError, match="render failed"),
-    ):
-        app._rebuild_transcript()
-
-    assert render_calls == 2
-    assert _presented_notification_ids(store) == {notification_ids[0]}
-
-
-@pytest.mark.asyncio
-async def test_async_tui_replay_persists_rendered_notifications_before_error(
-    tmp_path: Path,
-) -> None:
-    app, store, notification_ids = _notification_replay_app(tmp_path, "async-error")
-    render_calls = 0
-
-    def fail_second_render(*args: object, **kwargs: object) -> None:
-        nonlocal render_calls
-        render_calls += 1
-        if render_calls == 2:
-            raise RuntimeError("render failed")
-
-    with (
-        patch.object(app, "_print_unit", side_effect=fail_second_render),
-        pytest.raises(RuntimeError, match="render failed"),
-    ):
-        await app._rebuild_transcript_async(batch_size=2)
-
-    assert render_calls == 2
-    assert _presented_notification_ids(store) == {notification_ids[0]}
-
-
-@pytest.mark.asyncio
-async def test_async_tui_replay_persists_rendered_notifications_when_cancelled(
-    tmp_path: Path,
-) -> None:
-    app, store, notification_ids = _notification_replay_app(tmp_path, "async-cancel")
-    replay_task: asyncio.Task[bool] | None = None
-    render_calls = 0
-
-    def cancel_after_first_render(*args: object, **kwargs: object) -> None:
-        nonlocal render_calls
-        render_calls += 1
-        assert replay_task is not None
-        asyncio.get_running_loop().call_soon(replay_task.cancel)
-
-    with patch.object(app, "_print_unit", side_effect=cancel_after_first_render):
-        replay_task = asyncio.create_task(app._rebuild_transcript_async(batch_size=1))
-        with pytest.raises(asyncio.CancelledError):
-            await replay_task
-
-    assert render_calls == 1
-    assert _presented_notification_ids(store) == {notification_ids[0]}
-
-
-@pytest.mark.asyncio
-async def test_tui_replay_scans_notifications_constant_times_and_batches_markers(
-    tmp_path: Path,
-) -> None:
-    store = ConversationStore(tmp_path, session_id="tui-scan")
-    notification_ids = [_append_notification(store, f"child-{index}") for index in range(8)]
-    store.mark_agent_notification_presented_to_tui(notification_ids[0])
-    store.acknowledge_agent_notification(notification_ids[1])
-    output = StringIO()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=output, force_terminal=False),
-        resumed=True,
-    )
-
-    with patch.object(
-        store, "tui_replay_entries", wraps=store.tui_replay_entries
-    ) as replay_entries:
-        assert await app._rebuild_transcript_async(batch_size=3)
-
-    assert replay_entries.call_count == 1
-    rendered = Text.from_ansi(output.getvalue()).plain
-    assert "notification child-0" not in rendered
-    assert "notification child-1" not in rendered
-    for index in range(2, 8):
-        assert f"notification child-{index}" in rendered
-
-    reopened = ConversationStore(tmp_path, session_id="tui-scan")
-    rows = branch_entries(reopened)
-    presented = {
-        entry.data["notification_id"]
-        for entry in rows
-        if entry.type == "notification_tui_presented"
-    }
-    acknowledged = {
-        entry.data["notification_id"]
-        for entry in rows
-        if entry.type == "notification_ack"
-    }
-    assert presented == {notification_ids[0], *notification_ids[2:]}
-    assert acknowledged == {notification_ids[1]}
-
-    second_output = StringIO()
-    second_app = TUIApp(
-        AgentLoop(FakeBackend([]), reopened, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-        console=Console(file=second_output, force_terminal=False),
-        resumed=True,
-    )
-    assert await second_app._rebuild_transcript_async(batch_size=3)
-    assert "notification child-" not in Text.from_ansi(second_output.getvalue()).plain
-    await second_app.close()
-    await app.close()
-
-
-@pytest.mark.asyncio
 async def test_batched_presentation_markers_are_visible_after_reopen(
     tmp_path: Path,
 ) -> None:

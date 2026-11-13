@@ -79,6 +79,7 @@ class HistoryFinder:
         self._buffer: Buffer | None = None
         self._draft: Document | None = None
         self._entries: dict[int, str] = {}
+        self._snapshot_override: tuple[str, ...] | None = None
         self._preview = True
 
     @property
@@ -102,8 +103,15 @@ class HistoryFinder:
         snapshot = await asyncio.to_thread(self._load_snapshot)
         yield snapshot, True
 
+    def set_snapshot(self, history: tuple[str, ...]) -> None:
+        self._snapshot_override = history
+
     def _load_snapshot(self) -> HistorySnapshot:
-        return build_history_candidates(self._history_snapshot())
+        history = self._snapshot_override
+        self._snapshot_override = None
+        return build_history_candidates(
+            self._history_snapshot() if history is None else history
+        )
 
     def finder_publish_candidate_batch(
         self,
