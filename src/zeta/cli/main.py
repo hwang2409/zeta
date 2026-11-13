@@ -17,6 +17,7 @@ from ..config.tool_policy import parse_tool_patterns
 from ..core.commands.completion import completion_script
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
+from ..remote.update import add_remote_parser, run_remote_update
 from ..storage_format import StorageFormatError, advance, writer_epoch
 
 if TYPE_CHECKING:
@@ -432,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="run trusted global command hooks in restricted served sessions",
     )
+    add_remote_parser(commands)
     storage_format_parser = commands.add_parser(
         "storage-format", help="manage the home stored-format gate"
     )
@@ -823,10 +825,16 @@ def _cleanup_ephemeral(app: object) -> None:
     shutil.rmtree(root, ignore_errors=True)
 
 
+def _tui_print(message: str) -> None:
+    from ..tui.stderr_capture import write_terminal
+
+    write_terminal(message)
+
+
 def _print_exit_hint(app: object) -> None:
     if app.ephemeral_root is not None:
         return
-    print(f"resume with: zeta --resume {app.loop.store.session_id}", file=sys.stderr)
+    _tui_print(f"resume with: zeta --resume {app.loop.store.session_id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,15 +856,15 @@ def _unsaved_draft(app: object) -> _UnsavedDraft | None:
 
 
 def _print_unsaved_draft(draft: _UnsavedDraft, *, current_session_id: str) -> None:
-    print("unsaved composer draft:", file=sys.stderr)
+    _tui_print("unsaved composer draft:")
     if draft.session_id != current_session_id:
-        print(f"session: {draft.session_id}", file=sys.stderr)
+        _tui_print(f"session: {draft.session_id}")
     if draft.text:
-        print(draft.text, file=sys.stderr)
+        _tui_print(draft.text)
     if draft.attachment_names:
-        print("attachments:", file=sys.stderr)
+        _tui_print("attachments:")
         for name in draft.attachment_names:
-            print(f"- {name}", file=sys.stderr)
+            _tui_print(f"- {name}")
 
 
 def _retain_active_draft(
@@ -875,7 +883,7 @@ def _create_tui_app(
 
     try:
         if args.continue_session or args.resume is not None:
-            print("Loading session…", flush=True)
+            _tui_print("Loading session…")
             return asyncio.run(asyncio.to_thread(create_app, args))
         return create_app(args)
     except SessionError as exc:
@@ -883,11 +891,18 @@ def _create_tui_app(
     except StorageFormatError:
         raise
     except ValueError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
+        _tui_print(f"zeta: {exc}")
+        return None
+    except Exception as exc:
+        if _has_console_message(exc):
+            raise
+        from ..tui.loop_errors import log_tui_crash
+
+        _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
         return None
 
 
-def _run_tui_lifecycle(
+def _run_tui_lifecycle_captured(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
@@ -908,22 +923,18 @@ def _run_tui_lifecycle(
             restart_cancels_work = False
             new_session_requested = False
             try:
-                from prompt_toolkit.patch_stdout import (
-                    patch_stdout as default_patch_stdout,
-                )
-
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
 
-                patch_stdout = globals().get("patch_stdout") or default_patch_stdout
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
-                with patch_stdout(raw=True):
-                    restart_requested, restart_cancels_work = asyncio.run(
-                        _run_tui(run_app, args)
-                    )
+                from ..tui.stderr_capture import run_tui_session
+
+                restart_requested, restart_cancels_work = run_tui_session(
+                    run_app, args, _run_tui
+                )
                 new_session_requested = run_app.new_session_requested
                 if new_session_requested:
                     _retain_active_draft(app, retained_drafts)
@@ -931,7 +942,16 @@ def _run_tui_lifecycle(
                     args.continue_session = False
                     args.resume = None
             except terminal_render_error as exc:
-                print(f"zeta: {exc}", file=sys.stderr)
+                _tui_print(f"zeta: {exc}")
+                _print_exit_hint(app)
+                exit_status = 1
+                break
+            except Exception as exc:
+                if _has_console_message(exc):
+                    raise
+                from ..tui.loop_errors import log_tui_crash
+
+                _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
                 _print_exit_hint(app)
                 exit_status = 1
                 break
@@ -941,10 +961,7 @@ def _run_tui_lifecycle(
                 continue
             if restart_requested:
                 if restart_cancels_work:
-                    print(
-                        "restart · running children or background tasks will be cancelled",
-                        file=sys.stderr,
-                    )
+                    _tui_print("restart · running children or background tasks will be cancelled")
                 restart_session_id = current_session_id
                 break
             _print_exit_hint(app)
@@ -983,6 +1000,9 @@ def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str
 
 
 def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
+    from ..tui.stderr_capture import restore_stderr_for_cli
+
+    restore_stderr_for_cli()
     command = _restart_argv(entrypoint, argv, session_id)
     try:
         os.execv(entrypoint, command)
@@ -993,18 +1013,21 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 
 
+def _has_console_message(exc: Exception) -> bool:
+    from ..accounts import AccountError
+
+    return isinstance(exc, StorageFormatError | AccountError)
+
+
 def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
-    except StorageFormatError as exc:
-        print(f"zeta: {exc}", file=sys.stderr)
-        return 2
     except Exception as exc:
-        from ..accounts import AccountError
-
-        if not isinstance(exc, AccountError):
+        if not _has_console_message(exc):
             raise
-        print(f"zeta: {exc}", file=sys.stderr)
+        from ..tui.stderr_capture import write_terminal
+
+        write_terminal(f"zeta: {exc}")
         return 2
 
 
@@ -1014,7 +1037,11 @@ def _run_tui_command(
     entrypoint: str,
     original_argv: list[str],
 ) -> int:
-    exit_status, restart_session_id = _run_tui_lifecycle(args, parser)
+    from ..tui.stderr_capture import run_tui_lifecycle
+
+    exit_status, restart_session_id = run_tui_lifecycle(
+        args, parser, _run_tui_lifecycle_captured
+    )
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status
@@ -1222,6 +1249,8 @@ def _main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 130
         return 0
+    if args.command == "remote":
+        return run_remote_update(args.host)
     if args.command == "storage-format":
         try:
             advance(
@@ -1237,6 +1266,8 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "completion":
         print(completion_script(args.shell), end="")
         return 0
+    if args.force_provider and args.model is None:
+        parser.error("--force-provider requires --model")
     if args.prompt is not None:
         from ..runtime.headless import run_headless
 

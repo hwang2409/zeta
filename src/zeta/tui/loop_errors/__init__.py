@@ -13,11 +13,7 @@ from prompt_toolkit import PromptSession
 
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import write_tui_diagnostic
-from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
-from ..composer import FullScreenPromptSession
-from ..render import render_event
 
-_TUI_ERROR_LOG = "tui-errors.jsonl"
 _DIAGNOSTIC_QUEUE: queue.Queue[tuple[Path, dict[str, Any]]] = queue.Queue(maxsize=32)
 _DIAGNOSTIC_WORKER_LOCK = threading.Lock()
 _DIAGNOSTIC_WORKER_STARTED = False
@@ -30,6 +26,8 @@ def _write_diagnostics() -> None:
             write_tui_diagnostic(path, record)
         except Exception:  # noqa: BLE001, S110 - diagnostics must never affect the TUI
             pass
+        finally:
+            _DIAGNOSTIC_QUEUE.task_done()
 
 
 def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
@@ -46,6 +44,23 @@ def _schedule_diagnostic(path: Path, record: dict[str, Any]) -> None:
         _DIAGNOSTIC_QUEUE.put_nowait((path, record))
     except Exception:  # noqa: BLE001 - diagnostics must never affect the TUI
         return
+from ...protocol.types import ErrorInfo, StreamEvent, StreamEventType
+from ..composer import FullScreenPromptSession
+from ..render import render_event
+
+_TUI_ERROR_LOG = "tui-errors.jsonl"
+def tui_error_log() -> Path:
+    return env_home() / "logs" / _TUI_ERROR_LOG
+
+
+def log_tui_crash(error: BaseException) -> Path:
+    """Log a fatal TUI error and return the log path for one short exit line."""
+
+    path = tui_error_log()
+    stack = "".join(traceback.format_exception(error))
+    write_tui_diagnostic(path, {"type": "crash", "traceback": stack})
+    return path
+
 
 
 async def start_prompt_during_activation(
@@ -101,7 +116,7 @@ async def run_prompt_toolkit(
         _loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     ) -> None:
         error = context.get("exception")
-        log_path = env_home() / "logs" / _TUI_ERROR_LOG
+        log_path = tui_error_log()
         if isinstance(error, BaseException):
             message = f"unexpected ui error: {type(error).__name__}"
             stack = "".join(traceback.format_exception(error))

@@ -2565,7 +2565,7 @@ def test_api_key_mode_skips_named_accounts(
     app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
     rendered: list[object] = []
     app._presenter.print_unit = rendered.append
-    app._handle_slash_output(asyncio.run(app.slash_accounts("")))
+    app._handle_slash_output(asyncio.run(app._slash_commands.dispatch_async(app, "/accounts")))
     assert rendered[0].plain == (
         "system · this session uses an API key; account switching is unavailable"
     )

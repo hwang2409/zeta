@@ -206,6 +206,8 @@ class SlashHandlerMixin:
             {item.account: item.label for item in displays},
             {item.account: item.usage for item in displays},
             {item.account for item in displays if not item.available},
+            self._accounts_switching_unavailable(),
+            background_notice=self._accounts_background_notice(),
         )
         self._accounts_picker = picker
         self._accounts_picker_unit = self._presenter.print_unit(picker.render())
@@ -213,6 +215,9 @@ class SlashHandlerMixin:
         return ""
 
     async def _login_account(self, requested: list[str]) -> str:
+        unavailable = self._accounts_switching_unavailable()
+        if unavailable is not None:
+            return f"account unchanged: {unavailable}"
         context = getattr(self.loop, "account_context", None)
         if context is None:
             return "accounts unavailable for this session"
@@ -226,6 +231,35 @@ class SlashHandlerMixin:
             return login_failure_message(exc)
         return f"logged in as {requested[1]}:{requested[2].lower()}"
 
+    @property
+    def account_switch_pending(self) -> bool:
+        return getattr(self, "_account_switch_pending", False)
+
+    async def wait_for_account_switch(self) -> None:
+        await self._account_switch_finished.wait()
+
+    def _accounts_switching_unavailable(self) -> str | None:
+        if getattr(self, "active", False) or getattr(self, "pending_approvals", ()):
+            return "switching waits until the turn ends"
+        context = self.loop.account_context
+        return context.switching_unavailable
+
+    def _accounts_background_notice(self) -> str | None:
+        if getattr(self.loop, "background_children_running", False):
+            return "running children keep their account"
+        return None
+
+    def _block_account_mutation(self) -> bool:
+        picker = self._accounts_picker
+        if picker is None:
+            return True
+        unavailable = self._accounts_switching_unavailable()
+        if unavailable is None:
+            return False
+        picker.switching_unavailable = unavailable
+        self._repaint_accounts_picker()
+        return True
+
     async def slash_accounts(self, args: str) -> str:
         """List named accounts and open the current-session switcher."""
 
@@ -234,21 +268,20 @@ class SlashHandlerMixin:
         if requested and requested[0] == "login":
             return await self._login_account(requested)
         if requested:
+            unavailable = self._accounts_switching_unavailable()
+            if unavailable is not None:
+                return f"account unchanged: {unavailable}"
             if context is None:
                 return "accounts unavailable for this session"
             return await asyncio.to_thread(rename_account_command, context.store, args)
-        if self.active or self.pending_approvals:
-            return (
-                "accounts unavailable: cannot switch while a turn or approval is active"
-            )
         if context is None:
             return "accounts unavailable for this session"
-        if context.switching_unavailable is not None:
-            return context.switching_unavailable
         snapshot = await context.list_snapshot()
         if not snapshot.displays:
-            return "no accounts; run zeta login <provider> --account <name>"
-        return self._show_accounts_picker(snapshot)
+            unavailable = self._accounts_switching_unavailable()
+            return unavailable or "no accounts; run zeta login <provider> --account <name>"
+        self._show_accounts_picker(snapshot)
+        return ""
 
     def _handle_account_limit(self, event: StreamEvent) -> asyncio.Task[None]:
         context = self.loop.account_context
@@ -285,6 +318,8 @@ class SlashHandlerMixin:
         picker = self._accounts_picker
         if picker is None:
             return
+        picker.switching_unavailable = self._accounts_switching_unavailable()
+        picker.background_notice = self._accounts_background_notice()
         unit = self._accounts_picker_unit
         if unit is not None:
             self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
@@ -325,12 +360,16 @@ class SlashHandlerMixin:
         asyncio.create_task(refresh())
 
     def accounts_picker_default(self) -> asyncio.Task[None] | None:
+        if self._block_account_mutation():
+            return None
         picker = self._accounts_picker
         if picker is None:
             return None
         account = picker.highlighted
 
         async def set_default() -> None:
+            if self._block_account_mutation():
+                return
             try:
                 await asyncio.to_thread(
                     self.loop.account_context.store.set_default, account
@@ -344,6 +383,8 @@ class SlashHandlerMixin:
         return asyncio.create_task(set_default())
 
     def accounts_picker_login(self) -> None:
+        if self._block_account_mutation():
+            return
         picker = self._accounts_picker
         session = self._active_session
         if picker is None or session is None:
@@ -355,6 +396,8 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
 
     def accounts_picker_logout(self) -> asyncio.Task[None] | None:
+        if self._block_account_mutation():
+            return None
         picker = self._accounts_picker
         if picker is None:
             return None
@@ -365,6 +408,8 @@ class SlashHandlerMixin:
             return None
 
         async def logout() -> None:
+            if self._block_account_mutation():
+                return
             try:
                 message = await asyncio.to_thread(
                     self.loop.account_context.store.logout,
@@ -386,6 +431,8 @@ class SlashHandlerMixin:
         return asyncio.create_task(logout())
 
     def accounts_picker_rename(self) -> None:
+        if self._block_account_mutation():
+            return
         picker = self._accounts_picker
         session = self._active_session
         if picker is None or session is None:
@@ -397,6 +444,9 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
 
     def accounts_picker_select(self) -> asyncio.Task[None] | None:
+        blocker = getattr(self, "_block_account_mutation", None)
+        if blocker is not None and blocker():
+            return None
         picker = self._accounts_picker
         current_task = getattr(self, "_account_switch_task", None)
         if picker is None or (current_task is not None and not current_task.done()):
@@ -419,30 +469,69 @@ class SlashHandlerMixin:
             return backend
 
         async def switch() -> None:
-            try:
-                await context.switch_active(
-                    self.loop,
-                    account,
-                    boundary=self.loop.store.active_branch_head_sequence(),
-                    provider=self.provider,
-                    build_backend=prepare_backend,
-                )
-            except (AccountError, OSError, RuntimeError, ValueError) as exc:
-                self._print_system(f"account unchanged: {exc}")
-                return
-            finally:
-                self._account_switch_task = None
-            self._dismiss_accounts_picker()
-            if context.account_state_unknown:
-                self._presenter.print_unit(
-                    render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+            switch_account = getattr(self, "_switch_account", None)
+            if switch_account is None:
+                await SlashHandlerMixin._switch_account(
+                    self, account, context, prepare_backend
                 )
             else:
-                self._print_system(f"account: {account}")
+                await switch_account(account, context, prepare_backend)
 
+        self._account_switch_pending = True
+        finished = getattr(self, "_account_switch_finished", None)
+        if finished is not None:
+            finished.clear()
         task = asyncio.create_task(switch())
         self._account_switch_task = task
+        done = getattr(self, "_account_switch_done", None)
+        if done is not None:
+            task.add_done_callback(done)
         return task
+
+    async def _switch_account(
+        self, account: AccountId, context: Any, prepare_backend: Any
+    ) -> None:
+        picker = self._accounts_picker
+        if picker is None:
+            return
+        if getattr(self, "active", False) or getattr(self, "pending_approvals", ()):
+            unavailable = "switching waits until the turn ends"
+        else:
+            unavailable = getattr(context, "switching_unavailable", None)
+        if unavailable is not None:
+            picker.switching_unavailable = unavailable
+            self._repaint_accounts_picker()
+            return
+        try:
+            await context.switch_active(
+                self.loop,
+                account,
+                boundary=self.loop.store.active_branch_head_sequence(),
+                provider=self.provider,
+                build_backend=prepare_backend,
+            )
+        except (AccountError, OSError, RuntimeError, ValueError) as exc:
+            self._print_system(f"account unchanged: {exc}")
+            return
+        finally:
+            self._account_switch_task = None
+        self._dismiss_accounts_picker()
+        if context.account_state_unknown:
+            self._presenter.print_unit(
+                render_event(StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN))
+            )
+        else:
+            self._print_system(f"account: {account}")
+
+    def _account_switch_done(self, task: asyncio.Task[None]) -> None:
+        del task
+        self._account_switch_pending = False
+        finished = getattr(self, "_account_switch_finished", None)
+        if finished is not None:
+            finished.set()
+        invalidate = getattr(self, "_invalidate_prompt", None)
+        if invalidate is not None:
+            invalidate()
 
     def accounts_picker_cancel(self) -> None:
         self._dismiss_accounts_picker()
@@ -678,15 +767,36 @@ class SlashHandlerMixin:
             or self.loop.tool_registry.background_tasks.running_count > 0
         )
 
+    @property
+    def composer_empty(self) -> bool:
+        session = self._active_session
+        application = None if session is None else getattr(session, "app", None)
+        buffer = getattr(application, "current_buffer", None)
+        return buffer is None or not buffer.text
+
+    @property
+    def restart_pending(self) -> bool:
+        return self._fork_controller is not None and self._fork_controller.restart_pending
+
+    def _maybe_restart_when_idle(self) -> None:
+        if self._fork_controller is not None:
+            self._fork_controller.notify_restart_idle_check()
+
     def slash_restart(self, args: str) -> str:
-        if args.strip():
-            return "restart unchanged: /restart does not accept arguments"
+        requested = args.strip()
+        if requested not in {"", "now", "cancel"}:
+            return "restart unchanged: use /restart, /restart now, or /restart cancel"
         if self._ephemeral_root is not None:
             return "restart unavailable: this session is not persistent"
         if self._fork_controller is None:
             return "restart unavailable: no TUI session controller"
+        if requested == "cancel":
+            self._fork_controller.cancel_restart()
+            return "restart canceled"
+        if requested == "" and self._fork_controller.restart_has_running_work:
+            self._fork_controller.request_restart_when_idle()
+            return "restart pending · waiting for running work · /restart now to cancel it"
         self._fork_controller.request_restart()
-        self.request_exit()
         return "restarting from the local checkout..."
 
     def slash_new(self, args: str) -> str:

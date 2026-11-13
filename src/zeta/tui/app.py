@@ -306,6 +306,9 @@ class TUIApp(
         self._accounts_picker: AccountsPicker | None = None
         self._accounts_picker_unit: Any = None
         self._account_switch_task: asyncio.Task[None] | None = None
+        self._account_switch_pending = False
+        self._account_switch_finished = asyncio.Event()
+        self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
@@ -329,6 +332,7 @@ class TUIApp(
         self._turn_had_visible_output = False
         self._failed_turn: tuple[str, Message] | None = None
         self._active_session: PromptSession[str] | None = None
+        self._restart_idle_buffers: set[int] = set()
         self._prompt_styles: dict[bool, Style] = {}
         self._transcript = TranscriptWidget()
         self._init_remote_view()
@@ -769,12 +773,14 @@ class TUIApp(
                 self._agent_navigation.exit_navigation()
             self._reset_stream_state()
             self._loop_state = "approval"
+            self._repaint_accounts_picker()
             self._present_pending_approvals()
             return False
         if event.type is StreamEventType.TOOL_APPROVAL_END:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_finished(event.tool_call)
             self._loop_state = "streaming"
+            self._repaint_accounts_picker()
             self._present_pending_approvals()
             return False
         if event.data.get("agent_instance_id") is not None:
@@ -1000,7 +1006,10 @@ class TUIApp(
         if not self._full_screen_active(): return f"project instructions: {path}"
         command = shlex.join(project_instructions_editor_command(path))
         async def run() -> str:
-            try: status = await run_in_terminal(lambda: subprocess.call(command, shell=True), in_executor=True)
+            try: status = await run_in_terminal(
+                    lambda: subprocess.call(command, shell=True, stderr=subprocess.STDOUT),
+                    in_executor=True,
+                )
             except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
             return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
         return run()
@@ -1120,6 +1129,12 @@ class TUIApp(
         )
         self._bind_fork_navigation()
 
+    def _bind_restart_idle_buffer(self, session: PromptSession[str]) -> None:
+        buffer = getattr(getattr(session, "app", None), "current_buffer", None)
+        if buffer is not None and id(buffer) not in self._restart_idle_buffers:
+            buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            self._restart_idle_buffers.add(id(buffer))
+
     async def run(
         self,
         session: PromptSession[str] | None = None,
@@ -1152,6 +1167,7 @@ class TUIApp(
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
+            self._bind_restart_idle_buffer(session)
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
                 await start_prompt_during_activation(self, session, run_prompt_toolkit)
