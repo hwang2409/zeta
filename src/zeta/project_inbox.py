@@ -227,6 +227,17 @@ def validate_inbox_record(
     return value
 
 
+def _remove_terminal_body(bodies_fd: int, message_id: str) -> None:
+    body_name = f"{message_id}.txt"
+    try:
+        body_info = os.stat(body_name, dir_fd=bodies_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
+        raise InboxError("unsafe done history body")
+    os.unlink(body_name, dir_fd=bodies_fd)
+
+
 class ProjectInbox:
     """Own inbox storage, validation, claiming, completion, and stale recovery."""
 
@@ -769,6 +780,89 @@ class ProjectInbox:
             self._publish_record(claimed_fd, name, record)
             os.fsync(new_fd)
             return self._read_record(claimed_fd, name, bodies_fd)
+
+    def _select_terminal_records(self, project_id, remove_ids, charge):
+        selected = []
+        with self._held_directories(project_id) as dirs:
+            _new_fd, _claimed_fd, done_fd, bodies_fd = dirs[:4]
+            for name in sorted(os.listdir(done_fd)):
+                charge()
+                if not name.endswith(".json"):
+                    raise InboxError(f"unexpected inbox file: {name}")
+                record = self._read_record(
+                    done_fd, name, bodies_fd, resolve_body=False
+                )
+                sender = record["from"]
+                assert isinstance(sender, dict)
+                if (
+                    sender["session"] in remove_ids
+                    or record.get("to_session") in remove_ids
+                    or record.get("claimer_session") in remove_ids
+                ):
+                    selected.append(record)
+        return selected
+
+    def _remove_sender_history(self, selected, charge) -> None:
+        by_sender: dict[str, list[str]] = {}
+        for record in selected:
+            sender = record["from"]
+            assert isinstance(sender, dict)
+            by_sender.setdefault(str(sender["session"]), []).append(record["id"])
+        for sender_id, message_ids in by_sender.items():
+            charge()
+            tracker = SentMessageTracker(
+                self.sessions_root,
+                sender_id,
+                observed_epoch=self.observed_epoch,
+            )
+            if tracker.path.exists():
+                tracker.remove_terminal(
+                    message_ids,
+                    _storage_lease=self.registry._storage_lease,
+                )
+
+    def _delete_terminal_records(self, project_id, selected, charge) -> None:
+        with self._held_directories(project_id) as dirs:
+            _new_fd, _claimed_fd, done_fd, bodies_fd = dirs[:4]
+            for selected_record in selected:
+                charge()
+                name = f"{selected_record['id']}.json"
+                record = self._read_record(
+                    done_fd, name, bodies_fd, resolve_body=False
+                )
+                if record != selected_record:
+                    raise InboxError("terminal inbox record changed during cleanup")
+                os.unlink(name, dir_fd=done_fd)
+                _remove_terminal_body(bodies_fd, selected_record["id"])
+            os.fsync(done_fd)
+            os.fsync(bodies_fd)
+
+    def remove_terminal_session_references(
+        self,
+        project_ids: tuple[str, ...],
+        session_ids: tuple[str, ...],
+        *,
+        charge: Callable[[], None],
+    ) -> None:
+        """Durably remove terminal rows and their external sender history."""
+        remove_ids = set(session_ids)
+        if any(
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > 4_096
+            or "/" in session_id
+            or "\x00" in session_id
+            for session_id in remove_ids
+        ):
+            raise InboxError("invalid retention session id")
+        if not remove_ids:
+            return
+        for project_id in project_ids:
+            charge()
+            selected = self._select_terminal_records(project_id, remove_ids, charge)
+            self._remove_sender_history(selected, charge)
+            if selected:
+                self._delete_terminal_records(project_id, selected, charge)
 
     def done(
         self,

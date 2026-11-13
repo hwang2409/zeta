@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..project_registry import ProjectRegistry
+from ..storage_format import WriterLease
 
 
 @dataclass(frozen=True)
@@ -24,16 +25,20 @@ class ProjectRegistryState:
     unavailable: ProjectRegistryUnavailable | None = None
 
 
-def project_registry(root: Path | str) -> ProjectRegistry:
+def project_registry(
+    root: Path | str, *, _storage_lease: WriterLease | None = None
+) -> ProjectRegistry:
     """Construct a registry without probing or changing it."""
 
-    return ProjectRegistry(root)
+    return ProjectRegistry(root, _storage_lease=_storage_lease)
 
 
-def available_project_registry(root: Path | str) -> ProjectRegistryState:
+def available_project_registry(
+    root: Path | str, *, _storage_lease: WriterLease | None = None
+) -> ProjectRegistryState:
     """Construct an unprobed capability when no startup probe is needed."""
 
-    return ProjectRegistryState(project_registry(root))
+    return ProjectRegistryState(project_registry(root, _storage_lease=_storage_lease))
 
 
 def load_project_registry(root: Path | str) -> ProjectRegistryState:
