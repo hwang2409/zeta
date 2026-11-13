@@ -3678,6 +3678,39 @@ def test_recall_tool_is_registered_and_children_inherit(tmp_path: Path) -> None:
     assert "recall_history" in child.registered_names
 
 
+def test_recall_tool_streams_rows_off_owner_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    source = store.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("off-loop recall needle")])
+    )
+    store.append_compaction_marker("summary", source.seq, source.seq)
+    store.bind_owner_thread()
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=store,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    handler = registry.definitions_by_name["recall_history"].handler
+    owner_thread = threading.get_ident()
+    reader_threads: list[int] = []
+    original_stream_rows = store.stream_rows
+
+    def record_stream_thread(refs, *, batch=256):
+        reader_threads.append(threading.get_ident())
+        return original_stream_rows(refs, batch=batch)
+
+    monkeypatch.setattr(store, "stream_rows", record_stream_thread)
+    try:
+        result = asyncio.run(handler({"query": "off-loop recall needle"}))
+        assert f"seq {source.seq}:" in result
+        assert reader_threads and all(thread != owner_thread for thread in reader_threads)
+    finally:
+        asyncio.run(registry.close())
+        store.close()
+
+
 def test_oversized_recall_range_pages_one_entry_without_losing_content(
     tmp_path: Path,
 ) -> None:

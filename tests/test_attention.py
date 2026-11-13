@@ -66,7 +66,9 @@ def _session(home: Path, *, project_id: str | None = None):
     )
 
 
-def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
+def test_request_attention_writes_atomic_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     opened = _session(tmp_path)
     entry = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
@@ -75,6 +77,15 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
         tmp_path, session_store=opened.store, skill_catalog=SkillCatalog.empty()
     )
     definition = registry.definitions_by_name["request_attention"]
+    entry_reads = 0
+    original_entry = opened.store.entry
+
+    def counted_entry(ref):
+        nonlocal entry_reads
+        entry_reads += 1
+        return original_entry(ref)
+
+    monkeypatch.setattr(opened.store, "entry", counted_entry)
     assert isinstance(definition, ToolDefinition)
     assert definition.description == (
         "Use once per topic to put important user attention in the inbox, then continue work. "
@@ -103,6 +114,7 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
     assert result["content"][0]["text"].startswith("Attention requested:")
     assert record["entry_id"] == entry.id
     assert record["entry_seq"] == entry.seq
+    assert entry_reads == 0
     assert record["status"] == "open"
     assert not list(records[0].parent.glob("*.tmp"))
     asyncio.run(registry.close())
