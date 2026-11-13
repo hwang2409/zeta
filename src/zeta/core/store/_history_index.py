@@ -1183,6 +1183,8 @@ class HistoryPageStoreMixin:
             self._sync_history_index(
                 self.entry(ref) for ref in self.branch_refs()
             )
+            if not self._history_index.available:
+                return
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(
