@@ -113,6 +113,8 @@ class MCPSession:
         self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
         self._mcp_binding_configs = dict(configs or {})
         if self._mcp_mount is not None:
+            for name in bindings:
+                self._mcp_mount.set_primary_registry_only(name, True)
             await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
 
     async def clear_mcp_bindings(self) -> None:
@@ -126,6 +128,8 @@ class MCPSession:
                 {name: {} for name in self._mcp_bindings},
                 self._mcp_binding_configs,
             )
+            for name in self._mcp_bindings:
+                self._mcp_mount.set_primary_registry_only(name, False)
         self._mcp_bindings = {}
         self._mcp_binding_configs = {}
 

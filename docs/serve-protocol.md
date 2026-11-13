@@ -404,17 +404,13 @@ the session runtime still exists, and clears it when the runtime is gone.
 After a controller disconnect, a host-bound session rejects new `send` and
 `send_images` turns with `-32003` and `data.code: "host_binding_required"`
 until a controller supplies the binding again. An idle session accepts it on
-`resume`. During a running turn or pending approval, a replacement controller
-that negotiates both `approval_reconnect` and `session_mcp_bindings` supplies
-`session_id` and `mcp_bindings` on `hello`. The session id and server-name set
-must exactly match the active bound session. A tool call that resumes after
-approval uses the binding from the replacement attachment.
+`resume`.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123","host_commands":[{"name":"gamma-render","executable":"/opt/gamma/bin/render","summary":"render a file in the web surface","environment":{"GAMMA_SESSION":"s-1"}}]}}
 ```
 
-With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume`, or a reconnecting controller's `hello` during a live turn, supplies the binding again. Bound servers are not inherited by child sessions. serve-only: no TUI surface.
+With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume`, or a reconnecting controller's `hello` during a live turn, supplies the binding again. During a running turn or pending approval, the reconnecting controller negotiates both `approval_reconnect` and `session_mcp_bindings` and supplies `session_id` and `mcp_bindings` on `hello`. The session id and server-name set must exactly match the active bound session. A tool call that resumes after approval uses the binding from the replacement attachment. Bound servers are not inherited by child sessions. serve-only: no TUI surface.
 
 ### `resume`
 

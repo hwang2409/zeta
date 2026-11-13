@@ -29,6 +29,7 @@ _RESERVED_HEADERS = frozenset({
     "connection",
     "content-length",
     "expect",
+    "forwarded",
     "host",
     "http2-settings",
     "keep-alive",
@@ -36,8 +37,10 @@ _RESERVED_HEADERS = frozenset({
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "via",
+    "x-real-ip",
 })
-_RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-")
+_RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-", "x-forwarded-")
 
 
 async def _publish_project_registry_notice(self) -> None:
@@ -236,6 +239,21 @@ async def reconnect_mcp_bindings(
     return bindings
 
 
+def _valid_mcp_header(header: object, value: object) -> bool:
+    if type(header) is not str or type(value) is not str or not header:
+        return False
+    folded = header.casefold()
+    return (
+        _HEADER_NAME.fullmatch(header) is not None
+        and folded not in _RESERVED_HEADERS
+        and not folded.startswith(_RESERVED_HEADER_PREFIXES)
+        and not any(ord(char) < 32 and char not in "\t" for char in value)
+        and not any(ord(char) > 126 for char in value)
+        and len(header.encode()) <= 256
+        and len(value.encode()) <= 8192
+    )
+
+
 def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
     if type(raw) is not list:
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "mcp_bindings must be a list")
@@ -249,15 +267,7 @@ def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
             raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
         parsed: dict[str, str] = {}
         for header, value in headers.items():
-            if (
-                type(header) is not str or type(value) is not str or not header
-                or _HEADER_NAME.fullmatch(header) is None
-                or header.casefold() in _RESERVED_HEADERS
-                or header.casefold().startswith(_RESERVED_HEADER_PREFIXES)
-                or any(ord(char) < 32 and char not in "\t" for char in value)
-                or any(ord(char) > 126 for char in value)
-                or len(header.encode()) > 256 or len(value.encode()) > 8192
-            ):
+            if not _valid_mcp_header(header, value):
                 raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
             parsed[header] = value
         result[name] = parsed

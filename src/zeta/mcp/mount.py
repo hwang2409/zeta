@@ -357,6 +357,12 @@ class MCPMount:
             await old_actor.close()
         return await actor.reconnect(notice_sink=notice_sink)
 
+    def set_primary_registry_only(self, name: str, enabled: bool) -> None:
+        actor = self._actors.get(name)
+        if actor is None or self._closed:
+            raise ValueError(f"unknown MCP server: {name}")
+        actor.set_primary_registry_only(enabled)
+
     async def replace_server(
         self,
         server_config: MCPServerConfig,
@@ -592,6 +598,8 @@ async def mount_mcp_servers(
             config.sources.get(server_config.name, config.path),
         )
         mount._actors[server_config.name] = actor
+        if bindings and server_config.name in bindings:
+            actor.set_primary_registry_only(True)
         actor.start()
         actors.append(actor)
     mount._notice_skipped(tuple(skipped), notice_sink)

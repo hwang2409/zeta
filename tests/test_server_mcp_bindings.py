@@ -333,6 +333,108 @@ async def test_bound_mcp_tools_are_not_inherited_by_child_agents(
 
 
 @pytest.mark.asyncio
+async def test_binding_added_by_resume_is_hidden_from_existing_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    child_prompt = "use the existing page tool"
+    parent_call = ToolCall(
+        "agent-1", "agent",
+        {"prompt": child_prompt, "description": "child", "background": True},
+    )
+    backend = PerActorFakeBackend(
+        [
+            ScriptedTurn([TextContent("mounted")]),
+            ScriptedTurn(tool_calls=[parent_call]),
+            ScriptedTurn([TextContent("delegated")]),
+        ],
+        {child_prompt: [
+            ScriptedTurn(tool_calls=[ToolCall("page-1", "page__echo", {})]),
+            ScriptedTurn([TextContent("child done")]),
+        ]},
+        parent_prompt={"warm", "delegate"},
+        parent_waits_for_children=False,
+    )
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        created = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex"
+        }))[-1]["result"]
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await asyncio.wait_for(mcp.request_received.wait(), TIMEOUT)
+        await _event(reader, "turn_end")
+        await _request(reader, writer, 4, "send", {"text": "delegate"})
+        await asyncio.wait_for(backend.child_started[child_prompt].wait(), TIMEOUT)
+
+        resumed = (await _request(reader, writer, 5, "resume", {
+            "session_id": created["session"]["session_id"],
+            "mcp_bindings": [{
+                "server": "page",
+                "headers": {"Authorization": "Bearer live-child-secret"},
+            }],
+        }))[-1]
+        assert "result" in resumed
+        backend.release_children.set()
+
+        async def wait_for_child_retry() -> None:
+            async with asyncio.timeout(TIMEOUT):
+                while len(backend.children[child_prompt].calls) < 2:
+                    await asyncio.sleep(0)
+
+        child_retry = asyncio.create_task(wait_for_child_retry())
+        leaked_approval = asyncio.create_task(_event(reader, "approval_request"))
+        try:
+            done, _ = await asyncio.wait(
+                (child_retry, leaked_approval),
+                timeout=TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert child_retry in done, "live child retained the newly bound MCP tool"
+            await asyncio.wait_for(asyncio.shield(child_retry), TIMEOUT)
+        finally:
+            for task in (child_retry, leaked_approval):
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(child_retry, leaked_approval, return_exceptions=True),
+                TIMEOUT,
+            )
+
+        first_tools = {
+            tool["name"] for tool in backend.children[child_prompt].calls[0][1]
+        }
+        later_tools = {
+            tool["name"] for tool in backend.children[child_prompt].calls[1][1]
+        }
+        assert "page__echo" in first_tools
+        assert "page__echo" not in later_tools
+        assert "tools/call" not in mcp.methods
+        assert all(
+            header != "Bearer live-child-secret"
+            for method, header in zip(mcp.methods, mcp.headers, strict=True)
+            if method == "tools/call"
+        )
+    finally:
+        backend.release_children.set()
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
 async def test_unbound_disconnect_preserves_ordinary_mcp_mount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -505,14 +607,15 @@ async def test_reconnect_rebinds_mcp_during_pending_approval(
     )
     reader, writer = await _connect(server)
     features = ["approval_reconnect", "new_session_settings", "session_mcp_bindings"]
-    binding = {"server": "page", "headers": {"Authorization": "Bearer reconnect-secret"}}
+    old_binding = {"server": "page", "headers": {"Authorization": "Bearer old-secret"}}
+    new_binding = {"server": "page", "headers": {"Authorization": "Bearer new-secret"}}
     try:
         await _request(reader, writer, 1, "hello", {
             "protocol_version": "1.2", "features": features
         })
         created = (await _request(reader, writer, 2, "new_session", {
             "provider": "codex", "model": "gpt-5.6-sol",
-            "approval_mode": "ask", "mcp_bindings": [binding]
+            "approval_mode": "ask", "mcp_bindings": [old_binding]
         }))[-1]["result"]
         session_id = created["session"]["session_id"]
         await _request(reader, writer, 3, "send", {"text": "warm"})
@@ -531,12 +634,9 @@ async def test_reconnect_rebinds_mcp_during_pending_approval(
                 "protocol_version": "1.2",
                 "features": features,
                 "session_id": session_id,
-                "mcp_bindings": [binding],
+                "mcp_bindings": [new_binding],
             })
             assert "error" not in hello[-1]
-            assert server.control._active_mcp_bindings == {
-                "page": {"Authorization": "Bearer reconnect-secret"}
-            }
             allowed = await _request(reader2, writer2, 6, "approve", {
                 "request_id": approval["request_id"]
             })
@@ -551,7 +651,8 @@ async def test_reconnect_rebinds_mcp_during_pending_approval(
             await _event(reader2, "turn_end")
             assert mcp.methods.count("tools/call") == 1
             call_index = mcp.methods.index("tools/call")
-            assert mcp.headers[call_index] == "Bearer reconnect-secret"
+            assert mcp.headers[call_index] == "Bearer new-secret"
+            assert "Bearer old-secret" not in mcp.headers[call_index:]
         finally:
             writer2.close()
             await writer2.wait_closed()
@@ -576,6 +677,8 @@ async def test_session_mcp_binding_rejects_invalid_and_reserved_header_names(
         names = (
             "bad:name", "Host", "Content-Length", "Transfer-Encoding", "Connection",
             "Upgrade", "TE", "Trailer", "Keep-Alive", "Proxy-Authorization",
+            "Forwarded", "X-Forwarded-For", "X-Forwarded-Host",
+            "X-Forwarded-Proto", "X-Real-IP", "Via",
         )
         errors = []
         for request_id, name in enumerate(names, 2):

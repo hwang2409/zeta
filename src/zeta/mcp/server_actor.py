@@ -158,6 +158,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._active_names: WeakKeyDictionary[ToolRegistry, set[str]] = (
             WeakKeyDictionary()
         )
+        self._primary_registry_only = False
         self._publish_callback = publish
         self._build_client = build_client
         self._connect_and_list = connect_and_list
