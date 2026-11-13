@@ -6,6 +6,7 @@ import pty
 import selectors
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -294,6 +295,120 @@ def test_stale_temporary_logs_are_pruned_but_live_ones_are_kept(tmp_path: Path) 
     finally:
         fcntl.flock(live_fd, fcntl.LOCK_UN)
         os.close(live_fd)
+
+
+def test_stale_temp_retention_holds_lock_until_unlink(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    live = directory / ".live.tmp"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    unlink_started = threading.Event()
+    holder_done = threading.Event()
+    holder_locked: list[bool] = []
+    original_unlink = capture.os.unlink
+
+    def hold_unlink(path: Path) -> None:
+        if path == stale:
+            unlink_started.set()
+            holder_fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    holder_locked.append(False)
+                else:
+                    holder_locked.append(True)
+            finally:
+                os.close(holder_fd)
+            holder_done.set()
+        original_unlink(path)
+
+    monkeypatch.setattr(capture.os, "unlink", hold_unlink)
+    try:
+        capture._retain_logs(directory)
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
+    assert unlink_started.is_set()
+    assert holder_done.is_set()
+    assert holder_locked == [False]
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_completed_log_retention_holds_lock_until_unlink(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    old = directory / "old.log"
+    with old.open("wb") as file:
+        file.truncate(capture._TUI_STDERR_MAX_BYTES + 1)
+    live = directory / "live.log"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    unlink_started = threading.Event()
+    holder_done = threading.Event()
+    holder_locked: list[bool] = []
+    original_unlink = capture.os.unlink
+
+    def hold_unlink(path: Path) -> None:
+        if path == old:
+            unlink_started.set()
+            holder_fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    holder_locked.append(False)
+                else:
+                    holder_locked.append(True)
+            finally:
+                os.close(holder_fd)
+            holder_done.set()
+        original_unlink(path)
+
+    monkeypatch.setattr(capture.os, "unlink", hold_unlink)
+    try:
+        capture._retain_logs(directory)
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
+    assert unlink_started.is_set()
+    assert holder_done.is_set()
+    assert holder_locked == [False]
+    assert not old.exists()
+    assert live.exists()
+
+
+def test_retention_skips_replaced_path(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    original_flock = capture.fcntl.flock
+    replaced = False
+
+    def replace_after_lock(fd: int, operation: int) -> None:
+        nonlocal replaced
+        original_flock(fd, operation)
+        if operation == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not replaced:
+            replaced = True
+            stale.unlink()
+            stale.write_bytes(b"replacement")
+
+    monkeypatch.setattr(capture.fcntl, "flock", replace_after_lock)
+    capture._retain_logs(directory)
+    assert stale.read_bytes() == b"replacement"
 
 
 def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:
