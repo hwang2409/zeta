@@ -852,7 +852,7 @@ async def _iter_sse_event_records(
     pending_blank = False
 
     try:
-        chunks = response.aiter_bytes(chunk_size=65_536)
+        chunks = response.aiter_bytes()
         async for raw_chunk in chunks:
             for offset in range(0, len(raw_chunk), 65_536):
                 window = raw_chunk[offset : offset + 65_536]
