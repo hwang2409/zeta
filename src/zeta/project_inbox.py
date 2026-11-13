@@ -149,6 +149,84 @@ def _validate_json_shape(value: object) -> None:
             stack.append((child, depth + 1))
 
 
+def _validate_inbox_fields(value: dict[str, Any]) -> None:
+    _text(value.setdefault("origin", LEGACY_LOCAL_ORIGIN), "message origin")
+    if value.get("to_session") is not None:
+        _id(value["to_session"], "target session")
+    sender = value["from"]
+    if not isinstance(sender, dict) or not all(
+        field in sender for field in ("project", "session")
+    ):
+        raise InboxError("invalid message sender")
+    _text(sender.get("project"), "sender project")
+    _id(sender.get("session"), "sender session")
+    _text(value.get("to_project"), "target project")
+    try:
+        require_closed_variant("inbox.kind", value.get("kind"))
+    except ValueError as exc:
+        raise InboxError("invalid message kind") from exc
+    _text(value.get("title"), "title")
+    _text(value.get("created_at"), "created_at")
+    if "claimer_session" in value:
+        _id(value["claimer_session"], "claimer session")
+    for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
+        if field in value:
+            _text(value[field], field)
+    if "reply" in value and value["reply"] is not None:
+        _text(value["reply"], "reply", empty=True)
+    if "reply_id" in value and value["reply_id"] is not None:
+        _id(value["reply_id"], "reply id")
+    if value.get("in_reply_to") is not None:
+        _id(value["in_reply_to"], "in_reply_to")
+
+
+def _validate_inbox_body(value, message_id, bodies_fd, resolve_body) -> None:
+    body = value["body"]
+    if not isinstance(body, dict):
+        _text(body, "body", empty=True)
+        return
+    if body != {"file": f"bodies/{message_id}.txt"} or bodies_fd is None:
+        raise InboxError("invalid body reference")
+    try:
+        with os.fdopen(
+            open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb"
+        ) as stream:
+            if resolve_body:
+                value["body"] = stream.read().decode("utf-8")
+    except (OSError, SessionError, UnicodeDecodeError) as exc:
+        raise InboxError("unsafe or missing message body") from exc
+
+
+def validate_inbox_record(
+    value: object,
+    name: str,
+    *,
+    bodies_fd: int | None = None,
+    resolve_body: bool = False,
+) -> dict[str, Any]:
+    """Validate one stored inbox record without changing inbox state."""
+    _validate_json_shape(value)
+    if not isinstance(value, dict):
+        raise InboxError(f"unknown inbox schema: {name}")
+    value = dict(value)
+    try:
+        require_closed_variant("inbox.schema_version", value.get("schema_version"))
+    except ValueError as exc:
+        raise InboxError(f"unknown inbox schema: {name}") from exc
+    message_id = _id(value.get("id"))
+    if name != f"{message_id}.json":
+        raise InboxError("message id does not match filename")
+    required = {
+        "schema_version", "id", "from", "to_project", "kind", "title",
+        "body", "in_reply_to", "created_at",
+    }
+    if not required.issubset(value):
+        raise InboxError(f"invalid inbox message fields: {name}")
+    _validate_inbox_fields(value)
+    _validate_inbox_body(value, message_id, bodies_fd, resolve_body)
+    return value
+
+
 class ProjectInbox:
     """Own inbox storage, validation, claiming, completion, and stale recovery."""
 
@@ -934,76 +1012,9 @@ class ProjectInbox:
             data = stream.read(_MAX_FILE_BYTES + 1)
         if len(data) > _MAX_FILE_BYTES:
             raise InboxError(f"inbox message is too large: {name}")
-        value = json.loads(data)
-        _validate_json_shape(value)
-        if not isinstance(value, dict):
-            raise InboxError(f"unknown inbox schema: {name}")
-        schema_version = value.get("schema_version")
-        try:
-            require_closed_variant("inbox.schema_version", schema_version)
-        except ValueError as exc:
-            raise InboxError(f"unknown inbox schema: {name}") from exc
-        message_id = _id(value.get("id"))
-        if name != f"{message_id}.json":
-            raise InboxError("message id does not match filename")
-        required = {
-            "schema_version",
-            "id",
-            "from",
-            "to_project",
-            "kind",
-            "title",
-            "body",
-            "in_reply_to",
-            "created_at",
-        }
-        if not required.issubset(value):
-            raise InboxError(f"invalid inbox message fields: {name}")
-        origin = value.setdefault("origin", LEGACY_LOCAL_ORIGIN)
-        _text(origin, "message origin")
-        if value.get("to_session") is not None:
-            _id(value["to_session"], "target session")
-        sender = value["from"]
-        if not isinstance(sender, dict) or not all(
-            field in sender for field in ("project", "session")
-        ):
-            raise InboxError("invalid message sender")
-        _text(sender.get("project"), "sender project")
-        _id(sender.get("session"), "sender session")
-        _text(value.get("to_project"), "target project")
-        try:
-            require_closed_variant("inbox.kind", value.get("kind"))
-        except ValueError as exc:
-            raise InboxError("invalid message kind") from exc
-        _text(value.get("title"), "title")
-        _text(value.get("created_at"), "created_at")
-        if "claimer_session" in value:
-            _id(value["claimer_session"], "claimer session")
-        for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
-            if field in value:
-                _text(value[field], field)
-        if "reply" in value and value["reply"] is not None:
-            _text(value["reply"], "reply", empty=True)
-        if "reply_id" in value and value["reply_id"] is not None:
-            _id(value["reply_id"], "reply id")
-        if value.get("in_reply_to") is not None:
-            _id(value["in_reply_to"], "in_reply_to")
-        body = value["body"]
-        if isinstance(body, dict):
-            if body != {"file": f"bodies/{message_id}.txt"}:
-                raise InboxError("invalid body reference")
-            try:
-                with os.fdopen(
-                    open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY),
-                    "rb",
-                ) as stream:
-                    if resolve_body:
-                        value["body"] = stream.read().decode("utf-8")
-            except (OSError, SessionError, UnicodeDecodeError) as exc:
-                raise InboxError("unsafe or missing message body") from exc
-        else:
-            _text(body, "body", empty=True)
-        return value
+        return validate_inbox_record(
+            json.loads(data), name, bodies_fd=bodies_fd, resolve_body=resolve_body
+        )
 
     def _read_directory(
         self,
