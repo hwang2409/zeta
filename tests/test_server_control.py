@@ -7,7 +7,7 @@ import gc
 import json
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -686,9 +686,9 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
         assert server_sink is not None
         idle_events: list[StreamEvent] = []
 
-        def forward(event: StreamEvent) -> None:
+        def forward(event: StreamEvent) -> Awaitable[None] | None:
             idle_events.append(event)
-            server_sink(event)
+            return server_sink(event)
 
         root_loop.set_background_event_sink(forward)
         child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")

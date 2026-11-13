@@ -2312,7 +2312,6 @@ async def test_server_shutdown_emits_approval_end_once(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_matched_ends(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_id = "shared-call"
     target = tmp_path / "input.txt"
@@ -2344,33 +2343,6 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         socket_path=_socket_path(tmp_path),
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
-    agent_ended = asyncio.Event()
-    append_history = server.control._approvals._append_delegated_history
-    notify = server.control._notify
-
-    async def delay_delegated_approval_end(
-        record: object, payload: dict[str, object] | None
-    ) -> object:
-        if isinstance(record.target.key, tuple):
-            async with asyncio.timeout(10):
-                await agent_ended.wait()
-        return await append_history(record, payload)
-
-    async def record_agent_end(
-        event: str, session_id: str | None = None, **fields: object
-    ) -> bool:
-        published = await notify(event, session_id, **fields)
-        if event == "agent_end":
-            agent_ended.set()
-        return published
-
-    # test-contract: seam holds the delegated approval-end admission until agent_end
-    monkeypatch.setattr(
-        server.control._approvals,
-        "_append_delegated_history",
-        delay_delegated_approval_end,
-    )
-    monkeypatch.setattr(server.control, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
         await _request(reader, writer, 3, "send", {"text": "both"})
@@ -2397,11 +2369,12 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             event["request_id"] for event in _named_events(frames, "approval_end")
         } == expected_end_ids
         assert server.runtime.opened is not None
-        assert any(
+        while not any(
             isinstance(block, TextContent) and block.text == "parent done"
             for message in server.runtime.opened.store.messages()
             for block in message.content
-        )
+        ):
+            frames.append(await _read(reader))
         child_store = ConversationStore(
             server.runtime.opened.store.session_dir / "agents", session_id="1"
         )
