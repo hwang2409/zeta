@@ -187,6 +187,29 @@ def _wrapped_list_item(
     return result
 
 
+def _render_indented_blocks(
+    nodes: list[_MarkdownNode],
+    console: Console,
+    width: int,
+    indent: str,
+    deadline: float | None,
+) -> Text:
+    blocks = _with_blank_lines(
+        _render_blocks(nodes, console, max(1, width - cell_len(indent)), deadline)
+    )
+    lines = console.render_lines(
+        _Prefixed(Group(*blocks), indent, ""),
+        console.options.update_width(width),
+    )
+    rendered = Text()
+    for index, line in enumerate(lines):
+        if index:
+            rendered.append("\n")
+        for segment in line:
+            rendered.append(segment.text, style=segment.style)
+    return rendered
+
+
 def _render_list(
     node: _MarkdownNode,
     console: Console,
@@ -216,38 +239,26 @@ def _render_list(
         if rendered:
             rendered.append("\n\n" if loose else "\n")
         rendered.append_text(_wrapped_list_item(console, first, first_prefix, width))
-        for paragraph in paragraphs[1:]:
-            rendered.append("\n")
-            rendered.append_text(
-                _wrapped_list_item(
-                    console,
-                    _inline_child(paragraph),
-                    indent + "  ",
-                    width,
-                )
-            )
+        first_paragraph = next(iter(paragraphs), None)
         for child in item.children:
-            if child.token.type in {"bullet_list_open", "ordered_list_open"}:
-                rendered.append("\n")
+            if child is first_paragraph:
+                continue
+            rendered.append("\n")
+            if child.token.type == "paragraph_open":
                 rendered.append_text(
-                    _render_list(child, console, width, depth + 1, deadline)
+                    _wrapped_list_item(
+                        console,
+                        _inline_child(child),
+                        indent + "  ",
+                        width,
+                    )
                 )
-            elif child.token.type == "blockquote_open":
-                inner = _with_blank_lines(
-                    _render_blocks(child.children, console, width, deadline)
+            else:
+                rendered.append_text(
+                    _render_indented_blocks(
+                        [child], console, width, indent + "  ", deadline
+                    )
                 )
-                quote = _Prefixed(
-                    Group(*inner),
-                    indent + "  │ ",
-                    f"dim {theme.DIM}",
-                )
-                rendered.append("\n")
-                for index, line in enumerate(
-                    quote.__rich_console__(console, console.options.update_width(width))
-                ):
-                    if index:
-                        rendered.append("\n")
-                    rendered.append_text(line)
     return rendered
 
 

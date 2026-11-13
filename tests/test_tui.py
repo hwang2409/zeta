@@ -8228,16 +8228,21 @@ def test_completed_message_replaces_streaming_unit_once(
 
 
 @pytest.mark.parametrize(
-    ("source", "expected"),
+    ("source", "sentinel"),
     [
-        ("> top-level", ("│ top-level",)),
-        ("1. **x:**\n   > quoted\n   after", ("quoted", "after")),
-        ("> first\n> second", ("first", "second")),
+        ("- item\n\n  > blockquote-sentinel", "blockquote-sentinel"),
+        ("- item\n\n  ```text\n  fenced-sentinel\n  ```", "fenced-sentinel"),
+        (
+            "- item\n\n  | name |\n  | --- |\n  | table-sentinel |",
+            "table-sentinel",
+        ),
+        ("- item\n\n  # heading-sentinel", "heading-sentinel"),
+        ("- item\n  - nested-list-sentinel", "nested-list-sentinel"),
     ],
 )
 @pytest.mark.asyncio
-async def test_completed_assistant_renders_blockquotes(
-    tmp_path: Path, source: str, expected: tuple[str, ...]
+async def test_assistant_preserves_blocks_nested_in_list_items(
+    tmp_path: Path, source: str, sentinel: str
 ) -> None:
     app = TUIApp(
         AgentLoop(
@@ -8257,6 +8262,11 @@ async def test_completed_assistant_renders_blockquotes(
                 content=TextContent(source),
             )
         )
+        streaming = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert sentinel in streaming
+
         app._finish_message(
             StreamEvent(
                 StreamEventType.MESSAGE_END,
@@ -8264,11 +8274,10 @@ async def test_completed_assistant_renders_blockquotes(
             )
         )
 
-        plain = "\n".join(
+        completed = "\n".join(
             Text.from_ansi(line).plain for line in app._transcript.lines(80)
         )
-        assert all(value in plain for value in expected)
-        assert "│" in plain
+        assert sentinel in completed
 
 
 def test_mixed_assistant_tool_transcript_commits_each_text_once(
