@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import copy
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from ...core.store._rows import MessageFacts
 from ...protocol.types import (
+    FAILED_TURN_MARKER,
     MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
+    MessageRole,
     ToolUseContent,
 )
 from ..user import displayed_user_text
@@ -79,14 +82,26 @@ class RootTUIHistorySource:
     prompt_limit = 128
     prompt_bytes = 256 * 1024
 
-    def __init__(self, store: Any) -> None:
+    def __init__(
+        self,
+        store: Any,
+        *,
+        replay_provider_loader: Callable[[], str | None] | None = None,
+    ) -> None:
         self._store = store
+        self._replay_provider_loader = replay_provider_loader
+        self._replay_provider_loaded = False
+        self.replay_provider: str | None = None
 
     def _page_sync(
         self,
         cursor: HistoryCursor | None,
         direction: Literal["older", "newer"],
     ) -> TUIHistoryPage:
+        if not self._replay_provider_loaded:
+            loader = self._replay_provider_loader
+            self.replay_provider = loader() if loader is not None else None
+            self._replay_provider_loaded = True
         if direction == "newer":
             offset = int(cursor.value) if cursor is not None else 0
             request = {"offset": offset}
@@ -110,6 +125,15 @@ class RootTUIHistorySource:
             projected: list[tuple[str, Any]] = []
             if entry.type == "message":
                 message = Message.from_dict(entry.data["message"])
+                if (
+                    message.role is MessageRole.ASSISTANT
+                    and message.metadata.get(FAILED_TURN_MARKER)
+                ):
+                    dependency = self._store.tui_user_dependency(entry.seq)
+                    if dependency is not None:
+                        projected.append(
+                            (f"{dependency.id}:dependency:{entry.id}", dependency)
+                        )
                 result = message.tool_result
                 if result is not None:
                     dependency = self._store.tui_tool_call_dependency(
@@ -273,8 +297,11 @@ class RootTUIHistorySource:
             ),
         )
         try:
-            entry_ids = await asyncio.shield(worker)
+            matches = await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancel.set()
             raise
-        return tuple(HistorySearchResult(entry_id) for entry_id in entry_ids)
+        return tuple(
+            HistorySearchResult(entry_id, unit_ordinal)
+            for entry_id, unit_ordinal in matches
+        )

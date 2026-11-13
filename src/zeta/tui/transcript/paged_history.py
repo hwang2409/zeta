@@ -311,31 +311,44 @@ class PagedTranscriptHistory:
         if page.endpoint_id is not None:
             self.endpoint_id = page.endpoint_id
             self._frozen_endpoint = page.endpoint_id
-        durable_ids = {unit.entry_id for unit in page.units}
-        self._segments = deque(
-            descriptor
-            for descriptor in self._segments
-            if not (
-                descriptor.key.startswith("live:")
-                and any(unit.entry_id in durable_ids for unit in descriptor.page.units)
+        durable_units = {
+            (unit.entry_id, unit.unit_ordinal) for unit in page.units
+        }
+        reconciled: deque[PageDescriptor] = deque()
+        for descriptor in self._segments:
+            if not descriptor.key.startswith("live:"):
+                reconciled.append(descriptor)
+                continue
+            retained = tuple(
+                unit
+                for unit in descriptor.page.units
+                if (unit.entry_id, unit.unit_ordinal) not in durable_units
             )
-        )
+            if not retained:
+                continue
+            decoded_bytes = sum(
+                len(str(unit.value).encode("utf-8", errors="replace"))
+                for unit in retained
+            )
+            reconciled.append(
+                PageDescriptor(
+                    descriptor.key,
+                    TUIHistoryPage(
+                        (TUIPaintSegment(retained, decoded_bytes=decoded_bytes),),
+                        older=descriptor.page.older,
+                        newer=descriptor.page.newer,
+                        endpoint_id=descriptor.page.endpoint_id,
+                        repair_generation=descriptor.page.repair_generation,
+                    ),
+                )
+            )
+        self._segments = reconciled
         descriptors = [self._descriptor(page, index) for index in range(len(page.segments))]
         if direction == "older":
             for descriptor in reversed(descriptors):
                 self._segments.appendleft(descriptor)
             while len(self._segments) > self.max_pages:
-                candidates = [
-                    descriptor
-                    for descriptor in reversed(self._segments)
-                    if not descriptor.key.startswith("live:")
-                    and descriptor not in descriptors
-                ] or [
-                    descriptor
-                    for descriptor in reversed(self._segments)
-                    if not descriptor.key.startswith("live:")
-                ]
-                self._segments.remove(candidates[0] if candidates else self._segments[-1])
+                self._segments.pop()
         else:
             live_index = next(
                 (
@@ -349,17 +362,7 @@ class PagedTranscriptHistory:
                 self._segments.insert(live_index, descriptor)
                 live_index += 1
             while len(self._segments) > self.max_pages:
-                candidates = [
-                    descriptor
-                    for descriptor in self._segments
-                    if not descriptor.key.startswith("live:")
-                    and descriptor not in descriptors
-                ] or [
-                    descriptor
-                    for descriptor in self._segments
-                    if not descriptor.key.startswith("live:")
-                ]
-                self._segments.remove(candidates[0] if candidates else self._segments[0])
+                self._segments.popleft()
         self._refresh_edges()
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:

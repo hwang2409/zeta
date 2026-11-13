@@ -57,7 +57,7 @@ from .agent_card import (
 from .bootstrap import build_backend
 from .cards.mcp_manager import MCPManager
 from .cards.shared import wrap_by_cells
-from .checkpoints import CheckpointTranscriptMixin
+from .checkpoints import CheckpointTranscriptMixin, session_replay_provider
 from .composer import (
     ComposerAttachmentMixin,
     ComposerCompleter,
@@ -267,7 +267,12 @@ class TUIApp(
         self._active_turn_submission_id: int | None = None
         self._resuming_tool = False
         self._session = session
-        self._history_source = RootTUIHistorySource(self.loop.store)
+        self._history_source = RootTUIHistorySource(
+            self.loop.store,
+            replay_provider_loader=lambda: session_replay_provider(
+                self.loop.store.session_dir
+            ),
+        )
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
         self._history_search_results: tuple[Any, ...] = ()
@@ -800,7 +805,7 @@ class TUIApp(
         prompt_history.bind(path, self._history_source)
 
         async def load() -> None:
-            snapshot = await prompt_history.finder_snapshot()
+            snapshot = await prompt_history.finder_snapshot(buffer.text)
             if path != self._viewed_session_path():
                 return
             self._history_finder.set_snapshot(snapshot)

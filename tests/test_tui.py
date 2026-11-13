@@ -148,6 +148,8 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.protocol.types import (
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     CompletionBackend,
     ErrorInfo,
     ImageContent,
@@ -16406,6 +16408,219 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "live-tail" in rendered
         assert "history-49999" in rendered
         assert app._transcript.follow_tail
+
+@pytest.mark.parametrize(
+    "journey",
+    (
+        "stale-anchor",
+        "mixed-live-durable",
+        "failed-turn-dependency",
+        "tool-result-bound",
+        "close-search",
+        "unloaded-failed-search",
+        "bounded-prompt-finder",
+    ),
+)
+@pytest.mark.asyncio
+async def test_root_tui_paging_render_path_table(
+    tmp_path: Path, journey: str
+) -> None:
+    store = ConversationStore(tmp_path / journey / "sessions")
+    failure_text = "needle-provider-failure"
+
+    if journey == "stale-anchor":
+        for index in range(300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"anchor-{index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+    elif journey == "mixed-live-durable":
+        durable = store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("durable-A")]),
+                MessageOrigin.USER,
+            )
+        )
+    elif journey in {"failed-turn-dependency", "unloaded-failed-search"}:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("retry-target-user")]),
+                MessageOrigin.USER,
+            )
+        )
+        for index in range(130):
+            store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent(f"before-failure-{index}")])
+            )
+        failed = store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent("failed assistant text")],
+                metadata={
+                    FAILED_TURN_MARKER: True,
+                    FAILED_TURN_ERROR: ErrorInfo(
+                        "backend_error", failure_text
+                    ).to_dict(),
+                },
+            )
+        )
+        if journey == "unloaded-failed-search":
+            store.append_checkpoint("searchable-checkpoint")
+            for index in range(180):
+                store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"tail-{index}")])
+                )
+    elif journey == "tool-result-bound":
+        for index in range(128):
+            call = ToolCall(f"bounded-{index}", "read", {"path": str(index)})
+            store.append_message(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+            )
+            store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [],
+                    tool_result=ToolResult(call.id, f"result-{index}"),
+                )
+            )
+    elif journey == "bounded-prompt-finder":
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("oldest-needle")]),
+                MessageOrigin.USER,
+            )
+        )
+        for index in range(1, 300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prompt-{index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+    else:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("search-row")]),
+                MessageOrigin.USER,
+            )
+        )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+
+        if journey == "stale-anchor":
+            app._transcript.scroll_to_top()
+            original_page = app._history_source.page
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def delayed_page(cursor=None, *, direction="older"):
+                started.set()
+                await asyncio.wait_for(release.wait(), 10)
+                return await original_page(cursor, direction=direction)
+
+            app._history_source.page = delayed_page
+            load = asyncio.create_task(app._load_transcript_page(direction="older"))
+            await asyncio.wait_for(started.wait(), 10)
+            app._transcript.scroll_down()
+            moved_anchor = app._transcript.durable_scroll_anchor
+            release.set()
+            await await_or_fail(load, what="stale-anchor page read")
+            assert app._transcript.durable_scroll_anchor == moved_anchor
+        elif journey == "mixed-live-durable":
+            app._history_pager.reset(endpoint_id=durable.id)
+            app._history_pager.append_live(durable.id, Text("live-A"))
+            app._history_pager.append_live("live-B", Text("live-B"))
+            app._history_pager.append_live("live-C", Text("live-C"))
+            page = await app._history_source.reveal(durable.id)
+            app._history_pager.adopt(page, direction="newer")
+            app._render_resident_history()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "durable-A" in rendered
+            assert "live-B" in rendered
+            assert "live-C" in rendered
+        elif journey == "failed-turn-dependency":
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert failure_text in rendered
+            assert app._failed_turn is not None
+            assert app._failed_turn[0] == "retry-target-user"
+        elif journey == "tool-result-bound":
+            assert sum(
+                len(page.units) for page in app._history_pager.pages
+            ) <= app._history_pager.max_segment_rows
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "result-127" in rendered
+        elif journey == "close-search":
+            started = threading.Event()
+            release = threading.Event()
+            finished = threading.Event()
+            original_search = store.tui_history_search
+
+            def blocked_search(*args, **kwargs):
+                started.set()
+                release.wait(10)
+                try:
+                    return original_search(*args, **kwargs)
+                finally:
+                    finished.set()
+
+            store.tui_history_search = blocked_search
+            task = asyncio.create_task(app._history_pager.search("search-row"))
+            app._history_search_task = task
+            assert await asyncio.to_thread(started.wait, 10)
+            await asyncio.wait_for(app._close_history_search(), 0.2)
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 10)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        elif journey == "unloaded-failed-search":
+            matches = await app._history_pager.search(failure_text)
+            target = next(match for match in matches if match.entry_id == failed.id)
+            assert target.unit_ordinal == 1
+            checkpoint_matches = await app._history_pager.search(
+                "searchable-checkpoint"
+            )
+            assert checkpoint_matches[0].unit_ordinal == 0
+            await app._history_pager.reveal(target.entry_id)
+            app._render_resident_history()
+            assert app._transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert failure_text in rendered
+            assert app._failed_turn is not None
+            assert app._failed_turn[0] == "retry-target-user"
+        else:
+            buffer = Buffer(document=Document("oldest-needle"))
+            app._history_finder_open(buffer)
+            assert app._history_prompt_task is not None
+            await await_or_fail(
+                app._history_prompt_task, what="bounded ctrl+r source scan"
+            )
+            if app._finder_prepare_task is not None:
+                await await_or_fail(
+                    app._finder_prepare_task, what="bounded ctrl+r candidates"
+                )
+            if app._finder_rank_task is not None:
+                await await_or_fail(
+                    app._finder_rank_task, what="bounded ctrl+r ranking"
+                )
+            state = app._history_finder.finder_state()
+            assert state is not None
+            assert state.total <= 200
+            assert any("oldest-needle" in row.excerpt for row in state.rows)
+            assert len(app._prompt_history.pages) <= 2
+
 
 @pytest.mark.asyncio
 async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(

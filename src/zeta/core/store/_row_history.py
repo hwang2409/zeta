@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import threading
@@ -15,11 +14,14 @@ from ...protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     MESSAGE_ORIGIN_METADATA,
     Message,
     MessageOrigin,
-    ToolUseContent,
+    MessageRole,
     assistant_text,
+    is_passive_harness_message,
 )
 from ...storage_format import reject_unknown_keys
 from ._async_writes import _AppendTurnEndCommand
@@ -235,8 +237,75 @@ class RecentRowsMixin:
 def create_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS message_search ("
-        "entry_seq INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, text TEXT NOT NULL)"
+        "entry_seq INTEGER NOT NULL, entry_id TEXT NOT NULL, "
+        "unit_ordinal INTEGER NOT NULL, text TEXT NOT NULL, "
+        "PRIMARY KEY(entry_seq,unit_ordinal))"
     )
+
+
+def searchable_units(
+    entry_type: str, data: Mapping[str, object]
+) -> tuple[str, ...]:
+    """Return the visible search text for each unit painted by root replay."""
+
+    if entry_type == "message":
+        try:
+            message = Message.from_dict(data["message"])
+        except (KeyError, TypeError, ValueError):
+            return ()
+        if is_passive_harness_message(message):
+            text = assistant_text(message)
+            return (text,) if text else ()
+        if message.role is MessageRole.USER:
+            text = assistant_text(message)
+            return (text,) if text else ()
+        if message.role is MessageRole.ASSISTANT:
+            units = [text] if (text := assistant_text(message)) else []
+            if message.metadata.get(FAILED_TURN_MARKER):
+                error = message.metadata.get(FAILED_TURN_ERROR)
+                if isinstance(error, Mapping):
+                    units.append(" ".join(str(value) for value in error.values()))
+                else:
+                    units.append("provider failure")
+            return tuple(units)
+        if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
+            return (str(message.tool_result.content),)
+        return ()
+    if entry_type == "checkpoint":
+        return (f"checkpoint '{data.get('label', '')}' at seq",)
+    if entry_type == "fork":
+        label = data.get("label", data.get("name", ""))
+        return (f"forked {label} seq {data.get('from_seq', '')}",)
+    if entry_type == "compaction":
+        return (
+            (
+                "compaction marker entries "
+                f"{data.get('source_seq_start', '')} {data.get('source_seq_end', '')}"
+            ),
+        )
+    if entry_type == "turn_end":
+        reason = data.get("reason")
+        text = {
+            "user_stop": "turn stopped by the user",
+            "error": "turn ended with an error",
+            "disconnect": "turn ended when the controller disconnected",
+        }.get(reason)
+        return (text,) if text is not None else ()
+    if entry_type == "warning" and data.get("kind") == "transcript_recovery":
+        return (
+            (
+                "transcript recovered preserved corrupt bytes in quarantine "
+                f"{data.get('quarantine_id', '')}"
+            ),
+        )
+    if entry_type == "notification":
+        text = "\n".join(
+            value
+            for key in ("title", "message", "body", "summary", "question")
+            if isinstance((value := data.get(key)), str)
+        )
+        return (text,) if text else ()
+    return ()
 
 
 def write_text(
@@ -246,44 +315,12 @@ def write_text(
     entry_type: str,
     data: Mapping[str, object],
 ) -> None:
-    parts: list[str] = []
-    if entry_type == "message":
-        try:
-            message = Message.from_dict(data["message"])
-        except (KeyError, TypeError, ValueError):
-            return
-        parts.append(assistant_text(message))
-        for content in message.content:
-            if isinstance(content, ToolUseContent):
-                parts.extend(
-                    (
-                        content.tool_call.name,
-                        json.dumps(content.tool_call.arguments, sort_keys=True),
-                    )
-                )
-        if message.tool_result is not None:
-            parts.append(str(message.tool_result.content))
-    elif entry_type == "checkpoint":
-        parts.extend(("checkpoint", str(data.get("label", ""))))
-    elif entry_type == "fork":
-        parts.extend(("fork", str(data.get("label", data.get("name", "")))))
-    elif entry_type == "compaction":
-        parts.append("compaction marker")
-    elif entry_type == "turn_end":
-        parts.extend(("turn ended", str(data.get("reason", ""))))
-    elif entry_type == "warning" and data.get("kind") == "transcript_recovery":
-        parts.extend(("transcript recovered", str(data.get("quarantine_id", ""))))
-    elif entry_type == "notification":
-        for key in ("title", "message", "body", "summary", "question"):
-            value = data.get(key)
-            if isinstance(value, str):
-                parts.append(value)
-    if not parts:
-        return
-    connection.execute(
-        "INSERT INTO message_search(entry_seq,entry_id,text) VALUES(?,?,?)",
-        (seq, entry_id, "\n".join(parts).casefold()),
-    )
+    for unit_ordinal, text in enumerate(searchable_units(entry_type, data)):
+        connection.execute(
+            "INSERT INTO message_search(entry_seq,entry_id,unit_ordinal,text) "
+            "VALUES(?,?,?,?)",
+            (seq, entry_id, unit_ordinal, text.casefold()),
+        )
 
 
 def search(
@@ -291,20 +328,21 @@ def search(
     query: str,
     limit: int,
     cancel: threading.Event | None = None,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, int], ...]:
     needle = query.casefold()
     cursor = connection.execute(
-        "SELECT s.entry_id,s.text FROM message_search s "
+        "SELECT s.entry_id,s.unit_ordinal,s.text FROM message_search s "
         "JOIN entries e ON e.seq=s.entry_seq "
-        "WHERE e.tui_group IS NOT NULL ORDER BY s.entry_seq DESC"
+        "WHERE e.tui_group IS NOT NULL "
+        "ORDER BY s.entry_seq DESC,s.unit_ordinal DESC"
     )
-    matches: list[str] = []
+    matches: list[tuple[str, int]] = []
     while rows := cursor.fetchmany(256):
         if cancel is not None and cancel.is_set():
             break
-        for entry_id, text in rows:
+        for entry_id, unit_ordinal, text in rows:
             if needle in text:
-                matches.append(entry_id)
+                matches.append((entry_id, unit_ordinal))
                 if len(matches) >= limit:
                     return tuple(matches)
     return tuple(matches)

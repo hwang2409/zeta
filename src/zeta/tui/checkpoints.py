@@ -639,9 +639,14 @@ class CheckpointTranscriptMixin:
         page = await self._history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
+        restore_anchor = (
+            anchor
+            if scroll_generation == self._transcript.scroll_generation
+            else self._transcript.durable_scroll_anchor
+        )
         self._render_resident_history()
-        if anchor is not None and scroll_generation == self._transcript.scroll_generation:
-            self._transcript.restore_durable_scroll_anchor(anchor)
+        if restore_anchor is not None:
+            self._transcript.restore_durable_scroll_anchor(restore_anchor)
         if self._history_marker_tasks:
             await asyncio.gather(*tuple(self._history_marker_tasks))
         self._invalidate_prompt()
@@ -697,7 +702,7 @@ class CheckpointTranscriptMixin:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        provider = session_replay_provider(self.loop.store.session_dir)
+        provider = self._history_source.replay_provider
         transcript = getattr(self, "_transcript", None)
         for entry in branch:
             if transcript is not None:

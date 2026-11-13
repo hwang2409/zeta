@@ -92,7 +92,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -754,7 +754,7 @@ class HistoryIndex:
         limit: int,
         g0: object,
         cancel: threading.Event | None = None,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, int], ...]:
         with self._lock:
             self._check_open()
             connection = self._connection(write=False)
@@ -766,6 +766,37 @@ class HistoryIndex:
                 ):
                     raise StaleHistorySnapshot
                 return _row_history.search(connection, query, limit, cancel)
+            finally:
+                connection.close()
+
+    def user_dependency(
+        self, before_seq: int, g0: object
+    ) -> ConversationEntry | None:
+        with self._lock:
+            self._check_open()
+            connection = self._connection(write=False)
+            try:
+                stored = self._stored_facts(connection)
+                if stored is None or any(
+                    stored.get(key) != value
+                    for key, value in self._facts(g0).items()
+                ):
+                    raise StaleHistorySnapshot
+                row = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                    "WHERE seq<? AND tui_group IS NOT NULL AND type='message' "
+                    "AND json_extract(data,'$.message.role')='user' "
+                    "AND COALESCE(json_extract(data,"
+                    "'$.message.metadata.\"zeta.origin\"'),'')!='harness_nudge' "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (before_seq,),
+                ).fetchone()
+                if row is None:
+                    return None
+                seq, entry_id, parent_id, lane, entry_type, data = row
+                return ConversationEntry(
+                    seq, entry_id, parent_id, lane, entry_type, json.loads(data)
+                )
             finally:
                 connection.close()
 
@@ -1199,7 +1230,7 @@ class HistoryPageStoreMixin:
         *,
         limit: int = 200,
         cancel: threading.Event | None = None,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, int], ...]:
         index = self._history_index
         if self._closed or index is None:
             return ()
@@ -1218,6 +1249,26 @@ class HistoryPageStoreMixin:
                 return result
             index._mark_unavailable()
         return ()
+
+    def tui_user_dependency(
+        self: ConversationStore, before_seq: int
+    ) -> ConversationEntry | None:
+        index = self._history_index
+        if self._closed or index is None:
+            return None
+        for _attempt in range(2):
+            try:
+                facts = self._history_index_facts()
+                dependency = index.user_dependency(before_seq, facts)
+            except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+                index._mark_unavailable()
+                if self._read_only:
+                    return None
+                _rebuild_history_index(self)
+                continue
+            if self._history_index_facts() == facts:
+                return dependency
+        return None
 
     def tui_tool_call_dependency(
         self: ConversationStore, call_id: str, before_seq: int

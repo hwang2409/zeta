@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 from collections.abc import Sequence
 from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from .transcript.fuzzy import match_query, parse_query
 from .transcript.paged_history import HistoryCursor, TUIHistorySource
 
 
@@ -165,22 +167,64 @@ class SessionPromptHistory:
         self._index = None
         self._draft = None
 
-    async def finder_snapshot(self) -> tuple[str, ...]:
-        """Read prompt pages oldest-first without retaining them in the owner."""
+    async def finder_snapshot(
+        self, query: str = "", *, limit: int = 200
+    ) -> tuple[str, ...]:
+        """Stream prompt pages and retain only the best bounded candidates."""
 
         source = self.source
         if source is None:
-            return self.snapshot(self._session) if self._session is not None else ()
+            values = self.snapshot(self._session) if self._session is not None else ()
+            return values[-limit:]
+        parsed = parse_query(query)
         cursor: HistoryCursor | None = None
-        pages: list[tuple[tuple[str, str], ...]] = []
+        ranked: list[tuple[int, int, str]] = []
+        retained_values: set[str] = set()
+        newest_ordinal = 0
         while True:
             rows, older, _newer = await source.prompt_page(cursor, direction="older")
-            if rows:
-                pages.append(rows)
+
+            pending: list[tuple[int, str]] = []
+            pending_values: set[str] = set()
+            for _entry_id, raw in reversed(rows):
+                value = raw.rstrip()
+                ordinal = newest_ordinal
+                newest_ordinal += 1
+                if (
+                    value
+                    and value not in retained_values
+                    and value not in pending_values
+                ):
+                    pending.append((ordinal, value))
+                    pending_values.add(value)
+
+            def score_page(
+                candidates: tuple[tuple[int, str], ...],
+            ) -> list[tuple[int, int, str]]:
+                scored: list[tuple[int, int, str]] = []
+                for ordinal, value in candidates:
+                    match = match_query(parsed, value)
+                    if match is not None:
+                        scored.append((match.score, -ordinal, value))
+                return scored
+
+            for candidate in await asyncio.to_thread(score_page, tuple(pending)):
+                if len(ranked) < limit:
+                    heapq.heappush(ranked, candidate)
+                    retained_values.add(candidate[2])
+                elif candidate > ranked[0]:
+                    removed = heapq.heapreplace(ranked, candidate)
+                    retained_values.remove(removed[2])
+                    retained_values.add(candidate[2])
             if older is None:
                 break
             cursor = older
-        return tuple(text for page in reversed(pages) for _entry_id, text in page)
+        return tuple(
+            value
+            for _score, _recency, value in sorted(
+                ranked, key=lambda item: item[1]
+            )
+        )
 
     async def close(self) -> None:
         self.clear()
