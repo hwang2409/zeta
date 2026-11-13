@@ -1176,15 +1176,15 @@ async def test_session_tree_uses_one_store_snapshot(
     )
     captured = threading.Event()
     release = threading.Event()
-    branch_refs = type(store).branch_refs
+    resident_refs = type(store).resident_refs
 
-    def gated_branch_refs(target):
-        refs = branch_refs(target)
+    def gated_resident_refs(target):
+        refs = resident_refs(target)
         captured.set()
         assert release.wait(TIMEOUT)
         return refs
 
-    monkeypatch.setattr(type(store), "branch_refs", gated_branch_refs)
+    monkeypatch.setattr(type(store), "resident_refs", gated_resident_refs)
     request = asyncio.create_task(
         _request(
             reader,

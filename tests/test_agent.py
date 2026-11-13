@@ -3498,7 +3498,7 @@ async def _run_child_finish_gate_order(
     child_store: ConversationStore | None = None
     expect_gate_call = release_order != "before_end_turn"
     if expect_gate_call:
-        await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
+        await await_or_fail(backend.gate_seen.wait(), what="finish-gate seen")
         assert not task.done()
 
     def dump_order() -> str:
@@ -3551,7 +3551,7 @@ async def _run_child_finish_gate_order(
         if expect_gate_call:
             gate_message = next(
                 message
-                for message in child_store.messages()
+                for message in branch_messages(child_store)
                 if message.metadata.get("zeta_event") == "agent_finish_gate"
             )
             assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
