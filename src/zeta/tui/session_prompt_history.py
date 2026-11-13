@@ -22,6 +22,7 @@ class SessionPromptHistory:
         self.source = source
         self._entries: list[tuple[tuple[str, str], ...]] = []
         self._session: Path | None = None
+        self._branch_id: str | None = None
         self._older: HistoryCursor | None = None
         self._newer: HistoryCursor | None = None
         self._index: int | None = None
@@ -33,13 +34,23 @@ class SessionPromptHistory:
     def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
         return tuple(self._entries)
 
-    def bind(self, session_path: Path, source: TUIHistorySource | None = None) -> None:
-        if source is not None:
-            self.source = source
-        if session_path == self._session:
+    def bind(
+        self,
+        session_path: Path,
+        source: TUIHistorySource | None = None,
+        branch_id: str | None = None,
+    ) -> None:
+        if session_path == self._session and (
+            branch_id is None or branch_id == self._branch_id
+        ):
+            if source is not None:
+                self.source = source
             return
         self.clear()
+        if source is not None:
+            self.source = source
         self._session = session_path
+        self._branch_id = branch_id
 
     async def load_older(self) -> None:
         if self.source is None:
@@ -240,3 +251,4 @@ class SessionPromptHistory:
         self._index = None
         self._draft = None
         self._session = None
+        self._branch_id = None

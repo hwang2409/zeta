@@ -602,7 +602,11 @@ class CheckpointTranscriptMixin:
     def _rebuild_transcript(self) -> None:
         """Reset root paging after a branch or repair change."""
 
-        self._history_pager.reset(endpoint_id=self.loop.store.active_branch_head_id())
+        branch_id = self.loop.store.active_branch_head_id()
+        self._prompt_history.bind(
+            self._viewed_session_path(), self._history_source, branch_id
+        )
+        self._history_pager.reset(endpoint_id=branch_id)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -618,6 +622,11 @@ class CheckpointTranscriptMixin:
         await asyncio.sleep(0)
         if self._exit_requested:
             return False
+        self._prompt_history.bind(
+            self._viewed_session_path(),
+            self._history_source,
+            self.loop.store.active_branch_head_id(),
+        )
         await self._load_transcript_page(reset=True)
         if self._exit_requested:
             return False

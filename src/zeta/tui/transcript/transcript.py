@@ -295,7 +295,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
         history_identity = None
-        if self._history_entry_id is not None:
+        if self._history_entry_id is not None and value is not None:
             history_identity = (self._history_entry_id, self._history_unit_ordinal)
             self._history_unit_ordinal += 1
         unit = _TranscriptUnit(self._next_key, value, history_identity)

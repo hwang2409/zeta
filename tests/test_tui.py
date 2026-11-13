@@ -16419,6 +16419,7 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "close-search",
         "unloaded-failed-search",
         "bounded-prompt-finder",
+        "branch-prompt-reset",
     ),
 )
 @pytest.mark.asyncio
@@ -16427,6 +16428,7 @@ async def test_root_tui_paging_render_path_table(
 ) -> None:
     store = ConversationStore(tmp_path / journey / "sessions")
     failure_text = "needle-provider-failure"
+    checkpoint = None
 
     if journey == "stale-anchor":
         for index in range(300):
@@ -16467,7 +16469,7 @@ async def test_root_tui_paging_render_path_table(
             )
         )
         if journey == "unloaded-failed-search":
-            store.append_checkpoint("searchable-checkpoint")
+            checkpoint = store.append_checkpoint("searchable-checkpoint")
             for index in range(180):
                 store.append_message(
                     Message(MessageRole.ASSISTANT, [TextContent(f"tail-{index}")])
@@ -16499,6 +16501,17 @@ async def test_root_tui_paging_render_path_table(
                     MessageOrigin.USER,
                 )
             )
+    elif journey == "branch-prompt-reset":
+        store.append_checkpoint("branch-base")
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("branch-a-prompt")]),
+                MessageOrigin.USER,
+            )
+        )
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("branch-a-reply")])
+        )
     else:
         store.append_message(
             with_message_origin(
@@ -16592,16 +16605,73 @@ async def test_root_tui_paging_render_path_table(
             checkpoint_matches = await app._history_pager.search(
                 "searchable-checkpoint"
             )
-            assert checkpoint_matches[0].unit_ordinal == 0
-            await app._history_pager.reveal(target.entry_id)
-            app._render_resident_history()
-            assert app._transcript.restore_durable_scroll_anchor(
-                (target.entry_id, target.unit_ordinal, 0)
-            )
-            rendered = Text.from_ansi(app._transcript.render(120)).plain
-            assert failure_text in rendered
+            checkpoint_target = checkpoint_matches[0]
+            assert checkpoint is not None
+            assert checkpoint_target.entry_id == checkpoint.id
+            assert checkpoint_target.unit_ordinal == 0
+
+            for search_target, expected_text in (
+                (target, failure_text),
+                (checkpoint_target, "searchable-checkpoint"),
+            ):
+                await app._history_pager.reveal(search_target.entry_id)
+                app._render_resident_history()
+                assert app._transcript.restore_durable_scroll_anchor(
+                    (search_target.entry_id, search_target.unit_ordinal, 0)
+                )
+                anchor_unit, _offset = app._transcript.scroll_anchor
+                assert anchor_unit is not None
+                anchor_text = Text.from_ansi(
+                    app._transcript._render_unit(anchor_unit, 120)
+                ).plain
+                expected_unit = next(
+                    unit
+                    for unit in app._transcript._units
+                    if unit is not None
+                    and unit.history_identity is not None
+                    and unit.history_identity[0] == search_target.entry_id
+                    and expected_text in Text.from_ansi(
+                        app._transcript._render_unit(unit, 120)
+                    ).plain
+                )
+                assert anchor_unit is expected_unit
+                assert anchor_text == Text.from_ansi(
+                    app._transcript._render_unit(expected_unit, 120)
+                ).plain
             assert app._failed_turn is not None
             assert app._failed_turn[0] == "retry-target-user"
+        elif journey == "branch-prompt-reset":
+            app._prompt_history.bind(
+                app._viewed_session_path(), app._history_source
+            )
+            await app._prompt_history.load_older()
+            assert "branch-a-prompt" in app._prompt_history.snapshot(
+                app._viewed_session_path()
+            )
+            assert await app.slash_fork("branch-base") == (
+                "forked to checkpoint 'branch-base' at seq 1"
+            )
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                    MessageOrigin.USER,
+                )
+            )
+            assert await app._rebuild_transcript_async()
+
+            await app._prompt_history.load_older()
+            buffer = Buffer()
+            app._history_previous(buffer)
+            assert buffer.text == "branch-b-prompt"
+            finder_buffer = Buffer(document=Document("branch-a-prompt"))
+            app._history_finder_open(finder_buffer)
+            assert app._history_prompt_task is not None
+            await await_or_fail(
+                app._history_prompt_task, what="branch prompt finder reset"
+            )
+            state = app._history_finder.finder_state()
+            assert state is not None
+            assert all("branch-a-prompt" not in row.excerpt for row in state.rows)
         else:
             buffer = Buffer(document=Document("oldest-needle"))
             app._history_finder_open(buffer)
