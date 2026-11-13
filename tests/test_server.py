@@ -2621,7 +2621,18 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
             timeout=TIMEOUT,
             what=lambda: f"approval_end for grandchild ({wait_diagnostics()})",
         )
-        await _request(reader, writer, 5, "status")
+        status = (await _request(reader, writer, 5, "status"))[-1]["result"]
+        matching_ends = [
+            event
+            for event in _named_events(frames, "approval_end")
+            if event["request_id"] == approval["request_id"]
+        ]
+        assert len(matching_ends) == 1
+        assert matching_ends[0]["reason"] == "child_cleanup"
+        assert all(
+            item["request_id"] != approval["request_id"]
+            for item in status["pending_approvals"]
+        )
         assert len(backend.grandchild.calls) == 1
     finally:
         if child_watcher is not None and not child_watcher.done():
@@ -4532,6 +4543,54 @@ def test_delegated_approval_wire_keys_are_unique(tmp_path: Path) -> None:
     approvals.register_delegated(first, ConversationStore(tmp_path / "a"), "child-a")
     approvals.register_delegated(second, ConversationStore(tmp_path / "b"), "child-b")
     assert approvals.wire_id(first.key) != approvals.wire_id(second.key)
+
+
+@pytest.mark.asyncio
+async def test_serve_child_cleanup_is_segment_exact(tmp_path: Path) -> None:
+    approvals = _bare_approval_lifecycle(tmp_path)
+    stores: dict[str, ConversationStore] = {}
+    requests: dict[str, ApprovalRequest] = {}
+    try:
+        for index, child_id in enumerate(("session:1:1", "session:10", "session:1x")):
+            store = ConversationStore(tmp_path / f"serve-child-{index}")
+            call = ToolCall(f"serve-call-{index}", "read", {"path": "input"})
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            request = ApprovalRequest(call.id, call, child_instance_id=child_id)
+            approvals.register_delegated(request, store, child_id)
+            await approvals.transition(
+                Start(
+                    StreamEvent(
+                        StreamEventType.TOOL_APPROVAL_START,
+                        tool_call=call,
+                        data={"agent_instance_id": child_id},
+                    ),
+                    "session",
+                    "approval_request",
+                )
+            )
+            stores[child_id] = store
+            requests[child_id] = request
+
+        cleanup = approvals.cleanup_delegated("session:1")
+        assert cleanup is not None
+        await await_or_fail(cleanup, what="serve nested child cleanup")
+
+        nested = requests["session:1:1"]
+        assert (await stores["session:1:1"].approval_resolution(nested.request_id))[
+            "reason"
+        ] == "child_cleanup"
+        assert set(approvals.active_keys()) == {
+            requests["session:10"].key,
+            requests["session:1x"].key,
+        }
+    finally:
+        await approvals.wait_for_approval_settlement()
+        for store in stores.values():
+            store.close()
+        approvals._policy().store.close()
 
 
 @pytest.mark.asyncio
