@@ -411,6 +411,8 @@ class HistoryIndex:
             self._remove_file()
             connection = self._connection(write=True)
             self._create_schema(connection)
+            for index in ("entries_parent", "entries_type", "entries_history_group"):
+                connection.execute(f"DROP INDEX {index}")
             group = 0
             with connection:
                 count = 0
@@ -483,6 +485,11 @@ class HistoryIndex:
                     "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) "
                     "VALUES(?,?,?,?)",
                     warm_batch,
+                )
+                connection.execute("CREATE INDEX entries_parent ON entries(parent_id)")
+                connection.execute("CREATE INDEX entries_type ON entries(type)")
+                connection.execute(
+                    "CREATE INDEX entries_history_group ON entries(history_group,seq)"
                 )
                 self._set_meta(connection, source_facts, total=group)
                 connection.execute(
