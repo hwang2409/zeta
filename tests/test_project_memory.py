@@ -412,7 +412,7 @@ def test_linked_session_reopen_preserves_pending_link_above_record_limit(
     reopened = SessionManager(home).open(session_id)
     reopened.store.close()
 
-    assert pending.exists()
+    assert not pending.exists()
     assert links_path.read_bytes() == original
 
 
@@ -922,18 +922,12 @@ async def test_child_lineage_two_roots_each_with_child_and_grandchild(
 
     records = await asyncio.to_thread(manager.project_registry.list_session_links, project.project_id)
     by_id = {record["session_id"]: record for record in records}
-    assert len(by_id) == 6
+    assert len(by_id) == 2
 
     for root in (root_a, root_b):
         root_id = root.metadata.session_id
-        child_id = f"{root_id}:1"
-        grand_id = f"{root_id}:1:1"
         assert by_id[root_id]["role"] == "session"
         assert by_id[root_id]["parent_session_id"] is None
-        assert by_id[child_id]["role"] == "worker"
-        assert by_id[child_id]["parent_session_id"] == root_id
-        assert by_id[grand_id]["role"] == "worker"
-        assert by_id[grand_id]["parent_session_id"] == child_id
 
 
 @pytest.mark.asyncio
@@ -995,11 +989,8 @@ async def test_child_lineage_reconciled_after_registry_failure(
             for record in mgr.project_registry.list_session_links(project.project_id)
         ]
 
-    child_id = f"{root_id}:1"
-    grand_id = f"{root_id}:1:1"
-
     first = sorted(await asyncio.to_thread(_link_ids, SessionManager(home)))
-    assert first == sorted([root_id, child_id, grand_id])
+    assert first == [root_id]
     # A second open must not double-publish any link.
     second = sorted(await asyncio.to_thread(_link_ids, SessionManager(home)))
     assert second == first
@@ -1014,6 +1005,177 @@ _VALID_LINK = (
 def _write_sessions_file(path: Path, data: bytes) -> None:
     path.write_bytes(data)
     os.chmod(path, 0o600)
+
+
+def _registry_session_record(
+    session_id: str,
+    *,
+    role: str = "session",
+    parent_session_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "session_id": session_id,
+        "transcript_path": f"/sessions/{session_id}",
+        "role": role,
+        "parent_session_id": parent_session_id,
+    }
+
+
+def test_project_registry_coalesces_represented_workers_and_backups_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(registry_module, "MAX_SESSION_REFERENCES", 3)
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "a" * 32
+    worker_id = f"{root_id}:1"
+    registry.record_sessions(
+        project.project_id,
+        [_registry_session_record(root_id), _registry_session_record("b" * 32)],
+    )
+    sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
+    with sessions_path.open("ab") as handle:
+        handle.write(
+            (json.dumps(
+                registry._prepare_session_records(
+                    project.project_id,
+                    [
+                        _registry_session_record(
+                            worker_id, role="worker", parent_session_id=root_id
+                        )
+                    ],
+                )[0],
+                sort_keys=True,
+            ) + "\n").encode()
+        )
+    original = sessions_path.read_bytes()
+
+    registry.record_session(
+        project.project_id, session_id="c" * 32, transcript_path="/sessions/c"
+    )
+    sessions = registry.list_session_links(project.project_id, limit=3)
+    assert [record["session_id"] for record in sessions] == [root_id, "b" * 32, "c" * 32]
+    backups = list(
+        (tmp_path / "projects" / project.project_id).glob(
+            "sessions.jsonl.pre-compact-*"
+        )
+    )
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert stat.S_IMODE(backups[0].stat().st_mode) == 0o600
+
+    registry.record_session(
+        project.project_id,
+        session_id=f"{root_id}:2",
+        transcript_path=f"/sessions/{root_id}:2",
+        role="worker",
+        parent_session_id=root_id,
+    )
+    assert len(list((tmp_path / "projects" / project.project_id).glob("sessions.jsonl.pre-compact-*"))) == 1
+
+
+def test_project_registry_backup_failure_preserves_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "d" * 32
+    registry.record_session(
+        project.project_id, session_id=root_id, transcript_path="/sessions/root"
+    )
+    sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
+    worker = registry._prepare_session_records(
+        project.project_id,
+        [
+            _registry_session_record(
+                f"{root_id}:1", role="worker", parent_session_id=root_id
+            )
+        ],
+    )[0]
+    with sessions_path.open("ab") as handle:
+        handle.write((json.dumps(worker, sort_keys=True) + "\n").encode())
+    original = sessions_path.read_bytes()
+
+    def fail_backup(*args: object, **kwargs: object) -> bool:
+        raise OSError("backup failed")
+
+    monkeypatch.setattr(registry_module, "write_session_file_if_absent", fail_backup)
+    with pytest.raises(OSError, match="backup failed"):
+        registry.record_session(
+            project.project_id, session_id="e" * 32, transcript_path="/sessions/e"
+        )
+    assert sessions_path.read_bytes() == original
+    assert not list(sessions_path.parent.glob("sessions.jsonl.pre-compact-*"))
+
+
+def test_project_registry_preserves_orphan_and_non_child_workers(
+    tmp_path: Path,
+) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "1" * 32
+    orphan_id = f"{'2' * 32}:1"
+    non_child_id = f"{'3' * 32}:named"
+    records = registry._prepare_session_records(
+        project.project_id,
+        [
+            _registry_session_record(root_id),
+            _registry_session_record(
+                orphan_id, role="worker", parent_session_id="2" * 32
+            ),
+            _registry_session_record(
+                non_child_id, role="worker", parent_session_id="3" * 32
+            ),
+        ],
+    )
+    sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
+    sessions_path.write_bytes(
+        b"".join((json.dumps(record, sort_keys=True) + "\n").encode() for record in records)
+    )
+    sessions_path.chmod(0o600)
+
+    registry.record_session(
+        project.project_id, session_id="4" * 32, transcript_path="/sessions/four"
+    )
+    session_ids = {
+        record["session_id"]
+        for record in registry.list_session_links(project.project_id)
+    }
+    assert {orphan_id, non_child_id, "4" * 32} <= session_ids
+
+
+def test_project_registry_recompacts_workers_appended_by_old_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(registry_module, "MAX_SESSION_REFERENCES", 3)
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "f" * 32
+    registry.record_session(project.project_id, session_id=root_id, transcript_path="/sessions/root")
+    registry.record_session(
+        project.project_id,
+        session_id="1" * 32,
+        transcript_path="/sessions/one",
+    )
+    sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
+    old_worker = registry._prepare_session_records(
+        project.project_id,
+        [
+            _registry_session_record(
+                f"{root_id}:9", role="worker", parent_session_id=root_id
+            )
+        ],
+    )[0]
+    with sessions_path.open("ab") as handle:
+        handle.write((json.dumps(old_worker, sort_keys=True) + "\n").encode())
+    registry.record_session(
+        project.project_id, session_id="2" * 32, transcript_path="/sessions/two"
+    )
+    assert [record["session_id"] for record in registry.list_session_links(project.project_id, limit=3)] == [
+        root_id,
+        "1" * 32,
+        "2" * 32,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1228,14 +1390,13 @@ def test_child_reconciliation_makes_progress_across_budgeted_passes(
         seen.append(len(_child_link_ids(registry, project.project_id)))
         if seen[-1] == total:
             break
-    # Every link was eventually published, and it took more than one pass.
-    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+    # Every intent was acknowledged, and it took more than one pass.
+    assert _child_link_ids(registry, project.project_id) == []
     assert len(seen) > 1
     # No duplicate session links despite repeated bounded passes.
     records = registry.list_session_links(project.project_id)
     published_ids = [r["session_id"] for r in records if ":" in str(r["session_id"])]
-    assert sorted(published_ids) == sorted(ids)
-    assert len(published_ids) == len(set(published_ids))
+    assert published_ids == []
 
 
 def test_child_reconciliation_does_not_walk_agents_tree(
@@ -1276,7 +1437,7 @@ def test_child_reconciliation_does_not_walk_agents_tree(
     monkeypatch.undo()
     assert walked_agents["hit"] is False
     # The flat index was still fully reconciled.
-    assert _child_link_ids(manager.project_registry, project.project_id) == sorted(ids)
+    assert _child_link_ids(manager.project_registry, project.project_id) == []
     assert PENDING_CHILD_LINKS_DIRNAME  # index name is a public constant
 
 
@@ -1302,10 +1463,10 @@ def test_child_reconciliation_resumes_on_next_open_without_duplicates(
     monkeypatch.undo()
 
     reconcile_child_links(registry, manager.sessions_dir, root_id)
-    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+    assert _child_link_ids(registry, project.project_id) == []
     # A later open must not double-publish any link.
     reconcile_child_links(registry, manager.sessions_dir, root_id)
-    assert _child_link_ids(registry, project.project_id) == sorted(ids)
+    assert _child_link_ids(registry, project.project_id) == []
 
 
 def test_child_reconciliation_reads_registry_once(
@@ -1332,9 +1493,7 @@ def test_child_reconciliation_reads_registry_once(
     # The whole reconciliation reads the JSONL registry exactly once.
     assert reads["count"] == 1
     monkeypatch.undo()
-    assert _child_link_ids(registry, project.project_id) == sorted(
-        f"{root_id}:{i}" for i in range(1, total + 1)
-    )
+    assert _child_link_ids(registry, project.project_id) == []
 
 
 @pytest.mark.asyncio
@@ -1464,8 +1623,7 @@ async def test_real_child_spawns_repeat_stable_overflow_at_production_bound(
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
     ]
-    assert len(child_ids) == 257
-    assert len(set(child_ids)) == 257
+    assert child_ids == []
     pending = opened.store.session_dir / session_links.PENDING_CHILD_LINKS_DIRNAME
     assert list(pending.iterdir()) == []
 
@@ -1613,8 +1771,7 @@ async def test_real_child_spawns_repeat_after_generation_changes(
     child_ids = [
         record["session_id"] for record in records if ":" in str(record["session_id"])
     ]
-    assert len(child_ids) == 257
-    assert len(set(child_ids)) == 257
+    assert child_ids == []
     pending = opened.store.session_dir / session_links.PENDING_CHILD_LINKS_DIRNAME
     assert list(pending.iterdir()) == []
 
@@ -1831,7 +1988,7 @@ async def test_nested_child_loops_share_one_lineage_publication_owner(
         for record in records
         if str(record["session_id"]).count(":") == 2
     ]
-    assert len(grandchild_ids) == 4
+    assert grandchild_ids == []
 
 
 @pytest.mark.asyncio
@@ -1933,7 +2090,7 @@ async def test_cancelled_child_publication_joins_before_loop_close(
     assert order.index("heartbeat") < order.index("storage_return")
     child_id = f"{opened.metadata.session_id}:1"
     records = await asyncio.to_thread(registry.list_session_links, project.project_id)
-    assert [record["session_id"] for record in records].count(child_id) == 1
+    assert [record["session_id"] for record in records].count(child_id) == 0
 
 
 def test_pending_index_fsyncs_root_dir_before_record_session(
@@ -2048,8 +2205,8 @@ def test_invalid_entries_are_quarantined_not_deleted(
         if all_published and all_invalid_quarantined:
             break
 
-    # Every valid intent was eventually published despite the invalid entries.
-    assert _child_link_ids(registry, project.project_id) == sorted(valid_ids)
+    # Every valid intent was eventually acknowledged despite the invalid entries.
+    assert _child_link_ids(registry, project.project_id) == []
     # And every permanently invalid entry moved intact out of the index.
     quarantine_dir = pending_dir.parent / "pending_child_links.invalid"
     for name in invalid_names:
@@ -2309,9 +2466,7 @@ def test_only_writer_temp_pattern_is_treated_as_temp(tmp_path: Path) -> None:
         == "not json"
     )
     # The valid intent was still published.
-    assert _child_link_ids(manager.project_registry, project.project_id) == [
-        f"{root_id}:1"
-    ]
+    assert _child_link_ids(manager.project_registry, project.project_id) == []
 
 
 def test_quarantine_never_clobbers_existing_entry(tmp_path: Path) -> None:
@@ -2526,9 +2681,5 @@ async def test_child_with_explicit_cwd_records_lineage_to_root_project(
     opened.store.close()
 
     root_links = await asyncio.to_thread(manager.project_registry.list_session_links, root_project.project_id)
-    assert {record["session_id"] for record in root_links} == {
-        root_id,
-        f"{root_id}:1",
-    }
-    assert root_links[1]["parent_session_id"] == root_id
+    assert {record["session_id"] for record in root_links} == {root_id}
     assert await asyncio.to_thread(manager.project_registry.list_session_links, child_project.project_id) == []
