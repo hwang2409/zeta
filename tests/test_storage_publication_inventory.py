@@ -17,7 +17,9 @@ _DURABILITY_CALLBACKS = {
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention.py", "write_retention_pin", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),
-    ("project_registry.py", "_update_sessions_locked", "atomic_publish_file"),
+    ("project_registry.py", "publish", "atomic_publish_file"),
+    ("project_registry.py", "_backup_session_records", "write_session_file_if_absent"),
+    ("core/agent_state.py", "ensure_turn_limit_handoff", "write_session_file_if_absent"),
     ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox_sent/__init__.py", "_write_spill", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
@@ -200,7 +202,11 @@ def test_all_direct_publication_paths_are_classified() -> None:
                     name = node.func.attr
                 else:
                     name = ""
-                if name in {"atomic_publish_file", "write_json_file"}:
+                if name in {
+                    "atomic_publish_file",
+                    "write_json_file",
+                    "write_session_file_if_absent",
+                }:
                     found_callbacks.add((relative, function, name))
                 if name == "publish_append":
                     found_variant_append.add((relative, function, name))
