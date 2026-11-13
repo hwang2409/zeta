@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import asyncio
 import json
 import logging
 import os
 import re
 import stat
 import threading
+import time
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -255,6 +257,9 @@ def _persist_pending_child_link(
 
 
 _ReconcileOutcome = Literal["drained", "more", "failed"]
+_CHILD_RECONCILIATION_RETRY_DELAYS = (0.1, 1.0, 5.0, 30.0)
+_child_reconciliation_tasks: dict[tuple[str, str], object] = {}
+_child_reconciliation_tasks_lock = threading.Lock()
 
 
 class ChildLineagePublisher:
@@ -342,7 +347,7 @@ def reconcile_child_links(
     session_id: str,
     *,
     _reference_authority: SessionReferenceAuthority | None = None,
-) -> None:
+) -> _ReconcileOutcome:
     """Publish durable child-lineage intents from the ROOT's pending index.
 
     The root keeps a flat ``pending_child_links`` directory holding one small
@@ -371,6 +376,82 @@ def reconcile_child_links(
         )
     if outcome == "failed":
         logger.warning("child project linkage reconciliation failed for %s", session_id)
+    if outcome != "drained":
+        _schedule_child_links_reconciliation(project_registry, sessions_dir, session_id)
+    return outcome
+
+
+def _schedule_child_links_reconciliation(
+    project_registry: ProjectRegistry,
+    sessions_dir: os.PathLike[str] | str,
+    session_id: str,
+) -> None:
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    key = (str(Path(sessions_dir).absolute()), session_id)
+    with _child_reconciliation_tasks_lock:
+        if key in _child_reconciliation_tasks:
+            return
+
+    async def drain() -> None:
+        delay_index = 0
+        while True:
+            await asyncio.sleep(_CHILD_RECONCILIATION_RETRY_DELAYS[delay_index])
+            outcome = await asyncio.to_thread(
+                reconcile_child_links,
+                project_registry,
+                sessions_dir,
+                session_id,
+            )
+            if outcome == "drained":
+                return
+            delay_index = min(
+                delay_index + 1, len(_CHILD_RECONCILIATION_RETRY_DELAYS) - 1
+            )
+
+    if loop is not None and loop.is_running():
+        task = loop.create_task(drain())
+        with _child_reconciliation_tasks_lock:
+            _child_reconciliation_tasks[key] = task
+
+        def task_done(_: asyncio.Task[None]) -> None:
+            with _child_reconciliation_tasks_lock:
+                _child_reconciliation_tasks.pop(key, None)
+
+        task.add_done_callback(task_done)
+        return
+
+    def drain_off_loop() -> None:
+        delay_index = 0
+        try:
+            while True:
+                time.sleep(_CHILD_RECONCILIATION_RETRY_DELAYS[delay_index])
+                outcome = reconcile_child_links(project_registry, sessions_dir, session_id)
+                if outcome == "drained":
+                    return
+                delay_index = min(
+                    delay_index + 1, len(_CHILD_RECONCILIATION_RETRY_DELAYS) - 1
+                )
+        except BaseException as exc:
+            logger.warning(
+                "child project linkage retry stopped for %s: %s: %s",
+                session_id,
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            with _child_reconciliation_tasks_lock:
+                _child_reconciliation_tasks.pop(key, None)
+
+    with _child_reconciliation_tasks_lock:
+        _child_reconciliation_tasks[key] = threading.Thread(
+            target=drain_off_loop, daemon=True
+        )
+        thread = _child_reconciliation_tasks[key]
+    assert isinstance(thread, threading.Thread)
+    thread.start()
 
 
 def _reconcile_child_links_pass(
@@ -516,8 +597,15 @@ def _reconcile_child_links_pass_admitted(
         OSError,
         TypeError,
         ValueError,
-    ):
+    ) as exc:
+        logger.warning(
+            "child project linkage reconciliation failed for %s: %s: %s",
+            session_id,
+            type(exc).__name__,
+            exc,
+        )
         return "failed"
+
 
 def _collect_pending_intents(
     pending_fd: int, session_fd: int

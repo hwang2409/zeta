@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
@@ -2168,6 +2169,95 @@ def test_transient_read_error_keeps_intent_and_retries(
         [blocked_id, later_id]
     )
     assert list(pending_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_child_link_backlog_continues_without_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = await asyncio.to_thread(
+        _reconcile_fixture, tmp_path
+    )
+    monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 256)
+    monkeypatch.setattr(
+        session_links, "_CHILD_RECONCILIATION_RETRY_DELAYS", (0,), raising=False
+    )
+    for index in range(257):
+        await asyncio.to_thread(
+            _write_child_intent,
+            manager,
+            root_id,
+            project.project_id,
+            f"{root_id}:{index}",
+            root_id,
+        )
+
+    await asyncio.to_thread(
+        reconcile_child_links, manager.project_registry, manager.sessions_dir, root_id
+    )
+
+    async def drained() -> None:
+        pending = manager.sessions_dir / root_id / session_links.PENDING_CHILD_LINKS_DIRNAME
+        while await asyncio.to_thread(lambda: any(pending.iterdir())):
+            await asyncio.sleep(0)
+
+    await await_or_fail(drained(), what="child link backlog did not drain")
+    assert list(
+        (manager.sessions_dir / root_id / session_links.PENDING_CHILD_LINKS_DIRNAME).iterdir()
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_child_link_retry_logs_transient_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from zeta.core import session_links
+    from zeta.core.session_links import reconcile_child_links
+
+    manager, project, root_id = await asyncio.to_thread(
+        _reconcile_fixture, tmp_path
+    )
+    child_id = f"{root_id}:retry"
+    await asyncio.to_thread(
+        _write_child_intent, manager, root_id, project.project_id, child_id, root_id
+    )
+    real_collect = session_links._collect_pending_intents
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected transient failure")
+        return real_collect(*args, **kwargs)
+
+    monkeypatch.setattr(session_links, "_collect_pending_intents", fail_once)
+    monkeypatch.setattr(
+        session_links, "_CHILD_RECONCILIATION_RETRY_DELAYS", (0,), raising=False
+    )
+    with caplog.at_level(logging.WARNING, logger="zeta.core.session_links"):
+        await asyncio.to_thread(
+            reconcile_child_links, manager.project_registry, manager.sessions_dir, root_id
+        )
+        await await_or_fail(
+            asyncio.to_thread(
+                manager.project_registry.list_session_links, project.project_id
+            ),
+            what="child link retry did not complete",
+        )
+        async def published() -> None:
+            while not await asyncio.to_thread(
+                lambda: child_id
+                in _child_link_ids(manager.project_registry, project.project_id)
+            ):
+                await asyncio.sleep(0)
+
+        await await_or_fail(published(), what="child link was not retried")
+    assert "injected transient failure" in caplog.text
+    assert "OSError" in caplog.text
 
 
 def test_directory_entries_do_not_stall_reconciliation(
