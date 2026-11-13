@@ -996,12 +996,11 @@ class ProjectRegistry(
         self._update_sessions_locked(project_fd, remove_ids, records)
 
     @staticmethod
-    def _coalesce_session_records(
+    def _filter_represented_session_records(
         existing: list[dict[str, object]],
         remove_ids: set[str],
         records: list[dict[str, object]],
-    ) -> tuple[list[dict[str, object]], bool, bool]:
-        """Return retained rows, whether compaction occurred, and whether changed."""
+    ) -> tuple[list[dict[str, object]], set[str], bool]:
         retained = [
             record
             for record in existing
@@ -1017,13 +1016,20 @@ class ProjectRegistry(
             for record in records
             if _SESSION_ID.fullmatch(str(record["session_id"]))
         )
-        compacted = [
+        filtered = [
             record
             for record in retained
             if not _is_represented_child_record(record, root_ids)
         ]
-        changed = len(compacted) != len(existing)
-        retained = compacted
+        return filtered, root_ids, filtered != existing
+
+    @staticmethod
+    def _apply_session_upserts(
+        retained: list[dict[str, object]],
+        root_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], bool]:
+        changed = False
         positions = {
             str(record["session_id"]): index
             for index, record in enumerate(retained)
@@ -1050,7 +1056,21 @@ class ProjectRegistry(
             if current_business != business:
                 retained[position] = record
                 changed = True
-        return retained, compacted != existing, changed
+        return retained, changed
+
+    @classmethod
+    def _coalesce_session_records(
+        cls,
+        existing: list[dict[str, object]],
+        remove_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], bool, bool]:
+        """Return retained rows, whether compaction occurred, and whether changed."""
+        retained, root_ids, compacted = cls._filter_represented_session_records(
+            existing, remove_ids, records
+        )
+        retained, changed = cls._apply_session_upserts(retained, root_ids, records)
+        return retained, compacted, compacted or changed
 
     def _update_sessions_locked(
         self,

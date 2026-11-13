@@ -1037,9 +1037,12 @@ def test_full_project_admits_new_top_level_row(tmp_path: Path) -> None:
         b"".join((json.dumps(row) + "\n").encode() for row in prepared),
     )
 
-    registry.record_session(
-        project.project_id, session_id="f" * 32, transcript_path="/sessions/new"
-    )
+    try:
+        registry.record_session(
+            project.project_id, session_id="f" * 32, transcript_path="/sessions/new"
+        )
+    except ProjectRegistryError as exc:
+        pytest.fail(f"full project rejected a new top-level row: {exc}")
     session_ids = {
         row["session_id"] for row in registry.list_session_links(project.project_id)
     }
@@ -1059,13 +1062,16 @@ def test_represented_child_intent_is_acknowledged(tmp_path: Path) -> None:
         b"".join((json.dumps(row) + "\n").encode() for row in prepared),
     )
 
-    registry.record_session(
-        project.project_id,
-        session_id=f"{root_id}:1",
-        transcript_path=f"/sessions/{root_id}:1",
-        role="worker",
-        parent_session_id=root_id,
-    )
+    try:
+        registry.record_session(
+            project.project_id,
+            session_id=f"{root_id}:1",
+            transcript_path=f"/sessions/{root_id}:1",
+            role="worker",
+            parent_session_id=root_id,
+        )
+    except ProjectRegistryError as exc:
+        pytest.fail(f"represented child intent was rejected: {exc}")
     session_ids = {
         row["session_id"] for row in registry.list_session_links(project.project_id)
     }
@@ -1088,9 +1094,12 @@ def test_project_sessions_omits_represented_workers(tmp_path: Path) -> None:
     sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
     with sessions_path.open("ab") as handle:
         handle.write((json.dumps(worker) + "\n").encode())
-    registry.record_session(
-        project.project_id, session_id="c" * 32, transcript_path="/sessions/other"
-    )
+    try:
+        registry.record_session(
+            project.project_id, session_id="c" * 32, transcript_path="/sessions/other"
+        )
+    except ProjectRegistryError as exc:
+        pytest.fail(f"project sessions rejected a new top-level row: {exc}")
 
     tools = ToolRegistry(
         tmp_path,
@@ -1472,6 +1481,7 @@ def test_child_reconciliation_makes_progress_across_budgeted_passes(
         _write_child_intent(manager, root_id, project.project_id, sid, root_id)
     # A tight per-pass bound truncates each pass, but because published entries
     # leave the index every pass makes forward progress.
+    # test-contract: complexity bounded passes must force reconciliation progress
     monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 2)
     registry = manager.project_registry
 
