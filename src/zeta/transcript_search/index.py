@@ -12,7 +12,7 @@ import stat
 import tempfile
 import threading
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -979,6 +979,24 @@ def open_project_index(
         return TranscriptIndex(project_dir, project_id)
     index._backfill_if_empty(sources)
     return index
+
+
+def remove_indexed_sessions(
+    projects_root: Path,
+    project_ids: tuple[str, ...],
+    session_ids: tuple[str, ...],
+    *,
+    charge: Callable[[], None],
+) -> None:
+    """Durably remove quarantined ids from every named external index."""
+    for project_id in project_ids:
+        charge()
+        index = TranscriptIndex._reference(projects_root / project_id, project_id)
+        if not index.path.exists():
+            continue
+        for session_id in session_ids:
+            charge()
+            index.delete_session(session_id)
 
 
 def delete_indexed_session(

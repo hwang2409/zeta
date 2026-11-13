@@ -1128,9 +1128,9 @@ async def test_p06_2_child_lineage_stays_off_event_loop(
         assert observed == ["sentinel", "released"], _LOOP_BLOCKED
         assert isinstance(outcome, RuntimeError), repr(outcome)
         links = await asyncio.to_thread(registry.list_session_links, project_id)
-        assert f"{opened.store.session_id}:1" in {
+        assert {
             row["session_id"] for row in links
-        }
+        } == {opened.store.session_id}
     finally:
         try:
             await asyncio.wait_for(loop.close(), 10)
