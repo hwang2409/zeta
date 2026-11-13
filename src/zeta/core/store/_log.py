@@ -142,6 +142,7 @@ class _FullLoadValidator:
         self.state._sent_message_receipts = []
         self._linear_branch = True
         self._linear_approvals = _ApprovalValidationOverlay()
+        self._linear_error: tuple[_PhysicalRow, ConversationIntegrityError] | None = None
         self._client_delivery_entries: list[ConversationEntry] = []
         self.by_id: dict[str, RowRef] = {}
         self.rows_by_id: dict[str, _PhysicalRow] = {}
@@ -255,21 +256,20 @@ class _FullLoadValidator:
             entry, offset=row.byte_offset, length=row.length
         )
         if self._linear_branch and linear:
-            try:
-                self.state._apply_to_working_fold(entry, self._linear_approvals)
-            except ConversationIntegrityError as exc:
-                raise self._error(
-                    row,
-                    kind="broken_links",
-                    reason_code=self._semantic_reason(exc),
-                ) from exc
+            if self._linear_error is None:
+                try:
+                    self.state._apply_to_working_fold(entry, self._linear_approvals)
+                except ConversationIntegrityError as exc:
+                    self._linear_error = (row, exc)
         else:
             self._linear_branch = False
-        metadata = entry.data.get("message", {}).get("metadata", {})
+        metadata = (
+            entry.data["message"].get("metadata", {})
+            if entry.type == "message"
+            else {}
+        )
         if entry.type == "client_delivery" or (
-            entry.type == "message"
-            and type(metadata) is dict
-            and CLIENT_DELIVERY_METADATA in metadata
+            type(metadata) is dict and CLIENT_DELIVERY_METADATA in metadata
         ):
             self._client_delivery_entries.append(entry)
         self.by_id[entry.id] = self.state._resident_rows.rows[-1]
@@ -366,6 +366,13 @@ class _FullLoadValidator:
             )
         if self.state._resident_rows.rows and not self._linear_branch:
             self._select_branch(self.state._resident_rows.rows[-1])
+        elif self._linear_error is not None:
+            row, exc = self._linear_error
+            raise self._error(
+                row,
+                kind="broken_links",
+                reason_code=self._semantic_reason(exc),
+            ) from exc
         self.state._rebuild_client_deliveries(iter(self._client_delivery_entries))
         if install:
             if self.resets_resident_rows:

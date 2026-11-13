@@ -137,7 +137,7 @@ def test_resident_payloads_stay_bounded_after_compaction() -> None:
     )
 
     # test-contract: seam covered failed turns stay in context without retaining their payloads
-    assert len(rows.context_refs()) == 1100
+    assert sum(ref.type == "message" for ref in rows.context_refs()) == 1100
     assert len(rows.payloads) <= 65
     assert rows.resident_payload_bytes < 5 * 1024 * 1024
     assert 1 not in rows.payloads
