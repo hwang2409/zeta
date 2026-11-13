@@ -185,6 +185,28 @@ class SessionReferenceGate:
         return value
 
 
+def read_reference_generation(home: Path) -> int:
+    """Return the reference generation without touching its admission gate."""
+    try:
+        fd = os.open(
+            Path(home) / SESSION_REFERENCE_GENERATION,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise SessionError("session reference generation is unsafe") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SessionError("session reference generation is unsafe")
+        raw = os.read(fd, 32).decode("ascii", "replace")
+    finally:
+        os.close(fd)
+    if not raw.endswith("\n") or not raw[:-1].isdigit():
+        raise SessionError("session reference generation is malformed")
+    return int(raw[:-1])
+
+
 @contextmanager
 def reference_publication(
     home: Path,

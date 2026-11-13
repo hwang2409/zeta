@@ -708,18 +708,42 @@ def _result(manifest: dict[str, object]) -> SessionTransferResult:
     )
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise RemoteSyncError(f"cannot fsync file: {path}") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise RemoteSyncError(f"cannot fsync directory: {path}") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise RemoteSyncError(f"cannot fsync directory: {path}") from exc
+    finally:
+        os.close(fd)
+
+
 def _atomic_replace_directory(staging: Path, destination: Path) -> None:
     _preserve_retention_pin(destination, staging)
     backup = destination.parent / f".{destination.name}.replaced-{os.getpid()}"
     if backup.exists():
         shutil.rmtree(backup)
-    if destination.exists():
-        destination.rename(backup)
     try:
+        if destination.exists():
+            destination.rename(backup)
+            _fsync_directory(destination.parent)
         staging.rename(destination)
+        _fsync_directory(destination.parent)
     except BaseException:
         if backup.exists() and not destination.exists():
             backup.rename(destination)
+            _fsync_directory(destination.parent)
         raise
     if backup.exists():
         shutil.rmtree(backup)
@@ -744,6 +768,7 @@ def _preserve_retention_pin(destination: Path, staging: Path) -> None:
     target = staging / RETENTION_PIN_FILENAME
     shutil.copyfile(pin, target)
     target.chmod(0o600)
+    _fsync_file(target)
 
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:
