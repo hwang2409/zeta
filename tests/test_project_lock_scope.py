@@ -443,6 +443,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                     assert release_poll.wait(timeout=10)
                 yield directories
 
+        # test-contract: seam gate the real scanner lock while serve replies
         monkeypatch.setattr(ProjectInbox, "_directories", gated_directories)
         record = await asyncio.to_thread(
             AttentionStore(
@@ -1099,7 +1100,7 @@ async def _held_production_lock(
             except BlockingIOError:
                 contended.set()
             try:
-                original(lock_fd, mode, wait=wait)
+                original(lock_fd, mode)
             finally:
                 wait_ended.set()
 

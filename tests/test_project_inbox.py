@@ -738,6 +738,7 @@ def test_scanner_retries_busy_sent_poll_without_losing_status(
         with real_lock(*args, **kwargs) as project_fd:
             yield project_fd
 
+    # test-contract: seam force one busy poll before the retry
     monkeypatch.setattr(scanner.inbox, "_lock", busy_once_lock)
     with pytest.raises(InboxBusyError):
         scanner.scan_sent()
