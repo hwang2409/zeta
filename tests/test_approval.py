@@ -1434,15 +1434,18 @@ async def test_same_call_id_in_parent_and_child_approval_records_runs_both(
         registries.append(registry)
 
     try:
-        results = await asyncio.gather(
-            *(registry.execute(ToolCall("same-call", "echo", {})) for registry in registries)
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(registry.execute(ToolCall("same-call", "echo", {})) for registry in registries)
+            ),
+            10,
         )
 
         assert counts == [1, 1]
         assert all(result["isError"] is False for result in results)
     finally:
         for registry in registries:
-            await registry.close()
+            await asyncio.wait_for(registry.close(), 10)
         for store in stores:
             store.close()
 
@@ -1496,5 +1499,5 @@ async def test_approved_tool_rejects_a_different_definition_kind(
         assert result["isError"] is True
         assert "tool changed after approval" in result["content"][0]["text"]
     finally:
-        await registry.close()
+        await asyncio.wait_for(registry.close(), 10)
         store.close()
