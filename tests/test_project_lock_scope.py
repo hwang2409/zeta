@@ -335,6 +335,13 @@ async def test_p06_below_epoch_real_tui_serve_journey(
     from tests.test_server import _ready_extensions, _request
     from zeta.cli.main import main as cli_main
 
+    def serve_result(
+        response_frames: list[dict[str, object]], method: str, request_id: str
+    ) -> dict[str, object]:
+        response = response_frames[-1]
+        assert "result" in response, f"{method} {request_id}: {response!r}"
+        return response["result"]  # type: ignore[return-value]
+
     home = tmp_path / "home"
     for epoch in range(5):
         advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
@@ -358,17 +365,17 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             cli_main, ["project", "init", str(project_dir)]
         ) == 0
         reader, writer, serve_session_id = await _ready_extensions(server)
-        project_response = (
+        project_result = serve_result(
             await _request(
                 reader,
                 writer,
                 "project-init",
                 "slash_run",
                 {"session_id": serve_session_id, "text": "/project"},
-            )
-        )[-1]
-        assert "result" in project_response, project_response
-        project_result = project_response["result"]
+            ),
+            "slash_run",
+            "project-init",
+        )
         assert "project" in project_result["text"].lower()
         registry = server.runtime.manager.project_registry
         assert registry is not None
@@ -404,15 +411,6 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         app._install_full_screen_layout(session)
         async with owned_app(app):
             await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
-            poll_done = app.loop._project_inbox_poll_done
-            poll_event = app.loop._project_inbox_publication_event
-            assert poll_done is not None
-            assert poll_event is not None
-            poll_done.clear()
-            poll_event.set()
-            await await_or_fail(
-                poll_done.wait(), what="below-epoch TUI inbox poll"
-            )
             sent = await await_or_fail(
                 app.loop.tool_registry.execute(
                     ToolCall(
@@ -459,7 +457,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 why="normal journey",
                 options=("yes",),
             )
-            reply_response = (
+            reply = serve_result(
                 await _request(
                     reader,
                     writer,
@@ -469,10 +467,10 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                         "session_id": serve_session_id,
                         "text": f"/decisions reply {record.id} yes",
                     },
-                )
-            )[-1]
-            assert "result" in reply_response, reply_response
-            reply = reply_response["result"]
+                ),
+                "slash_run",
+                "attention-reply",
+            )
             assert reply["text"] == f"replied to {record.id}"
             assert (
                 await asyncio.to_thread(

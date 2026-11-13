@@ -135,12 +135,12 @@ def test_tui_startup_retries_busy_registry_and_links_project(
     original = ProjectRegistry._acquire_lock
     busy_attempts = 3
 
-    def acquire(fd: int, mode: int, *, wait: bool = True) -> None:
+    def acquire(fd: int, mode: int) -> None:
         nonlocal busy_attempts
         if busy_attempts and mode == fcntl.LOCK_EX:
             busy_attempts -= 1
             raise ProjectRegistryBusyError()
-        original(fd, mode, wait=wait)
+        original(fd, mode)
 
     # test-contract: seam patch the real registry lock for deterministic contention
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
@@ -164,10 +164,10 @@ def test_tui_busy_registry_notice_renders(
 
     original = ProjectRegistry._acquire_lock
 
-    def acquire(fd: int, mode: int, *, wait: bool = True) -> None:
+    def acquire(fd: int, mode: int) -> None:
         if mode == fcntl.LOCK_EX:
             raise ProjectRegistryBusyError()
-        original(fd, mode, wait=wait)
+        original(fd, mode)
 
     # test-contract: seam patch the real registry lock for deterministic contention
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
@@ -188,12 +188,12 @@ def test_busy_registry_retries_project_discovery(
     original = ProjectRegistry._acquire_lock
     busy_attempts = 3
 
-    def acquire(fd: int, mode: int, *, wait: bool = True) -> None:
+    def acquire(fd: int, mode: int) -> None:
         nonlocal busy_attempts
         if busy_attempts and mode == fcntl.LOCK_EX:
             busy_attempts -= 1
             raise ProjectRegistryBusyError()
-        original(fd, mode, wait=wait)
+        original(fd, mode)
 
     # test-contract: seam force a bounded busy-lock interleaving
     monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
