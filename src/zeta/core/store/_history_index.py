@@ -151,8 +151,9 @@ class HistoryIndex:
             if read_only:
                 connection.execute("PRAGMA busy_timeout=0")
             else:
-                connection.execute("PRAGMA journal_mode=DELETE")
-                connection.execute("PRAGMA synchronous=FULL")
+                # The transcript is authoritative and repairs interrupted cache writes.
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA foreign_keys=ON")
             return connection
         except BaseException:
@@ -410,9 +411,6 @@ class HistoryIndex:
         try:
             self._remove_file()
             connection = self._connection(write=True)
-            # This file is a replaceable cache; the transcript repairs an interrupted rebuild.
-            connection.execute("PRAGMA journal_mode=OFF")
-            connection.execute("PRAGMA synchronous=OFF")
             self._create_schema(connection)
             for index in ("entries_parent", "entries_type", "entries_history_group"):
                 connection.execute(f"DROP INDEX {index}")
