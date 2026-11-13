@@ -19,21 +19,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .attention_forks import remove_attention_source_links
-from .attention_records import remove_fork_session_links
-from .core.session_files import (
+from ..attention_forks import remove_attention_source_links
+from ..attention_records import remove_fork_session_links
+from ..core.session_files import (
     SessionError,
     SessionReferenceGate,
     atomic_publish_file,
     child_directory,
     read_reference_generation,
 )
-from .locking import RETENTION_HOME_ID, domain_authority
-from .project_errors import ProjectRegistryError
-from .project_inbox import InboxError, ProjectInbox
-from .project_registry import ProjectRegistry
-from .runtime.project_registry_state import available_project_registry
-from .storage_format import (
+from ..locking import RETENTION_HOME_ID, domain_authority
+from ..project_errors import ProjectRegistryError
+from ..project_inbox import InboxError, ProjectInbox
+from ..project_registry import ProjectRegistry
+from ..runtime.project_registry_state import available_project_registry
+from ..storage_format import (
     StorageFormatError,
     WriterLease,
     mapping_mutations,
@@ -42,7 +42,7 @@ from .storage_format import (
     validate_retention_reservation,
     validate_retention_state,
 )
-from .transcript_search.index import TranscriptIndexError, remove_indexed_sessions
+from ..transcript_search.index import TranscriptIndexError, remove_indexed_sessions
 
 _ARM_NAME = "retention-arm.json"
 _STATE_NAME = "retention-state.json"

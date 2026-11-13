@@ -90,6 +90,7 @@ _TOP_KEYS = frozenset(
         "remotes",
         "agents",
         "mcp",
+        "retention",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -142,6 +143,7 @@ class Settings:
     memory_token_threshold: int | None = None
     memory_idle_minutes: int | None = None
     command_niceness: int = 10
+    retention_days: int = 30
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
@@ -177,6 +179,7 @@ class ResolvedConfig:
     memory_token_threshold: int = 50_000
     memory_idle_minutes: int = 10
     command_niceness: int = 10
+    retention_days: int = 30
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
@@ -346,6 +349,7 @@ def resolve(
         memory_token_threshold=settings.memory_token_threshold or 50_000,
         memory_idle_minutes=settings.memory_idle_minutes or 10,
         command_niceness=settings.command_niceness,
+        retention_days=settings.retention_days,
         mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
@@ -583,6 +587,15 @@ def _validate(
         commands = {}
     for key in commands.keys() - _COMMAND_KEYS:
         notices.append(f"settings · ignored unknown key 'commands.{key}'")
+    retention = data.get("retention", {})
+    if not isinstance(retention, Mapping):
+        notices.append("settings · ignored key 'retention': expected table")
+        retention = {}
+    for key in retention.keys() - {"days"}:
+        notices.append(f"settings · ignored unknown key 'retention.{key}'")
+    retention_days = _validated_int_range(
+        retention, "days", notices, minimum=0, maximum=3650, prefix="retention"
+    )
     command_niceness = _validated_int_range(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
@@ -624,6 +637,7 @@ def _validate(
         memory_model=memory_model,
         memory_token_threshold=memory_token_threshold,
         memory_idle_minutes=memory_idle_minutes,
+        retention_days=30 if retention_days is None else retention_days,
         command_niceness=10 if command_niceness is None else command_niceness,
         mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
@@ -716,13 +730,14 @@ def _validated_int_range(
     *,
     minimum: int,
     maximum: int,
+    prefix: str = "commands",
 ) -> int | None:
     if key not in data:
         return None
     value = data[key]
     if type(value) is not int or not minimum <= value <= maximum:
         notices.append(
-            f"settings · ignored key 'commands.{key}': "
+            f"settings · ignored key '{prefix}.{key}': "
             f"expected integer from {minimum} to {maximum}"
         )
         return None
