@@ -46,7 +46,6 @@ from .approval_lifecycle import (
     Start,
     Terminate,
 )
-from .approval_settlement.resume import ApprovalResumeOwner
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
 from .protocol import (
@@ -147,7 +146,6 @@ class ServeControl:
         self._mcp_binding_servers: frozenset[str] = frozenset()
         self._mcp_binding_required = False
         self._host_binding_required = False
-        self._approval_resume = ApprovalResumeOwner(lambda: self.server.runtime.session_id)
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
@@ -394,8 +392,6 @@ class ServeControl:
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
-        if reconnect and had_mcp_bindings and (loop := self.server.runtime.loop) is not None:
-            self._approval_resume.mark_mcp_reconnect(self._approvals.active_keys(), loop.mcp_tool_names_owned_by(self._active_mcp_bindings), loop.store.approval_state_now)
         self._active_mcp_bindings = {}
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
@@ -547,7 +543,7 @@ class ServeControl:
             else None
         )
         if (
-            self._approval_resume.should_resume(core_key, self._turn_task)
+            (self._turn_task is None or self._turn_task.done())
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])

@@ -435,6 +435,8 @@ class AgentLoop(
         """Reserve the abort generation before resuming an approved tool."""
         if self._existing_tool_result(tool_call.id) is not None:
             return False
+        if not self.tool_registry.claim_pending_execution(tool_call.id):
+            return False
         self.tool_registry.start_batch()
         return True
 
@@ -611,6 +613,7 @@ class AgentLoop(
                 _scope_signal=abort_signal,
                 _host_environment=host_environment,
                 _lifecycle_sink=lifecycle,
+                _pending_execution_claimed=prepared,
             )
         except asyncio.CancelledError:
             result = self.finalize_canceled(tool_call)

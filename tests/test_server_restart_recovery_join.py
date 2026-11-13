@@ -10,6 +10,7 @@ resume and proves a concurrent join cannot read the mid-recovery store.
 from __future__ import annotations
 
 import asyncio
+import shlex
 import threading
 from pathlib import Path
 
@@ -28,7 +29,11 @@ pytest_plugins = ("tests.support.socket_fixtures",)
 
 
 def _seed_delegated(
-    home: Path, cwd: Path, *, foreground_request_id: str | None = None
+    home: Path,
+    cwd: Path,
+    *,
+    foreground_request_id: str | None = None,
+    foreground_command: str = "true",
 ) -> str:
     opened = SessionManager(home).create(provider="codex", model="offline", cwd=cwd)
     root = opened.store
@@ -37,7 +42,7 @@ def _seed_delegated(
         # re-presents it, so recovery must leave it open and answerable.
         root.append_approval_request(
             foreground_request_id,
-            ToolCall(foreground_request_id, "bash", {"command": "true"}),
+            ToolCall(foreground_request_id, "bash", {"command": foreground_command}),
         )
     call = ToolCall("call-c", "agent", {"prompt": "work", "description": "child"})
     root.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
@@ -190,8 +195,13 @@ async def test_status_represents_foreground_after_restart_and_join_shows_aborted
     above; this test asserts only the foreground re-presentation and answerability.
     """
     home = tmp_path / "home"
+    marker = tmp_path / "recovered-runs"
     session_id = await asyncio.to_thread(
-        _seed_delegated, home, tmp_path, foreground_request_id="wire-fg"
+        _seed_delegated,
+        home,
+        tmp_path,
+        foreground_request_id="wire-fg",
+        foreground_command=f"printf 'run\\n' >> {shlex.quote(str(marker))}",
     )
 
     server = ZetaServer(
@@ -253,6 +263,9 @@ async def test_status_represents_foreground_after_restart_and_join_shows_aborted
             await request(reader, writer, 5, "approve", {"request_id": "wire-fg"})
         )[-1]
         assert approved["result"]["accepted"] is True
+        assert server.control._turn_task is not None
+        await asyncio.wait_for(asyncio.shield(server.control._turn_task), 10)
+        assert marker.read_text().splitlines() == ["run"]
 
         after = (
             await request(

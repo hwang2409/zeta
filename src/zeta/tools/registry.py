@@ -324,6 +324,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
+        self._pending_execution_claims: set[str] = set()
         self._closed = False
         self.web_clients = SessionWebClients()
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -538,6 +539,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             actions=normalized_actions,
         )
         self._tools[name] = definition
+        self._mcp_owned.pop(name, None)
+        self._mcp_hidden.discard(name)
         if self.approval_policy is not None:
             self.approval_policy.bind_rule_resolver(self.resolve_approval_rule)
             self.approval_policy.bind_capability_resolver(
@@ -761,6 +764,16 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         """Rotate the active signal before a new tool batch."""
         self.abort_signal = self._abort_registry.new_generation()
 
+    def claim_pending_execution(self, tool_call_id: str) -> bool:
+        """Atomically reserve one approved call on the event loop."""
+        if tool_call_id in self._pending_execution_claims:
+            return False
+        self._pending_execution_claims.add(tool_call_id)
+        return True
+
+    def release_pending_execution(self, tool_call_id: str) -> None:
+        self._pending_execution_claims.discard(tool_call_id)
+
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
@@ -930,6 +943,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _capture_output: bool = False,
         _skip_approval: bool = False,
         _host_environment: Mapping[str, str] | None = None,
+        _pending_execution_claimed: bool = False,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
@@ -1085,6 +1099,48 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
+        if not _pending_execution_claimed and not self.claim_pending_execution(tool_call.id):
+            return await finalize(
+                _error_result(
+                    f"tool execution already claimed: {tool_call.id}",
+                    kind="duplicate_tool_execution",
+                )
+            )
+        definition = self._tools.get(tool_call.name)
+        if definition is None:
+            return await finalize(
+                _error_result(f"unknown tool: {tool_call.name}", kind="unknown_tool")
+            )
+        try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except UnknownToolAction as exc:
+            return await finalize(_error_result(str(exc), kind="invalid_tool_action"))
+        except InvalidActionArguments as exc:
+            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
+        except (KeyError, TypeError, ValueError) as exc:
+            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
+        if not self.tool_policy.allows_call(capability):
+            capability_name = (
+                tool_call.name
+                if capability.action is None
+                else f"{tool_call.name}({capability.action})"
+            )
+            return await finalize(
+                _error_result(
+                    f"tool action not allowed by session tool policy: {capability_name}",
+                    kind="tool_action_not_allowed",
+                )
+            )
+        try:
+            arguments = (
+                _validate_arguments(dict(capability.arguments), definition.parameters)
+                if definition.validate_arguments
+                else _coerce_arguments(dict(capability.arguments))
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            return await finalize(
+                _error_result(f"invalid arguments: {exc}", kind="invalid_arguments")
+            )
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():

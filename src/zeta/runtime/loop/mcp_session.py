@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import shlex
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Self
@@ -138,11 +138,6 @@ class MCPSession:
             for name in bindings:
                 self._mcp_mount.set_primary_registry_only(name, True)
             await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
-
-    def mcp_tool_names_owned_by(self, servers: Collection[str]) -> set[str]:
-        if self._mcp_mount is None:
-            return set()
-        return self._mcp_mount.owned_tool_names(servers)
 
     async def clear_mcp_bindings(self) -> None:
         if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
