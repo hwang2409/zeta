@@ -807,6 +807,8 @@ class TUIApp(
             return
         if self._finder_prepare_task is not None:
             self._finder_prepare_task.cancel()
+        if self._finder_rank_task is not None:
+            self._finder_rank_task.cancel()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Any) -> None:

@@ -20,6 +20,7 @@ _PREVIEW_TEXT_LIMIT = 12_000
 @dataclass(frozen=True, slots=True)
 class HistoryCandidateRequest:
     generation: int
+    snapshot: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +100,10 @@ class HistoryFinder:
     async def build_finder_candidate_batches(
         self, request: HistoryCandidateRequest
     ) -> AsyncIterator[tuple[HistorySnapshot, bool]]:
-        del request
-        snapshot = await asyncio.to_thread(self._load_snapshot)
+        snapshot = await asyncio.to_thread(
+            build_history_candidates,
+            self._load_snapshot() if request.snapshot is None else request.snapshot,
+        )
         yield snapshot, True
 
     def set_snapshot(
@@ -110,14 +113,12 @@ class HistoryFinder:
         if self._finder is None:
             return None
         self._generation += 1
-        return HistoryCandidateRequest(self._generation)
+        return HistoryCandidateRequest(self._generation, history)
 
-    def _load_snapshot(self) -> HistorySnapshot:
+    def _load_snapshot(self) -> tuple[str, ...]:
         history = self._snapshot_override
         self._snapshot_override = None
-        return build_history_candidates(
-            self._history_snapshot() if history is None else history
-        )
+        return self._history_snapshot() if history is None else history
 
     def finder_publish_candidate_batch(
         self,
