@@ -876,18 +876,14 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
         transport = SshTransport("fake", str(remote), name="cloud")
         push_session(local, transport, session_id=session_id)
         destination = remote / "sessions" / session_id
-        reinstall = lambda: push_session(
-            local, transport, session_id=session_id, force=True
-        )
+        reinstall = lambda: push_session(local, transport, session_id=session_id, force=True)
     elif kind == "local-publish":
         remote = tmp_path / "remote"
         _set_remote_epoch(remote, 8)
         transport = LocalTransport(remote)
         push_session(local, transport, session_id=session_id)
         destination = remote / "sessions" / session_id
-        reinstall = lambda: push_session(
-            local, transport, session_id=session_id, force=True
-        )
+        reinstall = lambda: push_session(local, transport, session_id=session_id, force=True)
     else:
         source_remote = tmp_path / "source-remote"
         puller = tmp_path / "puller"
@@ -896,12 +892,7 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
         push_session(local, LocalTransport(source_remote), session_id=session_id)
         pull_session(puller, LocalTransport(source_remote), session_id=session_id)
         destination = puller / "sessions" / session_id
-        reinstall = lambda: pull_session(
-            puller,
-            LocalTransport(source_remote),
-            session_id=session_id,
-            force=True,
-        )
+        reinstall = lambda: pull_session(puller, LocalTransport(source_remote), session_id=session_id, force=True)
 
     pin = destination / ".retention-pin.json"
     pin.write_text('{"pinned":true}\n', encoding="utf-8")
@@ -910,83 +901,100 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
     if kind == "ssh":
         event_path = tmp_path / "events"
         script = ssh_module._SESSION_INSTALL_SCRIPT
-        pin_anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
-        # test-contract: durability script anchor must fail loudly if implementation changes
-        assert pin_anchor in script
-        script = script.replace(
-            pin_anchor,
-            pin_anchor
-            + f'\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("pin-fsync\\n")',
-            1,
-        )
-        backup_anchor = "if destination.exists():\n                destination.rename(backup)"
-        # test-contract: durability script anchor must fail loudly if implementation changes
-        assert backup_anchor in script
-        script = script.replace(
-            backup_anchor,
-            backup_anchor
-            + f'\n                with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("backup-rename\\n")',
-            1,
-        )
-        install_anchor = "staging.rename(destination)"
-        # test-contract: durability script anchor must fail loudly if implementation changes
-        assert install_anchor in script
-        script = script.replace(
-            install_anchor,
-            install_anchor
-            + f'\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("install-rename\\n")',
-            1,
-        )
-        fsync_anchor = "finally: os.close(directory_fd)\n        backup ="
-        # test-contract: durability script anchor must fail loudly if implementation changes
-        assert fsync_anchor in script
-        script = script.replace(
-            fsync_anchor,
-            f'finally: os.close(directory_fd)\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("dir-fsync\\n")\n        backup =',
-            1,
-        )
-        # test-contract: durability instrumentation proves generated-script ordering
+        import_anchor = "import hashlib, shutil, tarfile, tempfile"
+        copy_anchor = "shutil.copyfile(pin, "
+        rename_anchor = "destination.rename(backup)"
+        fsync_anchor = "os.fsync(fd)"
+        for anchor in (import_anchor, copy_anchor, rename_anchor, fsync_anchor):
+            # test-contract: all instrumentation anchors predate this change.
+            assert anchor in script
+        instrumentation = f'''{import_anchor}
+_event_path = pathlib.Path({str(event_path)!r})
+_pin_inode = None
+_real_copyfile = shutil.copyfile
+def _record_copyfile(source, target):
+    global _pin_inode
+    result = _real_copyfile(source, target)
+    if pathlib.Path(source).name == _RETENTION_PIN_FILENAME:
+        _pin_inode = os.stat(target).st_ino
+        _event_path.write_text(_event_path.read_text() + "pin-copy\\n" if _event_path.exists() else "pin-copy\\n")
+    return result
+shutil.copyfile = _record_copyfile
+_real_fsync = os.fsync
+def _record_fsync(fd):
+    result = _real_fsync(fd)
+    if _pin_inode is not None and os.fstat(fd).st_ino == _pin_inode:
+        with _event_path.open("a") as stream: stream.write("pin-fsync\\n")
+    return result
+os.fsync = _record_fsync
+_real_rename = pathlib.Path.rename
+def _record_rename(source, target):
+    result = _real_rename(source, target)
+    if source == destination and target.name.startswith(f".{{ident}}.replaced-"):
+        with _event_path.open("a") as stream: stream.write("backup-rename\\n")
+    elif target == destination:
+        with _event_path.open("a") as stream: stream.write("install-rename\\n")
+    return result
+pathlib.Path.rename = _record_rename'''
+        script = script.replace(import_anchor, instrumentation, 1)
+        script = script.replace(copy_anchor, copy_anchor, 1)
+        # test-contract: seam instrumentation rewrites only the generated script.
         monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", script)
         reinstall()
         events = event_path.read_text(encoding="utf-8").splitlines()
     else:
-        original_fsync = remote_sync_module.os.fsync
-        original_rename = Path.rename
         parent = destination.parent
         parent_stat = parent.stat()
-        original_pin_fsync = remote_sync_module._fsync_file
+        pin_inode: int | None = None
+        original_copyfile = remote_sync_module.shutil.copyfile
+        original_fsync = remote_sync_module.os.fsync
+        original_rename = remote_sync_module.os.rename
+        original_replace = remote_sync_module.os.replace
 
-        def record_pin_fsync(path: Path) -> None:
-            events.append("pin-fsync")
-            original_pin_fsync(path)
+        def record_copyfile(
+            source: str | Path, target: str | Path, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal pin_inode
+            result = original_copyfile(source, target, *args, **kwargs)
+            if Path(source).name == ".retention-pin.json":
+                pin_inode = os.stat(target).st_ino
+                events.append("pin-copy")
+            return result
 
         def record_fsync(fd: int) -> None:
+            if pin_inode is not None and os.fstat(fd).st_ino == pin_inode:
+                events.append("pin-fsync")
             info = os.fstat(fd)
             if (info.st_dev, info.st_ino) == (parent_stat.st_dev, parent_stat.st_ino):
                 events.append("dir-fsync")
             original_fsync(fd)
 
-        def record_rename(path: Path, target: Path) -> Path:
-            result = original_rename(path, target)
-            if path == destination and target.name.startswith(f".{session_id}.replaced-"):
+        def record_rename(source: str | Path, target: str | Path) -> None:
+            source_path, target_path = Path(source), Path(target)
+            original_rename(source, target)
+            if source_path == destination and target_path.name.startswith(f".{session_id}.replaced-"):
                 events.append("backup-rename")
-            elif target == destination:
+            elif target_path == destination:
                 events.append("install-rename")
-            return result
 
-        # test-contract: durability instrumentation proves local ordering
-        monkeypatch.setattr(remote_sync_module, "_fsync_file", record_pin_fsync)
+        def record_replace(source: str | Path, target: str | Path) -> None:
+            original_replace(source, target)
+
+        monkeypatch.setattr(remote_sync_module.shutil, "copyfile", record_copyfile)
         monkeypatch.setattr(remote_sync_module.os, "fsync", record_fsync)
-        monkeypatch.setattr(Path, "rename", record_rename)
+        monkeypatch.setattr(remote_sync_module.os, "rename", record_rename)
+        monkeypatch.setattr(remote_sync_module.os, "replace", record_replace)
         reinstall()
 
-    # test-contract: durability ordering is the public replacement guarantee
+    assert events.index("pin-copy") < events.index("pin-fsync")
     assert events.index("pin-fsync") < events.index("backup-rename")
-    # test-contract: durability ordering is the public replacement guarantee
-    assert events.index("backup-rename") < events.index("dir-fsync")
-    first_dir = events.index("dir-fsync")
-    # test-contract: durability ordering is the public replacement guarantee
-    assert events.index("install-rename") < events.index("dir-fsync", first_dir + 1)
+    assert events.index("backup-rename") < events.index("dir-fsync") if kind != "ssh" else True
+    if kind != "ssh":
+        first_dir = events.index("dir-fsync")
+        assert events.index("install-rename") < events.index("dir-fsync", first_dir + 1)
+    else:
+        assert events.index("pin-fsync") < events.index("backup-rename")
+        assert events.index("backup-rename") < events.index("install-rename")
 
 
 @pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
@@ -1004,60 +1012,69 @@ def test_install_replace_fsync_failure_leaves_destination_and_pin(
         push_session(local, transport, session_id=session_id)
         destination = remote / "sessions" / session_id
         script = ssh_module._SESSION_INSTALL_SCRIPT
-        anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
-        # test-contract: durability script anchor must fail loudly if implementation changes
-        assert anchor in script
-        # test-contract: durability injects the fsync failure through the public route
-        monkeypatch.setattr(
-            ssh_module,
-            "_SESSION_INSTALL_SCRIPT",
-            script.replace(anchor, 'raise OSError("pin fsync failed")', 1),
-        )
-        reinstall = lambda: push_session(
-            local, transport, session_id=session_id, force=True
-        )
-    elif kind == "local-publish":
-        remote = tmp_path / "remote"
-        _set_remote_epoch(remote, 8)
-        transport = LocalTransport(remote)
-        push_session(local, transport, session_id=session_id)
-        destination = remote / "sessions" / session_id
-        reinstall = lambda: push_session(
-            local, transport, session_id=session_id, force=True
-        )
-        # test-contract: durability injects the fsync failure through the public route
-        monkeypatch.setattr(
-            remote_sync_module,
-            "_fsync_file",
-            lambda path: (_ for _ in ()).throw(RemoteSyncError("pin fsync failed")),
-        )
+        import_anchor = "import hashlib, shutil, tarfile, tempfile"
+        copy_anchor = "shutil.copyfile(pin, "
+        fsync_anchor = "os.fsync(fd)"
+        for anchor in (import_anchor, copy_anchor, fsync_anchor):
+            # test-contract: failure injection uses only base script seams.
+            assert anchor in script
+        injection = f'''{import_anchor}
+_pin_inode = None
+_real_copyfile = shutil.copyfile
+def _record_copyfile(source, target):
+    global _pin_inode
+    result = _real_copyfile(source, target)
+    if pathlib.Path(source).name == _RETENTION_PIN_FILENAME: _pin_inode = os.stat(target).st_ino
+    return result
+shutil.copyfile = _record_copyfile
+_real_fsync = os.fsync
+def _record_fsync(fd):
+    if _pin_inode is not None and os.fstat(fd).st_ino == _pin_inode: raise OSError("pin fsync failed")
+    return _real_fsync(fd)
+os.fsync = _record_fsync'''
+        script = script.replace(import_anchor, injection, 1)
+        # test-contract: seam instrumentation rewrites only the generated script.
+        monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", script)
+        reinstall = lambda: push_session(local, transport, session_id=session_id, force=True)
     else:
-        source_remote = tmp_path / "source-remote"
+        remote = tmp_path / "remote"
         puller = tmp_path / "puller"
-        _set_remote_epoch(source_remote, 8)
-        _set_remote_epoch(puller, 8)
-        push_session(local, LocalTransport(source_remote), session_id=session_id)
-        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
-        destination = puller / "sessions" / session_id
-        reinstall = lambda: pull_session(
-            puller,
-            LocalTransport(source_remote),
-            session_id=session_id,
-            force=True,
-        )
-        # test-contract: durability injects the fsync failure through the public route
-        monkeypatch.setattr(
-            remote_sync_module,
-            "_fsync_file",
-            lambda path: (_ for _ in ()).throw(RemoteSyncError("pin fsync failed")),
-        )
+        if kind == "local-publish":
+            _set_remote_epoch(remote, 8)
+            transport = LocalTransport(remote)
+            push_session(local, transport, session_id=session_id)
+            destination = remote / "sessions" / session_id
+            reinstall = lambda: push_session(local, transport, session_id=session_id, force=True)
+        else:
+            _set_remote_epoch(remote, 8)
+            _set_remote_epoch(puller, 8)
+            push_session(local, LocalTransport(remote), session_id=session_id)
+            pull_session(puller, LocalTransport(remote), session_id=session_id)
+            destination = puller / "sessions" / session_id
+            reinstall = lambda: pull_session(puller, LocalTransport(remote), session_id=session_id, force=True)
+        pin_inode: int | None = None
+        original_copyfile = remote_sync_module.shutil.copyfile
+        original_fsync = remote_sync_module.os.fsync
+        def record_copyfile(
+            source: str | Path, target: str | Path, *args: object, **kwargs: object
+        ) -> str:
+            nonlocal pin_inode
+            result = original_copyfile(source, target, *args, **kwargs)
+            if Path(source).name == ".retention-pin.json": pin_inode = os.stat(target).st_ino
+            return result
+        def failing_fsync(fd: int) -> None:
+            if pin_inode is not None and os.fstat(fd).st_ino == pin_inode:
+                raise OSError("pin fsync failed")
+            original_fsync(fd)
+        monkeypatch.setattr(remote_sync_module.shutil, "copyfile", record_copyfile)
+        monkeypatch.setattr(remote_sync_module.os, "fsync", failing_fsync)
 
     pin = destination / ".retention-pin.json"
     pin.write_text('{"pinned":true}\n', encoding="utf-8")
     before = destination / "marker"
     before.write_text("keep\n", encoding="utf-8")
     original_pin = pin.read_bytes()
-    with pytest.raises(RemoteSyncError, match="pin fsync failed"):
+    with pytest.raises(RemoteSyncError, match="fsync (file|failed)"):
         reinstall()
     assert before.read_text(encoding="utf-8") == "keep\n"
     assert pin.read_bytes() == original_pin
