@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+import zeta.project_locking as project_locking_module
 from zeta.attention_records import AttentionStore, observed_epoch_for_session
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
@@ -23,7 +24,6 @@ from zeta.core.session_links import (
     reconcile_child_links,
 )
 from zeta.core.store import ConversationStore
-import zeta.project_locking as project_locking_module
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
