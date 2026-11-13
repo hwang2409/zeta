@@ -16087,14 +16087,13 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
             app._prompt_history.finder_task,
             what="ctrl+r prompt paging",
         )
-        assert app._finder_prepare_task is not None
-        await await_or_fail(
-            app._finder_prepare_task,
-            what="ctrl+r candidate preparation",
+        await wait_until(
+            lambda: (
+                (state := app._history_finder.finder_state()) is not None
+                and state.total > 0
+                and state.complete
+            )
         )
-        result = app._history_finder.finder_rank()
-        assert result is not None
-        assert app._history_finder.finder_publish(result)
         assert app._history_finder.finder_accept()
         assert buffer.text == "prompt-0"
         assert len(app._prompt_history.pages) <= 2
