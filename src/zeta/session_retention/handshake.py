@@ -76,6 +76,17 @@ def planner_active(home: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def acquire_user_open_request(home: Path) -> int:
+    fd = _fd(home, "user-open-request")
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    return fd
+
+
+def release_user_open_request(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
 def planner_request_pending(home: Path) -> bool:
     fd = _fd(home, "user-open-request")
     try:

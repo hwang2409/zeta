@@ -85,6 +85,16 @@ async def test_yield_to_open_waits_for_planner_close() -> None:
     assert not owner.task
 
 
+async def test_yield_to_open_returns_when_owner_crashed() -> None:
+    owner = RetentionActivationOwner(
+        lambda: (_ for _ in ()).throw(RuntimeError("planner failed")), lambda: 30
+    )
+    owner.start()
+    await asyncio.sleep(0)
+    assert await asyncio.wait_for(owner.yield_to_open(), 10) is None
+    await owner.stop()
+
+
 async def test_zero_days_skips_planner_pass() -> None:
     created = 0
 
