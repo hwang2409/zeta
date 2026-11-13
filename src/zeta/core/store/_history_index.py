@@ -441,7 +441,7 @@ class HistoryIndex:
                             self._value(self._warm_facts(getattr(ref, "facts", None))),
                         )
                     )
-                    if len(entry_batch) == 128:
+                    if len(entry_batch) == 256:
                         connection.executemany(
                             "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                             "VALUES(?,?,?,?,?,?,?)",
