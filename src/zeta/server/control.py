@@ -545,7 +545,7 @@ class ServeControl:
         if (
             (self._turn_task is None or self._turn_task.done())
             and state is not None
-            and state[1] is not None
+            and state[1] in ("allow", "deny")
             and loop.prepare_resume_pending_tool(state[0])
         ):
             host_commands = self._active_host_commands
