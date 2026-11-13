@@ -592,44 +592,60 @@ async def test_session_mcp_binding_disconnect_suspends_all_servers_together(
         await asyncio.wait_for(first.notification_opened.wait(), TIMEOUT)
         await asyncio.wait_for(second.notification_opened.wait(), TIMEOUT)
 
+        mount = loop._mcp_mount
+        assert mount is not None
+        first_suspended = asyncio.Event()
+        second_suspended = asyncio.Event()
+        suspend_server = mount.suspend_server
+
+        async def observe_suspend(
+            config: MCPServerConfig, *, source: Path
+        ) -> None:
+            await suspend_server(config, source=source)
+            (first_suspended if config.name == "first" else second_suspended).set()
+
+        monkeypatch.setattr(mount, "suspend_server", observe_suspend)
         first.detached = True
         second.detached = True
         writer.close()
         await writer.wait_closed()
         await asyncio.wait_for(first_close_started.wait(), TIMEOUT)
-        second_closed = asyncio.create_task(
-            asyncio.wait_for(second.notification_closed.wait(), 10)
+        second.drop_notification.set()
+        second_request = asyncio.create_task(
+            asyncio.wait_for(second.request_after_detach.wait(), 10)
         )
-        first_timed_out = asyncio.create_task(
-            asyncio.wait_for(first_close_timed_out.wait(), 10)
+        second_suspend = asyncio.create_task(
+            asyncio.wait_for(second_suspended.wait(), 10)
         )
         try:
             done, _ = await asyncio.wait_for(
                 asyncio.wait(
-                    (second_closed, first_timed_out),
+                    (second_request, second_suspend),
                     return_when=asyncio.FIRST_COMPLETED,
                 ),
                 TIMEOUT,
             )
-            assert second_closed in done, (
-                "later MCP server stayed mounted until the first server close deadline"
+            assert second_suspend in done and second_request not in done, (
+                "later MCP server used the detached controller's old header "
+                "while the first server close was held"
             )
         finally:
-            second_closed.cancel()
-            first_timed_out.cancel()
+            second_request.cancel()
+            second_suspend.cancel()
             await asyncio.wait_for(
                 asyncio.gather(
-                    second_closed, first_timed_out, return_exceptions=True
+                    second_request, second_suspend, return_exceptions=True
                 ),
                 TIMEOUT,
             )
-        second.drop_notification.set()
-        assert not second.request_after_detach.is_set(), (
-            "later MCP server sent the detached controller's old header while "
-            "the first server close was held"
-        )
+        assert second.notification_closed.is_set()
         release_task = server.control._controller_release_task
         assert release_task is not None and not release_task.done()
+        release_first_close.set()
+        await asyncio.wait_for(first_suspended.wait(), TIMEOUT)
+        await asyncio.wait_for(release_task, TIMEOUT)
+        assert not first.request_after_detach.is_set()
+        assert not second.request_after_detach.is_set()
     finally:
         release_first_close.set()
         if not writer.is_closing():
