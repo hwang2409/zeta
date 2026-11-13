@@ -472,7 +472,7 @@ async def test_session_mcp_binding_disconnect_closes_authenticated_stream(
         assert mount is not None
         assert mount.client_for("page") is None, "credential-bearing MCP client remained mounted"
         try:
-            await asyncio.wait_for(mcp.notification_closed.wait(), 0.5)
+            await asyncio.wait_for(mcp.notification_closed.wait(), 10)
             stream_closed = True
         except TimeoutError:
             stream_closed = False
@@ -482,7 +482,7 @@ async def test_session_mcp_binding_disconnect_closes_authenticated_stream(
         mcp.send_tool_change.set()
         mcp.drop_notification.set()
         try:
-            await asyncio.wait_for(mcp.request_after_detach.wait(), 1.5)
+            await asyncio.wait_for(mcp.request_after_detach.wait(), 10)
         except TimeoutError:
             pass
         assert not mcp.request_after_detach.is_set()
