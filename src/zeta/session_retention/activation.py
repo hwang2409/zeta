@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib import import_module
@@ -11,7 +13,6 @@ from typing import Any
 
 from .handshake import (
     acquire_user_open_request,
-    open_with_retention_yield,
     release_user_open_request,
 )
 
@@ -100,6 +101,8 @@ class RetentionActivationOwner:
         self._open_finished.set()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
+        self._request_pending = threading.Event()
+        self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -128,37 +131,67 @@ class RetentionActivationOwner:
             except asyncio.CancelledError:
                 pass
 
-    async def yield_to_open(self, operation: Callable[[], Any] | None = None) -> Any:
-        """Abandon the current preview before an interactive open proceeds."""
+    async def run_user_access(self, operation: Callable[[], Any]) -> Any:
+        """Hold the user-access lease for one complete public operation."""
         request_fd = None
         if self._home is not None:
             request_fd = await asyncio.to_thread(acquire_user_open_request, self._home)
+        self._request_pending.set()
         self._open_finished.clear()
         self._restart.set()
         self._wake.set()
-        task = self._task
-        timed_out = False
-        if task is not None and not task.done() and self._planner is not None:
-            try:
-                await asyncio.wait_for(asyncio.shield(self._planner_closed.wait()), 2.0)
-            except TimeoutError:
-                timed_out = True
         try:
-            if operation is None:
-                if timed_out and self._home is not None:
-                    await asyncio.to_thread(release_user_open_request, request_fd)
-                    request_fd = None
-                    return await asyncio.to_thread(
-                        open_with_retention_yield, self._home, lambda: None
-                    )
-                return None
-            if self._home is None:
-                return await asyncio.to_thread(operation)
-            return await asyncio.to_thread(open_with_retention_yield, self._home, operation)
+            task = self._episode_task
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), 2.0)
+                except TimeoutError:
+                    pass
+            result = operation()
+            if inspect.isawaitable(result):
+                return await result
+            return result
         finally:
+            self._request_pending.clear()
             if request_fd is not None:
                 await asyncio.to_thread(release_user_open_request, request_fd)
             self._open_finished.set()
+
+    async def yield_to_open(self, operation: Callable[[], Any] | None = None) -> Any:
+        """Compatibility wrapper for callers that only need to stop retention."""
+        if operation is not None:
+            return await self.run_user_access(operation)
+        await self.run_user_access(lambda: None)
+
+    def _run_episode(self) -> tuple[list[Any], Exception | None]:
+        projections: list[Any] = []
+        failure: Exception | None = None
+        planner = None
+        try:
+            planner = self._planner_factory()
+            self._planner = planner
+            self._planner_closed.clear()
+            from .handshake import planner_active
+            context = planner_active(self._home) if self._home is not None else _null_context()
+            with context:
+                while not self._stop.is_set() and not self._request_pending.is_set():
+                    days = self._days()
+                    if days == 0:
+                        break
+                    result = self._run_pass(planner, days)
+                    projections.append(result)
+                    if result.complete:
+                        break
+        except Exception as exc:  # noqa: BLE001 - keep the owner alive after pass errors
+            failure = exc
+        finally:
+            if planner is not None:
+                try:
+                    planner.close()
+                finally:
+                    self._planner = None
+                    self._planner_closed.set()
+        return projections, failure
 
     async def _run(self) -> None:
         try:
@@ -173,54 +206,40 @@ class RetentionActivationOwner:
                     except TimeoutError:
                         pass
                     continue
-                failed = False
-                planner = None
-                error: Any = None
-                failure: Exception | None = None
-                try:
-                    planner = self._planner_factory()
-                    self._planner = planner
-                    self._planner_closed.clear()
-                    while not self._stop.is_set() and not self._restart.is_set():
-                        days = self._days()
-                        if days == 0:
-                            break
-                        self._run_done.clear()
-                        try:
-                            result = await asyncio.to_thread(self._run_pass, planner, days)
-                        finally:
-                            self._run_done.set()
-                        if self._publish is not None:
-                            await self._publish(result)
-                        if not result.complete:
-                            continue
-                        if self._restart.is_set():
-                            break
-                        self._wake.clear()
-                        try:
-                            await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
-                        except TimeoutError:
-                            continue
-                except Exception as exc:  # noqa: BLE001 - keep the owner alive after any pass failure
-                    failed = True
-                    failure = exc
-                finally:
-                    self._planner = None
-                    if planner is not None:
-                        await asyncio.to_thread(planner.close)
-                    self._planner_closed.set()
+                self._request_pending.clear()
+                self._restart.clear()
+                self._episode_task = asyncio.create_task(
+                    asyncio.to_thread(self._run_episode), name="retention-episode"
+                )
+                projections, failure = await asyncio.shield(self._episode_task)
+                self._episode_task = None
+                for projection in projections:
+                    if self._publish is not None:
+                        await self._publish(projection)
                 if failure is not None and not self._stop.is_set():
                     error = await asyncio.to_thread(self._on_error, failure, self._days())
                     if self._publish is not None:
                         await self._publish(error)
                 if self._stop.is_set():
                     return
-                self._restart.clear()
-                if failed:
+                if self._request_pending.is_set() or self._restart.is_set():
                     self._wake.clear()
-                    try:
-                        await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
-                    except TimeoutError:
-                        pass
+                    continue
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
+                except TimeoutError:
+                    pass
         finally:
+            task = self._episode_task
+            if task is not None:
+                await asyncio.shield(task)
             self._planner = None
+
+
+class _null_context:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False

@@ -15,6 +15,7 @@ from ...mcp.config import (
     load_mcp_config_overlay,
 )
 from ...protocol.types import StreamEvent, StreamEventType
+from ...session_retention.handshake import open_with_retention_yield
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -63,6 +64,13 @@ async def _publish_project_registry_notice(self) -> None:
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
+    owner = self.server._retention_owner
+    if owner is not None:
+        return await owner.run_user_access(lambda: _new_session(self, params))
+    return await _new_session(self, params)
+
+
+async def _new_session(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
         initial_model = validation.optional_string(params, "model")
@@ -74,8 +82,6 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
-            if self.server._retention_owner is not None:
-                await self.server._retention_owner.yield_to_open()
             self.server.connections.replay_session_replaced()
             cwd = None
             if "cwd" in params:
@@ -121,14 +127,19 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
 
 
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
+    owner = self.server._retention_owner
+    if owner is not None:
+        return await owner.run_user_access(lambda: _resume(self, params))
+    return await _resume(self, params)
+
+
+async def _resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
         state = self.server.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
-            if self.server._retention_owner is not None:
-                await self.server._retention_owner.yield_to_open()
             self.server.connections.replay_session_replaced()
             session_id = validation.required_string(params, "session_id")
             try:
@@ -469,6 +480,18 @@ async def status(
 
 
 def list_sessions(
+    self, request_id: str | int, params: dict[str, Any]
+) -> tuple[dict[str, object], list[str]]:
+    owner = self.server._retention_owner
+    if owner is not None:
+        return open_with_retention_yield(
+            self.server.runtime.manager.home,
+            lambda: _list_sessions(self, request_id, params),
+        )
+    return _list_sessions(self, request_id, params)
+
+
+def _list_sessions(
     self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features

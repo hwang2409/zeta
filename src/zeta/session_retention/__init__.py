@@ -57,7 +57,7 @@ from ..storage_format import (
     validate_retention_reservation,
     validate_retention_state,
 )
-from .handshake import planner_active, planner_request_pending
+from .handshake import planner_request_pending
 from .pin import is_retention_pinned
 from .transaction import (
     Candidate,
@@ -575,14 +575,13 @@ class RetentionPlanner:
         if planner_request_pending(self.home):
             self.close()
             return PassResult(enabled=True, complete=False)
-        with planner_active(self.home):
-            home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                return self._run_pass(home_fd, days)
-            finally:
-                os.close(home_fd)
-                if planner_request_pending(self.home):
-                    self.close()
+        home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            return self._run_pass(home_fd, days)
+        finally:
+            os.close(home_fd)
+            if planner_request_pending(self.home):
+                self.close()
 
     def _run_pass(self, home_fd: int, days: int) -> PassResult:
         if self._latest is _UNLOADED:
