@@ -1007,7 +1007,10 @@ class TUIApp(
         if not self._full_screen_active(): return f"project instructions: {path}"
         command = shlex.join(project_instructions_editor_command(path))
         async def run() -> str:
-            try: status = await run_in_terminal(lambda: subprocess.call(command, shell=True), in_executor=True)
+            try: status = await run_in_terminal(
+                    lambda: subprocess.call(command, shell=True, stderr=subprocess.STDOUT),
+                    in_executor=True,
+                )
             except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
             return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
         return run()
