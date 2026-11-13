@@ -62,6 +62,29 @@ async def test_yield_to_open_runs_operation_after_worker_pass(tmp_path) -> None:
     assert opened.is_set()
 
 
+async def test_yield_to_open_waits_for_planner_close() -> None:
+    closed = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Planner(_Planner):
+        def close(self) -> None:
+            closed.set()
+            super().close()
+
+    owner = RetentionActivationOwner(
+        lambda: Planner(entered, release), lambda: 30, wake_seconds=10
+    )
+    owner.start()
+    await _wait(entered)
+    opening = asyncio.create_task(owner.yield_to_open(lambda: closed.is_set()))
+    await asyncio.to_thread(entered.wait, 10)
+    release.set()
+    assert await asyncio.wait_for(opening, 10)
+    await owner.stop()
+    assert not owner.task
+
+
 async def test_zero_days_skips_planner_pass() -> None:
     created = 0
 

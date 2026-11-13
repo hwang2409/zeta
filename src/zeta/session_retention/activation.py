@@ -76,6 +76,8 @@ class RetentionActivationOwner:
         self._restart = asyncio.Event()
         self._run_done = asyncio.Event()
         self._run_done.set()
+        self._planner_closed = asyncio.Event()
+        self._planner_closed.set()
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
@@ -108,13 +110,13 @@ class RetentionActivationOwner:
         if self._home is None:
             self._restart.set()
             self._wake.set()
-            await self._run_done.wait()
+            await self._planner_closed.wait()
             return None if operation is None else await asyncio.to_thread(operation)
         with user_open_request(self._home):
             self._restart.set()
             self._wake.set()
             # run_pass owns the planner; closing it here would race with the worker.
-            await self._run_done.wait()
+            await self._planner_closed.wait()
             if operation is None:
                 return None
             return await asyncio.to_thread(open_with_retention_yield, self._home, operation)
@@ -132,6 +134,7 @@ class RetentionActivationOwner:
                     continue
                 planner = self._planner_factory()
                 self._planner = planner
+                self._planner_closed.clear()
                 try:
                     while not self._stop.is_set() and not self._restart.is_set():
                         days = self._days()
@@ -146,6 +149,8 @@ class RetentionActivationOwner:
                             await self._publish(result)
                         if not result.complete:
                             continue
+                        if self._restart.is_set():
+                            break
                         self._wake.clear()
                         try:
                             await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
@@ -154,6 +159,7 @@ class RetentionActivationOwner:
                 finally:
                     self._planner = None
                     await asyncio.to_thread(planner.close)
+                    self._planner_closed.set()
                 if self._stop.is_set():
                     return
                 self._restart.clear()
