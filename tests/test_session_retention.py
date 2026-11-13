@@ -172,7 +172,7 @@ def test_not_old_blocks_under_real_clock(tmp_path):
         recent_meta = _create_closed(manager, stack)
         _age_tree(tmp_path / "sessions" / recent_meta, keep_metadata=True)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=time.time_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=time.time_ns)
         _, reasons = _run_sweep(planner)
     assert reasons[fresh] == (False, "not old enough")
     assert reasons[aged] == (True, None)
@@ -281,7 +281,7 @@ def test_every_root_is_swept_and_the_next_sweep_starts_fresh(tmp_path):
         meta.write_text(json.dumps({**json.loads(meta.read_text()), "parent_session_id": parent}))
         expected = sum(_true_tree_bytes(tmp_path / "sessions" / i) for i in ids[1:])
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         first, reasons = _run_sweep(planner)
         second, _ = _run_sweep(planner)
     assert reasons[parent] == (False, "published top-level dependent")
@@ -304,7 +304,7 @@ def test_in_flight_walk_keeps_conforming_writers_out(tmp_path):
         )
         _age_tree(tmp_path / "sessions" / root)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, bounds=RetentionBounds(entries_per_root=1))
+        planner = _planner(stack, tmp_path, lease, bounds=RetentionBounds(entries_per_root=1))
         planner.run_pass(days=30)  # the root directory is walked; the walk is suspended
         # Walk progress stays authoritative only because no conforming writer
         # can append between passes (a stale age would select an active root).
@@ -339,7 +339,7 @@ def test_unreadable_entry_blocks_only_its_root(tmp_path):
         blocked.chmod(0)
         stack.callback(blocked.chmod, 0o700)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         result, reasons = _run_sweep_without_error(planner)
     assert result is not None
     assert reasons[ids[0]] == (False, "unreadable entry: Permission denied")
@@ -385,7 +385,7 @@ def test_malformed_metadata_is_never_closed(tmp_path):
         ids = sorted(_create_closed(manager, stack) for _ in range(2))
         (tmp_path / "sessions" / ids[0] / "meta.json").write_text("{not json")
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         result, reasons = _run_sweep(planner)
     # The broken root is ineligible, and it may hide a parent link, so the
     # other root's dependent scan cannot pass either.
@@ -398,8 +398,8 @@ def test_below_feature_epoch_writes_nothing(tmp_path):
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":7}\n')
     lease = open_writer(tmp_path)
     try:
-        planner = RetentionPlanner(tmp_path, lease)
-        result = planner.run_pass(days=30)
+        with RetentionPlanner(tmp_path, lease) as planner:
+            result = planner.run_pass(days=30)
     finally:
         lease.close()
     assert result.enabled is False
@@ -497,7 +497,7 @@ def test_isolated_all_roots_behavior(tmp_path):
         for root in roots:
             _age_tree(tmp_path / "sessions" / root)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        result, _ = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+        result, _ = _run_sweep(_planner(stack, tmp_path, lease, now_ns=_future_ns))
     assert result.complete
     assert set(result.preview.root_ids) == set(roots)
 
@@ -508,7 +508,7 @@ def test_isolated_completed_sweeps_do_not_double_count(tmp_path):
         root = _create_closed(manager, stack)
         _age_tree(tmp_path / "sessions" / root)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         first, _ = _run_sweep(planner)
         first_bytes = first.preview.bytes
         first_id = first.preview.preview_id
@@ -524,8 +524,8 @@ def test_isolated_partial_second_sweep_keeps_complete_preview(tmp_path):
         root = _create_closed(manager, stack)
         _age_tree(tmp_path / "sessions" / root)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(
-            tmp_path, lease, bounds=RetentionBounds(entries_per_root=1), now_ns=_future_ns
+        planner = _planner(
+            stack, tmp_path, lease, bounds=RetentionBounds(entries_per_root=1), now_ns=_future_ns
         )
         complete, _ = _run_sweep(planner)
         preview_id = complete.preview.preview_id
@@ -546,7 +546,7 @@ def test_isolated_sent_ledger_states(tmp_path, reported, expected):
         _age_tree(tmp_path / "sessions" / root)
         _write_sent_ledger(tmp_path, root, reported)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        _, reasons = _run_sweep(RetentionPlanner(tmp_path, lease, now_ns=_future_ns))
+        _, reasons = _run_sweep(_planner(stack, tmp_path, lease, now_ns=_future_ns))
     assert reasons[root][0] is expected
 
 
@@ -847,7 +847,7 @@ def _check_authority_case(tmp_path, monkeypatch, kind, mode):
         if kind == "generation" and mode == "present":
             _generation_reader(monkeypatch)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         result, reasons = _run_sweep(planner) if not (
             kind == "discovery" and mode == "malformed"
         ) else (planner.run_pass(days=30), {})
@@ -939,7 +939,7 @@ def _check_over_bound_case(tmp_path, kind):
             bounds = RetentionBounds(entries_per_root=2)
         else:
             bounds = RetentionBounds(reference_records_per_root=20)
-        planner = RetentionPlanner(tmp_path, lease, bounds=bounds, now_ns=_future_ns)
+        planner = _planner(stack, tmp_path, lease, bounds=bounds, now_ns=_future_ns)
         if kind in {"discovery", "walk"}:
             result = planner.run_pass(days=30)
             reasons = {}
@@ -1006,7 +1006,7 @@ def _check_deadline_case(tmp_path, kind):
         _setup_authority(tmp_path, manager, stack, root, kind, mode)
         clock = _DeadlineClock(kind)
         lease = stack.enter_context(_opened_lease(tmp_path))
-        planner = RetentionPlanner(tmp_path, lease, now_ns=clock)
+        planner = _planner(stack, tmp_path, lease, now_ns=clock)
         result = planner.run_pass(days=30)
         planner.close()
     assert clock.hit, f"deadline did not cross inside {kind}"
