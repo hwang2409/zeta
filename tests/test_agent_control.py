@@ -36,6 +36,45 @@ async def test_owner_cancel_is_scoped_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_late_grandchild_inherits_retired_parent_cancellation(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    canceled: list[str] = []
+    release = asyncio.Event()
+
+    async def wait_for_release() -> None:
+        await asyncio.wait_for(release.wait(), 10)
+
+    parent = asyncio.create_task(wait_for_release())
+    grandchild: asyncio.Task[None] | None = None
+    try:
+        owner.register("root:1", lambda: canceled.append("root:1"), parent)
+        assert owner.cancel("root:1")
+        owner.unregister("root:1")
+        assert owner._cancel_requested == set()
+
+        grandchild = asyncio.create_task(wait_for_release())
+        owner.register(
+            "root:1:1",
+            lambda: canceled.append("root:1:1"),
+            grandchild,
+            parent_instance_id="root:1",
+        )
+        assert canceled == ["root:1", "root:1:1"]
+        owner.unregister("root:1:1")
+        assert owner._cancel_requested == set()
+    finally:
+        release.set()
+        tasks = [parent] if grandchild is None else [parent, grandchild]
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_owner_cancel_only_cancels_selected_subtree(tmp_path: Path) -> None:
     owner = BackgroundAgentOwner(ConversationStore(tmp_path))
     canceled: list[str] = []
