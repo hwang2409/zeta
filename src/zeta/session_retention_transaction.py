@@ -32,6 +32,7 @@ from .locking import RETENTION_HOME_ID, domain_authority
 from .project_errors import ProjectRegistryError
 from .project_inbox import InboxError, ProjectInbox
 from .project_registry import ProjectRegistry
+from .runtime.project_registry_state import available_project_registry
 from .storage_format import (
     StorageFormatError,
     WriterLease,
@@ -190,9 +191,7 @@ class _QuarantineTransaction:
         try:
             self.project_ids = ()
             if _entry_exists(self.home / _TRASH_NAME, _RESERVATIONS_NAME):
-                registry = ProjectRegistry(
-                    self.home / "projects", _storage_lease=self.lease
-                )
+                registry = self._project_registry()
                 self.project_ids = tuple(
                     project.project_id for project in registry.list_projects()
                 )
@@ -425,12 +424,18 @@ class _QuarantineTransaction:
             return TransactionOutcome(True, session_id=session_id)
         return TransactionOutcome(False, "retention transaction is blocked", session_id)
 
+    def _project_registry(self) -> ProjectRegistry:
+        state = available_project_registry(
+            self.home / "projects", _storage_lease=self.lease
+        )
+        if state.registry is None:
+            raise ProjectRegistryError("project registry is unavailable")
+        return state.registry
+
     def _cleanup_stage(self, stage: str, manifest: dict, budget: _Budget) -> None:
         candidate_ids = (manifest["session_id"], *manifest["descendants"])
         budget.charge()
-        registry = ProjectRegistry(
-            self.home / "projects", _storage_lease=self.lease
-        )
+        registry = self._project_registry()
         try:
             if stage == "quarantined":
                 registry.remove_session_links(
