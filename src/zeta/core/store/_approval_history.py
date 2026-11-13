@@ -267,15 +267,7 @@ class ApprovalHistoryStoreMixin:
 
     def release_pending_approval_execution(self, request_id: str) -> None:
         record = self._pending_approval_executions.get(request_id)
-        if record is not None and (
-            record.owner in (
-                None,
-                _PREPARED_APPROVAL_EXECUTION,
-                asyncio.current_task(),
-            )
-            or isinstance(record.owner, asyncio.Task)
-            and record.owner.done()
-        ):
+        if record is not None:
             record.owner = _COMPLETED_APPROVAL_EXECUTION
             record.completed.set()
 

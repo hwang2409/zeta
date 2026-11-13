@@ -8,6 +8,7 @@ import pytest
 
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
     ApprovalDecision,
@@ -1503,6 +1504,51 @@ async def test_terminal_approval_claims_do_not_accumulate_across_turns(
             assert store._pending_approval_executions == {}
     finally:
         await asyncio.wait_for(loop.close(), 10)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_finalization_wakes_waiter_while_owner_unwinds(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    pending = ("call", ("host", None))
+    owner_claimed = asyncio.Event()
+    waiter_started = asyncio.Event()
+    release_owner = asyncio.Event()
+    executions = 0
+
+    async def own_execution() -> None:
+        nonlocal executions
+        store.remember_pending_approval_execution(*pending)
+        assert store.claim_pending_approval_execution(*pending) == "claimed"
+        executions += 1
+        owner_claimed.set()
+        await await_or_fail(
+            release_owner.wait(), timeout=30, what="execution owner release"
+        )
+
+    owner = asyncio.create_task(own_execution())
+    waiter = None
+    try:
+        await await_or_fail(owner_claimed.wait(), what="execution claim")
+
+        async def wait_for_owner() -> None:
+            assert store.claim_pending_approval_execution(*pending) == "duplicate"
+            waiter_started.set()
+            await store.wait_pending_approval_execution(pending[0])
+
+        waiter = asyncio.create_task(wait_for_owner())
+        await await_or_fail(waiter_started.wait(), what="approval claim waiter start")
+        store.release_pending_approval_execution(pending[0])
+        await await_or_fail(waiter, what="approval claim waiter")
+        assert executions == 1
+    finally:
+        release_owner.set()
+        await await_or_fail(owner, what="execution owner cleanup")
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+            await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), 10)
         store.close()
 
 
