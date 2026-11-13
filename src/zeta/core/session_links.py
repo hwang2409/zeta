@@ -433,7 +433,7 @@ def _schedule_child_links_reconciliation(
                 delay_index = min(
                     delay_index + 1, len(_CHILD_RECONCILIATION_RETRY_DELAYS) - 1
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - keep the worker from leaking its slot
             logger.warning(
                 "child project linkage retry stopped for %s: %s: %s",
                 session_id,
