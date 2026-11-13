@@ -69,6 +69,19 @@ def _nested_canceled_result(marker: dict[str, object]) -> ToolResult:
     )
     return receipt_tool_result(ToolCall.from_dict(marker["tool_call"]).id, result)
 
+async def _complete_despite_cancellation(task: asyncio.Task[Any]) -> bool:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    task.result()
+    return cancelled
+
 @dataclass(frozen=True)
 class _BackgroundTerminal:
     status: str
