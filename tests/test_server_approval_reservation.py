@@ -1333,11 +1333,13 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         assert old_state.loop.step_delivery is None
         mount_task = old_state.loop._mcp_mount_task
         assert mount_task is None or mount_task.done()
-        reopened = server.runtime.manager.open(old_state.session_id)
+        reopened = await asyncio.to_thread(
+            server.runtime.manager.open, old_state.session_id
+        )
         try:
             assert reopened.metadata.session_id == old_state.session_id
         finally:
-            reopened.store.close()
+            await asyncio.to_thread(reopened.store.close)
         fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
         leaked_targets = []
         for name in os.listdir(fd_directory):

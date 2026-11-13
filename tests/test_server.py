@@ -4506,7 +4506,11 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    messages = branch_messages(server.runtime.manager.open(session_id).store)
+    reopened = await asyncio.to_thread(server.runtime.manager.open, session_id)
+    try:
+        messages = branch_messages(reopened.store)
+    finally:
+        await asyncio.to_thread(reopened.store.close)
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -8558,9 +8562,9 @@ async def test_resume_does_not_bump_updated_at(tmp_path):
         first = await runtime.create_session()
         first_id = first.session_id
         await runtime.create_session()
-        before = runtime.manager.read_metadata(first_id).updated_at
+        before = (await asyncio.to_thread(runtime.manager.read_metadata, first_id)).updated_at
         await runtime.resume_session(first_id)
-        after = runtime.manager.read_metadata(first_id).updated_at
+        after = (await asyncio.to_thread(runtime.manager.read_metadata, first_id)).updated_at
         assert before == after
     finally:
         await runtime.close()
@@ -8725,7 +8729,8 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         assert error["code"] == -32004
         release.set()
         await _event(reader, "agent_end")
-        assert server.runtime.manager.read_metadata(sid).name == "mid-stream"
+        metadata = await asyncio.to_thread(server.runtime.manager.read_metadata, sid)
+        assert metadata.name == "mid-stream"
         assert (
             "result"
             in (
