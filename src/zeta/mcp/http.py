@@ -211,15 +211,13 @@ class StreamableHTTPMCPClient(MCPClient):
         if self._closed:
             return
         self._closed = True
-        notification_task = self._notification_task
-        self._notification_task = None
-        if notification_task is not None:
-            notification_task.cancel()
+        if self._notification_task is not None:
+            self._notification_task.cancel()
+            await asyncio.gather(self._notification_task, return_exceptions=True)
+            self._notification_task = None
         await self._drain_active_requests()
         if self._owns_client:
             await self._client.aclose()
-        if notification_task is not None:
-            await asyncio.gather(notification_task, return_exceptions=True)
         if self._owns_spill_store:
             self._spill_store.close()
 
