@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 
 def _remote_script(target: str, host: str) -> str:
@@ -74,6 +76,23 @@ def _target() -> tuple[str, str]:
         detail = (exc.stderr or "").strip()
         raise RuntimeError(detail or "could not resolve local origin/main") from None
     return sha, subject
+
+
+def add_remote_parser(commands: Any) -> None:
+    remote_parser = commands.add_parser("remote", help="manage a remote zeta checkout")
+    remote_commands = remote_parser.add_subparsers(dest="remote_action", required=True)
+    remote_update = remote_commands.add_parser("update", help="update a remote checkout over ssh")
+    remote_update.add_argument("host")
+
+
+def run_remote_update(host: str) -> int:
+    try:
+        result = update_remote(host)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"zeta remote update: {exc}", file=sys.stderr)
+        return 2
+    print(result)
+    return 0
 
 
 def update_remote(
