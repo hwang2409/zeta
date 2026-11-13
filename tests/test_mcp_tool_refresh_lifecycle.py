@@ -38,14 +38,14 @@ class _HeldRefreshClient:
 
     async def connect(self) -> None:
         if self.connect_release is not None:
-            await self.connect_release.wait()
+            await asyncio.wait_for(self.connect_release.wait(), 10)
 
     async def list_tools(self) -> list[MCPTool]:
         self._list_calls += 1
         if self._list_calls == 1:
             return [MCPTool("echo", "", {"type": "object"})]
         self.refresh_started.set()
-        await self.refresh_release.wait()
+        await asyncio.wait_for(self.refresh_release.wait(), 10)
         if self.fail_refresh:
             raise RuntimeError("refresh failed")
         return [MCPTool("changed", "", {"type": "object"})]
@@ -69,6 +69,7 @@ async def _mounted_refresh(
     *later_clients: _HeldRefreshClient,
 ) -> tuple[ToolRegistry, MCPMount]:
     clients = iter((client, *later_clients))
+    # test-contract: seam the mount client factory forces lifecycle ordering
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: next(clients))
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
@@ -153,7 +154,9 @@ async def test_close_publishes_removed_catalog_before_settling_held_refresh(
         client.refresh_release.set()
         if not close.done():
             close.cancel()
-            await asyncio.gather(close, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(close, return_exceptions=True), 10
+            )
         await mount.close()
         await registry.close()
 
