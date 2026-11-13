@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
 import selectors
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -184,6 +186,264 @@ with sc.stderr_to_log():
     expected = b"".join(bytes([i]) * 65536 for i in range(64))
     assert len(logs) == 1
     assert logs[0].read_bytes() == expected
+
+
+def test_new_log_is_not_visible_before_it_is_locked(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    code = """
+import fcntl
+import os
+from zeta.tui import stderr_capture
+original_flock = fcntl.flock
+blocked = False
+def delayed_flock(fd, operation):
+    global blocked
+    if operation == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not blocked:
+        blocked = True
+        os.write(int(os.environ["READY_FD"]), b"ready")
+        os.read(int(os.environ["RELEASE_FD"]), 1)
+    return original_flock(fd, operation)
+stderr_capture.fcntl.flock = delayed_flock
+with stderr_capture.stderr_to_log():
+    os.write(2, b'ZLOCKED\\n')
+"""
+    env = _capture_env(home) | {
+        "READY_FD": str(ready_write),
+        "RELEASE_FD": str(release_read),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], env=env, pass_fds=(ready_write, release_read)
+    )
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        assert os.read(ready_read, 5) == b"ready"
+        visible = list((home / "logs" / "tui-stderr").glob("*.log"))
+        if visible:
+            os.utime(visible[0], (1, 1))
+            (home / "logs" / "tui-stderr" / "retention.log").write_bytes(
+                b"x" * (50 * 1024 * 1024 + 1)
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; from zeta.tui.stderr_capture import _retain_logs; _retain_logs(Path(sys.argv[1]))",
+                    str(home / "logs" / "tui-stderr"),
+                ],
+                env=_capture_env(home),
+                check=True,
+            )
+        else:
+            assert not visible
+        os.write(release_write, b"x")
+        assert process.wait(timeout=10) == 0
+    finally:
+        if process.poll() is None:
+            os.write(release_write, b"x")
+            reap_process(process, timeout=10)
+        os.close(ready_read)
+        os.close(release_write)
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert any("ZLOCKED\n" in log.read_text() for log in logs)
+    assert len(logs) == 1
+    assert logs[0].read_text() == "ZLOCKED\n"
+
+
+def test_log_name_collision_keeps_both_files(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    code = """
+import os
+from pathlib import Path
+import zeta.tui.stderr_capture as sc
+log_dir = Path(os.environ["ZETA_HOME"]) / "logs" / "tui-stderr"
+log_dir.mkdir(parents=True)
+(log_dir / "collision.log").write_bytes(b"old\\n")
+sc._log_path = lambda directory: directory / "collision.log"
+with sc.stderr_to_log():
+    os.write(2, b"new\\n")
+"""
+    terminal, returncode = _run_pty_python(code, _capture_env(home))
+    assert returncode == 0
+    assert b"new" not in terminal
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 2
+    assert sorted(log.read_text() for log in logs) == ["new\n", "old\n"]
+
+
+def test_stale_temporary_logs_are_pruned_but_live_ones_are_kept(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    directory = home / "logs" / "tui-stderr"
+    directory.mkdir(parents=True)
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    live = directory / ".live.tmp"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        code = "from pathlib import Path; from zeta.tui.stderr_capture import _retain_logs; _retain_logs(Path(__import__('os').environ['LOG_DIR']))"
+        subprocess.run(
+            [sys.executable, "-c", code],
+            env=_capture_env(home) | {"LOG_DIR": str(directory)},
+            check=True,
+        )
+        assert not stale.exists()
+        assert live.exists()
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
+
+
+def test_stale_temp_retention_holds_lock_until_unlink(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    live = directory / ".live.tmp"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    unlink_started = threading.Event()
+    holder_done = threading.Event()
+    holder_locked: list[bool] = []
+    original_unlink = capture.os.unlink
+
+    def hold_unlink(path: Path) -> None:
+        if path == stale:
+            unlink_started.set()
+            holder_fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    holder_locked.append(False)
+                else:
+                    holder_locked.append(True)
+            finally:
+                os.close(holder_fd)
+            holder_done.set()
+        original_unlink(path)
+
+    monkeypatch.setattr(capture.os, "unlink", hold_unlink)
+    try:
+        capture._retain_logs(directory)
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
+    assert unlink_started.is_set()
+    assert holder_done.is_set()
+    assert holder_locked == [False]
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_completed_log_retention_holds_lock_until_unlink(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    old = directory / "old.log"
+    with old.open("wb") as file:
+        file.truncate(capture._TUI_STDERR_MAX_BYTES + 1)
+    live = directory / "live.log"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    unlink_started = threading.Event()
+    holder_done = threading.Event()
+    holder_locked: list[bool] = []
+    original_unlink = capture.os.unlink
+
+    def hold_unlink(path: Path) -> None:
+        if path == old:
+            unlink_started.set()
+            holder_fd = os.open(path, os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    holder_locked.append(False)
+                else:
+                    holder_locked.append(True)
+            finally:
+                os.close(holder_fd)
+            holder_done.set()
+        original_unlink(path)
+
+    monkeypatch.setattr(capture.os, "unlink", hold_unlink)
+    try:
+        capture._retain_logs(directory)
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
+    assert unlink_started.is_set()
+    assert holder_done.is_set()
+    assert holder_locked == [False]
+    assert not old.exists()
+    assert live.exists()
+
+
+def test_completed_log_retention_holds_at_most_one_fd(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    for index in range(250):
+        path = directory / f"{index:03d}.log"
+        with path.open("wb") as file:
+            file.truncate(1024 * 1024)
+        os.utime(path, (index + 1, index + 1))
+
+    original_open = capture.os.open
+    original_close = capture.os.close
+    open_fds: set[int] = set()
+    peak = 0
+
+    def track_open(path, flags, mode=0o777):
+        nonlocal peak
+        fd = original_open(path, flags, mode)
+        if str(path).endswith(".log"):
+            open_fds.add(fd)
+            peak = max(peak, len(open_fds))
+        return fd
+
+    def track_close(fd: int) -> None:
+        open_fds.discard(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(capture.os, "open", track_open)
+    monkeypatch.setattr(capture.os, "close", track_close)
+    capture._retain_logs(directory)
+    assert peak == 1
+    assert not open_fds
+
+
+def test_retention_skips_replaced_path(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    original_flock = capture.fcntl.flock
+    replaced = False
+
+    def replace_after_lock(fd: int, operation: int) -> None:
+        nonlocal replaced
+        original_flock(fd, operation)
+        if operation == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not replaced:
+            replaced = True
+            stale.unlink()
+            stale.write_bytes(b"replacement")
+
+    monkeypatch.setattr(capture.fcntl, "flock", replace_after_lock)
+    capture._retain_logs(directory)
+    assert stale.read_bytes() == b"replacement"
 
 
 def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:
