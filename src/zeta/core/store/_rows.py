@@ -17,7 +17,11 @@ from ..checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
-from ._client_delivery import without_client_delivery_marker
+from ._client_delivery import (
+    CLIENT_DELIVERY_METADATA,
+    CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA,
+    without_client_delivery_marker,
+)
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -162,8 +166,18 @@ class StartupFactsMixin:
 
 def _message_facts(entry: ConversationEntry) -> MessageFacts:
     message = entry.data["message"]
-    projection = without_client_delivery_marker(Message.from_dict(message))
-    projection_digest = hashlib.sha256(encode_json(projection.to_dict())).hexdigest()
+    metadata = message.get("metadata", {})
+    projection = message
+    if isinstance(metadata, Mapping) and CLIENT_DELIVERY_METADATA in metadata:
+        projection = dict(message)
+        projection_metadata = dict(metadata)
+        del projection_metadata[CLIENT_DELIVERY_METADATA]
+        projection_metadata.pop(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA, None)
+        if projection_metadata:
+            projection["metadata"] = projection_metadata
+        else:
+            projection.pop("metadata", None)
+    projection_digest = hashlib.sha256(encode_json(projection)).hexdigest()
     is_user = message["role"] == "user"
     text = " ".join(
         block["text"].strip()
