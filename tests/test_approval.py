@@ -1531,7 +1531,9 @@ async def test_terminal_claim_blocks_a_delayed_loser_until_turn_end(
         finally:
             if not delayed.done():
                 delayed.cancel()
-                await asyncio.gather(delayed, return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(delayed, return_exceptions=True), 10
+                )
         assert len(store._pending_approval_executions) == 2
 
         store.retire_terminal_approval_executions()
