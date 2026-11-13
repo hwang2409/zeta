@@ -7,6 +7,7 @@ manifest replay, and bounded tree removal behind one ``advance`` interface.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -243,8 +244,26 @@ class _QuarantineTransaction:
                     dir_fd=txn_fd,
                 )
             except FileNotFoundError:
-                self.lease.delete(reservations_fd, name)
-                _remove_empty_transaction(txns_fd, txn_fd, txid)
+                manifest = _read_optional_validated_json(
+                    txn_fd, _MANIFEST_NAME, validate_retention_manifest
+                )
+                if manifest is None:
+                    if _remove_empty_transaction(txns_fd, txn_fd, txid):
+                        self.lease.delete(reservations_fd, name)
+                    return TransactionOutcome(True, session_id=reservation["session_id"])
+                _match_manifest(reservation, manifest)
+                if manifest["stage"] == "removing":
+                    self._publish(
+                        txn_fd, _MANIFEST_NAME,
+                        {**manifest, "stage": "removed"},
+                        validate_retention_manifest,
+                    )
+                    return TransactionOutcome(True, session_id=reservation["session_id"])
+                if manifest["stage"] != "removed":
+                    raise TransactionError("retention tree disappeared before removal")
+                self.lease.delete(txn_fd, _MANIFEST_NAME)
+                if _remove_empty_transaction(txns_fd, txn_fd, txid):
+                    self.lease.delete(reservations_fd, name)
                 return TransactionOutcome(True, session_id=reservation["session_id"])
             try:
                 info = os.fstat(tree_fd)
@@ -360,8 +379,11 @@ class _QuarantineTransaction:
             return TransactionOutcome(True, session_id=session_id)
         if manifest["stage"] == "removed":
             self.lease.delete(txn_fd, _MANIFEST_NAME)
+            if not _remove_empty_transaction(
+                txns_fd, txn_fd, manifest["transaction_id"]
+            ):
+                raise TransactionError("retention transaction directory is not empty")
             self.lease.delete(reservations_fd, reservation_name)
-            _remove_empty_transaction(txns_fd, txn_fd, manifest["transaction_id"])
             return TransactionOutcome(True, session_id=session_id)
         return TransactionOutcome(False, "retention transaction is blocked", session_id)
 
@@ -609,14 +631,15 @@ def _descend(parent_fd: int, components: tuple[str, ...]) -> int:
         raise
 
 
-def _remove_empty_transaction(txns_fd: int, txn_fd: int, txid: str) -> None:
+def _remove_empty_transaction(txns_fd: int, txn_fd: int, txid: str) -> bool:
     try:
         os.rmdir(txid, dir_fd=txns_fd)
     except OSError as exc:
-        if exc.errno == 39:  # ENOTEMPTY: evidence remains authoritative.
-            return
+        if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+            return False
         raise
     os.fsync(txns_fd)
+    return True
 
 
 def _bounded(message: str) -> str:

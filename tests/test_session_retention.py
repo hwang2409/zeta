@@ -1183,3 +1183,34 @@ def test_armed_completed_preview_quarantines_eligible_root(tmp_path):
     )
     reservation = tmp_path / "session-trash" / "reservations" / f"{root}.json"
     assert reservation.exists(), "quarantine did not publish its durable reservation"
+
+
+def test_quarantine_restart_resumes_to_durable_removal(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        first = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        preview, _ = _run_sweep(first)
+        arm = tmp_path / "retention-arm.json"
+        arm.write_text(json.dumps({
+            "schema_version": 1, "gate_version": 1,
+            "armed_by_zeta_version": "test", "armed_at": _OLD,
+            "preview_id": preview.preview.preview_id,
+        }) + "\n")
+        arm.chmod(0o600)
+        first.close()
+        for _ in range(100):
+            resumed = RetentionPlanner(tmp_path, lease, now_ns=_future_ns)
+            try:
+                resumed.run_pass(days=30)
+            finally:
+                resumed.close()
+            if not (tmp_path / "session-trash" / "reservations" / f"{root}.json").exists():
+                break
+        else:
+            raise AssertionError("quarantine did not finish within 100 restart steps")
+
+    assert not (tmp_path / "sessions" / root).exists()
+    assert not list((tmp_path / "session-trash" / "transactions").iterdir())
