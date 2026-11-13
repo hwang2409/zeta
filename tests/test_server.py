@@ -8857,7 +8857,7 @@ async def test_serve_retention_pin_table_uses_public_slash_run(tmp_path: Path) -
             response = await _request(
                 reader, writer, text, "slash_run", {"session_id": session_id, "text": text}
             )
-            assert response[-1]["result"] == {"kind": "output", "output": expected}
+            assert response[-1]["result"] == {"kind": "output", "text": expected}
             assert read_reference_generation(server.home) == generation
         sidecar = server.home / "sessions" / session_id / RETENTION_PIN_FILENAME
         assert not sidecar.exists()
@@ -8878,7 +8878,7 @@ async def test_serve_retention_pin_unsafe_sidecar_fails_closed(tmp_path: Path) -
         )
         assert response[-1]["result"] == {
             "kind": "output",
-            "output": "retention pin unsafe: refusing change",
+            "text": "retention pin unsafe: refusing change",
         }
         assert sidecar.read_bytes() == b"unsafe"
         assert read_reference_generation(server.home) == before
@@ -8890,7 +8890,7 @@ async def test_serve_retention_pin_unsafe_sidecar_fails_closed(tmp_path: Path) -
 async def test_slash_run_rejects_pin_mutation_below_retention_epoch(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    (home / "storage-format.json").write_text('{"writer_epoch":7}\\n')
+    (home / "storage-format.json").write_text('{"writer_epoch":7}\n')
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     try:
