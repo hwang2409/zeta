@@ -264,13 +264,26 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
                 home, sid, crashed=owner_state == "crashed"
             )
         if route == "resume" or route.startswith("resume-"):
-            result = (await _request(reader, writer, 2, "resume", {"session_id": sid}))[-1]
+            method = "resume"
+            params = {"session_id": sid}
         elif route == "list-paged":
-            result = (await _request(reader, writer, 2, "list_sessions", {"offset": 0, "limit": 1}))[-1]
+            method = "list_sessions"
+            params = {"offset": 0, "limit": 1}
         elif route == "delete":
-            result = (await _request(reader, writer, 2, "delete_session", {"session_id": sid}))[-1]
+            method = "delete_session"
+            params = {"session_id": sid}
+        elif route == "rename":
+            method = "rename_session"
+            params = {"session_id": sid, "name": "matrix"}
         else:
-            result = (await _request(reader, writer, 2, "rename_session", {"session_id": sid, "name": "matrix"}))[-1]
+            method = (
+                "session_history_and_subscribe"
+                if route == "resume-reconnect"
+                else "session_history"
+            )
+            params = {"session_id": sid}
+        frames = await _request(reader, writer, 2, method, params)
+        result = next(frame for frame in reversed(frames) if "result" in frame or "error" in frame)
         assert "error" not in result, result
         assert result.get("result") is not None
         if route == "list-paged":
