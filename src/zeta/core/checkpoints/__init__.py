@@ -13,8 +13,6 @@ from ...protocol.types import (
     Message,
     MessageRole,
     TextContent,
-    ToolUseContent,
-    is_passive_harness_message,
 )
 from ..session_files import read_session_file, session_directory
 from .entry_types import CONVERSATION_ENTRY_SPECS
@@ -265,14 +263,14 @@ class CheckpointForkMixin:
 
     def _validate_fork_entry(self, entry: ConversationEntry) -> None:
         source_id = entry.data["from_entry_id"]
-        source = next(
-            (candidate for candidate in self._resident_rows.entries if candidate.id == source_id),
+        source_ref = next(
+            (candidate for candidate in self.resident_refs() if candidate.id == source_id),
             None,
         )
         if (
-            source is None
-            or entry.parent_id != source.id
-            or entry.data["from_seq"] != source.seq
+            source_ref is None
+            or entry.parent_id != source_ref.id
+            or entry.data["from_seq"] != source_ref.seq
         ):
             raise ConversationIntegrityError(
                 f"fork source is not its parent: {entry.id}"
@@ -283,14 +281,13 @@ class CheckpointForkMixin:
 
         with self._append_lock():
             self._load()
-            branch = self.resident_payloads()
-            if not self.is_turn_boundary(branch):
+            if not self.is_turn_boundary():
                 raise ConversationIntegrityError(
                     "cannot create a checkpoint while a turn is in flight"
                 )
             resolved_label = label.strip() if label is not None else ""
             if not resolved_label:
-                resolved_label = self._default_checkpoint_label(branch)
+                resolved_label = self._default_checkpoint_label()
             self._validate_checkpoint_label(resolved_label)
             entry = self._append_row_unlocked(
                 "checkpoint",
@@ -309,12 +306,13 @@ class CheckpointForkMixin:
             raise ValueError("fork requires a checkpoint label or sequence")
         with self._append_lock():
             self._load()
-            branch = self.resident_payloads()
-            if not self.is_turn_boundary(branch):
+            if not self.is_turn_boundary():
                 raise ConversationIntegrityError(
                     "cannot fork while a turn is in flight"
                 )
-            checkpoint = self._resolve_checkpoint(selector.strip(), branch)
+            checkpoint = self._resolve_checkpoint(
+                selector.strip(), self.relation_payloads({"checkpoint"})
+            )
             entry = self._append_row_unlocked(
                 "fork",
                 {
@@ -329,30 +327,20 @@ class CheckpointForkMixin:
             self._write_session_state(self.bash_cwd, self._todo_items)
             return self._snapshot_entry(entry)
 
-    @staticmethod
-    def is_turn_boundary(entries: Iterable[ConversationEntry]) -> bool:
-        """Return whether a branch ends between complete turns."""
+    def is_turn_boundary(self) -> bool:
+        """Return whether the active branch ends between complete turns."""
 
-        messages = [entry for entry in entries if entry.type == "message"]
-        if not messages:
+        last = self.last_message_ref()
+        if last is None:
             return True
-        last = messages[-1]
-        if Message.from_dict(last.data["message"]).role is MessageRole.USER:
-            return False
-        outstanding: set[str] = set()
-        for entry in messages:
-            parsed = Message.from_dict(entry.data["message"])
-            outstanding.update(
-                block.tool_call.id
-                for block in parsed.content
-                if isinstance(block, ToolUseContent)
-            )
-            if parsed.tool_result is not None:
-                outstanding.discard(parsed.tool_result.tool_call_id)
-        return not outstanding
+        message = Message.from_dict(self.entry(last).data["message"])
+        return (
+            message.role is not MessageRole.USER
+            and not self._delivery_fold.open_tool_calls
+        )
 
     def turn_in_flight(self) -> bool:
-        return not self.is_turn_boundary(self.resident_payloads())
+        return not self.is_turn_boundary()
 
     def has_outstanding_tool_calls(self) -> bool:
         """Return whether any tool_call lacks a matching tool_result (O(1))."""
@@ -362,18 +350,19 @@ class CheckpointForkMixin:
     def list_checkpoints(self) -> list[tuple[ConversationEntry, str | None]]:
         """Return active checkpoints with the next message preview."""
 
-        branch = self.resident_payloads()
+        refs = self.branch_refs()
         result: list[tuple[ConversationEntry, str | None]] = []
-        for index, entry in enumerate(branch):
-            if entry.type != "checkpoint":
+        for index, ref in enumerate(refs):
+            if ref.type != "checkpoint":
                 continue
             preview: str | None = None
-            for following in branch[index + 1 :]:
-                if following.type != "message":
-                    continue
-                preview = _message_preview(following)
-                break
-            result.append((self._snapshot_entry(entry), preview))
+            next_message = next(
+                (following for following in refs[index + 1 :] if following.type == "message"),
+                None,
+            )
+            if next_message is not None:
+                preview = _message_preview(self.entry(next_message))
+            result.append((self._snapshot_entry(self.entry(ref)), preview))
         return result
 
     def checkpoint_count(self) -> int:
@@ -384,16 +373,11 @@ class CheckpointForkMixin:
     ) -> list[tuple[int, ConversationEntry, str]]:
         """Return ``(index, entry, preview)`` for USER messages on the branch."""
 
-        branch = self.resident_payloads()
         result: list[tuple[int, ConversationEntry, str]] = []
-        for entry in branch:
-            if entry.type != "message":
+        for ref in self.branch_refs():
+            if not getattr(ref.facts, "is_user_forkpoint", False):
                 continue
-            message = Message.from_dict(entry.data["message"])
-            if message.role is not MessageRole.USER:
-                continue
-            if is_passive_harness_message(message):
-                continue
+            entry = self.entry(ref)
             preview = _message_preview(entry) or ""
             result.append((len(result) + 1, self._snapshot_entry(entry), preview))
         return result
@@ -412,20 +396,19 @@ class CheckpointForkMixin:
             raise ValueError("fork requires a user message entry id")
         with self._append_lock():
             self._load()
-            branch = self.resident_payloads()
-            source = next(
-                (candidate for candidate in branch if candidate.id == entry_id),
+            source_ref = next(
+                (candidate for candidate in self.branch_refs() if candidate.id == entry_id),
                 None,
             )
-            if source is None:
+            if source_ref is None:
                 raise ValueError(
                     f"user message is not on the active branch: {entry_id!r}"
                 )
-            if source.type != "message":
+            if source_ref.type != "message":
                 raise ValueError(f"fork source is not a message: {entry_id!r}")
-            message = Message.from_dict(source.data["message"])
-            if message.role is not MessageRole.USER:
+            if not getattr(source_ref.facts, "is_user_forkpoint", False):
                 raise ValueError(f"fork source is not a user message: {entry_id!r}")
+            source = self.entry(source_ref)
             label = self._message_fork_label(source)
             entry = self._append_row_unlocked(
                 "fork",
@@ -462,19 +445,20 @@ class CheckpointForkMixin:
             raise ValueError("branch switch requires a head entry id")
         with self._append_lock():
             self._load()
-            current_branch = self.resident_payloads()
-            by_id = {entry.id: entry for entry in self._resident_rows.entries}
-            source = by_id.get(head_entry_id)
-            if source is None:
+            refs = self.resident_refs()
+            refs_by_id = {ref.id: ref for ref in refs}
+            source_ref = refs_by_id.get(head_entry_id)
+            if source_ref is None:
                 raise ValueError(f"branch head not found: {head_entry_id!r}")
-            for entry in self._resident_rows.entries:
-                if entry.parent_id == source.id:
-                    raise ValueError(
-                        f"entry has children; not a branch head: {head_entry_id!r}"
-                    )
-            if current_branch and current_branch[-1].id == source.id:
+            if any(ref.parent_id == source_ref.id for ref in refs):
+                raise ValueError(
+                    f"entry has children; not a branch head: {head_entry_id!r}"
+                )
+            current_refs = self.branch_refs()
+            if current_refs and current_refs[-1].id == source_ref.id:
                 raise ValueError("already on that branch")
-            label = self._branch_switch_label(source, by_id)
+            source = self.entry(source_ref)
+            label = self._branch_switch_label(source_ref, refs_by_id)
             entry = self._append_row_unlocked(
                 "fork",
                 {
@@ -485,33 +469,26 @@ class CheckpointForkMixin:
                 },
                 parent_id=source.id,
             )
-            walker: ConversationEntry | None = source
+            walker = source_ref
             dismissed = False
             while walker is not None:
                 if walker.type == "checkpoint":
-                    dismissed = bool(walker.data.get("todo_dismissed", False))
+                    dismissed = bool(
+                        self.entry(walker).data.get("todo_dismissed", False)
+                    )
                     break
-                if walker.parent_id is None:
-                    break
-                walker = by_id.get(walker.parent_id)
+                walker = refs_by_id.get(walker.parent_id) if walker.parent_id else None
             self._todo_dismissed = dismissed
             self._write_session_state(self.bash_cwd, self._todo_items)
             return self._snapshot_entry(entry)
 
-    @staticmethod
-    def _default_checkpoint_label(branch: list[ConversationEntry]) -> str:
-        count = sum(entry.type == "checkpoint" for entry in branch) + 1
-        for entry in reversed(branch):
-            if entry.type != "message":
-                continue
-            message = Message.from_dict(entry.data["message"])
-            text = " ".join(
-                block.text.strip()
-                for block in message.content
-                if isinstance(block, TextContent) and block.text.strip()
-            )
-            if text and not CheckpointForkMixin._is_numeric_selector(text):
-                return " ".join(text.split())[:48]
+    def _default_checkpoint_label(self) -> str:
+        refs = self.branch_refs()
+        count = sum(ref.type == "checkpoint" for ref in refs) + 1
+        for ref in reversed(refs):
+            text = getattr(ref.facts, "message_text", None)
+            if text and not self._is_numeric_selector(text):
+                return text[:48]
         return f"checkpoint {count}"
 
     @staticmethod
@@ -543,25 +520,14 @@ class CheckpointForkMixin:
         return f"message seq {entry.seq}"
 
     @staticmethod
-    def _branch_switch_label(
-        head: ConversationEntry,
-        by_id: Mapping[str, ConversationEntry],
-    ) -> str:
-        walker: ConversationEntry | None = head
+    def _branch_switch_label(head, by_id) -> str:
+        walker = head
         while walker is not None:
-            if walker.type == "message":
-                message = Message.from_dict(walker.data["message"])
-                if message.role is MessageRole.USER:
-                    text = " ".join(
-                        block.text.strip()
-                        for block in message.content
-                        if isinstance(block, TextContent) and block.text.strip()
-                    )
-                    if text:
-                        return " ".join(text.split())[:48]
-            if walker.parent_id is None:
-                break
-            walker = by_id.get(walker.parent_id)
+            if getattr(walker.facts, "is_user", False):
+                text = getattr(walker.facts, "message_text", None)
+                if text:
+                    return text[:48]
+            walker = by_id.get(walker.parent_id) if walker.parent_id else None
         return f"branch seq {head.seq}"
 
     @staticmethod

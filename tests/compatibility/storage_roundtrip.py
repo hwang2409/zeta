@@ -33,14 +33,15 @@ def _missing_api(family: str, owner: object, names: tuple[str, ...]) -> bool:
 
 
 def _message_texts(store: object) -> list[str]:
-    return [
-        part.text
-        for row in store.path.read_text().splitlines()  # type: ignore[attr-defined]
-        for data in [json.loads(row)]
-        if data.get("type") == "message"
-        for part in Message.from_dict(data["data"]["message"]).content
-        if hasattr(part, "text")
-    ]
+    texts: list[str] = []
+    for row in store.path.read_text().splitlines():  # type: ignore[attr-defined]
+        data = json.loads(row)
+        if data.get("type") != "message":
+            continue
+        for part in Message.from_dict(data["data"]["message"]).content:
+            if hasattr(part, "text"):
+                texts.append(part.text)
+    return texts
 
 
 def _session(home: Path, stage: str) -> dict[str, object] | None:
@@ -87,13 +88,15 @@ def _session(home: Path, stage: str) -> dict[str, object] | None:
             warnings.simplefilter("ignore", RuntimeWarning)
             repaired = manager.open(opened.metadata.session_id)
         try:
-            entries = getattr(repaired.store, "entries", None)
-            if entries is None:
-                entries = [
-                    repaired.store.entry(ref) for ref in repaired.store.resident_refs()
-                ]
-            warning = entries[-1]
-            if warning.type != "warning" or warning.data.get("kind") != "transcript_recovery":
+            warning = None
+            for row in repaired.store.path.read_text().splitlines():
+                data = json.loads(row)
+                if data.get("type") == "warning":
+                    warning = data
+            if (
+                warning is None
+                or warning["data"].get("kind") != "transcript_recovery"
+            ):
                 raise RuntimeError("predecessor did not record transcript recovery")
         finally:
             repaired.store.close()

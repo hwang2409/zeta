@@ -2531,6 +2531,7 @@ async def test_background_completion_wakes_idle_parent(
     background_events: list[StreamEvent] = []
     wake_events: list[StreamEvent] = []
     wake_task: asyncio.Task[None] | None = None
+    wake_called = asyncio.Event()
     loop.set_background_event_sink(background_events.append)
 
     async def consume_wake() -> None:
@@ -2540,16 +2541,15 @@ async def test_background_completion_wakes_idle_parent(
         nonlocal wake_task
         if wake_task is None or wake_task.done():
             wake_task = asyncio.create_task(consume_wake())
+            wake_called.set()
 
     loop.set_background_wake_callback(wake)
 
     await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     backend.release_child.set()
-    for _ in range(10000):
-        if wake_task is not None:
-            break
-        await asyncio.sleep(0)
-    await asyncio.wait_for(wake_task, 10)
+    await await_or_fail(wake_called.wait(), what="background wake callback")
+    assert wake_task is not None
+    await await_or_fail(wake_task, what="background notification turn")
 
     receipt = next(
         event

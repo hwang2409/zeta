@@ -6,7 +6,12 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
-from ...protocol.types import Message, is_passive_harness_message
+from ...protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    is_passive_harness_message,
+)
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
@@ -18,6 +23,16 @@ class ContextCalibrationRecord:
     ratio: float | None = None
     estimate: int | None = None
     actual: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageFacts:
+    calibration: ContextCalibrationRecord | None
+    receipts: tuple[tuple[str, str], ...]
+    approval_request_ids: tuple[str, ...]
+    is_user: bool
+    is_user_forkpoint: bool
+    message_text: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,12 +105,8 @@ class StartupFactsMixin:
         records: list[ContextCalibrationRecord] = []
         for ref in self._resident_rows.branch_refs():
             facts = ref.facts
-            if (
-                isinstance(facts, tuple)
-                and facts
-                and isinstance(facts[0], ContextCalibrationRecord)
-            ):
-                records.append(facts[0])
+            if isinstance(facts, MessageFacts) and facts.calibration is not None:
+                records.append(facts.calibration)
         return tuple(records)
 
 
@@ -103,7 +114,25 @@ def row_facts(entry: ConversationEntry) -> object | None:
     if entry.type == "message":
         calibration = context_calibration_record(entry)
         receipts = sent_message_receipts(entry)
-        return (calibration, receipts) if calibration is not None or receipts else None
+        approval_request_ids = tuple(
+            request["request_id"] for request in entry.data.get("approval_requests", ())
+        )
+        message = Message.from_dict(entry.data["message"])
+        is_user = message.role is MessageRole.USER
+        text = " ".join(
+            block.text.strip()
+            for block in message.content
+            if isinstance(block, TextContent) and block.text.strip()
+        )
+        message_text = " ".join(text.split()) if text else None
+        return MessageFacts(
+            calibration,
+            receipts,
+            approval_request_ids,
+            is_user,
+            is_user and not is_passive_harness_message(message),
+            message_text,
+        )
     if entry.type == "compaction":
         data = entry.data
         return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))
@@ -208,6 +237,12 @@ class ResidentRows:
 
     def resident_refs(self) -> tuple[RowRef, ...]:
         return tuple(self.rows)
+
+    def last_message_ref(self) -> RowRef | None:
+        return next(
+            (ref for ref in reversed(self.branch_refs()) if ref.type == "message"),
+            None,
+        )
 
     def entry(self, ref: RowRef) -> ConversationEntry:
         entry = self._by_id.get(ref.id)

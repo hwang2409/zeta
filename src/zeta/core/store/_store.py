@@ -95,7 +95,7 @@ from ._pending_prompts import (
     PendingPromptStoreMixin,
 )
 from ._row_history import RecentRowsMixin, TurnHistoryMixin
-from ._rows import ResidentRows, StartupFactsMixin, sent_message_receipts
+from ._rows import MessageFacts, ResidentRows, StartupFactsMixin, sent_message_receipts
 from ._session_state import SessionStatePersistenceMixin
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
@@ -910,24 +910,28 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            current_branch = self.resident_payloads()
+            current_refs = self.branch_refs()
             resolved_parent = (
                 parent_id
                 if parent_id is not None
-                else (current_branch[-1].id if current_branch else None)
+                else (current_refs[-1].id if current_refs else None)
             )
-            branch = (
-                list(current_branch)
-                if current_branch and resolved_parent == current_branch[-1].id
-                else self._branch_to_parent(resolved_parent)
+            target_refs = (
+                current_refs
+                if current_refs and resolved_parent == current_refs[-1].id
+                else self._refs_to_parent(resolved_parent)
             )
-            active_child = next(
+            branch = list(self._approval_payloads(target_refs))
+            active_child_ref = next(
                 (
-                    entry
-                    for entry in current_branch
-                    if entry.type == "message" and entry.parent_id == resolved_parent
+                    ref
+                    for ref in current_refs
+                    if ref.type == "message" and ref.parent_id == resolved_parent
                 ),
                 None,
+            )
+            active_child = (
+                self.entry(active_child_ref) if active_child_ref is not None else None
             )
             target_entries = [active_child] if request_data and active_child else []
             if request_data:
@@ -1068,7 +1072,7 @@ class ConversationStore(
         parent_id: str | None = None,
         reason: str | None = None,
     ) -> ConversationEntry | None:
-        branch = self.resident_payloads()
+        branch = list(self.approval_payloads())
         states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
@@ -1076,13 +1080,14 @@ class ConversationStore(
         request_entry = self._request_entry(branch, request_id)
         if request_entry is None:
             return None
-        active_ids = {entry.id for entry in branch}
-        resolved_parent = parent_id or branch[-1].id
+        branch_refs = self.branch_refs()
+        active_ids = {ref.id for ref in branch_refs}
+        resolved_parent = parent_id or branch_refs[-1].id
         if resolved_parent not in active_ids:
             raise ConversationIntegrityError(
                 f"approval resolution parent is not on the active branch: {resolved_parent}"
             )
-        by_id = {entry.id: entry for entry in branch}
+        by_id = {ref.id: ref for ref in branch_refs}
         if resolved_parent != request_entry.id and not self._is_ancestor(
             request_entry.id,
             resolved_parent,
@@ -1097,7 +1102,7 @@ class ConversationStore(
         return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def compaction_marker_count(self) -> int:
-        return sum(entry.type == "compaction" for entry in self.resident_payloads())
+        return sum(ref.type == "compaction" for ref in self.branch_refs())
 
     def latest_compaction_marker(self) -> ConversationEntry | None:
         """Return the newest compaction marker on the active branch (no copy).
@@ -1105,9 +1110,9 @@ class ConversationStore(
         Reverse-scans the resident branch and snapshots only the one hit, so a
         caller that reads ``marker.data`` never touches resident state.
         """
-        for entry in reversed(self._resident_rows.branch):
-            if entry.type == "compaction":
-                return self._snapshot_entry(entry)
+        for ref in reversed(self.branch_refs()):
+            if ref.type == "compaction":
+                return self._snapshot_entry(self.entry(ref))
         return None
 
     @property
@@ -1126,9 +1131,45 @@ class ConversationStore(
     def branch_refs(self):
         return self._resident_rows.branch_refs()
 
-    def resident_payloads(self, refs=None):
-        """Read resident payloads for the given refs without storage access."""
-        return tuple(self._resident_rows.entry(ref) for ref in (self.branch_refs() if refs is None else refs))
+    def last_message_ref(self):
+        return self._resident_rows.last_message_ref()
+
+    def relation_payloads(self, kinds):
+        """Return active relation rows of the requested kinds."""
+        payloads = []
+        for ref in self.branch_refs():
+            if (
+                ref.type not in {"message", "compaction", "notification"}
+                and ref.type in kinds
+            ):
+                payloads.append(self.entry(ref))
+        return tuple(payloads)
+
+    def _approval_payloads(self, refs):
+        payloads = []
+        for ref in refs:
+            if ref.type in {"approval_resolution", "approval_history"} or (
+                ref.type == "message"
+                and isinstance(ref.facts, MessageFacts)
+                and ref.facts.approval_request_ids
+            ):
+                payloads.append(self.entry(ref))
+        return tuple(payloads)
+
+    def approval_payloads(self):
+        """Return active approval relations and request-bearing messages."""
+        return self._approval_payloads(self.branch_refs())
+
+    def _refs_to_parent(self, parent_id):
+        if parent_id is None:
+            return ()
+        by_id = {ref.id: ref for ref in self.resident_refs()}
+        current = by_id.get(parent_id)
+        refs = []
+        while current is not None:
+            refs.append(current)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        return tuple(reversed(refs))
 
     def resident_refs(self):
         return self._resident_rows.resident_refs()
@@ -1191,7 +1232,3 @@ class ConversationStore(
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
             return self._delivery_fold.tool_results.get(tool_call_id)
-
-    @property
-    def entries(self) -> list[ConversationEntry]:
-        return [self._snapshot_entry(entry) for entry in self._resident_rows.entries]
