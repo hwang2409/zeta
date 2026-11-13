@@ -660,6 +660,8 @@ class SlashSession(Protocol):
 
     async def slash_unpin(self, args: str) -> str: ...
 
+    async def slash_retention(self, args: str) -> str: ...
+
     def slash_inbox(self, args: str) -> str: ...
 
     def slash_theme(self, args: str) -> str: ...
@@ -1107,6 +1109,15 @@ def create_slash_registry(
                 reason=native,
             )
         )
+    registry.register(
+        safe(
+            "retention",
+            _delegate("slash_retention", strip=True),
+            "show or change session retention: /retention [arm|disarm]",
+            serve=ServeSlash(mutates=lambda args: args.strip() in {"arm", "disarm"}, runs_while_busy=_no_args),
+            reason=native,
+        )
+    )
     registry.register(
         safe(
             "decisions",

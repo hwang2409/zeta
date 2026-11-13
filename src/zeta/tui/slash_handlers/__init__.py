@@ -22,6 +22,7 @@ from ...accounts import (
 )
 from ...accounts.login import login_failure_message, login_named_account
 from ...accounts.store import rename_account_command
+from ...config.settings import load_settings
 from ...core.approval import ApprovalDecision
 from ...core.commands.plan_commands import run_implement_command, run_plan_command
 from ...core.commands.slash_registry import SlashLock, waiting_message
@@ -45,6 +46,12 @@ from ...project_registry import ProjectRegistryError
 from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...runtime.status import capture_slash_status
+from ...session_retention import (
+    disarm_retention,
+    read_retention_history,
+    retention_arm_warning,
+    retention_authority,
+)
 from ...session_retention.pin import set_retention_pin
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
@@ -566,6 +573,23 @@ class SlashHandlerMixin:
             self.loop.store._storage_lease,
             pinned=False,
         )
+
+    async def slash_retention(self, args: str) -> str:
+        command = args.strip()
+        home = self._zeta_home or env_home()
+        if command == "":
+            history = await asyncio.to_thread(read_retention_history, home)
+            return "retention: none" if not history else f"retention: {history[-1]}"
+        if command == "disarm":
+            return await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
+        if command == "arm":
+            days = load_settings(home=home).settings.retention_days
+            result = await asyncio.to_thread(
+                retention_authority, home, self.loop.store._storage_lease,
+                days=days, zeta_version="unknown",
+            )
+            return f"{result}\n{retention_arm_warning()}" if result.startswith("retention arm") else result
+        return "usage: /retention [arm|disarm]"
 
     async def slash_model(self, args: str) -> str:
         """Pick a model from a card, or switch straight to a named one."""
