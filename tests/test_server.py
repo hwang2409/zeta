@@ -2518,6 +2518,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 @pytest.mark.asyncio
 async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
@@ -2529,16 +2530,50 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
+    assert server.runtime.loop is not None
+    owner = server.runtime.loop._background_owner
+    register_attempted = asyncio.Event()
+    original_register = owner.register
+    deferred_registration: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def defer_grandchild_registration(
+        *args: object, **kwargs: object
+    ) -> None:
+        if kwargs.get("parent_instance_id") is not None:
+            deferred_registration.append((args, kwargs))
+            register_attempted.set()
+            return
+        original_register(*args, **kwargs)
+
+    original_notify = server.control._notify
+
+    async def cancel_before_grandchild_registration(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if event == "approval_request" and fields.get("agent_instance_id") is not None:
+            await await_or_fail(
+                register_attempted.wait(),
+                timeout=TIMEOUT,
+                what="grandchild registration attempt",
+            )
+            grandchild_id = str(fields["agent_instance_id"])
+            assert owner.cancel(grandchild_id.rsplit(":", 1)[0])
+            args, kwargs = deferred_registration.pop()
+            original_register(*args, **kwargs)
+        return await original_notify(event, session_id, **fields)
+
+    # test-contract: force approval publication before the grandchild is registered
+    monkeypatch.setattr(owner, "register", defer_grandchild_registration)
+    # test-contract: seam no public hook controls notification publication order
+    monkeypatch.setattr(server.control, "_notify", cancel_before_grandchild_registration)
     child_watcher: asyncio.Task[object] | None = None
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
         grandchild_id = approval["agent_instance_id"]
         child_id = grandchild_id.rsplit(":", 1)[0]
-        assert server.runtime.loop is not None
-        owner = server.runtime.loop._background_owner
+        # test-contract: seam no public child-completion hook exists
         child_watcher = owner._watchers[child_id]
-        assert owner.cancel(child_id)
         frames = deque(await _request(reader, writer, 4, "status"), maxlen=50)
         frame_count = len(frames)
 
@@ -2586,7 +2621,18 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
             timeout=TIMEOUT,
             what=lambda: f"approval_end for grandchild ({wait_diagnostics()})",
         )
-        await _request(reader, writer, 5, "status")
+        status = (await _request(reader, writer, 5, "status"))[-1]["result"]
+        matching_ends = [
+            event
+            for event in _named_events(frames, "approval_end")
+            if event["request_id"] == approval["request_id"]
+        ]
+        assert len(matching_ends) == 1
+        assert matching_ends[0]["reason"] == "child_cleanup"
+        assert all(
+            item["request_id"] != approval["request_id"]
+            for item in status["pending_approvals"]
+        )
         assert len(backend.grandchild.calls) == 1
     finally:
         if child_watcher is not None and not child_watcher.done():
@@ -4500,6 +4546,54 @@ def test_delegated_approval_wire_keys_are_unique(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_serve_child_cleanup_is_segment_exact(tmp_path: Path) -> None:
+    approvals = _bare_approval_lifecycle(tmp_path)
+    stores: dict[str, ConversationStore] = {}
+    requests: dict[str, ApprovalRequest] = {}
+    try:
+        for index, child_id in enumerate(("session:1:1", "session:10", "session:1x")):
+            store = ConversationStore(tmp_path / f"serve-child-{index}")
+            call = ToolCall(f"serve-call-{index}", "read", {"path": "input"})
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            request = ApprovalRequest(call.id, call, child_instance_id=child_id)
+            approvals.register_delegated(request, store, child_id)
+            await approvals.transition(
+                Start(
+                    StreamEvent(
+                        StreamEventType.TOOL_APPROVAL_START,
+                        tool_call=call,
+                        data={"agent_instance_id": child_id},
+                    ),
+                    "session",
+                    "approval_request",
+                )
+            )
+            stores[child_id] = store
+            requests[child_id] = request
+
+        cleanup = approvals.cleanup_delegated("session:1")
+        assert cleanup is not None
+        await await_or_fail(cleanup, what="serve nested child cleanup")
+
+        nested = requests["session:1:1"]
+        assert (await stores["session:1:1"].approval_resolution(nested.request_id))[
+            "reason"
+        ] == "child_cleanup"
+        assert set(approvals.active_keys()) == {
+            requests["session:10"].key,
+            requests["session:1x"].key,
+        }
+    finally:
+        await approvals.wait_for_approval_settlement()
+        for store in stores.values():
+            store.close()
+        approvals._policy().store.close()
+
+
+@pytest.mark.asyncio
 async def test_reused_core_key_gets_fresh_wire_id_after_end(tmp_path: Path) -> None:
     approvals = _bare_approval_lifecycle(tmp_path)
     store = ConversationStore(tmp_path / "child")
@@ -4859,7 +4953,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 5, "new_session", {"provider": "codex"})
@@ -4869,7 +4963,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
 
         await _request(reader, writer, 7, "send", {"text": "second"})
         await _event(reader, "usage")
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert (await _request(reader, writer, 8, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 9, "resume", {"session_id": first_session})
@@ -8262,7 +8356,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         ]
         sid = created["session_id"]
         await _request(reader, writer, 3, "send", {"text": "original preview"})
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         renamed = (
             await _request(
                 reader,
@@ -8630,7 +8724,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         )[-1]["error"]
         assert error["code"] == -32004
         release.set()
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert server.runtime.manager.read_metadata(sid).name == "mid-stream"
         assert (
             "result"
@@ -11681,7 +11775,7 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(
     try:
         await _request(reader, writer, 3, "resume", {"session_id": session_id})
         await _request(reader, writer, 4, "resume", {"session_id": session_id})
-        await _frames_until_event(reader, "turn_end")
+        await _frames_until_event(reader, "agent_end")
         await _request(reader, writer, 5, "resume", {"session_id": session_id})
         async with asyncio.timeout(TIMEOUT):
             while store.agent_notifications():
