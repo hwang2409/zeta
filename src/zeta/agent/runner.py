@@ -7,7 +7,6 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -47,7 +46,10 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
 from . import child_context as _child_context
-from .background_lifecycle import finish_background_child
+from .background_lifecycle import (
+    _complete_despite_cancellation,
+    finish_background_child,
+)
 from .background_owner import CancellationRequest
 from .child_context import (
     _child_base_system_prompt,
@@ -530,10 +532,7 @@ async def _build_child_loop(
         cleanup = asyncio.create_task(
             close_construction(background_task_cause="child spawn setup canceled")
         )
-        while not cleanup.done():
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(cleanup)
-        cleanup.result()
+        await _complete_despite_cancellation(cleanup)
         raise
     except BaseException:
         await close_construction(background_task_cause="child spawn setup failed")
@@ -1059,9 +1058,13 @@ async def run_agent_tool(
         # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
         try:
-            return await persist_confirmed_cancel(
+            confirmed = await persist_confirmed_cancel(
                 terminal_fence, child_store, tool_call.id
             )
+            if confirmed:
+                child_loop.admit_abort()
+                child_loop.tool_registry.abort()
+            return confirmed
         except BaseException:
             child_canceled = False
             raise
@@ -1075,8 +1078,6 @@ async def run_agent_tool(
             return
         if not confirmed:
             return
-        child_loop.admit_abort()
-        child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         loop._background_owner.cancel_subtree(child_instance_id)
         if not child_task.done():
@@ -1141,40 +1142,44 @@ async def run_agent_tool(
             )
 
         async def finish_background() -> None:
-            await finish_background_child(
-                child_task=child_task,
-                child_store=child_store,
-                parent_store=loop.store,
-                tool_call=tool_call,
-                child_instance_id=child_instance_id,
-                child_path=child_path,
-                description=description,
-                child_turns=child_turns,
-                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                    child_result(
-                        text,
-                        error=error,
-                        status=status,
-                        stats=stats,
-                        include_stats=True,
-                        notice=notice,
-                        notice_items=notice_items,
-                        max_bytes=background_receipt_bytes,
-                    )
-                ),
-                validate_result=validate_result,
-                publish_event=loop._publish_background_event,
-                cleanup=cleanup_background_child,
-                close_child=close_background_child,
-                error_message=error_message,
-                marker_key=child_marker_key,
-                agent_instance_id=loop.agent_instance_id,
-                background_owner=loop._background_owner,
-                max_receipt_bytes=background_receipt_bytes,
-                explicit_finish=terminal_fence is not None,
-                child_loop=child_loop,
-                finish_gate_state=finish_gate_state,
+            lifecycle = asyncio.create_task(
+                finish_background_child(
+                    child_task=child_task,
+                    child_store=child_store,
+                    parent_store=loop.store,
+                    tool_call=tool_call,
+                    child_instance_id=child_instance_id,
+                    child_path=child_path,
+                    description=description,
+                    child_turns=child_turns,
+                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                        child_result(
+                            text,
+                            error=error,
+                            status=status,
+                            stats=stats,
+                            include_stats=True,
+                            notice=notice,
+                            notice_items=notice_items,
+                            max_bytes=background_receipt_bytes,
+                        )
+                    ),
+                    validate_result=validate_result,
+                    publish_event=loop._publish_background_event,
+                    cleanup=cleanup_background_child,
+                    close_child=close_background_child,
+                    error_message=error_message,
+                    marker_key=child_marker_key,
+                    agent_instance_id=loop.agent_instance_id,
+                    background_owner=loop._background_owner,
+                    max_receipt_bytes=background_receipt_bytes,
+                    explicit_finish=terminal_fence is not None,
+                    child_loop=child_loop,
+                    finish_gate_state=finish_gate_state,
+                )
             )
+            if await _complete_despite_cancellation(lifecycle):
+                raise asyncio.CancelledError
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher
@@ -1266,12 +1271,5 @@ async def run_agent_tool(
                 )[0],
             )
         )
-        cancelled = False
-        while not close_task.done():
-            try:
-                await asyncio.shield(close_task)
-            except asyncio.CancelledError:
-                cancelled = True
-        close_task.result()
-        if cancelled:
+        if await _complete_despite_cancellation(close_task):
             raise asyncio.CancelledError()
