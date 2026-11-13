@@ -45,7 +45,7 @@ from ...project_registry import ProjectRegistryError
 from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...runtime.status import capture_slash_status
-from ...session_retention import set_retention_pin
+from ...session_retention.pin import set_retention_pin
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name

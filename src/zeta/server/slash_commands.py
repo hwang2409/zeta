@@ -41,7 +41,7 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
 from ..runtime.status import capture_slash_status
-from ..session_retention import set_retention_pin
+from ..session_retention.pin import set_retention_pin
 from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
