@@ -653,13 +653,26 @@ class CheckpointTranscriptMixin:
         self._presenter.clear()
         self._failed_turn = None
         pages = self._history_pager.pages
-        entries = tuple(unit.value for page in pages for unit in page.units)
+        entries = tuple(
+            unit.value
+            for page in pages
+            for unit in page.units
+            if hasattr(unit.value, "type")
+        )
+        live_values = tuple(
+            unit.value
+            for page in pages
+            for unit in page.units
+            if not hasattr(unit.value, "type")
+        )
         self._rendering_history = True
         try:
             for _ in self._render_history_entries(entries, rendered_notifications):
                 pass
         finally:
             self._rendering_history = False
+        if live_values:
+            self._transcript.adopt_units(live_values)
         marker_write = self._persist_rendered_notifications(
             rendered_notifications, asynchronous=True
         )

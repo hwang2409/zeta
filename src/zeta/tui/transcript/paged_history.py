@@ -93,6 +93,7 @@ class PagedTranscriptHistory:
         self._newer: HistoryCursor | None = None
         self._frozen_endpoint: str | None = None
         self._newest_tail: HistoryCursor | None = None
+        self._live_units: list[TUIHistoryUnit] = []
         self._anchor: tuple[str, int, int] | None = None
         self._reveal_target: str | None = None
         self._loads: dict[
@@ -105,10 +106,15 @@ class PagedTranscriptHistory:
             cursor = descriptor.page.older
             return int(cursor.value) if cursor is not None else -1
 
-        return tuple(
+        pages = [
             descriptor.page
             for descriptor in sorted(self._pages.values(), key=position)
-        )
+        ]
+        seen = {unit.entry_id for page in pages for unit in page.units}
+        live = tuple(unit for unit in self._live_units if unit.entry_id not in seen)
+        if live:
+            pages.append(TUIHistoryPage((TUIPaintSegment(live),)))
+        return tuple(pages)
 
     @property
     def descriptors(self) -> tuple[PageDescriptor, ...]:
@@ -141,12 +147,11 @@ class PagedTranscriptHistory:
         self._anchor = (entry_id, unit_ordinal, text_offset)
 
     async def close(self) -> None:
-        """Invalidate publication and finish canceled page tasks."""
+        """Invalidate publication without waiting for executor-backed reads."""
 
-        tasks = tuple(self._loads.values())
         self.reset()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        self.source = None  # type: ignore[assignment]
+        await asyncio.sleep(0)
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1
@@ -154,6 +159,7 @@ class PagedTranscriptHistory:
             task.cancel()
         self._loads.clear()
         self._pages.clear()
+        self._live_units.clear()
         self._older = self._newer = self._newest_tail = None
         self._frozen_endpoint = endpoint_id
         self.endpoint_id = endpoint_id
@@ -164,6 +170,14 @@ class PagedTranscriptHistory:
         if page.units:
             return page.units[0].entry_id
         return f"{page.endpoint_id}:{cursor.value if cursor else 'initial'}"
+
+    def append_live(self, entry_id: str, value: Any) -> None:
+        """Keep provisional newest rows outside the durable page window."""
+
+        self._live_units = [
+            unit for unit in self._live_units if unit.entry_id != entry_id
+        ]
+        self._live_units.append(TUIHistoryUnit(entry_id, value))
 
     async def load(self, direction: Literal["older", "newer"] = "older") -> TUIHistoryPage:
         cursor = self._older if direction == "older" else self._newer
@@ -176,6 +190,8 @@ class PagedTranscriptHistory:
         task = self._loads.get(key)
         if task is None:
             generation = self.generation
+            if self.source is None:
+                return TUIHistoryPage(())
             task = asyncio.create_task(self.source.page(cursor, direction=direction))
             self._loads[key] = task
             try:
