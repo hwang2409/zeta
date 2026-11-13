@@ -120,13 +120,13 @@ class RootTUIHistorySource:
                             (f"{dependency.id}:dependency:{entry.id}", dependency)
                         )
             projected.append((entry.id, entry))
-            return (
-                [
-                    TUIHistoryUnit(entry_id, _project_entry(item))
-                    for entry_id, item in projected
-                ],
-                sum(len(repr(item.data).encode()) for _entry_id, item in projected),
-            )
+            units: list[TUIHistoryUnit] = []
+            decoded_bytes = 0
+            for entry_id, item in projected:
+                value = _project_entry(item)
+                units.append(TUIHistoryUnit(entry_id, value))
+                decoded_bytes += len(str(value).encode("utf-8", errors="replace"))
+            return units, decoded_bytes
 
         scan = reversed(entries) if direction == "older" else iter(entries)
         selected: list[tuple[list[TUIHistoryUnit], int]] = []
