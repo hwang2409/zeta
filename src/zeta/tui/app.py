@@ -267,11 +267,10 @@ class TUIApp(
         self._active_turn_submission_id: int | None = None
         self._resuming_tool = False
         self._session = session
+        session_dir = self.loop.store.session_dir
         self._history_source = RootTUIHistorySource(
             self.loop.store,
-            replay_provider_loader=lambda: session_replay_provider(
-                self.loop.store.session_dir
-            ),
+            replay_provider_loader=lambda: session_replay_provider(session_dir),
         )
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None

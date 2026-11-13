@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...protocol.types import (
@@ -22,6 +22,7 @@ from ...protocol.types import (
     MessageRole,
     assistant_text,
     is_passive_harness_message,
+    is_visible_harness_notice,
 )
 from ...storage_format import reject_unknown_keys
 from ._async_writes import _AppendTurnEndCommand
@@ -29,11 +30,54 @@ from ._client_delivery import CLIENT_DELIVERY_METADATA
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
+    from ._history_index import IndexedHistoryPage
     from ._store import ConversationStore
 
 
 # The newest rows a lookup can see; older rows are unknown, not absent.
 RECENT_ROW_WINDOW = 1024
+
+
+def starts_next_group(entry_type: str, data: Mapping[str, object]) -> bool:
+    if entry_type == "message":
+        message = data.get("message")
+        return isinstance(message, dict) and not (
+            is_passive_harness_message(message)
+            and not is_visible_harness_notice(message)
+        )
+    return entry_type == "notification" or (
+        entry_type == "warning" and data.get("kind") == "transcript_recovery"
+    )
+
+
+def belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
+    return starts_next_group(entry_type, data) or entry_type in {
+        "client_delivery", "approval_resolution", "approval_history", "turn_end"
+    }
+
+
+def overlay_resident_entries(
+    store: ConversationStore, page: IndexedHistoryPage
+) -> IndexedHistoryPage:
+    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
+        if entry.seq > len(store._resident_rows.entries):
+            return entry
+        resident = store._resident_rows.entries[entry.seq - 1]
+        if resident.id != entry.id:
+            return entry
+        accepted = entry.data.get("_accepted_message")
+        if accepted is None:
+            return resident
+        return replace(
+            resident,
+            data={**resident.data, "_accepted_message": accepted},
+        )
+
+    groups = tuple(
+        tuple(resident_entry(entry) for entry in group)
+        for group in page.groups
+    )
+    return replace(page, groups=groups)
 
 
 @dataclass(frozen=True, slots=True)

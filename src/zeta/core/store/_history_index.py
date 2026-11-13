@@ -9,17 +9,13 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
-from ...protocol.types import (
-    ToolCall,
-    is_passive_harness_message,
-    is_visible_harness_notice,
-)
+from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ..transcript_recovery import recovery_status
 from . import _row_history
@@ -196,24 +192,6 @@ class HistoryIndex:
             if hasattr(value, key)
         }
 
-    @staticmethod
-    def _starts_next_group(entry_type: str, data: Mapping[str, object]) -> bool:
-        if entry_type == "message":
-            message = data.get("message")
-            return isinstance(message, dict) and not (
-                is_passive_harness_message(message)
-                and not is_visible_harness_notice(message)
-            )
-        return entry_type == "notification" or (
-            entry_type == "warning" and data.get("kind") == "transcript_recovery"
-        )
-
-    @staticmethod
-    def _belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
-        return HistoryIndex._starts_next_group(entry_type, data) or entry_type in {
-            "client_delivery", "approval_resolution", "approval_history", "turn_end"
-        }
-
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)"
@@ -322,9 +300,9 @@ class HistoryIndex:
                     data = json.loads(encoded)
                     active = entry_id in active_ids
                     history_group = (
-                        group if active and self._belongs_in_history(entry_type, data) else None
+                        group if active and _row_history.belongs_in_history(entry_type, data) else None
                     )
-                    if active and self._starts_next_group(entry_type, data):
+                    if active and _row_history.starts_next_group(entry_type, data):
                         group += 1
                     tui_history_group = tui_group if active else None
                     if active:
@@ -392,7 +370,7 @@ class HistoryIndex:
     ) -> tuple[list[tuple[object, int | None, int]], int, int]:
         return _row_history.project_history_entries(
             entries, total, tui_total, data=lambda entry: dict(entry.data),
-            belongs=self._belongs_in_history, starts=self._starts_next_group,
+            belongs=_row_history.belongs_in_history, starts=_row_history.starts_next_group,
         )
 
     def _write_tool_calls(
@@ -1022,30 +1000,6 @@ def _read_stable_tui_page(
     return None
 
 
-def _overlay_resident_entries(
-    store: ConversationStore, page: IndexedHistoryPage
-) -> IndexedHistoryPage:
-    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._resident_rows.entries):
-            return entry
-        resident = store._resident_rows.entries[entry.seq - 1]
-        if resident.id != entry.id:
-            return entry
-        accepted = entry.data.get("_accepted_message")
-        if accepted is None:
-            return resident
-        return replace(
-            resident,
-            data={**resident.data, "_accepted_message": accepted},
-        )
-
-    groups = tuple(
-        tuple(resident_entry(entry) for entry in group)
-        for group in page.groups
-    )
-    return replace(page, groups=groups)
-
-
 def _decide_approval(
     store: ConversationStore, index_query: object, resident: object
 ) -> object:
@@ -1250,8 +1204,9 @@ class HistoryPageStoreMixin:
             index._mark_unavailable()
         return ()
 
-    def tui_user_dependency(
-        self: ConversationStore, before_seq: int
+    def _tui_dependency(
+        self: ConversationStore,
+        read: Callable[[HistoryIndex, Mapping[str, object]], ConversationEntry | None],
     ) -> ConversationEntry | None:
         index = self._history_index
         if self._closed or index is None:
@@ -1259,7 +1214,7 @@ class HistoryPageStoreMixin:
         for _attempt in range(2):
             try:
                 facts = self._history_index_facts()
-                dependency = index.user_dependency(before_seq, facts)
+                dependency = read(index, facts)
             except (StaleHistorySnapshot, HistoryIndexUnavailableError):
                 index._mark_unavailable()
                 if self._read_only:
@@ -1270,25 +1225,19 @@ class HistoryPageStoreMixin:
                 return dependency
         return None
 
+    def tui_user_dependency(
+        self: ConversationStore, before_seq: int
+    ) -> ConversationEntry | None:
+        return self._tui_dependency(
+            lambda index, facts: index.user_dependency(before_seq, facts)
+        )
+
     def tui_tool_call_dependency(
         self: ConversationStore, call_id: str, before_seq: int
     ) -> ConversationEntry | None:
-        index = self._history_index
-        if self._closed or index is None:
-            return None
-        for _attempt in range(2):
-            try:
-                facts = self._history_index_facts()
-                dependency = index.tool_call_dependency(call_id, before_seq, facts)
-            except (StaleHistorySnapshot, HistoryIndexUnavailableError):
-                index._mark_unavailable()
-                if self._read_only:
-                    return None
-                _rebuild_history_index(self)
-                continue
-            if self._history_index_facts() == facts:
-                return dependency
-        return None
+        return self._tui_dependency(
+            lambda index, facts: index.tool_call_dependency(call_id, before_seq, facts)
+        )
 
     def tui_history_index_page(
         self: ConversationStore, request: Mapping[str, object]
@@ -1299,7 +1248,11 @@ class HistoryPageStoreMixin:
         if index is None or (self._read_only and not index.available):
             return None
         page = _read_stable_tui_page(self, index, request)
-        return _overlay_resident_entries(self, page) if page is not None else None
+        return (
+            _row_history.overlay_resident_entries(self, page)
+            if page is not None
+            else None
+        )
 
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]
@@ -1311,4 +1264,8 @@ class HistoryPageStoreMixin:
         if index is None or (self._read_only and not index.available):
             return None
         page = _read_stable_page(self, index, request)
-        return _overlay_resident_entries(self, page) if page is not None else None
+        return (
+            _row_history.overlay_resident_entries(self, page)
+            if page is not None
+            else None
+        )

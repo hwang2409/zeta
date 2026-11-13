@@ -702,7 +702,8 @@ class CheckpointTranscriptMixin:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        provider = self._history_source.replay_provider
+        source = getattr(self, "_history_source", None)
+        provider = source.replay_provider if source is not None else None
         transcript = getattr(self, "_transcript", None)
         for entry in branch:
             if transcript is not None:
