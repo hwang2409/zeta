@@ -434,19 +434,30 @@ class StreamableHTTPMCPClient(MCPClient):
         if self.protocol_version is not None:
             headers["mcp-protocol-version"] = self.protocol_version
         headers.update(extra_headers)
+        transport_error: str | None = None
         try:
             async with self._client.stream(
                 method, self.config.url, headers=headers, json=json
             ) as response:
                 if response.status_code == 401:
-                    detail = await _response_detail(response)
+                    detail = self._redact_error(await _response_detail(response))
                     raise MCPHTTPError(401, detail or "unauthorized")
                 if response.status_code >= 400:
-                    detail = await _response_detail(response)
+                    detail = self._redact_error(await _response_detail(response))
                     raise MCPHTTPError(response.status_code, detail or "request failed")
                 yield response
         except httpx.HTTPError as exc:
-            raise MCPHTTPError(0, str(exc)) from exc
+            transport_error = self._redact_error(str(exc))
+        if transport_error is not None:
+            raise MCPHTTPError(
+                0, transport_error or "MCP transport request failed"
+            )
+
+    def _redact_error(self, message: str) -> str:
+        for secret in (*self.config.headers.values(), self.config.auth_token):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        return message
 
     async def _send(
         self,
