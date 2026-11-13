@@ -164,10 +164,9 @@ class StartupFactsMixin:
         return tuple(records)
 
 
-def _message_facts(entry: ConversationEntry) -> MessageFacts:
-    message = entry.data["message"]
+def _message_projection_digest(message: Mapping[str, object]) -> str:
     metadata = message.get("metadata", {})
-    projection = message
+    projection: Mapping[str, object] = message
     if isinstance(metadata, Mapping) and CLIENT_DELIVERY_METADATA in metadata:
         projection = dict(message)
         projection_metadata = dict(metadata)
@@ -177,7 +176,17 @@ def _message_facts(entry: ConversationEntry) -> MessageFacts:
             projection["metadata"] = projection_metadata
         else:
             projection.pop("metadata", None)
-    projection_digest = hashlib.sha256(encode_json(projection)).hexdigest()
+    return hashlib.sha256(encode_json(projection)).hexdigest()
+
+
+def _message_facts(entry: ConversationEntry) -> MessageFacts:
+    message = entry.data["message"]
+    metadata = message.get("metadata", {})
+    projection_digest = (
+        _message_projection_digest(message)
+        if isinstance(metadata, Mapping) and CLIENT_DELIVERY_METADATA in metadata
+        else ""
+    )
     is_user = message["role"] == "user"
     text = " ".join(
         block["text"].strip()
@@ -524,7 +533,6 @@ class ResidentRows:
         return ref.facts if isinstance(ref.facts, tuple) and len(ref.facts) == 4 else (None,) * 4
 
     def _required_payloads(self) -> set[int]:
-        self._legacy_pinned_source_seqs = {}
         required: set[int] = set()
         context_required = {
             ref.seq for ref in self.rows if ref.type not in self._BULK_TYPES
@@ -547,8 +555,16 @@ class ResidentRows:
             )
         }
         live_markers = [ref for ref in markers if ref.id not in replaced]
+        live_marker_ids = {ref.id for ref in live_markers}
+        self._legacy_pinned_source_seqs = {
+            marker_id: seq
+            for marker_id, seq in self._legacy_pinned_source_seqs.items()
+            if marker_id in live_marker_ids
+        }
         required.update(ref.seq for ref in live_markers)
         for marker in live_markers:
+            if marker.id in self._legacy_pinned_source_seqs:
+                continue
             payload = self.payloads.get(marker.seq)
             start, end, _, _ = self._compaction_values(marker)
             pinned = None if payload is None else payload.data.get("pinned_message")
@@ -563,17 +579,31 @@ class ResidentRows:
                 projection = without_client_delivery_marker(Message.from_dict(pinned))
             except (KeyError, TypeError, ValueError):
                 continue
-            digest = hashlib.sha256(encode_json(projection.to_dict())).hexdigest()
-            match = next(
-                (
-                    ref.seq
-                    for ref in reversed(self._branch_refs)
-                    if start <= ref.seq <= end
-                    and isinstance(ref.facts, MessageFacts)
-                    and ref.facts.projection_digest == digest
-                ),
-                None,
-            )
+            digest = _message_projection_digest(projection.to_dict())
+            match = None
+            fd: int | None = None
+            try:
+                for ref in reversed(self._branch_refs):
+                    if not (
+                        start <= ref.seq <= end
+                        and isinstance(ref.facts, MessageFacts)
+                    ):
+                        continue
+                    if ref.facts.projection_digest == digest:
+                        match = ref.seq
+                        break
+                    if ref.facts.projection_digest:
+                        continue
+                    candidate = self.payloads.get(ref.seq)
+                    if candidate is None:
+                        fd = self._open_source() if fd is None else fd
+                        candidate = self._decode(fd, ref)
+                    if _message_projection_digest(candidate.data["message"]) == digest:
+                        match = ref.seq
+                        break
+            finally:
+                if fd is not None:
+                    os.close(fd)
             if match is not None:
                 self._legacy_pinned_source_seqs[marker.id] = match
         coverage_end = max(
