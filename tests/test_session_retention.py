@@ -708,7 +708,9 @@ def _write_recovery_state(directory, target, mode):
 
 
 def _write_reconciliation_state(directory, mode):
-    cursor = {} if mode == "absent" else {"recovery_paused": True}
+    cursor = {} if mode in {"absent", "malformed_receipt"} else {
+        "recovery_paused": True
+    }
     (directory / "memory-reconcile.json").write_text(
         "{" if mode == "malformed" else json.dumps(cursor)
     )
@@ -717,7 +719,7 @@ def _write_reconciliation_state(directory, mode):
         "attempt_count": 3, "validation_summary": "failed", "occurred_at": _OLD,
     }
     (directory / "memory-reconcile-receipts.jsonl").write_text(
-        json.dumps(receipt) + "\n"
+        "{\n" if mode == "malformed_receipt" else json.dumps(receipt) + "\n"
     )
 
 
@@ -1017,6 +1019,8 @@ _RUN_PASS_ROWS = [
     ("pin", "missing_parent"),
     ("inbox", "non_json_new"),
     ("inbox", "non_json_claimed"),
+    ("memory_reconciliation", "malformed_receipt"),
+    ("child_memory_reconciliation", "malformed_receipt"),
     *((kind, "deadline") for kind in _MATRIX_KINDS),
     *((kind, "over_bound") for kind in _OVER_BOUND_KINDS),
 ]
