@@ -8,14 +8,19 @@ import shutil
 import stat
 import time
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from zeta import session_retention
+from zeta.attention_records import AttentionStore
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.session_files import SessionError, session_root
 from zeta.core.transcript_recovery import EvidenceManifest, RecoveryRecord, RepairTarget
+from zeta.project_inbox import ProjectInbox
+from zeta.project_inbox_sent import SentMessageTracker
+from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.session_retention import (
     RETENTION_PIN_FILENAME,
@@ -26,6 +31,7 @@ from zeta.session_retention import (
     write_retention_pin,
 )
 from zeta.storage_format import open_writer
+from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
 
 
 def _directory(path):
@@ -1214,3 +1220,249 @@ def test_quarantine_restart_resumes_to_durable_removal(tmp_path):
 
     assert not (tmp_path / "sessions" / root).exists()
     assert not list((tmp_path / "session-trash" / "transactions").iterdir())
+
+
+def _retention_manifest(home: Path) -> tuple[Path, dict]:
+    manifests = list((home / "session-trash" / "transactions").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    return manifests[0], json.loads(manifests[0].read_text())
+
+
+def _arm_and_quarantine(home, stack, root, lease):
+    _age_tree(home / "sessions" / root)
+    planner = _planner(stack, home, lease, now_ns=_future_ns)
+    preview, reasons = _run_sweep(planner)
+    assert reasons[root] == (True, None)
+    arm = home / "retention-arm.json"
+    arm.write_text(json.dumps({
+        "schema_version": 1,
+        "gate_version": 1,
+        "armed_by_zeta_version": "test",
+        "armed_at": _OLD,
+        "preview_id": preview.preview.preview_id,
+    }) + "\n")
+    arm.chmod(0o600)
+    planner.close()
+    resumed = _planner(stack, home, lease, now_ns=_future_ns)
+    resumed.run_pass(days=30)
+    assert _retention_manifest(home)[1]["stage"] == "quarantined"
+    return resumed
+
+
+def _registry(stack, home):
+    registry = ProjectRegistry(home / "projects")
+    release = getattr(registry, "_release_storage_lease", None)
+    if release is not None:
+        stack.callback(release)
+    return registry
+
+
+def _external_reference(stage, home, manager, stack, root, lease):
+    registry = _registry(stack, home)
+    project = registry.create_project(f"retention-{stage}", "test")
+    if stage in {"projects", "indexes"}:
+        registry.record_session(
+            project.project_id,
+            session_id=root,
+            transcript_path=str(home / "sessions" / root),
+        )
+        if stage == "indexes":
+            source_dir = home / "indexed-source"
+            source_dir.mkdir()
+            rows = [
+                {
+                    "seq": 1,
+                    "id": "user",
+                    "parent_id": None,
+                    "lane": "main",
+                    "type": "message",
+                    "data": {"message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "prompt"}],
+                        "metadata": {"zeta.origin": "user", "origin": "human"},
+                    }},
+                },
+                {
+                    "seq": 2,
+                    "id": "assistant",
+                    "parent_id": "user",
+                    "lane": "main",
+                    "type": "message",
+                    "data": {"message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "indexed"}],
+                        "metadata": {"response_state": "complete"},
+                    }},
+                },
+            ]
+            (source_dir / "conversation.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            index = TranscriptIndex(registry.root / project.project_id, project.project_id)
+            status = index.append(TranscriptSource(root, source_dir))
+            assert status.session_count == 1
+            return registry, project, index
+        return registry, project, None
+    if stage == "inbox":
+        sender = _create_closed(manager, stack)
+        tracker = SentMessageTracker(
+            home / "sessions", sender, observed_epoch=lease.observed_epoch
+        )
+        inbox = ProjectInbox(
+            registry, sessions_root=home / "sessions", sent_tracker=tracker
+        )
+        message_id = inbox.send_user(
+            from_project=project.project_id,
+            from_session=sender,
+            to_project=project.project_id,
+            to_session=root,
+            kind="question",
+            title="terminal reference",
+            body="done",
+        )
+        assert inbox.claim(project.project_id, message_id, root) is not None
+        inbox.done(project.project_id, message_id, root, "done")
+        tracker.mark_reported(((message_id, "done"),))
+        return inbox, tracker, message_id
+    child = home / "sessions" / root / "agents" / "1"
+    child.mkdir(parents=True)
+    (child / "agent_lifecycle.json").write_text(json.dumps({
+        "handle": "child",
+        "state": "completed",
+        "started_at": _OLD,
+        "finished_at": _OLD,
+    }))
+    (child / "conversation.jsonl").write_text("")
+    (child / ".lock").write_text("")
+    source = _create_closed(manager, stack)
+    with session_root(home / "sessions" / source) as source_fd:
+        write_retention_pin(source_fd)
+    store = AttentionStore(
+        home / "sessions" / source, writer_epoch=lease.observed_epoch
+    )
+    record = store.request(
+        session_id=source,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="retention fork",
+        why="test external fork link",
+    )
+    store.replace(
+        replace(
+            record,
+            status="resolved",
+            resolved_at=_OLD,
+            fork_session_id=f"{root}:1",
+            decision="done",
+        )
+    )
+    return store, record.id, None
+
+
+@pytest.mark.parametrize(
+    ("stage", "start_stage", "advance_count"),
+    [
+        ("projects", "quarantined", 0),
+        ("inbox", "projects", 1),
+        ("attention", "inbox", 2),
+        ("indexes", "attention", 3),
+    ],
+)
+def test_quarantine_cleanup_uses_durable_owners(
+    tmp_path, stage, start_stage, advance_count
+):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        owner = _external_reference(stage, tmp_path, manager, stack, root, lease)
+        planner = _arm_and_quarantine(tmp_path, stack, root, lease)
+        prior = None
+        for _ in range(advance_count):
+            prior = planner.run_pass(days=30)
+        assert _retention_manifest(tmp_path)[1]["stage"] == start_stage, prior
+        planner.run_pass(days=30)
+
+        if stage == "projects":
+            registry, project, _ = owner
+            assert all(
+                link["session_id"] != root
+                for link in registry.list_session_links(project.project_id)
+            ), "project cleanup left the quarantined session linked"
+        elif stage == "inbox":
+            _inbox, tracker, message_id = owner
+            assert all(
+                row["id"] != message_id for row in tracker.records()
+            ), "inbox cleanup left the external sender tracker"
+        elif stage == "attention":
+            store, attention_id, _ = owner
+            assert store.get(attention_id).fork_session_id is None, (
+                "attention cleanup left the quarantined fork linked"
+            )
+        else:
+            _registry_owner, _project, index = owner
+            assert index.status().session_count == 0, (
+                "index cleanup left the quarantined session indexed"
+            )
+
+
+@pytest.mark.parametrize(
+    ("stage", "advance_count"),
+    [
+        ("projects", 0),
+        ("inbox", 1),
+        ("attention", 2),
+        ("indexes", 3),
+    ],
+)
+def test_quarantine_cleanup_malformed_owner_record_does_not_advance(
+    tmp_path, stage, advance_count
+):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        owner = _external_reference(stage, tmp_path, manager, stack, root, lease)
+        planner = _arm_and_quarantine(tmp_path, stack, root, lease)
+        for _ in range(advance_count):
+            planner.run_pass(days=30)
+        manifest_path, before = _retention_manifest(tmp_path)
+        if stage == "projects":
+            registry, project, _ = owner
+            malformed = registry.root / project.project_id / "sessions.jsonl"
+        elif stage == "inbox":
+            inbox, _tracker, message_id = owner
+            malformed = (
+                inbox.registry.root
+                / inbox.registry.list_projects()[0].project_id
+                / "inbox"
+                / "done"
+                / f"{message_id}.json"
+            )
+        elif stage == "attention":
+            store, attention_id, _ = owner
+            malformed = store.directory / f"{attention_id}.json"
+        else:
+            _registry_owner, _project, index = owner
+            malformed = index.path
+        malformed.write_text("not a durable owner record\n")
+        result = planner.run_pass(days=30)
+
+    assert json.loads(manifest_path.read_text())["stage"] == before["stage"], (
+        "cleanup advanced after its durable owner refused a malformed record"
+    )
+    assert result.reasons[0].reason is not None
+
+
+def test_quarantine_cleanup_stops_when_id_is_republished(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _arm_and_quarantine(tmp_path, stack, root, lease)
+        (tmp_path / "sessions" / root).mkdir()
+        result = planner.run_pass(days=30)
+
+    assert result.reasons[0].reason == "id_republished"
+    assert _retention_manifest(tmp_path)[1]["stage"] == "id_republished"

@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -402,6 +402,40 @@ class AttentionStore:
                 + "\n"
             ).encode(),
         )
+
+
+def remove_fork_session_links(
+    sessions_root: Path,
+    session_ids: tuple[str, ...],
+    *,
+    writer_epoch: int,
+    charge: Callable[[], None],
+) -> None:
+    """Durably clear attention records bound to quarantined fork sessions."""
+    remove_ids = set(session_ids)
+    if not remove_ids:
+        return
+    try:
+        entries = sorted(Path(sessions_root).iterdir(), key=lambda path: path.name)
+    except FileNotFoundError:
+        return
+    for session_dir in entries:
+        charge()
+        if (
+            len(session_dir.name) != 32
+            or any(character not in "0123456789abcdef" for character in session_dir.name)
+        ):
+            continue
+        info = session_dir.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ValueError("unsafe session directory during attention cleanup")
+        store = AttentionStore(session_dir, writer_epoch=writer_epoch)
+        for record in store.list():
+            charge()
+            if isinstance(record, Broken):
+                raise TypeError(f"broken attention record: {record.reason}")
+            if record.fork_session_id in remove_ids:
+                store.replace(replace(record, fork_session_id=None))
 
 
 def _check_id(attention_id: str) -> None:

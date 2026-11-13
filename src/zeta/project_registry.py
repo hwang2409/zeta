@@ -18,7 +18,7 @@ import secrets
 import stat
 import uuid
 import weakref
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -221,18 +221,26 @@ class ProjectRegistry(
 ):
     """A local registry whose root can be overridden for tests."""
 
-    def __init__(self, root: Path | str | None = None):
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        *,
+        _storage_lease: WriterLease | None = None,
+    ):
         self.root = (
             Path(root).expanduser()
             if root is not None
             else Path.home() / ".zeta" / "projects"
         )
         self.memory_transactions = MemoryTransactions(self)
-        with format_lock():
-            self._storage_lease = open_writer(self.root.parent)
-        self._release_storage_lease = weakref.finalize(
-            self, release_later, self._storage_lease.close
-        )
+        if _storage_lease is None:
+            with format_lock():
+                self._storage_lease = open_writer(self.root.parent)
+            self._release_storage_lease = weakref.finalize(
+                self, release_later, self._storage_lease.close
+            )
+        else:
+            self._storage_lease = _storage_lease
 
     @property
     def observed_storage_epoch(self) -> int:
@@ -884,6 +892,47 @@ class ProjectRegistry(
             project_id, "sessions", exclusive=False
         ) as project_fd:
             return read(project_fd)
+
+    def remove_session_links(
+        self,
+        project_ids: tuple[str, ...],
+        session_ids: tuple[str, ...],
+        *,
+        charge: Callable[[], None],
+    ) -> None:
+        """Durably remove links under already-enumerated project authority."""
+        remove_ids = set(session_ids)
+        if not remove_ids:
+            return
+        for session_id in remove_ids:
+            _validate_text(session_id, "session_id", 128)
+        for project_id in project_ids:
+            charge()
+            _validate_id(project_id, _PROJECT_ID, "project_id")
+            with self._project_lock(
+                project_id, "sessions", exclusive=True
+            ) as project_fd:
+                directory_fd = os.dup(project_fd)
+                try:
+                    existing = self._read_session_records(
+                        directory_fd, repair_torn_final=False
+                    )
+                finally:
+                    os.close(directory_fd)
+                for _record in existing:
+                    charge()
+                retained = [
+                    record
+                    for record in existing
+                    if record["session_id"] not in remove_ids
+                    and record.get("parent_session_id") not in remove_ids
+                ]
+                if len(retained) != len(existing):
+                    self._update_sessions_locked(
+                        project_fd,
+                        {str(record["session_id"]) for record in existing},
+                        retained,
+                    )
 
     def record_session(
         self,

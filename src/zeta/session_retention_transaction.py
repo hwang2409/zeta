@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .attention_forks import remove_attention_source_links
+from .attention_records import remove_fork_session_links
 from .core.session_files import (
     SessionError,
     SessionReferenceGate,
@@ -26,6 +28,9 @@ from .core.session_files import (
     child_directory,
 )
 from .locking import RETENTION_HOME_ID, domain_authority
+from .project_errors import ProjectRegistryError
+from .project_inbox import InboxError, ProjectInbox
+from .project_registry import ProjectRegistry
 from .storage_format import (
     StorageFormatError,
     WriterLease,
@@ -35,6 +40,7 @@ from .storage_format import (
     validate_retention_reservation,
     validate_retention_state,
 )
+from .transcript_search.index import TranscriptIndexError, remove_indexed_sessions
 
 _ARM_NAME = "retention-arm.json"
 _STATE_NAME = "retention-state.json"
@@ -157,6 +163,7 @@ class _QuarantineTransaction:
         self.entries = entries
         self.worker_ns = worker_ns
         self.clock = clock
+        self.project_ids: tuple[str, ...] = ()
 
     def advance(
         self,
@@ -180,6 +187,14 @@ class _QuarantineTransaction:
             clock=self.clock,
         )
         try:
+            self.project_ids = ()
+            if _entry_exists(self.home / _TRASH_NAME, _RESERVATIONS_NAME):
+                registry = ProjectRegistry(
+                    self.home / "projects", _storage_lease=self.lease
+                )
+                self.project_ids = tuple(
+                    project.project_id for project in registry.list_projects()
+                )
             with domain_authority(
                 self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
             ), SessionReferenceGate(self.home, self.lease).exclusive():
@@ -187,7 +202,9 @@ class _QuarantineTransaction:
                 if recovered is not None:
                     return recovered
                 return self._start_one(days, preview, verify)
-        except (OSError, StorageFormatError, TransactionError) as exc:
+        except (
+            OSError, ProjectRegistryError, StorageFormatError, TransactionError
+        ) as exc:
             return TransactionOutcome(False, _bounded(str(exc)))
 
     def _recover_one(self, budget: _Budget) -> TransactionOutcome | None:
@@ -363,9 +380,16 @@ class _QuarantineTransaction:
             return TransactionOutcome(False, "id_republished", session_id)
         stages = ("quarantined", "projects", "inbox", "attention", "indexes")
         if manifest["stage"] in stages:
-            following = stages[stages.index(manifest["stage"]) + 1] if manifest["stage"] != "indexes" else "references-clean"
+            self._cleanup_stage(manifest["stage"], manifest, budget)
+            following = (
+                stages[stages.index(manifest["stage"]) + 1]
+                if manifest["stage"] != "indexes"
+                else "references-clean"
+            )
             manifest = {**manifest, "stage": following}
-            self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
+            self._publish(
+                txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest
+            )
             return TransactionOutcome(True, session_id=session_id)
         if manifest["stage"] == "references-clean":
             manifest = {**manifest, "stage": "removing"}
@@ -386,6 +410,51 @@ class _QuarantineTransaction:
             self.lease.delete(reservations_fd, reservation_name)
             return TransactionOutcome(True, session_id=session_id)
         return TransactionOutcome(False, "retention transaction is blocked", session_id)
+
+    def _cleanup_stage(self, stage: str, manifest: dict, budget: _Budget) -> None:
+        candidate_ids = (manifest["session_id"], *manifest["descendants"])
+        budget.charge()
+        registry = ProjectRegistry(
+            self.home / "projects", _storage_lease=self.lease
+        )
+        try:
+            if stage == "quarantined":
+                registry.remove_session_links(
+                    self.project_ids, candidate_ids, charge=budget.charge
+                )
+            elif stage == "projects":
+                ProjectInbox(
+                    registry, sessions_root=self.home / "sessions"
+                ).remove_terminal_session_references(
+                    self.project_ids, candidate_ids, charge=budget.charge
+                )
+            elif stage == "inbox":
+                remove_fork_session_links(
+                    self.home / "sessions",
+                    candidate_ids,
+                    writer_epoch=self.lease.observed_epoch,
+                    charge=budget.charge,
+                )
+                remove_attention_source_links(
+                    self.home / "sessions", candidate_ids, charge=budget.charge
+                )
+            elif stage == "attention":
+                remove_indexed_sessions(
+                    registry.root,
+                    self.project_ids,
+                    candidate_ids,
+                    charge=budget.charge,
+                )
+            elif stage != "indexes":
+                raise TransactionError("unknown retention cleanup stage")
+        except (
+            InboxError,
+            ProjectRegistryError,
+            TranscriptIndexError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise TransactionError(str(exc)) from exc
 
     def _remove_tree_step(self, txn_fd: int, manifest: dict, budget: _Budget) -> bool:
         home_fd = _open_home(self.home)
@@ -523,7 +592,10 @@ def _durable_child_directory(parent_fd: int, name: str, *, create: bool):
 
 
 def _entry_exists(parent: Path, name: str) -> bool:
-    parent_fd = _open_home(parent)
+    try:
+        parent_fd = _open_home(parent)
+    except FileNotFoundError:
+        return False
     try:
         try:
             os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
