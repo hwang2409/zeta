@@ -141,9 +141,12 @@ class PagedTranscriptHistory:
         self._anchor = (entry_id, unit_ordinal, text_offset)
 
     async def close(self) -> None:
-        """Invalidate publication without waiting for off-loop reads."""
+        """Invalidate publication and finish canceled page tasks."""
 
+        tasks = tuple(self._loads.values())
         self.reset()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1

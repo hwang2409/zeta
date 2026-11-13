@@ -272,8 +272,6 @@ class TUIApp(
         self._history_search_task: asyncio.Task[None] | None = None
         self._history_prompt_task: asyncio.Task[None] | None = None
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
-        self._history_rebuild_tasks: set[asyncio.Task[None]] = set()
-        self._live_renderables: list[RenderableType] = []
         self._rendering_history = False
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
@@ -509,7 +507,7 @@ class TUIApp(
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
             on_page_up=lambda: app._page_history_up(),
-            on_page_down=self._page_history_down,
+            on_page_down=self._transcript.page_down,
             on_finder_open=lambda: app._finder_open(),
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
             on_history_previous=lambda buffer: app._history_previous(buffer),
@@ -540,7 +538,7 @@ class TUIApp(
             approval_active=lambda: bool(app.pending_approvals),
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=lambda: app._scroll_history_up(),
-            on_scroll_down=self._scroll_history_down,
+            on_scroll_down=self._transcript.scroll_down,
             on_picker_move=lambda delta: app._picker_move(delta),
             on_picker_select=lambda: app._picker_select(),
             on_picker_cancel=lambda: app._picker_cancel(),
@@ -744,14 +742,6 @@ class TUIApp(
         if tasks:
             await asyncio.gather(*tasks)
 
-    async def _close_history_rebuilds(self) -> None:
-        tasks = tuple(self._history_rebuild_tasks)
-        for task in tasks:
-            task.cancel()
-        self._history_rebuild_tasks.clear()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     def _history_finder_open(self, buffer: Any) -> None:
         prompt_history = getattr(self, "_prompt_history", None)
         if self._agent_navigation.child_view_active or prompt_history is None:
@@ -898,8 +888,6 @@ class TUIApp(
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
-            if not self._rendering_history:
-                self._live_renderables.append(renderable)
             self._transcript.append(renderable)
 
     def _print(self, renderable: RenderableType | None) -> None:

@@ -608,9 +608,7 @@ class CheckpointTranscriptMixin:
         except RuntimeError:
             asyncio.run(self._load_transcript_page(reset=True))
         else:
-            task = loop.create_task(self._load_transcript_page(reset=True))
-            self._history_rebuild_tasks.add(task)
-            task.add_done_callback(self._history_rebuild_tasks.discard)
+            loop.create_task(self._load_transcript_page(reset=True))
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
         """Load only the newest bounded history page after first paint."""
@@ -636,7 +634,6 @@ class CheckpointTranscriptMixin:
             self._history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
-            self._live_renderables.clear()
         scroll_anchor = self._transcript.scroll_anchor
         anchor_value = scroll_anchor[0].value if scroll_anchor[0] is not None else None
         anchor_offset = scroll_anchor[1]
@@ -663,8 +660,6 @@ class CheckpointTranscriptMixin:
                 pass
         finally:
             self._rendering_history = False
-        if self._live_renderables:
-            self._transcript.adopt_units(tuple(self._live_renderables))
         marker_write = self._persist_rendered_notifications(
             rendered_notifications, asynchronous=True
         )
