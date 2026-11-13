@@ -27,10 +27,8 @@ from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
-    MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
     Message,
-    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -50,7 +48,6 @@ from .render import (
     render_markdown,
     render_thought,
 )
-from .user import displayed_user_text
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 _MAX_DEFERRED_TOOL_UPDATES = 64
@@ -307,7 +304,7 @@ class CheckpointTranscriptMixin:
             _, restore_note = _restore_workspace(
                 snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
             )
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             header = (
                 f"forked to user message {index} at seq {source.seq} "
@@ -340,7 +337,7 @@ class CheckpointTranscriptMixin:
             _, restore_note = _restore_workspace(
                 snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
             )
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             message = (
                 f"forked to checkpoint '{entry.data['label']}' at seq "
@@ -379,7 +376,7 @@ class CheckpointTranscriptMixin:
                 await self.loop.store.switch_to_branch_async(target.head.id)
             except (ValueError, ConversationIntegrityError) as exc:
                 return f"tree: switch failed: {exc}"
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             return f"switched to branch {index} (head seq {target.head.seq})"
 
@@ -603,78 +600,107 @@ class CheckpointTranscriptMixin:
         return None
 
     def _rebuild_transcript(self) -> None:
-        """Synchronously rebuild for explicit commands outside app startup."""
+        """Reset root paging after a branch or repair change."""
 
-        rendered_notifications: list[str] = []
-        replay_error: BaseException | None = None
+        branch_id = self.loop.store.active_branch_head_id()
+        self._prompt_history.bind(
+            self._viewed_session_path(), self._history_source, branch_id
+        )
+        self._history_pager.reset(endpoint_id=branch_id)
         try:
-            for _ in self._rebuild_transcript_steps(rendered_notifications):
-                pass
-        except BaseException as error:
-            replay_error = error
-            raise
-        finally:
-            try:
-                self._persist_rendered_notifications(rendered_notifications)
-            except BaseException:
-                if replay_error is None:
-                    raise
-                _LOGGER.exception(
-                    "failed to persist rendered notifications after replay error"
-                )
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._load_transcript_page(reset=True))
+        else:
+            loop.create_task(self._load_transcript_page(reset=True))
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
-        """Rebuild after first paint, yielding between bounded entry batches."""
+        """Load only the newest bounded history page after first paint."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        rendered_notifications: list[str] = []
-        replay_error: BaseException | None = None
-        try:
-            await asyncio.sleep(0)
-            if self._exit_requested:
-                return False
-            for index, _ in enumerate(
-                self._rebuild_transcript_steps(rendered_notifications), start=1
-            ):
-                if self._exit_requested:
-                    return False
-                if index % batch_size == 0:
-                    await asyncio.sleep(0)
-            if self._exit_requested:
-                return False
-        except BaseException as error:
-            replay_error = error
-            raise
-        finally:
-            try:
-                marker_write = self._persist_rendered_notifications(
-                    rendered_notifications, asynchronous=True
-                )
-                if marker_write is not None:
-                    await marker_write
-            except BaseException:
-                if replay_error is None:
-                    raise
-                _LOGGER.exception(
-                    "failed to persist rendered notifications after replay error"
-                )
+        await asyncio.sleep(0)
+        if self._exit_requested:
+            return False
+        self._prompt_history.bind(
+            self._viewed_session_path(),
+            self._history_source,
+            self.loop.store.active_branch_head_id(),
+        )
+        await self._load_transcript_page(reset=True)
+        if self._exit_requested:
+            return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
 
-    def _rebuild_transcript_steps(
-        self, rendered_notifications: list[str]
-    ) -> Iterator[None]:
-        """Render the transcript one durable entry at a time."""
+    async def _load_transcript_page(
+        self, *, reset: bool = False, direction: str = "older"
+    ) -> None:
+        """Read one page off-loop, then repaint the bounded resident window."""
 
+        if reset:
+            self._history_pager.reset(
+                endpoint_id=self.loop.store.active_branch_head_id()
+            )
+        anchor = self._transcript.durable_scroll_anchor
+        scroll_generation = self._transcript.scroll_generation
+        page = await self._history_pager.load(direction)
+        if not page.units or self._exit_requested:
+            return
+        restore_anchor = (
+            anchor
+            if scroll_generation == self._transcript.scroll_generation
+            else self._transcript.durable_scroll_anchor
+        )
+        self._render_resident_history()
+        if restore_anchor is not None:
+            self._transcript.restore_durable_scroll_anchor(restore_anchor)
+        if self._history_marker_tasks:
+            await asyncio.gather(*tuple(self._history_marker_tasks))
+        self._invalidate_prompt()
+
+    def _render_resident_history(self) -> None:
+        rendered_notifications: list[str] = []
         self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
+        pages = self._history_pager.pages
+        entries = tuple(
+            unit.value
+            for page in pages
+            for unit in page.units
+            if hasattr(unit.value, "type")
+        )
+        live_values = tuple(
+            unit.value
+            for page in pages
+            for unit in page.units
+            if not hasattr(unit.value, "type")
+        )
+        self._rendering_history = True
+        try:
+            for _ in self._render_history_entries(entries, rendered_notifications):
+                pass
+        finally:
+            self._rendering_history = False
+        if live_values:
+            self._transcript.adopt_units(live_values)
+        marker_write = self._persist_rendered_notifications(
+            rendered_notifications, asynchronous=True
+        )
+        if marker_write is not None:
+            task = asyncio.create_task(marker_write)
+            self._history_marker_tasks.add(task)
+            task.add_done_callback(self._history_marker_tasks.discard)
+
+    def _render_history_entries(
+        self, branch: tuple[Any, ...], rendered_notifications: list[str]
+    ) -> Iterator[None]:
+        """Render one already bounded, detached history page."""
+
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
-        prompts: list[str] = []
-        branch = self.loop.store.tui_replay_entries()
         acknowledged_notifications = {
             entry.data["notification_id"]
             for entry in branch
@@ -685,114 +711,119 @@ class CheckpointTranscriptMixin:
             for entry in branch
             if entry.type == "notification_tui_presented"
         }
-        provider = session_replay_provider(self.loop.store.session_dir)
+        source = getattr(self, "_history_source", None)
+        provider = source.replay_provider if source is not None else None
+        transcript = getattr(self, "_transcript", None)
         for entry in branch:
-            if entry.type == "checkpoint":
-                self._print_system(
-                    f"checkpoint '{entry.data['label']}' at seq {entry.seq}"
-                )
-                yield
-                continue
-            if entry.type == "fork":
-                self._print_system(_fork_banner(entry))
-                yield
-                continue
-            if entry.type == "compaction":
-                self._print_system(
-                    "[compaction marker: entries "
-                    f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
-                )
-                yield
-                continue
-            if entry.type == "turn_end":
-                text = {
-                    "user_stop": "turn stopped by the user",
-                    "error": "turn ended with an error",
-                    "disconnect": "turn ended when the controller disconnected",
-                }.get(entry.data["reason"])
-                if text is not None:
-                    self._print_system(text)
-                yield
-                continue
-            if entry.type != "message":
-                if (
-                    entry.type == "warning"
-                    and entry.data.get("kind") == "transcript_recovery"
-                ):
+            if transcript is not None:
+                transcript.begin_history_entry(entry.id)
+            try:
+                if entry.type == "checkpoint":
                     self._print_system(
-                        "transcript recovered; preserved corrupt bytes in quarantine "
-                        f"{entry.data['quarantine_id']}"
+                        f"checkpoint '{entry.data['label']}' at seq {entry.seq}"
                     )
-                elif (
-                    entry.type == "notification"
-                    and entry.id not in acknowledged_notifications
-                    and entry.id not in presented_notifications
-                ):
-                    data = {
-                        "notification_id": entry.id,
-                        **project_notification_data(entry.data),
-                    }
-                    rendered = self._presenter.render_event(
-                        StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+                    yield
+                    continue
+                if entry.type == "fork":
+                    self._print_system(_fork_banner(entry))
+                    yield
+                    continue
+                if entry.type == "compaction":
+                    self._print_system(
+                        "[compaction marker: entries "
+                        f"{entry.data['source_seq_start']}–{entry.data['source_seq_end']}]"
                     )
-                    if rendered is not None:
-                        self._print_unit(rendered, blank_before=True)
-                        rendered_notifications.append(entry.id)
-                yield
-                continue
-            message = entry.message
-            if message is None:
-                raise RuntimeError("TUI message projection is missing its message")
-            if is_passive_harness_message(message):
-                notice_text = _visible_harness_notice_text(message)
-                if notice_text is not None:
-                    self._print_system(notice_text)
-                yield
-                continue
-            if message.role is MessageRole.USER:
-                self._failed_turn = None
-                last_user = message
-                if message.metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER:
-                    prompts.append(displayed_user_text(message))
-                self._print_user(message)
-            elif message.role is MessageRole.ASSISTANT:
-                render_replayed_message(
-                    message,
-                    presenter=self._presenter,
-                    print_user=self._print_user,
-                    print_unit=self._print_unit,
-                    tool_calls=tool_calls,
-                    provider=provider,
-                )
-                if not message.metadata.get(FAILED_TURN_MARKER):
+                    yield
+                    continue
+                if entry.type == "turn_end":
+                    text = {
+                        "user_stop": "turn stopped by the user",
+                        "error": "turn ended with an error",
+                        "disconnect": "turn ended when the controller disconnected",
+                    }.get(entry.data["reason"])
+                    if text is not None:
+                        self._print_system(text)
+                    yield
+                    continue
+                if entry.type != "message":
+                    if (
+                        entry.type == "warning"
+                        and entry.data.get("kind") == "transcript_recovery"
+                    ):
+                        self._print_system(
+                            "transcript recovered; preserved corrupt bytes in quarantine "
+                            f"{entry.data['quarantine_id']}"
+                        )
+                    elif (
+                        entry.type == "notification"
+                        and entry.id not in acknowledged_notifications
+                        and entry.id not in presented_notifications
+                    ):
+                        data = {
+                            "notification_id": entry.id,
+                            **project_notification_data(entry.data),
+                        }
+                        rendered = self._presenter.render_event(
+                            StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)
+                        )
+                        if rendered is not None:
+                            self._print_unit(rendered, blank_before=True)
+                            rendered_notifications.append(entry.id)
+                    yield
+                    continue
+                message = entry.message
+                if message is None:
+                    raise RuntimeError("TUI message projection is missing its message")
+                if is_passive_harness_message(message):
+                    notice_text = _visible_harness_notice_text(message)
+                    if notice_text is not None:
+                        self._print_system(notice_text)
+                    yield
+                    continue
+                if message.role is MessageRole.USER:
                     self._failed_turn = None
-                else:
-                    error_value = message.metadata.get(FAILED_TURN_ERROR)
-                    error = (
-                        ErrorInfo.from_dict(error_value)
-                        if isinstance(error_value, dict)
-                        else ErrorInfo("backend_error", "provider failure")
+                    last_user = message
+                    self._print_user(message)
+                elif message.role is MessageRole.ASSISTANT:
+                    render_replayed_message(
+                        message,
+                        presenter=self._presenter,
+                        print_user=self._print_user,
+                        print_unit=self._print_unit,
+                        tool_calls=tool_calls,
+                        provider=provider,
                     )
-                    if is_retryable_error(error) and last_user is not None:
-                        self._failed_turn = (assistant_text(last_user), last_user)
-                    else:
+                    if not message.metadata.get(FAILED_TURN_MARKER):
                         self._failed_turn = None
-                    self._print_unit(
-                        render_event(StreamEvent(StreamEventType.ERROR, error=error))
+                    else:
+                        error_value = message.metadata.get(FAILED_TURN_ERROR)
+                        error = (
+                            ErrorInfo.from_dict(error_value)
+                            if isinstance(error_value, dict)
+                            else ErrorInfo("backend_error", "provider failure")
+                        )
+                        if is_retryable_error(error) and last_user is not None:
+                            self._failed_turn = (assistant_text(last_user), last_user)
+                        else:
+                            self._failed_turn = None
+                        self._print_unit(
+                            render_event(StreamEvent(StreamEventType.ERROR, error=error))
+                        )
+                elif (
+                    message.role is MessageRole.TOOL_RESULT
+                    and message.tool_result is not None
+                ):
+                    render_replayed_message(
+                        message,
+                        presenter=self._presenter,
+                        print_unit=self._print_unit,
+                        tool_calls=tool_calls,
+                        provider=provider,
                     )
-            elif (
-                message.role is MessageRole.TOOL_RESULT
-                and message.tool_result is not None
-            ):
-                render_replayed_message(
-                    message,
-                    presenter=self._presenter,
-                    print_unit=self._print_unit,
-                    tool_calls=tool_calls,
-                    provider=provider,
-                )
-            yield
-        self._prompt_history.replace(self.loop.store.session_dir, prompts)
+                yield
+            finally:
+                if transcript is not None:
+                    transcript.end_history_entry()
 
 
 def render_replayed_message(

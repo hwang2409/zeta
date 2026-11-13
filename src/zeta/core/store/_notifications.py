@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import valid_killed_task_fields
-from ...protocol.types import Message, MessageOrigin, ToolUseContent
+from ...protocol.types import MessageOrigin
 from ..checkpoints import ConversationEntry
 from ._async_writes import (
     _PresentNotificationsCommand,
@@ -28,17 +26,6 @@ from ._validation import (
 
 if TYPE_CHECKING:
     from ._store import ConversationStore
-
-
-@dataclass(frozen=True, slots=True)
-class TUIReplayEntry:
-    """Detached fields consumed while rebuilding the TUI transcript."""
-
-    seq: int
-    id: str
-    type: str
-    data: dict[str, Any]
-    message: Message | None = None
 
 
 class NotificationStateMixin:
@@ -435,64 +422,6 @@ class NotificationStateMixin:
             entry = self._delivery_fold.completions_by_child.get(child_instance_id)
             return self._snapshot_entry(entry) if entry is not None else None
 
-    def tui_replay_entries(self: ConversationStore) -> tuple[TUIReplayEntry, ...]:
-        """Project the active branch into detached data needed by TUI replay."""
-        projected: list[TUIReplayEntry] = []
-        for ref in self.branch_refs():
-            entry = self.entry(ref)
-            message = None
-            if entry.type == "message":
-                parsed = Message.from_dict(entry.data["message"])
-                content = [
-                    replace(
-                        block,
-                        tool_call=replace(
-                            block.tool_call,
-                            arguments=copy.deepcopy(block.tool_call.arguments),
-                        ),
-                    )
-                    if isinstance(block, ToolUseContent)
-                    else block
-                    for block in parsed.content
-                ]
-                tool_result = parsed.tool_result
-                if tool_result is not None:
-                    tool_result = replace(
-                        tool_result,
-                        structured_content=copy.deepcopy(
-                            tool_result.structured_content
-                        ),
-                    )
-                message = replace(
-                    parsed,
-                    content=content,
-                    tool_result=tool_result,
-                    metadata=copy.deepcopy(parsed.metadata),
-                )
-                data = {}
-            elif entry.type in {
-                "checkpoint",
-                "fork",
-                "compaction",
-                "notification",
-                "notification_ack",
-                "notification_tui_presented",
-                "turn_end",
-                "warning",
-            }:
-                data = copy.deepcopy(entry.data)
-            else:
-                data = {}
-            projected.append(
-                TUIReplayEntry(
-                    seq=entry.seq,
-                    id=entry.id,
-                    type=entry.type,
-                    data=data,
-                    message=message,
-                )
-            )
-        return tuple(projected)
 
     def agent_notifications(
         self: ConversationStore, *, pending_only: bool = True
@@ -513,6 +442,13 @@ class NotificationStateMixin:
             for entry in entries
             if not pending_only or entry.data.get("display_only") is not True
         ]
+
+    def is_agent_notification_active(
+        self: ConversationStore, notification_id: str
+    ) -> bool:
+        """Return whether an active-branch notification still needs acknowledgement."""
+
+        return notification_id in self._delivery_fold.active_notifications
 
     def is_agent_notification_presented_to_tui(
         self: ConversationStore, notification_id: str
