@@ -514,6 +514,35 @@ class SentMessageTracker:
             rows.remove(terminal or rows[0])
         return list(reversed(rows))
 
+    def remove_terminal(
+        self,
+        message_ids: Iterable[str],
+        *,
+        _storage_lease: WriterLease | None = None,
+    ) -> None:
+        """Durably remove terminal rows selected by the inbox owner."""
+        remove_ids = {_id(message_id) for message_id in message_ids}
+        if not remove_ids:
+            return
+        with self._lock:
+            self._refresh()
+            if isinstance(self._state, _Broken):
+                raise TypeError("sent-message tracking record is malformed")
+            selected = [
+                record for record in self._records if record["id"] in remove_ids
+            ]
+            if any("done" not in record["reported"] for record in selected):
+                raise ValueError("sent-message tracking record is not terminal")
+            outcome = self._persist(
+                (), remove_ids, _storage_lease=_storage_lease
+            )
+            if outcome.health.state == "broken":
+                raise TypeError("sent-message tracking record is malformed")
+            self._records = [
+                record for record in self._records if record["id"] not in remove_ids
+            ]
+            self._pending.difference_update(remove_ids)
+
     def mark_reported(
         self, statuses: Iterable[tuple[str, str]]
     ) -> SentLedgerOutcome[None]:
