@@ -1846,7 +1846,9 @@ async def test_concurrent_delegated_history_uses_store_durable_writer(
         await asyncio.wait_for(store.append_approval_history_async(end), 10)
 
     try:
-        await asyncio.gather(write_pair("wire-a"), write_pair("wire-b"))
+        await asyncio.wait_for(
+            asyncio.gather(write_pair("wire-a"), write_pair("wire-b")), 10
+        )
         history = [
             entry.data for entry in resident_entries(store) if entry.type == "approval_history"
         ]
