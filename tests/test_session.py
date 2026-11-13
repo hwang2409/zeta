@@ -642,6 +642,40 @@ async def test_project_instructions_editor_failure_prints_notice(
 
 
 @pytest.mark.asyncio
+async def test_project_instructions_editor_uses_terminal_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "zeta-home"
+    root = tmp_path / "project"
+    root.mkdir()
+    _, private = await asyncio.to_thread(_private_project, home, root, "")
+    monkeypatch.setenv("EDITOR", "editor")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(root)
+    app = await asyncio.to_thread(create_app, _args())
+    session = app._make_session()
+    app._active_session = session
+    app._install_full_screen_layout(session)
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 0
+
+    async def run_in_terminal(func, **_kwargs):
+        return func()
+
+    monkeypatch.setattr(tui_app.subprocess, "call", call)
+    monkeypatch.setattr(tui_app, "run_in_terminal", run_in_terminal)
+    result = await app._slash_commands.dispatch_async(app, "/project-instructions")
+
+    assert result is not None
+    assert str(private) in result
+    assert calls and calls[0][1]["stderr"] is subprocess.STDOUT
+    await app.close()
+
+
+@pytest.mark.asyncio
 async def test_project_instructions_serve_does_not_start_editor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

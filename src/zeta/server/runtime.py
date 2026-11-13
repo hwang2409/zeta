@@ -15,6 +15,7 @@ from ..config.settings import load_settings
 from ..config.settings import resolve as resolve_settings
 from ..core.approval import ApprovalPolicy
 from ..core.project_context import (
+    associate_project_discovery,
     discover_project,
     load_project_context,
     project_context_projection_for_discovery,
@@ -33,6 +34,7 @@ from ..core.slash import (
 )
 from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..project_context.projection import compose_with_stable_projection
+from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -139,6 +141,7 @@ class SessionState:
     policy: ApprovalPolicy
     project_dir: Path
     repo_root: Path
+    project_registry_busy: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -156,6 +159,7 @@ class SessionState:
             policy=composition.policy,
             project_dir=composition.project_dir,
             repo_root=composition.repo_root,
+            project_registry_busy=composition.project_registry_busy,
         )
 
     @property
@@ -352,6 +356,10 @@ class ServerRuntime:
         return self.metadata.session_id
 
     @property
+    def project_registry_busy(self) -> bool:
+        return self._state is not None and self._state.project_registry_busy
+
+    @property
     def project_dir(self) -> Path:
         if self._state is None:
             raise RuntimeError("server has no active session")
@@ -450,9 +458,16 @@ class ServerRuntime:
         skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
         agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         registry = self.manager.project_registry
+        if registry is not None and config.auto_project:
+            try:
+                discovery = associate_project_discovery(
+                    discovery, registry, create=False
+                )
+            except (ProjectRegistryError, OSError, ValueError):
+                pass
         projection = (
             project_context_projection_for_discovery(discovery, registry)
-            if registry is not None
+            if registry is not None and not discovery.registry_busy
             else None
         )
         session_project = projection.session_project if projection is not None else None
@@ -499,9 +514,20 @@ class ServerRuntime:
             project_root=repo_root,
         )
         registry = self.manager.project_registry
+        if (
+            registry is not None
+            and config.auto_project
+            and opened.metadata.project_id is None
+        ):
+            try:
+                discovery = associate_project_discovery(
+                    discovery, registry, create=False
+                )
+            except (ProjectRegistryError, OSError, ValueError):
+                pass
         projection = (
             registry.project_context_projection(opened.metadata.project_id)
-            if registry is not None
+            if registry is not None and not discovery.registry_busy
             else None
         )
         session_project = projection.session_project if projection is not None else None
