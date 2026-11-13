@@ -91,7 +91,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    AUTO_INDEX_MIN_BYTES = 1024 * 1024
+    AUTO_INDEX_MIN_BYTES = 16 * 1024 * 1024
     SCHEMA_VERSION = 5
     _NAME = "history-index.sqlite3"
 
