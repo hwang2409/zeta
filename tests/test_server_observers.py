@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import threading
 import uuid
@@ -881,31 +882,36 @@ async def test_controller_close_never_writes_after_registry_release(
     monkeypatch.setattr(server.connections, "release", registry_release)
     publication_done = asyncio.Event()
     publication_results: list[bool] = []
-    original_notify = server.control._notify
+    original_admit = server.control._admit_background
 
     async def record_notification(*args: Any, **kwargs: Any) -> bool:
-        result = await original_notify(*args, **kwargs)
+        result = await original_admit(*args, **kwargs)
         publication_results.append(result)
         publication_done.set()
         return result
 
-    monkeypatch.setattr(server.control, "_notify", record_notification)
+    monkeypatch.setattr(server.control, "_admit_background", record_notification)
     writer.close()
     await writer.wait_closed()
     try:
         await asyncio.wait_for(close_entered.wait(), TIMEOUT)
         assert server.runtime._background_event_sink is runtime_sink
-        runtime_sink(
+        publication = runtime_sink(
             server.runtime.session_id,
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"kind": "agent_completion", "text": "late"},
             ),
         )
+        publication_task = (
+            asyncio.create_task(publication) if inspect.isawaitable(publication) else None
+        )
         close_release.set()
         await asyncio.wait_for(client._close_lock.acquire(), TIMEOUT)
         client._close_lock.release()
         await asyncio.wait_for(publication_done.wait(), TIMEOUT)
+        if publication_task is not None:
+            await await_or_fail(publication_task, what="late background publication")
         assert publication_results in ([True], [False])
         assert "release" in order
         assert all(
@@ -991,12 +997,14 @@ async def _controller_event_stream(
             reader, is_event("approval_request"), what="approval_request"
         )
         assert server.runtime.loop is not None
-        server.runtime.loop._publish_background_event(
+        publication = server.runtime.loop._publish_background_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"kind": "agent_completion", "text": "background done"},
             )
         )
+        if inspect.isawaitable(publication):
+            await await_or_fail(publication, what="background event publication")
         frames += await read_until(
             reader, is_event("sub_agent_receipt"), what="sub_agent_receipt"
         )

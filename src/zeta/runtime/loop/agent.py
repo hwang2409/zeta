@@ -397,16 +397,10 @@ class AgentLoop(
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
 
-    async def _publish_background_event(self, event: StreamEvent) -> None:
+    def _publish_background_event(self, event: StreamEvent) -> Awaitable[None] | None:
         if self._background_event_sink is not None:
-            result = self._background_event_sink(event)
-            if inspect.isawaitable(result):
-                await result
-
-    async def _wait_for_background_event(self, event: StreamEvent) -> None:
-        result = self._publish_background_event(event)
-        if inspect.isawaitable(result):
-            await result
+            return self._background_event_sink(event)
+        return None
 
     def _create_task[TaskResult](
         self,

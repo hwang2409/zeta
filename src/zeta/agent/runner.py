@@ -59,6 +59,7 @@ from .child_context import (
     resolve_child_backend,
 )
 from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
+from .event_sink import await_event_sink
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
@@ -881,7 +882,8 @@ async def run_agent_tool(
             event_data: dict[str, object] = {"stream": "stdout"}
             if loop.agent_instance_id is not None:
                 event_data["agent_instance_id"] = loop.agent_instance_id
-            await loop._wait_for_background_event(
+            await await_event_sink(
+                loop._publish_background_event,
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     tool_call=tool_call,
@@ -980,7 +982,8 @@ async def run_agent_tool(
         data = {"depth": child_depth if depth is None else depth}
         data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
         if background:
-            await loop._wait_for_background_event(
+            await await_event_sink(
+                loop._publish_background_event,
                 StreamEvent(
                     event_type,
                     tool_call=call,

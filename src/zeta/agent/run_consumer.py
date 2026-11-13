@@ -18,6 +18,7 @@ from ..protocol.types import (
     harness_notice,
 )
 from ..tools.agent import agent_stats
+from .event_sink import await_event_sink
 from .explicit_finish import IdleNudgeLifecycle, kill_tasks_after_deadline
 from .finish_gate import FinishGateState
 from .receipt import (
@@ -292,7 +293,8 @@ async def consume_run(
                         publish_stalled,
                     )
                     if stalled_result == "suppressed" and not ordinary_idle_presented:
-                        await child_loop._wait_for_background_event(
+                        await await_event_sink(
+                            child_loop._publish_background_event,
                             StreamEvent(
                                 StreamEventType.AGENT_NOTIFICATION,
                                 data={

@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from ...agent.event_sink import await_event_sink
 from ...agent.plan_mode import plan_mode_prompt
 from ...config.live import (
     LiveConfigBase,
@@ -156,8 +157,9 @@ class LiveConfigMixin:
             if publish and candidate.notice:
                 self._live_config_notices.append(candidate.notice)
             if publish and candidate.payload is not None:
-                await self._wait_for_background_event(
-                    StreamEvent(StreamEventType.CONFIG_CHANGED, data=candidate.payload)
+                await await_event_sink(
+                    self._publish_background_event,
+                    StreamEvent(StreamEventType.CONFIG_CHANGED, data=candidate.payload),
                 )
 
     def _live_config_base_is_current(self, base: LiveConfigBase) -> bool:

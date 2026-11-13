@@ -975,7 +975,7 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     del client
     gc.collect()
 
-    assert server.runtime._background_event_sink is not None
+    assert server.runtime._background_event_sink is None
     assert server.runtime._memory_notice_sink is not None
     assert server.runtime._background_wake_sink is not None
     assert reference() is None

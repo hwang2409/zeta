@@ -16,6 +16,7 @@ from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..core.store._step_delivery import TerminalTargetSealedError
 from ..protocol.types import StreamEvent, StreamEventType
 from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
+from .event_sink import await_event_sink
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -413,7 +414,8 @@ class ConversationChannel:
         }
         result = await self.produce_to(None, NotificationInput("child_idle", data))
         for entry in result.entries:
-            await child_loop._wait_for_background_event(
+            await await_event_sink(
+                child_loop._publish_background_event,
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"notification_id": entry.id, **entry.data},

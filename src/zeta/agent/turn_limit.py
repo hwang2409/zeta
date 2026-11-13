@@ -18,6 +18,7 @@ from ..core.agent_progress import publish_child_started
 from ..core.checkpoints import _now
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
 from ..protocol.types import Message, StreamEvent, StreamEventType, harness_notice
+from .event_sink import await_event_sink
 from .presets import valid_max_turns
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
 
@@ -90,7 +91,8 @@ def turn_control_for(
 
 async def forward_nested_agent_start(child_loop: AgentLoop, event: StreamEvent) -> None:
     if event.type is StreamEventType.AGENT_START and child_loop.agent_depth > 1:
-        await child_loop._wait_for_background_event(
+        await await_event_sink(
+            child_loop._publish_background_event,
             StreamEvent(
                 StreamEventType.AGENT_START,
                 data={"agent_instance_id": child_loop.agent_instance_id},

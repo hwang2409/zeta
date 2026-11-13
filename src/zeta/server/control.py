@@ -139,8 +139,6 @@ class ServeControl:
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
-        # Serve reads requests serially per connection and has one controller,
-        # so this lock never contends today; status projects its holder.
         self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
@@ -1141,6 +1139,8 @@ class ServeControl:
     ) -> bool:
         if fields.pop("_admitted", False):
             return True
+        if getattr(self.server, "connections", None) is None:
+            return await self._notify(event, session_id, **fields)
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
         admission = self._admit_controller(event, session_id, **fields)
