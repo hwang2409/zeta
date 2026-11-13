@@ -778,9 +778,9 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
             with observer._append_lock(observer=True):
                 facts = observer._history_index_facts()
                 if not store._history_index.catch_up_validated(
-                    facts, observer._entries
+                    facts, observer._resident_rows.entries
                 ):
-                    observer._sync_history_index(observer._entries)
+                    observer._sync_history_index(observer._resident_rows.entries)
                 return facts
         finally:
             observer.close()
@@ -788,8 +788,8 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
-            if not store._history_index.catch_up_validated(facts, store._entries):
-                store._sync_history_index(store._entries)
+            if not store._history_index.catch_up_validated(facts, store._resident_rows.entries):
+                store._sync_history_index(store._resident_rows.entries)
             return facts
     finally:
         writer.close()
@@ -824,9 +824,9 @@ def _overlay_resident_entries(
     store: ConversationStore, page: IndexedHistoryPage
 ) -> IndexedHistoryPage:
     def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._entries):
+        if entry.seq > len(store._resident_rows.entries):
             return entry
-        resident = store._entries[entry.seq - 1]
+        resident = store._resident_rows.entries[entry.seq - 1]
         if resident.id != entry.id:
             return entry
         accepted = entry.data.get("_accepted_message")
@@ -893,7 +893,7 @@ class HistoryPageStoreMixin:
             self._history_index._mark_unavailable()
             return
         try:
-            self._sync_history_index(tuple(self.entry(ref) for ref in self.branch_refs()))
+            self._sync_history_index(self.resident_payloads())
         except (OSError, HistoryIndexError):
             self._history_index._mark_unavailable()
 
@@ -901,7 +901,7 @@ class HistoryPageStoreMixin:
         stat = os.stat(
             "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
         )
-        last = self._entries[-1] if self._entries else None
+        last = self._resident_rows.entries[-1] if self._resident_rows.entries else None
         return {
             "st_dev": stat.st_dev,
             "st_ino": stat.st_ino,
@@ -942,7 +942,7 @@ class HistoryPageStoreMixin:
                 self._history_index._mark_unavailable()
             return
         if not self._history_index.available:
-            self._sync_history_index(tuple(self.entry(ref) for ref in self.branch_refs()))
+            self._sync_history_index(self.resident_payloads())
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(

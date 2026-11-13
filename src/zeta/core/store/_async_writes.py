@@ -594,7 +594,7 @@ class AsyncDurableWritesMixin:
             or delta._resident_patch.replace_entries
         ):
             return entries
-        existing_ids = {entry.id for entry in self._entries}
+        existing_ids = {entry.id for entry in self._resident_rows.entries}
         missing = next(
             (
                 index
@@ -708,7 +708,7 @@ class AsyncDurableWritesMixin:
         )
         if current == baseline.cursor:
             return None
-        entries_to_install = writer._owned_installed_delta(tuple(writer._entries))
+        entries_to_install = writer._owned_installed_delta(tuple(writer._resident_rows.entries))
         return CommittedDelta(
             generation_before=baseline.generation,
             generation_after=writer.conversation_generation,
@@ -765,7 +765,7 @@ class AsyncDurableWritesMixin:
             if prelude is not None and isinstance(command, _StoreMutationCommand):
                 durable_command = replace(
                     command,
-                    baseline_count=len(writer._entries),
+                    baseline_count=len(writer._resident_rows.entries),
                     baseline_digest=writer._entry_prefix_digest,
                     baseline_patch=prelude._resident_patch.values,
                 )
@@ -923,7 +923,7 @@ class AsyncDurableWritesMixin:
         async with self._async_write_lock:
             command = replace(
                 command,
-                baseline_count=len(self._entries),
+                baseline_count=len(self._resident_rows.entries),
                 baseline_digest=self._entry_prefix_digest,
                 baseline_patch=_snapshot_patch_fields(self, command.patch_fields),
             )
@@ -936,7 +936,7 @@ class AsyncDurableWritesMixin:
                 if self.conversation_generation != resident_generation:
                     command = replace(
                         command,
-                        baseline_count=len(self._entries),
+                        baseline_count=len(self._resident_rows.entries),
                         baseline_digest=self._entry_prefix_digest,
                         baseline_patch=_snapshot_patch_fields(
                             self, command.patch_fields

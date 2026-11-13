@@ -128,10 +128,6 @@ class ConversationStore(
     ChildRunStoreMixin,
     SessionStatePersistenceMixin,
 ):
-    @property
-    def _entries(self) -> list[ConversationEntry]:
-        return self._resident_rows.entries
-
     def __init__(
         self,
         session_dir: str | Path | None = None,
@@ -438,15 +434,15 @@ class ConversationStore(
         notification_tui_presentations: set[str] = set()
         pending_prompts: set[str] = set()
         pending_prompt_acks: set[str] = set()
-        by_id = {entry.id: entry for entry in self._entries}
+        by_id = {entry.id: entry for entry in self._resident_rows.entries}
         active_ids: set[str] = set()
-        current = self._entries[-1] if self._entries else None
+        current = self._resident_rows.entries[-1] if self._resident_rows.entries else None
         while current is not None:
             if current.id in active_ids:
                 break
             active_ids.add(current.id)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        for expected_seq, entry in enumerate(self._entries, start=1):
+        for expected_seq, entry in enumerate(self._resident_rows.entries, start=1):
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
                     f"non-monotonic conversation sequence at {entry.id}"
@@ -630,8 +626,8 @@ class ConversationStore(
         self, rows: list[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
         prior_ids = set(self._entry_ids)
-        parent_id = self._entries[-1].id if self._entries else None
-        next_seq = self._entries[-1].seq + 1 if self._entries else 1
+        parent_id = self._resident_rows.entries[-1].id if self._resident_rows.entries else None
+        next_seq = self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1
         entries: list[ConversationEntry] = []
         for index, (entry_type, data) in enumerate(rows):
             self._validate_notification_write(entry_type, data)
@@ -704,12 +700,12 @@ class ConversationStore(
         if entry_id in prior_ids:
             raise ConversationIntegrityError(f"duplicate conversation id: {entry_id}")
         entry = ConversationEntry(
-            seq=(self._entries[-1].seq + 1 if self._entries else 1),
+            seq=(self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1),
             id=entry_id,
             parent_id=(
                 parent_id
                 if parent_id is not None
-                else (self._entries[-1].id if self._entries else None)
+                else (self._resident_rows.entries[-1].id if self._resident_rows.entries else None)
             ),
             lane="main",
             type=entry_type,
@@ -718,7 +714,7 @@ class ConversationStore(
         # Reject with the same payload and relation validators used while loading
         # before any authoritative bytes reach disk.
         self._validate_entry_payload(entry)
-        linear = not self._entries or entry.parent_id == self._entries[-1].id
+        linear = not self._resident_rows.entries or entry.parent_id == self._resident_rows.entries[-1].id
         touched = _ApprovalValidationOverlay.touched([entry])
         if touched or entry.type == "approval_request":
             if linear:
@@ -755,10 +751,10 @@ class ConversationStore(
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries(
-                _ApprovalValidationOverlay(), {row.id for row in self._entries}
+                _ApprovalValidationOverlay(), {row.id for row in self._resident_rows.entries}
             )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self._entries)
+            self._sync_history_index(self._resident_rows.entries)
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         self._record_physical_entry(entry)
@@ -914,7 +910,7 @@ class ConversationStore(
         if request_data:
             data["approval_requests"] = request_data
         with self._append_lock():
-            current_branch = tuple(self.entry(ref) for ref in self.branch_refs())
+            current_branch = self.resident_payloads()
             resolved_parent = (
                 parent_id
                 if parent_id is not None
@@ -990,7 +986,7 @@ class ConversationStore(
     def _branch_to_parent(self, parent_id: str | None) -> list[ConversationEntry]:
         if parent_id is None:
             return []
-        by_id = {entry.id: entry for entry in self._entries}
+        by_id = {entry.id: entry for entry in self._resident_rows.entries}
         current = by_id.get(parent_id)
         branch: list[ConversationEntry] = []
         seen: set[str] = set()
@@ -1072,7 +1068,7 @@ class ConversationStore(
         parent_id: str | None = None,
         reason: str | None = None,
     ) -> ConversationEntry | None:
-        branch = tuple(self.entry(ref) for ref in self.branch_refs())
+        branch = self.resident_payloads()
         states = self._approval_states_from_branch(branch)
         state = states.get(request_id)
         if state is None or state[1] is not None:
@@ -1101,7 +1097,7 @@ class ConversationStore(
         return self._append_row_unlocked("approval_resolution", data, parent_id)
 
     def compaction_marker_count(self) -> int:
-        return sum(entry.type == "compaction" for entry in tuple(self.entry(ref) for ref in self.branch_refs()))
+        return sum(entry.type == "compaction" for entry in self.resident_payloads())
 
     def latest_compaction_marker(self) -> ConversationEntry | None:
         """Return the newest compaction marker on the active branch (no copy).
@@ -1121,14 +1117,18 @@ class ConversationStore(
 
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""
-        return self._entries[-1].id if self._entries else None
+        return self._resident_rows.entries[-1].id if self._resident_rows.entries else None
 
     def active_branch_head_sequence(self) -> int:
         """Return the active leaf sequence without materializing the branch."""
-        return self._entries[-1].seq if self._entries else 0
+        return self._resident_rows.entries[-1].seq if self._resident_rows.entries else 0
 
     def branch_refs(self):
         return self._resident_rows.branch_refs()
+
+    def resident_payloads(self, refs=None):
+        """Read resident payloads for the given refs without storage access."""
+        return tuple(self._resident_rows.entry(ref) for ref in (self.branch_refs() if refs is None else refs))
 
     def resident_refs(self):
         return self._resident_rows.resident_refs()
@@ -1137,6 +1137,8 @@ class ConversationStore(
         return self._resident_rows.entry(ref)
 
     def stream_rows(self, refs, *, batch=256):
+        if self._owner_thread_id == threading.get_ident():
+            raise RuntimeError("stream_rows must run off the owner thread")
         return self._resident_rows.stream_rows(refs, batch=batch)
 
     def active_agent_receipts(self) -> tuple[tuple[str, str], ...]:
@@ -1192,4 +1194,4 @@ class ConversationStore(
 
     @property
     def entries(self) -> list[ConversationEntry]:
-        return [self._snapshot_entry(entry) for entry in self._entries]
+        return [self._snapshot_entry(entry) for entry in self._resident_rows.entries]

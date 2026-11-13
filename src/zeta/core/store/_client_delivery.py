@@ -205,7 +205,7 @@ class ClientDeliveryMixin:
 
         ids = [
             entry.data["delivery_id"]
-            for entry in self._entries
+            for entry in self._resident_rows.entries
             if entry.type == "client_delivery"
             and "outcome" in entry.data
             and entry.data["method"] == "steer"

@@ -172,7 +172,7 @@ class ApprovalHistoryStoreMixin:
         resolutions: dict[str, Mapping[str, Any]] = {}
         resolved: set[str] = set()
         requested: list[tuple[int, str, Mapping[str, object]]] = []
-        for entry in tuple(self.entry(ref) for ref in self.branch_refs()):
+        for entry in self.resident_payloads():
             if entry.type == "message":
                 for request in entry.data.get("approval_requests", []):
                     request_id = request["request_id"]
@@ -222,7 +222,7 @@ class ApprovalHistoryStoreMixin:
         """
         requests: dict[str, dict[str, Any]] = {}
         ended: set[str] = set()
-        for entry in tuple(self.entry(ref) for ref in self.branch_refs()):
+        for entry in self.resident_payloads():
             if entry.type != "approval_history":
                 continue
             data = entry.data
@@ -248,7 +248,7 @@ class ApprovalHistoryStoreMixin:
         a repeated restart never writes a duplicate end."""
         wire_id = payload["request_id"]
         with self._append_lock():
-            for entry in tuple(self.entry(ref) for ref in self.branch_refs()):
+            for entry in self.resident_payloads():
                 if (
                     entry.type == "approval_history"
                     and entry.data.get("event") == "approval_end"
