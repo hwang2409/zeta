@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -163,6 +164,7 @@ def test_warm_message_transcript_opens_from_compact_index(
         physical_reads += 1
         return original(store, source, validated_prefix)
 
+    # test-contract: seam counts authoritative transcript reads on warm startup
     monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
     with ConversationStore(tmp_path, session_id="warm-index") as reopened:
         assert [item.content[0].text for item in branch_messages(reopened)] == [
@@ -172,9 +174,12 @@ def test_warm_message_transcript_opens_from_compact_index(
 
     assert physical_reads == 0
 
-    (store.session_dir / "history-index.sqlite3").write_bytes(
-        b"broken disposable index"
-    )
+    index_path = store.session_dir / "history-index.sqlite3"
+    with sqlite3.connect(index_path) as connection:
+        connection.execute(
+            "UPDATE entries SET data=? WHERE seq=1",
+            (json.dumps({"message": message(MessageRole.ASSISTANT, "changed").to_dict()}),),
+        )
     with ConversationStore(tmp_path, session_id="warm-index") as recovered:
         assert [item.content[0].text for item in branch_messages(recovered)] == [
             "first",
@@ -182,9 +187,22 @@ def test_warm_message_transcript_opens_from_compact_index(
         ]
     assert physical_reads == 1
 
+    index_path.write_bytes(
+        b"broken disposable index"
+    )
+    with ConversationStore(tmp_path, session_id="warm-index") as recovered:
+        assert [item.content[0].text for item in branch_messages(recovered)] == [
+            "first",
+            "second",
+        ]
+    assert physical_reads == 2
+
 
 @pytest.mark.asyncio
-async def test_nonresident_rows_support_point_and_stream_reads(tmp_path: Path) -> None:
+async def test_nonresident_rows_support_point_and_stream_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
     store = ConversationStore(tmp_path, session_id="nonresident-reads")
     try:
         entries = [

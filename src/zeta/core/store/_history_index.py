@@ -279,9 +279,35 @@ class HistoryIndex:
                 if facts is None or any(facts.get(key) != value for key, value in expected.items()):
                     return None
                 try:
-                    if len(bytes.fromhex(str(facts.get("prefix_digest")))) != 32:
+                    expected_digest = bytes.fromhex(str(facts.get("prefix_digest")))
+                    if len(expected_digest) != 32:
                         return None
                 except ValueError:
+                    return None
+                digest = b""
+                indexed_entries = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries ORDER BY seq"
+                )
+                for seq, entry_id, parent_id, lane, entry_type, data in indexed_entries:
+                    encoded_line = b"".join(
+                        (
+                            b'{"data":',
+                            data.encode(),
+                            b',"id":',
+                            encode_json(entry_id),
+                            b',"lane":',
+                            encode_json(lane),
+                            b',"parent_id":',
+                            encode_json(parent_id),
+                            b',"seq":',
+                            encode_json(seq),
+                            b',"type":',
+                            encode_json(entry_type),
+                            b"}\n",
+                        )
+                    )
+                    digest = hashlib.sha256(digest + encoded_line).digest()
+                if digest != expected_digest:
                     return None
                 rows = connection.execute(
                     "SELECT e.seq,e.id,e.parent_id,e.lane,e.type,w.byte_offset,"
