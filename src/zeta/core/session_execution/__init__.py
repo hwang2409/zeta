@@ -8,11 +8,13 @@ import os
 import threading
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
 from ...locking import execution_lock
+from ..retention_access import acquire_after_retention_yield
 from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
@@ -181,6 +183,7 @@ class SessionExecutionLease:
         session_id: str,
         owner: OwnerHint,
         recovery: bool = False,
+        home: Path | None = None,
     ) -> SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
 
@@ -207,7 +210,11 @@ class SessionExecutionLease:
             os.set_inheritable(fd, False)
             try:
                 with execution_lock():
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquire_after_retention_yield(
+                        home or Path("."),
+                        lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB),
+                        lambda exc: SessionOwnedError(session_id),
+                    )
             except BlockingIOError as exc:
                 surface, pid, epoch = _read_owner_hint(fd)
                 os.close(fd)
@@ -217,6 +224,15 @@ class SessionExecutionLease:
                     owner_pid=pid,
                     owner_epoch=epoch,
                 ) from exc
+            except SessionOwnedError:
+                surface, pid, epoch = _read_owner_hint(fd)
+                os.close(fd)
+                raise SessionOwnedError(
+                    session_id,
+                    owner_surface=surface,
+                    owner_pid=pid,
+                    owner_epoch=epoch,
+                ) from None
             except BaseException:
                 os.close(fd)
                 raise
@@ -380,6 +396,7 @@ class StoreRuntimeLeaseMixin:
             session_id=session_id,
             owner=OwnerHint(owner_surface),
             recovery=recovery_owner,
+            home=self._storage_lease.home,
         )
 
     @property

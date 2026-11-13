@@ -108,7 +108,7 @@ class SessionReferenceGate:
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         with ExitStack() as authority:
             try:
-                authority.enter_context(
+                enter = lambda: authority.enter_context(
                     domain_authority(
                         self.home,
                         RETENTION_HOME_ID,
@@ -117,6 +117,19 @@ class SessionReferenceGate:
                         nonblocking=on_loop or timeout is not None,
                     )
                 )
+                if exclusive:
+                    enter()
+                else:
+                    from .retention_access import acquire_after_retention_yield
+
+                    acquire_after_retention_yield(
+                        self.home,
+                        enter,
+                        lambda exc: SessionReferenceUnavailable(
+                            f"session reference unavailable: {unavailable_id or 'unknown'} is being deleted"
+                        ),
+                        observed_epoch=self.lease.observed_epoch,
+                    )
             except BlockingIOError as exc:
                 if timeout is not None and not on_loop:
                     deadline = time.monotonic() + timeout
@@ -393,9 +406,17 @@ def session_directory(
             if exclusive:
                 drain_releases()  # a store this process dropped must not refuse deletion
             try:
-                fcntl.flock(
-                    session_fd,
-                    (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB,
+                from .retention_access import acquire_after_retention_yield
+
+                acquire_after_retention_yield(
+                    root.parent,
+                    lambda: fcntl.flock(
+                        session_fd,
+                        (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB,
+                    ),
+                    lambda exc: SessionInUseError(
+                        "session is currently open or in use"
+                    ),
                 )
             except BlockingIOError as exc:
                 raise SessionInUseError("session is currently open or in use") from exc

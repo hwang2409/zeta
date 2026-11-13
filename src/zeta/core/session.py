@@ -258,6 +258,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                             destination_fd,
                             session_id=session_id,
                             owner=OwnerHint(self._owner_surface),
+                            home=self.home,
                         )
                     referenced_ids = (parent_session_id,) if parent_session_id else ()
                     if _reference_authority is not None:
@@ -398,6 +399,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                 directory_fd,
                 session_id=session_id,
                 owner=OwnerHint(self._owner_surface),
+                home=self.home,
             )
         opened_metadata: SessionMetadata | None = None
         reference_authority: SessionReferenceAuthority | None = None
@@ -1127,6 +1129,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     directory_fd,
                     session_id=session_id,
                     owner=OwnerHint(self._owner_surface),
+                    home=self.home,
                 )
             try:
                 with lease.serialize_mutation():
