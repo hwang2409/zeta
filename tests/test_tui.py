@@ -16363,6 +16363,29 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         )
         assert "history-0" in Text.from_ansi(app._transcript.render(120)).plain
 
+        request = app._transcript.open_finder()
+        app._active_finder = app._transcript
+        app._start_finder_preparation(request)
+        app._finder_input("history-")
+        assert app._history_search_task is not None
+        await await_or_fail(
+            app._history_search_task,
+            what="global transcript search",
+        )
+        assert len(app._history_search_results) == 200
+        app._history_search_index = len(app._history_search_results) - 1
+        assert app._navigate_history_search(1)
+        assert app._history_search_task is not None
+        await await_or_fail(app._history_search_task, what="wrapped next search result")
+        assert app._history_search_index == 0
+        assert app._navigate_history_search(-1)
+        assert app._history_search_task is not None
+        await await_or_fail(
+            app._history_search_task,
+            what="wrapped previous search result",
+        )
+        assert app._history_search_index == len(app._history_search_results) - 1
+
         app._append_transcript(Text("live-tail"))
         page_number = 0
         async with asyncio.timeout(120):
