@@ -25,6 +25,7 @@ class SessionPromptHistory:
         self._index: int | None = None
         self._draft: Document | None = None
         self._load: asyncio.Task[None] | None = None
+        self._generation = 0
 
     @property
     def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
@@ -45,10 +46,14 @@ class SessionPromptHistory:
             await self._load
             return
 
+        generation = self._generation
+
         async def read() -> None:
             rows, older, newer = await self.source.prompt_page(
                 self._older, direction="older"
             )
+            if generation != self._generation:
+                return
             self._older, self._newer = older, newer
             if rows:
                 self._entries.insert(0, rows)
@@ -69,10 +74,14 @@ class SessionPromptHistory:
             await self._load
             return
 
+        generation = self._generation
+
         async def read() -> None:
             rows, older, newer = await self.source.prompt_page(
                 self._newer, direction="newer"
             )
+            if generation != self._generation:
+                return
             self._older, self._newer = older, newer
             if rows:
                 self._entries.append(rows)
@@ -156,13 +165,29 @@ class SessionPromptHistory:
         self._index = None
         self._draft = None
 
+    async def finder_snapshot(self) -> tuple[str, ...]:
+        """Read prompt pages oldest-first without retaining them in the owner."""
+
+        source = self.source
+        if source is None:
+            return self.snapshot(self._session) if self._session is not None else ()
+        cursor: HistoryCursor | None = None
+        pages: list[tuple[tuple[str, str], ...]] = []
+        while True:
+            rows, older, _newer = await source.prompt_page(cursor, direction="older")
+            if rows:
+                pages.append(rows)
+            if older is None:
+                break
+            cursor = older
+        return tuple(text for page in reversed(pages) for _entry_id, text in page)
+
     async def close(self) -> None:
-        task = self._load
         self.clear()
-        if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
 
     def clear(self) -> None:
+        self._generation += 1
         if self._load is not None:
             self._load.cancel()
         self._load = None

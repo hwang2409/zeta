@@ -178,9 +178,15 @@ class _StreamingText(StreamingText):
 
 
 class _TranscriptUnit:
-    def __init__(self, key: int, value: RenderableType | _ToolUnit | None) -> None:
+    def __init__(
+        self,
+        key: int,
+        value: RenderableType | _ToolUnit | None,
+        history_identity: tuple[str, int] | None = None,
+    ) -> None:
         self.key = key
         self.value = value
+        self.history_identity = history_identity
 
 
 class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl):
@@ -201,6 +207,9 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         )
         self._revision = 0
         self._next_key = 0
+        self._scroll_generation = 0
+        self._history_entry_id: str | None = None
+        self._history_unit_ordinal = 0
         self._follow_tail = True
         self._scroll_offset = 0
         self._viewport_height = 1
@@ -285,7 +294,11 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._highlight_cache = None
 
     def _append_unit(self, value: RenderableType | _ToolUnit | None) -> _TranscriptUnit:
-        unit = _TranscriptUnit(self._next_key, value)
+        history_identity = None
+        if self._history_entry_id is not None:
+            history_identity = (self._history_entry_id, self._history_unit_ordinal)
+            self._history_unit_ordinal += 1
+        unit = _TranscriptUnit(self._next_key, value, history_identity)
         self._units.append(unit)
         self._unit_set.add(unit)
         self._next_key += 1
@@ -306,6 +319,16 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def append(self, renderable: RenderableType) -> _TranscriptUnit:
         return self._append_unit(renderable)
+
+    def begin_history_entry(self, entry_id: str) -> None:
+        """Tag rendered units with one durable history identity."""
+
+        self._history_entry_id = entry_id
+        self._history_unit_ordinal = 0
+
+    def end_history_entry(self) -> None:
+        self._history_entry_id = None
+        self._history_unit_ordinal = 0
 
     def adopt_units(
         self, units: Sequence[RenderableType | _ToolUnit | None]
@@ -392,6 +415,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._highlight_cache = None
         self._scroll_offset = 0
         self._follow_tail = True
+        self.end_history_entry()
         self._bump_revision()
 
     def set_line_limit_marker(self, marker: str | None) -> None:
@@ -583,6 +607,19 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             return None, 0
         return self._anchor
 
+    @property
+    def scroll_generation(self) -> int:
+        return self._scroll_generation
+
+    @property
+    def durable_scroll_anchor(self) -> tuple[str, int, int] | None:
+        if self._anchor is None or self._anchor[0] is None:
+            return None
+        identity = self._anchor[0].history_identity
+        if identity is None:
+            return None
+        return identity[0], identity[1], self._anchor[1]
+
     def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
         """Restore a non-tail viewport anchor after transcript reconstruction."""
 
@@ -592,11 +629,14 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._anchor = (unit, max(0, text_offset))
         self._bump_revision()
 
-    def restore_scroll_value(self, value: object, text_offset: int) -> bool:
-        """Restore an anchor by the value retained across a history repaint."""
+    def restore_durable_scroll_anchor(
+        self, anchor: tuple[str, int, int]
+    ) -> bool:
+        """Restore a viewport anchor after durable rows are reconstructed."""
 
+        entry_id, unit_ordinal, text_offset = anchor
         for unit in self._units:
-            if unit.value is value:
+            if unit is not None and unit.history_identity == (entry_id, unit_ordinal):
                 self.restore_scroll_anchor(unit, text_offset)
                 return True
         return False
@@ -613,6 +653,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def _scroll_by(self, amount: int) -> None:
         if self._follow_tail and amount >= 0:
             return
+        self._scroll_generation += 1
         if self._uses_virtual_history():
             self._pending_virtual_scroll += amount
             if amount < 0:
@@ -646,6 +687,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_top(self) -> None:
         """Move to the first transcript line without materializing all history."""
 
+        self._scroll_generation += 1
         self._follow_tail = False
         self._pending_virtual_scroll = 0
         if self._uses_virtual_history():
@@ -658,6 +700,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_bottom(self) -> None:
         """Resume following the live transcript tail."""
 
+        self._scroll_generation += 1
         self._follow_tail = True
         self._anchor = None
         self._pending_virtual_scroll = 0

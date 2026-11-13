@@ -16058,6 +16058,46 @@ async def test_history_finder_does_not_cross_session_boundaries(
     await second.close()
 
 
+@pytest.mark.asyncio
+async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(300):
+        store.append_message(
+            Message(
+                MessageRole.USER,
+                [TextContent(f"prompt-{index}")],
+                metadata={"zeta.origin": "user"},
+            )
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+    buffer = Buffer(document=Document("prompt-0"))
+
+    async with owned_app(app):
+        app._history_finder_open(buffer)
+        assert app._history_prompt_task is not None
+        await await_or_fail(
+            app._history_prompt_task,
+            what="ctrl+r prompt paging",
+        )
+        assert app._finder_prepare_task is not None
+        await await_or_fail(
+            app._finder_prepare_task,
+            what="ctrl+r candidate preparation",
+        )
+        result = app._history_finder.finder_rank()
+        assert result is not None
+        assert app._history_finder.finder_publish(result)
+        assert app._history_finder.finder_accept()
+        assert buffer.text == "prompt-0"
+        assert len(app._prompt_history.pages) <= 2
+
+
 def test_agent_transcript_source_keeps_snapshot_during_active_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16295,22 +16335,53 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         rendered = Text.from_ansi(app._transcript.render(120)).plain
         assert "history-49999" in rendered
         assert "history-0" not in rendered
-        assert len(app._transcript.units) <= 256
+        assert len(app._transcript.units) <= 4 * 128
         assert len(app._history_pager.pages) <= 4
         assert len(app._history_pager.descriptors) <= 4
         assert len(app._history_pager.scalar_tokens) == 6
+
+        for page_number in range(5):
+            app._transcript.scroll_to_top()
+            anchor = app._transcript.durable_scroll_anchor
+            app._scroll_history_up()
+            await asyncio.sleep(0)
+            reads = tuple(app._history_pager._loads.values())
+            assert len(reads) == 1
+            await await_or_fail(
+                asyncio.gather(*reads),
+                what=f"older transcript page {page_number + 1}",
+            )
+            assert app._transcript.durable_scroll_anchor == anchor
+            assert len(app._history_pager.descriptors) <= 4
+
         matches = await app._history_pager.search("history-0")
-        assert len(matches) == 1
-        await app._history_pager.reveal(matches[0])
+        assert [(match.entry_id, match.unit_ordinal) for match in matches]
+        await app._history_pager.reveal(matches[0].entry_id)
         app._render_resident_history()
+        assert app._transcript.restore_durable_scroll_anchor(
+            (matches[0].entry_id, matches[0].unit_ordinal, 0)
+        )
         assert "history-0" in Text.from_ansi(app._transcript.render(120)).plain
-        app._transcript.scroll_to_top()
+
         app._append_transcript(Text("live-tail"))
-        for _ in range(5):
-            await app._load_transcript_page(direction="older")
+        page_number = 0
+        async with asyncio.timeout(120):
+            while app._history_pager.can_load_newer:
+                page_number += 1
+                assert page_number <= 500
+                app._transcript.scroll_to_bottom()
+                app._scroll_history_down()
+                await asyncio.sleep(0)
+                reads = tuple(app._history_pager._loads.values())
+                assert len(reads) == 1
+                await await_or_fail(
+                    asyncio.gather(*reads),
+                    what=f"newer transcript page {page_number}",
+                )
+        app._transcript.scroll_to_bottom()
         rendered = Text.from_ansi(app._transcript.render(120)).plain
         assert "live-tail" in rendered
-        app._transcript.scroll_to_bottom()
+        assert "history-49999" in rendered
         assert app._transcript.follow_tail
 
 @pytest.mark.asyncio

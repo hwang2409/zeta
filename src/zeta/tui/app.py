@@ -270,10 +270,14 @@ class TUIApp(
         self._history_source = RootTUIHistorySource(self.loop.store)
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        self._history_search_results: tuple[Any, ...] = ()
+        self._history_search_index = 0
         self._history_prompt_task: asyncio.Task[None] | None = None
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._rendering_history = False
         self._live_sequence = 0
+        self._live_entry_id: str | None = None
+        self._live_unit_ordinal = 0
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
@@ -520,9 +524,9 @@ class TUIApp(
             on_finder_cancel=lambda: app._finder_cancel(),
             on_finder_toggle_preview=lambda: app._finder_toggle_preview(),
             search_active=lambda: app._viewed_transcript().search_active,
-            on_search_next=lambda: app._viewed_transcript().next_search_match(),
-            on_search_previous=lambda: app._viewed_transcript().previous_search_match(),
-            on_search_end=lambda: app._viewed_transcript().end_search(),
+            on_search_next=lambda: app._navigate_history_search(1),
+            on_search_previous=lambda: app._navigate_history_search(-1),
+            on_search_end=lambda: app._end_history_search(),
             on_previous_user=lambda: app._navigate_history_user("older"),
             on_next_user=lambda: app._navigate_history_user("newer"),
             on_toggle_agent=lambda: (
@@ -691,6 +695,8 @@ class TUIApp(
         asyncio.create_task(reveal())
 
     def _finder_input(self, query: str) -> None:
+        self._history_search_results = ()
+        self._history_search_index = 0
         FinderRuntimeMixin._finder_input(self, query)
         history_pager = getattr(self, "_history_pager", None)
         if history_pager is None:
@@ -707,16 +713,22 @@ class TUIApp(
 
         async def reveal_match() -> None:
             matches = await history_pager.search(query)
+            if not matches or not self._transcript.finder_active:
+                return
+            self._history_search_results = matches
+            self._history_search_index = 0
+            target = matches[0]
             resident = {
                 unit.entry_id
                 for page in history_pager.pages
                 for unit in page.units
             }
-            target = next((entry_id for entry_id in matches if entry_id not in resident), None)
-            if target is None or not self._transcript.finder_active:
-                return
-            await history_pager.reveal(target)
+            if target.entry_id not in resident:
+                await history_pager.reveal(target.entry_id)
             self._render_resident_history()
+            self._transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
             request = self._transcript.open_finder()
             self._active_finder = self._transcript
             self._start_finder_preparation(request)
@@ -724,6 +736,42 @@ class TUIApp(
             self._invalidate_prompt()
 
         self._history_search_task = asyncio.create_task(reveal_match())
+
+    def _navigate_history_search(self, delta: int) -> bool:
+        if not self._history_search_results:
+            viewed = self._viewed_transcript()
+            return (
+                viewed.next_search_match()
+                if delta > 0
+                else viewed.previous_search_match()
+            )
+        self._history_search_index = (
+            self._history_search_index + delta
+        ) % len(self._history_search_results)
+        target = self._history_search_results[self._history_search_index]
+
+        async def reveal() -> None:
+            await self._history_pager.reveal(target.entry_id)
+            if not self._transcript.finder_active:
+                return
+            query = self._transcript.search_query
+            self._render_resident_history()
+            self._transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            request = self._transcript.open_finder()
+            self._active_finder = self._transcript
+            self._start_finder_preparation(request)
+            self._transcript.finder_set_query(query)
+            self._invalidate_prompt()
+
+        self._history_search_task = asyncio.create_task(reveal())
+        return True
+
+    def _end_history_search(self) -> None:
+        self._history_search_results = ()
+        self._history_search_index = 0
+        self._viewed_transcript().end_search()
 
     async def _close_history_search(self) -> None:
         tasks = tuple(
@@ -733,9 +781,9 @@ class TUIApp(
         )
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
         self._history_search_task = None
+        self._history_search_results = ()
+        self._history_search_index = 0
         self._history_prompt_task = None
 
     async def _close_history_markers(self) -> None:
@@ -750,12 +798,12 @@ class TUIApp(
             return
         path = self._viewed_session_path()
         prompt_history.bind(path, self._history_source)
-        if prompt_history.snapshot(path):
-            FinderRuntimeMixin._history_finder_open(self, buffer)
-            return
 
         async def load() -> None:
-            await prompt_history.load_older()
+            snapshot = await prompt_history.finder_snapshot()
+            if path != self._viewed_session_path():
+                return
+            self._history_finder.set_snapshot(snapshot)
             FinderRuntimeMixin._history_finder_open(self, buffer)
 
         self._history_prompt_task = asyncio.create_task(load())
@@ -891,9 +939,19 @@ class TUIApp(
         if renderable is not None:
             self._transcript.append(renderable)
             if not self._rendering_history:
-                self._live_sequence += 1
+                entry_id = self.loop.store.active_branch_head_id()
+                if entry_id is None or entry_id == self._history_pager.endpoint_id:
+                    self._live_sequence += 1
+                    entry_id = f"live:{self._live_sequence}"
+                    unit_ordinal = 0
+                else:
+                    if entry_id != self._live_entry_id:
+                        self._live_entry_id = entry_id
+                        self._live_unit_ordinal = 0
+                    unit_ordinal = self._live_unit_ordinal
+                    self._live_unit_ordinal += 1
                 self._history_pager.append_live(
-                    f"live:{self._live_sequence}", renderable
+                    entry_id, renderable, unit_ordinal=unit_ordinal
                 )
 
     def _print(self, renderable: RenderableType | None) -> None:

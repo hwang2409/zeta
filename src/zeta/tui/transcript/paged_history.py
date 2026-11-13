@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -10,6 +11,12 @@ from typing import Any, Literal, Protocol
 @dataclass(frozen=True, slots=True)
 class HistoryCursor:
     value: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistorySearchResult:
+    entry_id: str
+    unit_ordinal: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +76,9 @@ class TUIHistorySource(Protocol):
         self, entry_id: str, *, direction: Literal["older", "newer"]
     ) -> str | None: ...
 
-    async def search(self, query: str, *, limit: int = 200) -> tuple[str, ...]: ...
+    async def search(
+        self, query: str, *, limit: int = 200
+    ) -> tuple[HistorySearchResult, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,46 +88,55 @@ class PageDescriptor:
 
 
 class PagedTranscriptHistory:
-    """Own at most four transcript pages and coalesce edge reads."""
+    """Own one contiguous, bounded deque of transcript paint segments."""
 
     max_pages = 4
     max_scalar_tokens = 6
+    max_segment_rows = 128
+    max_segment_bytes = 1024 * 1024
 
     def __init__(self, source: TUIHistorySource) -> None:
-        self.source = source
+        self.source: TUIHistorySource | None = source
         self.generation = 0
         self.endpoint_id: str | None = None
-        self._pages: dict[str, PageDescriptor] = {}
+        self._segments: deque[PageDescriptor] = deque()
         self._older: HistoryCursor | None = None
         self._newer: HistoryCursor | None = None
         self._frozen_endpoint: str | None = None
         self._newest_tail: HistoryCursor | None = None
-        self._live_units: list[TUIHistoryUnit] = []
         self._anchor: tuple[str, int, int] | None = None
         self._reveal_target: str | None = None
         self._loads: dict[
             tuple[int, str | None, str, str | None], asyncio.Task[TUIHistoryPage]
         ] = {}
+        self._live_sequence = 0
 
     @property
     def pages(self) -> tuple[TUIHistoryPage, ...]:
-        def position(descriptor: PageDescriptor) -> int:
-            cursor = descriptor.page.older
-            return int(cursor.value) if cursor is not None else -1
-
-        pages = [
-            descriptor.page
-            for descriptor in sorted(self._pages.values(), key=position)
-        ]
-        seen = {unit.entry_id for page in pages for unit in page.units}
-        live = tuple(unit for unit in self._live_units if unit.entry_id not in seen)
-        if live:
-            pages.append(TUIHistoryPage((TUIPaintSegment(live),)))
+        seen: set[tuple[str, int]] = set()
+        pages: list[TUIHistoryPage] = []
+        for descriptor in self._segments:
+            units: list[TUIHistoryUnit] = []
+            for unit in descriptor.page.units:
+                identity = (unit.entry_id, unit.unit_ordinal)
+                if identity not in seen:
+                    seen.add(identity)
+                    units.append(unit)
+            if units:
+                pages.append(
+                    TUIHistoryPage(
+                        (TUIPaintSegment(tuple(units), decoded_bytes=descriptor.page.segments[0].decoded_bytes),),
+                        older=descriptor.page.older,
+                        newer=descriptor.page.newer,
+                        endpoint_id=descriptor.page.endpoint_id,
+                        repair_generation=descriptor.page.repair_generation,
+                    )
+                )
         return tuple(pages)
 
     @property
     def descriptors(self) -> tuple[PageDescriptor, ...]:
-        return tuple(self._pages.values())
+        return tuple(self._segments)
 
     @property
     def scalar_tokens(self) -> tuple[object | None, ...]:
@@ -150,7 +168,7 @@ class PagedTranscriptHistory:
         """Invalidate publication without waiting for executor-backed reads."""
 
         self.reset()
-        self.source = None  # type: ignore[assignment]
+        self.source = None
         await asyncio.sleep(0)
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
@@ -158,41 +176,119 @@ class PagedTranscriptHistory:
         for task in self._loads.values():
             task.cancel()
         self._loads.clear()
-        self._pages.clear()
-        self._live_units.clear()
+        self._segments.clear()
         self._older = self._newer = self._newest_tail = None
         self._frozen_endpoint = endpoint_id
         self.endpoint_id = endpoint_id
         self._anchor = None
         self._reveal_target = None
 
-    def _key(self, page: TUIHistoryPage, cursor: HistoryCursor | None) -> str:
-        if page.units:
-            return page.units[0].entry_id
-        return f"{page.endpoint_id}:{cursor.value if cursor else 'initial'}"
+    def _refresh_edges(self) -> None:
+        if not self._segments:
+            self._older = self._newer = None
+            return
+        self._older = self._segments[0].page.older
+        newest_durable = next(
+            (
+                descriptor
+                for descriptor in reversed(self._segments)
+                if not descriptor.key.startswith("live:")
+            ),
+            None,
+        )
+        self._newer = (
+            newest_durable.page.newer if newest_durable is not None else None
+        )
 
-    def append_live(self, entry_id: str, value: Any) -> None:
-        """Keep provisional newest rows outside the durable page window."""
+    def _descriptor(self, page: TUIHistoryPage, index: int = 0) -> PageDescriptor:
+        segment = page.segments[index]
+        key = segment.first_entry_id or f"{page.endpoint_id}:{index}:{self.generation}"
+        return PageDescriptor(
+            key,
+            TUIHistoryPage(
+                (segment,),
+                older=page.older if index == 0 else None,
+                newer=page.newer if index == len(page.segments) - 1 else None,
+                endpoint_id=page.endpoint_id,
+                repair_generation=page.repair_generation,
+            ),
+        )
 
-        self._live_units = [
-            unit for unit in self._live_units if unit.entry_id != entry_id
-        ]
-        self._live_units.append(TUIHistoryUnit(entry_id, value))
+    def append_live(
+        self, entry_id: str, value: Any, *, unit_ordinal: int = 0
+    ) -> None:
+        """Rotate provisional tail rows through the same bounded segment deque."""
+
+        size = len(str(value).encode("utf-8", errors="replace"))
+        unit = TUIHistoryUnit(entry_id, value, unit_ordinal=unit_ordinal)
+        for index, descriptor in enumerate(self._segments):
+            units = list(descriptor.page.units)
+            for unit_index, existing in enumerate(units):
+                if (existing.entry_id, existing.unit_ordinal) == (
+                    entry_id,
+                    unit_ordinal,
+                ):
+                    units[unit_index] = unit
+                    self._segments[index] = PageDescriptor(
+                        descriptor.key,
+                        TUIHistoryPage(
+                            (
+                                TUIPaintSegment(
+                                    tuple(units),
+                                    decoded_bytes=descriptor.page.segments[0].decoded_bytes,
+                                ),
+                            ),
+                            older=descriptor.page.older,
+                            newer=descriptor.page.newer,
+                            endpoint_id=descriptor.page.endpoint_id,
+                            repair_generation=descriptor.page.repair_generation,
+                        ),
+                    )
+                    return
+        tail = self._segments[-1] if self._segments else None
+        if (
+            tail is not None
+            and tail.key.startswith("live:")
+            and len(tail.page.units) < self.max_segment_rows
+            and tail.page.segments[0].decoded_bytes + size <= self.max_segment_bytes
+        ):
+            units = (*tail.page.units, unit)
+            self._segments[-1] = PageDescriptor(
+                tail.key,
+                TUIHistoryPage(
+                    (TUIPaintSegment(units, decoded_bytes=tail.page.segments[0].decoded_bytes + size),),
+                    older=tail.page.older,
+                    newer=None,
+                    endpoint_id=self.endpoint_id,
+                ),
+            )
+        else:
+            self._live_sequence += 1
+            self._segments.append(
+                PageDescriptor(
+                    f"live:{self._live_sequence}",
+                    TUIHistoryPage(
+                        (TUIPaintSegment((unit,), decoded_bytes=size),),
+                        older=tail.page.newer if tail is not None else self._older,
+                        newer=None,
+                        endpoint_id=self.endpoint_id,
+                    ),
+                )
+            )
+        while len(self._segments) > self.max_pages:
+            self._segments.popleft()
+        self._refresh_edges()
 
     async def load(self, direction: Literal["older", "newer"] = "older") -> TUIHistoryPage:
         cursor = self._older if direction == "older" else self._newer
-        key = (
-            self.generation,
-            self.endpoint_id,
-            direction,
-            cursor.value if cursor else None,
-        )
+        key = (self.generation, self.endpoint_id, direction, cursor.value if cursor else None)
         task = self._loads.get(key)
         if task is None:
             generation = self.generation
-            if self.source is None:
+            source = self.source
+            if source is None:
                 return TUIHistoryPage(())
-            task = asyncio.create_task(self.source.page(cursor, direction=direction))
+            task = asyncio.create_task(source.page(cursor, direction=direction))
             self._loads[key] = task
             try:
                 page = await task
@@ -200,7 +296,7 @@ class PagedTranscriptHistory:
                 self._loads.pop(key, None)
             if generation != self.generation:
                 return TUIHistoryPage(())
-            self.adopt(page, direction=direction, cursor=cursor)
+            self.adopt(page, direction=direction)
             return page
         return await task
 
@@ -209,49 +305,86 @@ class PagedTranscriptHistory:
         page: TUIHistoryPage,
         *,
         direction: Literal["older", "newer"] = "older",
-        cursor: HistoryCursor | None = None,
     ) -> None:
+        if not page.segments:
+            return
         if page.endpoint_id is not None:
             self.endpoint_id = page.endpoint_id
             self._frozen_endpoint = page.endpoint_id
-        key = self._key(page, cursor)
-        self._pages[key] = PageDescriptor(key, page)
+        durable_ids = {unit.entry_id for unit in page.units}
+        self._segments = deque(
+            descriptor
+            for descriptor in self._segments
+            if not (
+                descriptor.key.startswith("live:")
+                and any(unit.entry_id in durable_ids for unit in descriptor.page.units)
+            )
+        )
+        descriptors = [self._descriptor(page, index) for index in range(len(page.segments))]
         if direction == "older":
-            self._older = page.older
+            for descriptor in reversed(descriptors):
+                self._segments.appendleft(descriptor)
+            while len(self._segments) > self.max_pages:
+                candidates = [
+                    descriptor
+                    for descriptor in reversed(self._segments)
+                    if not descriptor.key.startswith("live:")
+                    and descriptor not in descriptors
+                ] or [
+                    descriptor
+                    for descriptor in reversed(self._segments)
+                    if not descriptor.key.startswith("live:")
+                ]
+                self._segments.remove(candidates[0] if candidates else self._segments[-1])
         else:
-            self._newer = page.newer
-        if page.newer is None:
-            self._newest_tail = cursor
-        while len(self._pages) > self.max_pages:
-            candidates = [
-                candidate
-                for candidate, descriptor in self._pages.items()
-                if candidate != key and descriptor.page.newer is not None
-            ]
-            if not candidates:
-                candidates = [candidate for candidate in self._pages if candidate != key]
-            self._pages.pop(candidates[0])
-
-    def evict(self, key: str) -> None:
-        self._pages.pop(key, None)
+            live_index = next(
+                (
+                    index
+                    for index, descriptor in enumerate(self._segments)
+                    if descriptor.key.startswith("live:")
+                ),
+                len(self._segments),
+            )
+            for descriptor in descriptors:
+                self._segments.insert(live_index, descriptor)
+                live_index += 1
+            while len(self._segments) > self.max_pages:
+                candidates = [
+                    descriptor
+                    for descriptor in self._segments
+                    if not descriptor.key.startswith("live:")
+                    and descriptor not in descriptors
+                ] or [
+                    descriptor
+                    for descriptor in self._segments
+                    if not descriptor.key.startswith("live:")
+                ]
+                self._segments.remove(candidates[0] if candidates else self._segments[0])
+        self._refresh_edges()
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
         self._reveal_target = entry_id
         generation = self.generation
-        page = await self.source.reveal(entry_id)
-        if generation == self.generation:
+        source = self.source
+        if source is None:
+            return TUIHistoryPage(())
+        page = await source.reveal(entry_id)
+        if generation == self.generation and page.segments:
+            self._segments.clear()
             self.adopt(page)
         return page
 
     async def navigate_user(
         self, entry_id: str, direction: Literal["older", "newer"]
     ) -> str | None:
-        target = await self.source.adjacent_visible_user(
-            entry_id, direction=direction
-        )
+        source = self.source
+        if source is None:
+            return None
+        target = await source.adjacent_visible_user(entry_id, direction=direction)
         if target is not None:
             await self.reveal(target)
         return target
 
-    async def search(self, query: str) -> tuple[str, ...]:
-        return await self.source.search(query)
+    async def search(self, query: str) -> tuple[HistorySearchResult, ...]:
+        source = self.source
+        return () if source is None else await source.search(query)

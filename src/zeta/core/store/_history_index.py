@@ -92,7 +92,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -338,9 +338,12 @@ class HistoryIndex:
                             history_group, tui_history_group,
                         ),
                     )
+                    if active:
+                        _row_history.write_text(
+                            connection, seq, entry_id, entry_type, data
+                        )
                     if active and entry_type == "message":
                         self._write_tool_calls(connection, seq, entry_id, data)
-                        _row_history.write_text(connection, seq, entry_id, data)
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
                                 "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -425,9 +428,11 @@ class HistoryIndex:
     ) -> None:
         for entry in entries:
             data = dict(entry.data)
+            _row_history.write_text(
+                connection, entry.seq, entry.id, entry.type, data
+            )
             if entry.type == "message":
                 self._write_tool_calls(connection, entry.seq, entry.id, data)
-                _row_history.write_text(connection, entry.seq, entry.id, data)
                 for approval in data.get("approval_requests", ()):
                     connection.execute(
                         "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -744,7 +749,11 @@ class HistoryIndex:
                 connection.close()
 
     def tui_search(
-        self, query: str, limit: int, g0: object
+        self,
+        query: str,
+        limit: int,
+        g0: object,
+        cancel: threading.Event | None = None,
     ) -> tuple[str, ...]:
         with self._lock:
             self._check_open()
@@ -756,7 +765,7 @@ class HistoryIndex:
                     stored.get(key) != value for key, value in requested.items()
                 ):
                     raise StaleHistorySnapshot
-                return _row_history.search(connection, query, limit)
+                return _row_history.search(connection, query, limit, cancel)
             finally:
                 connection.close()
 
@@ -1185,7 +1194,11 @@ class HistoryPageStoreMixin:
         )
 
     def tui_history_search(
-        self: ConversationStore, query: str, *, limit: int = 200
+        self: ConversationStore,
+        query: str,
+        *,
+        limit: int = 200,
+        cancel: threading.Event | None = None,
     ) -> tuple[str, ...]:
         index = self._history_index
         if self._closed or index is None:
@@ -1195,7 +1208,7 @@ class HistoryPageStoreMixin:
                 if not index.available:
                     _rebuild_history_index(self)
                 facts = self._history_index_facts()
-                result = index.tui_search(query, limit, facts)
+                result = index.tui_search(query, limit, facts, cancel)
             except (StaleHistorySnapshot, HistoryIndexUnavailableError):
                 index._mark_unavailable()
                 if self._read_only:

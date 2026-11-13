@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -242,23 +243,43 @@ def write_text(
     connection: sqlite3.Connection,
     seq: int,
     entry_id: str,
+    entry_type: str,
     data: Mapping[str, object],
 ) -> None:
-    try:
-        message = Message.from_dict(data["message"])
-    except (KeyError, TypeError, ValueError):
-        return
-    parts = [assistant_text(message)]
-    for content in message.content:
-        if isinstance(content, ToolUseContent):
-            parts.extend(
-                (
-                    content.tool_call.name,
-                    json.dumps(content.tool_call.arguments, sort_keys=True),
+    parts: list[str] = []
+    if entry_type == "message":
+        try:
+            message = Message.from_dict(data["message"])
+        except (KeyError, TypeError, ValueError):
+            return
+        parts.append(assistant_text(message))
+        for content in message.content:
+            if isinstance(content, ToolUseContent):
+                parts.extend(
+                    (
+                        content.tool_call.name,
+                        json.dumps(content.tool_call.arguments, sort_keys=True),
+                    )
                 )
-            )
-    if message.tool_result is not None:
-        parts.append(str(message.tool_result.content))
+        if message.tool_result is not None:
+            parts.append(str(message.tool_result.content))
+    elif entry_type == "checkpoint":
+        parts.extend(("checkpoint", str(data.get("label", ""))))
+    elif entry_type == "fork":
+        parts.extend(("fork", str(data.get("label", data.get("name", "")))))
+    elif entry_type == "compaction":
+        parts.append("compaction marker")
+    elif entry_type == "turn_end":
+        parts.extend(("turn ended", str(data.get("reason", ""))))
+    elif entry_type == "warning" and data.get("kind") == "transcript_recovery":
+        parts.extend(("transcript recovered", str(data.get("quarantine_id", ""))))
+    elif entry_type == "notification":
+        for key in ("title", "message", "body", "summary", "question"):
+            value = data.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    if not parts:
+        return
     connection.execute(
         "INSERT INTO message_search(entry_seq,entry_id,text) VALUES(?,?,?)",
         (seq, entry_id, "\n".join(parts).casefold()),
@@ -266,23 +287,27 @@ def write_text(
 
 
 def search(
-    connection: sqlite3.Connection, query: str, limit: int
+    connection: sqlite3.Connection,
+    query: str,
+    limit: int,
+    cancel: threading.Event | None = None,
 ) -> tuple[str, ...]:
-    pattern = (
-        "%"
-        + query.casefold()
-        .replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-        + "%"
+    needle = query.casefold()
+    cursor = connection.execute(
+        "SELECT s.entry_id,s.text FROM message_search s "
+        "JOIN entries e ON e.seq=s.entry_seq "
+        "WHERE e.tui_group IS NOT NULL ORDER BY s.entry_seq DESC"
     )
-    rows = connection.execute(
-        "SELECT entry_id FROM message_search "
-        "WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE "
-        "ORDER BY entry_seq DESC LIMIT ?",
-        (pattern, limit),
-    ).fetchall()
-    return tuple(row[0] for row in rows)
+    matches: list[str] = []
+    while rows := cursor.fetchmany(256):
+        if cancel is not None and cancel.is_set():
+            break
+        for entry_id, text in rows:
+            if needle in text:
+                matches.append(entry_id)
+                if len(matches) >= limit:
+                    return tuple(matches)
+    return tuple(matches)
 
 
 def history_index_suffix_start(

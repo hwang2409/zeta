@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import threading
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -16,6 +18,7 @@ from ...protocol.types import (
 from ..user import displayed_user_text
 from .paged_history import (
     HistoryCursor,
+    HistorySearchResult,
     TUIHistoryPage,
     TUIHistoryUnit,
     TUIPaintSegment,
@@ -103,51 +106,56 @@ class RootTUIHistorySource:
                 and not self._store.is_agent_notification_presented_to_tui(entry.id)
             )
         )
-        seen_calls: set[str] = set()
-        projected: list[tuple[str, Any]] = []
-        for entry in entries:
+        def bundle(entry: Any) -> tuple[list[TUIHistoryUnit], int]:
+            projected: list[tuple[str, Any]] = []
             if entry.type == "message":
                 message = Message.from_dict(entry.data["message"])
                 result = message.tool_result
-                if result is not None and result.tool_call_id not in seen_calls:
+                if result is not None:
                     dependency = self._store.tui_tool_call_dependency(
                         result.tool_call_id, entry.seq
                     )
                     if dependency is not None:
                         projected.append(
-                            (
-                                f"{dependency.id}:dependency:{entry.id}",
-                                dependency,
-                            )
+                            (f"{dependency.id}:dependency:{entry.id}", dependency)
                         )
-                        seen_calls.add(result.tool_call_id)
-                for block in message.content:
-                    if isinstance(block, ToolUseContent):
-                        seen_calls.add(block.tool_call.id)
             projected.append((entry.id, entry))
-        segments: list[TUIPaintSegment] = []
-        current: list[TUIHistoryUnit] = []
-        current_bytes = 0
-        for entry_id, entry in projected:
-            unit = TUIHistoryUnit(entry_id, _project_entry(entry))
-            size = len(repr(entry.data).encode())
-            if current and (len(current) >= 128 or current_bytes + size > 1024 * 1024):
-                segments.append(TUIPaintSegment(tuple(current), decoded_bytes=current_bytes))
-                current = []
-                current_bytes = 0
-            current.append(unit)
-            current_bytes += size
-        if current:
-            segments.append(TUIPaintSegment(tuple(current), decoded_bytes=current_bytes))
-        stop = indexed.start + len(indexed.groups)
+            return (
+                [
+                    TUIHistoryUnit(entry_id, _project_entry(item))
+                    for entry_id, item in projected
+                ],
+                sum(len(repr(item.data).encode()) for _entry_id, item in projected),
+            )
+
+        scan = reversed(entries) if direction == "older" else iter(entries)
+        selected: list[tuple[list[TUIHistoryUnit], int]] = []
+        row_count = decoded_bytes = 0
+        consumed = 0
+        for entry in scan:
+            units, size = bundle(entry)
+            if selected and (
+                row_count + len(units) > 128
+                or decoded_bytes + size > 1024 * 1024
+            ):
+                break
+            selected.append((units, size))
+            row_count += len(units)
+            decoded_bytes += size
+            consumed += 1
+        if direction == "older":
+            selected.reverse()
+            start = indexed.start + len(entries) - consumed
+            stop = indexed.start + len(entries)
+        else:
+            start = indexed.start
+            stop = indexed.start + consumed
+        units = tuple(unit for bundle_units, _size in selected for unit in bundle_units)
+        segments = (TUIPaintSegment(units, decoded_bytes=decoded_bytes),) if units else ()
         return TUIHistoryPage(
-            tuple(segments),
-            older=HistoryCursor(str(indexed.start)) if indexed.start > 0 else None,
-            newer=(
-                HistoryCursor(str(stop))
-                if stop < indexed.total
-                else None
-            ),
+            segments,
+            older=HistoryCursor(str(start)) if start > 0 else None,
+            newer=HistoryCursor(str(stop)) if stop < indexed.total else None,
             endpoint_id=indexed.endpoint,
             repair_generation=indexed.repair_generation,
         )
@@ -254,16 +262,19 @@ class RootTUIHistorySource:
 
         return await self._store._to_thread_store(read)
 
-    async def search(self, query: str, *, limit: int = 200) -> tuple[str, ...]:
-        def read() -> tuple[str, ...]:
-            needle = query.casefold()
-            matches: list[str] = []
-            for ref in reversed(self._store.branch_refs()):
-                entry = self._store.entry(ref)
-                if needle in repr(entry.data).casefold():
-                    matches.append(entry.id)
-                    if len(matches) >= limit:
-                        break
-            return tuple(matches)
-
-        return await self._store._to_thread_store(read)
+    async def search(
+        self, query: str, *, limit: int = 200
+    ) -> tuple[HistorySearchResult, ...]:
+        cancel = threading.Event()
+        worker = asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: self._store.tui_history_search(
+                query, limit=limit, cancel=cancel
+            ),
+        )
+        try:
+            entry_ids = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+        return tuple(HistorySearchResult(entry_id) for entry_id in entry_ids)
