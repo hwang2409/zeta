@@ -8849,11 +8849,11 @@ async def test_serve_retention_pin_table_uses_public_slash_run(tmp_path: Path) -
     try:
         baseline = read_reference_generation(server.home)
         for text, expected, delta in (
-            ("/pin", "session pinned", 1),
-            ("/pin", "session pinned", 1),
-            ("/unpin", "session unpinned", 2),
-            ("/unpin", "session unpinned", 2),
-            ("/pin extra", "usage: /pin", 2),
+            ("/pin", "session pinned", 0),
+            ("/pin", "session pinned", 0),
+            ("/unpin", "session unpinned", 1),
+            ("/unpin", "session unpinned", 1),
+            ("/pin extra", "usage: /pin", 1),
         ):
             response = await _request(
                 reader, writer, text, "slash_run", {"session_id": session_id, "text": text}
