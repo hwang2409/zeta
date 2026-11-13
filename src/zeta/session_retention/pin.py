@@ -90,8 +90,10 @@ def set_retention_pin(
         # or remove it through a public operation.
         if sidecar_exists and not _safe_sidecar(session_fd):
             return "retention pin unsafe: refusing change"
-        if sidecar_exists and current:
-            return "session pinned" if pinned else "session unpinned"
+        if pinned and sidecar_exists and current:
+            return "session pinned"
+        if not pinned and not sidecar_exists:
+            return "session unpinned"
         authority.gate.bump_generation()
         if pinned:
             write_retention_pin(session_fd)
