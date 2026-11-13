@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -703,6 +704,63 @@ async def test_socket_http_list_changed_refreshes_next_turn_catalog(
 
 
 @pytest.mark.asyncio
+async def test_bound_http_list_changed_disconnect_does_not_drop_refresh_coroutine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport,
+        "handle_async_request",
+        _REAL_ASYNC_HTTP_REQUEST,
+    )
+    mcp = LocalMCP(chunked_notifications=True)
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http",
+        "url": f"http://127.0.0.1:{port}",
+    }}}))
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("mounted")])])
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        await _request(reader, writer, 2, "new_session", {
+            "provider": "codex",
+            "mcp_bindings": [{
+                "server": "page",
+                "headers": {"Authorization": f"Bearer {SECRET}"},
+            }],
+        })
+        await _request(reader, writer, 3, "send", {"text": "mount"})
+        await _event(reader, "agent_end")
+        await mcp.add_tool()
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        gc.collect()
+        assert not [
+            warning
+            for warning in recwarn
+            if warning.category is RuntimeWarning
+            and "was never awaited" in str(warning.message)
+        ], "disconnect dropped an unawaited MCP tool refresh coroutine"
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_refresh_expired_deadline_does_not_wait(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1253,6 +1311,7 @@ async def test_binding_added_by_resume_is_hidden_from_existing_child(
         await _request(reader, writer, 4, "send", {"text": "delegate"})
         await asyncio.wait_for(backend.child_started[child_prompt].wait(), TIMEOUT)
         await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
 
         resumed = (await _request(reader, writer, 5, "resume", {
             "session_id": created["session"]["session_id"],
