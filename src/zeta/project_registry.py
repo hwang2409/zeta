@@ -995,6 +995,63 @@ class ProjectRegistry(
         """Apply one child-lineage project group under held sessions authority."""
         self._update_sessions_locked(project_fd, remove_ids, records)
 
+    @staticmethod
+    def _coalesce_session_records(
+        existing: list[dict[str, object]],
+        remove_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], bool, bool]:
+        """Return retained rows, whether compaction occurred, and whether changed."""
+        retained = [
+            record
+            for record in existing
+            if str(record["session_id"]) not in remove_ids
+        ]
+        root_ids = {
+            str(record["session_id"])
+            for record in retained
+            if _SESSION_ID.fullmatch(str(record["session_id"]))
+        }
+        root_ids.update(
+            str(record["session_id"])
+            for record in records
+            if _SESSION_ID.fullmatch(str(record["session_id"]))
+        )
+        compacted = [
+            record
+            for record in retained
+            if not _is_represented_child_record(record, root_ids)
+        ]
+        changed = len(compacted) != len(existing)
+        retained = compacted
+        positions = {
+            str(record["session_id"]): index
+            for index, record in enumerate(retained)
+        }
+        for record in records:
+            if _is_represented_child_record(record, root_ids):
+                continue
+            session_id = str(record["session_id"])
+            position = positions.get(session_id)
+            if position is None:
+                if len(retained) >= MAX_SESSION_REFERENCES:
+                    raise ProjectRegistryError("project session reference limit exceeded")
+                positions[session_id] = len(retained)
+                retained.append(record)
+                changed = True
+                continue
+            current = retained[position]
+            business = {
+                key: value for key, value in record.items() if key != "recorded_at"
+            }
+            current_business = {
+                key: value for key, value in current.items() if key != "recorded_at"
+            }
+            if current_business != business:
+                retained[position] = record
+                changed = True
+        return retained, compacted != existing, changed
+
     def _update_sessions_locked(
         self,
         project_fd: int,
@@ -1017,56 +1074,9 @@ class ProjectRegistry(
             existing = self._read_session_records(
                 directory_fd, repair_torn_final=True, allow_overflow=True
             )
-            retained = [
-                record
-                for record in existing
-                if str(record["session_id"]) not in remove_ids
-            ]
-            root_ids = {
-                str(record["session_id"])
-                for record in retained
-                if _SESSION_ID.fullmatch(str(record["session_id"]))
-            }
-            root_ids.update(
-                str(record["session_id"])
-                for record in records
-                if _SESSION_ID.fullmatch(str(record["session_id"]))
+            retained, compacted, changed = self._coalesce_session_records(
+                existing, remove_ids, records
             )
-            compacted = [
-                record
-                for record in retained
-                if not _is_represented_child_record(record, root_ids)
-            ]
-            changed = len(compacted) != len(existing)
-            retained = compacted
-            positions = {
-                str(record["session_id"]): index
-                for index, record in enumerate(retained)
-            }
-            for record in records:
-                if _is_represented_child_record(record, root_ids):
-                    continue
-                session_id = str(record["session_id"])
-                position = positions.get(session_id)
-                if position is None:
-                    if len(retained) >= MAX_SESSION_REFERENCES:
-                        raise ProjectRegistryError(
-                            "project session reference limit exceeded"
-                        )
-                    positions[session_id] = len(retained)
-                    retained.append(record)
-                    changed = True
-                    continue
-                current = retained[position]
-                business = {
-                    key: value for key, value in record.items() if key != "recorded_at"
-                }
-                current_business = {
-                    key: value for key, value in current.items() if key != "recorded_at"
-                }
-                if current_business != business:
-                    retained[position] = record
-                    changed = True
             if not changed:
                 return
             payload = b"".join(
@@ -1080,7 +1090,7 @@ class ProjectRegistry(
             ):
                 raise ProjectRegistryError("project session reference is too large")
             def publish() -> None:
-                if compacted != existing and existing:
+                if compacted and existing:
                     self._backup_session_records(directory_fd, existing)
                 atomic_publish_file(
                     directory_fd,

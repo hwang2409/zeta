@@ -1021,6 +1021,94 @@ def _registry_session_record(
     }
 
 
+def test_full_project_admits_new_top_level_row(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "a" * 32
+    rows = [_registry_session_record(root_id)] + [
+        _registry_session_record(
+            f"{root_id}:{index}", role="worker", parent_session_id=root_id
+        )
+        for index in range(1, MAX_SESSION_REFERENCES)
+    ]
+    prepared = registry._prepare_session_records(project.project_id, rows)
+    _write_sessions_file(
+        tmp_path / "projects" / project.project_id / "sessions.jsonl",
+        b"".join((json.dumps(row) + "\n").encode() for row in prepared),
+    )
+
+    registry.record_session(
+        project.project_id, session_id="f" * 32, transcript_path="/sessions/new"
+    )
+    session_ids = {
+        row["session_id"] for row in registry.list_session_links(project.project_id)
+    }
+    assert "f" * 32 in session_ids, "full project must admit a new top-level row"
+
+
+def test_represented_child_intent_is_acknowledged(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "a" * 32
+    rows = [_registry_session_record(root_id)] + [
+        _registry_session_record(f"{index:032x}") for index in range(1, MAX_SESSION_REFERENCES)
+    ]
+    prepared = registry._prepare_session_records(project.project_id, rows)
+    _write_sessions_file(
+        tmp_path / "projects" / project.project_id / "sessions.jsonl",
+        b"".join((json.dumps(row) + "\n").encode() for row in prepared),
+    )
+
+    registry.record_session(
+        project.project_id,
+        session_id=f"{root_id}:1",
+        transcript_path=f"/sessions/{root_id}:1",
+        role="worker",
+        parent_session_id=root_id,
+    )
+    session_ids = {
+        row["session_id"] for row in registry.list_session_links(project.project_id)
+    }
+    assert f"{root_id}:1" not in session_ids, (
+        "represented child intent must be acknowledged without a worker row"
+    )
+
+
+def test_project_sessions_omits_represented_workers(tmp_path: Path) -> None:
+    registry = ProjectRegistry(tmp_path / "projects")
+    project = registry.create_project("demo", "scope")
+    root_id = "b" * 32
+    registry.record_session(
+        project.project_id, session_id=root_id, transcript_path="/sessions/root"
+    )
+    worker = registry._prepare_session_records(
+        project.project_id,
+        [_registry_session_record(f"{root_id}:1", role="worker", parent_session_id=root_id)],
+    )[0]
+    sessions_path = tmp_path / "projects" / project.project_id / "sessions.jsonl"
+    with sessions_path.open("ab") as handle:
+        handle.write((json.dumps(worker) + "\n").encode())
+    registry.record_session(
+        project.project_id, session_id="c" * 32, transcript_path="/sessions/other"
+    )
+
+    tools = ToolRegistry(
+        tmp_path,
+        project_id=project.project_id,
+        project_registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        result = asyncio.run(tools.execute(ToolCall("project-call", "project", {"action": "sessions"})))
+        assert result["structuredContent"] is not None
+        sessions = result["structuredContent"]["sessions"]
+        assert all(row["session_id"] != f"{root_id}:1" for row in sessions), (
+            "project sessions must omit represented workers"
+        )
+    finally:
+        asyncio.run(tools.close())
+
+
 def test_project_registry_coalesces_represented_workers_and_backups_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
