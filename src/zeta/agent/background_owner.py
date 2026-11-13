@@ -304,6 +304,13 @@ class BackgroundAgentOwner:
         )
         if description is not None:
             self._descriptions[instance_id] = description
+        parent_run_id, separator, _ = instance_id.rpartition(":")
+        parent_is_child = bool(separator and ":" in parent_run_id)
+        if parent_is_child and (
+            parent_run_id not in self._cancellers
+            or parent_run_id in self._cancel_requested
+        ):
+            self._request_cancellation(instance_id)
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
