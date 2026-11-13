@@ -8749,11 +8749,11 @@ async def test_exit_during_activation_keeps_accepted_input_in_draft(
 
     async def blocked_activation() -> None:
         activation_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
 
     async def type_then_exit(session: FullScreenPromptSession, owner: object) -> object:
         del session, owner
-        await activation_started.wait()
+        await await_or_fail(activation_started.wait(), what="activation start")
         assert app._submit_input("do not lose me")
         app.request_exit()
         return None
@@ -8798,13 +8798,13 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
 
     async def blocked_activation() -> None:
         activation_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
 
     async def type_then_crash(
         session: FullScreenPromptSession, owner: object
     ) -> object:
         del session, owner
-        await activation_started.wait()
+        await await_or_fail(activation_started.wait(), what="activation start")
         assert app._submit_input("queued before render crash")
         raise RuntimeError("render crash")
 
@@ -8852,7 +8852,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
     async def blocked_activation() -> None:
         activation_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
         except asyncio.CancelledError:
             activation_cancelled.set()
             raise
@@ -8861,7 +8861,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         del session, owner
         prompt_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="prompt cancellation")
         except asyncio.CancelledError:
             prompt_cancelled.set()
             raise
@@ -8887,7 +8887,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         assert app._submit_input("accepted before cancel")
         run.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await run
+            await asyncio.wait_for(run, 10)
 
     assert prompt_cancelled.is_set(), "prompt task outlived the cancelled run"
     assert activation_cancelled.is_set(), "activation task outlived the cancelled run"
