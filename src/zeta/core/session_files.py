@@ -88,7 +88,10 @@ class SessionReferenceGate:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
 
     @contextmanager
-    def _locked(self, *, exclusive: bool, unavailable_id: str | None = None):
+    def _locked(
+        self, *, exclusive: bool, unavailable_id: str | None = None,
+        timeout: float | None = None,
+    ):
         if not self._enabled():
             yield self
             return
@@ -111,10 +114,22 @@ class SessionReferenceGate:
                         RETENTION_HOME_ID,
                         REFERENCES_DOMAIN,
                         exclusive=exclusive,
-                        nonblocking=on_loop,
+                        nonblocking=on_loop or timeout is not None,
                     )
                 )
             except BlockingIOError as exc:
+                if timeout is not None and not on_loop:
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        try:
+                            with domain_authority(
+                                self.home, RETENTION_HOME_ID, REFERENCES_DOMAIN,
+                                exclusive=exclusive, nonblocking=True,
+                            ):
+                                yield self
+                                return
+                        except BlockingIOError:
+                            time.sleep(min(0.01, deadline - time.monotonic()))
                 session_id = unavailable_id or "unknown"
                 raise SessionReferenceUnavailable(
                     f"session reference unavailable: {session_id} is being deleted"
@@ -139,8 +154,8 @@ class SessionReferenceGate:
                 self.bump_generation()
             yield SessionReferenceAuthority(self, frozenset(ids))
 
-    def exclusive(self, *, session_id: str | None = None):
-        return self._locked(exclusive=True, unavailable_id=session_id)
+    def exclusive(self, *, session_id: str | None = None, timeout: float | None = None):
+        return self._locked(exclusive=True, unavailable_id=session_id, timeout=timeout)
 
     def validate(self, session_ids: tuple[str, ...] | list[str]) -> None:
         if not self._enabled():

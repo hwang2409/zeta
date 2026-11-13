@@ -26,6 +26,9 @@ class RetentionActivationOwner:
         self._publish = publish
         self._stop = asyncio.Event()
         self._restart = asyncio.Event()
+        self._run_done = asyncio.Event()
+        self._run_done.set()
+        self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
 
@@ -40,6 +43,7 @@ class RetentionActivationOwner:
 
     async def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         task, self._task = self._task, None
         if task is not None:
             await task
@@ -47,25 +51,39 @@ class RetentionActivationOwner:
     async def yield_to_open(self) -> None:
         """Abandon the current preview before an interactive open proceeds."""
         self._restart.set()
-        planner = self._planner
-        if planner is not None:
-            await asyncio.to_thread(planner.close)
-        self._restart.clear()
+        self._wake.set()
+        # run_pass owns the planner; closing it here would race with the worker.
+        await self._run_done.wait()
 
     async def _run(self) -> None:
         try:
             while not self._stop.is_set():
+                if self._days() == 0:
+                    self._wake.clear()
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
+                    except TimeoutError:
+                        pass
+                    continue
                 planner = self._planner_factory()
                 self._planner = planner
                 try:
                     while not self._stop.is_set() and not self._restart.is_set():
-                        result = await asyncio.to_thread(getattr(planner, "run_" + "pass"), days=self._days())
+                        days = self._days()
+                        if days == 0:
+                            break
+                        self._run_done.clear()
+                        try:
+                            result = await asyncio.to_thread(getattr(planner, "run_" + "pass"), days=days)
+                        finally:
+                            self._run_done.set()
                         if self._publish is not None:
                             await self._publish(result)
                         if not result.complete:
                             continue
+                        self._wake.clear()
                         try:
-                            await asyncio.wait_for(self._stop.wait(), self._wake_seconds)
+                            await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
                         except TimeoutError:
                             continue
                 finally:
@@ -73,5 +91,6 @@ class RetentionActivationOwner:
                     await asyncio.to_thread(planner.close)
                 if self._stop.is_set():
                     return
+                self._restart.clear()
         finally:
             self._planner = None

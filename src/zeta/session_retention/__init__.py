@@ -18,6 +18,7 @@ from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Self
 
@@ -31,6 +32,7 @@ from ..core.session_files import (
     SessionInUseError,
     SessionNotFoundError,
     SessionReferenceGate,
+    SessionReferenceUnavailable,
     atomic_publish_file,
     child_directory,
     descend_directory,
@@ -198,7 +200,7 @@ def append_retention_history(home: str | Path, lease: WriterLease, result: Mappi
     try:
         atomic_publish_file(
             home_fd, _HISTORY_FILENAME,
-            ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\\n" for row in rows)).encode(),
+            ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows)).encode(),
         )
     finally:
         os.close(home_fd)
@@ -208,11 +210,37 @@ def retention_arm_warning() -> str:
     return _ARM_WARNING
 
 
+@dataclass(frozen=True)
+class RetentionAuthorityResult:
+    message: str
+    projection: dict[str, object]
+    applied: bool
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@contextmanager
+def _try_authority(root: Path, *, exclusive: bool, deadline: float):
+    while True:
+        try:
+            with domain_authority(
+                root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN,
+                exclusive=exclusive, nonblocking=True,
+            ):
+                yield
+                return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            time.sleep(min(0.01, deadline - time.monotonic()))
+
+
 def retention_authority(
-    home: str | Path, lease: WriterLease, *, days: int, zeta_version: str,
+    home: str | Path, lease: WriterLease, *, days: int,
+    zeta_version: str | None = None,
     now: Callable[[], str] = lambda: datetime.now(UTC).isoformat(),
-) -> str:
-    """Arm, disarm, or disable retention in one off-loop transaction."""
+) -> RetentionAuthorityResult:
     try:
         import asyncio
         asyncio.get_running_loop()
@@ -222,34 +250,54 @@ def retention_authority(
         raise SessionError("retention authority requested on an asyncio event-loop thread")
     if type(days) is not int or not 0 <= days <= 3650:
         raise RetentionPlannerError("retention days must be in 0..3650")
+    empty = retention_result(timestamp=now(), mode="none", days=days)
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
-        return "retention unavailable: upgrade the home before arming"
+        return RetentionAuthorityResult("retention unavailable: upgrade the home before arming", empty, False)
     root = Path(home)
-    with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True), SessionReferenceGate(root, lease).exclusive():
-        home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            if days == 0:
-                unlink_session_file(home_fd, _ARM_FILENAME)
-                return "retention disabled"
-            state = _load_state(home_fd)
-            preview = state.get("preview") if state else None
-            if not isinstance(preview, dict) or preview.get("days") != days:
-                return "retention arm requires a completed preview for the current days"
-            arm = {
-                "schema_version": 1, "gate_version": 1,
-                "armed_by_zeta_version": zeta_version,
-                "armed_at": now(), "preview_id": preview["preview_id"],
-            }
-            validate_retention_arm(arm)
-            atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\\n").encode())
-            return _ARM_WARNING
-        finally:
-            os.close(home_fd)
+    try:
+        if days == 0:
+            with SessionReferenceGate(root, lease).exclusive(timeout=10):
+                home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    unlink_session_file(home_fd, _ARM_FILENAME)
+                    projection = retention_result(timestamp=now(), mode="disabled", days=0)
+                    append_retention_history(root, lease, projection)
+                finally:
+                    os.close(home_fd)
+            return RetentionAuthorityResult("retention disabled", projection, True)
+        with (
+            _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
+            SessionReferenceGate(root, lease).exclusive(timeout=10),
+        ):
+                home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    state = _load_state(home_fd)
+                    preview = state.get("preview") if state else None
+                    if not isinstance(preview, dict) or preview.get("days") != days:
+                        message = "retention arm requires a completed preview for the current days"
+                        projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
+                        append_retention_history(root, lease, projection)
+                        return RetentionAuthorityResult(message, projection, False)
+                    arm = {
+                        "schema_version": 1, "gate_version": 1,
+                        "armed_by_zeta_version": zeta_version or package_version("zeta"),
+                        "armed_at": now(), "preview_id": preview["preview_id"],
+                    }
+                    validate_retention_arm(arm)
+                    atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode())
+                    projection = retention_result(timestamp=now(), mode="armed", days=days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
+                    append_retention_history(root, lease, projection)
+                    return RetentionAuthorityResult(_ARM_WARNING, projection, True)
+                finally:
+                    os.close(home_fd)
+    except (TimeoutError, SessionReferenceUnavailable):
+        message = "retention busy, try again" if days else "retention busy; disarm not applied, try again"
+        projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
+        return RetentionAuthorityResult(message, projection, False)
 
 
-def disarm_retention(home: str | Path, lease: WriterLease) -> str:
-    return retention_authority(home, lease, days=0, zeta_version="")
-
+def disarm_retention(home: str | Path, lease: WriterLease) -> RetentionAuthorityResult:
+    return retention_authority(home, lease, days=0)
 
 def read_retention_history(home: str | Path) -> tuple[dict[str, object], ...]:
     """Read and validate the bounded history projection."""

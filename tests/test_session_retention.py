@@ -38,6 +38,22 @@ def _directory(path):
     return session_root(path)
 
 
+def test_retention_history_trims_oldest_row(tmp_path):
+    from zeta.session_retention import append_retention_history, retention_result
+
+    with _opened_lease(tmp_path) as lease:
+        for index in range(129):
+            append_retention_history(
+                tmp_path,
+                lease,
+                retention_result(timestamp=str(index), mode="preview", days=30),
+            )
+    rows = session_retention.read_retention_history(tmp_path)
+    assert len(rows) == 128
+    assert rows[0]["timestamp"] == "1"
+    assert rows[-1]["timestamp"] == "128"
+
+
 def test_pin_round_trip_and_idempotent_unpin(tmp_path):
     with _directory(tmp_path / "session") as directory_fd:
         assert not is_retention_pinned(directory_fd)

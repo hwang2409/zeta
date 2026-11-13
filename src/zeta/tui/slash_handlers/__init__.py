@@ -49,7 +49,6 @@ from ...runtime.status import capture_slash_status
 from ...session_retention import (
     disarm_retention,
     read_retention_history,
-    retention_arm_warning,
     retention_authority,
 )
 from ...session_retention.pin import set_retention_pin
@@ -581,14 +580,15 @@ class SlashHandlerMixin:
             history = await asyncio.to_thread(read_retention_history, home)
             return "retention: none" if not history else f"retention: {history[-1]}"
         if command == "disarm":
-            return await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
+            result = await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
+            return result.message
         if command == "arm":
             days = load_settings(home=home).settings.retention_days
             result = await asyncio.to_thread(
                 retention_authority, home, self.loop.store._storage_lease,
-                days=days, zeta_version="unknown",
+                days=days,
             )
-            return f"{result}\n{retention_arm_warning()}" if result.startswith("retention arm") else result
+            return result.message
         return "usage: /retention [arm|disarm]"
 
     async def slash_model(self, args: str) -> str:
