@@ -64,6 +64,21 @@ class Broken:
 PersistedState = Missing | Loaded | Broken
 
 
+def classify_reconciliation_records(
+    cursor_payload: bytes | None, receipt_payload: bytes | None
+) -> bool:
+    """Return whether durable reconciliation state blocks retention."""
+    cursor = ReconciliationState._decode_cursor_payload(
+        Path("memory-reconcile.json"), cursor_payload
+    )
+    receipts = ReconciliationState._decode_receipt_payload(
+        Path("memory-reconcile-receipts.jsonl"), receipt_payload
+    )
+    if isinstance(cursor, Broken) or isinstance(receipts, Broken):
+        return True
+    return isinstance(cursor, Loaded) and cursor.value["recovery_paused"] is True
+
+
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
     """The last sanitized reconciliation failure shown in session status."""
@@ -706,6 +721,21 @@ class ReconciliationState:
                     payload,
                 )
             payload = payload[:tail_offset]
+        return self._decode_receipt_payload(self.receipts_path, payload)
+
+    @classmethod
+    def _decode_receipt_payload(
+        cls, path: Path, payload: bytes | None
+    ) -> PersistedState:
+        if payload is None:
+            return Missing()
+        if payload and not payload.endswith(b"\n"):
+            return Broken(
+                path,
+                "torn final receipt",
+                "back up the archive, restore or repair valid JSON lines, and restart",
+                payload,
+            )
         records: list[dict[str, Any]] = []
         offset = 0
         for line in payload.splitlines(keepends=True):
@@ -713,23 +743,23 @@ class ReconciliationState:
                 value = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 return Broken(
-                    self.receipts_path,
-                    f"malformed receipt at byte offset {offset}: {self._decode_reason(exc)}",
+                    path,
+                    f"malformed receipt at byte offset {offset}: {cls._decode_reason(exc)}",
                     "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
                 )
             if not isinstance(value, dict):
                 return Broken(
-                    self.receipts_path,
+                    path,
                     f"invalid receipt at byte offset {offset}: expected an object",
                     "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
                 )
             try:
-                self._validate_terminal_record(value)
+                cls._validate_terminal_record(value)
             except ValueError as exc:
                 return Broken(
-                    self.receipts_path,
+                    path,
                     f"invalid receipt at byte offset {offset}: {exc}",
                     "back up the archive, restore or repair valid JSON lines, and restart",
                     payload,
@@ -949,41 +979,50 @@ class ReconciliationState:
             return Missing()
         except OSError as exc:
             return self._broken_read(self.path, exc)
+        return self._decode_cursor_payload(self.path, payload)
+
+    @classmethod
+    def _decode_cursor_payload(
+        cls, path: Path, payload: bytes | None
+    ) -> PersistedState:
+        if payload is None:
+            return Missing()
         try:
             value = json.loads(payload)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return Broken(
-                self.path,
-                self._decode_reason(exc),
+                path,
+                cls._decode_reason(exc),
                 "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
         if not isinstance(value, dict):
             return Broken(
-                self.path,
+                path,
                 "invalid reconciliation cursor: expected an object",
                 "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
         try:
-            return Loaded(self._normalize_cursor(value))
+            return Loaded(cls._normalize_cursor(value))
         except ValueError as exc:
             return Broken(
-                self.path,
+                path,
                 str(exc),
                 "back up the cursor, restore or repair valid JSON, and restart",
                 payload,
             )
 
-    def _normalize_cursor(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        normalized = self._empty_value()
-        self._normalize_cursor_scalars(value, normalized)
-        self._normalize_cursor_records(value, normalized)
+    @classmethod
+    def _normalize_cursor(cls, value: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = cls._empty_value()
+        cls._normalize_cursor_scalars(value, normalized)
+        cls._normalize_cursor_records(value, normalized)
         last_failure = value.get("last_failure")
-        if last_failure is not None and self._parse_failure(last_failure) is None:
+        if last_failure is not None and cls._parse_failure(last_failure) is None:
             raise ValueError("invalid reconciliation cursor field: last_failure")
         normalized["last_failure"] = last_failure
-        normalized.update(self._recovery_fields(value))
+        normalized.update(cls._recovery_fields(value))
         for key, item in value.items():
             if key not in normalized:
                 normalized[key] = item
@@ -1014,8 +1053,9 @@ class ReconciliationState:
                 raise ValueError(f"invalid reconciliation cursor field: {name}")
             normalized[name] = candidate
 
+    @classmethod
     def _normalize_cursor_records(
-        self, value: Mapping[str, Any], normalized: dict[str, Any]
+        cls, value: Mapping[str, Any], normalized: dict[str, Any]
     ) -> None:
         for name in (
             "pending_failures",
@@ -1028,7 +1068,7 @@ class ReconciliationState:
             ):
                 raise ValueError(f"invalid reconciliation cursor field: {name}")
             for item in candidate:
-                self._validate_cursor_record(name, item)
+                cls._validate_cursor_record(name, item)
             normalized[name] = candidate
 
     @classmethod
