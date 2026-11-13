@@ -95,19 +95,22 @@ def acquire_after_retention_yield(
     if request_fd is None:
         os.close(active_fd)
         raise blocked(first) from first
-    _off_loop()
     try:
         fcntl.flock(request_fd, fcntl.LOCK_SH)
-        deadline = clock() + timeout
-        while True:
-            try:
-                fcntl.flock(active_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                remaining = deadline - clock()
-                if remaining <= 0:
+        try:
+            fcntl.flock(active_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _off_loop()
+            deadline = clock() + timeout
+            while True:
+                try:
+                    fcntl.flock(active_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
-                wait(remaining)
+                except BlockingIOError:
+                    remaining = deadline - clock()
+                    if remaining <= 0:
+                        break
+                    wait(remaining)
         try:
             return acquire()
         except BlockingIOError as second:

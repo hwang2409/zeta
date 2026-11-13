@@ -241,3 +241,29 @@ def test_epoch_ten_keeps_old_refusal_without_handshake_files(tmp_path: Path) -> 
         command.send(True)
         process.join(10)
         assert process.exitcode == 0
+
+
+@pytest.mark.asyncio
+async def test_on_loop_non_retention_holder_keeps_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":11}')
+    lock_dir = tmp_path / ".domain-locks"
+    lock_dir.mkdir()
+    (lock_dir / domain_lock_name(RETENTION_HOME_ID, "user-open-request")).touch()
+    active_fd = os.open(
+        lock_dir / domain_lock_name(RETENTION_HOME_ID, "planner-active"),
+        os.O_RDWR | os.O_CREAT,
+    )
+    monkeypatch.setattr("zeta.core.retention_access._active", lambda _: active_fd)
+    try:
+        with pytest.raises(RuntimeError, match="original"):
+            acquire_after_retention_yield(
+                tmp_path, lambda: (_ for _ in ()).throw(BlockingIOError()),
+                lambda _: RuntimeError("original"),
+            )
+    finally:
+        try:
+            os.close(active_fd)
+        except OSError:
+            pass
