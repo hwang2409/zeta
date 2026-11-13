@@ -77,11 +77,6 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         _OWNER_COUNTS.install()
 
 
-@pytest.fixture(autouse=True)
-def zero_store_payload_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
-
-
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
@@ -108,7 +103,6 @@ def pytest_configure(config: pytest.Config) -> None:
     monkeypatch = cleanup.enter_context(pytest.MonkeyPatch.context())
     monkeypatch.setenv("HOME", fake_home)
     monkeypatch.setenv("ZETA_STALL_WATCHDOG", "0")
-    monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
     # Toolchain caches (rustup/cargo) invoked by any subprocess belong outside
     # the watched home; the guard polices zeta's writes, not toolchain caches.
     toolchain = cleanup.enter_context(TemporaryDirectory(prefix="zeta-test-toolchain-"))
