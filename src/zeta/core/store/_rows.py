@@ -32,7 +32,7 @@ class MessageFacts:
     approval_request_ids: tuple[str, ...]
     is_user: bool
     is_user_forkpoint: bool
-    message_text: str | None
+    message_preview: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,29 +110,27 @@ class StartupFactsMixin:
         return tuple(records)
 
 
+def _message_facts(entry: ConversationEntry) -> MessageFacts:
+    message = Message.from_dict(entry.data["message"])
+    is_user = message.role is MessageRole.USER
+    text = " ".join(
+        block.text.strip()
+        for block in message.content
+        if isinstance(block, TextContent) and block.text.strip()
+    )
+    return MessageFacts(
+        context_calibration_record(entry),
+        sent_message_receipts(entry),
+        tuple(request["request_id"] for request in entry.data.get("approval_requests", ())),
+        is_user,
+        is_user and not is_passive_harness_message(message),
+        " ".join(text.split())[:48] if text else None,
+    )
+
+
 def row_facts(entry: ConversationEntry) -> object | None:
     if entry.type == "message":
-        calibration = context_calibration_record(entry)
-        receipts = sent_message_receipts(entry)
-        approval_request_ids = tuple(
-            request["request_id"] for request in entry.data.get("approval_requests", ())
-        )
-        message = Message.from_dict(entry.data["message"])
-        is_user = message.role is MessageRole.USER
-        text = " ".join(
-            block.text.strip()
-            for block in message.content
-            if isinstance(block, TextContent) and block.text.strip()
-        )
-        message_text = " ".join(text.split()) if text else None
-        return MessageFacts(
-            calibration,
-            receipts,
-            approval_request_ids,
-            is_user,
-            is_user and not is_passive_harness_message(message),
-            message_text,
-        )
+        return _message_facts(entry)
     if entry.type == "compaction":
         data = entry.data
         return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))

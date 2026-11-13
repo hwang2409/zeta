@@ -486,7 +486,7 @@ class CheckpointForkMixin:
         refs = self.branch_refs()
         count = sum(ref.type == "checkpoint" for ref in refs) + 1
         for ref in reversed(refs):
-            text = getattr(ref.facts, "message_text", None)
+            text = getattr(ref.facts, "message_preview", None)
             if text and not self._is_numeric_selector(text):
                 return text[:48]
         return f"checkpoint {count}"
@@ -524,7 +524,7 @@ class CheckpointForkMixin:
         walker = head
         while walker is not None:
             if getattr(walker.facts, "is_user", False):
-                text = getattr(walker.facts, "message_text", None)
+                text = getattr(walker.facts, "message_preview", None)
                 if text:
                     return text[:48]
             walker = by_id.get(walker.parent_id) if walker.parent_id else None
