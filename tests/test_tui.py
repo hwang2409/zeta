@@ -16082,9 +16082,9 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
 
     async with owned_app(app):
         app._history_finder_open(buffer)
-        assert app._history_prompt_task is not None
+        assert app._prompt_history.finder_task is not None
         await await_or_fail(
-            app._history_prompt_task,
+            app._prompt_history.finder_task,
             what="ctrl+r prompt paging",
         )
         assert app._finder_prepare_task is not None
@@ -16420,11 +16420,13 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "unloaded-failed-search",
         "bounded-prompt-finder",
         "branch-prompt-reset",
+        "branch-prompt-stale-fork",
+        "branch-prompt-stale-tree",
     ),
 )
 @pytest.mark.asyncio
 async def test_root_tui_paging_render_path_table(
-    tmp_path: Path, journey: str
+    tmp_path: Path, journey: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / journey / "sessions")
     failure_text = "needle-provider-failure"
@@ -16501,7 +16503,7 @@ async def test_root_tui_paging_render_path_table(
                     MessageOrigin.USER,
                 )
             )
-    elif journey == "branch-prompt-reset":
+    elif journey.startswith("branch-prompt-"):
         store.append_checkpoint("branch-base")
         store.append_message(
             with_message_origin(
@@ -16665,19 +16667,105 @@ async def test_root_tui_paging_render_path_table(
             assert buffer.text == "branch-b-prompt"
             finder_buffer = Buffer(document=Document("branch-a-prompt"))
             app._history_finder_open(finder_buffer)
-            assert app._history_prompt_task is not None
+            assert app._prompt_history.finder_task is not None
             await await_or_fail(
-                app._history_prompt_task, what="branch prompt finder reset"
+                app._prompt_history.finder_task, what="branch prompt finder reset"
             )
             state = app._history_finder.finder_state()
             assert state is not None
             assert all("branch-a-prompt" not in row.excerpt for row in state.rows)
+        elif journey.startswith("branch-prompt-stale-"):
+            if journey.endswith("tree"):
+                assert await app.slash_fork("branch-base") == (
+                    "forked to checkpoint 'branch-base' at seq 1"
+                )
+                store.append_message(
+                    with_message_origin(
+                        Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                        MessageOrigin.USER,
+                    )
+                )
+                assert await app._rebuild_transcript_async()
+                old_branch = next(
+                    index
+                    for index, branch in enumerate(store.list_branches(), 1)
+                    if not branch.is_current
+                )
+                assert str(await app.slash_tree(str(old_branch))).startswith(
+                    "switched to branch"
+                )
+
+            original_prompt_page = app._history_source.prompt_page
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def delayed_prompt_page(cursor=None, *, direction="older"):
+                page = await original_prompt_page(cursor, direction=direction)
+                started.set()
+                await asyncio.wait_for(release.wait(), 10)
+                return page
+
+            monkeypatch.setattr(app._history_source, "prompt_page", delayed_prompt_page)
+            published: list[tuple[str, ...]] = []
+            original_set_snapshot = app._history_finder.set_snapshot
+
+            def record_snapshot(snapshot: tuple[str, ...]) -> None:
+                published.append(snapshot)
+                original_set_snapshot(snapshot)
+
+            monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
+            app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
+            scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+                app, "_history_prompt_task", None
+            )
+            assert scan is not None
+            await asyncio.wait_for(started.wait(), 10)
+
+            if journey.endswith("fork"):
+                assert await app.slash_fork("branch-base") == (
+                    "forked to checkpoint 'branch-base' at seq 1"
+                )
+                store.append_message(
+                    with_message_origin(
+                        Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                        MessageOrigin.USER,
+                    )
+                )
+                assert await app._rebuild_transcript_async()
+            else:
+                new_branch = next(
+                    index
+                    for index, branch in enumerate(store.list_branches(), 1)
+                    if not branch.is_current
+                )
+                assert str(await app.slash_tree(str(new_branch))).startswith(
+                    "switched to branch"
+                )
+
+            release.set()
+            try:
+                await asyncio.wait_for(scan, 10)
+            except asyncio.CancelledError:
+                pass
+            assert all("branch-a-prompt" not in snapshot for snapshot in published)
+
+            monkeypatch.setattr(app._history_source, "prompt_page", original_prompt_page)
+            published.clear()
+            finder_buffer = Buffer(document=Document("branch-b-prompt"))
+            app._history_finder_open(finder_buffer)
+            new_scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+                app, "_history_prompt_task", None
+            )
+            assert new_scan is not None
+            await await_or_fail(new_scan, what="new branch prompt finder")
+            assert all("branch-a-prompt" not in snapshot for snapshot in published)
+            assert any("branch-b-prompt" in snapshot for snapshot in published)
         else:
             buffer = Buffer(document=Document("oldest-needle"))
             app._history_finder_open(buffer)
-            assert app._history_prompt_task is not None
+            assert app._prompt_history.finder_task is not None
             await await_or_fail(
-                app._history_prompt_task, what="bounded ctrl+r source scan"
+                app._prompt_history.finder_task, what="bounded ctrl+r source scan"
             )
             if app._finder_prepare_task is not None:
                 await await_or_fail(

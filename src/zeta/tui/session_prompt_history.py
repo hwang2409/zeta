@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from prompt_toolkit.document import Document
@@ -28,11 +28,16 @@ class SessionPromptHistory:
         self._index: int | None = None
         self._draft: Document | None = None
         self._load: asyncio.Task[None] | None = None
+        self._finder_scan: asyncio.Task[None] | None = None
         self._generation = 0
 
     @property
     def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
         return tuple(self._entries)
+
+    @property
+    def finder_task(self) -> asyncio.Task[None] | None:
+        return self._finder_scan
 
     def bind(
         self,
@@ -178,15 +183,36 @@ class SessionPromptHistory:
         self._index = None
         self._draft = None
 
-    async def finder_snapshot(
-        self, query: str = "", *, limit: int = 200
-    ) -> tuple[str, ...]:
-        """Stream prompt pages and retain only the best bounded candidates."""
+    def start_finder_scan(
+        self,
+        query: str,
+        publish: Callable[[tuple[str, ...]], None],
+        *,
+        limit: int = 200,
+    ) -> None:
+        """Own and publish one branch-scoped finder scan."""
 
+        if self._finder_scan is not None:
+            self._finder_scan.cancel()
+        generation = self._generation
+        self._finder_scan = asyncio.create_task(
+            self._scan_finder(query, publish, limit=limit, generation=generation)
+        )
+
+    async def _scan_finder(
+        self,
+        query: str,
+        publish: Callable[[tuple[str, ...]], None],
+        *,
+        limit: int,
+        generation: int,
+    ) -> None:
         source = self.source
         if source is None:
             values = self.snapshot(self._session) if self._session is not None else ()
-            return values[-limit:]
+            if generation == self._generation:
+                publish(values[-limit:])
+            return
         parsed = parse_query(query)
         cursor: HistoryCursor | None = None
         ranked: list[tuple[int, int, str]] = []
@@ -194,6 +220,8 @@ class SessionPromptHistory:
         newest_ordinal = 0
         while True:
             rows, older, _newer = await source.prompt_page(cursor, direction="older")
+            if generation != self._generation:
+                return
 
             pending: list[tuple[int, str]] = []
             pending_values: set[str] = set()
@@ -219,7 +247,10 @@ class SessionPromptHistory:
                         scored.append((match.score, -ordinal, value))
                 return scored
 
-            for candidate in await asyncio.to_thread(score_page, tuple(pending)):
+            candidates = await asyncio.to_thread(score_page, tuple(pending))
+            if generation != self._generation:
+                return
+            for candidate in candidates:
                 if len(ranked) < limit:
                     heapq.heappush(ranked, candidate)
                     retained_values.add(candidate[2])
@@ -230,10 +261,14 @@ class SessionPromptHistory:
             if older is None:
                 break
             cursor = older
-        return tuple(
-            value
-            for _score, _recency, value in sorted(
-                ranked, key=lambda item: item[1]
+        if generation != self._generation:
+            return
+        publish(
+            tuple(
+                value
+                for _score, _recency, value in sorted(
+                    ranked, key=lambda item: item[1]
+                )
             )
         )
 
@@ -245,7 +280,10 @@ class SessionPromptHistory:
         self._generation += 1
         if self._load is not None:
             self._load.cancel()
+        if self._finder_scan is not None:
+            self._finder_scan.cancel()
         self._load = None
+        self._finder_scan = None
         self._entries.clear()
         self._older = self._newer = None
         self._index = None

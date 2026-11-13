@@ -276,7 +276,6 @@ class TUIApp(
         self._history_search_task: asyncio.Task[None] | None = None
         self._history_search_results: tuple[Any, ...] = ()
         self._history_search_index = 0
-        self._history_prompt_task: asyncio.Task[None] | None = None
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._rendering_history = False
         self._live_sequence = 0
@@ -778,17 +777,11 @@ class TUIApp(
         self._viewed_transcript().end_search()
 
     async def _close_history_search(self) -> None:
-        tasks = tuple(
-            task
-            for task in (self._history_search_task, self._history_prompt_task)
-            if task is not None
-        )
-        for task in tasks:
-            task.cancel()
+        if self._history_search_task is not None:
+            self._history_search_task.cancel()
         self._history_search_task = None
         self._history_search_results = ()
         self._history_search_index = 0
-        self._history_prompt_task = None
 
     async def _close_history_markers(self) -> None:
         tasks = tuple(self._history_marker_tasks)
@@ -800,17 +793,13 @@ class TUIApp(
         if self._agent_navigation.child_view_active or prompt_history is None:
             FinderRuntimeMixin._history_finder_open(self, buffer)
             return
-        path = self._viewed_session_path()
-        prompt_history.bind(path, self._history_source)
+        prompt_history.bind(self._viewed_session_path(), self._history_source)
 
-        async def load() -> None:
-            snapshot = await prompt_history.finder_snapshot(buffer.text)
-            if path != self._viewed_session_path():
-                return
+        def publish(snapshot: tuple[str, ...]) -> None:
             self._history_finder.set_snapshot(snapshot)
             FinderRuntimeMixin._history_finder_open(self, buffer)
 
-        self._history_prompt_task = asyncio.create_task(load())
+        prompt_history.start_finder_scan(buffer.text, publish)
 
     def _history_previous(self, buffer: Any) -> None:
         path = self._viewed_session_path()
