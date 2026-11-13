@@ -58,18 +58,16 @@ class TranscriptStream:
     def _row_end(self) -> int | None:
         search_from = 0
         while True:
-            for index in range(search_from, len(self._buffer)):
-                byte = self._buffer[index]
-                if byte == 10:
-                    return index + 1
-                if byte != 13:
-                    continue
-                if index + 1 < len(self._buffer):
-                    return index + 2 if self._buffer[index + 1] == 10 else index + 1
+            lf_index = self._buffer.find(b"\n", search_from)
+            cr_index = self._buffer.find(b"\r", search_from)
+            if lf_index >= 0 and (cr_index < 0 or lf_index < cr_index):
+                return lf_index + 1
+            if cr_index >= 0:
+                if cr_index + 1 < len(self._buffer):
+                    return cr_index + 2 if self._buffer[cr_index + 1] == 10 else cr_index + 1
                 if self._read_offset >= self.stat.st_size or self._exhausted:
-                    return index + 1
-                search_from = index
-                break
+                    return cr_index + 1
+                search_from = cr_index
             else:
                 search_from = len(self._buffer)
             if not self._fill():
