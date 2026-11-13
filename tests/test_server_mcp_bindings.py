@@ -866,9 +866,10 @@ async def test_bound_http_list_changed_disconnect_does_not_drop_refresh_coroutin
         await mcp.close()
 
 
+@pytest.mark.parametrize("approved_tool", ["bash", "mcp"])
 @pytest.mark.asyncio
-async def test_socket_approved_bash_after_turn_end_runs_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_socket_approved_tool_after_turn_end_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_tool: str
 ) -> None:
     allow_local_http(monkeypatch)
     mcp = LocalMCP()
@@ -882,9 +883,13 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
     backend = FakeBackend([
         ScriptedTurn(content=[TextContent("ready")]),
         ScriptedTurn(tool_calls=[ToolCall(
-            "bash-call",
-            "bash",
-            {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"},
+            "approval-call",
+            "bash" if approved_tool == "bash" else "page__echo",
+            (
+                {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"}
+                if approved_tool == "bash"
+                else {}
+            ),
         )]),
         ScriptedTurn(content=[TextContent("done")]),
         ScriptedTurn(tool_calls=[ToolCall("mcp-call", "page__echo", {})]),
@@ -926,11 +931,68 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         await _request(reader, writer, 3, "send", {"text": "warm"})
         await _event(reader, "turn_end")
         await asyncio.wait_for(first_agent_end.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        reservation_ready = asyncio.Event()
+        recovery_waiting = asyncio.Event()
+        recovery_released = asyncio.Event()
+        live_claimed = asyncio.Event()
+        live_claims: list[str] = []
+        prepare_execution = loop.store.prepare_pending_approval_execution
+        claim_execution = loop.store.claim_pending_approval_execution
+
+        def prepare_and_release_live(*args: object, **kwargs: object) -> bool:
+            prepared = prepare_execution(*args, **kwargs)
+            reservation_ready.set()
+            return prepared
+
+        monkeypatch.setattr(
+            loop.store,
+            "prepare_pending_approval_execution",
+            prepare_and_release_live,
+        )
+
+        def claim_and_release_first_turn(*args: object, **kwargs: object) -> str:
+            claim = claim_execution(*args, **kwargs)
+            if kwargs.get("prepared") is not True:
+                live_claims.append(claim)
+                asyncio.get_running_loop().call_soon(live_claimed.set)
+            return claim
+
+        monkeypatch.setattr(
+            loop.store,
+            "claim_pending_approval_execution",
+            claim_and_release_first_turn,
+        )
+        approval_gate = loop.tool_registry._approval_gate
+        approval_gate_run = type(approval_gate).run
+
+        async def hold_live_after_approval(
+            self: object, tool_call: ToolCall, *args: object, **kwargs: object
+        ) -> object:
+            result = await approval_gate_run(self, tool_call, *args, **kwargs)
+            if self is approval_gate and tool_call.id == "approval-call":
+                await asyncio.wait_for(reservation_ready.wait(), TIMEOUT)
+                await asyncio.wait_for(recovery_waiting.wait(), TIMEOUT)
+            return result
+
+        monkeypatch.setattr(type(approval_gate), "run", hold_live_after_approval)
         await _request(reader, writer, 4, "send", {"text": "run bash"})
         approval = await _event(reader, "approval_request")
         assert not server.control.turn_busy()
         live_turn = server.control._turn_task
         assert live_turn is not None
+        live_finished = asyncio.Event()
+        live_turn.add_done_callback(lambda _task: live_finished.set())
+        resume_pending_tool = loop.resume_pending_tool
+
+        async def resume_after_live_turn(*args: object, **kwargs: object) -> object:
+            recovery_waiting.set()
+            await asyncio.wait_for(live_finished.wait(), TIMEOUT)
+            await asyncio.wait_for(recovery_released.wait(), TIMEOUT)
+            return await resume_pending_tool(*args, **kwargs)
+
+        monkeypatch.setattr(loop, "resume_pending_tool", resume_after_live_turn)
         server.control._turn_task = None
         allowed = await _request(reader, writer, 5, "approve", {
             "request_id": approval["request_id"]
@@ -938,10 +1000,26 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         assert "error" not in allowed[-1]
         recovery_turn = server.control._turn_task
         assert recovery_turn is not None
+        await asyncio.wait_for(live_claimed.wait(), TIMEOUT)
+        await asyncio.wait_for(live_finished.wait(), TIMEOUT)
+        recovery_released.set()
         release_first_agent_end.set()
         await asyncio.wait_for(asyncio.gather(live_turn, recovery_turn), TIMEOUT)
 
-        assert marker.read_text().splitlines() == ["run"]
+        if approved_tool == "bash":
+            runs = marker.read_text().splitlines() if marker.exists() else []
+            assert runs == ["run"]
+        else:
+            assert mcp.methods.count("tools/call") == 1
+        assert live_claims == ["claimed"]
+        approval_results = [
+            message.tool_result
+            for message in backend.calls[-1][0]
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == "approval-call"
+        ]
+        assert len(approval_results) == 1
+        assert not approval_results[0].is_error
 
         await _request(reader, writer, 6, "send", {"text": "run mcp"})
         mcp_approval = await _event(reader, "approval_request")
@@ -962,8 +1040,17 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         assert "error" not in allowed[-1]
         await _event(reader2, "agent_end")
 
-        assert marker.read_text().splitlines() == ["run"]
-        assert mcp.methods.count("tools/call") == 1
+        runs = marker.read_text().splitlines() if marker.exists() else []
+        assert runs == (["run"] if approved_tool == "bash" else [])
+        assert mcp.methods.count("tools/call") == (1 if approved_tool == "bash" else 2)
+        mcp_results = [
+            message.tool_result
+            for message in backend.calls[-1][0]
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == "mcp-call"
+        ]
+        assert len(mcp_results) == 1
+        assert not mcp_results[0].is_error
     finally:
         release_first_agent_end.set()
         for connection in (writer2, writer):
