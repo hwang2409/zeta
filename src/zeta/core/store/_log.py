@@ -42,6 +42,7 @@ from ..transcript_recovery import (
     repair_transcript,
 )
 from ..transcript_recovery.stream import TranscriptStream
+from ._client_delivery import CLIENT_DELIVERY_METADATA
 from ._delivery_fold import DeliveryFold
 from ._incremental_validation import _ApprovalValidationOverlay
 from ._rows import MessageFacts, ResidentRows, RowRef
@@ -139,6 +140,9 @@ class _FullLoadValidator:
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()
         self.state._sent_message_receipts = []
+        self._linear_branch = True
+        self._linear_approvals = _ApprovalValidationOverlay()
+        self._client_delivery_entries: list[ConversationEntry] = []
         self.by_id: dict[str, RowRef] = {}
         self.rows_by_id: dict[str, _PhysicalRow] = {}
         self.header_seen = False
@@ -241,9 +245,33 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
+        previous = (
+            self.state._resident_rows.rows[-1]
+            if self.state._resident_rows.rows
+            else None
+        )
+        linear = previous is None or entry.parent_id == previous.id
         self.state._resident_rows.append(
             entry, offset=row.byte_offset, length=row.length
         )
+        if self._linear_branch and linear:
+            try:
+                self.state._apply_to_working_fold(entry, self._linear_approvals)
+            except ConversationIntegrityError as exc:
+                raise self._error(
+                    row,
+                    kind="broken_links",
+                    reason_code=self._semantic_reason(exc),
+                ) from exc
+        else:
+            self._linear_branch = False
+        metadata = entry.data.get("message", {}).get("metadata", {})
+        if entry.type == "client_delivery" or (
+            entry.type == "message"
+            and type(metadata) is dict
+            and CLIENT_DELIVERY_METADATA in metadata
+        ):
+            self._client_delivery_entries.append(entry)
         self.by_id[entry.id] = self.state._resident_rows.rows[-1]
         self.rows_by_id[entry.id] = replace(row, value=None)
         self.state._entry_ids.add(entry.id)
@@ -336,11 +364,9 @@ class _FullLoadValidator:
                 prefix_digest=hashlib.sha256().hexdigest(),
                 source_digest=self.source.finish_digest(),
             )
-        if self.state._resident_rows.rows:
+        if self.state._resident_rows.rows and not self._linear_branch:
             self._select_branch(self.state._resident_rows.rows[-1])
-        self.state._rebuild_client_deliveries(
-            self.state._resident_rows.stream_rows(self.state._resident_rows.rows)
-        )
+        self.state._rebuild_client_deliveries(iter(self._client_delivery_entries))
         if install:
             if self.resets_resident_rows:
                 self.store._reset_generation += 1

@@ -529,11 +529,12 @@ class ResidentRows:
         context_required = {
             ref.seq for ref in self.rows if ref.type not in self._BULK_TYPES
         }
-        for ref in self.rows:
-            if isinstance(ref.facts, MessageFacts) and (
-                ref.facts.approval_request_ids or ref.facts.context_exception
-            ):
-                required.add(ref.seq)
+        context_required.update(
+            ref.seq
+            for ref in self.rows
+            if isinstance(ref.facts, MessageFacts)
+            and (ref.facts.approval_request_ids or ref.facts.context_exception)
+        )
 
         markers = [ref for ref in self._branch_refs if ref.type == "compaction"]
         replaced = {
