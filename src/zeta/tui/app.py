@@ -272,6 +272,8 @@ class TUIApp(
         self._history_search_task: asyncio.Task[None] | None = None
         self._history_prompt_task: asyncio.Task[None] | None = None
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
+        self._history_rebuild_tasks: set[asyncio.Task[None]] = set()
+        self._live_renderables: list[RenderableType] = []
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
@@ -506,7 +508,7 @@ class TUIApp(
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
             on_page_up=lambda: app._page_history_up(),
-            on_page_down=self._transcript.page_down,
+            on_page_down=self._page_history_down,
             on_finder_open=lambda: app._finder_open(),
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
             on_history_previous=lambda buffer: app._history_previous(buffer),
@@ -537,7 +539,7 @@ class TUIApp(
             approval_active=lambda: bool(app.pending_approvals),
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=lambda: app._scroll_history_up(),
-            on_scroll_down=self._transcript.scroll_down,
+            on_scroll_down=self._scroll_history_down,
             on_picker_move=lambda delta: app._picker_move(delta),
             on_picker_select=lambda: app._picker_select(),
             on_picker_cancel=lambda: app._picker_cancel(),
@@ -632,18 +634,29 @@ class TUIApp(
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
 
-    def _request_older_history(self) -> None:
-        if self._history_pager.scalar_tokens[0] is None:
+    def _request_history_edge(self, direction: str) -> None:
+        if direction == "older":
+            if not self._history_pager.can_load_older or self._transcript.scroll_offset > 0:
+                return
+        elif not self._history_pager.can_load_newer or not self._transcript.follow_tail:
             return
-        asyncio.create_task(self._load_transcript_page(direction="older"))
+        asyncio.create_task(self._load_transcript_page(direction=direction))
 
     def _page_history_up(self) -> None:
         self._transcript.page_up()
-        self._request_older_history()
+        self._request_history_edge("older")
 
     def _scroll_history_up(self) -> None:
         self._transcript.scroll_up()
-        self._request_older_history()
+        self._request_history_edge("older")
+
+    def _page_history_down(self) -> None:
+        self._transcript.page_down()
+        self._request_history_edge("newer")
+
+    def _scroll_history_down(self) -> None:
+        self._transcript.scroll_down()
+        self._request_history_edge("newer")
 
     def _navigate_history_user(self, direction: str) -> None:
         moved = (
@@ -876,6 +889,7 @@ class TUIApp(
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
+            self._live_renderables.append(renderable)
             self._transcript.append(renderable)
 
     def _print(self, renderable: RenderableType | None) -> None:

@@ -129,14 +129,21 @@ class PagedTranscriptHistory:
     def anchor(self) -> tuple[str, int, int] | None:
         return self._anchor
 
+    @property
+    def can_load_older(self) -> bool:
+        return self._older is not None
+
+    @property
+    def can_load_newer(self) -> bool:
+        return self._newer is not None
+
     def set_anchor(self, entry_id: str, unit_ordinal: int, text_offset: int) -> None:
         self._anchor = (entry_id, unit_ordinal, text_offset)
 
     async def close(self) -> None:
-        tasks = tuple(self._loads.values())
+        """Invalidate publication without waiting for off-loop reads."""
+
         self.reset()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1

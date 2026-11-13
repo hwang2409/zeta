@@ -608,7 +608,9 @@ class CheckpointTranscriptMixin:
         except RuntimeError:
             asyncio.run(self._load_transcript_page(reset=True))
         else:
-            loop.create_task(self._load_transcript_page(reset=True))
+            task = loop.create_task(self._load_transcript_page(reset=True))
+            self._history_rebuild_tasks.add(task)
+            task.add_done_callback(self._history_rebuild_tasks.discard)
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
         """Load only the newest bounded history page after first paint."""
@@ -634,10 +636,16 @@ class CheckpointTranscriptMixin:
             self._history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
+            self._live_renderables.clear()
+        scroll_anchor = self._transcript.scroll_anchor
+        anchor_value = scroll_anchor[0].value if scroll_anchor[0] is not None else None
+        anchor_offset = scroll_anchor[1]
         page = await self._history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
         self._render_resident_history()
+        if anchor_value is not None:
+            self._transcript.restore_scroll_value(anchor_value, anchor_offset)
         if self._history_marker_tasks:
             await asyncio.gather(*tuple(self._history_marker_tasks))
         self._invalidate_prompt()
@@ -656,6 +664,8 @@ class CheckpointTranscriptMixin:
         entries = tuple(unit.value for page in pages for unit in page.units)
         for _ in self._render_history_entries(entries, rendered_notifications):
             pass
+        if self._live_renderables:
+            self._transcript.adopt_units(tuple(self._live_renderables))
         marker_write = self._persist_rendered_notifications(
             rendered_notifications, asynchronous=True
         )

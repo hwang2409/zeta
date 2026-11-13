@@ -592,6 +592,15 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._anchor = (unit, max(0, text_offset))
         self._bump_revision()
 
+    def restore_scroll_value(self, value: object, text_offset: int) -> bool:
+        """Restore an anchor by the value retained across a history repaint."""
+
+        for unit in self._units:
+            if unit.value is value:
+                self.restore_scroll_anchor(unit, text_offset)
+                return True
+        return False
+
     def _set_scroll_offset(self, value: int, *, allow_follow_tail: bool = True) -> None:
         line_count = len(self._parsed_lines(self._content_width))
         tail = max(0, line_count - self._viewport_height)
