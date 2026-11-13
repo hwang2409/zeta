@@ -920,11 +920,21 @@ def _record_copyfile(source, target):
         _event_path.write_text(_event_path.read_text() + "pin-copy\\n" if _event_path.exists() else "pin-copy\\n")
     return result
 shutil.copyfile = _record_copyfile
+_real_open = os.open
+_dir_fds = set()
+def _record_open(path, flags, *args, **kwargs):
+    fd = _real_open(path, flags, *args, **kwargs)
+    if isinstance(path, (str, bytes, pathlib.Path)) and pathlib.Path(path) == parent:
+        _dir_fds.add(fd)
+    return fd
+os.open = _record_open
 _real_fsync = os.fsync
 def _record_fsync(fd):
     result = _real_fsync(fd)
     if _pin_inode is not None and os.fstat(fd).st_ino == _pin_inode:
         with _event_path.open("a") as stream: stream.write("pin-fsync\\n")
+    if fd in _dir_fds:
+        with _event_path.open("a") as stream: stream.write("dir-fsync\\n")
     return result
 os.fsync = _record_fsync
 _real_rename = pathlib.Path.rename
@@ -988,13 +998,10 @@ pathlib.Path.rename = _record_rename'''
 
     assert events.index("pin-copy") < events.index("pin-fsync")
     assert events.index("pin-fsync") < events.index("backup-rename")
-    assert events.index("backup-rename") < events.index("dir-fsync") if kind != "ssh" else True
-    if kind != "ssh":
-        first_dir = events.index("dir-fsync")
-        assert events.index("install-rename") < events.index("dir-fsync", first_dir + 1)
-    else:
-        assert events.index("pin-fsync") < events.index("backup-rename")
-        assert events.index("backup-rename") < events.index("install-rename")
+    first_dir = events.index("dir-fsync")
+    assert events.index("backup-rename") < first_dir
+    second_dir = events.index("dir-fsync", first_dir + 1)
+    assert first_dir < events.index("install-rename") < second_dir
 
 
 @pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
