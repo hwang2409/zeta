@@ -12,6 +12,12 @@ from typing import Any
 from .handshake import open_with_retention_yield, user_open_request
 
 
+class _PublishedPass(dict[str, object]):
+    def __init__(self, projection: dict[str, object], *, complete: bool) -> None:
+        super().__init__(projection)
+        self.complete = complete
+
+
 def make_retention_owner(
     home: str | Path, lease: Any, days: Callable[[], int] | None = None
 ) -> RetentionActivationOwner:
@@ -31,7 +37,7 @@ def make_retention_owner(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
         append_retention_history(root, retained, projection)
-        return projection
+        return _PublishedPass(projection, complete=result.complete)
 
     return RetentionActivationOwner(
         lambda: planner_type(root, retained),
