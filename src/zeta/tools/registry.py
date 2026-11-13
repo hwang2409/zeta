@@ -5,6 +5,7 @@ also include ``full_size_chars`` for their readable-text character length.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib
 import inspect

@@ -718,7 +718,9 @@ async def approved_mcp_task_stack_watchdog() -> AsyncIterator[None]:
         yield
     finally:
         watchdog.cancel()
-        await asyncio.gather(watchdog, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(watchdog, return_exceptions=True), 10
+        )
 
 
 @pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
