@@ -15,6 +15,15 @@ from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _event, _request
 from zeta.core.session import SessionManager
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+    with_message_origin,
+)
 from zeta.server import ZetaServer
 from zeta.session_retention import (
     RetentionPlanner,
@@ -193,8 +202,45 @@ async def test_retention_policy_stays_preview_only_until_later_armed_pass(tmp_pa
     assert not list(home.glob("retention-quarantine*"))
 
 
-SERVE_RETENTION_STATES = ("idle", "mid-preview", "crashed", "armed-mid-pass")
-SERVE_RETENTION_ROUTES = ("resume", "resume-history-backward", "resume-approval-setup", "resume-yolo", "resume-corrupt-transcript", "resume-reconnect", "list-paged", "delete", "rename")
+SERVE_RETENTION_STATES = ("none", "idle", "mid-preview", "crashed", "armed-mid-pass")
+SERVE_RETENTION_ROUTES = (
+    "resume", "resume-history-backward", "resume-approval-setup", "resume-yolo",
+    "resume-corrupt-transcript", "resume-reconnect", "list-full", "list-paged",
+    "list-project", "delete", "rename",
+)
+
+
+def _seed_matrix_session(home: Path, cwd: Path, route: str) -> str:
+    """Build the same durable fixtures used by the server resume regressions."""
+    initialize_storage_home(home)
+    opened = SessionManager(home).create(
+        provider="codex", model="offline", cwd=cwd
+    )
+    sid = opened.metadata.session_id
+    if route == "resume-history-backward":
+        for index in range(6):
+            opened.store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prefix {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+    elif route == "resume-approval-setup":
+        call = ToolCall("matrix-call", "read", {"path": str(cwd / "input")})
+        opened.store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call)],
+        )
+    elif route == "resume-corrupt-transcript":
+        path = opened.store.path
+        opened.store.close()
+        with path.open("ab") as stream:
+            stream.write(b'{"private":"must-not-leak"\n')
+        return sid
+    opened.store.close()
+    if route == "resume-yolo":
+        (cwd / "settings.toml").write_text("yolo = true\\n")
+    return sid
 
 
 def _retention_lock_path(home: Path, domain: str) -> Path:
@@ -245,54 +291,86 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
 ) -> None:
     """Every serve access keeps its normal result while preview owns a root."""
     home = tmp_path / "home"
-    initialize_storage_home(home)
-    manager = SessionManager(home)
-    opened = await asyncio.to_thread(
-        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
-    )
-    sid = opened.metadata.session_id
-    opened.store.close()
+    sid = await asyncio.to_thread(_seed_matrix_session, home, tmp_path, route)
     if owner_state == "armed-mid-pass":
         (home / "retention-arm.json").write_text("{}\n")
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer = await _connect(server)
     holder = command = None
     try:
-        await _hello(reader, writer, 1, features=["list_sessions_paging"])
-        if owner_state != "idle":
+        await _hello(
+            reader,
+            writer,
+            1,
+            features=["list_sessions_paging", "projects", "session_replay_seq"],
+        )
+        if owner_state not in {"none", "idle"}:
             holder, command = _start_retention_holder(
                 home, sid, crashed=owner_state == "crashed"
             )
-        if route == "resume" or route.startswith("resume-"):
-            method = "resume"
-            params = {"session_id": sid}
-        elif route == "list-paged":
-            method = "list_sessions"
-            params = {"offset": 0, "limit": 1}
-        elif route == "delete":
-            method = "delete_session"
-            params = {"session_id": sid}
-        elif route == "rename":
-            method = "rename_session"
-            params = {"session_id": sid, "name": "matrix"}
+        if route.startswith("resume") and route != "resume-reconnect":
+            frames = await _request(reader, writer, 2, "resume", {"session_id": sid})
+            result = next(frame for frame in reversed(frames) if "result" in frame or "error" in frame)
+            if route == "resume-corrupt-transcript":
+                assert result["error"]["data"]["code"] == "corrupt_transcript"
+            else:
+                assert result.get("result", {}).get("session", {}).get("session_id") == sid, result
+                if route == "resume-history-backward":
+                    pages: list[tuple[int, dict[str, object]]] = []
+                    offset = 0
+                    while True:
+                        page = (await _request(reader, writer, f"page-{offset}", "session_history", {"session_id": sid, "offset": offset}))[-1]["result"]
+                        pages.append((offset, page))
+                        if page["next_offset"] is None:
+                            break
+                        offset = page["next_offset"]
+                    forward = [row for _, page in pages for row in page["messages"]]
+                    backward_pages: dict[int, list[dict[str, object]]] = {}
+                    for offset, _ in reversed(pages):
+                        backward_pages[offset] = (await _request(reader, writer, f"back-{offset}", "session_history", {"session_id": sid, "offset": offset}))[-1]["result"]["messages"]
+                    assert [row for offset, _ in pages for row in backward_pages[offset]] == forward
+        elif route == "resume-reconnect":
+            resumed = (await _request(reader, writer, 2, "resume", {"session_id": sid}))[-1]
+            assert resumed.get("result", {}).get("session", {}).get("session_id") == sid, resumed
+            first_response = (await _request(reader, writer, 3, "session_history_and_subscribe", {"session_id": sid}))[-1]
+            assert "result" in first_response, first_response
+            first = first_response["result"]
+            assert first["replay"]["history_seq"] == 0
+            writer.close()
+            await writer.wait_closed()
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            await _hello(reader, writer, 3, features=["session_replay_seq"])
+            result = (await _request(reader, writer, 4, "session_history_and_subscribe", {"session_id": sid}))[-1]
+            assert result.get("result", {}).get("replay", {}).get("history_seq") == 0, result
         else:
-            method = (
-                "session_history_and_subscribe"
-                if route == "resume-reconnect"
-                else "session_history"
-            )
+            method = "list_sessions" if route.startswith("list-") else route
             params = {"session_id": sid}
-        frames = await _request(reader, writer, 2, method, params)
-        result = next(frame for frame in reversed(frames) if "result" in frame or "error" in frame)
-        assert "error" not in result, result
-        assert result.get("result") is not None
-        if route == "list-paged":
-            rows = result["result"]["sessions"]
-            assert len(rows) <= 1
-        if owner_state == "mid-preview":
+            if route == "list-full":
+                params = {}
+            elif route == "list-paged":
+                params = {"offset": 0, "limit": 1}
+            elif route == "list-project":
+                params = {"project_id": "missing-project"}
+            elif route == "delete":
+                method, params = "delete_session", {"session_id": sid}
+            elif route == "rename":
+                method, params = "rename_session", {"session_id": sid, "name": "matrix"}
+            result = next(frame for frame in reversed(await _request(reader, writer, 2, method, params)) if "result" in frame or "error" in frame)
+            if route == "list-project":
+                assert result.get("error", {}).get("code") == -32602, result
+                assert result["error"]["data"]["code"] == "project_not_found"
+            else:
+                assert "error" not in result, result
+                assert result.get("result") is not None
+            if route.startswith("list-") and route != "list-project":
+                rows = result["result"]["sessions"]
+                assert sid in {row["session_id"] for row in rows}
+            if route == "rename":
+                assert result["result"]["session"]["session_id"] == sid
+        if owner_state == "mid-preview" and route != "list-project":
             assert holder is not None
             assert not holder.is_alive()
-            if route == "list-paged":
+            if route in {"list-full", "list-paged"}:
                 assert sid in {row["session_id"] for row in rows}
     finally:
         if holder is not None and holder.is_alive():
