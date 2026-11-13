@@ -237,16 +237,7 @@ class _QuarantineTransaction:
         self, reservations_fd: int, txns_fd: int, name: str,
         reservation: dict, budget: _Budget,
     ) -> TransactionOutcome:
-        expected_name = f"{reservation['session_id']}.json"
-        if name != expected_name:
-            raise TransactionError("retention reservation name mismatch")
-        txid = reservation["transaction_id"]
-        _hex_id(txid, "transaction id")
-        _component(reservation["session_id"], "session id")
-        if reservation["source_path"] != f"sessions/{reservation['session_id']}":
-            raise TransactionError("retention reservation source mismatch")
-        if reservation["trash_path"] != f"session-trash/transactions/{txid}/tree":
-            raise TransactionError("retention reservation trash mismatch")
+        txid = _validated_reservation_name(name, reservation)
         if txns_fd is None:
             self.lease.delete(reservations_fd, name)
             return TransactionOutcome(
@@ -268,36 +259,8 @@ class _QuarantineTransaction:
                     dir_fd=txn_fd,
                 )
             except FileNotFoundError:
-                manifest = _read_optional_validated_json(
-                    txn_fd, _MANIFEST_NAME, validate_retention_manifest
-                )
-                if manifest is None:
-                    completed = _remove_empty_transaction(txns_fd, txn_fd, txid)
-                    if completed:
-                        self.lease.delete(reservations_fd, name)
-                    return TransactionOutcome(
-                        True,
-                        session_id=reservation["session_id"],
-                        completed=completed,
-                    )
-                _match_manifest(reservation, manifest)
-                if manifest["stage"] == "removing":
-                    self._publish(
-                        txn_fd, _MANIFEST_NAME,
-                        {**manifest, "stage": "removed"},
-                        validate_retention_manifest,
-                    )
-                    return TransactionOutcome(True, session_id=reservation["session_id"])
-                if manifest["stage"] != "removed":
-                    raise TransactionError("retention tree disappeared before removal")
-                self.lease.delete(txn_fd, _MANIFEST_NAME)
-                completed = _remove_empty_transaction(txns_fd, txn_fd, txid)
-                if completed:
-                    self.lease.delete(reservations_fd, name)
-                return TransactionOutcome(
-                    True,
-                    session_id=reservation["session_id"],
-                    completed=completed,
+                return self._recover_missing_tree(
+                    reservations_fd, txns_fd, txn_fd, name, reservation
                 )
             try:
                 info = os.fstat(tree_fd)
@@ -330,6 +293,44 @@ class _QuarantineTransaction:
             )
         finally:
             os.close(txn_fd)
+
+    def _recover_missing_tree(
+        self, reservations_fd, txns_fd, txn_fd, name, reservation
+    ) -> TransactionOutcome:
+        manifest = _read_optional_validated_json(
+            txn_fd, _MANIFEST_NAME, validate_retention_manifest
+        )
+        if manifest is None:
+            return self._finish_empty_transaction(
+                reservations_fd, txns_fd, txn_fd, name, reservation
+            )
+        _match_manifest(reservation, manifest)
+        if manifest["stage"] == "removing":
+            self._publish(
+                txn_fd,
+                _MANIFEST_NAME,
+                {**manifest, "stage": "removed"},
+                validate_retention_manifest,
+            )
+            return TransactionOutcome(True, session_id=reservation["session_id"])
+        if manifest["stage"] != "removed":
+            raise TransactionError("retention tree disappeared before removal")
+        self.lease.delete(txn_fd, _MANIFEST_NAME)
+        return self._finish_empty_transaction(
+            reservations_fd, txns_fd, txn_fd, name, reservation
+        )
+
+    def _finish_empty_transaction(
+        self, reservations_fd, txns_fd, txn_fd, name, reservation
+    ) -> TransactionOutcome:
+        completed = _remove_empty_transaction(
+            txns_fd, txn_fd, reservation["transaction_id"]
+        )
+        if completed:
+            self.lease.delete(reservations_fd, name)
+        return TransactionOutcome(
+            True, session_id=reservation["session_id"], completed=completed
+        )
 
     def _start_one(
         self, days: int, preview: dict | None, verify: CandidateVerifier
@@ -510,39 +511,30 @@ class _QuarantineTransaction:
             self._publish_state({**state, "frontier": [list(p) for p in frontier]})
             return not frontier
         try:
-            first = None
-            with _ChargedScan(directory_fd, budget.charge) as entries:
-                for first in entries:
-                    break
+            first = _first_entry(directory_fd, budget)
             if first is not None:
-                info = first.stat(follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    if len(path) >= _MAX_DEPTH:
-                        raise TransactionError("retention trash is too deep")
-                    frontier.append((*path, first.name))
-                    self._publish_state({**state, "frontier": [list(p) for p in frontier]})
-                    return False
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise TransactionError("unsafe retention trash entry")
-                self._publish_state(state)
-                os.unlink(first.name, dir_fd=directory_fd)
-                os.fsync(directory_fd)
+                self._remove_tree_entry(directory_fd, path, first, state, frontier)
                 return False
         finally:
             os.close(directory_fd)
-        if path:
-            parent_fd = _descend(txn_fd, (_TREE_NAME, *path[:-1]))
-            try:
-                os.rmdir(path[-1], dir_fd=parent_fd)
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        else:
-            os.rmdir(_TREE_NAME, dir_fd=txn_fd)
-            os.fsync(txn_fd)
+        _remove_empty_tree_directory(txn_fd, path)
         frontier.pop()
         self._publish_state({**state, "frontier": [list(p) for p in frontier]})
         return not frontier
+
+    def _remove_tree_entry(self, directory_fd, path, entry, state, frontier) -> None:
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if len(path) >= _MAX_DEPTH:
+                raise TransactionError("retention trash is too deep")
+            frontier.append((*path, entry.name))
+            self._publish_state({**state, "frontier": [list(p) for p in frontier]})
+            return
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise TransactionError("unsafe retention trash entry")
+        self._publish_state(state)
+        os.unlink(entry.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
 
     def _read_arm(self) -> dict | None:
         home_fd = _open_home(self.home)
@@ -688,6 +680,20 @@ def _read_optional_validated_json(directory_fd, name, validate) -> dict | None:
     return value
 
 
+def _validated_reservation_name(name: str, reservation: dict) -> str:
+    session_id = reservation["session_id"]
+    txid = reservation["transaction_id"]
+    if name != f"{session_id}.json":
+        raise TransactionError("retention reservation name mismatch")
+    _hex_id(txid, "transaction id")
+    _component(session_id, "session id")
+    if reservation["source_path"] != f"sessions/{session_id}":
+        raise TransactionError("retention reservation source mismatch")
+    if reservation["trash_path"] != f"session-trash/transactions/{txid}/tree":
+        raise TransactionError("retention reservation trash mismatch")
+    return txid
+
+
 def _manifest_from_reservation(reservation: dict) -> dict:
     return {
         "schema_version": 1,
@@ -715,30 +721,36 @@ def _scan_quarantined_tree(
     retained_bytes = 0
     with _ChargedScan(tree_fd, budget.charge) as entries:
         for entry in entries:
-            info = entry.stat(follow_symlinks=False)
-            child_path = (*path, entry.name)
-            if stat.S_ISDIR(info.st_mode):
-                child_fd = os.open(
-                    entry.name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=tree_fd,
-                )
-                try:
-                    nested, nested_bytes = _scan_quarantined_tree(
-                        child_fd, root_id, budget, child_path
-                    )
-                finally:
-                    os.close(child_fd)
-                descendants.extend(nested)
-                retained_bytes += nested_bytes
-                if path and path[-1] == "agents":
-                    child_id = ":".join(part for part in child_path if part != "agents")
-                    descendants.append(f"{root_id}:{child_id}")
-            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                retained_bytes += info.st_size
-            else:
-                raise TransactionError("unsafe retention trash entry")
+            nested, nested_bytes = _scan_quarantined_entry(
+                tree_fd, entry, root_id, budget, path
+            )
+            descendants.extend(nested)
+            retained_bytes += nested_bytes
     return tuple(sorted(descendants)), retained_bytes
+
+
+def _scan_quarantined_entry(tree_fd, entry, root_id, budget, path):
+    info = entry.stat(follow_symlinks=False)
+    if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+        return (), info.st_size
+    if not stat.S_ISDIR(info.st_mode):
+        raise TransactionError("unsafe retention trash entry")
+    child_path = (*path, entry.name)
+    child_fd = os.open(
+        entry.name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=tree_fd,
+    )
+    try:
+        descendants, retained_bytes = _scan_quarantined_tree(
+            child_fd, root_id, budget, child_path
+        )
+    finally:
+        os.close(child_fd)
+    if path and path[-1] == "agents":
+        child_id = ":".join(part for part in child_path if part != "agents")
+        descendants = (*descendants, f"{root_id}:{child_id}")
+    return descendants, retained_bytes
 
 
 def _match_manifest(reservation: dict, manifest: dict) -> None:
@@ -769,6 +781,24 @@ def _removal_state(manifest: dict) -> dict:
         "reference_cursor": {}, "start_generation": manifest["generation"],
         "references": {}, "phase": "removing", "preview": None,
     }
+
+
+def _first_entry(directory_fd: int, budget: _Budget):
+    with _ChargedScan(directory_fd, budget.charge) as entries:
+        return next(entries, None)
+
+
+def _remove_empty_tree_directory(txn_fd: int, path: tuple[str, ...]) -> None:
+    if not path:
+        os.rmdir(_TREE_NAME, dir_fd=txn_fd)
+        os.fsync(txn_fd)
+        return
+    parent_fd = _descend(txn_fd, (_TREE_NAME, *path[:-1]))
+    try:
+        os.rmdir(path[-1], dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _descend(parent_fd: int, components: tuple[str, ...]) -> int:
