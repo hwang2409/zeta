@@ -890,6 +890,7 @@ async def test_controller_close_never_writes_after_registry_release(
         publication_done.set()
         return result
 
+    # test-contract: seam observe wire admission after semantic recording
     monkeypatch.setattr(server.control, "_admit_background", record_notification)
     writer.close()
     await writer.wait_closed()
