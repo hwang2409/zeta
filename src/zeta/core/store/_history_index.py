@@ -414,6 +414,8 @@ class HistoryIndex:
             group = 0
             with connection:
                 count = 0
+                entry_batch: list[tuple[object, ...]] = []
+                warm_batch: list[tuple[object, ...]] = []
                 for ref, entry in zip(row_refs, validated_rows, strict=True):
                     count += 1
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
@@ -428,20 +430,30 @@ class HistoryIndex:
                     )
                     if active and self._starts_next_group(entry_type, data):
                         group += 1
-                    connection.execute(
-                        "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        (seq, entry_id, parent_id, lane, entry_type, encoded, history_group),
+                    entry_batch.append(
+                        (seq, entry_id, parent_id, lane, entry_type, encoded, history_group)
                     )
-                    connection.execute(
-                        "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) VALUES(?,?,?,?)",
+                    warm_batch.append(
                         (
                             seq,
                             int(getattr(ref, "offset", 0)),
                             int(getattr(ref, "length", 0)),
                             self._value(self._warm_facts(getattr(ref, "facts", None))),
-                        ),
+                        )
                     )
+                    if len(entry_batch) == 128:
+                        connection.executemany(
+                            "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            entry_batch,
+                        )
+                        connection.executemany(
+                            "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) "
+                            "VALUES(?,?,?,?)",
+                            warm_batch,
+                        )
+                        entry_batch.clear()
+                        warm_batch.clear()
                     if active and entry_type == "message":
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
@@ -462,6 +474,16 @@ class HistoryIndex:
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
                         )
+                connection.executemany(
+                    "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    entry_batch,
+                )
+                connection.executemany(
+                    "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) "
+                    "VALUES(?,?,?,?)",
+                    warm_batch,
+                )
                 self._set_meta(connection, source_facts, total=group)
                 connection.execute(
                     "INSERT INTO meta(key,value) VALUES('startup_projection',?) "
