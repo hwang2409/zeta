@@ -43,6 +43,7 @@ from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
 from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
+from ..runtime.update_notice import subscribe_tui_update_notice
 from ..skills import (
     discover_session_skills,
 )
@@ -692,6 +693,7 @@ def _create_app_with_root(
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system
+    subscribe_tui_update_notice(app)
     return app
 
 
