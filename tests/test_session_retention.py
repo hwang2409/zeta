@@ -1663,6 +1663,7 @@ def _run_fault_transaction(home, details, monkeypatch, *, fail_at=None, cancel=F
         return real_delete(lease, directory_fd, name)
 
     monkeypatch.setattr(transaction._QuarantineTransaction, "advance", advance)
+    # test-contract: seam observes every durable publication without product hooks
     monkeypatch.setattr(transaction._QuarantineTransaction, "_publish", publish)
     monkeypatch.setattr(transaction, "os", TransactionOs())
     monkeypatch.setattr(WriterLease, "delete", delete)
