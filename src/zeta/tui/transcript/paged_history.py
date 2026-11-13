@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -71,6 +72,10 @@ class TUIHistorySource(Protocol):
         *,
         direction: Literal["older", "newer"] = "older",
     ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]: ...
+
+    def prompt_pages(
+        self,
+    ) -> AsyncIterator[tuple[tuple[str, str], ...]]: ...
 
     async def adjacent_visible_user(
         self, entry_id: str, *, direction: Literal["older", "newer"]
