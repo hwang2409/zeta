@@ -2518,6 +2518,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 @pytest.mark.asyncio
 async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "input.txt"
     target.write_text("data")
@@ -2529,16 +2530,48 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
+    assert server.runtime.loop is not None
+    owner = server.runtime.loop._background_owner
+    register_attempted = asyncio.Event()
+    original_register = owner.register
+    deferred_registration: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def defer_grandchild_registration(
+        *args: object, **kwargs: object
+    ) -> None:
+        if kwargs.get("parent_instance_id") is not None:
+            deferred_registration.append((args, kwargs))
+            register_attempted.set()
+            return
+        original_register(*args, **kwargs)
+
+    original_notify = server.control._notify
+
+    async def cancel_before_grandchild_registration(
+        event: str, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if event == "approval_request" and fields.get("agent_instance_id") is not None:
+            await await_or_fail(
+                register_attempted.wait(),
+                timeout=TIMEOUT,
+                what="grandchild registration attempt",
+            )
+            grandchild_id = str(fields["agent_instance_id"])
+            assert owner.cancel(grandchild_id.rsplit(":", 1)[0])
+            args, kwargs = deferred_registration.pop()
+            original_register(*args, **kwargs)
+        return await original_notify(event, session_id, **fields)
+
+    # test-contract: force approval publication before the grandchild is registered
+    monkeypatch.setattr(owner, "register", defer_grandchild_registration)
+    monkeypatch.setattr(server.control, "_notify", cancel_before_grandchild_registration)
     child_watcher: asyncio.Task[object] | None = None
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
         grandchild_id = approval["agent_instance_id"]
         child_id = grandchild_id.rsplit(":", 1)[0]
-        assert server.runtime.loop is not None
-        owner = server.runtime.loop._background_owner
         child_watcher = owner._watchers[child_id]
-        assert owner.cancel(child_id)
         frames = deque(await _request(reader, writer, 4, "status"), maxlen=50)
         frame_count = len(frames)
 

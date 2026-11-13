@@ -635,7 +635,10 @@ class ApprovalLifecycle:
     def _cleanup_delegated(self, child_instance_id: str) -> Awaitable[object] | None:
         settlements: list[asyncio.Task[object]] = []
         for key, record in tuple(self._state.records.items()):
-            if not isinstance(key, tuple) or key[0] != child_instance_id:
+            if not isinstance(key, tuple) or not (
+                key[0] == child_instance_id
+                or key[0].startswith(f"{child_instance_id}:")
+            ):
                 continue
             reserved = self._reserve(record, "child_cleanup")
             if reserved is not None:
