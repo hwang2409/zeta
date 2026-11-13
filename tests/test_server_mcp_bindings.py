@@ -26,6 +26,63 @@ from zeta.server import ZetaServer
 SECRET = "page-secret-never-persisted"
 
 
+class LocalGETStream:
+    def __init__(
+        self,
+        owner: LocalMCP,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self.owner = owner
+        self.reader = reader
+        self.writer = writer
+
+    async def run(self) -> None:
+        self.writer.write(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
+        )
+        await self.writer.drain()
+        self.owner.notification_opened.set()
+        while True:
+            client_closed = asyncio.create_task(self.reader.read())
+            drop = asyncio.create_task(
+                asyncio.wait_for(self.owner.drop_notification.wait(), 10)
+            )
+            send = asyncio.create_task(
+                asyncio.wait_for(self.owner.send_tool_change.wait(), 10)
+            )
+            try:
+                done, _ = await asyncio.wait_for(
+                    asyncio.wait(
+                        (client_closed, drop, send),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    ),
+                    10,
+                )
+                if send in done:
+                    self.owner.send_tool_change.clear()
+                    payload = json.dumps({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                    }).encode()
+                    self.writer.write(b"data: " + payload + b"\n\n")
+                    await self.writer.drain()
+                    self.owner.tool_change_sent.set()
+                    continue
+                self.owner.notification_closed.set()
+                return
+            finally:
+                client_closed.cancel()
+                drop.cancel()
+                send.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        client_closed, drop, send, return_exceptions=True
+                    ),
+                    10,
+                )
+
+
 class LocalMCP:
     def __init__(
         self, *, error_with_header: bool = False, reject_missing_auth: bool = False
@@ -76,49 +133,8 @@ class LocalMCP:
                 self.auth_received.set()
             if http_method == "GET":
                 self.methods.append("GET")
-                writer.write(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
-                )
-                await writer.drain()
-                self.notification_opened.set()
-                while True:
-                    client_closed = asyncio.create_task(reader.read())
-                    drop = asyncio.create_task(
-                        asyncio.wait_for(self.drop_notification.wait(), 10)
-                    )
-                    send = asyncio.create_task(
-                        asyncio.wait_for(self.send_tool_change.wait(), 10)
-                    )
-                    try:
-                        done, _ = await asyncio.wait_for(
-                            asyncio.wait(
-                                (client_closed, drop, send),
-                                return_when=asyncio.FIRST_COMPLETED,
-                            ),
-                            10,
-                        )
-                        if send in done:
-                            self.send_tool_change.clear()
-                            payload = json.dumps({
-                                "jsonrpc": "2.0",
-                                "method": "notifications/tools/list_changed",
-                            }).encode()
-                            writer.write(b"data: " + payload + b"\n\n")
-                            await writer.drain()
-                            self.tool_change_sent.set()
-                            continue
-                        self.notification_closed.set()
-                        return
-                    finally:
-                        client_closed.cancel()
-                        drop.cancel()
-                        send.cancel()
-                        await asyncio.wait_for(
-                            asyncio.gather(
-                                client_closed, drop, send, return_exceptions=True
-                            ),
-                            10,
-                        )
+                await LocalGETStream(self, reader, writer).run()
+                return
             length = int(headers.get("content-length", "0"))
             body = await reader.readexactly(length)
             request = json.loads(body)
@@ -173,21 +189,39 @@ class LocalMCP:
 
 class LocalResponseStream(httpx.AsyncByteStream):
     def __init__(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        close_barrier: tuple[asyncio.Event, asyncio.Event, asyncio.Event] | None = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
+        self.close_barrier = close_barrier
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         while chunk := await self.reader.read(65536):
             yield chunk
 
     async def aclose(self) -> None:
+        if self.close_barrier is not None:
+            started, release, timed_out = self.close_barrier
+            started.set()
+            try:
+                await asyncio.wait_for(release.wait(), 10)
+            except asyncio.CancelledError:
+                timed_out.set()
+                raise
         self.writer.close()
         await self.writer.wait_closed()
 
 
 class LocalTransport(httpx.AsyncBaseTransport):
+    def __init__(
+        self,
+        close_barriers: dict[int, tuple[asyncio.Event, asyncio.Event, asyncio.Event]] | None = None,
+    ) -> None:
+        self.close_barriers = close_barriers or {}
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         reader, writer = await asyncio.open_connection(request.url.host, request.url.port)
         body = request.content
@@ -221,19 +255,24 @@ class LocalTransport(httpx.AsyncBaseTransport):
         return httpx.Response(
             status,
             headers=response_headers,
-            stream=LocalResponseStream(reader, writer),
+            stream=LocalResponseStream(
+                reader, writer, self.close_barriers.get(request.url.port)
+            ),
             request=request,
         )
 
 
-def allow_local_http(monkeypatch: pytest.MonkeyPatch) -> None:
+def allow_local_http(
+    monkeypatch: pytest.MonkeyPatch,
+    close_barriers: dict[int, tuple[asyncio.Event, asyncio.Event, asyncio.Event]] | None = None,
+) -> None:
     original_client = httpx.AsyncClient
     monkeypatch.setattr(
         httpx,
         "AsyncClient",
         lambda *args, **kwargs: original_client(
             *args,
-            transport=LocalTransport(),
+            transport=LocalTransport(close_barriers),
             **{key: value for key, value in kwargs.items() if key != "transport"},
         ),
     )
@@ -493,6 +532,112 @@ async def test_session_mcp_binding_disconnect_closes_authenticated_stream(
             await writer.wait_closed()
         await server.close()
         await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_disconnect_suspends_all_servers_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = LocalMCP(reject_missing_auth=True)
+    second = LocalMCP(reject_missing_auth=True)
+    first_port = await first.start()
+    second_port = await second.start()
+    first_close_started = asyncio.Event()
+    release_first_close = asyncio.Event()
+    first_close_timed_out = asyncio.Event()
+    allow_local_http(
+        monkeypatch,
+        {first_port: (first_close_started, release_first_close, first_close_timed_out)},
+    )
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {
+        "first": {
+            "transport": "streamable-http",
+            "url": f"http://127.0.0.1:{first_port}",
+        },
+        "second": {
+            "transport": "streamable-http",
+            "url": f"http://127.0.0.1:{second_port}",
+        },
+    }}))
+    model_called = asyncio.Event()
+
+    def record_call(messages: object, tools: object) -> bytes:
+        model_called.set()
+        return json.dumps([]).encode()
+
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("mounted")])],
+        request_serializer=record_call,
+    )
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    bindings = [
+        {"server": "first", "headers": {"Authorization": "Bearer old"}},
+        {"server": "second", "headers": {"Authorization": "Bearer old"}},
+    ]
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "mcp_bindings": bindings
+        })
+        await _request(reader, writer, 3, "send", {"text": "mount"})
+        await asyncio.wait_for(model_called.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        await asyncio.wait_for(first.notification_opened.wait(), TIMEOUT)
+        await asyncio.wait_for(second.notification_opened.wait(), TIMEOUT)
+
+        first.detached = True
+        second.detached = True
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.wait_for(first_close_started.wait(), TIMEOUT)
+        second_closed = asyncio.create_task(
+            asyncio.wait_for(second.notification_closed.wait(), 10)
+        )
+        first_timed_out = asyncio.create_task(
+            asyncio.wait_for(first_close_timed_out.wait(), 10)
+        )
+        try:
+            done, _ = await asyncio.wait_for(
+                asyncio.wait(
+                    (second_closed, first_timed_out),
+                    return_when=asyncio.FIRST_COMPLETED,
+                ),
+                TIMEOUT,
+            )
+            assert second_closed in done, (
+                "later MCP server stayed mounted until the first server close deadline"
+            )
+        finally:
+            second_closed.cancel()
+            first_timed_out.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(
+                    second_closed, first_timed_out, return_exceptions=True
+                ),
+                TIMEOUT,
+            )
+        second.drop_notification.set()
+        assert not second.request_after_detach.is_set(), (
+            "later MCP server sent the detached controller's old header while "
+            "the first server close was held"
+        )
+        release_task = server.control._controller_release_task
+        assert release_task is not None and not release_task.done()
+    finally:
+        release_first_close.set()
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        await server.close()
+        await first.close()
+        await second.close()
 
 
 @pytest.mark.asyncio
