@@ -735,6 +735,33 @@ async def test_memory_retry_refused_while_scanner_blocked(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_retention_pin_shared_dispatch_renders_real_tui_output(tmp_path: Path) -> None:
+    from tests.support.owned import owned_app
+    from zeta.core.session import SessionManager
+
+    manager = SessionManager(tmp_path)
+    current = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    loop = AgentLoop(FakeBackend([]), current.store, skill_catalog=SkillCatalog.empty())
+    rendered = StringIO()
+    app = TUIApp(
+        loop,
+        provider="codex",
+        model="offline",
+        zeta_home=tmp_path,
+        console=Console(file=rendered, force_terminal=False, width=200),
+    )
+    async with owned_app(app):
+        for command, expected in (("/pin", "session pinned"), ("/unpin", "session unpinned")):
+            output = await app._slash_commands.dispatch(app, command)
+            assert output == expected
+            app._handle_slash_output(output)
+    assert "system · session pinned" in rendered.getvalue()
+    assert "system · session unpinned" in rendered.getvalue()
+
+
+@pytest.mark.asyncio
 async def test_memory_recovery_and_guarded_undo_use_real_tui_and_serve_slash_paths() -> None:
     class Registry:
         memory_transactions = SimpleNamespace(

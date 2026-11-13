@@ -21,12 +21,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from .attention_forks import read_attention_fork
-from .attention_records import AttentionRecord
-from .core.agent_state import _parse_agent_state
-from .core.child_lifecycle import ChildRunPhase, parse_legacy_child_lifecycle
-from .core.session import SessionMetadata
-from .core.session_files import (
+from ..attention_forks import read_attention_fork
+from ..attention_records import AttentionRecord
+from ..core.agent_state import _parse_agent_state
+from ..core.child_lifecycle import ChildRunPhase, parse_legacy_child_lifecycle
+from ..core.session import SessionMetadata
+from ..core.session_files import (
     SessionError,
     SessionInUseError,
     SessionNotFoundError,
@@ -35,21 +35,14 @@ from .core.session_files import (
     descend_directory,
     open_session_file,
     read_reference_generation,
-    unlink_session_file,
 )
-from .core.session_links import valid_child_pending_link, valid_pending_link
-from .core.todo import parse_todo_items
-from .core.transcript_recovery import RepairTarget, classify_recovery_records
-from .memory.reconciliation_state import classify_reconciliation_records
-from .project_inbox import InboxError, validate_inbox_record
-from .project_inbox_sent import SentMessageTracker, _Broken, _Loaded
-from .session_retention_transaction import (
-    Candidate,
-    CandidateRejected,
-    TransactionOutcome,
-    _QuarantineTransaction,
-)
-from .storage_format import (
+from ..core.session_links import valid_child_pending_link, valid_pending_link
+from ..core.todo import parse_todo_items
+from ..core.transcript_recovery import RepairTarget, classify_recovery_records
+from ..memory.reconciliation_state import classify_reconciliation_records
+from ..project_inbox import InboxError, validate_inbox_record
+from ..project_inbox_sent import SentMessageTracker, _Broken, _Loaded
+from ..storage_format import (
     StorageFeature,
     StorageFormatError,
     WriterLease,
@@ -57,61 +50,13 @@ from .storage_format import (
     validate_retention_reservation,
     validate_retention_state,
 )
-
-RETENTION_PIN_FILENAME = ".retention-pin.json"
-_MAX_PIN_BYTES = 256
-_PIN_DATA = b'{"pinned":true,"schema_version":1}\n'
-
-
-def is_retention_pinned(directory_fd: int, *, scan=None) -> bool:
-    """Return pin state, treating every unsafe present sidecar as pinned."""
-    try:
-        fd = open_session_file(directory_fd, RETENTION_PIN_FILENAME, os.O_RDONLY)
-    except FileNotFoundError:
-        try:
-            charge = scan.charge_entry if scan is not None else (lambda _size: None)
-            with _EntryScan(directory_fd, charge) as entries:
-                return any(
-                    entry.name.startswith(f".{RETENTION_PIN_FILENAME}.")
-                    and entry.name.endswith(".tmp")
-                    for entry in entries
-                )
-        except OSError:
-            return True
-    except (OSError, SessionError):
-        return True
-    try:
-        info = os.fstat(fd)
-        if (
-            info.st_size > _MAX_PIN_BYTES
-            or info.st_nlink != 1
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            return True
-        with os.fdopen(fd, "rb") as stream:
-            fd = -1
-            try:
-                json.loads(stream.read(_MAX_PIN_BYTES + 1))
-            except (UnicodeDecodeError, json.JSONDecodeError, OSError):
-                return True
-        return True
-    except (OSError, ValueError):
-        return True
-    finally:
-        if fd != -1:
-            os.close(fd)
-
-
-def write_retention_pin(directory_fd: int) -> None:
-    """Atomically publish the v1 pin sidecar."""
-    atomic_publish_file(directory_fd, RETENTION_PIN_FILENAME, _PIN_DATA)
-
-
-def remove_retention_pin(directory_fd: int) -> None:
-    """Remove the pin sidecar; an absent sidecar is already unpinned."""
-    unlink_session_file(directory_fd, RETENTION_PIN_FILENAME)
-
+from .pin import is_retention_pinned
+from .transaction import (
+    Candidate,
+    CandidateRejected,
+    TransactionOutcome,
+    _QuarantineTransaction,
+)
 
 _STATE_FILENAME = "retention-state.json"
 _METADATA_NAME = "meta.json"

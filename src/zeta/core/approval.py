@@ -25,6 +25,11 @@ from .store import ConversationStore
 PRECEDENCE = ("deny", "ask", "allow", "default")
 PENDING_APPROVAL_LIMIT = 64
 
+
+def child_instance_in_subtree(candidate: str, root: str) -> bool:
+    return candidate == root or candidate.startswith(f"{root}:")
+
+
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -893,7 +898,7 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         if self._serve_control is not None:
             return self._serve_control.cleanup_delegated(child_instance_id)
         for key, (request, store) in list(self._delegated.items()):
-            if key[0] != child_instance_id:
+            if not child_instance_in_subtree(key[0], child_instance_id):
                 continue
             try:
                 store.resolve_approval(request.request_id, ApprovalDecision.DENY.value)

@@ -50,6 +50,29 @@ def test_missing_files_are_silent(tmp_path: Path) -> None:
     assert loaded.notices == ()
 
 
+@pytest.mark.parametrize("days", [0, 1, 3650])
+def test_retention_days_accepts_global_values(tmp_path: Path, days: int) -> None:
+    _write(tmp_path / "home", f"[retention]\ndays = {days}\n")
+    assert load_settings(home=tmp_path / "home").settings.retention_days == days
+
+
+@pytest.mark.parametrize("value", [True, -1, 3651, "30"])
+def test_retention_days_rejects_invalid_values(tmp_path: Path, value: object) -> None:
+    literal = str(value).lower() if isinstance(value, bool) else repr(value)
+    _write(tmp_path / "home", f"[retention]\ndays = {literal}\n")
+    loaded = load_settings(home=tmp_path / "home")
+    assert loaded.settings.retention_days == 30
+    assert any("retention.days" in notice for notice in loaded.notices)
+
+
+def test_project_retention_days_is_ignored_with_warning(tmp_path: Path) -> None:
+    _write(tmp_path / "home", "[retention]\ndays = 3650\n")
+    _write(tmp_path / "project", "[retention]\ndays = 0\n")
+    loaded = load_settings(home=tmp_path / "home", project_dir=tmp_path / "project")
+    assert loaded.settings.retention_days == 3650
+    assert any("retention" in warning for warning in loaded.warnings)
+
+
 def test_project_settings_can_only_lower_limits(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
