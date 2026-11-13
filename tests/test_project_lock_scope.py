@@ -23,6 +23,7 @@ from zeta.core.session_links import (
     reconcile_child_links,
 )
 from zeta.core.store import ConversationStore
+import zeta.project_locking as project_locking_module
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
@@ -404,6 +405,24 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         app._install_full_screen_layout(session)
         poll_acquired = threading.Event()
         release_poll = threading.Event()
+        reply_started = threading.Event()
+        past_old_deadline = threading.Event()
+        reply_clock_calls = 0
+        real_monotonic = project_locking_module.time.monotonic
+
+        def injected_monotonic() -> float:
+            nonlocal reply_clock_calls
+            if not reply_started.is_set():
+                return real_monotonic()
+            reply_clock_calls += 1
+            if reply_clock_calls >= 2:
+                past_old_deadline.set()
+                return 2.0
+            return 0.0
+
+        monkeypatch.setattr(
+            project_locking_module.time, "monotonic", injected_monotonic
+        )
         real_directories = ProjectInbox._directories
         poll_gate_used = False
 
@@ -446,8 +465,9 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 asyncio.to_thread(poll_acquired.wait, 10),
                 what="inbox poll lock acquisition",
             )
-            reply_task = asyncio.create_task(
-                _request(
+            async def send_reply() -> list[dict[str, object]]:
+                reply_started.set()
+                return await _request(
                     reader,
                     writer,
                     "attention-reply",
@@ -457,16 +477,14 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                         "text": f"/decisions reply {record.id} yes",
                     },
                 )
+
+            reply_task = asyncio.create_task(send_reply())
+            await await_or_fail(
+                asyncio.to_thread(past_old_deadline.wait, 10),
+                what="serve reply passes old lock deadline",
             )
-            try:
-                reply_response = (
-                    await asyncio.wait_for(asyncio.shield(reply_task), timeout=1.2)
-                )[-1]
-            except TimeoutError:
-                release_poll.set()
-                reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
-            else:
-                release_poll.set()
+            release_poll.set()
+            reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
             assert "result" in reply_response, reply_response
             reply = reply_response["result"]
             assert reply["text"] == f"replied to {record.id}"
