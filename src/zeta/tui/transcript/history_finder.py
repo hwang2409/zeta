@@ -103,8 +103,14 @@ class HistoryFinder:
         snapshot = await asyncio.to_thread(self._load_snapshot)
         yield snapshot, True
 
-    def set_snapshot(self, history: tuple[str, ...]) -> None:
+    def set_snapshot(
+        self, history: tuple[str, ...]
+    ) -> HistoryCandidateRequest | None:
         self._snapshot_override = history
+        if self._finder is None:
+            return None
+        self._generation += 1
+        return HistoryCandidateRequest(self._generation)
 
     def _load_snapshot(self) -> HistorySnapshot:
         history = self._snapshot_override

@@ -67,12 +67,17 @@ class SessionPromptHistory:
         generation = self._generation
 
         async def read() -> None:
-            rows, older, newer = await self.source.prompt_page(
-                self._older, direction="older"
-            )
-            if generation != self._generation:
-                return
-            self._older, self._newer = older, newer
+            cursor = self._older
+            while True:
+                rows, older, newer = await self.source.prompt_page(
+                    cursor, direction="older"
+                )
+                if generation != self._generation:
+                    return
+                self._older, self._newer = older, newer
+                if rows or older is None:
+                    break
+                cursor = older
             if rows:
                 self._entries.insert(0, rows)
                 del self._entries[self.max_pages:]
@@ -214,12 +219,11 @@ class SessionPromptHistory:
                 publish(values[-limit:])
             return
         parsed = parse_query(query)
-        cursor: HistoryCursor | None = None
         ranked: list[tuple[int, int, str]] = []
         retained_values: set[str] = set()
         newest_ordinal = 0
-        while True:
-            rows, older, _newer = await source.prompt_page(cursor, direction="older")
+        published = False
+        async for rows in source.prompt_pages():
             if generation != self._generation:
                 return
 
@@ -258,19 +262,17 @@ class SessionPromptHistory:
                     removed = heapq.heapreplace(ranked, candidate)
                     retained_values.remove(removed[2])
                     retained_values.add(candidate[2])
-            if older is None:
-                break
-            cursor = older
-        if generation != self._generation:
-            return
-        publish(
-            tuple(
-                value
-                for _score, _recency, value in sorted(
-                    ranked, key=lambda item: item[1]
+            publish(
+                tuple(
+                    value
+                    for _score, _recency, value in sorted(
+                        ranked, key=lambda item: item[1]
+                    )
                 )
             )
-        )
+            published = True
+        if not published and generation == self._generation:
+            publish(())
 
     async def close(self) -> None:
         self.clear()

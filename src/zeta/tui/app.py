@@ -796,8 +796,13 @@ class TUIApp(
         prompt_history.bind(self._viewed_session_path(), self._history_source)
 
         def publish(snapshot: tuple[str, ...]) -> None:
-            self._history_finder.set_snapshot(snapshot)
-            FinderRuntimeMixin._history_finder_open(self, buffer)
+            request = self._history_finder.set_snapshot(snapshot)
+            if request is None:
+                FinderRuntimeMixin._history_finder_open(self, buffer)
+            else:
+                if self._finder_prepare_task is not None:
+                    self._finder_prepare_task.cancel()
+                self._start_finder_preparation(request)
 
         prompt_history.start_finder_scan(buffer.text, publish)
 
