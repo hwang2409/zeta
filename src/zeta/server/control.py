@@ -150,16 +150,12 @@ class ServeControl:
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
-            session_id=lambda: (
-                self.server.runtime.session_id
-                if self.server.runtime.opened is not None
-                else None
-            ),
-            parent_store=lambda: (
-                self.server.runtime.opened.store
-                if self.server.runtime.opened is not None
-                else None
-            ),
+            session_id=lambda: self.server.runtime.session_id
+            if self.server.runtime.opened is not None
+            else None,
+            parent_store=lambda: self.server.runtime.opened.store
+            if self.server.runtime.opened is not None
+            else None,
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
             grant_published=self._publish_session_grant,
@@ -547,7 +543,7 @@ class ServeControl:
             else None
         )
         if (
-            not self.turn_busy()
+            (self._turn_task is None or self._turn_task.done())
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])

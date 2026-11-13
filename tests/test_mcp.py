@@ -3930,6 +3930,15 @@ def test_activation_rejects_foreign_definition_with_same_name(tmp_path: Path) ->
     assert registry.is_mcp_owned("srv__real", owner, 2) is False
     assert registry.is_mcp_owned("srv__real", object(), 1) is False
 
+    # A host replacement becomes the only owner of the current definition.
+    registry.register("srv__real", lambda args: "host")
+    assert registry.is_mcp_owned("srv__real", owner, 1) is False
+    registry.unregister("srv__real")
+    assert (
+        registry.register_mcp("srv__real", handler, owner=owner, generation=2) is True
+    )
+    assert registry.is_mcp_owned("srv__real", owner, 2) is True
+
 
 def _deferred_listed_client(name: str, count: int = 40):
     def build(config: MCPServerConfig) -> _ListedClient:

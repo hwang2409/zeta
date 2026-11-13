@@ -253,6 +253,7 @@ class AgentNotificationMixin:
                 pass
             if self.child_turn_control is not None:
                 self.child_turn_control.abandon_completion()
+            self.store.retire_terminal_approval_executions()
             self._turn_active = False
             self._delivering_prompt_id = None
             flow = self.step_delivery
