@@ -10,7 +10,7 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1201,30 +1201,6 @@ def _read_stable_page(
             return None
         index._mark_unavailable()
     return None
-
-
-def _overlay_resident_entries(
-    store: ConversationStore, page: IndexedHistoryPage
-) -> IndexedHistoryPage:
-    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._resident_rows.rows):
-            return entry
-        resident = store._resident_rows.entries[entry.seq - 1]
-        if resident.id != entry.id:
-            return entry
-        accepted = entry.data.get("_accepted_message")
-        if accepted is None:
-            return resident
-        return replace(
-            resident,
-            data={**resident.data, "_accepted_message": accepted},
-        )
-
-    groups = tuple(
-        tuple(resident_entry(entry) for entry in group)
-        for group in page.groups
-    )
-    return replace(page, groups=groups)
 
 
 def _read_stable_tui_page(
