@@ -451,14 +451,26 @@ with _reference_gate(home, (ident,), referenced):
                 _reject(
                     "destination retention pin is not a regular single-link file"
                 )
-            shutil.copyfile(pin, staging / _RETENTION_PIN_FILENAME)
-            (staging / _RETENTION_PIN_FILENAME).chmod(0o600)
+            copied_pin = staging / _RETENTION_PIN_FILENAME
+            shutil.copyfile(pin, copied_pin)
+            copied_pin.chmod(0o600)
+            with copied_pin.open("rb") as stream: os.fsync(stream.fileno())
+        def _fsync_directory(path):
+            directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory_fd)
+            finally: os.close(directory_fd)
         backup = parent / f".{ident}.replaced-{os.getpid()}"
         if backup.exists(): shutil.rmtree(backup)
-        if destination.exists(): destination.rename(backup)
-        try: staging.rename(destination)
+        try:
+            if destination.exists():
+                destination.rename(backup)
+                _fsync_directory(parent)
+            staging.rename(destination)
+            _fsync_directory(parent)
         except BaseException:
-            if backup.exists() and not destination.exists(): backup.rename(destination)
+            if backup.exists() and not destination.exists():
+                backup.rename(destination)
+                _fsync_directory(parent)
             raise
         if backup.exists(): shutil.rmtree(backup)
     finally:

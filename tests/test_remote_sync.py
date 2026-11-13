@@ -862,6 +862,194 @@ def test_install_replace_preserves_retention_pin(
     assert pin.read_text() == '{"pinned":true,"schema_version":1}\n'
 
 
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+def test_install_replace_fsyncs_pin_and_renames_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    local = tmp_path / "local"
+    _set_remote_epoch(local, 8)
+    session_id = _ssh_session(local)
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+        reinstall = lambda: push_session(
+            local, transport, session_id=session_id, force=True
+        )
+    elif kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = LocalTransport(remote)
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+        reinstall = lambda: push_session(
+            local, transport, session_id=session_id, force=True
+        )
+    else:
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+        reinstall = lambda: pull_session(
+            puller,
+            LocalTransport(source_remote),
+            session_id=session_id,
+            force=True,
+        )
+
+    pin = destination / ".retention-pin.json"
+    pin.write_text('{"pinned":true}\n', encoding="utf-8")
+    pin.chmod(0o600)
+    events: list[str] = []
+    if kind == "ssh":
+        event_path = tmp_path / "events"
+        script = ssh_module._SESSION_INSTALL_SCRIPT
+        pin_anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
+        assert pin_anchor in script
+        script = script.replace(
+            pin_anchor,
+            pin_anchor
+            + f'\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("pin-fsync\\n")',
+            1,
+        )
+        backup_anchor = "if destination.exists():\n                destination.rename(backup)"
+        assert backup_anchor in script
+        script = script.replace(
+            backup_anchor,
+            backup_anchor
+            + f'\n                with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("backup-rename\\n")',
+            1,
+        )
+        install_anchor = "staging.rename(destination)"
+        assert install_anchor in script
+        script = script.replace(
+            install_anchor,
+            install_anchor
+            + f'\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("install-rename\\n")',
+            1,
+        )
+        fsync_anchor = "finally: os.close(directory_fd)\n        backup ="
+        assert fsync_anchor in script
+        script = script.replace(
+            fsync_anchor,
+            f'finally: os.close(directory_fd)\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("dir-fsync\\n")\n        backup =',
+            1,
+        )
+        monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", script)
+        reinstall()
+        events = event_path.read_text(encoding="utf-8").splitlines()
+    else:
+        original_fsync = remote_sync_module.os.fsync
+        original_rename = Path.rename
+        parent = destination.parent
+        parent_stat = parent.stat()
+        original_pin_fsync = remote_sync_module._fsync_file
+
+        def record_pin_fsync(path: Path) -> None:
+            events.append("pin-fsync")
+            original_pin_fsync(path)
+
+        def record_fsync(fd: int) -> None:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) == (parent_stat.st_dev, parent_stat.st_ino):
+                events.append("dir-fsync")
+            original_fsync(fd)
+
+        def record_rename(path: Path, target: Path) -> Path:
+            result = original_rename(path, target)
+            if path == destination and target.name.startswith(f".{session_id}.replaced-"):
+                events.append("backup-rename")
+            elif target == destination:
+                events.append("install-rename")
+            return result
+
+        monkeypatch.setattr(remote_sync_module, "_fsync_file", record_pin_fsync)
+        monkeypatch.setattr(remote_sync_module.os, "fsync", record_fsync)
+        monkeypatch.setattr(Path, "rename", record_rename)
+        reinstall()
+
+    assert events.index("pin-fsync") < events.index("backup-rename")
+    assert events.index("backup-rename") < events.index("dir-fsync")
+    first_dir = events.index("dir-fsync")
+    assert events.index("install-rename") < events.index("dir-fsync", first_dir + 1)
+
+
+@pytest.mark.parametrize("kind", ("ssh", "local-publish", "local-pull"))
+def test_install_replace_fsync_failure_leaves_destination_and_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    local = tmp_path / "local"
+    _set_remote_epoch(local, 8)
+    session_id = _ssh_session(local)
+    if kind == "ssh":
+        _install_ssh_shim(tmp_path, monkeypatch)
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = SshTransport("fake", str(remote), name="cloud")
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+        script = ssh_module._SESSION_INSTALL_SCRIPT
+        anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
+        assert anchor in script
+        monkeypatch.setattr(
+            ssh_module,
+            "_SESSION_INSTALL_SCRIPT",
+            script.replace(anchor, 'raise OSError("pin fsync failed")', 1),
+        )
+        reinstall = lambda: push_session(
+            local, transport, session_id=session_id, force=True
+        )
+    elif kind == "local-publish":
+        remote = tmp_path / "remote"
+        _set_remote_epoch(remote, 8)
+        transport = LocalTransport(remote)
+        push_session(local, transport, session_id=session_id)
+        destination = remote / "sessions" / session_id
+        reinstall = lambda: push_session(
+            local, transport, session_id=session_id, force=True
+        )
+        monkeypatch.setattr(
+            remote_sync_module,
+            "_fsync_file",
+            lambda path: (_ for _ in ()).throw(RemoteSyncError("pin fsync failed")),
+        )
+    else:
+        source_remote = tmp_path / "source-remote"
+        puller = tmp_path / "puller"
+        _set_remote_epoch(source_remote, 8)
+        _set_remote_epoch(puller, 8)
+        push_session(local, LocalTransport(source_remote), session_id=session_id)
+        pull_session(puller, LocalTransport(source_remote), session_id=session_id)
+        destination = puller / "sessions" / session_id
+        reinstall = lambda: pull_session(
+            puller,
+            LocalTransport(source_remote),
+            session_id=session_id,
+            force=True,
+        )
+        monkeypatch.setattr(
+            remote_sync_module,
+            "_fsync_file",
+            lambda path: (_ for _ in ()).throw(RemoteSyncError("pin fsync failed")),
+        )
+
+    pin = destination / ".retention-pin.json"
+    pin.write_text('{"pinned":true}\n', encoding="utf-8")
+    before = destination / "marker"
+    before.write_text("keep\n", encoding="utf-8")
+    original_pin = pin.read_bytes()
+    with pytest.raises(RemoteSyncError, match="pin fsync failed"):
+        reinstall()
+    assert before.read_text(encoding="utf-8") == "keep\n"
+    assert pin.read_bytes() == original_pin
+
+
 def test_ssh_install_below_feature_epoch_writes_no_retention_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
