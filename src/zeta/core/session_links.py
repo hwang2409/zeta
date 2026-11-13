@@ -12,16 +12,15 @@ session id and a published intent is removed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import fcntl
-import asyncio
 import json
 import logging
 import os
 import re
 import stat
 import threading
-import time
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -434,7 +433,7 @@ def _schedule_child_links_reconciliation(
                 delay_index = min(
                     delay_index + 1, len(_CHILD_RECONCILIATION_RETRY_DELAYS) - 1
                 )
-        except BaseException as exc:
+        except Exception as exc:
             logger.warning(
                 "child project linkage retry stopped for %s: %s: %s",
                 session_id,
