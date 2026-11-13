@@ -578,7 +578,9 @@ def classify_recovery_records(
 ) -> bool:
     """Return whether validated durable recovery work is still unresolved."""
     manifests, records = _read_all_records(directory_fd, target, names)
-    if set(manifests) != set(records):
+    if len(manifests) != len(records) or any(
+        quarantine_id not in records for quarantine_id in manifests
+    ):
         raise TranscriptRecoveryIntegrityError("incomplete transcript recovery transaction")
     return any(
         record.state == "pending" or record.memory_step == "review_pending"
