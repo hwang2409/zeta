@@ -51,8 +51,8 @@ def _hold_memory_publication(home: str, project_id: str, channel: socket.socket)
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int) -> None:
-        original(fd, mode)
+    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
+        original(fd, mode, wait=wait)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -133,8 +133,8 @@ def _hold_identity_publication(home: str, _project_id: str, channel: socket.sock
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int) -> None:
-        original(fd, mode)
+    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
+        original(fd, mode, wait=wait)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -160,8 +160,8 @@ def _hold_inbox_publication(home: str, project_id: str, channel: socket.socket) 
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int) -> None:
-        original(fd, mode)
+    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
+        original(fd, mode, wait=wait)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -1074,14 +1074,14 @@ async def _held_production_lock(
         assert observed == [], observed
         original = ProjectRegistry._acquire_lock
 
-        def gated(lock_fd: int, mode: int) -> None:
+        def gated(lock_fd: int, mode: int, *, wait: bool = True) -> None:
             try:
                 fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
                 return
             except BlockingIOError:
                 contended.set()
             try:
-                original(lock_fd, mode)
+                original(lock_fd, mode, wait=wait)
             finally:
                 wait_ended.set()
 
