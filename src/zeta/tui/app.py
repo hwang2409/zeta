@@ -52,7 +52,6 @@ from ..protocol.types import (
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
-from ..runtime.update_notice import start_tui_update_notice, subscribe_tui_update_notice
 from ..submission.pipeline import SubmissionPipeline
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, render, theme
@@ -227,7 +226,6 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
-        subscribe_tui_update_notice(self)
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -824,6 +822,7 @@ class TUIApp(
         stop_after_tool = presentation is not None and presentation.stop_after_tool
         self._abort_requested = False
         return stop_after_tool
+
     def _handle_background_notice(self, notice: object) -> None:
         self._agent_navigation.request_refresh()
         if not self._defer_startup_notice(notice):
@@ -1165,7 +1164,6 @@ class TUIApp(
             if observer_host is not None and (error := await observer_host.start_or_close()):
                 self.observer_host = None  # optional endpoint: never stops the TUI or a fork
                 self._handle_background_notice(f"remote observer unavailable: {error}")
-            start_tui_update_notice()
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
