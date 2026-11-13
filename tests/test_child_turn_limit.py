@@ -722,7 +722,7 @@ async def test_tui_replay_renders_child_turn_limit_notice_once(tmp_path: Path) -
         console=Console(file=output, force_terminal=False),
     )
     async with owned_app(app):
-        app._rebuild_transcript()
+        await app._rebuild_transcript_async()
         rendered = " ".join(Text.from_ansi(output.getvalue()).plain.split())
         assert rendered.count("child turn limit") == 1
         assert rendered.count("2 model completion(s) remain, including this one") == 1
