@@ -125,19 +125,23 @@ class RootTUIHistorySource:
                     if isinstance(block, ToolUseContent):
                         seen_calls.add(block.tool_call.id)
             projected.append((entry.id, entry))
-        units = tuple(
-            TUIHistoryUnit(entry_id, _project_entry(entry))
-            for entry_id, entry in projected
-        )
-        segment = TUIPaintSegment(
-            units,
-            decoded_bytes=sum(
-                len(repr(entry.data).encode()) for _entry_id, entry in projected
-            ),
-        )
+        segments: list[TUIPaintSegment] = []
+        current: list[TUIHistoryUnit] = []
+        current_bytes = 0
+        for entry_id, entry in projected:
+            unit = TUIHistoryUnit(entry_id, _project_entry(entry))
+            size = len(repr(entry.data).encode())
+            if current and (len(current) >= 128 or current_bytes + size > 1024 * 1024):
+                segments.append(TUIPaintSegment(tuple(current), decoded_bytes=current_bytes))
+                current = []
+                current_bytes = 0
+            current.append(unit)
+            current_bytes += size
+        if current:
+            segments.append(TUIPaintSegment(tuple(current), decoded_bytes=current_bytes))
         stop = indexed.start + len(indexed.groups)
         return TUIHistoryPage(
-            (segment,) if units else (),
+            tuple(segments),
             older=HistoryCursor(str(indexed.start)) if indexed.start > 0 else None,
             newer=(
                 HistoryCursor(str(stop))
@@ -251,6 +255,15 @@ class RootTUIHistorySource:
         return await self._store._to_thread_store(read)
 
     async def search(self, query: str, *, limit: int = 200) -> tuple[str, ...]:
-        return await self._store._to_thread_store(
-            lambda: self._store.tui_history_search(query, limit=limit)
-        )
+        def read() -> tuple[str, ...]:
+            needle = query.casefold()
+            matches: list[str] = []
+            for ref in reversed(self._store.branch_refs()):
+                entry = self._store.entry(ref)
+                if needle in repr(entry.data).casefold():
+                    matches.append(entry.id)
+                    if len(matches) >= limit:
+                        break
+            return tuple(matches)
+
+        return await self._store._to_thread_store(read)

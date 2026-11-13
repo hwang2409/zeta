@@ -134,6 +134,8 @@ class SessionPromptHistory:
             self._index = len(entries) - 1
         elif self._index > 0:
             self._index -= 1
+        elif self._older is not None:
+            return None
         return Document(entries[self._index], cursor_position=len(entries[self._index]))
 
     def newer(self, session_path: Path) -> Document | None:

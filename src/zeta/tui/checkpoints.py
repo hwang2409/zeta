@@ -655,12 +655,7 @@ class CheckpointTranscriptMixin:
         self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
-        pages = sorted(
-            self._history_pager.pages,
-            key=lambda page: min(
-                (unit.value.seq for unit in page.units), default=0
-            ),
-        )
+        pages = self._history_pager.pages
         entries = tuple(unit.value for page in pages for unit in page.units)
         self._rendering_history = True
         try:
