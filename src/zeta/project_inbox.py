@@ -159,11 +159,13 @@ class ProjectInbox:
         sessions_root: Path,
         sent_tracker: SentMessageTracker | None = None,
         receipts: Iterable[tuple[str, str]] = (),
+        wait_for_locks: bool = True,
     ):
         self.registry = registry
         self.sessions_root = Path(sessions_root)
         self.sent_tracker = sent_tracker
         self.receipts = tuple(receipts)
+        self.wait_for_locks = wait_for_locks
         # The feature switch follows the home's observed epoch, so no caller can
         # select an epoch different from the registry (and then silently lose
         # generation-gated delivery).
@@ -598,7 +600,9 @@ class ProjectInbox:
             except _InboxNotFound:
                 return None
 
-        with _storage_errors(), self._lock(target_project, exclusive=False) as project_fd:
+        with _storage_errors(), self._lock(
+            target_project, exclusive=False, wait=self.wait_for_locks
+        ) as project_fd:
             return read(project_fd)
 
     def new_ids(
@@ -632,8 +636,10 @@ class ProjectInbox:
         digest = hashlib.sha256("\n".join(message_ids).encode()).hexdigest()
         name = f"{digest}.wake"
         now_ns = time.time_ns()
-        self._ensure_directories(target.project_id)
-        with self._directories(target.project_id, create=True) as dirs:
+        self._ensure_directories(target.project_id, wait=self.wait_for_locks)
+        with self._directories(
+            target.project_id, create=True, wait=self.wait_for_locks
+        ) as dirs:
             wake_fd = dirs[4]
             for existing in os.listdir(wake_fd):
                 info = os.stat(existing, dir_fd=wake_fd, follow_symlinks=False)

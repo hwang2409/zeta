@@ -402,8 +402,64 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
+        poll_acquired = threading.Event()
+        release_poll = threading.Event()
+        real_directories = ProjectInbox._directories
+        poll_gate_used = False
+
+        @contextmanager
+        def gated_directories(
+            inbox: ProjectInbox, project_id: str, *, create: bool, wait: bool = True
+        ):
+            nonlocal poll_gate_used
+            with real_directories(
+                inbox, project_id, create=create, wait=wait
+            ) as directories:
+                if not wait and not poll_gate_used:
+                    poll_gate_used = True
+                    poll_acquired.set()
+                    assert release_poll.wait(timeout=10)
+                yield directories
+
+        monkeypatch.setattr(ProjectInbox, "_directories", gated_directories)
+        record = await asyncio.to_thread(
+            AttentionStore(
+                home / "sessions" / serve_session_id,
+                writer_epoch=observed_epoch_for_session(
+                    home / "sessions" / serve_session_id
+                ),
+            ).request,
+            session_id=serve_session_id,
+            project_id=project.project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="below epoch reply",
+            why="normal journey",
+            options=("yes",),
+        )
         async with owned_app(app):
             await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
+            await await_or_fail(
+                asyncio.to_thread(poll_acquired.wait, 10),
+                what="inbox poll lock acquisition",
+            )
+            reply_task = asyncio.create_task(
+                _request(
+                    reader,
+                    writer,
+                    "attention-reply",
+                    "slash_run",
+                    {
+                        "session_id": serve_session_id,
+                        "text": f"/decisions reply {record.id} yes",
+                    },
+                )
+            )
+            release_poll.set()
+            reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
+            assert "result" in reply_response, reply_response
+            reply = reply_response["result"]
+            assert reply["text"] == f"replied to {record.id}"
             sent = await await_or_fail(
                 app.loop.tool_registry.execute(
                     ToolCall(
@@ -435,36 +491,6 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 for message in listed["structuredContent"]["messages"]
             )
 
-            record = await asyncio.to_thread(
-                AttentionStore(
-                    home / "sessions" / serve_session_id,
-                    writer_epoch=observed_epoch_for_session(
-                        home / "sessions" / serve_session_id
-                    ),
-                ).request,
-                session_id=serve_session_id,
-                project_id=project.project_id,
-                entry_id=None,
-                entry_seq=None,
-                title="below epoch reply",
-                why="normal journey",
-                options=("yes",),
-            )
-            reply_response = (
-                await _request(
-                    reader,
-                    writer,
-                    "attention-reply",
-                    "slash_run",
-                    {
-                        "session_id": serve_session_id,
-                        "text": f"/decisions reply {record.id} yes",
-                    },
-                )
-            )[-1]
-            assert "result" in reply_response, reply_response
-            reply = reply_response["result"]
-            assert reply["text"] == f"replied to {record.id}"
             assert (
                 await asyncio.to_thread(
                     lambda: AttentionStore(
@@ -477,6 +503,8 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 == "resolved"
             )
     finally:
+        if "release_poll" in locals():
+            release_poll.set()
         if opened is not None and app is None:
             opened.store.close()
         if opened is not None:
