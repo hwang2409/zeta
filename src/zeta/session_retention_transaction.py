@@ -26,6 +26,7 @@ from .core.session_files import (
     SessionReferenceGate,
     atomic_publish_file,
     child_directory,
+    read_reference_generation,
 )
 from .locking import RETENTION_HOME_ID, domain_authority
 from .project_errors import ProjectRegistryError
@@ -208,7 +209,10 @@ class _QuarantineTransaction:
             return TransactionOutcome(False, _bounded(str(exc)))
 
     def _recover_one(self, budget: _Budget) -> TransactionOutcome | None:
-        if not _entry_exists(self.home, _TRASH_NAME):
+        trash = self.home / _TRASH_NAME
+        if not _entry_exists(self.home, _TRASH_NAME) or not _entry_exists(
+            trash, _RESERVATIONS_NAME
+        ):
             return None
         with (
                 self._trash_directories(create=False) as (
@@ -288,13 +292,23 @@ class _QuarantineTransaction:
                     reservation["device"], reservation["inode"]
                 ):
                     raise TransactionError("retention trash identity mismatch")
+                manifest = _read_optional_validated_json(
+                    txn_fd, _MANIFEST_NAME, validate_retention_manifest
+                )
+                manifest_missing = manifest is None
+                if manifest_missing:
+                    descendants, retained_bytes = _scan_quarantined_tree(
+                        tree_fd, reservation["session_id"], budget
+                    )
+                    manifest = {
+                        **_manifest_from_reservation(reservation),
+                        "descendants": list(descendants),
+                        "bytes": retained_bytes,
+                        "generation": read_reference_generation(self.home),
+                    }
             finally:
                 os.close(tree_fd)
-            manifest = _read_optional_validated_json(
-                txn_fd, _MANIFEST_NAME, validate_retention_manifest
-            )
-            if manifest is None:
-                manifest = _manifest_from_reservation(reservation)
+            if manifest_missing:
                 self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
                 return TransactionOutcome(True, session_id=reservation["session_id"])
             _match_manifest(reservation, manifest)
@@ -495,8 +509,6 @@ class _QuarantineTransaction:
                 os.unlink(first.name, dir_fd=directory_fd)
                 os.fsync(directory_fd)
                 return False
-            frontier.pop()
-            self._publish_state({**state, "frontier": [list(p) for p in frontier]})
         finally:
             os.close(directory_fd)
         if path:
@@ -509,6 +521,8 @@ class _QuarantineTransaction:
         else:
             os.rmdir(_TREE_NAME, dir_fd=txn_fd)
             os.fsync(txn_fd)
+        frontier.pop()
+        self._publish_state({**state, "frontier": [list(p) for p in frontier]})
         return not frontier
 
     def _read_arm(self) -> dict | None:
@@ -667,6 +681,45 @@ def _manifest_from_reservation(reservation: dict) -> dict:
         "stage": "quarantined",
         "generation": 0,
     }
+
+
+def _scan_quarantined_tree(
+    tree_fd: int,
+    root_id: str,
+    budget: _Budget,
+    path: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], int]:
+    """Rebuild the manifest evidence lost by a crash before publication."""
+    if len(path) > _MAX_DEPTH:
+        raise TransactionError("retention trash is too deep")
+    descendants = []
+    retained_bytes = 0
+    with _ChargedScan(tree_fd, budget.charge) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            child_path = (*path, entry.name)
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=tree_fd,
+                )
+                try:
+                    nested, nested_bytes = _scan_quarantined_tree(
+                        child_fd, root_id, budget, child_path
+                    )
+                finally:
+                    os.close(child_fd)
+                descendants.extend(nested)
+                retained_bytes += nested_bytes
+                if path and path[-1] == "agents":
+                    child_id = ":".join(part for part in child_path if part != "agents")
+                    descendants.append(f"{root_id}:{child_id}")
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                retained_bytes += info.st_size
+            else:
+                raise TransactionError("unsafe retention trash entry")
+    return tuple(sorted(descendants)), retained_bytes
 
 
 def _match_manifest(reservation: dict, manifest: dict) -> None:

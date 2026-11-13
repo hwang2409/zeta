@@ -1466,3 +1466,470 @@ def test_quarantine_cleanup_stops_when_id_is_republished(tmp_path):
 
     assert result.reasons[0].reason == "id_republished"
     assert _retention_manifest(tmp_path)[1]["stage"] == "id_republished"
+
+
+class _SimulatedProcessDeath(BaseException):
+    pass
+
+
+def _arm_fault_fixture(home):
+    details = {}
+    with ExitStack() as stack:
+        manager = _manager(home)
+        stack.callback(manager._release_storage_lease)
+        root = _create_closed(manager, stack)
+        root_dir = home / "sessions" / root
+        (root_dir / "nested" / "leaf").mkdir(parents=True)
+        (root_dir / "nested" / "one.txt").write_text("one")
+        (root_dir / "nested" / "leaf" / "two.txt").write_text("two")
+        lease = stack.enter_context(_opened_lease(home))
+        _registry_owner, project, _ = _external_reference(
+            "projects", home, manager, stack, root, lease
+        )
+        inbox, tracker, message_id = _external_reference(
+            "inbox", home, manager, stack, root, lease
+        )
+        inbox_project_id = next(
+            project.project_id
+            for project in inbox.registry.list_projects()
+            if any(
+                row["id"] == message_id
+                for row in inbox.list(project.project_id)["done"]
+            )
+        )
+        attention, attention_id, _ = _external_reference(
+            "attention", home, manager, stack, root, lease
+        )
+        _index_registry, index_project, _index = _external_reference(
+            "indexes", home, manager, stack, root, lease
+        )
+        details.update(
+            root=root,
+            project_id=project.project_id,
+            inbox_project_id=inbox_project_id,
+            sender_id=tracker.session_id,
+            message_id=message_id,
+            attention_session=attention.session_dir.name,
+            attention_id=attention_id,
+            index_project_id=index_project.project_id,
+        )
+        for session_dir in (home / "sessions").iterdir():
+            if session_dir.name != root:
+                with session_root(session_dir) as directory_fd:
+                    write_retention_pin(directory_fd)
+        _age_tree(root_dir)
+        planner = _planner(stack, home, lease, now_ns=_future_ns)
+        preview, reasons = _run_sweep(planner)
+        assert reasons[root] == (True, None)
+        arm = home / "retention-arm.json"
+        arm.write_text(json.dumps({
+            "schema_version": 1,
+            "gate_version": 1,
+            "armed_by_zeta_version": "test",
+            "armed_at": _OLD,
+            "preview_id": preview.preview.preview_id,
+        }) + "\n")
+        arm.chmod(0o600)
+    return details
+
+
+def _external_reference_state(home, details):
+    with ExitStack() as stack:
+        registry = _registry(stack, home)
+        project_link = any(
+            row["session_id"] == details["root"]
+            for row in registry.list_session_links(details["project_id"])
+        )
+        inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+        inbox_link = any(
+            row["id"] == details["message_id"]
+            for row in inbox.list(details["inbox_project_id"])["done"]
+        )
+        tracker = SentMessageTracker(
+            home / "sessions",
+            details["sender_id"],
+            observed_epoch=registry._storage_lease.observed_epoch,
+        )
+        sent_link = any(
+            row["id"] == details["message_id"] for row in tracker.records()
+        )
+        attention = AttentionStore(
+            home / "sessions" / details["attention_session"],
+            writer_epoch=registry._storage_lease.observed_epoch,
+        ).get(details["attention_id"])
+        index = TranscriptIndex(
+            registry.root / details["index_project_id"],
+            details["index_project_id"],
+        )
+        return (
+            project_link,
+            inbox_link,
+            sent_link,
+            attention.fork_session_id is not None,
+            index.status().session_count != 0,
+        )
+
+
+def _manifest_stage(home):
+    manifests = list((home / "session-trash" / "transactions").glob("*/manifest.json"))
+    if not manifests:
+        return None
+    assert len(manifests) == 1
+    return json.loads(manifests[0].read_text())["stage"]
+
+
+def _drive_fault_transaction(home, root):
+    crashed = False
+    with _opened_lease(home) as lease:
+        for _ in range(200):
+            planner = RetentionPlanner(home, lease, now_ns=_future_ns)
+            try:
+                planner.run_pass(days=30)
+            except BaseException as exc:
+                if not isinstance(
+                    exc,
+                    (_SimulatedProcessDeath, __import__("asyncio").CancelledError),
+                ):
+                    raise
+                crashed = True
+            finally:
+                planner.close()
+            if crashed or (
+                not (home / "session-trash" / "reservations" / f"{root}.json").exists()
+                and not (home / "sessions" / root).exists()
+            ):
+                return crashed
+    raise AssertionError("transaction did not finish in 200 public passes")
+
+
+def _run_fault_transaction(home, details, monkeypatch, *, fail_at=None, cancel=False):
+    from zeta import session_retention_transaction as transaction
+    from zeta.storage_format import WriterLease
+
+    steps = []
+    active = False
+    failure_stage = None
+    real_advance = transaction._QuarantineTransaction.advance
+    real_publish = transaction._QuarantineTransaction._publish
+    real_os = transaction.os
+    real_delete = WriterLease.delete
+
+    def step(name):
+        nonlocal failure_stage
+        if not active:
+            return
+        steps.append(name)
+        if fail_at == len(steps):
+            failure_stage = _manifest_stage(home)
+            if cancel:
+                import asyncio
+                raise asyncio.CancelledError
+            raise _SimulatedProcessDeath
+
+    def advance(owner, **kwargs):
+        nonlocal active
+        active = True
+        try:
+            return real_advance(owner, **kwargs)
+        finally:
+            active = False
+
+    def publish(owner, directory_fd, name, payload, validate):
+        step(f"publish:{name}")
+        return real_publish(owner, directory_fd, name, payload, validate)
+
+    class TransactionOs:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def fsync(self, fd):
+            step("fsync")
+            return real_os.fsync(fd)
+
+        def rename(self, *args, **kwargs):
+            step("rename")
+            return real_os.rename(*args, **kwargs)
+
+        def unlink(self, *args, **kwargs):
+            step("unlink")
+            return real_os.unlink(*args, **kwargs)
+
+        def rmdir(self, *args, **kwargs):
+            step("rmdir")
+            return real_os.rmdir(*args, **kwargs)
+
+    def delete(lease, directory_fd, name):
+        step(f"delete:{name}")
+        return real_delete(lease, directory_fd, name)
+
+    monkeypatch.setattr(transaction._QuarantineTransaction, "advance", advance)
+    monkeypatch.setattr(transaction._QuarantineTransaction, "_publish", publish)
+    monkeypatch.setattr(transaction, "os", TransactionOs())
+    monkeypatch.setattr(WriterLease, "delete", delete)
+
+    crashed = _drive_fault_transaction(home, details["root"])
+    return steps, crashed, failure_stage
+
+
+def _finish_fault_recovery(home, details):
+    stages = []
+    with _opened_lease(home) as lease:
+        # Two independent owners replay the same durable input before ordinary
+        # recovery continues, which covers restart and duplicate delivery.
+        for _ in range(2):
+            planner = RetentionPlanner(home, lease, now_ns=_future_ns)
+            try:
+                planner.run_pass(days=30)
+                stages.append(_manifest_stage(home))
+            finally:
+                planner.close()
+        for _ in range(200):
+            reservation = (
+                home / "session-trash" / "reservations" / f"{details['root']}.json"
+            )
+            if (
+                not reservation.exists()
+                and not (home / "sessions" / details["root"]).exists()
+            ):
+                return stages
+            planner = RetentionPlanner(home, lease, now_ns=_future_ns)
+            try:
+                planner.run_pass(days=30)
+                stages.append(_manifest_stage(home))
+            finally:
+                planner.close()
+    raise AssertionError("recovery did not finish in 200 public passes")
+
+
+def test_quarantine_every_durable_fault_recovers_monotonically(tmp_path, monkeypatch):
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    details = _arm_fault_fixture(fixture)
+    assert _external_reference_state(fixture, details) == (True,) * 5
+
+    uninterrupted = tmp_path / "uninterrupted"
+    shutil.copytree(fixture, uninterrupted)
+    with monkeypatch.context() as patch:
+        steps, crashed, _ = _run_fault_transaction(
+            uninterrupted, details, patch
+        )
+    assert not crashed
+    assert 10 <= len(steps) <= 120, f"fixture made {len(steps)} durable steps"
+    rename_step = steps.index("rename")
+    assert steps[rename_step + 1:rename_step + 3] == ["fsync", "fsync"], (
+        "quarantine rename did not fsync both parent directories"
+    )
+    assert _external_reference_state(uninterrupted, details) == (False,) * 5
+
+    for fail_at in range(1, len(steps) + 1):
+        home = tmp_path / f"fault-{fail_at:03}"
+        shutil.copytree(fixture, home)
+        with monkeypatch.context() as patch:
+            actual, crashed, failure_stage = _run_fault_transaction(
+                home, details, patch, fail_at=fail_at
+            )
+        assert crashed and len(actual) == fail_at, f"durable fault {fail_at} was not reached"
+        assert _manifest_stage(home) == failure_stage, (
+            f"durable fault {fail_at} advanced its stage after failure"
+        )
+        root_exists = (home / "sessions" / details["root"]).exists()
+        references = _external_reference_state(home, details)
+        if root_exists:
+            assert references == (True,) * 5, (
+                f"durable fault {fail_at} cleaned a still-published root"
+            )
+        reservation = (
+            home / "session-trash" / "reservations" / f"{details['root']}.json"
+        )
+        if reservation.exists():
+            with ExitStack() as stack:
+                registry = _registry(stack, home)
+                project = registry.create_project(f"blocked-{fail_at}", "test")
+                with pytest.raises(SessionError, match="reserved|quarantined|being deleted"):
+                    registry.record_session(
+                        project.project_id,
+                        session_id=details["root"],
+                        transcript_path=str(home / "sessions" / details["root"]),
+                    )
+        recovered_stages = _finish_fault_recovery(home, details)
+        ranks = {
+            None: -1,
+            "quarantined": 0,
+            "projects": 1,
+            "inbox": 2,
+            "attention": 3,
+            "indexes": 4,
+            "references-clean": 5,
+            "removing": 6,
+            "removed": 7,
+        }
+        visible = [
+            ranks[stage]
+            for stage in recovered_stages
+            if stage is not None and stage in ranks
+        ]
+        assert visible == sorted(visible), f"durable fault {fail_at} replayed backwards"
+        assert not (home / "sessions" / details["root"]).exists()
+        assert _external_reference_state(home, details) == (False,) * 5, (
+            f"durable fault {fail_at} left an external reference"
+        )
+
+    cancelled = tmp_path / "cancelled"
+    shutil.copytree(fixture, cancelled)
+    cancel_at = steps.index("rename") + 1
+    with monkeypatch.context() as patch:
+        _actual, crashed, failure_stage = _run_fault_transaction(
+            cancelled, details, patch, fail_at=cancel_at, cancel=True
+        )
+    assert crashed
+    assert _manifest_stage(cancelled) == failure_stage
+    _finish_fault_recovery(cancelled, details)
+    assert _external_reference_state(cancelled, details) == (False,) * 5
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "malformed_reservation",
+        "mismatched_manifest",
+        "recovery_bound",
+        "recovery_deadline",
+        "removal_bound",
+        "removal_deadline",
+    ],
+)
+def test_quarantine_recovery_refusal_table(tmp_path, case):
+    details = _arm_fault_fixture(tmp_path)
+    root = details["root"]
+    reservation = tmp_path / "session-trash" / "reservations" / f"{root}.json"
+    with ExitStack() as stack:
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        if case == "malformed_reservation":
+            reservation.parent.mkdir(parents=True)
+            reservation.write_text("{}\n")
+            reservation.chmod(0o600)
+            before = None
+        else:
+            planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+            planner.run_pass(days=30)
+            before = _manifest_stage(tmp_path)
+            assert before == "quarantined"
+            if case == "mismatched_manifest":
+                manifest_path, manifest = _retention_manifest(tmp_path)
+                manifest["transaction_id"] = "f" * 32
+                manifest_path.write_text(json.dumps(manifest) + "\n")
+                manifest_path.chmod(0o600)
+            elif case.startswith("removal"):
+                for _ in range(6):
+                    planner.run_pass(days=30)
+                before = _manifest_stage(tmp_path)
+                assert before == "removing"
+            planner.close()
+
+        if case.endswith("bound"):
+            bounds = RetentionBounds(entries_total=1)
+            clock = _future_ns
+        elif case.endswith("deadline"):
+            bounds = RetentionBounds()
+            clock = _DeadlineClock("reservation")
+        else:
+            bounds = RetentionBounds()
+            clock = _future_ns
+        refused = _planner(
+            stack, tmp_path, lease, bounds=bounds, now_ns=clock
+        ).run_pass(days=30)
+
+    assert refused.reasons and refused.reasons[0].reason is not None
+    assert _manifest_stage(tmp_path) == before, f"{case} advanced after refusing evidence"
+    if case == "malformed_reservation":
+        assert (tmp_path / "sessions" / root).is_dir()
+        assert _external_reference_state(tmp_path, details) == (True,) * 5
+
+
+def test_quarantine_reservation_blocks_open_import_reference_and_pin(tmp_path):
+    from zeta.remote_sync import LocalTransport, push_session
+
+    details = _arm_fault_fixture(tmp_path)
+    root = details["root"]
+    import_home = tmp_path.parent / f"{tmp_path.name}-import"
+    shutil.copytree(tmp_path, import_home)
+    shutil.rmtree(import_home / "sessions" / root / "agents")
+    with ExitStack() as stack:
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        planner.run_pass(days=30)
+        assert (tmp_path / "session-trash" / "reservations" / f"{root}.json").is_file()
+
+        manager = _manager(tmp_path)
+        stack.callback(manager._release_storage_lease)
+        with pytest.raises((FileNotFoundError, SessionError)):
+            manager.open(root)
+        registry = _registry(stack, tmp_path)
+        project = registry.create_project("blocked-reference", "test")
+        with pytest.raises(SessionError, match="reserved|quarantined|being deleted"):
+            registry.record_session(
+                project.project_id,
+                session_id=root,
+                transcript_path=str(tmp_path / "sessions" / root),
+            )
+        with pytest.raises(SessionError, match="reserved|quarantined|being deleted"):
+            push_session(
+                import_home,
+                LocalTransport(tmp_path),
+                session_id=root,
+                force=True,
+            )
+        with (
+            pytest.raises(FileNotFoundError),
+            session_root(tmp_path / "sessions" / root) as directory_fd,
+        ):
+            write_retention_pin(directory_fd)
+
+
+def test_pin_committed_before_final_authority_blocks_quarantine(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from zeta.core import session_files
+
+    details = _arm_fault_fixture(tmp_path)
+    root = details["root"]
+    requested = Event()
+    release = Event()
+    real_exclusive = session_files.SessionReferenceGate.exclusive
+
+    @contextmanager
+    def paused_exclusive(gate):
+        requested.set()
+        assert release.wait(10), "test did not release retention authority"
+        with real_exclusive(gate) as authority:
+            yield authority
+
+    monkeypatch.setattr(
+        session_files.SessionReferenceGate, "exclusive", paused_exclusive
+    )
+
+    def run_pass():
+        with (
+            _opened_lease(tmp_path) as lease,
+            RetentionPlanner(tmp_path, lease, now_ns=_future_ns) as planner,
+        ):
+            return planner.run_pass(days=30)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(run_pass)
+        assert requested.wait(10), "retention never requested exclusive authority"
+        with session_root(tmp_path / "sessions" / root) as directory_fd:
+            write_retention_pin(directory_fd)
+        manager = _manager(tmp_path)
+        try:
+            opened = manager.open(root)
+            opened.store.close()
+        finally:
+            manager._release_storage_lease()
+        release.set()
+        result = future.result(timeout=10)
+
+    assert (tmp_path / "sessions" / root).is_dir()
+    assert not (tmp_path / "session-trash" / "reservations" / f"{root}.json").exists()
+    assert result.reasons[0].reason == "pinned"
