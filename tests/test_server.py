@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from dataclasses import replace
@@ -2542,7 +2543,8 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         owner = server.runtime.loop._background_owner
         child_watcher = owner._watchers[child_id]
         assert owner.cancel(child_id)
-        frames = await _request(reader, writer, 4, "status")
+        frames = deque(await _request(reader, writer, 4, "status"), maxlen=50)
+        frame_count = len(frames)
 
         def wait_diagnostics() -> str:
             frame_summary = [
@@ -2570,16 +2572,18 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
                     else "pending"
                 )
             return (
-                f"frames={frame_summary!r}; pending_approvals={pending!r}; "
-                f"runs={run_states!r}"
+                f"{frame_count} frames, last 50: {frame_summary!r}; "
+                f"pending_approvals={pending!r}; runs={run_states!r}"
             )
 
         async def wait_for_approval_end() -> None:
+            nonlocal frame_count
             while not any(
                 event["request_id"] == approval["request_id"]
                 for event in _named_events(frames, "approval_end")
             ):
                 frames.append(await _read(reader))
+                frame_count += 1
 
         await await_or_fail(
             wait_for_approval_end(),
