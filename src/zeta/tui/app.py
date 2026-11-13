@@ -744,6 +744,14 @@ class TUIApp(
         if tasks:
             await asyncio.gather(*tasks)
 
+    async def _close_history_rebuilds(self) -> None:
+        tasks = tuple(self._history_rebuild_tasks)
+        for task in tasks:
+            task.cancel()
+        self._history_rebuild_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _history_finder_open(self, buffer: Any) -> None:
         prompt_history = getattr(self, "_prompt_history", None)
         if self._agent_navigation.child_view_active or prompt_history is None:

@@ -71,6 +71,9 @@ class RuntimeCloseMixin:
             close_history_markers = getattr(self, "_close_history_markers", None)
             if close_history_markers is not None:
                 await attempt_async(close_history_markers)
+            close_history_rebuilds = getattr(self, "_close_history_rebuilds", None)
+            if close_history_rebuilds is not None:
+                await attempt_async(close_history_rebuilds)
             history_pager = getattr(self, "_history_pager", None)
             if history_pager is not None:
                 await attempt_async(history_pager.close)
