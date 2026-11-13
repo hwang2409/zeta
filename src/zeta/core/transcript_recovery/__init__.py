@@ -573,10 +573,25 @@ def recovery_status(directory_fd: int, target: RepairTarget) -> RecoveryStatus:
     )
 
 
+def classify_recovery_records(
+    directory_fd: int, target: RepairTarget, names: list[str] | None = None
+) -> bool:
+    """Return whether validated durable recovery work is still unresolved."""
+    manifests, records = _read_all_records(directory_fd, target, names)
+    if len(manifests) != len(records) or any(
+        quarantine_id not in records for quarantine_id in manifests
+    ):
+        raise TranscriptRecoveryIntegrityError("incomplete transcript recovery transaction")
+    return any(
+        record.state == "pending" or record.memory_step == "review_pending"
+        for record in records.values()
+    )
+
+
 def _read_all_records(
-    directory_fd: int, target: RepairTarget
+    directory_fd: int, target: RepairTarget, names: list[str] | None = None
 ) -> tuple[dict[str, EvidenceManifest], dict[str, RecoveryRecord]]:
-    names = os.listdir(directory_fd)
+    names = os.listdir(directory_fd) if names is None else names
     evidence_names = _recovery_names(names, _EVIDENCE_PREFIX)
     state_names = _recovery_names(names, _STATE_PREFIX)
     if len(evidence_names) + len(state_names) > _MAX_RECORDS:
