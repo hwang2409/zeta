@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, ExitStack, asynccontextmanager
 from typing import TypeVar
@@ -59,8 +60,10 @@ async def await_or_fail[T](
     for task in asyncio.all_tasks():
         if not task.done():
             task.print_stack(file=task_stacks)
+    task_dump = task_stacks.getvalue()
+    print(task_dump, file=sys.stderr, flush=True)
     timeout_error = TimeoutError(f"{what} did not finish within {timeout} s")
-    timeout_error.add_note(task_stacks.getvalue())
+    timeout_error.add_note(task_dump)
     try:
         await _cancel_and_drain([future], timeout=10, what=what)
     except AssertionError as cleanup_error:
