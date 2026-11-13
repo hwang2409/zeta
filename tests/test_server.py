@@ -8847,7 +8847,8 @@ async def test_serve_retention_pin_table_uses_public_slash_run(tmp_path: Path) -
     server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        for text, expected, generation in (
+        baseline = read_reference_generation(server.home)
+        for text, expected, delta in (
             ("/pin", "session pinned", 1),
             ("/pin", "session pinned", 1),
             ("/unpin", "session unpinned", 2),
@@ -8858,7 +8859,7 @@ async def test_serve_retention_pin_table_uses_public_slash_run(tmp_path: Path) -
                 reader, writer, text, "slash_run", {"session_id": session_id, "text": text}
             )
             assert response[-1]["result"] == {"kind": "output", "text": expected}
-            assert read_reference_generation(server.home) == generation
+            assert read_reference_generation(server.home) == baseline + delta
         sidecar = server.home / "sessions" / session_id / RETENTION_PIN_FILENAME
         assert not sidecar.exists()
     finally:
