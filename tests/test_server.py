@@ -6056,7 +6056,9 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
         text="heads up",
     )
     assert unknown is not None
-    loaded = next(entry for entry in resident_entries(store) if entry.id == unknown.id)
+    loaded = next(
+        store.entry(ref) for ref in store.resident_refs() if ref.id == unknown.id
+    )
     loaded.data["kind"] = "monitor_alert"  # Simulate a future kind loaded from disk.
     try:
         history = (
