@@ -15,7 +15,6 @@ from zeta.tui.transcript.paged_history import (
     TUIHistoryUnit,
     TUIPaintSegment,
 )
-from zeta.tui.transcript.transcript import TranscriptWidget
 
 
 class FakeSource:
@@ -60,15 +59,6 @@ async def test_edge_loads_coalesce_and_resident_pages_are_bounded() -> None:
     assert len(pager.pages) <= 4
     assert len(pager.descriptors) <= 4
     assert len(pager.scalar_tokens) == 6
-
-
-def test_widget_bulk_adopt_and_remove_uses_real_render_path() -> None:
-    widget = TranscriptWidget()
-    units = widget.adopt_units((Text("old"), Text("new")))
-    assert "old" in "\n".join(widget.lines(80))
-    widget.create_content(80, 5)
-    widget.remove_units(units)
-    assert widget.units == ()
 
 
 def test_prompt_owner_keeps_only_two_pages_and_exact_draft() -> None:

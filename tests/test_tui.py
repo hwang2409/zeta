@@ -16304,6 +16304,14 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         await app._history_pager.reveal(matches[0])
         app._render_resident_history()
         assert "history-0" in Text.from_ansi(app._transcript.render(120)).plain
+        app._transcript.scroll_to_top()
+        app._append_transcript(Text("live-tail"))
+        for _ in range(5):
+            await app._load_transcript_page(direction="older")
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "live-tail" in rendered
+        app._transcript.scroll_to_bottom()
+        assert app._transcript.follow_tail
 
 @pytest.mark.asyncio
 async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
