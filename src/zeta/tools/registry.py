@@ -917,6 +917,40 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             capability=capability,
         )
 
+    def _current_execution(
+        self, tool_call: ToolCall
+    ) -> tuple[ToolDefinition, ResolvedCapability, dict[str, Any]] | StructuredToolResult:
+        definition = self._tools.get(tool_call.name)
+        if definition is None:
+            return _error_result(f"unknown tool: {tool_call.name}", kind="unknown_tool")
+        try:
+            capability = self.resolve_call(tool_call.name, tool_call.arguments)
+        except UnknownToolAction as exc:
+            return _error_result(str(exc), kind="invalid_tool_action")
+        except InvalidActionArguments as exc:
+            return _error_result(str(exc), kind="invalid_arguments")
+        except (KeyError, TypeError, ValueError) as exc:
+            return _error_result(str(exc), kind="invalid_arguments")
+        if not self.tool_policy.allows_call(capability):
+            capability_name = (
+                tool_call.name
+                if capability.action is None
+                else f"{tool_call.name}({capability.action})"
+            )
+            return _error_result(
+                f"tool action not allowed by session tool policy: {capability_name}",
+                kind="tool_action_not_allowed",
+            )
+        try:
+            arguments = (
+                _validate_arguments(dict(capability.arguments), definition.parameters)
+                if definition.validate_arguments
+                else _coerce_arguments(dict(capability.arguments))
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            return _error_result(f"invalid arguments: {exc}", kind="invalid_arguments")
+        return definition, capability, arguments
+
     async def execute(
         self,
         tool_call: ToolCall,
@@ -985,64 +1019,16 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                     kind="tool_not_allowed",
                 )
             )
-        definition = self._tools.get(tool_call.name)
-        if definition is None:
-            await self.abort_approval(tool_call)
-            return await finalize(
-                _error_result(
-                    f"unknown tool: {tool_call.name}",
-                    kind="unknown_tool",
-                )
-            )
         try:
             tool_call = await self.prepare_tool_call(tool_call)
         except (KeyError, TypeError, ValueError) as exc:
             await self.abort_approval(tool_call)
             return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        try:
-            capability = self.resolve_call(tool_call.name, tool_call.arguments)
-        except UnknownToolAction as exc:
+        current = self._current_execution(tool_call)
+        if isinstance(current, dict):
             await self.abort_approval(tool_call)
-            return await finalize(
-                _error_result(str(exc), kind="invalid_tool_action")
-            )
-        except InvalidActionArguments as exc:
-            await self.abort_approval(tool_call)
-            return await finalize(
-                _error_result(str(exc), kind="invalid_arguments")
-            )
-        except (TypeError, ValueError) as exc:
-            await self.abort_approval(tool_call)
-            return await finalize(
-                _error_result(str(exc), kind="invalid_arguments")
-            )
-        if not self.tool_policy.allows_call(capability):
-            await self.abort_approval(tool_call)
-            capability_name = (
-                tool_call.name
-                if capability.action is None
-                else f"{tool_call.name}({capability.action})"
-            )
-            return await finalize(
-                _error_result(
-                    f"tool action not allowed by session tool policy: {capability_name}",
-                    kind="tool_action_not_allowed",
-                )
-            )
-        try:
-            arguments = (
-                _validate_arguments(dict(capability.arguments), definition.parameters)
-                if definition.validate_arguments
-                else _coerce_arguments(dict(capability.arguments))
-            )
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            await self.abort_approval(tool_call)
-            return await finalize(
-                _error_result(
-                    f"invalid arguments: {exc}",
-                    kind="invalid_arguments",
-                )
-            )
+            return await finalize(current)
+        definition, capability, arguments = current
         if _signal_is_set(signal_state):
             signal_state, abort_result = await self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
@@ -1096,41 +1082,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         )
         if claim_error is not None:
             return await finalize(_error_result(claim_error[0], kind=claim_error[1]))
-        definition = self._tools.get(tool_call.name)
-        if definition is None:
-            return await finalize(
-                _error_result(f"unknown tool: {tool_call.name}", kind="unknown_tool")
-            )
-        try:
-            capability = self.resolve_call(tool_call.name, tool_call.arguments)
-        except UnknownToolAction as exc:
-            return await finalize(_error_result(str(exc), kind="invalid_tool_action"))
-        except InvalidActionArguments as exc:
-            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        except (KeyError, TypeError, ValueError) as exc:
-            return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        if not self.tool_policy.allows_call(capability):
-            capability_name = (
-                tool_call.name
-                if capability.action is None
-                else f"{tool_call.name}({capability.action})"
-            )
-            return await finalize(
-                _error_result(
-                    f"tool action not allowed by session tool policy: {capability_name}",
-                    kind="tool_action_not_allowed",
-                )
-            )
-        try:
-            arguments = (
-                _validate_arguments(dict(capability.arguments), definition.parameters)
-                if definition.validate_arguments
-                else _coerce_arguments(dict(capability.arguments))
-            )
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            return await finalize(
-                _error_result(f"invalid arguments: {exc}", kind="invalid_arguments")
-            )
+        current = self._current_execution(tool_call)
+        if isinstance(current, dict):
+            return await finalize(current)
+        definition, capability, arguments = current
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():

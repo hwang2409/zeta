@@ -60,6 +60,7 @@ class _LiveConfigRegistryMixin:
     ) -> tuple[str, str] | None:
         if self._session_store is None:
             return None
+        # shortcut: approved identity is resident-only; restart recovery matches by tool name.
         claim = self._session_store.claim_pending_approval_execution(
             tool_call.id,
             self.approval_definition_identity(tool_call.name),

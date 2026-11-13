@@ -216,14 +216,6 @@ class ApprovalHistoryStoreMixin:
     def remember_pending_approval_execution(
         self, request_id: str, definition: tuple[str, str | None]
     ) -> None:
-        completed = [
-            key
-            for key, record in self._pending_approval_executions.items()
-            if record.owner is _COMPLETED_APPROVAL_EXECUTION
-            and self.approval_state_now(key) is None
-        ]
-        for key in completed:
-            self._pending_approval_executions.pop(key, None)
         self._pending_approval_executions.setdefault(
             request_id, _PendingApprovalExecution(definition)
         )
@@ -266,8 +258,23 @@ class ApprovalHistoryStoreMixin:
 
     def release_pending_approval_execution(self, request_id: str) -> None:
         record = self._pending_approval_executions.get(request_id)
-        if record is not None and record.owner is asyncio.current_task():
+        if record is not None and (
+            record.owner in (
+                None,
+                _PREPARED_APPROVAL_EXECUTION,
+                asyncio.current_task(),
+            )
+            or isinstance(record.owner, asyncio.Task)
+            and record.owner.done()
+        ):
             record.owner = _COMPLETED_APPROVAL_EXECUTION
+
+    def retire_terminal_approval_executions(self) -> None:
+        self._pending_approval_executions = {
+            key: record
+            for key, record in self._pending_approval_executions.items()
+            if record.owner is not _COMPLETED_APPROVAL_EXECUTION
+        }
 
     def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
         return self._approval_now_snapshot().resolutions.get(request_id)
