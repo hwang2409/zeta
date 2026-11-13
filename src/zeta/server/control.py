@@ -546,8 +546,9 @@ class ServeControl:
             if isinstance(core_key, str)
             else None
         )
+        turn_task = self._turn_task
         if (
-            not self.turn_busy()
+            (turn_task is None or turn_task.done())
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])

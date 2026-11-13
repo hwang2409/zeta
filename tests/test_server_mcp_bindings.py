@@ -112,6 +112,7 @@ class LocalMCP:
         self.reject_missing_auth = reject_missing_auth
         self.request_received = asyncio.Event()
         self.auth_received = asyncio.Event()
+        self.tool_called = asyncio.Event()
         self.notification_opened = asyncio.Event()
         self.notification_closed = asyncio.Event()
         self.send_tool_change = asyncio.Event()
@@ -199,6 +200,7 @@ class LocalMCP:
                 if self.include_x:
                     self.tools_refetched.set()
             elif method == "tools/call":
+                self.tool_called.set()
                 result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
             else:
                 result = {}
@@ -695,6 +697,104 @@ async def test_socket_http_list_changed_refreshes_next_turn_catalog(
         await _event(reader, "agent_end")
         second_names = {schema["name"] for schema in backend.calls[1][1]}
         assert "page__x" in second_names
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
+@pytest.mark.parametrize("live_added", [True, False], ids=["live-added", "initial"])
+@pytest.mark.asyncio
+async def test_socket_http_approved_tool_runs_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound: bool,
+    live_added: bool,
+) -> None:
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport,
+        "handle_async_request",
+        _REAL_ASYNC_HTTP_REQUEST,
+    )
+    mcp = LocalMCP(chunked_notifications=True)
+    mcp.include_x = not live_added
+    port = await mcp.start()
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "mcp.json").write_text(
+        json.dumps({
+            "servers": {
+                "page": {
+                    "transport": "streamable-http",
+                    "url": f"http://127.0.0.1:{port}",
+                    **(
+                        {}
+                        if bound
+                        else {"headers": {"Authorization": f"Bearer {SECRET}"}}
+                    ),
+                }
+            }
+        })
+    )
+    backend = FakeBackend([
+        ScriptedTurn(content=[TextContent("first")]),
+        ScriptedTurn(tool_calls=[ToolCall("x-call", "page__x", {})]),
+        ScriptedTurn(content=[TextContent("done")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2",
+            "features": [
+                "approval_reconnect",
+                "new_session_settings",
+                "session_mcp_bindings",
+            ],
+        })
+        new_session: dict[str, Any] = {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "approval_mode": "ask",
+        }
+        if bound:
+            new_session["mcp_bindings"] = [{
+                "server": "page",
+                "headers": {"Authorization": f"Bearer {SECRET}"},
+            }]
+        created = await _request(reader, writer, 2, "new_session", new_session)
+        assert "error" not in created[-1]
+        sent = await _request(reader, writer, 3, "send", {"text": "first"})
+        assert "error" not in sent[-1]
+        await _event(reader, "agent_end")
+
+        if live_added:
+            await mcp.add_tool()
+            await asyncio.wait_for(mcp.tools_refetched.wait(), TIMEOUT)
+
+        await _request(reader, writer, 4, "send", {"text": "use x"})
+        approval = await _event(reader, "approval_request")
+        approved = await _request(reader, writer, 5, "approve", {
+            "request_id": approval["request_id"],
+        })
+        assert "error" not in approved[-1]
+        await asyncio.wait_for(mcp.tool_called.wait(), TIMEOUT)
+        await _event(reader, "agent_end")
+
+        assert mcp.methods.count("tools/call") == 1
+        assert sum(
+            message.tool_result is not None
+            for messages, _tools in backend.calls
+            for message in messages
+        ) == 1
     finally:
         writer.close()
         await writer.wait_closed()
