@@ -14,7 +14,7 @@ from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
 from tests.support.sockets import short_socket_path as _socket_path
-from zeta.core.store import ConversationStore, ObserverSnapshotChanged, _history_index
+from zeta.core.store import ConversationStore, ObserverSnapshotChanged
 from zeta.core.store._history_index import HistoryIndexUnavailableError
 from zeta.protocol.types import (
     Message,
@@ -28,11 +28,6 @@ from zeta.server.handlers import history, history_projection
 from zeta.server.protocol import FrameCodec, ProtocolError
 
 pytest_plugins = ("tests.support.socket_fixtures",)
-
-
-@pytest.fixture(autouse=True)
-def _build_small_history_indexes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_history_index.HistoryIndex, "AUTO_INDEX_MIN_BYTES", 0)
 
 
 def _entry(number: int) -> SimpleNamespace:

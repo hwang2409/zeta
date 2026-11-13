@@ -91,7 +91,6 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    AUTO_INDEX_MIN_BYTES = 16 * 1024 * 1024
     SCHEMA_VERSION = 5
     _NAME = "history-index.sqlite3"
 
@@ -1147,16 +1146,9 @@ class HistoryPageStoreMixin:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            facts = self._history_index_facts()
-            if (
-                facts["byte_boundary"] < self._history_index.AUTO_INDEX_MIN_BYTES
-                and not self._history_index._exists()
-            ):
-                self._history_index._mark_unavailable()
-                return
             refs = self._resident_rows.resident_refs()
             self._history_index.sync_validated(
-                facts,
+                self._history_index_facts(),
                 refs,
                 lambda: self._resident_rows.stream_validated_rows(refs),
             )
@@ -1183,8 +1175,6 @@ class HistoryPageStoreMixin:
             self._sync_history_index(
                 self.entry(ref) for ref in self.branch_refs()
             )
-            if not self._history_index.available:
-                return
         digest = self._entry_prefix_digest
         for entry in entries:
             digest = self._next_entry_prefix_digest(

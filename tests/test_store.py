@@ -29,7 +29,6 @@ from zeta.core.store import (
     ConversationStore,
     TranscriptLoadError,
     _async_writes,
-    _history_index,
     _log,
 )
 from zeta.core.store._delivery_fold import DeliveryFold
@@ -57,11 +56,6 @@ from zeta.protocol.types import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _build_small_history_indexes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_history_index.HistoryIndex, "AUTO_INDEX_MIN_BYTES", 0)
-
-
 def message(role: MessageRole, text: str) -> Message:
     message = Message(role, [TextContent(text)])
     if role is MessageRole.USER:
@@ -75,24 +69,6 @@ def test_every_notification_kind_has_a_validator() -> None:
     assert set(NOTIFICATION_VALIDATORS) == set(NOTIFICATION_KINDS) == set(payloads)
     for kind in NOTIFICATION_KINDS:
         validate_notification_data(payloads[kind])
-
-
-def test_small_transcript_defers_history_index_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        _history_index.HistoryIndex, "AUTO_INDEX_MIN_BYTES", 1024, raising=False
-    )
-    store = ConversationStore(tmp_path, session_id="deferred-history-index")
-    try:
-        store.append_message(message(MessageRole.USER, "small"))
-        assert store._history_index is not None
-        assert not store._history_index.available
-
-        store.append_message(message(MessageRole.USER, "x" * 2048))
-        assert store._history_index.available
-    finally:
-        store.close()
 
 
 def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:

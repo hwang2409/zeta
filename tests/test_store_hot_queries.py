@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.branch_reads import branch_entries
-from zeta.core.store import ConversationStore, _history_index
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -22,11 +22,6 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
-
-
-@pytest.fixture(autouse=True)
-def _build_small_history_indexes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_history_index.HistoryIndex, "AUTO_INDEX_MIN_BYTES", 0)
 
 
 @pytest.mark.parametrize("old_version", [3, 999])
