@@ -381,6 +381,21 @@ def _end_event(call: ToolCall, decision: str = "abort") -> StreamEvent:
 
 
 @pytest.mark.asyncio
+async def test_denied_approval_without_live_turn_starts_no_recovery_turn(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        await server.control.resolve_approval("deny", call.id)
+
+        assert server.control._turn_task is None
+        assert server.runtime.opened.store.approval_state_now(call.id) == (call, "deny")
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_first", [False, True])
 async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_first: bool
