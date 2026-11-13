@@ -391,6 +391,10 @@ async def test_denied_approval_without_live_turn_starts_no_recovery_turn(
 
         assert server.control._turn_task is None
         assert server.runtime.opened.store.approval_state_now(call.id) == (call, "deny")
+
+        result = await server.runtime.loop.resume_pending_tool(call.id)
+        assert result.is_error is True
+        assert result.content == "tool execution denied"
     finally:
         await close_serve(server, writer)
 
