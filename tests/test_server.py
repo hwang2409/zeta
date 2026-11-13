@@ -2564,6 +2564,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
 
     # test-contract: force approval publication before the grandchild is registered
     monkeypatch.setattr(owner, "register", defer_grandchild_registration)
+    # test-contract: seam no public hook controls notification publication order
     monkeypatch.setattr(server.control, "_notify", cancel_before_grandchild_registration)
     child_watcher: asyncio.Task[object] | None = None
     try:
@@ -2571,6 +2572,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         approval = await _event(reader, "approval_request")
         grandchild_id = approval["agent_instance_id"]
         child_id = grandchild_id.rsplit(":", 1)[0]
+        # test-contract: seam no public child-completion hook exists
         child_watcher = owner._watchers[child_id]
         frames = deque(await _request(reader, writer, 4, "status"), maxlen=50)
         frame_count = len(frames)
