@@ -99,6 +99,128 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
         reopened.close()
 
 
+def test_resident_payloads_stay_bounded_after_compaction() -> None:
+    rows = ResidentRows()
+    rows.payload_cache_bytes = 0
+    parent_id = None
+    for seq in range(1, 1101):
+        entry_id = f"message-{seq}"
+        rows.append(
+            ConversationEntry(
+                seq=seq,
+                id=entry_id,
+                parent_id=parent_id,
+                lane="main",
+                type="message",
+                data={
+                    "message": message(
+                        MessageRole.ASSISTANT, "x" * 4096
+                    ).to_dict()
+                },
+            )
+        )
+        parent_id = entry_id
+    rows.append(
+        ConversationEntry(
+            seq=1101,
+            id="compaction",
+            parent_id=parent_id,
+            lane="main",
+            type="compaction",
+            data={
+                "summary": "bounded",
+                "source_seq_start": 1,
+                "source_seq_end": 1100,
+                "replaces": [],
+            },
+        )
+    )
+
+    assert len(rows.payloads) <= 1025
+    assert rows.resident_payload_bytes < 5 * 1024 * 1024
+    assert 1 not in rows.payloads
+
+
+def test_warm_message_transcript_opens_from_compact_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path, session_id="warm-index") as store:
+        stored = store.append_many(
+            [
+                ("message", {"message": message(MessageRole.ASSISTANT, value).to_dict()})
+                for value in ("first", "second")
+            ]
+        )
+        store.commit_compaction_marker(
+            "summary", 1, 2, expected_parent_id=stored[-1].id
+        )
+
+    physical_reads = 0
+    original = ConversationStore._iter_physical_rows
+
+    def counted_rows(store, source, validated_prefix):
+        nonlocal physical_reads
+        physical_reads += 1
+        return original(store, source, validated_prefix)
+
+    monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
+    with ConversationStore(tmp_path, session_id="warm-index") as reopened:
+        assert [item.content[0].text for item in branch_messages(reopened)] == [
+            "first",
+            "second",
+        ]
+
+    assert physical_reads == 0
+
+    (store.session_dir / "history-index.sqlite3").write_bytes(
+        b"broken disposable index"
+    )
+    with ConversationStore(tmp_path, session_id="warm-index") as recovered:
+        assert [item.content[0].text for item in branch_messages(recovered)] == [
+            "first",
+            "second",
+        ]
+    assert physical_reads == 1
+
+
+@pytest.mark.asyncio
+async def test_nonresident_rows_support_point_and_stream_reads(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="nonresident-reads")
+    try:
+        entries = [
+            (
+                "message",
+                {
+                    "message": message(
+                        MessageRole.ASSISTANT, f"payload-{seq}"
+                    ).to_dict()
+                },
+            )
+            for seq in range(1030)
+        ]
+        stored = store.append_many(entries)
+        store.commit_compaction_marker(
+            "bounded",
+            1,
+            1030,
+            expected_parent_id=stored[-1].id,
+        )
+    finally:
+        store.close()
+
+    reopened = ConversationStore(tmp_path, session_id="nonresident-reads")
+    try:
+        refs = reopened.resident_refs()[:2]
+        assert refs[0].seq not in reopened._resident_rows.payloads
+        assert reopened.entry(refs[0]).data["message"]["content"][0]["text"] == "payload-0"
+        streamed = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(reopened.stream_rows(refs))), 10
+        )
+        assert [entry.seq for entry in streamed] == [1, 2]
+    finally:
+        reopened.close()
+
+
 @pytest.mark.asyncio
 async def test_loop_append_defers_sqlite_to_an_off_loop_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -294,7 +416,7 @@ def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
         )
 
         assert entries.iterations == 0
-        assert store._entry_ids == {entry.id for entry in list(entries)}
+        assert store._entry_ids == {ref.id for ref in store.resident_refs()}
 
 
 def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> None:
@@ -2352,13 +2474,13 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
     original_append = store._resident_rows.append
     original_extend = store._resident_rows.extend
 
-    def observed_append(entry):
+    def observed_append(entry, **kwargs):
         mutation_threads.append(threading.get_ident())
-        return original_append(entry)
+        return original_append(entry, **kwargs)
 
-    def observed_extend(entries):
+    def observed_extend(entries, **kwargs):
         mutation_threads.append(threading.get_ident())
-        return original_extend(entries)
+        return original_extend(entries, **kwargs)
 
     store._resident_rows.append = observed_append
     store._resident_rows.extend = observed_extend

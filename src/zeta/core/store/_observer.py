@@ -62,7 +62,7 @@ class ObserverSnapshotMixin:
                 self._check_observer_source(g0, retry_source_change)
                 return
             candidate = raw[:complete_end]
-            baseline = (len(self._resident_rows.entries), self._entry_prefix_digest)
+            baseline = (len(self._resident_rows.rows), self._entry_prefix_digest)
             validation = self._validate_observer_range(fd, g0, candidate)
             has_suffix = complete_end < g0.st_size
             full_validation: _ObserverValidation | None = None
@@ -142,7 +142,7 @@ class ObserverSnapshotMixin:
         ):
             return False
         replaced = (g0.st_dev, g0.st_ino) != (g1.st_dev, g1.st_ino)
-        if retry_source_change and (not self._resident_rows.entries or not replaced):
+        if retry_source_change and (not self._resident_rows.rows or not replaced):
             self._sync_observer_snapshot(retry_source_change=False)
             return True
         raise ObserverSnapshotChanged("observer transcript changed during read")

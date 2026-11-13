@@ -174,7 +174,7 @@ class RecentRowsMixin:
     def recent_row_floor(self: ConversationStore) -> int:
         """Return the lowest seq a lookup can see."""
         self._assert_owner_thread()
-        return max(1, len(self._resident_rows.entries) - RECENT_ROW_WINDOW + 1)
+        return max(1, len(self._resident_rows.rows) - RECENT_ROW_WINDOW + 1)
 
     def recent_row_seq(self: ConversationStore, key: RecentRowKey) -> int | None:
         """Return the seq of the row ``key`` names, or None when not visible.
@@ -211,7 +211,7 @@ class RecentRowsMixin:
     def row_id_at(self: ConversationStore, seq: int) -> str | None:
         """Return the stable entry id at ``seq`` while it is visible."""
         floor = self.recent_row_floor()
-        if not floor <= seq <= len(self._resident_rows.entries):
+        if not floor <= seq <= len(self._resident_rows.rows):
             return None
         return self._resident_rows.entries[seq - 1].id
 

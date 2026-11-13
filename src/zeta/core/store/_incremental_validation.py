@@ -131,20 +131,14 @@ class IncrementalValidationMixin:
     def _rebuild_incremental_validation_state(self) -> None:
         """Build O(1) integrity indexes after a complete validation pass."""
         self._reset_incremental_validation_state()
-        by_id: dict[str, ConversationEntry] = {}
-        for index, entry in enumerate(self._resident_rows.entries):
+        for index, ref in enumerate(self._resident_rows.rows):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
-            self._entry_ids.add(entry.id)
-            by_id[entry.id] = entry
-        branch: list[ConversationEntry] = []
-        current = self._resident_rows.entries[-1] if self._resident_rows.entries else None
-        while current is not None:
-            branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
+            self._entry_ids.add(ref.id)
         approvals = _ApprovalValidationOverlay()
         fold = DeliveryFold()
-        for index, entry in enumerate(reversed(branch)):
+        branch = self._resident_rows.stream_rows(self._resident_rows.branch_refs())
+        for index, entry in enumerate(branch):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
             fold.apply(entry, approvals)
@@ -153,7 +147,7 @@ class IncrementalValidationMixin:
     def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
         staged = copy.copy(self)
-        staged._resident_rows = type(self._resident_rows)(self._resident_rows.entries)
+        staged._resident_rows = self._resident_rows.clone()
         staged._entry_ids = set(self._entry_ids)
         staged._entry_prefix_digest = self._entry_prefix_digest
         staged._delivery_fold = self._delivery_fold.staged()
@@ -225,7 +219,10 @@ class IncrementalValidationMixin:
         return True
 
     def _install_validated_linear_entries(
-        self, entries: list[ConversationEntry]
+        self,
+        entries: list[ConversationEntry],
+        *,
+        start_offset: int | None = None,
     ) -> None:
         """Install worker-validated tail rows and publish the entry list once."""
         previous = self._resident_rows.entries[-1] if self._resident_rows.entries else None
@@ -240,7 +237,7 @@ class IncrementalValidationMixin:
             self._record_physical_entry(entry)
             previous = entry
         self._delivery_fold = fold
-        self._resident_rows.extend(entries)
+        self._resident_rows.extend(entries, start_offset=start_offset)
 
     def _apply_to_working_fold(
         self,

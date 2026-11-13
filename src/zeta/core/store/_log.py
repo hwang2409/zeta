@@ -44,6 +44,7 @@ from ..transcript_recovery import (
 from ..transcript_recovery.stream import TranscriptStream
 from ._delivery_fold import DeliveryFold
 from ._incremental_validation import _ApprovalValidationOverlay
+from ._rows import MessageFacts, ResidentRows, RowRef
 
 if TYPE_CHECKING:
     from ._client_delivery import ClientDelivery
@@ -78,7 +79,7 @@ class _DetachedLogState:
     """Validated transcript state that is safe to install without file access."""
 
     cwd: str
-    entries: list[ConversationEntry]
+    resident_rows: ResidentRows
     entry_ids: set[str]
     entry_prefix_digest: bytes
     delivery_fold: DeliveryFold
@@ -124,15 +125,21 @@ class _FullLoadValidator:
         self.store = store
         self.source = source
         # The resident rows stay a prefix only if the digest at their count matches.
-        self.baseline = (len(store._resident_rows.entries), store._entry_prefix_digest)
-        self._digest_at_baseline: bytes | None = b"" if not store._resident_rows.entries else None
+        self.baseline = (len(store._resident_rows.rows), store._entry_prefix_digest)
+        self._digest_at_baseline: bytes | None = b"" if not store._resident_rows.rows else None
         self.state = copy.copy(store)
         self.state._resident_rows = type(store._resident_rows)(())
+        self.state._resident_rows.bind_source(
+            store.directory_fd,
+            (source.stat.st_dev, source.stat.st_ino, source.stat.st_ctime_ns),
+            store._reset_generation,
+            lambda: store._reset_generation,
+        )
         self.state._entry_prefix_digest = b""
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()
         self.state._sent_message_receipts = []
-        self.by_id: dict[str, ConversationEntry] = {}
+        self.by_id: dict[str, RowRef] = {}
         self.rows_by_id: dict[str, _PhysicalRow] = {}
         self.header_seen = False
 
@@ -227,7 +234,7 @@ class _FullLoadValidator:
             reason_code = "invalid_sequence"
         elif entry.id in self.by_id:
             reason_code = "duplicate_id"
-        elif self.state._resident_rows.entries and entry.parent_id is None:
+        elif self.state._resident_rows.rows and entry.parent_id is None:
             reason_code = "orphaned_root"
         elif entry.parent_id is not None and entry.parent_id not in self.by_id:
             reason_code = "missing_parent"
@@ -237,11 +244,11 @@ class _FullLoadValidator:
         self.state._resident_rows.append(
             entry, offset=row.byte_offset, length=row.length
         )
-        self.by_id[entry.id] = entry
-        self.rows_by_id[entry.id] = row
+        self.by_id[entry.id] = self.state._resident_rows.rows[-1]
+        self.rows_by_id[entry.id] = replace(row, value=None)
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
-        if len(self.state._resident_rows.entries) == self.baseline[0]:
+        if len(self.state._resident_rows.rows) == self.baseline[0]:
             self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
         self.state._record_physical_entry(entry)
@@ -251,9 +258,9 @@ class _FullLoadValidator:
         """Return the exact prefix already accepted by this one-pass validator."""
         last = next(
             (
-                entry
-                for entry in reversed(self.state._resident_rows.entries)
-                if self.rows_by_id[entry.id].byte_offset < end_offset
+                ref
+                for ref in reversed(self.state._resident_rows.rows)
+                if self.rows_by_id[ref.id].byte_offset < end_offset
             ),
             None,
         )
@@ -264,17 +271,17 @@ class _FullLoadValidator:
             last_lane=last.lane if last is not None else "main",
         )
 
-    def _select_branch(self, head: ConversationEntry) -> None:
+    def _select_branch(self, head: RowRef) -> None:
         entry_ids = set(self.by_id)
         self.state._reset_incremental_validation_state()
         self.state._entry_ids = entry_ids
-        branch: list[ConversationEntry] = []
-        current: ConversationEntry | None = head
+        branch: list[RowRef] = []
+        current: RowRef | None = head
         while current is not None:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
         approvals = _ApprovalValidationOverlay()
-        for entry in reversed(branch):
+        for entry in self.state._resident_rows.stream_rows(reversed(branch)):
             try:
                 self.state._apply_to_working_fold(entry, approvals)
             except ConversationIntegrityError as exc:
@@ -329,16 +336,27 @@ class _FullLoadValidator:
                 prefix_digest=hashlib.sha256().hexdigest(),
                 source_digest=self.source.finish_digest(),
             )
-        if self.state._resident_rows.entries:
-            self._select_branch(self.state._resident_rows.entries[-1])
-        self.state._rebuild_client_deliveries(self.state._resident_rows.entries)
+        if self.state._resident_rows.rows:
+            self._select_branch(self.state._resident_rows.rows[-1])
+        self.state._rebuild_client_deliveries(
+            self.state._resident_rows.stream_rows(self.state._resident_rows.rows)
+        )
         if install:
             if self.resets_resident_rows:
                 self.store._reset_generation += 1
             for attribute in self._STATE_ATTRIBUTES:
                 setattr(self.store, attribute, getattr(self.state, attribute))
             self.store._resident_rows = self.state._resident_rows
-            self.store._resident_rows.bind_source(self.store.directory_fd)
+            self.store._resident_rows.bind_source(
+                self.store.directory_fd,
+                (
+                    self.source.stat.st_dev,
+                    self.source.stat.st_ino,
+                    self.source.stat.st_ctime_ns,
+                ),
+                self.store._reset_generation,
+                lambda: self.store._reset_generation,
+            )
 
     @property
     def resets_resident_rows(self) -> bool:
@@ -361,7 +379,7 @@ class ConversationLogMixin:
         """Return the worker-owned validated state for an atomic loop install."""
         return _DetachedLogState(
             cwd=self.cwd,
-            entries=self._resident_rows.entries,
+            resident_rows=self._resident_rows.clone(),
             entry_ids=self._entry_ids,
             entry_prefix_digest=self._entry_prefix_digest,
             delivery_fold=self._delivery_fold,
@@ -382,7 +400,7 @@ class ConversationLogMixin:
         # share the reference and build its own fold by staged()+swap instead.
         return replace(
             state,
-            entries=list(state.entries),
+            resident_rows=state.resident_rows.clone(),
             entry_ids=set(state.entry_ids),
             task_notification_ids=set(state.task_notification_ids),
             sent_message_receipts=list(state.sent_message_receipts),
@@ -497,7 +515,13 @@ class ConversationLogMixin:
         self._log_mtime_ns = state.log_mtime_ns
         self._log_prefix_fingerprint = state.log_prefix_fingerprint
         # Publish entries last so readers never see rows without matching indexes.
-        self._resident_rows.replace(state.entries)
+        self._resident_rows = state.resident_rows.clone()
+        self._resident_rows.bind_source(
+            self.directory_fd,
+            state.log_identity,
+            self._reset_generation,
+            lambda: self._reset_generation,
+        )
         self._transcript_generation += 1
         return previous
 
@@ -584,7 +608,7 @@ class ConversationLogMixin:
         parse; ordinary external appends read and validate only the new bytes.
         """
         self._assert_owner_thread()
-        had_entries = bool(self._resident_rows.entries)
+        had_entries = bool(self._resident_rows.rows)
         try:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         except FileNotFoundError:
@@ -644,7 +668,7 @@ class ConversationLogMixin:
 
         try:
             entries, torn_at = self._parse_entry_lines(
-                raw, first_row=len(self._resident_rows.entries) + 2
+                raw, first_row=len(self._resident_rows.rows) + 2
             )
         except ConversationIntegrityError:
             self._load_full()
@@ -652,7 +676,7 @@ class ConversationLogMixin:
         if torn_at is not None:
             if self._read_only:
                 raise ConversationIntegrityError(
-                    f"invalid conversation row {len(self._resident_rows.entries) + len(entries) + 2}: {self.path}"
+                    f"invalid conversation row {len(self._resident_rows.rows) + len(entries) + 2}: {self.path}"
                 )
             self._strict_snapshot_sync = False
             self._load_full()
@@ -896,7 +920,7 @@ class ConversationLogMixin:
         # Nested reloads (repairs) receive the outer reload's start, so the
         # whole operation publishes once against the rows resident before it.
         if since is None:
-            since = (self._reset_generation, len(self._resident_rows.entries))
+            since = (self._reset_generation, len(self._resident_rows.rows))
         self._full_reload_count += 1
         if not self._read_only and self._repair_enabled:
             reconcile_pending(
@@ -907,6 +931,47 @@ class ConversationLogMixin:
         fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         try:
             stat = os.fstat(fd)
+            if self._history_index is not None:
+                snapshot = self._history_index.warm_snapshot(stat)
+                if snapshot is not None:
+                    raw_rows, raw_payloads, facts = snapshot
+                    try:
+                        payloads = [
+                            ConversationEntry.from_dict(row) for row in raw_payloads
+                        ]
+                        resident = type(self._resident_rows).warm(raw_rows, payloads)
+                    except (ConversationIntegrityError, KeyError, TypeError, ValueError):
+                        snapshot = None
+                    simple_messages = snapshot is not None and all(
+                        ref.type != "message"
+                        or (
+                            isinstance(ref.facts, MessageFacts)
+                            and not ref.facts.receipts
+                            and not ref.facts.approval_request_ids
+                        )
+                        for ref in resident.rows
+                    )
+                    header_bytes = os.pread(fd, 4096, 0).split(b"\n", 1)[0]
+                    if simple_messages and header_bytes:
+                        header = load_session_json(header_bytes)
+                        if isinstance(header, dict):
+                            self._validate_header(header)
+                            self._resident_rows = resident
+                            self._reset_incremental_validation_state()
+                            self._entry_ids = {ref.id for ref in resident.rows}
+                            self._entry_prefix_digest = bytes.fromhex(
+                                str(facts["prefix_digest"])
+                            )
+                            for entry in payloads:
+                                self._delivery_fold.apply(entry)
+                            self._task_notification_ids = set()
+                            self._sent_message_receipts = []
+                            self._client_deliveries = {}
+                            self._client_delivery_outcomes = {}
+                            self._reset_generation += 1
+                            self._set_log_stat(stat)
+                            self._publish_reload(since)
+                            return
             source = TranscriptStream(fd, stat)
             validator = _FullLoadValidator(self, source)
             torn_row: _PhysicalRow | None = None
@@ -1125,6 +1190,12 @@ class ConversationLogMixin:
         finally:
             os.close(fd)
         self._log_identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
+        self._resident_rows.bind_source(
+            self.directory_fd,
+            self._log_identity,
+            self._reset_generation,
+            lambda: self._reset_generation,
+        )
         self._log_offset = stat.st_size
         self._log_mtime_ns = stat.st_mtime_ns
         self._log_prefix_fingerprint = fingerprint

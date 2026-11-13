@@ -9,8 +9,8 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -91,7 +91,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -178,8 +178,12 @@ class HistoryIndex:
                 value.get("lane", "main"), value["type"], HistoryIndex._value(value["data"]),
             )
         return (
-            entry.seq, entry.id, entry.parent_id, entry.lane, entry.type,
-            HistoryIndex._value(entry.data),
+            entry.seq,
+            entry.id,
+            entry.parent_id,
+            entry.lane,
+            entry.type,
+            HistoryIndex._value(getattr(entry, "data", None)),
         )
 
     @staticmethod
@@ -243,10 +247,81 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS active_approval_resolutions ("
             "request_id TEXT PRIMARY KEY, decision TEXT NOT NULL, data BLOB NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS warm_rows ("
+            "seq INTEGER PRIMARY KEY, byte_offset INTEGER NOT NULL, "
+            "byte_length INTEGER NOT NULL, facts BLOB)"
+        )
 
     def _stored_facts(self, connection: sqlite3.Connection) -> dict[str, object] | None:
         row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
         return self._facts(json.loads(row[0])) if row is not None else None
+
+    def warm_snapshot(
+        self, stat: os.stat_result
+    ) -> tuple[list[tuple[object, ...]], list[dict[str, object]], dict[str, object]] | None:
+        """Return a compact unchanged message transcript, or require full validation."""
+        with self._lock:
+            try:
+                connection = self._connection(write=False)
+            except (HistoryIndexError, OSError, sqlite3.Error):
+                return None
+            try:
+                facts = self._stored_facts(connection)
+                expected = {
+                    "st_dev": stat.st_dev,
+                    "st_ino": stat.st_ino,
+                    "byte_boundary": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "schema_version": self.SCHEMA_VERSION,
+                }
+                if facts is None or any(facts.get(key) != value for key, value in expected.items()):
+                    return None
+                try:
+                    if len(bytes.fromhex(str(facts.get("prefix_digest")))) != 32:
+                        return None
+                except ValueError:
+                    return None
+                rows = connection.execute(
+                    "SELECT e.seq,e.id,e.parent_id,e.lane,e.type,w.byte_offset,"
+                    "w.byte_length,w.facts FROM entries e JOIN warm_rows w USING(seq) "
+                    "ORDER BY e.seq"
+                ).fetchall()
+                if len(rows) != facts.get("last_seq") or any(
+                    row[4] not in {"message", "compaction"} for row in rows
+                ):
+                    return None
+                unsupported_message = connection.execute(
+                    "SELECT 1 FROM entries WHERE type='message' AND ("
+                    "COALESCE(json_array_length(json_extract(data,'$.message.content')),0) != 1 "
+                    "OR json_extract(data,'$.message.content[0].type') != 'text' "
+                    "OR EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.message.metadata')) "
+                    "WHERE key != 'zeta.origin')) LIMIT 1"
+                ).fetchone()
+                if unsupported_message is not None:
+                    return None
+                payload_rows = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                    "WHERE type='compaction' OR seq>? ORDER BY seq",
+                    (max(0, len(rows) - 1024),),
+                ).fetchall()
+                payloads = [
+                    {
+                        "seq": row[0],
+                        "id": row[1],
+                        "parent_id": row[2],
+                        "lane": row[3],
+                        "type": row[4],
+                        "data": json.loads(row[5]),
+                    }
+                    for row in payload_rows
+                ]
+                return rows, payloads, facts
+            except (HistoryIndexError, OSError, sqlite3.Error, ValueError, TypeError):
+                return None
+            finally:
+                connection.close()
 
     def _set_meta(
         self, connection: sqlite3.Connection, facts: object, *, total: int
@@ -282,11 +357,21 @@ class HistoryIndex:
             current = by_id.get(row[2]) if row[2] else None
         return active
 
+    @staticmethod
+    def _warm_facts(value: object) -> object:
+        if value is None or isinstance(value, (str, int, float, bool, list, tuple, dict)):
+            return value
+        if is_dataclass(value):
+            return {"kind": type(value).__name__, "value": asdict(value)}
+        raise TypeError(f"unsupported warm row facts: {type(value).__name__}")
+
     def _rebuild(
-        self, source_facts: object, validated_rows: Iterable[object]
+        self,
+        source_facts: object,
+        row_refs: Sequence[object],
+        validated_rows: Iterable[object],
     ) -> None:
-        rows = tuple(validated_rows)
-        active_ids = self._active_ids(rows)
+        active_ids = self._active_ids(row_refs)
         connection: sqlite3.Connection | None = None
         try:
             self._remove_file()
@@ -294,7 +379,9 @@ class HistoryIndex:
             self._create_schema(connection)
             group = 0
             with connection:
-                for entry in rows:
+                count = 0
+                for ref, entry in zip(row_refs, validated_rows, strict=True):
+                    count += 1
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
                     active = entry_id in active_ids
@@ -307,6 +394,15 @@ class HistoryIndex:
                         "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                         "VALUES(?,?,?,?,?,?,?)",
                         (seq, entry_id, parent_id, lane, entry_type, encoded, history_group),
+                    )
+                    connection.execute(
+                        "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) VALUES(?,?,?,?)",
+                        (
+                            seq,
+                            int(getattr(ref, "offset", 0)),
+                            int(getattr(ref, "length", 0)),
+                            self._value(self._warm_facts(getattr(ref, "facts", None))),
+                        ),
                     )
                     if active and entry_type == "message":
                         for approval in data.get("approval_requests", ()):
@@ -329,6 +425,19 @@ class HistoryIndex:
                             (data["delivery_id"], self._value(data["accepted_message"])),
                         )
                 self._set_meta(connection, source_facts, total=group)
+                connection.execute(
+                    "INSERT INTO meta(key,value) VALUES('startup_projection',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (
+                        self._value(
+                            {
+                                "active_head": self._row(row_refs[-1])[1] if row_refs else None,
+                                "row_count": count,
+                                "resident_tail_start": max(1, count - 1023) if count else 0,
+                            }
+                        ),
+                    ),
+                )
             self._available = True
         finally:
             if connection is not None:
@@ -452,6 +561,25 @@ class HistoryIndex:
                 "VALUES(?,?,?,?,?,?,?)",
                 ((*self._row(entry), group) for entry, group in projected),
             )
+            from ._rows import row_facts
+
+            lengths = [len(encode_json(entry.to_dict())) + 1 for entry in entries]
+            offset = int(self._facts(facts)["byte_boundary"]) - sum(lengths)
+            warm_rows = []
+            for entry, length in zip(entries, lengths, strict=True):
+                warm_rows.append(
+                    (
+                        entry.seq,
+                        offset,
+                        length,
+                        self._value(self._warm_facts(row_facts(entry))),
+                    )
+                )
+                offset += length
+            connection.executemany(
+                "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) VALUES(?,?,?,?)",
+                warm_rows,
+            )
             self._write_correlations(connection, entries)
             self._set_meta(connection, facts, total=total)
 
@@ -491,41 +619,64 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
-    def sync_validated(self, source_facts: object, validated_rows: Iterable[object]) -> None:
-        """Make the disposable index match validated authority without failing it."""
+    def sync_validated(
+        self,
+        source_facts: object,
+        row_refs: Iterable[object],
+        validated_rows: Iterable[object] | Callable[[], Iterable[object]] | None = None,
+    ) -> None:
+        """Make the disposable index match validated authority without retaining it."""
         with self._lock:
             self._check_open()
             if self._observer:
                 self._available = self._exists()
                 return
-            rows = tuple(validated_rows)
+            refs = tuple(row_refs)
+            def rows() -> Iterable[object]:
+                if validated_rows is None:
+                    return refs
+                return validated_rows() if callable(validated_rows) else validated_rows
             expected = self._facts(source_facts)
             try:
                 connection = self._connection(write=True)
                 try:
                     self._create_schema(connection)
                     stored = self._stored_facts(connection)
-                    if stored is not None and all(
-                        stored.get(key) == value for key, value in expected.items()
-                    ) and stored.get("schema_version") == self.SCHEMA_VERSION:
-                        self._available = True
-                        return
-                    suffix_start = (
-                        self._suffix_start(stored, expected, rows)
-                        if stored is not None else None
-                    )
-                    if suffix_start is not None:
-                        self._append_entries(connection, source_facts, rows[suffix_start:])
+                    warm_count = connection.execute(
+                        "SELECT COUNT(*) FROM warm_rows"
+                    ).fetchone()[0]
+                    if (
+                        stored is not None
+                        and all(
+                            stored.get(key) == value for key, value in expected.items()
+                        )
+                        and stored.get("schema_version") == self.SCHEMA_VERSION
+                        and warm_count == len(refs)
+                    ):
                         self._available = True
                         return
                 finally:
                     connection.close()
-                self._rebuild(source_facts, rows)
-            except (HistoryIndexError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                self._rebuild(source_facts, refs, rows())
+            except (
+                HistoryIndexError,
+                OSError,
+                sqlite3.Error,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
                 self._available = False
                 try:
-                    self._rebuild(source_facts, rows)
-                except (HistoryIndexError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                    self._rebuild(source_facts, refs, rows())
+                except (
+                    HistoryIndexError,
+                    OSError,
+                    sqlite3.Error,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
                     self._available = False
 
     def apply_committed(self, facts: object, rows: Iterable[object]) -> None:
@@ -824,7 +975,7 @@ def _overlay_resident_entries(
     store: ConversationStore, page: IndexedHistoryPage
 ) -> IndexedHistoryPage:
     def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._resident_rows.entries):
+        if entry.seq > len(store._resident_rows.rows):
             return entry
         resident = store._resident_rows.entries[entry.seq - 1]
         if resident.id != entry.id:
@@ -908,6 +1059,8 @@ class HistoryPageStoreMixin:
             "st_dev": stat.st_dev,
             "st_ino": stat.st_ino,
             "byte_boundary": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
             "last_seq": last.seq if last else 0,
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
@@ -923,7 +1076,12 @@ class HistoryPageStoreMixin:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            self._history_index.sync_validated(self._history_index_facts(), entries)
+            refs = self._resident_rows.resident_refs()
+            self._history_index.sync_validated(
+                self._history_index_facts(),
+                refs,
+                lambda: self._resident_rows.stream_rows(refs),
+            )
         else:
             self._history_index._mark_unavailable()
 

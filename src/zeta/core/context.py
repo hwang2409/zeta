@@ -179,8 +179,10 @@ class ContextAssembler(ContextMarkerMixin):
         """Return whether the next assembly must compact the active branch."""
         if force:
             return True
-        branch = tuple(self.store.entry(ref) for ref in self.store.branch_refs())
-        items = self._visible_items(branch)
+        branch = tuple(self.store.entry(ref) for ref in self.store.context_refs())
+        items = self._visible_items(
+            branch, active_source_seqs=self.store.context_source_seqs()
+        )
         self._track_token_counts(items)
         system_prompt = self._system_prompt_message(system_append)
         messages = [
@@ -599,6 +601,7 @@ class ContextAssembler(ContextMarkerMixin):
         self,
         branch: Sequence[ConversationEntry],
         *,
+        active_source_seqs: set[int] | None = None,
         force: bool,
         assembly_budget: int,
         system_append: str = "",
@@ -606,7 +609,9 @@ class ContextAssembler(ContextMarkerMixin):
     ) -> _AssemblyPreparation:
         """Build the immutable inputs for compaction without store access."""
 
-        items = self._visible_items(branch)
+        items = self._visible_items(
+            branch, active_source_seqs=active_source_seqs
+        )
         self._track_token_counts(items)
         result_seqs = {
             id(item.message): item.entry.seq
@@ -723,14 +728,17 @@ class ContextAssembler(ContextMarkerMixin):
                     self._record_compaction_telemetry(plan.telemetry or {})
                     self._request_budget.reset_provider_total()
             if stale:
-                branch = [self.store.entry(ref) for ref in self.store.branch_refs()]
+                branch = [self.store.entry(ref) for ref in self.store.context_refs()]
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:
                     logger.debug(
                         "eviction planning repeatedly invalidated by branch changes"
                     )
-                items = self._visible_items(branch)
+                items = self._visible_items(
+                    branch,
+                    active_source_seqs=self.store.context_source_seqs(),
+                )
                 snapshot = {
                     **snapshot,
                     "branch": tuple(branch),
@@ -1147,14 +1155,17 @@ class ContextAssembler(ContextMarkerMixin):
         return self._is_pending_delivery_metadata(message.metadata)
 
     def _visible_items(
-        self, entries: Sequence[ConversationEntry]
+        self,
+        entries: Sequence[ConversationEntry],
+        *,
+        active_source_seqs: set[int] | None = None,
     ) -> list[_ContextItem]:
         all_markers = [entry for entry in entries if entry.type == "compaction"]
         superseded_ids: set[str] = set()
         for marker in all_markers:
             superseded_ids.update(marker.data.get("replaces", []))
         markers = [entry for entry in all_markers if entry.id not in superseded_ids]
-        active_source_seqs = {
+        active_source_seqs = active_source_seqs or {
             entry.seq for entry in entries if entry.type in {"message", "compaction"}
         }
         valid_markers = [
@@ -1167,15 +1178,18 @@ class ContextAssembler(ContextMarkerMixin):
             (entry.data["source_seq_start"], entry.data["source_seq_end"])
             for entry in valid_markers
         ]
-        markers_by_start = {
-            entry.data["source_seq_start"]: entry for entry in valid_markers
-        }
+        pending_markers = sorted(
+            valid_markers, key=lambda marker: marker.data["source_seq_start"]
+        )
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()
         for entry in entries:
-            marker = markers_by_start.get(entry.seq)
-            if marker is not None:
+            while (
+                pending_markers
+                and pending_markers[0].data["source_seq_start"] <= entry.seq
+            ):
+                marker = pending_markers.pop(0)
                 items.extend(self._marker_items(marker, active_source_seqs, entries))
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
