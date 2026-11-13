@@ -101,13 +101,13 @@ class ListChangedNotificationStream(httpx.AsyncByteStream):
 
     async def __aiter__(self):
         self.server.notification_open.set()
-        await self.server.notification_ready.wait()
+        await asyncio.wait_for(self.server.notification_ready.wait(), TIMEOUT)
         yield (
             b'event: message\ndata: {"jsonrpc":"2.0",'
             b'"method":"notifications/tools/list_changed"}\n\n'
         )
         yield b":" + b"x" * 65_536 + b"\n\n"
-        await self.server.notification_release.wait()
+        await asyncio.wait_for(self.server.notification_release.wait(), TIMEOUT)
 
     async def aclose(self) -> None:
         self.server.notification_release.set()
@@ -121,7 +121,7 @@ class RefetchResponseStream(httpx.AsyncByteStream):
     async def __aiter__(self):
         yield self.content
         self.server.tools_refetched.set()
-        await self.server.refetch_response_release.wait()
+        await asyncio.wait_for(self.server.refetch_response_release.wait(), TIMEOUT)
 
 
 class ListChangedMCP(httpx.AsyncBaseTransport):
@@ -327,6 +327,7 @@ async def test_http_list_changed_refreshes_next_turn_catalog(
         assert original_wait is not None
         await original_wait(mount)
 
+    # test-contract: seam observes turn and refresh ordering through the real server
     monkeypatch.setattr(MCPSession, "_ensure_mcp_servers", observe_turn_start)
     if original_wait is not None:
         monkeypatch.setattr(MCPMount, "wait_for_tool_refreshes", observe_refresh_wait)
@@ -392,13 +393,18 @@ async def test_http_list_changed_refreshes_next_turn_catalog(
         await asyncio.wait_for(mcp.tools_refetched.wait(), TIMEOUT)
         await _request(reader, writer, 4, "send", {"text": "second"})
         await asyncio.wait_for(turn_started.wait(), TIMEOUT)
-        wait_started = asyncio.create_task(refresh_wait_started.wait())
-        turn_passed = asyncio.create_task(turn_passed_refresh.wait())
+        wait_started = asyncio.create_task(
+            asyncio.wait_for(refresh_wait_started.wait(), TIMEOUT)
+        )
+        turn_passed = asyncio.create_task(
+            asyncio.wait_for(turn_passed_refresh.wait(), TIMEOUT)
+        )
         try:
             done, _ = await asyncio.wait_for(
                 asyncio.wait(
                     {wait_started, turn_passed},
                     return_when=asyncio.FIRST_COMPLETED,
+                    timeout=TIMEOUT,
                 ),
                 TIMEOUT,
             )
@@ -406,7 +412,10 @@ async def test_http_list_changed_refreshes_next_turn_catalog(
         finally:
             for task in (wait_started, turn_passed):
                 task.cancel()
-            await asyncio.gather(wait_started, turn_passed, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(wait_started, turn_passed, return_exceptions=True),
+                TIMEOUT,
+            )
 
         assert len(backend.calls) == 1
         mcp.refetch_response_release.set()
