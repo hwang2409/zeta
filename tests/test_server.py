@@ -4859,7 +4859,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert (await _request(reader, writer, 4, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 5, "new_session", {"provider": "codex"})
@@ -4869,7 +4869,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
 
         await _request(reader, writer, 7, "send", {"text": "second"})
         await _event(reader, "usage")
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert (await _request(reader, writer, 8, "status"))[-1]["result"]["usage"]
 
         await _request(reader, writer, 9, "resume", {"session_id": first_session})
@@ -8262,7 +8262,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         ]
         sid = created["session_id"]
         await _request(reader, writer, 3, "send", {"text": "original preview"})
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         renamed = (
             await _request(
                 reader,
@@ -8630,7 +8630,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         )[-1]["error"]
         assert error["code"] == -32004
         release.set()
-        await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
         assert server.runtime.manager.read_metadata(sid).name == "mid-stream"
         assert (
             "result"
@@ -11681,7 +11681,7 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(
     try:
         await _request(reader, writer, 3, "resume", {"session_id": session_id})
         await _request(reader, writer, 4, "resume", {"session_id": session_id})
-        await _frames_until_event(reader, "turn_end")
+        await _frames_until_event(reader, "agent_end")
         await _request(reader, writer, 5, "resume", {"session_id": session_id})
         async with asyncio.timeout(TIMEOUT):
             while store.agent_notifications():

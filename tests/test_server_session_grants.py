@@ -766,7 +766,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         release_observer.set()
         observer_event = await _event(observer_reader, "session_grants_changed")
         assert observer_event["data"] == controller_event["data"]
-        await _frames_until_event(reader, "turn_end")
+        await _frames_until_event(reader, "agent_end")
 
         observer_blocked.clear()
         release_observer = asyncio.Event()
@@ -936,7 +936,7 @@ async def test_observer_write_failure_does_not_turn_revoke_into_error(
             "approve",
             {"request_id": "call-1", "scope": "always_tool"},
         )
-        await _frames_until_event(reader, "turn_end")
+        await _frames_until_event(reader, "agent_end")
 
         assert server.connections is not None
         observer_connection = server.connections._observers[0].connection

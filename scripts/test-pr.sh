@@ -26,8 +26,12 @@ done
 
 if [ -z "$record" ]; then
     branch=$(git branch --show-current | tr '/' '-')
+    if [ -z "$branch" ]; then
+        branch=$(basename "$(git rev-parse --show-toplevel)")
+    fi
     short_head=$(git rev-parse --short HEAD)
-    record="${ZETA_TEST_RECORD_DIR:-$HOME/.zeta/scratch/test-runs}/$branch-$short_head.txt"
+    timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    record="${ZETA_TEST_RECORD_DIR:-$HOME/.zeta/scratch/test-runs}/$branch-$short_head-$timestamp.txt"
 fi
 mkdir -p "$(dirname "$record")"
 
