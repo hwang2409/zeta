@@ -1099,7 +1099,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
-        if not _pending_execution_claimed and not self.claim_pending_execution(tool_call.id):
+        if (
+            approved_execution is not None
+            and not _pending_execution_claimed
+            and not self.claim_pending_execution(tool_call.id)
+        ):
             return await finalize(
                 _error_result(
                     f"tool execution already claimed: {tool_call.id}",
