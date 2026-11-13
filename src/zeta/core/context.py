@@ -936,7 +936,9 @@ class ContextAssembler(ContextMarkerMixin):
         system_messages: Sequence[Message],
         assembly_budget: int,
     ) -> _EvictionPlan:
-        visible = self._visible_items(branch)
+        visible = self._visible_items(
+            branch, active_source_seqs=self.store.context_source_seqs()
+        )
         messages = [*system_messages, *(item.message for item in visible)]
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
@@ -1184,13 +1186,27 @@ class ContextAssembler(ContextMarkerMixin):
         items: list[_ContextItem] = []
         emitted_marker_ids: set[str] = set()
         failed_tool_call_ids: set[str] = set()
+        pinned_source_seq = getattr(
+            getattr(self, "store", None), "legacy_pinned_source_seq", None
+        )
         for entry in entries:
             while (
                 pending_markers
                 and pending_markers[0].data["source_seq_start"] <= entry.seq
             ):
                 marker = pending_markers.pop(0)
-                items.extend(self._marker_items(marker, active_source_seqs, entries))
+                items.extend(
+                    self._marker_items(
+                        marker,
+                        active_source_seqs,
+                        entries,
+                        legacy_pinned_seq=(
+                            pinned_source_seq(marker.id)
+                            if callable(pinned_source_seq)
+                            else None
+                        ),
+                    )
+                )
                 emitted_marker_ids.add(marker.id)
             if entry.type == "compaction":
                 continue
@@ -1235,7 +1251,18 @@ class ContextAssembler(ContextMarkerMixin):
             )
         for marker in valid_markers:
             if marker.id not in emitted_marker_ids:
-                items.extend(self._marker_items(marker, active_source_seqs, entries))
+                items.extend(
+                    self._marker_items(
+                        marker,
+                        active_source_seqs,
+                        entries,
+                        legacy_pinned_seq=(
+                            pinned_source_seq(marker.id)
+                            if callable(pinned_source_seq)
+                            else None
+                        ),
+                    )
+                )
         return items
 
     @staticmethod

@@ -951,27 +951,26 @@ class ConversationLogMixin:
                         )
                         for ref in resident.rows
                     )
-                    header_bytes = os.pread(fd, 4096, 0).split(b"\n", 1)[0]
-                    if simple_messages and header_bytes:
-                        header = load_session_json(header_bytes)
-                        if isinstance(header, dict):
-                            self._validate_header(header)
-                            self._resident_rows = resident
-                            self._reset_incremental_validation_state()
-                            self._entry_ids = {ref.id for ref in resident.rows}
-                            self._entry_prefix_digest = bytes.fromhex(
-                                str(facts["prefix_digest"])
-                            )
-                            for entry in payloads:
-                                self._delivery_fold.apply(entry)
-                            self._task_notification_ids = set()
-                            self._sent_message_receipts = []
-                            self._client_deliveries = {}
-                            self._client_delivery_outcomes = {}
-                            self._reset_generation += 1
-                            self._set_log_stat(stat)
-                            self._publish_reload(since)
-                            return
+                    if simple_messages:
+                        self.cwd = str(facts["cwd"])
+                        self._resident_rows = resident
+                        self._reset_incremental_validation_state()
+                        self._entry_ids = {ref.id for ref in resident.rows}
+                        self._entry_prefix_digest = bytes.fromhex(
+                            str(facts["prefix_digest"])
+                        )
+                        for entry in payloads:
+                            self._delivery_fold.apply(entry)
+                        self._task_notification_ids = set()
+                        self._sent_message_receipts = []
+                        self._client_deliveries = {}
+                        self._client_delivery_outcomes = {}
+                        self._reset_generation += 1
+                        self._set_log_stat(
+                            stat, bytes.fromhex(str(facts["prefix_fingerprint"]))
+                        )
+                        self._publish_reload(since)
+                        return
             source = TranscriptStream(fd, stat)
             validator = _FullLoadValidator(self, source)
             torn_row: _PhysicalRow | None = None
@@ -1183,12 +1182,17 @@ class ConversationLogMixin:
         known = getattr(self, "_log_prefix_fingerprint", None)
         return known is not None and self._prefix_fingerprint(fd, offset) == known
 
-    def _set_log_stat(self: ConversationStore, stat: os.stat_result) -> None:
-        fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
-        try:
-            fingerprint = self._prefix_fingerprint(fd, stat.st_size)
-        finally:
-            os.close(fd)
+    def _set_log_stat(
+        self: ConversationStore,
+        stat: os.stat_result,
+        fingerprint: bytes | None = None,
+    ) -> None:
+        if fingerprint is None:
+            fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
+            try:
+                fingerprint = self._prefix_fingerprint(fd, stat.st_size)
+            finally:
+                os.close(fd)
         self._log_identity = (stat.st_dev, stat.st_ino, stat.st_ctime_ns)
         self._resident_rows.bind_source(
             self.directory_fd,

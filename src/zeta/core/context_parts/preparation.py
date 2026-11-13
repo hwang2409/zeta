@@ -108,8 +108,13 @@ class ContextPreparation:
         try:
             while True:
                 assembly_budget = self.budget(reserved_estimator_tokens)
-                branch = tuple(
-                    self._store.entry(ref) for ref in self._store.context_refs()
+                refs = (
+                    self._store.branch_refs()
+                    if force
+                    else self._store.context_refs()
+                )
+                branch = await asyncio.to_thread(
+                    tuple, self._store.stream_rows(refs)
                 )
                 active_source_seqs = self._store.context_source_seqs()
                 branch_id = self._store.active_branch_head_id()

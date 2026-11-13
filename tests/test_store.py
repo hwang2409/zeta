@@ -29,6 +29,7 @@ from zeta.core.store import (
     ConversationStore,
     TranscriptLoadError,
     _async_writes,
+    _log,
 )
 from zeta.core.store._delivery_fold import DeliveryFold
 from zeta.core.store._history_index import (
@@ -157,22 +158,31 @@ def test_warm_message_transcript_opens_from_compact_index(
         )
 
     physical_reads = 0
+    point_reads = 0
     original = ConversationStore._iter_physical_rows
+    original_pread = _log.os.pread
 
     def counted_rows(store, source, validated_prefix):
         nonlocal physical_reads
         physical_reads += 1
         return original(store, source, validated_prefix)
 
-    # test-contract: seam counts authoritative transcript reads on warm startup
+    def counted_pread(fd, length, offset):
+        nonlocal point_reads
+        point_reads += 1
+        return original_pread(fd, length, offset)
+
+    # test-contract: seam counts full scans and point reads from the authoritative transcript on warm startup
     monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
+    monkeypatch.setattr(_log.os, "pread", counted_pread)
     with ConversationStore(tmp_path, session_id="warm-index") as reopened:
+        assert physical_reads == 0
+        # test-contract: seam the warm-open path performs no point read from the transcript
+        assert point_reads == 0
         assert [item.content[0].text for item in branch_messages(reopened)] == [
             "first",
             "second",
         ]
-
-    assert physical_reads == 0
 
     index_path = store.session_dir / "history-index.sqlite3"
     with sqlite3.connect(index_path) as connection:
@@ -196,6 +206,88 @@ def test_warm_message_transcript_opens_from_compact_index(
             "second",
         ]
     assert physical_reads == 2
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_messages",
+    [
+        ("foreign_append", ["first", "second", "appended"]),
+        ("crash_after_log_append", ["first", "second", "appended"]),
+        ("torn_tail", ["first", "second"]),
+        ("same_size_replacement", ["other", "second"]),
+        ("old_schema", ["first", "second"]),
+        ("corrupt_sidecar", ["first", "second"]),
+    ],
+)
+def test_warm_index_invalidations_read_authoritative_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_messages: list[str],
+) -> None:
+    with ConversationStore(tmp_path, session_id="warm-invalidations") as store:
+        stored = store.append_many(
+            [
+                ("message", {"message": message(MessageRole.ASSISTANT, value).to_dict()})
+                for value in ("first", "second")
+            ]
+        )
+        store.commit_compaction_marker(
+            "summary", 1, 2, expected_parent_id=stored[-1].id
+        )
+        marker_id = store.branch_refs()[-1].id
+        log_path = store.path
+        index_path = store.session_dir / "history-index.sqlite3"
+
+    if mutation in {"foreign_append", "crash_after_log_append"}:
+        appended = ConversationEntry(
+            seq=4,
+            id=("f" if mutation == "foreign_append" else "c") * 32,
+            parent_id=marker_id,
+            lane="main",
+            type="message",
+            data={"message": message(MessageRole.ASSISTANT, "appended").to_dict()},
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(appended.to_dict(), separators=(",", ":")) + "\n")
+    elif mutation == "torn_tail":
+        with log_path.open("ab") as handle:
+            handle.write(b'{"data":')
+    elif mutation == "same_size_replacement":
+        before = log_path.stat()
+        replacement = log_path.with_suffix(".replacement")
+        replacement.write_bytes(log_path.read_bytes().replace(b"first", b"other", 1))
+        assert replacement.stat().st_size == before.st_size
+        os.replace(replacement, log_path)
+        os.utime(log_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    elif mutation == "old_schema":
+        with sqlite3.connect(index_path) as connection:
+            raw = connection.execute(
+                "SELECT value FROM meta WHERE key='facts'"
+            ).fetchone()[0]
+            facts = json.loads(raw)
+            facts["schema_version"] -= 1
+            connection.execute(
+                "UPDATE meta SET value=? WHERE key='facts'", (json.dumps(facts),)
+            )
+    else:
+        index_path.write_bytes(b"broken disposable index")
+
+    physical_reads = 0
+    original = ConversationStore._iter_physical_rows
+
+    def counted_rows(store, source, validated_prefix):
+        nonlocal physical_reads
+        physical_reads += 1
+        return original(store, source, validated_prefix)
+
+    # test-contract: each stale, replaced, incomplete, or corrupt sidecar route must return to the transcript authority
+    monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
+    with ConversationStore(tmp_path, session_id="warm-invalidations") as reopened:
+        assert [item.content[0].text for item in branch_messages(reopened)] == expected_messages
+
+    # test-contract: seam every invalid sidecar route reads the authoritative transcript
+    assert physical_reads >= 1
 
 
 @pytest.mark.asyncio

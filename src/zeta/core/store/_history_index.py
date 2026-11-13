@@ -276,7 +276,15 @@ class HistoryIndex:
                     "ctime_ns": stat.st_ctime_ns,
                     "schema_version": self.SCHEMA_VERSION,
                 }
-                if facts is None or any(facts.get(key) != value for key, value in expected.items()):
+                if (
+                    facts is None
+                    or type(facts.get("cwd")) is not str
+                    or not facts["cwd"]
+                    or type(facts.get("prefix_fingerprint")) is not str
+                    or any(facts.get(key) != value for key, value in expected.items())
+                ):
+                    return None
+                if len(bytes.fromhex(facts["prefix_fingerprint"])) != 16:
                     return None
                 try:
                     expected_digest = bytes.fromhex(str(facts.get("prefix_digest")))
@@ -1082,6 +1090,7 @@ class HistoryPageStoreMixin:
         )
         last = self._resident_rows.entries[-1] if self._resident_rows.entries else None
         return {
+            "cwd": self.cwd,
             "st_dev": stat.st_dev,
             "st_ino": stat.st_ino,
             "byte_boundary": stat.st_size,
@@ -1091,6 +1100,7 @@ class HistoryPageStoreMixin:
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
             "prefix_digest": self._entry_prefix_digest.hex(),
+            "prefix_fingerprint": self._log_prefix_fingerprint.hex(),
             "repair_generation": self._repair_generation,
         }
 

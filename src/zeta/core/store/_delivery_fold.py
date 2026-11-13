@@ -46,11 +46,13 @@ class DeliveryFold:
         "presented",
         "prompt_ids",
         "prompt_messages",
-        "tool_results",
+        "tool_result_receipts",
+        "tool_result_seqs",
     )
 
     def __init__(self) -> None:
-        self.tool_results: dict[str, ToolResult] = {}
+        self.tool_result_seqs: dict[str, int] = {}
+        self.tool_result_receipts: dict[str, tuple[str, str]] = {}
         self.open_tool_calls: set[str] = set()
         self.agent_call_ids: set[str] = set()
         self.agent_receipts: list[tuple[str, str]] = []
@@ -93,7 +95,8 @@ class DeliveryFold:
     def staged(self) -> DeliveryFold:
         """Return a mutable working fold with its own containers for one change."""
         new = DeliveryFold.__new__(DeliveryFold)
-        new.tool_results = dict(self.tool_results)
+        new.tool_result_seqs = dict(self.tool_result_seqs)
+        new.tool_result_receipts = dict(self.tool_result_receipts)
         new.open_tool_calls = set(self.open_tool_calls)
         new.agent_call_ids = set(self.agent_call_ids)
         new.agent_receipts = list(self.agent_receipts)
@@ -183,7 +186,10 @@ class DeliveryFold:
             self.delivery_message = message
         tool_result = message.tool_result
         if tool_result is not None:
-            self.tool_results[tool_result.tool_call_id] = tool_result
+            self.tool_result_seqs[tool_result.tool_call_id] = entry.seq
+            receipt = self._agent_receipt(tool_result)
+            if receipt is not None:
+                self.tool_result_receipts[tool_result.tool_call_id] = receipt
         for block in message.content:
             if not isinstance(block, ToolUseContent):
                 continue
@@ -194,9 +200,9 @@ class DeliveryFold:
             self.open_tool_calls.add(block.tool_call.id)
             if block.tool_call.name.casefold() == "agent":
                 self.agent_call_ids.add(block.tool_call.id)
-                prior_result = self.tool_results.get(block.tool_call.id)
-                if prior_result is not None:
-                    self._record_agent_receipt(prior_result)
+                prior_receipt = self.tool_result_receipts.get(block.tool_call.id)
+                if prior_receipt is not None:
+                    self.agent_receipts.append(prior_receipt)
         if tool_result is not None:
             self.open_tool_calls.discard(tool_result.tool_call_id)
             if tool_result.tool_call_id in self.agent_call_ids:
@@ -216,11 +222,18 @@ class DeliveryFold:
         ):
             self.completions_by_child.setdefault(child_id, entry)
 
-    def _record_agent_receipt(self, result: ToolResult) -> None:
+    @staticmethod
+    def _agent_receipt(result: ToolResult) -> tuple[str, str] | None:
         structured = result.structured_content
         if structured is None:
-            return
+            return None
         handle = structured.get("child_instance_id")
         child_path = structured.get("child_session_path")
         if type(handle) is str and handle and type(child_path) is str and child_path:
-            self.agent_receipts.append((handle, child_path))
+            return handle, child_path
+        return None
+
+    def _record_agent_receipt(self, result: ToolResult) -> None:
+        receipt = self._agent_receipt(result)
+        if receipt is not None:
+            self.agent_receipts.append(receipt)

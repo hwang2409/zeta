@@ -100,6 +100,7 @@ from ._rows import (
     ResidentRows,
     RowRef,
     StartupFactsMixin,
+    TranscriptRows,
     sent_message_receipts,
 )
 from ._session_state import SessionStatePersistenceMixin
@@ -1162,6 +1163,10 @@ class ConversationStore(
         return None
 
     @property
+    def resident_payload_bytes(self) -> int:
+        return self._resident_rows.resident_payload_bytes
+
+    @property
     def closed(self) -> bool:
         """Whether this store instance has been closed (its fd released)."""
         return self._closed
@@ -1182,6 +1187,9 @@ class ConversationStore(
 
     def context_source_seqs(self):
         return self._resident_rows.context_source_seqs()
+
+    def legacy_pinned_source_seq(self, marker_id: str) -> int | None:
+        return self._resident_rows.legacy_pinned_source_seq(marker_id)
 
     def last_message_ref(self):
         return self._resident_rows.last_message_ref()
@@ -1228,6 +1236,15 @@ class ConversationStore(
 
     def entry(self, ref):
         return self._resident_rows.entry(ref)
+
+    def transcript_rows(self, refs) -> TranscriptRows:
+        stat = os.stat("conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False)
+        return TranscriptRows(
+            path=self.path,
+            refs=tuple(refs),
+            source_identity=(stat.st_dev, stat.st_ino),
+            relative_offsets=self._resident_rows.relative_offsets,
+        )
 
     def stream_rows(self, refs, *, batch=256):
         if self._owner_thread_id == threading.get_ident():
@@ -1283,4 +1300,8 @@ class ConversationStore(
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
-            return self._delivery_fold.tool_results.get(tool_call_id)
+            seq = self._delivery_fold.tool_result_seqs.get(tool_call_id)
+            if seq is None:
+                return None
+            ref = self._resident_rows.rows[seq - 1]
+            return Message.from_dict(self.entry(ref).data["message"]).tool_result

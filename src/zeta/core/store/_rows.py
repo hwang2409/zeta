@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from pathlib import Path
 
 from ...agent.receipt import encode_json
 from ...protocol.types import Message, is_passive_harness_message
@@ -16,6 +17,7 @@ from ..checkpoints import (
     ConversationIntegrityError,
     load_session_json,
 )
+from ._client_delivery import without_client_delivery_marker
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -37,6 +39,48 @@ class MessageFacts:
     is_user: bool
     is_user_forkpoint: bool
     message_preview: str | None
+    projection_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptRows:
+    path: Path
+    refs: tuple[RowRef, ...]
+    source_identity: tuple[int, int]
+    relative_offsets: bool
+
+    def read(self) -> tuple[ConversationEntry, ...]:
+        fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            stat = os.fstat(fd)
+            if (stat.st_dev, stat.st_ino) != self.source_identity:
+                from ._history_index import StaleHistorySnapshot
+
+                raise StaleHistorySnapshot("conversation row source changed")
+            header_size = 0
+            if self.relative_offsets:
+                header = os.pread(fd, 4096, 0)
+                header_size = header.find(b"\n") + 1
+                if header_size <= 0:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation header is incomplete")
+            entries = []
+            for ref in self.refs:
+                raw = os.pread(fd, ref.length, ref.offset + header_size)
+                if len(raw) != ref.length:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation row offset is stale")
+                entry = ConversationEntry.from_dict(load_session_json(raw))
+                if entry.seq != ref.seq or entry.id != ref.id:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation row identity is stale")
+                entries.append(entry)
+            return tuple(entries)
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +162,8 @@ class StartupFactsMixin:
 
 def _message_facts(entry: ConversationEntry) -> MessageFacts:
     message = entry.data["message"]
+    projection = without_client_delivery_marker(Message.from_dict(message))
+    projection_digest = hashlib.sha256(encode_json(projection.to_dict())).hexdigest()
     is_user = message["role"] == "user"
     text = " ".join(
         block["text"].strip()
@@ -138,6 +184,7 @@ def _message_facts(entry: ConversationEntry) -> MessageFacts:
         is_user,
         is_user and not is_passive_harness_message(message),
         " ".join(text.split())[:48] if text else None,
+        projection_digest,
     )
 
 
@@ -186,6 +233,9 @@ def decode_row_facts(raw: str | bytes) -> object:
         return tuple(value)
     if kind == "MessageFacts" and isinstance(value, dict):
         calibration = value.get("calibration")
+        projection_digest = value.get("projection_digest")
+        if not isinstance(projection_digest, str):
+            raise ConversationIntegrityError("warm message facts lack projection digest")
         return MessageFacts(
             calibration=(
                 ContextCalibrationRecord(**calibration)
@@ -198,28 +248,32 @@ def decode_row_facts(raw: str | bytes) -> object:
             is_user=bool(value.get("is_user")),
             is_user_forkpoint=bool(value.get("is_user_forkpoint")),
             message_preview=value.get("message_preview"),
+            projection_digest=projection_digest,
         )
     raise ConversationIntegrityError(f"unsupported warm row facts: {kind}")
 
 
 class ResidentRows:
+    _BULK_TYPES = frozenset({"message", "compaction", "notification"})
+
     """One owner for the row skeleton and its bounded resident payload set."""
 
-    _BULK_TYPES: ClassVar[set[str]] = {"message", "compaction", "notification"}
-    _RECENT_WINDOW = 1024
+    _RECENT_WINDOW = 64
 
     def __init__(self, entries: Iterable[ConversationEntry] = ()) -> None:
         self.rows: list[RowRef] = []
         self._rows_by_id: dict[str, RowRef] = {}
         self._branch_refs: list[RowRef] = []
         self._context_refs: list[RowRef] = []
+        self._context_required: set[int] = set()
         self._context_source_seqs: set[int] = set()
+        self._legacy_pinned_source_seqs: dict[str, int] = {}
         self.payloads: dict[int, ConversationEntry] = {}
         self._payload_sizes: dict[int, int] = {}
         self._pinned: set[int] = set()
         self._payload_lru: OrderedDict[int, int] = OrderedDict()
         self.payload_cache_bytes = int(
-            os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", str(16 * 1024 * 1024))
+            os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
         )
         self.resident_payload_bytes = 0
         self._source_dir_fd: int | None = None
@@ -270,6 +324,7 @@ class ResidentRows:
         self._source_identity = None if identity is None else identity[:2]
         self._source_generation = generation
         self._generation_reader = generation_reader
+        self._rebalance_resident()
 
     def append(
         self,
@@ -437,18 +492,29 @@ class ResidentRows:
     def row_by_id(self, entry_id: str) -> RowRef | None:
         return self._rows_by_id.get(entry_id)
 
+    @property
+    def relative_offsets(self) -> bool:
+        return self._relative_offsets
+
     def context_refs(self) -> tuple[RowRef, ...]:
         return tuple(self._context_refs)
 
     def context_source_seqs(self) -> set[int]:
         return self._context_source_seqs
 
+    def legacy_pinned_source_seq(self, marker_id: str) -> int | None:
+        return self._legacy_pinned_source_seqs.get(marker_id)
+
     @staticmethod
     def _compaction_values(ref: RowRef) -> tuple[object, object, object, object]:
         return ref.facts if isinstance(ref.facts, tuple) and len(ref.facts) == 4 else (None,) * 4
 
     def _required_payloads(self) -> set[int]:
-        required = {ref.seq for ref in self.rows if ref.type not in self._BULK_TYPES}
+        self._legacy_pinned_source_seqs = {}
+        required: set[int] = set()
+        context_required = {
+            ref.seq for ref in self.rows if ref.type not in self._BULK_TYPES
+        }
         for ref in self.rows:
             if isinstance(ref.facts, MessageFacts) and (
                 ref.facts.approval_request_ids or ref.facts.context_exception
@@ -467,6 +533,34 @@ class ResidentRows:
         }
         live_markers = [ref for ref in markers if ref.id not in replaced]
         required.update(ref.seq for ref in live_markers)
+        for marker in live_markers:
+            payload = self.payloads.get(marker.seq)
+            start, end, _, _ = self._compaction_values(marker)
+            pinned = None if payload is None else payload.data.get("pinned_message")
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not isinstance(pinned, dict)
+                or type(pinned.get("source_seq")) is int
+            ):
+                continue
+            try:
+                projection = without_client_delivery_marker(Message.from_dict(pinned))
+            except (KeyError, TypeError, ValueError):
+                continue
+            digest = hashlib.sha256(encode_json(projection.to_dict())).hexdigest()
+            match = next(
+                (
+                    ref.seq
+                    for ref in reversed(self._branch_refs)
+                    if start <= ref.seq <= end
+                    and isinstance(ref.facts, MessageFacts)
+                    and ref.facts.projection_digest == digest
+                ),
+                None,
+            )
+            if match is not None:
+                self._legacy_pinned_source_seqs[marker.id] = match
         coverage_end = max(
             (
                 value
@@ -484,12 +578,13 @@ class ResidentRows:
             for ref in recent
             if ref.type != "compaction" or ref in live_markers
         )
+        self._context_required = context_required | required
         return required
 
     def _rebalance_resident(self) -> None:
         required = self._required_payloads()
         self._context_refs = [
-            ref for ref in self._branch_refs if ref.seq in required
+            ref for ref in self._branch_refs if ref.seq in self._context_required
         ]
         self._pinned = required
         for seq in tuple(self._payload_lru):
