@@ -303,8 +303,9 @@ async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path
         ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
     )
 
+    max_niceness = 20 if sys.platform == "darwin" else 19
     assert int(result["structuredContent"]["stdout"]) == min(
-        19, parent_niceness + 10
+        max_niceness, parent_niceness + 10
     )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
@@ -2816,8 +2817,9 @@ async def test_run_background_lowers_child_priority_without_changing_parent(
         ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
     )
 
+    max_niceness = 20 if sys.platform == "darwin" else 19
     assert int(output["structuredContent"]["output"]) == min(
-        19, parent_niceness + 10
+        max_niceness, parent_niceness + 10
     )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()
