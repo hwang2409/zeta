@@ -291,4 +291,3 @@ class StreamEventMixin:
         current = self._stream_kind, self._stream_identity
         if (incoming_kind, incoming_identity) != current:
             self._flush_pending_stream()
-

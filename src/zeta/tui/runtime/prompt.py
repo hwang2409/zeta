@@ -242,4 +242,3 @@ class PromptRuntimeMixin:
         header = self.fork_header_notice
         if header is not None:
             self._print_unit(Text(header, style=theme.DIM))
-
