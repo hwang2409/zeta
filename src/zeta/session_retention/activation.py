@@ -64,6 +64,7 @@ def make_retention_owner(
         run_pass=run_pass,
         on_error=record_error,
         home=root,
+        close_lease=retained.close,
     )
 
 
@@ -81,6 +82,7 @@ class RetentionActivationOwner:
         run_pass: Callable[[Any, int], Any] | None = None,
         on_error: Callable[[Exception, int], Any] | None = None,
         home: str | Path | None = None,
+        close_lease: Callable[[], Any] | None = None,
     ) -> None:
         self._planner_factory = planner_factory
         self._home = Path(home) if home is not None else None
@@ -103,6 +105,7 @@ class RetentionActivationOwner:
         self._planner: Any = None
         self._request_pending = threading.Event()
         self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
+        self._close_lease = close_lease
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -130,6 +133,9 @@ class RetentionActivationOwner:
                 await task
             except asyncio.CancelledError:
                 pass
+        if self._close_lease is not None:
+            await asyncio.to_thread(self._close_lease)
+            self._close_lease = None
 
     async def run_user_access(self, operation: Callable[[], Any]) -> Any:
         """Hold the user-access lease for one complete public operation."""
@@ -180,8 +186,9 @@ class RetentionActivationOwner:
                         break
                     result = self._run_pass(planner, days)
                     projections.append(result)
-                    if result.complete:
-                        break
+                    # each bounded pass is its own episode; close its leases before
+                    # the event loop can publish or wait for the next pass.
+                    break
         except Exception as exc:  # noqa: BLE001 - keep the owner alive after pass errors
             failure = exc
         finally:
