@@ -15,7 +15,6 @@ from ...mcp.config import (
     load_mcp_config_overlay,
 )
 from ...protocol.types import StreamEvent, StreamEventType
-from ...session_retention.handshake import open_with_retention_yield
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -64,9 +63,6 @@ async def _publish_project_registry_notice(self) -> None:
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
-    owner = self.server._retention_owner
-    if owner is not None:
-        return await owner.run_user_access(lambda: _new_session(self, params))
     return await _new_session(self, params)
 
 
@@ -127,9 +123,6 @@ async def _new_session(self, params: dict[str, Any]) -> dict[str, object]:
 
 
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
-    owner = self.server._retention_owner
-    if owner is not None:
-        return await owner.run_user_access(lambda: _resume(self, params))
     return await _resume(self, params)
 
 
@@ -482,13 +475,6 @@ async def status(
 def list_sessions(
     self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
-    owner = self.server._retention_owner
-    if owner is not None:
-        return open_with_retention_yield(
-            self.server.runtime.manager.home,
-            lambda: _list_sessions(self, request_id, params),
-            create_locks=False,
-        )
     return _list_sessions(self, request_id, params)
 
 

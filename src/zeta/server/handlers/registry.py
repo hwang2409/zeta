@@ -116,9 +116,6 @@ async def delete_session(client, request_id, params):
         validation.required_string(params, "session_id"),
         client.server.control.require_idle,
     )
-    owner = client.server._retention_owner
-    if owner is not None:
-        return await owner.run_user_access(operation)
     return await operation()
 
 

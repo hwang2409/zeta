@@ -4,18 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
-
-from .handshake import (
-    acquire_user_open_request,
-    release_user_open_request,
-)
-
 
 class _PublishedPass(dict[str, object]):
     def __init__(self, projection: dict[str, object], *, complete: bool) -> None:
@@ -65,7 +58,6 @@ def make_retention_owner(
         on_error=record_error,
         home=root,
         close_lease=retained.close,
-        access_enabled=retained.observed_epoch >= 11,
     )
 
 
@@ -84,7 +76,6 @@ class RetentionActivationOwner:
         on_error: Callable[[Exception, int], Any] | None = None,
         home: str | Path | None = None,
         close_lease: Callable[[], Any] | None = None,
-        access_enabled: bool = True,
     ) -> None:
         self._planner_factory = planner_factory
         self._home = Path(home) if home is not None else None
@@ -95,20 +86,15 @@ class RetentionActivationOwner:
         self._run_pass = run_pass or (lambda planner, current_days: getattr(planner, "run_" + "pass")(days=current_days))
         self._on_error = on_error or (lambda exc, current_days: {"mode": "none", "days": current_days, "errors": [str(exc)]})
         self._stop = asyncio.Event()
-        self._restart = asyncio.Event()
         self._run_done = asyncio.Event()
         self._run_done.set()
         self._planner_closed = asyncio.Event()
         self._planner_closed.set()
         self._wake = asyncio.Event()
-        self._open_finished = asyncio.Event()
-        self._open_finished.set()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
-        self._request_pending = threading.Event()
         self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
         self._close_lease = close_lease
-        self._access_enabled = access_enabled
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -140,40 +126,6 @@ class RetentionActivationOwner:
             await asyncio.to_thread(self._close_lease)
             self._close_lease = None
 
-    async def run_user_access(self, operation: Callable[[], Any]) -> Any:
-        """Hold the user-access lease for one complete public operation."""
-        if not self._access_enabled:
-            return await operation()
-        request_fd = None
-        if self._home is not None:
-            request_fd = await asyncio.to_thread(acquire_user_open_request, self._home)
-        self._request_pending.set()
-        self._open_finished.clear()
-        self._restart.set()
-        self._wake.set()
-        try:
-            task = self._episode_task
-            if task is not None and not task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(task), 2.0)
-                except TimeoutError:
-                    pass
-            result = operation()
-            if inspect.isawaitable(result):
-                return await result
-            return result
-        finally:
-            self._request_pending.clear()
-            if request_fd is not None:
-                await asyncio.to_thread(release_user_open_request, request_fd)
-            self._open_finished.set()
-
-    async def yield_to_open(self, operation: Callable[[], Any] | None = None) -> Any:
-        """Compatibility wrapper for callers that only need to stop retention."""
-        if operation is not None:
-            return await self.run_user_access(operation)
-        await self.run_user_access(lambda: None)
-
     def _run_episode(self) -> tuple[list[Any], Exception | None]:
         projections: list[Any] = []
         failure: Exception | None = None
@@ -190,7 +142,7 @@ class RetentionActivationOwner:
                 return projections, None
             context = planner_active(self._home) if self._home is not None else _null_context()
             with context:
-                while not self._stop.is_set() and not self._request_pending.is_set():
+                while not self._stop.is_set():
                     if self._home is not None and planner_request_pending(self._home):
                         break
                     days = self._days()
@@ -216,8 +168,6 @@ class RetentionActivationOwner:
         try:
             await asyncio.sleep(0)
             while not self._stop.is_set():
-                if not self._open_finished.is_set():
-                    await self._open_finished.wait()
                 if self._days() == 0:
                     self._wake.clear()
                     try:
@@ -225,8 +175,6 @@ class RetentionActivationOwner:
                     except TimeoutError:
                         pass
                     continue
-                self._request_pending.clear()
-                self._restart.clear()
                 self._episode_task = asyncio.create_task(
                     asyncio.to_thread(self._run_episode), name="retention-episode"
                 )
@@ -245,9 +193,6 @@ class RetentionActivationOwner:
                             await published
                 if self._stop.is_set():
                     return
-                if self._request_pending.is_set() or self._restart.is_set():
-                    self._wake.clear()
-                    continue
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(self._wake.wait(), self._wake_seconds)

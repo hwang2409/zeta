@@ -14,7 +14,6 @@ from ..core.session import (
     env_home,
     format_relative_age,
 )
-from ..session_retention.handshake import open_with_retention_yield
 
 
 def add_subcommand(commands: argparse._SubParsersAction) -> None:
@@ -70,9 +69,7 @@ def run(
         return _run_transfer(args, out, err)
     manager = SessionManager(env_home())
     if verb == "list":
-        return open_with_retention_yield(
-            manager.home, lambda: _run_list(manager, out), create_locks=False
-        )
+        return _run_list(manager, out)
     if verb == "rename":
         try:
             metadata = manager.rename(args.session_id, args.name)

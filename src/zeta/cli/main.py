@@ -1049,11 +1049,7 @@ async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
         return create_app(fork_args)
 
     async def build_fork(fork_id: str) -> object:
-        owner = getattr(app, "_retention_owner", None)
-        operation = lambda: asyncio.to_thread(_build_fork, fork_id)
-        if owner is not None:
-            return await owner.run_user_access(operation)
-        return await operation()
+        return await asyncio.to_thread(_build_fork, fork_id)
 
     return await run_fork_stack(app, build_fork)
 
