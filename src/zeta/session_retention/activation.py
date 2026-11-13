@@ -62,6 +62,7 @@ class RetentionActivationOwner:
 
     def start(self) -> asyncio.Task[None]:
         if self._task is None:
+            self._stop.clear()
             self._task = asyncio.create_task(self._run(), name="retention-activation")
         return self._task
 
