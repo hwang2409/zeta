@@ -135,6 +135,7 @@ class ServeControl:
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
+        self._reconnected_approvals: set[str] = set()
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
         # Serve reads requests serially per connection and has one controller,
@@ -321,9 +322,11 @@ class ServeControl:
         return bound_reconnect_approvals(merged)
 
     def clear_approvals(self) -> None:
+        self._reconnected_approvals.clear()
         self._approvals.clear_approvals()
 
     def session_replaced(self) -> None:
+        self._reconnected_approvals.clear()
         self._approvals.session_replaced()
 
     async def wait_for_approval_settlement(self, timeout: float | None = None) -> None:
@@ -379,6 +382,9 @@ class ServeControl:
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
         if reconnect:
+            self._reconnected_approvals.update(
+                key for key in self._approvals.active_keys() if isinstance(key, str)
+            )
             await self._approvals.transition(Reclaim())
         else:
             await self._approvals.transition(Expire())
@@ -547,8 +553,16 @@ class ServeControl:
             else None
         )
         turn_task = self._turn_task
+        reconnected = isinstance(core_key, str) and core_key in self._reconnected_approvals
+        if isinstance(core_key, str):
+            self._reconnected_approvals.discard(core_key)
         if (
-            (turn_task is None or turn_task.done())
+            (
+                reconnected
+                or turn_task is None
+                or turn_task.done()
+                or turn_task.cancelling()
+            )
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])
