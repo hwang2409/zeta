@@ -26,10 +26,13 @@ SECRET = "page-secret-never-persisted"
 
 
 class LocalMCP:
-    def __init__(self, *, error_with_header: bool = False) -> None:
+    def __init__(
+        self, *, error_with_header: bool = False, reject_missing_auth: bool = False
+    ) -> None:
         self.headers: list[str | None] = []
         self.methods: list[str] = []
         self.error_with_header = error_with_header
+        self.reject_missing_auth = reject_missing_auth
         self.request_received = asyncio.Event()
         self.auth_received = asyncio.Event()
         self.server: asyncio.AbstractServer | None = None
@@ -49,9 +52,20 @@ class LocalMCP:
             length = int(headers.get("content-length", "0"))
             body = await reader.readexactly(length)
             request = json.loads(body)
-            self.headers.append(headers.get("authorization"))
+            authorization = headers.get("authorization")
+            self.headers.append(authorization)
             self.request_received.set()
-            if headers.get("authorization") is not None:
+            if self.reject_missing_auth and authorization is None:
+                payload = b"credentials rejected: missing bearer"
+                writer.write(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: "
+                    + str(len(payload)).encode()
+                    + b"\r\n\r\n"
+                    + payload
+                )
+                await writer.drain()
+                return
+            if authorization is not None:
                 self.auth_received.set()
             method = request["method"]
             self.methods.append(method)
@@ -257,6 +271,72 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
             writer2.close(); await writer2.wait_closed()
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_reconnect_keeps_authenticated_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP(reject_missing_auth=True)
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    first_call = asyncio.Event()
+    second_call = asyncio.Event()
+    call_count = 0
+
+    def record_call(messages: object, tools: object) -> bytes:
+        nonlocal call_count
+        call_count += 1
+        (first_call if call_count == 1 else second_call).set()
+        return json.dumps([]).encode()
+
+    backend = FakeBackend([
+        ScriptedTurn(content=[TextContent("first")]),
+        ScriptedTurn(content=[TextContent("second")]),
+    ], request_serializer=record_call)
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    binding = {"server": "page", "headers": {"Authorization": "Bearer reconnect"}}
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        session = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "mcp_bindings": [binding]
+        }))[-1]["result"]["session"]
+        first_sent = (await _request(reader, writer, 3, "send", {"text": "first"}))[-1]
+        assert "result" in first_sent, first_sent
+        await asyncio.wait_for(first_call.wait(), TIMEOUT)
+        await asyncio.wait_for(mcp.auth_received.wait(), TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        resumed = (await _request(reader, writer, 5, "resume", {
+            "session_id": session["session_id"], "mcp_bindings": [binding]
+        }))[-1]
+        assert "result" in resumed
+        sent = (await _request(reader, writer, 6, "send", {"text": "second"}))[-1]
+        assert "result" in sent, sent
+        await asyncio.wait_for(second_call.wait(), TIMEOUT)
+
+        assert mcp.headers
+        assert all(header == "Bearer reconnect" for header in mcp.headers)
+        assert len(backend.calls) == 2, backend.calls
+        assert "page__echo" in {tool["name"] for tool in backend.calls[1][1]}
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
 
 
 async def _wait_for_controller_release(server: ZetaServer) -> None:

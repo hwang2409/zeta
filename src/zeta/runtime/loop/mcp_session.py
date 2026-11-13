@@ -124,10 +124,6 @@ class MCPSession:
             self._mcp_mount_task = None
             self._mcp_mount_attempted = self._mcp_mount is not None
         if self._mcp_mount is not None and self._mcp_bindings:
-            await self._replace_mcp_binding_configs(
-                {name: {} for name in self._mcp_bindings},
-                self._mcp_binding_configs,
-            )
             for name in self._mcp_bindings:
                 self._mcp_mount.set_primary_registry_only(name, False)
         self._mcp_bindings = {}
