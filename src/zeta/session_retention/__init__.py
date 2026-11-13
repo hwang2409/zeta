@@ -1,4 +1,3 @@
-# ruff: noqa: F401
 """Durable retention-owned session sidecars and the dormant retention planner.
 
 The planner is a library-only, bounded, resumable preview walk. It is reachable
@@ -9,10 +8,8 @@ planner entry points.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
-import stat
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -23,31 +20,18 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Self
 
-from ..attention_forks import read_attention_fork
-from ..attention_records import AttentionRecord
-from ..core.agent_state import _parse_agent_state
-from ..core.child_lifecycle import ChildRunPhase, parse_legacy_child_lifecycle
-from ..core.session import SessionMetadata
 from ..core.session_files import (
     SessionError,
-    SessionInUseError,
     SessionNotFoundError,
     SessionReferenceGate,
     SessionReferenceUnavailable,
     atomic_publish_file,
     child_directory,
-    descend_directory,
     open_session_file,
     read_reference_generation,
     unlink_session_file,
 )
-from ..core.session_links import valid_child_pending_link, valid_pending_link
-from ..core.todo import parse_todo_items
-from ..core.transcript_recovery import RepairTarget, classify_recovery_records
 from ..locking import RETENTION_HOME_ID, domain_authority
-from ..memory.reconciliation_state import classify_reconciliation_records
-from ..project_inbox import InboxError, validate_inbox_record
-from ..project_inbox_sent import SentMessageTracker, _Broken, _Loaded
 from ..storage_format import (
     StorageFeature,
     StorageFormatError,
@@ -55,7 +39,6 @@ from ..storage_format import (
     feature_enabled,
     validate_retention_arm,
     validate_retention_history,
-    validate_retention_reservation,
     validate_retention_state,
 )
 from .handshake import planner_request_pending
@@ -928,34 +911,22 @@ class _ClosureAuthority:
 PlannerError = RetentionPlannerError
 
 from ._helpers import (
-    _attention_reference,
     _authority_dependents,
-    _authority_inbox_dirs,
     _authority_inbox_reason,
     _authority_memory_reconciliation_reason,
     _authority_parent_id,
     _authority_store_dirs,
     _authority_store_reason,
     _authority_transcript_recovery_reason,
-    _bounded_reason,
-    _canonical_metadata,
-    _classify_inbox_record,
-    _dependent_reason,
     _descend,
     _EntryScan,
     _failure_reason,
     _fingerprints_intact,
     _flock_nb,
     _generation_value,
-    _has_child_marker,
     _lease_file,
-    _lifecycle_terminal,
-    _metadata_activity,
     _next_root,
-    _open_dir,
-    _pending_child_link,
     _preview_snapshot,
-    _read_authority_bytes,
     _reservation_present,
     _sent_file_reason,
     _visit,

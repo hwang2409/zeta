@@ -266,7 +266,7 @@ class ZetaServer:
                 not self._borrowed
                 and feature_enabled(
                     self.runtime.manager._storage_lease.observed_epoch,
-                    StorageFeature.SESSION_RETENTION,
+                    StorageFeature.SESSION_RETENTION_ACTIVATION,
                 )
             )
             else None

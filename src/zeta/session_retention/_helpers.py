@@ -1,8 +1,56 @@
-# ruff: noqa
-"""internal retention scan helpers."""
+"""Internal retention scan helpers."""
 
-from . import __dict__ as _parent_globals
-globals().update(_parent_globals)
+from __future__ import annotations
+
+import fcntl
+import os
+import stat
+from collections.abc import Callable
+from contextlib import ExitStack
+from datetime import UTC, datetime
+from pathlib import Path
+
+from ..attention_forks import read_attention_fork
+from ..attention_records import AttentionRecord
+from ..core.agent_state import _parse_agent_state
+from ..core.child_lifecycle import ChildRunPhase, parse_legacy_child_lifecycle
+from ..core.session import SessionMetadata
+from ..core.session_files import (
+    SessionError,
+    SessionInUseError,
+    SessionNotFoundError,
+    child_directory,
+    descend_directory,
+    open_session_file,
+    read_reference_generation,
+)
+from ..core.session_links import valid_child_pending_link, valid_pending_link
+from ..core.todo import parse_todo_items
+from ..core.transcript_recovery import RepairTarget, classify_recovery_records
+from ..memory.reconciliation_state import classify_reconciliation_records
+from ..project_inbox import InboxError, validate_inbox_record
+from ..project_inbox_sent import SentMessageTracker, _Broken, _Loaded
+from ..storage_format import StorageFormatError, validate_retention_reservation
+from . import (
+    _AGENTS_DIRNAME,
+    _ATTENTION_FORK_NAME,
+    _LIFECYCLE_NAME,
+    _MAX_TREE_DEPTH,
+    _METADATA_NAME,
+    _PENDING_CHILD_LINKS_DIRNAME,
+    _PENDING_LINK_NAME,
+    _SESSION_STATE_NAME,
+    PreviewSnapshot,
+    _Budget,
+    _ClosureBudget,
+    _InFlight,
+    _read_json,
+    _Sweep,
+    _Walk,
+)
+from . import (
+    RetentionPlannerError as PlannerError,
+)
 
 _descend = descend_directory
 _TIMESTAMP_FIELDS = ("created_at", "updated_at", "started_at", "finished_at")
@@ -438,9 +486,7 @@ def _authority_store_dirs(root_fd, scan, prefix=()):
 
 
 def _generation_value(home, scan) -> int:
-    from . import read_reference_generation as current_reader
-
-    value = current_reader(home)
+    value = read_reference_generation(home)
     scan.charge(0)
     return value
 

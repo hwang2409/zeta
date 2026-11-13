@@ -432,8 +432,11 @@ def test_planner_entry_points_have_no_production_callers():
     root = Path(__file__).resolve().parents[1] / "src" / "zeta"
     offenders = []
     for path in root.rglob("*.py"):
-        if path.relative_to(root) == Path("session_retention/__init__.py"):
-            continue  # the module that defines the planner
+        if path.relative_to(root) in {
+            Path("session_retention/__init__.py"),
+            Path("session_retention/_helpers.py"),
+        }:
+            continue  # planner implementation modules
         text = path.read_text(encoding="utf-8")
         if "RetentionPlanner" in text or ".run_pass(" in text:
             offenders.append(str(path.relative_to(root)))
@@ -855,7 +858,7 @@ def _generation_reader(monkeypatch):
         calls += 1
         return 0 if calls % 2 else 1
 
-    monkeypatch.setattr("zeta.session_retention.read_reference_generation", read)
+    monkeypatch.setattr("zeta.session_retention._helpers.read_reference_generation", read)
 
 
 def _check_authority_case(tmp_path, monkeypatch, kind, mode):

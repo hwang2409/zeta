@@ -881,41 +881,6 @@ def _retain_active_draft(
         retained_drafts.append(draft)
 
 
-def _create_tui_app(
-    args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-) -> object | None:
-    from ..session_retention.handshake import open_with_retention_yield
-    from ..tui.bootstrap import create_app
-
-    try:
-        if args.continue_session or args.resume is not None:
-            _tui_print("Loading session…")
-            return asyncio.run(
-                asyncio.to_thread(
-                    open_with_retention_yield,
-                    env_home(),
-                    lambda: create_app(args),
-                    create_locks=False,
-                )
-            )
-        return open_with_retention_yield(env_home(), lambda: create_app(args), create_locks=False)
-    except SessionError as exc:
-        parser.error(str(exc))
-    except StorageFormatError:
-        raise
-    except ValueError as exc:
-        _tui_print(f"zeta: {exc}")
-        return None
-    except Exception as exc:
-        if _has_console_message(exc):
-            raise
-        from ..tui.loop_errors import log_tui_crash
-
-        _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
-        return None
-
-
 def _run_tui_lifecycle_captured(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -926,14 +891,16 @@ def _run_tui_lifecycle_captured(
     exit_status = 0
     app: object | None = None
     retention_owner: object | None = None
+    from .retention import create_tui_app
+
     try:
         while True:
-            app = _create_tui_app(args, parser)
+            app = create_tui_app(args, parser, _tui_print, _has_console_message)
             if app is None:
                 exit_status = 1
                 break
             current_session_id = app.loop.store.session_id
-            if retention_owner is None and not args.no_session and feature_enabled(app.loop.store._storage_lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+            if retention_owner is None and not args.no_session and feature_enabled(app.loop.store._storage_lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
                 from ..session_retention.activation import make_retention_owner
                 retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
