@@ -99,6 +99,7 @@ _RAW_DELETION = {
     ("core/session_files.py", "write_session_file_if_absent", "unlink"),
     ("core/session_links.py", "_remove_entry", "unlink"),
     ("core/store/_history_index.py", "_remove_file", "unlink"),
+    ("tui/stderr_capture.py", "_retain_logs", "unlink"),
     ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
     ("mcp/management.py", "_atomic_json", "unlink"),
@@ -155,6 +156,7 @@ _APPEND_PUBLICATION = {
     ("memory/reconciliation_state.py", "_append_receipt_archive", "append"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "append"),
     ("core/store/_log.py", "_write_bytes", "append"),
+    ("tui/stderr_capture.py", "_open_capture", "append"),
 }
 
 # p07 owns remote project publication. It is authoritative, not a derived or
