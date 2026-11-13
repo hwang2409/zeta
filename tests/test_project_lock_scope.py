@@ -412,10 +412,13 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             inbox: ProjectInbox, project_id: str, *, create: bool, wait: bool = True
         ):
             nonlocal poll_gate_used
-            with real_directories(
-                inbox, project_id, create=create, wait=wait
-            ) as directories:
-                if not wait and not poll_gate_used:
+            directories_context = (
+                real_directories(inbox, project_id, create=create, wait=wait)
+                if wait is False
+                else real_directories(inbox, project_id, create=create)
+            )
+            with directories_context as directories:
+                if not poll_gate_used:
                     poll_gate_used = True
                     poll_acquired.set()
                     assert release_poll.wait(timeout=10)
@@ -455,8 +458,15 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                     },
                 )
             )
-            release_poll.set()
-            reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
+            try:
+                reply_response = (
+                    await asyncio.wait_for(asyncio.shield(reply_task), timeout=1.2)
+                )[-1]
+            except TimeoutError:
+                release_poll.set()
+                reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
+            else:
+                release_poll.set()
             assert "result" in reply_response, reply_response
             reply = reply_response["result"]
             assert reply["text"] == f"replied to {record.id}"
