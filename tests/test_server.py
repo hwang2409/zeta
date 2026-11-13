@@ -8899,7 +8899,7 @@ async def test_slash_run_rejects_pin_mutation_below_retention_epoch(tmp_path: Pa
         )
         assert response[-1]["result"] == {
             "kind": "output",
-            "output": "retention pins unavailable: upgrade the home before pinning",
+            "text": "retention pins unavailable: upgrade the home before pinning",
         }
         assert not (server.home / RETENTION_PIN_FILENAME).exists()
         assert not (server.home / "session-reference-generation").exists()
