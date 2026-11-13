@@ -67,4 +67,3 @@ def planner_request_pending(home: Path) -> bool:
         return False
     finally:
         os.close(fd)
-
