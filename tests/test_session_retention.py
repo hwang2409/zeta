@@ -1144,3 +1144,36 @@ def test_every_charge_deferral_preserves_final_sweep(tmp_path, monkeypatch):
         )
         assert classification == expected_classification, f"charge {charge} changed root decisions"
         assert preview == expected_preview, f"charge {charge} changed the completed preview"
+
+
+def test_armed_completed_preview_quarantines_eligible_root(tmp_path):
+    """An arm for the last complete preview makes the next pass quarantine it."""
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        preview, reasons = _run_sweep(planner)
+        assert reasons[root] == (True, None)
+        (tmp_path / "retention-arm.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "gate_version": 1,
+                    "armed_by_zeta_version": "test",
+                    "armed_at": _OLD,
+                    "preview_id": preview.preview_id,
+                }
+            )
+            + "\n"
+        )
+        planner.close()
+        resumed = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        resumed.run_pass(days=30)
+
+    assert not (tmp_path / "sessions" / root).exists(), (
+        "an armed root from the completed preview remained published"
+    )
+    reservation = tmp_path / "session-trash" / "reservations" / f"{root}.json"
+    assert reservation.exists(), "quarantine did not publish its durable reservation"
