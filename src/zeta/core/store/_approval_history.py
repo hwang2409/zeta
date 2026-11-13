@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ...protocol.types import ToolCall
@@ -19,6 +19,7 @@ _COMPLETED_APPROVAL_EXECUTION = object()
 class _PendingApprovalExecution:
     definition: tuple[str, str | None]
     owner: object | None = None
+    completed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +240,9 @@ class ApprovalHistoryStoreMixin:
                 return "duplicate"
             record.owner = owner
             return "claimed"
+        if record.owner is _PREPARED_APPROVAL_EXECUTION:
+            record.owner = owner
+            return "claimed"
         if record.owner is not None:
             return "duplicate"
         record.owner = owner
@@ -256,6 +260,11 @@ class ApprovalHistoryStoreMixin:
         record.owner = _PREPARED_APPROVAL_EXECUTION
         return True
 
+    async def wait_pending_approval_execution(self, request_id: str) -> None:
+        record = self._pending_approval_executions.get(request_id)
+        if record is not None:
+            await record.completed.wait()
+
     def release_pending_approval_execution(self, request_id: str) -> None:
         record = self._pending_approval_executions.get(request_id)
         if record is not None and (
@@ -268,6 +277,7 @@ class ApprovalHistoryStoreMixin:
             and record.owner.done()
         ):
             record.owner = _COMPLETED_APPROVAL_EXECUTION
+            record.completed.set()
 
     def retire_terminal_approval_executions(self) -> None:
         self._pending_approval_executions = {
