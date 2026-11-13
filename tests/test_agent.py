@@ -17519,10 +17519,29 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
     )
     idle_entries: asyncio.Queue[None] = asyncio.Queue()
     forced_extra_idle = asyncio.Event()
-    answer_idle_entered = asyncio.Event()
+    answer_notice_started = asyncio.Event()
+    release_answer_notice = asyncio.Event()
+    answer_notice_published = asyncio.Event()
     force_extra_idle = False
     answer_consumed = False
     prompts: list[str] = []
+
+    channel = loop._background_owner.conversation_channel
+    original_publish_idle = channel.publish_idle
+
+    async def gated_publish_idle(**kwargs):
+        if kwargs.get("text") == "after Re q-reset: approved":
+            answer_notice_started.set()
+            await await_or_fail(
+                release_answer_notice.wait(),
+                what="release answered child idle notice",
+            )
+            result = await original_publish_idle(**kwargs)
+            answer_notice_published.set()
+            return result
+        return await original_publish_idle(**kwargs)
+
+    monkeypatch.setattr(channel, "publish_idle", gated_publish_idle)
 
     async def consume(_loop, prompt, **kwargs):
         nonlocal answer_consumed
@@ -17554,18 +17573,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         idle_entries.put_nowait(None)
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
-        if answer_consumed:
-            notices = [
-                entry
-                for entry in parent.agent_notifications(pending_only=False)
-                if entry.data.get("kind") == "child_idle"
-            ]
-            if any(
-                entry.data.get("text") == "after Re q-reset: approved"
-                for entry in notices
-            ):
-                answer_idle_entered.set()
-        await asyncio.wait_for(wake(), 10)
+        await await_or_fail(wake(), what="idle notice wake")
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -17587,7 +17595,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         "root:1", run.cancel, run, parent_store=parent, active_store=child
     )
     try:
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await await_or_fail(idle_entries.get(), what="first idle entry")
         assert (
             await send_to_run(
                 parent,
@@ -17598,7 +17606,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await await_or_fail(idle_entries.get(), what="question idle entry")
         assert (
             len(
                 [
@@ -17615,7 +17623,9 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if extra_idle_wake:
             force_extra_idle = True
             loop._background_owner.conversation_channel.wake("root:1")
-            await asyncio.wait_for(forced_extra_idle.wait(), 10)
+            await await_or_fail(
+                forced_extra_idle.wait(), what="forced extra idle entry"
+            )
         assert (
             await send_to_run(
                 parent,
@@ -17626,7 +17636,13 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(answer_idle_entered.wait(), 10)
+        await await_or_fail(
+            answer_notice_started.wait(), what="answered idle notice start"
+        )
+        release_answer_notice.set()
+        await await_or_fail(
+            answer_notice_published.wait(), what="answered idle notice publication"
+        )
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)
@@ -17636,6 +17652,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         assert notices[0].id != notices[1].id
         assert notices[1].data["text"] == "after Re q-reset: approved"
     finally:
+        release_answer_notice.set()
         loop._background_owner.unregister("root:1")
         await _cancel_idle_fixture(run, registry, parent, child)
 
