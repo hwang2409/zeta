@@ -936,6 +936,14 @@ that gets no answer within its own timeout can treat the server as hung.
 
 All examples below use the common event envelope:
 
+The `zeta_updated` event requires the negotiated `zeta_updated` feature and
+contains `data.old_revision` and `data.new_revision`. When a session is open,
+it also carries `session_id`; otherwise that field is absent. `old_revision` is the
+revision the process is running, fixed when it starts. `new_revision` is the
+latest revision found on disk. These values are opaque strings: they are a git
+SHA when the source is in a git checkout, or a source hash when it is not.
+Clients must not parse either value.
+
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
@@ -1327,6 +1335,7 @@ Event fields are:
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
+| `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1891,6 +1900,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 | `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
+| `zeta_updated` | emits one `zeta_updated` event when the running source revision changes; revision values are opaque strings and clients must not parse them |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 

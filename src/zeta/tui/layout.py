@@ -27,6 +27,10 @@ from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import Char, Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.cells import cell_len
+
+import zeta
+
+from ..runtime.update_notice import process_update_monitor
 from ..core.session import _preview_text
 from ..core.slash import context_window
 from . import theme
@@ -496,6 +500,11 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         text = f"remote · {state.host} · {state.session_id[:8]}"
         if state.disconnected:
             text += " · disconnected"
+        return [("class:status-bar", text.ljust(width)[:width])]
+    if process_update_monitor(zeta.__file__ or "").current is not None:
+        text = "zeta updated · /restart"
+        if app.restart_pending:
+            text = "restart pending · " + text
         return [("class:status-bar", text.ljust(width)[:width])]
     usage = dict(app._usage)
     usage.setdefault(
