@@ -817,6 +817,10 @@ class AgentNavigation:
         self._refresh_signature: tuple[object, ...] | None = None
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
+        self._signature_task: asyncio.Task[tuple[object, ...]] | None = None
+        self._signature_generation = 0
+        self._signature_dirty = False
+        self._signature_force = False
         self._invalidate: Callable[[], None] | None = None
         self.refresh(force=True)
 
@@ -991,8 +995,25 @@ class AgentNavigation:
         self._refresh_handle = None
         if self._invalidate is None:
             return
-        if self.refresh():
-            self._invalidate()
+        if self._signature_task is not None:
+            self._signature_dirty = True
+            return
+        self._signature_generation += 1
+        generation = self._signature_generation
+        self._signature_force = False
+        running = tuple(
+            entry.path for entry in self.entries
+            if entry.state not in _TERMINAL_AGENT_STATES
+            and (entry.path != self.root_path or self.child_view_active)
+        )
+        task = asyncio.create_task(asyncio.to_thread(
+            agent_tree_signature, self.current_path, self.selected_index,
+            running, self._path_signature
+        ))
+        self._signature_task = task
+        task.add_done_callback(
+            lambda completed: self._debounced_signature_done(generation, completed)
+        )
         delay = (
             _AGENT_REFRESH_INTERVAL_SECONDS
             if any(
@@ -1003,9 +1024,32 @@ class AgentNavigation:
         )
         self._schedule_refresh(delay)
 
-    def refresh(self, *, force: bool = False) -> bool:
+    def _debounced_signature_done(
+        self, generation: int, task: asyncio.Task[tuple[object, ...]]
+    ) -> None:
+        if self._signature_task is task:
+            self._signature_task = None
+        if task.cancelled():
+            return
+        if generation != self._signature_generation or self._signature_dirty:
+            if self._signature_dirty:
+                self._signature_dirty = False
+                self._refresh_after_debounce()
+            return
+        try:
+            signature = task.result()
+        except (OSError, ValueError):
+            return
+        if self.refresh(_signature=signature) and self._invalidate is not None:
+            self._invalidate()
+
+    def refresh(
+        self, *, force: bool = False, _signature: tuple[object, ...] | None = None
+    ) -> bool:
         """Refresh at most once per second unless fresh state is required."""
 
+        if _signature is None:
+            self._signature_generation += 1
         now = _monotonic()
         elapsed = now - self._last_refresh_at
         if not force and elapsed < _AGENT_REFRESH_INTERVAL_SECONDS:
@@ -1023,7 +1067,7 @@ class AgentNavigation:
             if self.child_view_active
             else False
         )
-        signature = self._agent_tree_signature()
+        signature = _signature or self._agent_tree_signature()
         if not force and signature == self._refresh_signature:
             return transcript_changed or todo_changed
         was_list_focused = bool(self.entries) and self.list_focused()

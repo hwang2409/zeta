@@ -113,6 +113,7 @@ from zeta.skills import SkillCatalog
 from zeta.storage_format import WriterLease, open_writer
 from zeta.tools import ToolRegistry, ToolStreamPublisher
 from zeta.tools._shared.process import BackgroundTaskInfo
+from zeta.tui import agent_card as agent_card_module
 from zeta.tui import loop_errors as loop_errors_module
 from zeta.tui.agent_card import (
     MAX_CARD_COLUMNS,
@@ -5287,6 +5288,53 @@ def test_tasks_panel_wraps_long_commands_at_a_separator() -> None:
     assert path in content
     assert "verylongfilenamewithoutbreaks" in content
     assert all(cell_len(line) <= 72 for line in rendered)
+
+
+@pytest.mark.asyncio
+async def test_agent_signature_drops_stale_result_and_coalesces_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    navigation = AgentNavigation(store)
+    started = threading.Event()
+    second_started = threading.Event()
+    release = threading.Event()
+    main_thread = threading.current_thread()
+    invalidations: list[None] = []
+    calls: list[tuple[Path, int, tuple[Path, ...]]] = []
+
+    def signature(
+        path: Path,
+        selected_index: int,
+        running: tuple[Path, ...],
+        _path_signature: Callable[..., object],
+    ) -> tuple[object, ...]:
+        assert threading.current_thread() is not main_thread, "signature must run off the event loop"
+        calls.append((path, selected_index, running))
+        (started if len(calls) == 1 else second_started).set()
+        assert release.wait(timeout=10)
+        return path, selected_index, (len(calls), None), ()
+
+    monkeypatch.setattr(agent_card_module, "agent_tree_signature", signature)
+    navigation._invalidate = lambda: invalidations.append(None)
+    try:
+        navigation._refresh_after_debounce()
+        await asyncio.wait_for(asyncio.to_thread(started.wait), 10)
+        navigation._refresh_after_debounce()
+        release.set()
+        await asyncio.wait_for(asyncio.to_thread(second_started.wait), 10)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(calls) == 2
+        assert navigation._refresh_signature == (
+            store.session_dir,
+            navigation.selected_index,
+            (2, None),
+            (),
+        )
+        assert len(invalidations) == 1
+    finally:
+        await navigation.close()
 
 
 def test_idle_agent_card_reports_count_fd_floor_and_warning(tmp_path: Path) -> None:
