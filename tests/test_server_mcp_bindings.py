@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,13 @@ class LocalMCP:
         self.reject_missing_auth = reject_missing_auth
         self.request_received = asyncio.Event()
         self.auth_received = asyncio.Event()
+        self.notification_opened = asyncio.Event()
+        self.notification_closed = asyncio.Event()
+        self.send_tool_change = asyncio.Event()
+        self.tool_change_sent = asyncio.Event()
+        self.drop_notification = asyncio.Event()
+        self.detached = False
+        self.request_after_detach = asyncio.Event()
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> int:
@@ -44,17 +52,16 @@ class LocalMCP:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             raw = await reader.readuntil(b"\r\n\r\n")
+            lines = raw.decode().split("\r\n")
+            http_method = lines[0].split()[0]
             headers = dict(
-                line.split(": ", 1)
-                for line in raw.decode().split("\r\n")[1:]
-                if ": " in line
+                line.split(": ", 1) for line in lines[1:] if ": " in line
             )
-            length = int(headers.get("content-length", "0"))
-            body = await reader.readexactly(length)
-            request = json.loads(body)
             authorization = headers.get("authorization")
             self.headers.append(authorization)
             self.request_received.set()
+            if self.detached:
+                self.request_after_detach.set()
             if self.reject_missing_auth and authorization is None:
                 payload = b"credentials rejected: missing bearer"
                 writer.write(
@@ -67,6 +74,54 @@ class LocalMCP:
                 return
             if authorization is not None:
                 self.auth_received.set()
+            if http_method == "GET":
+                self.methods.append("GET")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
+                )
+                await writer.drain()
+                self.notification_opened.set()
+                while True:
+                    client_closed = asyncio.create_task(reader.read())
+                    drop = asyncio.create_task(
+                        asyncio.wait_for(self.drop_notification.wait(), 10)
+                    )
+                    send = asyncio.create_task(
+                        asyncio.wait_for(self.send_tool_change.wait(), 10)
+                    )
+                    try:
+                        done, _ = await asyncio.wait_for(
+                            asyncio.wait(
+                                (client_closed, drop, send),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            ),
+                            10,
+                        )
+                        if send in done:
+                            self.send_tool_change.clear()
+                            payload = json.dumps({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/tools/list_changed",
+                            }).encode()
+                            writer.write(b"data: " + payload + b"\n\n")
+                            await writer.drain()
+                            self.tool_change_sent.set()
+                            continue
+                        self.notification_closed.set()
+                        return
+                    finally:
+                        client_closed.cancel()
+                        drop.cancel()
+                        send.cancel()
+                        await asyncio.wait_for(
+                            asyncio.gather(
+                                client_closed, drop, send, return_exceptions=True
+                            ),
+                            10,
+                        )
+            length = int(headers.get("content-length", "0"))
+            body = await reader.readexactly(length)
+            request = json.loads(body)
             method = request["method"]
             self.methods.append(method)
             if self.error_with_header:
@@ -94,7 +149,17 @@ class LocalMCP:
                 result = {}
             response = {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
             payload = json.dumps(response).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+            session_header = (
+                b"mcp-session-id: local-session\r\n" if method == "initialize" else b""
+            )
+            writer.write(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+                + session_header
+                + b"content-length: "
+                + str(len(payload)).encode()
+                + b"\r\n\r\n"
+                + payload
+            )
             await writer.drain()
         finally:
             writer.close()
@@ -106,41 +171,59 @@ class LocalMCP:
         await self.server.wait_closed()
 
 
+class LocalResponseStream(httpx.AsyncByteStream):
+    def __init__(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        self.reader = reader
+        self.writer = writer
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while chunk := await self.reader.read(65536):
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
+
 class LocalTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        mcp_reader, mcp_writer = await asyncio.open_connection(
-            request.url.host, request.url.port
+        reader, writer = await asyncio.open_connection(request.url.host, request.url.port)
+        body = request.content
+        wire_headers = "".join(
+            f"{name}: {value}\r\n" for name, value in request.headers.items()
         )
-        try:
-            body = request.content
-            wire_headers = "".join(
-                f"{name}: {value}\r\n" for name, value in request.headers.items()
-            )
-            mcp_writer.write(
-                (
-                    f"POST {request.url.raw_path.decode()} HTTP/1.1\r\n"
-                    f"{wire_headers}content-length: {len(body)}\r\n\r\n"
-                ).encode()
-                + body
-            )
-            await mcp_writer.drain()
-            head = await mcp_reader.readuntil(b"\r\n\r\n")
-            lines = head.split(b"\r\n")
-            status = int(lines[0].split()[1])
-            response_headers = dict(
+        writer.write(
+            (
+                f"{request.method} {request.url.raw_path.decode()} HTTP/1.1\r\n"
+                f"{wire_headers}content-length: {len(body)}\r\n\r\n"
+            ).encode()
+            + body
+        )
+        await writer.drain()
+        head = await reader.readuntil(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        status = int(lines[0].split()[1])
+        response_headers = {
+            key.decode(): value.decode()
+            for key, value in (
                 line.split(b": ", 1) for line in lines[1:] if b": " in line
             )
-            length = int(response_headers.get(b"content-length", b"0"))
-            payload = await mcp_reader.readexactly(length)
+        }
+        if "content-length" in response_headers:
+            payload = await reader.readexactly(int(response_headers["content-length"]))
+            writer.close()
+            await writer.wait_closed()
             return httpx.Response(
-                status,
-                headers={key.decode(): value.decode() for key, value in response_headers.items()},
-                content=payload,
-                request=request,
+                status, headers=response_headers, content=payload, request=request
             )
-        finally:
-            mcp_writer.close()
-            await mcp_writer.wait_closed()
+        return httpx.Response(
+            status,
+            headers=response_headers,
+            stream=LocalResponseStream(reader, writer),
+            request=request,
+        )
 
 
 def allow_local_http(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -335,6 +418,153 @@ async def test_session_mcp_binding_reconnect_keeps_authenticated_tools(
     finally:
         writer.close()
         await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_disconnect_closes_authenticated_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP(reject_missing_auth=True)
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    model_called = asyncio.Event()
+
+    def record_call(messages: object, tools: object) -> bytes:
+        model_called.set()
+        return json.dumps([]).encode()
+
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("mounted")])],
+        request_serializer=record_call,
+    )
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    binding = {"server": "page", "headers": {"Authorization": "Bearer old"}}
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "mcp_bindings": [binding]
+        })
+        await _request(reader, writer, 3, "send", {"text": "mount"})
+        await asyncio.wait_for(model_called.wait(), TIMEOUT)
+        loop = server.runtime.loop
+        assert loop is not None
+        await asyncio.wait_for(mcp.notification_opened.wait(), TIMEOUT)
+        mcp.send_tool_change.set()
+        await asyncio.wait_for(mcp.tool_change_sent.wait(), TIMEOUT)
+        assert not mcp.notification_closed.is_set()
+
+        mcp.detached = True
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        mount = loop._mcp_mount
+        assert mount is not None
+        assert mount.client_for("page") is None, "credential-bearing MCP client remained mounted"
+        try:
+            await asyncio.wait_for(mcp.notification_closed.wait(), 0.5)
+            stream_closed = True
+        except TimeoutError:
+            stream_closed = False
+        assert stream_closed, "credential-bearing notification stream remained open"
+
+        request_count = len(mcp.headers)
+        mcp.send_tool_change.set()
+        mcp.drop_notification.set()
+        try:
+            await asyncio.wait_for(mcp.request_after_detach.wait(), 1.5)
+        except TimeoutError:
+            pass
+        assert not mcp.request_after_detach.is_set()
+        assert len(mcp.headers) == request_count
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_session_mcp_binding_reconnect_uses_only_new_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP(reject_missing_auth=True)
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    first_call = asyncio.Event()
+    second_call = asyncio.Event()
+    call_count = 0
+
+    def record_call(messages: object, tools: object) -> bytes:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_call.set()
+        elif call_count == 2:
+            second_call.set()
+        return json.dumps([]).encode()
+
+    backend = FakeBackend([
+        ScriptedTurn(content=[TextContent("first")]),
+        ScriptedTurn(content=[TextContent("second")]),
+    ], request_serializer=record_call)
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    old_binding = {"server": "page", "headers": {"Authorization": "Bearer old"}}
+    new_binding = {"server": "page", "headers": {"Authorization": "Bearer new"}}
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        session = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "mcp_bindings": [old_binding]
+        }))[-1]["result"]["session"]
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await asyncio.wait_for(first_call.wait(), TIMEOUT)
+        await asyncio.wait_for(mcp.notification_opened.wait(), TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        await asyncio.wait_for(mcp.notification_closed.wait(), TIMEOUT)
+        request_boundary = len(mcp.headers)
+
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        await _request(reader, writer, 4, "hello", {
+            "protocol_version": "1.2", "features": ["session_mcp_bindings"]
+        })
+        resumed = (await _request(reader, writer, 5, "resume", {
+            "session_id": session["session_id"], "mcp_bindings": [new_binding]
+        }))[-1]
+        assert "result" in resumed
+        sent = (await _request(reader, writer, 6, "send", {"text": "second"}))[-1]
+        assert "result" in sent, sent
+        await asyncio.wait_for(second_call.wait(), TIMEOUT)
+
+        assert mcp.headers[request_boundary:]
+        assert all(header == "Bearer new" for header in mcp.headers[request_boundary:])
+        assert len(backend.calls) == 2, backend.calls
+        assert "page__echo" in {tool["name"] for tool in backend.calls[1][1]}
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
         await server.close()
         await mcp.close()
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..client import MCPClient
+from ..config import MCPServerConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,13 @@ class ChildFinished:
 class CancelOperation:
     identifier: int
     acknowledged: asyncio.Future[None]
+
+
+@dataclass(frozen=True, slots=True)
+class Suspend:
+    config: MCPServerConfig
+    source: Path
+    result: asyncio.Future[None]
 
 
 @dataclass(frozen=True, slots=True)
