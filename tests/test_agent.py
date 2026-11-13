@@ -17756,6 +17756,27 @@ async def test_non_explicit_finish_child_gets_no_reminder(
     store, registry, loop = _reminder_loop(tmp_path)
     loop.explicit_finish = False
     prompts: list[str] = []
+    terminal_write_started = asyncio.Event()
+    terminal_write_completed = asyncio.Event()
+    release_terminal_write = asyncio.Event()
+    original_admit = ConversationStore.admit_step_delivery_terminal
+
+    async def gated_admit(
+        target: ConversationStore,
+        intent: str,
+        *,
+        _store: ConversationStore = store,
+    ):
+        if target is _store:
+            terminal_write_started.set()
+            await await_or_fail(
+                release_terminal_write.wait(),
+                what="release non-explicit child terminal store write",
+            )
+            result = await original_admit(target, intent)
+            terminal_write_completed.set()
+            return result
+        return await original_admit(target, intent)
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(store, kwargs)
@@ -17767,13 +17788,34 @@ async def test_non_explicit_finish_child_gets_no_reminder(
         }
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
-    await asyncio.wait_for(
-        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+    monkeypatch.setattr(ConversationStore, "admit_step_delivery_terminal", gated_admit)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(loop, "work", child_store=store)
     )
-    assert prompts == ["work"]
-    assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
-    await registry.close()
-    store.close()
+    try:
+        await await_or_fail(
+            terminal_write_started.wait(),
+            what="non-explicit child terminal store write",
+        )
+        release_terminal_write.set()
+        await await_or_fail(run, what="non-explicit child completion")
+        await await_or_fail(
+            terminal_write_completed.wait(),
+            what="non-explicit child terminal store write completion",
+        )
+        assert terminal_write_completed.is_set()
+        assert prompts == ["work"]
+        assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
+    finally:
+        release_terminal_write.set()
+        if not run.done():
+            run.cancel()
+        await await_or_fail(
+            asyncio.gather(run, return_exceptions=True),
+            what="non-explicit child cleanup",
+        )
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio
