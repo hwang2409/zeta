@@ -1,4 +1,3 @@
-
 """Real-socket tests for the native frontend server."""
 
 from __future__ import annotations
