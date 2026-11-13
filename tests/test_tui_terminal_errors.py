@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pty
 import selectors
@@ -218,7 +219,24 @@ with stderr_capture.stderr_to_log():
     os.close(release_read)
     try:
         assert os.read(ready_read, 5) == b"ready"
-        assert not list((home / "logs" / "tui-stderr").glob("*.log"))
+        visible = list((home / "logs" / "tui-stderr").glob("*.log"))
+        if visible:
+            os.utime(visible[0], (1, 1))
+            (home / "logs" / "tui-stderr" / "retention.log").write_bytes(
+                b"x" * (50 * 1024 * 1024 + 1)
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; from zeta.tui.stderr_capture import _retain_logs; _retain_logs(Path(sys.argv[1]))",
+                    str(home / "logs" / "tui-stderr"),
+                ],
+                env=_capture_env(home),
+                check=True,
+            )
+        else:
+            assert not visible
         os.write(release_write, b"x")
         assert process.wait(timeout=10) == 0
     finally:
@@ -228,8 +246,54 @@ with stderr_capture.stderr_to_log():
         os.close(ready_read)
         os.close(release_write)
     logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert any("ZLOCKED\n" in log.read_text() for log in logs)
     assert len(logs) == 1
     assert logs[0].read_text() == "ZLOCKED\n"
+
+
+def test_log_name_collision_keeps_both_files(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    code = """
+import os
+from pathlib import Path
+import zeta.tui.stderr_capture as sc
+log_dir = Path(os.environ["ZETA_HOME"]) / "logs" / "tui-stderr"
+log_dir.mkdir(parents=True)
+(log_dir / "collision.log").write_bytes(b"old\\n")
+sc._log_path = lambda directory: directory / "collision.log"
+with sc.stderr_to_log():
+    os.write(2, b"new\\n")
+"""
+    terminal, returncode = _run_pty_python(code, _capture_env(home))
+    assert returncode == 0
+    assert b"new" not in terminal
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 2
+    assert sorted(log.read_text() for log in logs) == ["new\n", "old\n"]
+
+
+def test_stale_temporary_logs_are_pruned_but_live_ones_are_kept(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    directory = home / "logs" / "tui-stderr"
+    directory.mkdir(parents=True)
+    stale = directory / ".stale.tmp"
+    stale.write_bytes(b"stale")
+    os.utime(stale, (1, 1))
+    live = directory / ".live.tmp"
+    live_fd = os.open(live, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(live_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        code = "from pathlib import Path; from zeta.tui.stderr_capture import _retain_logs; _retain_logs(Path(__import__('os').environ['LOG_DIR']))"
+        subprocess.run(
+            [sys.executable, "-c", code],
+            env=_capture_env(home) | {"LOG_DIR": str(directory)},
+            check=True,
+        )
+        assert not stale.exists()
+        assert live.exists()
+    finally:
+        fcntl.flock(live_fd, fcntl.LOCK_UN)
+        os.close(live_fd)
 
 
 def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from ..core.session import env_home
 
 _TUI_STDERR_MAX_BYTES = 50 * 1024 * 1024
+_TUI_STDERR_TEMP_MAX_AGE_NS = 60 * 60 * 1_000_000_000
 _SETUP = False
 _LOCK_FD: int | None = None
 _TERMINAL_FD: int | None = None
@@ -34,6 +35,20 @@ def _log_path(directory: Path) -> Path:
 
 
 def _retain_logs(directory: Path) -> None:
+    now_ns = time.time_ns()
+    for temp in directory.glob(".*.tmp"):
+        try:
+            fd = os.open(temp, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                stale = now_ns - os.fstat(fd).st_mtime_ns > _TUI_STDERR_TEMP_MAX_AGE_NS
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+            if stale:
+                temp.unlink()
+        except OSError:
+            continue
     try:
         files = sorted(directory.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
     except OSError:
@@ -74,7 +89,18 @@ def _open_capture(path: Path) -> int:
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.rename(temp_path, path)
+        published = path
+        for suffix in range(100):
+            if suffix:
+                published = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+            try:
+                os.link(temp_path, published)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(path)
+        os.unlink(temp_path)
         _retain_logs(path.parent)
     except BaseException:
         try:
