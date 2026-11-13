@@ -5,6 +5,7 @@ import asyncio
 import gc
 import json
 import logging
+import shlex
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from zeta.mcp.client import MCPHTTPError
 from zeta.protocol.types import TextContent, ToolCall
 from zeta.runtime.loop.mcp_session import MCPSession
 from zeta.server import ZetaServer
+from zeta.server.protocol import EventDescriptor
 
 SECRET = "page-secret-never-persisted"
 _REAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
@@ -856,6 +858,173 @@ async def test_bound_http_list_changed_disconnect_does_not_drop_refresh_coroutin
         if not writer.is_closing():
             writer.close()
             await writer.wait_closed()
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_socket_approved_bash_after_turn_end_runs_once(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "bash-runs"
+    backend = FakeBackend([
+        ScriptedTurn(content=[TextContent("ready")]),
+        ScriptedTurn(tool_calls=[ToolCall(
+            "bash-call",
+            "bash",
+            {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"},
+        )]),
+        ScriptedTurn(content=[TextContent("done")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    first_agent_end = asyncio.Event()
+    release_first_agent_end = asyncio.Event()
+    notify = server.control._notify
+
+    async def hold_first_agent_end(
+        event: EventDescriptor, session_id: str | None = None, **fields: object
+    ) -> bool:
+        if event is EventDescriptor.AGENT_END and not first_agent_end.is_set():
+            first_agent_end.set()
+            await asyncio.wait_for(release_first_agent_end.wait(), TIMEOUT)
+        return await notify(event, session_id, **fields)
+
+    server.control._notify = hold_first_agent_end
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["new_session_settings"]
+        })
+        created = await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol", "approval_mode": "ask"
+        })
+        assert "error" not in created[-1]
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await _event(reader, "turn_end")
+        await asyncio.wait_for(first_agent_end.wait(), TIMEOUT)
+        await _request(reader, writer, 4, "send", {"text": "run bash"})
+        approval = await _event(reader, "approval_request")
+        assert not server.control.turn_busy()
+        allowed = await _request(reader, writer, 5, "approve", {
+            "request_id": approval["request_id"]
+        })
+        assert "error" not in allowed[-1]
+        release_first_agent_end.set()
+        await _event(reader, "tool_end")
+        await _event(reader, "agent_end")
+
+        assert marker.read_text().splitlines() == ["run"]
+    finally:
+        release_first_agent_end.set()
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "bash-runs"
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = FakeBackend([
+        ScriptedTurn(content=[TextContent("mounted")]),
+        ScriptedTurn(tool_calls=[ToolCall(
+            "bash-call",
+            "bash",
+            {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"},
+        )]),
+        ScriptedTurn(content=[TextContent("bash done")]),
+        ScriptedTurn(tool_calls=[ToolCall("page-call", "page__echo", {})]),
+        ScriptedTurn(content=[TextContent("mcp done")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    features = ["approval_reconnect", "new_session_settings", "session_mcp_bindings"]
+    binding = {"server": "page", "headers": {"Authorization": "Bearer secret"}}
+    reader, writer = await _connect(server)
+    writer2 = None
+    writer3 = None
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        created = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "approval_mode": "ask",
+            "mcp_bindings": [binding],
+        }))[-1]["result"]
+        session_id = created["session"]["session_id"]
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await _event(reader, "agent_end")
+
+        await _request(reader, writer, 4, "send", {"text": "run bash"})
+        bash_approval = await _event(reader, "approval_request")
+        writer.close()
+        await writer.wait_closed()
+        await _wait_for_controller_release(server)
+        reader2, writer2 = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
+        )
+        await _request(reader2, writer2, 5, "hello", {
+            "protocol_version": "1.2",
+            "features": features,
+            "session_id": session_id,
+            "mcp_bindings": [binding],
+        })
+        allowed = await _request(reader2, writer2, 6, "approve", {
+            "request_id": bash_approval["request_id"]
+        })
+        assert "error" not in allowed[-1]
+        await _event(reader2, "agent_end")
+        assert marker.read_text().splitlines() == ["run"]
+
+        await _request(reader2, writer2, 7, "send", {"text": "use page"})
+        mcp_approval = await _event(reader2, "approval_request")
+        writer2.close()
+        await writer2.wait_closed()
+        await _wait_for_controller_release(server)
+        reader3, writer3 = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", server.port), TIMEOUT
+        )
+        await _request(reader3, writer3, 8, "hello", {
+            "protocol_version": "1.2",
+            "features": features,
+            "session_id": session_id,
+            "mcp_bindings": [binding],
+        })
+        allowed = await _request(reader3, writer3, 9, "approve", {
+            "request_id": mcp_approval["request_id"]
+        })
+        assert "error" not in allowed[-1]
+        await _event(reader3, "agent_end")
+
+        assert marker.read_text().splitlines() == ["run"]
+        assert mcp.methods.count("tools/call") == 1
+    finally:
+        for connection in (writer3, writer2, writer):
+            if connection is not None and not connection.is_closing():
+                connection.close()
+                await connection.wait_closed()
         await server.close()
         await mcp.close()
 
