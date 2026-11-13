@@ -701,6 +701,13 @@ class TUIApp(
         self._history_search_results = ()
         self._history_search_index = 0
         FinderRuntimeMixin._finder_input(self, query)
+        if (
+            self._active_finder is self._history_finder
+            and not self._agent_navigation.child_view_active
+        ):
+            self._prompt_history.start_finder_scan(
+                query, self._publish_prompt_history_snapshot
+            )
         history_pager = getattr(self, "_history_pager", None)
         if history_pager is None:
             return
@@ -787,16 +794,6 @@ class TUIApp(
         tasks = tuple(self._history_marker_tasks)
         if tasks:
             await asyncio.gather(*tasks)
-
-    def _finder_input(self, query: str) -> None:
-        FinderRuntimeMixin._finder_input(self, query)
-        if (
-            self._active_finder is self._history_finder
-            and not self._agent_navigation.child_view_active
-        ):
-            self._prompt_history.start_finder_scan(
-                query, self._publish_prompt_history_snapshot
-            )
 
     def _publish_prompt_history_snapshot(
         self, snapshot: tuple[str, ...], buffer: Any | None = None
