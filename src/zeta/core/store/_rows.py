@@ -6,12 +6,7 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
-from ...protocol.types import (
-    Message,
-    MessageRole,
-    TextContent,
-    is_passive_harness_message,
-)
+from ...protocol.types import Message, is_passive_harness_message
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
@@ -111,12 +106,12 @@ class StartupFactsMixin:
 
 
 def _message_facts(entry: ConversationEntry) -> MessageFacts:
-    message = Message.from_dict(entry.data["message"])
-    is_user = message.role is MessageRole.USER
+    message = entry.data["message"]
+    is_user = message["role"] == "user"
     text = " ".join(
-        block.text.strip()
-        for block in message.content
-        if isinstance(block, TextContent) and block.text.strip()
+        block["text"].strip()
+        for block in message["content"]
+        if block["type"] == "text" and block["text"].strip()
     )
     return MessageFacts(
         context_calibration_record(entry),
