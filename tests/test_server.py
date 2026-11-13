@@ -2543,19 +2543,58 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         child_watcher = owner._watchers[child_id]
         assert owner.cancel(child_id)
         frames = await _request(reader, writer, 4, "status")
-        async with asyncio.timeout(TIMEOUT):
+
+        def wait_diagnostics() -> str:
+            frame_summary = [
+                (
+                    frame.get("method", "-"),
+                    frame.get("id", "-"),
+                    frame.get("params", {}).get("event", "-"),
+                )
+                for frame in frames
+            ]
+            pending = [
+                (item.get("request_id"), item.get("agent_instance_id"))
+                for item in server.control.pending_approvals_now()
+            ]
+            run_states = {}
+            for instance_id in (child_id, grandchild_id):
+                watcher = owner._watchers.get(instance_id)
+                run_states[instance_id] = (
+                    "absent"
+                    if watcher is None
+                    else "cancelled"
+                    if watcher.cancelled()
+                    else "done"
+                    if watcher.done()
+                    else "pending"
+                )
+            return (
+                f"frames={frame_summary!r}; pending_approvals={pending!r}; "
+                f"runs={run_states!r}"
+            )
+
+        async def wait_for_approval_end() -> None:
             while not any(
                 event["request_id"] == approval["request_id"]
                 for event in _named_events(frames, "approval_end")
             ):
                 frames.append(await _read(reader))
+
+        await await_or_fail(
+            wait_for_approval_end(),
+            timeout=TIMEOUT,
+            what=lambda: f"approval_end for grandchild ({wait_diagnostics()})",
+        )
         await _request(reader, writer, 5, "status")
         assert len(backend.grandchild.calls) == 1
     finally:
         if child_watcher is not None and not child_watcher.done():
             child_watcher.cancel()
-            await asyncio.wait_for(
-                asyncio.gather(child_watcher, return_exceptions=True), TIMEOUT
+            await await_or_fail(
+                asyncio.gather(child_watcher, return_exceptions=True),
+                timeout=TIMEOUT,
+                what="child watcher cleanup",
             )
         await close_serve(server, writer)
 
