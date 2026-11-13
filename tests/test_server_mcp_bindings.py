@@ -866,9 +866,10 @@ async def test_bound_http_list_changed_disconnect_does_not_drop_refresh_coroutin
         await mcp.close()
 
 
+@pytest.mark.parametrize("approved_tool", ["bash", "mcp"])
 @pytest.mark.asyncio
-async def test_socket_approved_bash_after_turn_end_runs_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_socket_approved_tool_after_turn_end_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved_tool: str
 ) -> None:
     allow_local_http(monkeypatch)
     mcp = LocalMCP()
@@ -882,9 +883,13 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
     backend = FakeBackend([
         ScriptedTurn(content=[TextContent("ready")]),
         ScriptedTurn(tool_calls=[ToolCall(
-            "bash-call",
-            "bash",
-            {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"},
+            "approval-call",
+            "bash" if approved_tool == "bash" else "page__echo",
+            (
+                {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"}
+                if approved_tool == "bash"
+                else {}
+            ),
         )]),
         ScriptedTurn(content=[TextContent("done")]),
         ScriptedTurn(tool_calls=[ToolCall("mcp-call", "page__echo", {})]),
@@ -966,7 +971,7 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
             self: object, tool_call: ToolCall, *args: object, **kwargs: object
         ) -> object:
             result = await approval_gate_run(self, tool_call, *args, **kwargs)
-            if self is approval_gate and tool_call.id == "bash-call":
+            if self is approval_gate and tool_call.id == "approval-call":
                 await asyncio.wait_for(reservation_ready.wait(), TIMEOUT)
                 await asyncio.wait_for(recovery_waiting.wait(), TIMEOUT)
             return result
@@ -1001,17 +1006,20 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         release_first_agent_end.set()
         await asyncio.wait_for(asyncio.gather(live_turn, recovery_turn), TIMEOUT)
 
-        runs = marker.read_text().splitlines() if marker.exists() else []
-        assert runs == ["run"]
+        if approved_tool == "bash":
+            runs = marker.read_text().splitlines() if marker.exists() else []
+            assert runs == ["run"]
+        else:
+            assert mcp.methods.count("tools/call") == 1
         assert live_claims == ["claimed"]
-        bash_results = [
+        approval_results = [
             message.tool_result
             for message in backend.calls[-1][0]
             if message.tool_result is not None
-            and message.tool_result.tool_call_id == "bash-call"
+            and message.tool_result.tool_call_id == "approval-call"
         ]
-        assert len(bash_results) == 1
-        assert not bash_results[0].is_error
+        assert len(approval_results) == 1
+        assert not approval_results[0].is_error
 
         await _request(reader, writer, 6, "send", {"text": "run mcp"})
         mcp_approval = await _event(reader, "approval_request")
@@ -1033,8 +1041,8 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         await _event(reader2, "agent_end")
 
         runs = marker.read_text().splitlines() if marker.exists() else []
-        assert runs == ["run"]
-        assert mcp.methods.count("tools/call") == 1
+        assert runs == (["run"] if approved_tool == "bash" else [])
+        assert mcp.methods.count("tools/call") == (1 if approved_tool == "bash" else 2)
         mcp_results = [
             message.tool_result
             for message in backend.calls[-1][0]
