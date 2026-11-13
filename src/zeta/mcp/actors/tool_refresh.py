@@ -85,9 +85,7 @@ class ToolRefreshActor:
         if self._task is not None:
             self._pending = True
             return
-        task = asyncio.create_task(
-            asyncio.wait_for(message.client.list_tools(), owner._setup_timeout)
-        )
+        task = asyncio.create_task(self._list_tools(message.client))
         self._task = task
         owner._children.add(task)
         task.add_done_callback(
@@ -95,6 +93,9 @@ class ToolRefreshActor:
                 ToolsListRefreshed(client, done)
             )
         )
+
+    async def _list_tools(self, client: MCPClient) -> list[MCPTool]:
+        return await asyncio.wait_for(client.list_tools(), self._owner._setup_timeout)
 
     def handle_refreshed(self, message: ToolsListRefreshed) -> None:
         from ..server_actor import MCPServerStatus
