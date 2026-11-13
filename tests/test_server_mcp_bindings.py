@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -18,9 +19,11 @@ from tests.support.fake_backend import (
 )
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
-from zeta.mcp import MCPServerConfig, StreamableHTTPMCPClient
+from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
+from zeta.mcp.call_deadline import MCPCallDeadline
 from zeta.mcp.client import MCPHTTPError
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop.mcp_session import MCPSession
 from zeta.server import ZetaServer
 
 SECRET = "page-secret-never-persisted"
@@ -187,6 +190,100 @@ class LocalMCP:
         await self.server.wait_closed()
 
 
+class ListChangedNotificationStream(httpx.AsyncByteStream):
+    def __init__(self, server: ListChangedMCP) -> None:
+        self.server = server
+
+    async def __aiter__(self):
+        self.server.notification_open.set()
+        await asyncio.wait_for(self.server.notification_ready.wait(), TIMEOUT)
+        yield (
+            b'event: message\ndata: {"jsonrpc":"2.0",'
+            b'"method":"notifications/tools/list_changed"}\n\n'
+        )
+        yield b":" + b"x" * 65_536 + b"\n\n"
+        await asyncio.wait_for(self.server.notification_release.wait(), TIMEOUT)
+
+    async def aclose(self) -> None:
+        self.server.notification_release.set()
+
+
+class RefetchResponseStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes, server: ListChangedMCP) -> None:
+        self.content = content
+        self.server = server
+
+    async def __aiter__(self):
+        yield self.content
+        self.server.tools_refetched.set()
+        await asyncio.wait_for(self.server.refetch_response_release.wait(), TIMEOUT)
+
+
+class ListChangedMCP(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.notification_open = asyncio.Event()
+        self.notification_ready = asyncio.Event()
+        self.notification_release = asyncio.Event()
+        self.tools_refetched = asyncio.Event()
+        self.refetch_response_release = asyncio.Event()
+        self.tools_list_calls = 0
+        self.include_x = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") != f"Bearer {SECRET}":
+            return httpx.Response(401, request=request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=ListChangedNotificationStream(self),
+                request=request,
+            )
+        payload = json.loads(request.content)
+        method = payload["method"]
+        if method == "notifications/initialized":
+            return httpx.Response(202, request=request)
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": "list-changed", "version": "1"},
+            }
+            headers = {"mcp-session-id": "test-session"}
+        elif method == "tools/list":
+            self.tools_list_calls += 1
+            tools = [
+                {
+                    "name": name,
+                    "description": name,
+                    "inputSchema": {"type": "object"},
+                }
+                for name in (["echo", "x"] if self.include_x else ["echo"])
+            ]
+            result = {"tools": tools}
+            headers = {}
+        else:
+            result = {}
+            headers = {}
+        response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": result}
+        if method == "tools/list" and self.include_x:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=RefetchResponseStream(json.dumps(response).encode(), self),
+                request=request,
+            )
+        return httpx.Response(200, headers=headers, json=response, request=request)
+
+    async def add_tool(self) -> None:
+        await asyncio.wait_for(self.notification_open.wait(), TIMEOUT)
+        self.include_x = True
+        self.notification_ready.set()
+
+    async def aclose(self) -> None:
+        self.notification_release.set()
+
+
 class LocalResponseStream(httpx.AsyncByteStream):
     def __init__(
         self,
@@ -278,6 +375,21 @@ def allow_local_http(
     )
 
 
+def allow_streamable_local_http(
+    monkeypatch: pytest.MonkeyPatch, transport: httpx.AsyncBaseTransport
+) -> None:
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_client(
+            *args,
+            transport=transport,
+            **{key: value for key, value in kwargs.items() if key != "transport"},
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     mcp = LocalMCP()
@@ -318,6 +430,163 @@ async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_pat
             writer.close(); await writer.wait_closed(); await server.close()
     finally:
         await mcp.close()
+
+
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
+@pytest.mark.asyncio
+async def test_http_list_changed_refreshes_next_turn_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound: bool,
+) -> None:
+    mcp = ListChangedMCP()
+    allow_streamable_local_http(monkeypatch, mcp)
+    original_ensure = MCPSession._ensure_mcp_servers
+    original_wait = getattr(MCPMount, "wait_for_tool_refreshes", None)
+    turn_started = asyncio.Event()
+    turn_passed_refresh = asyncio.Event()
+    refresh_wait_started = asyncio.Event()
+    ensure_calls = 0
+
+    async def observe_turn_start(session: MCPSession) -> None:
+        nonlocal ensure_calls
+        ensure_calls += 1
+        this_call = ensure_calls
+        if this_call == 2:
+            turn_started.set()
+        await original_ensure(session)
+        if this_call == 2:
+            turn_passed_refresh.set()
+
+    async def observe_refresh_wait(mount: MCPMount) -> None:
+        refresh_wait_started.set()
+        assert original_wait is not None
+        await original_wait(mount)
+
+    # test-contract: seam observes turn and refresh ordering through the real server
+    monkeypatch.setattr(MCPSession, "_ensure_mcp_servers", observe_turn_start)
+    if original_wait is not None:
+        monkeypatch.setattr(MCPMount, "wait_for_tool_refreshes", observe_refresh_wait)
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "page": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        **(
+                            {}
+                            if bound
+                            else {"headers": {"Authorization": f"Bearer {SECRET}"}}
+                        ),
+                    }
+                }
+            }
+        )
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("first")]),
+            ScriptedTurn(content=[TextContent("second")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": ["session_mcp_bindings"],
+            },
+        )
+        new_session: dict[str, Any] = {"provider": "codex"}
+        if bound:
+            new_session["mcp_bindings"] = [
+                {
+                    "server": "page",
+                    "headers": {"Authorization": f"Bearer {SECRET}"},
+                }
+            ]
+        await _request(reader, writer, 2, "new_session", new_session)
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await _event(reader, "agent_end")
+        first_names = {schema["name"] for schema in backend.calls[0][1]}
+        assert "page__echo" in first_names
+
+        await mcp.add_tool()
+        await asyncio.wait_for(mcp.tools_refetched.wait(), TIMEOUT)
+        await _request(reader, writer, 4, "send", {"text": "second"})
+        await asyncio.wait_for(turn_started.wait(), TIMEOUT)
+        wait_started = asyncio.create_task(
+            asyncio.wait_for(refresh_wait_started.wait(), TIMEOUT)
+        )
+        turn_passed = asyncio.create_task(
+            asyncio.wait_for(turn_passed_refresh.wait(), TIMEOUT)
+        )
+        try:
+            done, _ = await asyncio.wait_for(
+                asyncio.wait(
+                    {wait_started, turn_passed},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=TIMEOUT,
+                ),
+                TIMEOUT,
+            )
+            assert wait_started in done, "turn did not wait for the pending tool refresh"
+        finally:
+            for task in (wait_started, turn_passed):
+                task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(wait_started, turn_passed, return_exceptions=True),
+                TIMEOUT,
+            )
+
+        assert len(backend.calls) == 1
+        mcp.refetch_response_release.set()
+        await _event(reader, "agent_end")
+        second_names = {schema["name"] for schema in backend.calls[1][1]}
+        assert "page__x" in second_names
+        assert mcp.tools_list_calls == 2
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        mcp.notification_release.set()
+        await server.close()
+        await mcp.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_refresh_expired_deadline_does_not_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class PendingMount:
+        tool_refresh_pending = True
+        waited = False
+
+        async def wait_for_tool_refreshes(self) -> None:
+            self.waited = True
+
+    mount = PendingMount()
+    session = SimpleNamespace(_mcp_mount=mount)
+    with caplog.at_level(logging.WARNING):
+        await MCPSession._wait_for_pending_mcp_refreshes(
+            session, deadline=MCPCallDeadline(1, lambda: 1)
+        )
+
+    assert not mount.waited
+    assert "MCP tool refresh was late" in caplog.text
 
 
 @pytest.mark.asyncio
