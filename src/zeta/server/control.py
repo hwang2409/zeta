@@ -135,7 +135,7 @@ class ServeControl:
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
-        self._reconnected_approvals: set[str] = set()
+        self._mcp_reconnect_approvals: set[str] = set()
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
         # Serve reads requests serially per connection and has one controller,
@@ -322,11 +322,11 @@ class ServeControl:
         return bound_reconnect_approvals(merged)
 
     def clear_approvals(self) -> None:
-        self._reconnected_approvals.clear()
+        self._mcp_reconnect_approvals.clear()
         self._approvals.clear_approvals()
 
     def session_replaced(self) -> None:
-        self._reconnected_approvals.clear()
+        self._mcp_reconnect_approvals.clear()
         self._approvals.session_replaced()
 
     async def wait_for_approval_settlement(self, timeout: float | None = None) -> None:
@@ -382,9 +382,6 @@ class ServeControl:
         await asyncio.gather(task, return_exceptions=True)
         self._grace_task = None
         if reconnect:
-            self._reconnected_approvals.update(
-                key for key in self._approvals.active_keys() if isinstance(key, str)
-            )
             await self._approvals.transition(Reclaim())
         else:
             await self._approvals.transition(Expire())
@@ -402,6 +399,10 @@ class ServeControl:
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
+        if reconnect and had_mcp_bindings:
+            self._mcp_reconnect_approvals.update(
+                key for key in self._approvals.active_keys() if isinstance(key, str)
+            )
         self._active_mcp_bindings = {}
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
@@ -553,9 +554,11 @@ class ServeControl:
             else None
         )
         turn_task = self._turn_task
-        reconnected = isinstance(core_key, str) and core_key in self._reconnected_approvals
+        reconnected = (
+            isinstance(core_key, str) and core_key in self._mcp_reconnect_approvals
+        )
         if isinstance(core_key, str):
-            self._reconnected_approvals.discard(core_key)
+            self._mcp_reconnect_approvals.discard(core_key)
         if (
             (
                 reconnected
