@@ -911,6 +911,7 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
         event_path = tmp_path / "events"
         script = ssh_module._SESSION_INSTALL_SCRIPT
         pin_anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
+        # test-contract: durability script anchor must fail loudly if implementation changes
         assert pin_anchor in script
         script = script.replace(
             pin_anchor,
@@ -919,6 +920,7 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
             1,
         )
         backup_anchor = "if destination.exists():\n                destination.rename(backup)"
+        # test-contract: durability script anchor must fail loudly if implementation changes
         assert backup_anchor in script
         script = script.replace(
             backup_anchor,
@@ -927,6 +929,7 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
             1,
         )
         install_anchor = "staging.rename(destination)"
+        # test-contract: durability script anchor must fail loudly if implementation changes
         assert install_anchor in script
         script = script.replace(
             install_anchor,
@@ -935,12 +938,14 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
             1,
         )
         fsync_anchor = "finally: os.close(directory_fd)\n        backup ="
+        # test-contract: durability script anchor must fail loudly if implementation changes
         assert fsync_anchor in script
         script = script.replace(
             fsync_anchor,
             f'finally: os.close(directory_fd)\n            with pathlib.Path({str(event_path)!r}).open("a") as stream: stream.write("dir-fsync\\n")\n        backup =',
             1,
         )
+        # test-contract: durability instrumentation proves generated-script ordering
         monkeypatch.setattr(ssh_module, "_SESSION_INSTALL_SCRIPT", script)
         reinstall()
         events = event_path.read_text(encoding="utf-8").splitlines()
@@ -969,14 +974,18 @@ def test_install_replace_fsyncs_pin_and_renames_in_order(
                 events.append("install-rename")
             return result
 
+        # test-contract: durability instrumentation proves local ordering
         monkeypatch.setattr(remote_sync_module, "_fsync_file", record_pin_fsync)
         monkeypatch.setattr(remote_sync_module.os, "fsync", record_fsync)
         monkeypatch.setattr(Path, "rename", record_rename)
         reinstall()
 
+    # test-contract: durability ordering is the public replacement guarantee
     assert events.index("pin-fsync") < events.index("backup-rename")
+    # test-contract: durability ordering is the public replacement guarantee
     assert events.index("backup-rename") < events.index("dir-fsync")
     first_dir = events.index("dir-fsync")
+    # test-contract: durability ordering is the public replacement guarantee
     assert events.index("install-rename") < events.index("dir-fsync", first_dir + 1)
 
 
@@ -996,7 +1005,9 @@ def test_install_replace_fsync_failure_leaves_destination_and_pin(
         destination = remote / "sessions" / session_id
         script = ssh_module._SESSION_INSTALL_SCRIPT
         anchor = 'with copied_pin.open("rb") as stream: os.fsync(stream.fileno())'
+        # test-contract: durability script anchor must fail loudly if implementation changes
         assert anchor in script
+        # test-contract: durability injects the fsync failure through the public route
         monkeypatch.setattr(
             ssh_module,
             "_SESSION_INSTALL_SCRIPT",
@@ -1014,6 +1025,7 @@ def test_install_replace_fsync_failure_leaves_destination_and_pin(
         reinstall = lambda: push_session(
             local, transport, session_id=session_id, force=True
         )
+        # test-contract: durability injects the fsync failure through the public route
         monkeypatch.setattr(
             remote_sync_module,
             "_fsync_file",
@@ -1033,6 +1045,7 @@ def test_install_replace_fsync_failure_leaves_destination_and_pin(
             session_id=session_id,
             force=True,
         )
+        # test-contract: durability injects the fsync failure through the public route
         monkeypatch.setattr(
             remote_sync_module,
             "_fsync_file",
