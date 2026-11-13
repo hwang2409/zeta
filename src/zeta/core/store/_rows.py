@@ -217,7 +217,13 @@ def row_facts(entry: ConversationEntry) -> object | None:
         return _message_facts(entry)
     if entry.type == "compaction":
         data = entry.data
-        return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))
+        replaces = data.get("replaces")
+        return (
+            data.get("source_seq_start"),
+            data.get("source_seq_end"),
+            tuple(replaces) if isinstance(replaces, list) else replaces,
+            data.get("kind"),
+        )
     if entry.type == "notification":
         data = entry.data
         return tuple(data.get(key) for key in ("kind", "task_id", "child_instance_id", "display_only"))
@@ -246,7 +252,9 @@ class _EntryView(Sequence[ConversationEntry]):
 def decode_row_facts(raw: str | bytes) -> object:
     stored = load_session_json(raw.encode() if isinstance(raw, str) else raw)
     if isinstance(stored, list):
-        return tuple(stored)
+        return tuple(
+            tuple(value) if isinstance(value, list) else value for value in stored
+        )
     if not isinstance(stored, dict):
         raise ConversationIntegrityError("warm row facts are malformed")
     kind = stored.get("kind")
@@ -551,7 +559,7 @@ class ResidentRows:
             for ref in markers
             for marker_id in (
                 self._compaction_values(ref)[2]
-                if isinstance(self._compaction_values(ref)[2], list)
+                if isinstance(self._compaction_values(ref)[2], tuple)
                 else ()
             )
         }

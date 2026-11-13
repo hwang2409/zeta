@@ -370,11 +370,18 @@ def _build_append_entries(
 
 
 def _install_appended_entries(
-    store: ConversationStore, entries: list[ConversationEntry]
+    store: ConversationStore,
+    entries: list[ConversationEntry],
+    start_offset: int,
 ) -> None:
     linear = not store._resident_rows.rows or entries[0].parent_id == store._resident_rows.rows[-1].id
+    offset = start_offset
     for entry in entries:
-        store._resident_rows.append(entry)
+        store._resident_rows.append(
+            entry,
+            offset=0 if store._resident_rows.relative_offsets else offset,
+        )
+        offset += store._resident_rows.rows[-1].length
         store._record_entry_prefix(entry)
         store._entry_ids.add(entry.id)
         store._sent_message_receipts.extend(sent_message_receipts(entry))
@@ -414,13 +421,12 @@ def _execute_append[ResultT](
         if expected_generation != generation_before:
             raise ConversationGenerationConflict(expected_generation, generation_before)
         entries = _build_append_entries(store, command.rows, deterministic_ids)
-        store._write_bytes(
-            b"".join(store._encoded_entry_line(entry) for entry in entries)
-        )
+        encoded = b"".join(store._encoded_entry_line(entry) for entry in entries)
+        store._write_bytes(encoded)
         if not store._resident_rows.rows or entries[0].parent_id == store._resident_rows.rows[-1].id:
             store._apply_history_index_entries(tuple(entries))
         # A fork is rebuilt by _install_appended_entries below.
-        _install_appended_entries(store, entries)
+        _install_appended_entries(store, entries, store._log_offset - len(encoded))
         generation_after = store.conversation_generation
         committed = tuple(store._snapshot_entry(entry) for entry in entries)
         if store.on_persisted_activity is not None:
