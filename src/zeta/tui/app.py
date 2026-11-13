@@ -745,7 +745,6 @@ class TUIApp(
             self._presenter.print_unit(renderable, blank_before=True)
         else:
             self._presenter.print_unit(renderable)
-        self._thinking_duration = self._thinking_started_at = None
     def open_project_instructions_editor(self, path: Path) -> str | Awaitable[str]:
         if not self._full_screen_active(): return f"project instructions: {path}"
         command = shlex.join(project_instructions_editor_command(path))

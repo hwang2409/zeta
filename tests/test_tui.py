@@ -7585,6 +7585,45 @@ def test_thought_updates_keep_active_unit_after_interleaved_output(
     assert "tool output" in rendered
 
 
+def test_thought_duration_survives_unrelated_background_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = iter((10.0, 10.25))
+    monkeypatch.setattr("zeta.tui.runtime.stream.time.monotonic", lambda: next(ticks))
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+    app._active_session = app._make_session()
+
+    try:
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent("plan"),
+            )
+        )
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "kind": "task_exited",
+                    "task_id": "background-task",
+                    "headline": "finished",
+                    "exit_code": 0,
+                },
+            )
+        )
+        app._flush_pending_stream()
+
+        rendered = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(120)
+        )
+        assert "✱ thought · 0.2s" in rendered
+        assert "plan" in rendered
+    finally:
+        monkeypatch.undo()
+        asyncio.run(app.close())
+
+
 def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

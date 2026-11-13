@@ -262,6 +262,7 @@ class StreamEventMixin:
     def _reset_stream_buffers(self) -> None:
         self._assistant_chunks.clear()
         self._thinking_chunks.clear()
+        self._thinking_duration = self._thinking_started_at = None
 
     def _prepare_stream_event(self, event: StreamEvent) -> None:
         if event.type is StreamEventType.MESSAGE_START:
