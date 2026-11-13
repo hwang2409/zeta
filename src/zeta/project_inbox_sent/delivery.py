@@ -127,9 +127,7 @@ class SentDelivery:
                     lease,
                     referenced_ids=(sender, to_session) if to_session else (sender,),
                 ):
-                    with inbox._directories(
-                        target, create=True, wait=inbox.wait_for_locks
-                    ) as dirs:
+                    with inbox._directories(target, create=True) as dirs:
                         inbox._publish_outgoing(dirs, message_id, body, record)
                     tracker.record(message_id, target, _storage_lease=lease)
             except (OSError, SessionError, InboxError, ValueError) as exc:
@@ -179,9 +177,7 @@ class SentDelivery:
             project_name = inbox.registry.show_project(project_id).name
         except ProjectNotFoundError:
             project_name = project_id
-        with inbox._lock(
-            project_id, exclusive=False, wait=inbox.wait_for_locks
-        ) as project_fd:
+        with inbox._lock(project_id, exclusive=False) as project_fd:
             read(project_fd)
         return rows
 

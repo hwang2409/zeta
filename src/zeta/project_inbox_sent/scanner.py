@@ -32,7 +32,6 @@ class ProjectInboxScanner:
             registry,
             sessions_root=sessions_root,
             sent_tracker=tracker,
-            wait_for_locks=False,
         )
         self.project_id = project_id
         self.session_id = session_id

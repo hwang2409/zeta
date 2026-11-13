@@ -15,7 +15,6 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-import zeta.project_locking as project_locking_module
 from zeta.attention_records import AttentionStore, observed_epoch_for_session
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
@@ -52,8 +51,8 @@ def _hold_memory_publication(home: str, project_id: str, channel: socket.socket)
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
-        original(fd, mode, wait=wait)
+    def gated(fd: int, mode: int) -> None:
+        original(fd, mode)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -134,8 +133,8 @@ def _hold_identity_publication(home: str, _project_id: str, channel: socket.sock
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
-        original(fd, mode, wait=wait)
+    def gated(fd: int, mode: int) -> None:
+        original(fd, mode)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -161,8 +160,8 @@ def _hold_inbox_publication(home: str, project_id: str, channel: socket.socket) 
     registry = ProjectRegistry(Path(home) / "projects")
     original = registry._acquire_lock
 
-    def gated(fd: int, mode: int, *, wait: bool = True) -> None:
-        original(fd, mode, wait=wait)
+    def gated(fd: int, mode: int) -> None:
+        original(fd, mode)
         if mode == fcntl.LOCK_EX:
             _send(channel, "acquired")
             if _receive(channel) != "release":
@@ -403,75 +402,8 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
-        poll_acquired = threading.Event()
-        release_poll = threading.Event()
-        real_directories = ProjectInbox._directories
-        poll_gate_used = False
-
-        @contextmanager
-        def gated_directories(
-            inbox: ProjectInbox, project_id: str, *, create: bool, wait: bool = True
-        ):
-            nonlocal poll_gate_used
-            directories_context = (
-                real_directories(inbox, project_id, create=create, wait=wait)
-                if wait is False
-                else real_directories(inbox, project_id, create=create)
-            )
-            with directories_context as directories:
-                if not poll_gate_used:
-                    poll_gate_used = True
-                    poll_acquired.set()
-                    assert release_poll.wait(timeout=10)
-                yield directories
-
-        # test-contract: seam gate the real scanner lock while serve replies
-        monkeypatch.setattr(ProjectInbox, "_directories", gated_directories)
-        record = await asyncio.to_thread(
-            AttentionStore(
-                home / "sessions" / serve_session_id,
-                writer_epoch=observed_epoch_for_session(
-                    home / "sessions" / serve_session_id
-                ),
-            ).request,
-            session_id=serve_session_id,
-            project_id=project.project_id,
-            entry_id=None,
-            entry_seq=None,
-            title="below epoch reply",
-            why="normal journey",
-            options=("yes",),
-        )
         async with owned_app(app):
             await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
-            await await_or_fail(
-                asyncio.to_thread(poll_acquired.wait, 10),
-                what="inbox poll lock acquisition",
-            )
-            reply_task = asyncio.create_task(
-                _request(
-                    reader,
-                    writer,
-                    "attention-reply",
-                    "slash_run",
-                    {
-                        "session_id": serve_session_id,
-                        "text": f"/decisions reply {record.id} yes",
-                    },
-                )
-            )
-            try:
-                reply_response = (
-                    await asyncio.wait_for(asyncio.shield(reply_task), timeout=1.2)
-                )[-1]
-            except TimeoutError:
-                release_poll.set()
-                reply_response = (await await_or_fail(reply_task, what="serve decision reply"))[-1]
-            else:
-                release_poll.set()
-            assert "result" in reply_response, reply_response
-            reply = reply_response["result"]
-            assert reply["text"] == f"replied to {record.id}"
             sent = await await_or_fail(
                 app.loop.tool_registry.execute(
                     ToolCall(
@@ -503,6 +435,36 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 for message in listed["structuredContent"]["messages"]
             )
 
+            record = await asyncio.to_thread(
+                AttentionStore(
+                    home / "sessions" / serve_session_id,
+                    writer_epoch=observed_epoch_for_session(
+                        home / "sessions" / serve_session_id
+                    ),
+                ).request,
+                session_id=serve_session_id,
+                project_id=project.project_id,
+                entry_id=None,
+                entry_seq=None,
+                title="below epoch reply",
+                why="normal journey",
+                options=("yes",),
+            )
+            reply_response = (
+                await _request(
+                    reader,
+                    writer,
+                    "attention-reply",
+                    "slash_run",
+                    {
+                        "session_id": serve_session_id,
+                        "text": f"/decisions reply {record.id} yes",
+                    },
+                )
+            )[-1]
+            assert "result" in reply_response, reply_response
+            reply = reply_response["result"]
+            assert reply["text"] == f"replied to {record.id}"
             assert (
                 await asyncio.to_thread(
                     lambda: AttentionStore(
@@ -515,8 +477,6 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 == "resolved"
             )
     finally:
-        if "release_poll" in locals():
-            release_poll.set()
         if opened is not None and app is None:
             opened.store.close()
         if opened is not None:
@@ -1076,7 +1036,7 @@ async def _held_production_lock(
         assert observed == [], observed
         original = ProjectRegistry._acquire_lock
 
-        def gated(lock_fd: int, mode: int, *, wait: bool = True) -> None:
+        def gated(lock_fd: int, mode: int) -> None:
             try:
                 fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
                 return

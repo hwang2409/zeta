@@ -29,7 +29,6 @@ from zeta.core.store import ConversationStore
 from zeta.project_errors import ProjectRegistryBusyError, ProjectRegistryError
 from zeta.project_inbox import (
     SENT_PAGE_LIMIT,
-    InboxBusyError,
     InboxError,
     ProjectInbox,
     ProjectInboxScanner,
@@ -697,55 +696,6 @@ def test_durable_intent_recovers_exactly_one_delivery_after_crash(
         (home / "sessions" / session_id / "project-inbox-sent.json").read_text()
     )
     assert [record["publication"] for record in final_ledger["records"]] == ["published"]
-
-
-def test_scanner_retries_busy_sent_poll_without_losing_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home, registry, project_a, project_b = _epoch_projects(tmp_path)
-    session_id = "a" * 32
-    tracker = SentMessageTracker(
-        home / "sessions", session_id, observed_epoch=registry.observed_storage_epoch
-    )
-    inbox = ProjectInbox(
-        registry, sessions_root=home / "sessions", sent_tracker=tracker
-    )
-    message_id = inbox.send_user(
-        from_project=project_a.project_id,
-        from_session=session_id,
-        to_project=project_b.project_id,
-        kind="info",
-        title="retry",
-        body="body",
-    )
-    assert inbox.claim(project_b.project_id, message_id, "b" * 32) is not None
-    scanner = ProjectInboxScanner(
-        registry,
-        project_a.project_id,
-        sessions_root=home / "sessions",
-        session_id=session_id,
-        tracker=tracker,
-    )
-    real_lock = scanner.inbox._lock
-    busy_once = True
-
-    @contextmanager
-    def busy_once_lock(*args: object, **kwargs: object):
-        nonlocal busy_once
-        if busy_once:
-            busy_once = False
-            raise InboxBusyError("inbox is busy; retry")
-        with real_lock(*args, **kwargs) as project_fd:
-            yield project_fd
-
-    # test-contract: seam force one busy poll before the retry
-    monkeypatch.setattr(scanner.inbox, "_lock", busy_once_lock)
-    with pytest.raises(InboxBusyError):
-        scanner.scan_sent()
-    statuses = scanner.scan_sent()
-    assert [(item["id"], item["status"]) for item in statuses] == [
-        (message_id, "claimed")
-    ]
 
 
 def test_sent_view_during_durable_send_does_not_invert_locks(
@@ -2073,13 +2023,9 @@ async def test_claim_tracking_is_read_only_for_receiver(
     real_lock = ProjectInbox._lock
 
     @contextmanager
-    def counted_lock(
-        self, project_id: str, *, exclusive: bool, wait: bool = True
-    ):
+    def counted_lock(self, project_id: str, *, exclusive: bool):
         inbox_locks.append(exclusive)
-        with real_lock(
-            self, project_id, exclusive=exclusive, wait=wait
-        ) as project_fd:
+        with real_lock(self, project_id, exclusive=exclusive) as project_fd:
             yield project_fd
 
     # test-contract: seam observe domain lock modes behind sent-status scanning

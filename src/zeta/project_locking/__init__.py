@@ -184,9 +184,12 @@ class ProjectLockingMixin:
             stack.callback(os.close, root_fd)
             lock_fd = self._open_lock(root_fd, create=True)
             assert lock_fd is not None
-            self._acquire_lock(
-                lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, wait=wait
-            )
+            if wait:
+                self._acquire_lock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            else:
+                self._acquire_lock(
+                    lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, wait=False
+                )
             stack.callback(self._release_lock, lock_fd)
             project_fds = tuple(
                 self._validated_project_fd(root_fd, project_id)
@@ -214,9 +217,16 @@ class ProjectLockingMixin:
                 project_fds.append(project_fd)
                 stack.callback(os.close, project_fd)
                 lock_fd = self._named_lock_fd(project_fd, domain)
-                self._acquire_lock(
-                    lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, wait=wait
-                )
+                if wait:
+                    self._acquire_lock(
+                        lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                    )
+                else:
+                    self._acquire_lock(
+                        lock_fd,
+                        fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+                        wait=False,
+                    )
                 stack.callback(self._release_lock, lock_fd)
             yield tuple(project_fds)
 
