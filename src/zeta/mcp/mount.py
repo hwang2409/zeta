@@ -7,6 +7,7 @@ import logging
 import time  # noqa: F401 - kept as the monkey-patch seam for tests
 from collections.abc import Callable
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 
 from ..core.abort import AbortSignal
@@ -243,11 +244,14 @@ class MCPMount:
         activated: list[str] = []
         rejected: list[str] = []
         for name in dict.fromkeys(names):
-            if name in registry._mcp_excluded_names:
-                rejected.append(f"{name}: excluded from this session")
-                continue
             entry = self._catalog.get(name)
             actor, tool = entry if entry is not None else (None, None)
+            if name in registry._mcp_excluded_names or (
+                actor is not None
+                and actor.config.name in registry._mcp_excluded_servers
+            ):
+                rejected.append(f"{name}: excluded from this session")
+                continue
             if actor is None or tool is None:
                 rejected.append(f"{name}: unavailable")
             elif actor.register_tool_for(registry, tool) or registry.is_mcp_owned(
@@ -352,6 +356,56 @@ class MCPMount:
         if old_actor is not None:
             await old_actor.close()
         return await actor.reconnect(notice_sink=notice_sink)
+
+    @property
+    def tool_refresh_pending(self) -> bool:
+        return any(actor._tool_refresh.pending for actor in self._actors.values())
+
+    async def wait_for_tool_refreshes(self) -> None:
+        waits = [
+            actor._tool_refresh.wait()
+            for actor in self._actors.values()
+            if actor._tool_refresh.pending
+        ]
+        if waits:
+            await asyncio.gather(*waits)
+
+    def set_primary_registry_only(self, name: str, enabled: bool) -> None:
+        actor = self._actors.get(name)
+        if actor is None or self._closed:
+            raise ValueError(f"unknown MCP server: {name}")
+        actor.set_primary_registry_only(enabled)
+
+    async def suspend_server(
+        self,
+        server_config: MCPServerConfig,
+        *,
+        source: Path,
+    ) -> None:
+        """Suspend one connection while keeping its actor available for replacement."""
+        async with self._config_lock:
+            actor = self._actors.get(server_config.name)
+            if actor is None or self._closed:
+                raise ValueError(f"unknown MCP server: {server_config.name}")
+            self.configs[server_config.name] = server_config
+            self.sources[server_config.name] = source
+        await actor.suspend(server_config, source)
+
+    async def replace_server(
+        self,
+        server_config: MCPServerConfig,
+        *,
+        source: Path,
+        notice_sink: NoticeSink | None = None,
+    ) -> MCPServerStatus:
+        """Replace one connection while preserving its actor and tool handlers."""
+        async with self._config_lock:
+            actor = self._actors.get(server_config.name)
+            if actor is None or self._closed:
+                raise ValueError(f"unknown MCP server: {server_config.name}")
+            self.configs[server_config.name] = server_config
+            self.sources[server_config.name] = source
+        return await actor.replace(server_config, source, notice_sink=notice_sink)
 
     async def add_server(
         self,
@@ -529,11 +583,23 @@ async def mount_mcp_servers(
     *,
     notice_sink: NoticeSink | None = None,
     home: str | None = None,
+    bindings: dict[str, dict[str, str]] | None = None,
+    binding_configs: dict[str, MCPServerConfig] | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
 
     enabled_configs = {
-        name: server_config
+        name: (
+            replace(
+                (binding_configs or {}).get(name, server_config),
+                headers={
+                    **(binding_configs or {}).get(name, server_config).headers,
+                    **bindings[name],
+                },
+            )
+            if bindings and name in bindings
+            else server_config
+        )
         for name, server_config in config.configured_servers.items()
         if server_config.enabled
     }
@@ -560,6 +626,8 @@ async def mount_mcp_servers(
             config.sources.get(server_config.name, config.path),
         )
         mount._actors[server_config.name] = actor
+        if bindings and server_config.name in bindings:
+            actor.set_primary_registry_only(True)
         actor.start()
         actors.append(actor)
     mount._notice_skipped(tuple(skipped), notice_sink)

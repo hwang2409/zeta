@@ -1,8 +1,10 @@
 """MCP session lifecycle operations for AgentLoop."""
 
 import asyncio
+import logging
 import shlex
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Self
 
@@ -14,6 +16,7 @@ from ...mcp import (
     mount_mcp_servers,
     tool_prefix,
 )
+from ...mcp.call_deadline import MCPCallDeadline
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
@@ -22,6 +25,7 @@ from ...mcp.commands import (
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
+from ...mcp.config import MCPServerConfig
 from ...mcp.oauth import MCPOAuthError
 from ...mcp.oauth_store import (
     MCPCredentialStoreError,
@@ -29,6 +33,10 @@ from ...mcp.oauth_store import (
     public_credential_store_error,
 )
 from ...model_input import ModelInputEnvelope
+
+logger = logging.getLogger(__name__)
+
+MCP_REFRESH_TURN_WAIT_SECONDS = 1.0
 
 
 class MCPCommandOutput(str):
@@ -54,26 +62,48 @@ class MCPSession:
         return self._mcp_home_hint
 
     async def _ensure_mcp_servers(self) -> None:
-        if self._mcp_mount_attempted:
+        if not self._mcp_mount_attempted:
+            if (
+                self._mcp_management.project_dir == self.tool_registry.cwd
+                and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
+            ):
+                self._mcp_management.project_dir = None
+            if self._mcp_mount_task is None:
+                self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
+            await asyncio.shield(self._mcp_mount_task)
+        await self._wait_for_pending_mcp_refreshes()
+
+    async def _wait_for_pending_mcp_refreshes(
+        self, *, deadline: MCPCallDeadline | None = None
+    ) -> None:
+        mount = self._mcp_mount
+        if mount is None or not mount.tool_refresh_pending:
             return
-        if (
-            self._mcp_management.project_dir == self.tool_registry.cwd
-            and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
-        ):
-            self._mcp_management.project_dir = None
-        if self._mcp_mount_task is None:
-            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-        await asyncio.shield(self._mcp_mount_task)
+        deadline = deadline or MCPCallDeadline.start(MCP_REFRESH_TURN_WAIT_SECONDS)
+        if deadline.expired:
+            logger.warning("MCP tool refresh was late; using the current tool catalog")
+            return
+        try:
+            async with asyncio.timeout_at(deadline.expires_at):
+                await mount.wait_for_tool_refreshes()
+        except TimeoutError:
+            logger.warning("MCP tool refresh was late; using the current tool catalog")
 
     async def _mount_mcp_servers(self) -> None:
         try:
             service = self._mcp_management
             config = await service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
+                self.tool_registry, config, notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
+                **(
+                    {
+                        "bindings": self._mcp_bindings,
+                        "binding_configs": self._mcp_binding_configs,
+                    }
+                    if self._mcp_bindings
+                    else {}
+                ),
             )
             service.mount = self._mcp_mount
         except (MCPConfigError, MCPManagementError) as exc:
@@ -94,6 +124,54 @@ class MCPSession:
         self._mcp_mount = mount
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+
+    async def set_mcp_bindings(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig] | None = None,
+    ) -> None:
+        """Set transient per-attachment headers without replacing tool handlers."""
+        await self.clear_mcp_bindings()
+        self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
+        self._mcp_binding_configs = dict(configs or {})
+        if self._mcp_mount is not None:
+            for name in bindings:
+                self._mcp_mount.set_primary_registry_only(name, True)
+            await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
+
+    async def clear_mcp_bindings(self) -> None:
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            self._mcp_mount_task.cancel()
+            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+            self._mcp_mount_task = None
+            self._mcp_mount_attempted = self._mcp_mount is not None
+        if self._mcp_mount is not None and self._mcp_bindings:
+            names = tuple(self._mcp_bindings)
+            await asyncio.gather(*(
+                self._mcp_mount.suspend_server(
+                    self._mcp_binding_configs[name],
+                    source=self._mcp_mount.sources[name],
+                )
+                for name in names
+            ))
+            for name in names:
+                self._mcp_mount.set_primary_registry_only(name, False)
+        self._mcp_bindings = {}
+        self._mcp_binding_configs = {}
+
+    async def _replace_mcp_binding_configs(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        mount = self._mcp_mount
+        assert mount is not None
+        for name, headers in bindings.items():
+            config = configs[name]
+            await mount.replace_server(
+                replace(config, headers={**config.headers, **headers}),
+                source=mount.sources[name],
+            )
 
     def set_mcp_scope(
         self,

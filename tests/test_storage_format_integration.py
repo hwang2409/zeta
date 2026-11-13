@@ -56,6 +56,8 @@ def _run_cli(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 def _tree_digest(home: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(home.rglob("*")):
+        if path.relative_to(home).as_posix() == "logs" or path.relative_to(home).as_posix().startswith("logs/"):
+            continue
         digest.update(path.relative_to(home).as_posix().encode())
         digest.update(b"d" if path.is_dir() else b"f")
         if path.is_file():

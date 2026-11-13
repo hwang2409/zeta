@@ -18,7 +18,7 @@ import secrets
 import stat
 import uuid
 import weakref
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,7 @@ from .core.session_files import (
     atomic_publish_file,
     open_session_file,
     reference_publication,
+    write_session_file_if_absent,
 )
 from .locking import format_lock
 from .memory.transaction import MemoryTransactions
@@ -70,6 +71,22 @@ MAX_SESSION_REFERENCES = 10_000
 MAX_CREATE_RETRIES = 32
 _PROJECT_ID = project_schema.PROJECT_ID_PATTERN
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_CHILD_SESSION_ID = re.compile(r"([0-9a-f]{32})(?::[1-9][0-9]*)+\Z")
+
+
+def _is_represented_child_record(
+    record: Mapping[str, object], root_ids: set[str]
+) -> bool:
+    if record.get("role") != "worker":
+        return False
+    session_id = record.get("session_id")
+    parent_session_id = record.get("parent_session_id")
+    if not isinstance(session_id, str) or not isinstance(parent_session_id, str):
+        return False
+    match = _CHILD_SESSION_ID.fullmatch(session_id)
+    if match is None or match.group(1) not in root_ids:
+        return False
+    return parent_session_id == session_id.rpartition(":")[0]
 @dataclass(frozen=True)
 class Project:
     project_id: str
@@ -216,23 +233,43 @@ def resolve_project_ref(registry: ProjectRegistry, text: str) -> str | None:
             return None
 
 
+def _retained_session_links(existing, remove_ids, charge):
+    retained = []
+    for record in existing:
+        charge()
+        if (
+            record["session_id"] not in remove_ids
+            and record.get("parent_session_id") not in remove_ids
+        ):
+            retained.append(record)
+    return retained
+
+
 class ProjectRegistry(
     ProjectLockingMixin, ProjectContextProjectionMixin, ProjectMemoryHistoryMixin
 ):
     """A local registry whose root can be overridden for tests."""
 
-    def __init__(self, root: Path | str | None = None):
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        *,
+        _storage_lease: WriterLease | None = None,
+    ):
         self.root = (
             Path(root).expanduser()
             if root is not None
             else Path.home() / ".zeta" / "projects"
         )
         self.memory_transactions = MemoryTransactions(self)
-        with format_lock():
-            self._storage_lease = open_writer(self.root.parent)
-        self._release_storage_lease = weakref.finalize(
-            self, release_later, self._storage_lease.close
-        )
+        if _storage_lease is None:
+            with format_lock():
+                self._storage_lease = open_writer(self.root.parent)
+            self._release_storage_lease = weakref.finalize(
+                self, release_later, self._storage_lease.close
+            )
+        else:
+            self._storage_lease = _storage_lease
 
     @property
     def observed_storage_epoch(self) -> int:
@@ -770,10 +807,11 @@ class ProjectRegistry(
 
     @staticmethod
     def _iter_session_record_lines(
-        fd: int, *, repair_torn_final: bool
+        fd: int, *, repair_torn_final: bool, allow_overflow: bool = False
     ) -> Iterator[bytes]:
         """Yield bounded complete JSONL records and optionally remove a torn tail."""
         maximum = MAX_SESSION_REFERENCES * MAX_SESSION_REFERENCE_SIZE
+        line_limit = None if allow_overflow else MAX_SESSION_REFERENCES
         pending = bytearray()
         total = 0
         line_count = 0
@@ -798,7 +836,7 @@ class ProjectRegistry(
                             "project session reference is too large"
                         )
                     line_count += 1
-                    if line_count > MAX_SESSION_REFERENCES:
+                    if line_limit is not None and line_count > line_limit:
                         raise ProjectRegistryError(
                             "project session references exceed the limit"
                         )
@@ -837,7 +875,9 @@ class ProjectRegistry(
             if key not in {"project_id", "recorded_at"}
         }
         matched = False
-        for line in cls._iter_session_record_lines(fd, repair_torn_final=True):
+        for line in cls._iter_session_record_lines(
+            fd, repair_torn_final=True, allow_overflow=True
+        ):
             if session_id_field not in line:
                 continue
             candidate = cls._decode_session_record_line(line)
@@ -849,7 +889,11 @@ class ProjectRegistry(
 
     @classmethod
     def _read_session_records(
-        cls, directory_fd: int, *, repair_torn_final: bool
+        cls,
+        directory_fd: int,
+        *,
+        repair_torn_final: bool,
+        allow_overflow: bool = False,
     ) -> list[dict[str, object]]:
         """Read the bounded JSONL reference file from one pinned regular fd."""
         with cls._open_session_records(
@@ -860,7 +904,9 @@ class ProjectRegistry(
             return [
                 cls._decode_session_record_line(line)
                 for line in cls._iter_session_record_lines(
-                    fd, repair_torn_final=repair_torn_final
+                    fd,
+                    repair_torn_final=repair_torn_final,
+                    allow_overflow=allow_overflow,
                 )
             ]
 
@@ -884,6 +930,40 @@ class ProjectRegistry(
             project_id, "sessions", exclusive=False
         ) as project_fd:
             return read(project_fd)
+
+    def remove_session_links(
+        self,
+        project_ids: tuple[str, ...],
+        session_ids: tuple[str, ...],
+        *,
+        charge: Callable[[], None],
+    ) -> None:
+        """Durably remove links under already-enumerated project authority."""
+        remove_ids = set(session_ids)
+        if not remove_ids:
+            return
+        for session_id in remove_ids:
+            _validate_text(session_id, "session_id", 128)
+        for project_id in project_ids:
+            charge()
+            _validate_id(project_id, _PROJECT_ID, "project_id")
+            with self._project_lock(
+                project_id, "sessions", exclusive=True
+            ) as project_fd:
+                directory_fd = os.dup(project_fd)
+                try:
+                    existing = self._read_session_records(
+                        directory_fd, repair_torn_final=False
+                    )
+                finally:
+                    os.close(directory_fd)
+                retained = _retained_session_links(existing, remove_ids, charge)
+                if len(retained) != len(existing):
+                    self._update_sessions_locked(
+                        project_fd,
+                        {str(record["session_id"]) for record in existing},
+                        retained,
+                    )
 
     def record_session(
         self,
@@ -969,6 +1049,83 @@ class ProjectRegistry(
         """Apply one child-lineage project group under held sessions authority."""
         self._update_sessions_locked(project_fd, remove_ids, records)
 
+    @staticmethod
+    def _filter_represented_session_records(
+        existing: list[dict[str, object]],
+        remove_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], set[str], bool]:
+        retained = [
+            record
+            for record in existing
+            if str(record["session_id"]) not in remove_ids
+        ]
+        root_ids = {
+            str(record["session_id"])
+            for record in retained
+            if _SESSION_ID.fullmatch(str(record["session_id"]))
+        }
+        root_ids.update(
+            str(record["session_id"])
+            for record in records
+            if _SESSION_ID.fullmatch(str(record["session_id"]))
+        )
+        filtered = [
+            record
+            for record in retained
+            if not _is_represented_child_record(record, root_ids)
+        ]
+        return filtered, root_ids, filtered != existing
+
+    @staticmethod
+    def _apply_session_upserts(
+        retained: list[dict[str, object]],
+        root_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], bool]:
+        changed = False
+        positions = {
+            str(record["session_id"]): index
+            for index, record in enumerate(retained)
+        }
+        for record in records:
+            if _is_represented_child_record(record, root_ids):
+                continue
+            session_id = str(record["session_id"])
+            position = positions.get(session_id)
+            if position is None:
+                if len(retained) >= MAX_SESSION_REFERENCES:
+                    raise ProjectRegistryError("project session reference limit exceeded")
+                positions[session_id] = len(retained)
+                retained.append(record)
+                changed = True
+                continue
+            current = retained[position]
+            business = {
+                key: value for key, value in record.items() if key != "recorded_at"
+            }
+            current_business = {
+                key: value for key, value in current.items() if key != "recorded_at"
+            }
+            if current_business != business:
+                retained[position] = record
+                changed = True
+        return retained, changed
+
+    @classmethod
+    def _coalesce_session_records(
+        cls,
+        existing: list[dict[str, object]],
+        remove_ids: set[str],
+        records: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], bool, bool]:
+        """Return retained rows, whether compaction occurred, and whether changed."""
+        retained, root_ids, compacted = cls._filter_represented_session_records(
+            existing, remove_ids, records
+        )
+        retained, changed = cls._apply_session_upserts(retained, root_ids, records)
+        return retained, compacted, compacted or changed
+
     def _update_sessions_locked(
         self,
         project_fd: int,
@@ -978,47 +1135,22 @@ class ProjectRegistry(
         """Apply removals and exact upserts with one bounded project rewrite."""
         directory_fd = os.dup(project_fd)
         try:
-            if not remove_ids and len(records) == 1:
+            if (
+                not remove_ids
+                and len(records) == 1
+                and _CHILD_SESSION_ID.fullmatch(str(records[0]["session_id"])) is None
+            ):
                 with self._open_session_records(
                     directory_fd, repair_torn_final=True
                 ) as fd:
                     if fd is not None and self._session_record_matches(fd, records[0]):
                         return
             existing = self._read_session_records(
-                directory_fd, repair_torn_final=True
+                directory_fd, repair_torn_final=True, allow_overflow=True
             )
-            retained = [
-                record
-                for record in existing
-                if str(record["session_id"]) not in remove_ids
-            ]
-            changed = len(retained) != len(existing)
-            positions = {
-                str(record["session_id"]): index
-                for index, record in enumerate(retained)
-            }
-            for record in records:
-                session_id = str(record["session_id"])
-                position = positions.get(session_id)
-                if position is None:
-                    if len(retained) >= MAX_SESSION_REFERENCES:
-                        raise ProjectRegistryError(
-                            "project session reference limit exceeded"
-                        )
-                    positions[session_id] = len(retained)
-                    retained.append(record)
-                    changed = True
-                    continue
-                current = retained[position]
-                business = {
-                    key: value for key, value in record.items() if key != "recorded_at"
-                }
-                current_business = {
-                    key: value for key, value in current.items() if key != "recorded_at"
-                }
-                if current_business != business:
-                    retained[position] = record
-                    changed = True
+            retained, compacted, changed = self._coalesce_session_records(
+                existing, remove_ids, records
+            )
             if not changed:
                 return
             payload = b"".join(
@@ -1031,18 +1163,38 @@ class ProjectRegistry(
                 for record in retained
             ):
                 raise ProjectRegistryError("project session reference is too large")
-            self._writer_lease().publish_append(
-                "project.session_role",
-                (record["role"] for record in retained),
-                lambda: atomic_publish_file(
+            def publish() -> None:
+                if compacted and existing:
+                    self._backup_session_records(directory_fd, existing)
+                atomic_publish_file(
                     directory_fd,
                     "sessions.jsonl",
                     payload,
                     sync_directory=True,
-                ),
+                )
+
+            self._writer_lease().publish_append(
+                "project.session_role",
+                (record["role"] for record in retained),
+                publish,
             )
         finally:
             os.close(directory_fd)
+
+    @staticmethod
+    def _backup_session_records(
+        directory_fd: int, records: list[dict[str, object]]
+    ) -> None:
+        names = os.listdir(directory_fd)
+        if any(name.startswith("sessions.jsonl.pre-compact-") for name in names):
+            return
+        payload = b"".join(
+            (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            for record in records
+        )
+        timestamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        name = f"sessions.jsonl.pre-compact-{timestamp}"
+        write_session_file_if_absent(directory_fd, name, payload)
 
     def initialize_memory(self, project_id: str) -> None:
         """Create the standard memory files without overwriting human edits."""

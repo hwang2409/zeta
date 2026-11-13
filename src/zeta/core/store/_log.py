@@ -110,7 +110,6 @@ class _FullLoadValidator:
 
     _STATE_ATTRIBUTES = (
         "cwd",
-        "_entries",
         "_entry_ids",
         "_entry_prefix_digest",
         "_delivery_fold",
@@ -124,10 +123,10 @@ class _FullLoadValidator:
         self.store = store
         self.source = source
         # The resident rows stay a prefix only if the digest at their count matches.
-        self.baseline = (len(store._entries), store._entry_prefix_digest)
-        self._digest_at_baseline: bytes | None = b"" if not store._entries else None
+        self.baseline = (len(store._resident_rows.entries), store._entry_prefix_digest)
+        self._digest_at_baseline: bytes | None = b"" if not store._resident_rows.entries else None
         self.state = copy.copy(store)
-        self.state._entries = []
+        self.state._resident_rows = type(store._resident_rows)(())
         self.state._entry_prefix_digest = b""
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()
@@ -227,19 +226,19 @@ class _FullLoadValidator:
             reason_code = "invalid_sequence"
         elif entry.id in self.by_id:
             reason_code = "duplicate_id"
-        elif self.state._entries and entry.parent_id is None:
+        elif self.state._resident_rows.entries and entry.parent_id is None:
             reason_code = "orphaned_root"
         elif entry.parent_id is not None and entry.parent_id not in self.by_id:
             reason_code = "missing_parent"
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
-        self.state._entries.append(entry)
+        self.state._resident_rows.append(entry)
         self.by_id[entry.id] = entry
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
         self.state._record_entry_prefix(entry)
-        if len(self.state._entries) == self.baseline[0]:
+        if len(self.state._resident_rows.entries) == self.baseline[0]:
             self._digest_at_baseline = self.state._entry_prefix_digest
         self.state._sent_message_receipts.extend(sent_message_receipts(entry))
         self.state._record_physical_entry(entry)
@@ -250,7 +249,7 @@ class _FullLoadValidator:
         last = next(
             (
                 entry
-                for entry in reversed(self.state._entries)
+                for entry in reversed(self.state._resident_rows.entries)
                 if self.rows_by_id[entry.id].byte_offset < end_offset
             ),
             None,
@@ -327,14 +326,15 @@ class _FullLoadValidator:
                 prefix_digest=hashlib.sha256().hexdigest(),
                 source_digest=self.source.finish_digest(),
             )
-        if self.state._entries:
-            self._select_branch(self.state._entries[-1])
-        self.state._rebuild_client_deliveries(self.state._entries)
+        if self.state._resident_rows.entries:
+            self._select_branch(self.state._resident_rows.entries[-1])
+        self.state._rebuild_client_deliveries(self.state._resident_rows.entries)
         if install:
             if self.resets_resident_rows:
                 self.store._reset_generation += 1
             for attribute in self._STATE_ATTRIBUTES:
                 setattr(self.store, attribute, getattr(self.state, attribute))
+            self.store._resident_rows = self.state._resident_rows
 
     @property
     def resets_resident_rows(self) -> bool:
@@ -357,7 +357,7 @@ class ConversationLogMixin:
         """Return the worker-owned validated state for an atomic loop install."""
         return _DetachedLogState(
             cwd=self.cwd,
-            entries=self._entries,
+            entries=self._resident_rows.entries,
             entry_ids=self._entry_ids,
             entry_prefix_digest=self._entry_prefix_digest,
             delivery_fold=self._delivery_fold,
@@ -493,7 +493,7 @@ class ConversationLogMixin:
         self._log_mtime_ns = state.log_mtime_ns
         self._log_prefix_fingerprint = state.log_prefix_fingerprint
         # Publish entries last so readers never see rows without matching indexes.
-        self._entries = state.entries
+        self._resident_rows.replace(state.entries)
         self._transcript_generation += 1
         return previous
 
@@ -580,7 +580,7 @@ class ConversationLogMixin:
         parse; ordinary external appends read and validate only the new bytes.
         """
         self._assert_owner_thread()
-        had_entries = bool(self._entries)
+        had_entries = bool(self._resident_rows.entries)
         try:
             fd = open_session_file(self.directory_fd, "conversation.jsonl", os.O_RDONLY)
         except FileNotFoundError:
@@ -588,11 +588,11 @@ class ConversationLogMixin:
                 raise ConversationIntegrityError(
                     f"conversation file is missing: {self.path}"
                 )
-            self._entries = []
+            self._resident_rows.replace(())
             self._entry_prefix_digest = b""
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
-            self._rebuild_client_deliveries(self._entries)
+            self._rebuild_client_deliveries(self._resident_rows.entries)
             if had_entries:
                 self._reset_generation += 1
             header = {
@@ -640,7 +640,7 @@ class ConversationLogMixin:
 
         try:
             entries, torn_at = self._parse_entry_lines(
-                raw, first_row=len(self._entries) + 2
+                raw, first_row=len(self._resident_rows.entries) + 2
             )
         except ConversationIntegrityError:
             self._load_full()
@@ -648,7 +648,7 @@ class ConversationLogMixin:
         if torn_at is not None:
             if self._read_only:
                 raise ConversationIntegrityError(
-                    f"invalid conversation row {len(self._entries) + len(entries) + 2}: {self.path}"
+                    f"invalid conversation row {len(self._resident_rows.entries) + len(entries) + 2}: {self.path}"
                 )
             self._strict_snapshot_sync = False
             self._load_full()
@@ -881,7 +881,7 @@ class ConversationLogMixin:
         self._publish_entries_installed(
             "reset"
             if self._reset_generation != generation
-            else tuple(self._entries[count:])
+            else tuple(self._resident_rows.entries[count:])
         )
 
     def _load_full(
@@ -890,7 +890,7 @@ class ConversationLogMixin:
         # Nested reloads (repairs) receive the outer reload's start, so the
         # whole operation publishes once against the rows resident before it.
         if since is None:
-            since = (self._reset_generation, len(self._entries))
+            since = (self._reset_generation, len(self._resident_rows.entries))
         self._full_reload_count += 1
         if not self._read_only and self._repair_enabled:
             reconcile_pending(

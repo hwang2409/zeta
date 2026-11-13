@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import zeta
+from tests.support.branch_reads import branch_entries, branch_messages
 from zeta import attention_forks
 from zeta.attention_forks import (
     ATTENTION_FORK_POLICY,
@@ -65,7 +66,9 @@ def _session(home: Path, *, project_id: str | None = None):
     )
 
 
-def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
+def test_request_attention_writes_atomic_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     opened = _session(tmp_path)
     entry = opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Choose")])
@@ -74,6 +77,15 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
         tmp_path, session_store=opened.store, skill_catalog=SkillCatalog.empty()
     )
     definition = registry.definitions_by_name["request_attention"]
+    entry_reads = 0
+    original_entry = opened.store.entry
+
+    def counted_entry(ref):
+        nonlocal entry_reads
+        entry_reads += 1
+        return original_entry(ref)
+
+    monkeypatch.setattr(opened.store, "entry", counted_entry)
     assert isinstance(definition, ToolDefinition)
     assert definition.description == (
         "Use once per topic to put important user attention in the inbox, then continue work. "
@@ -102,6 +114,7 @@ def test_request_attention_writes_atomic_record(tmp_path: Path) -> None:
     assert result["content"][0]["text"].startswith("Attention requested:")
     assert record["entry_id"] == entry.id
     assert record["entry_seq"] == entry.seq
+    assert entry_reads == 0
     assert record["status"] == "open"
     assert not list(records[0].parent.glob("*.tmp"))
     asyncio.run(registry.close())
@@ -201,7 +214,7 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
     fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
     fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
-        branch = fork.store.replay()
+        branch = branch_entries(fork.store)
         assert [entry.id for entry in branch[:5]] == [
             anchor.id,
             *(result.id for result in results),
@@ -210,7 +223,7 @@ def test_parallel_attention_fork_copies_the_complete_tool_batch(tmp_path: Path) 
             Message.from_dict(branch[5].data["message"]).metadata["kind"]
             == "attention_fork"
         )
-        messages = fork.store.messages()
+        messages = branch_messages(fork.store)
         assert _anthropic_tool_ids(messages) == (
             {call.id for call in calls},
             {call.id for call in calls},
@@ -251,8 +264,8 @@ def test_attention_fork_cuts_before_an_incomplete_tool_batch(tmp_path: Path) -> 
     fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
     fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
-        assert [entry.id for entry in fork.store.replay()[:1]] == [before.id]
-        messages = fork.store.messages()
+        assert [entry.id for entry in branch_entries(fork.store)[:1]] == [before.id]
+        messages = branch_messages(fork.store)
         assert _anthropic_tool_ids(messages) == (set(), set())
         payload_text = json.dumps(_anthropic_payload(messages))
         assert "The sibling result is not durable yet." in payload_text
@@ -282,8 +295,8 @@ def test_single_attention_call_fork_cut_is_unchanged(tmp_path: Path) -> None:
     fork_id = create_discussion_fork(tmp_path, opened.store.session_id, attention.id)
     fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
-        assert [entry.id for entry in fork.store.replay()[:2]] == [anchor.id, result.id]
-        assert _anthropic_tool_ids(fork.store.messages()) == ({call.id}, {call.id})
+        assert [entry.id for entry in branch_entries(fork.store)[:2]] == [anchor.id, result.id]
+        assert _anthropic_tool_ids(branch_messages(fork.store)) == ({call.id}, {call.id})
     finally:
         fork.store.close()
         opened.store.close()
@@ -340,7 +353,7 @@ def test_reused_fork_with_dangling_parallel_calls_is_safe_on_reopen(
 
     reopened = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
-        messages = reopened.store.messages()
+        messages = branch_messages(reopened.store)
         assert _anthropic_tool_ids(messages) == (set(), set())
         payload = build_messages_payload(
             messages,
@@ -401,9 +414,9 @@ def test_fork_copies_active_branch_through_anchor_without_modifying_source(
     } == original
     fork = SessionManager(tmp_path).open(fork_id, _read_only=True)
     assert [
-        entry.data["message"]["content"][0]["text"] for entry in fork.store.replay()[:2]
+        entry.data["message"]["content"][0]["text"] for entry in branch_entries(fork.store)[:2]
     ] == ["one", "two"]
-    assert len(fork.store.replay()) == 3  # harness note follows copied branch
+    assert len(branch_entries(fork.store)) == 3  # harness note follows copied branch
     fork_metadata = read_attention_fork(fork.store.session_dir)
     assert fork_metadata is not None
     assert fork_metadata.forked_from_session == opened.store.session_id

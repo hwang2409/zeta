@@ -1,3 +1,4 @@
+
 """Idempotent client-delivery tests for the native serve protocol."""
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
@@ -342,7 +344,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
             "duplicate": True,
         }
         assert backend.calls == 1
-        assert len(server.runtime.opened.store.messages()) == 1
+        assert len(branch_messages(server.runtime.opened.store)) == 1
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
@@ -416,7 +418,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         assert delivered[-1]["result"]["status"] == "delivered"
         texts = [
             block.text
-            for message in server.runtime.opened.store.messages()
+            for message in branch_messages(server.runtime.opened.store)
             if message.role is MessageRole.USER
             for block in message.content
             if isinstance(block, TextContent)
@@ -809,7 +811,7 @@ def test_delivery_record_accepts_tagged_user_message_atomically(tmp_path: Path) 
         message=message,
     )
     assert store.client_delivery("send-atomic").status == "delivered"
-    assert [item.content[0].text for item in store.messages()] == ["hello"]
+    assert [item.content[0].text for item in branch_messages(store)] == ["hello"]
     store.close()
 
 
@@ -1050,7 +1052,7 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
         {"accepted": True},
     )
 
-    (delivery,) = store.replay()
+    (delivery,) = branch_entries(store)
     assert delivery.type == "client_delivery"
     assert delivery.data == {
         "delivery_id": "compat-steer",
@@ -1058,7 +1060,7 @@ def test_steer_acceptance_keeps_legacy_delivery_shape_without_text(
         "status": "queued",
         "outcome": {"accepted": True},
     }
-    assert all(entry.type not in {"message", "warning"} for entry in store.replay())
+    assert all(entry.type not in {"message", "warning"} for entry in branch_entries(store))
     store.close()
 
 
@@ -1201,7 +1203,7 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
                 "print(zeta.__file__); "
                 "store = ConversationStore(Path(__import__('sys').argv[1]), "
                 "session_id=__import__('sys').argv[2]); "
-                "rows = store.replay(); store.close(); "
+                "rows = branch_entries(store); store.close(); "
                 "print('old reader replayed', len(rows), 'rows')"
             ),
             str(session_root),
@@ -1225,13 +1227,21 @@ def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
     )
 
     class UnreadableEntries(list):
+        blocked = False
+
         def __iter__(self):
-            raise AssertionError("delivery lookup read the conversation log")
+            if self.blocked:
+                raise AssertionError("delivery lookup read the conversation log")
+            return super().__iter__()
 
         def __reversed__(self):
-            raise AssertionError("delivery lookup read the conversation log")
+            if self.blocked:
+                raise AssertionError("delivery lookup read the conversation log")
+            return super().__reversed__()
 
-    store._entries = UnreadableEntries(store._entries)
+    unreadable_entries = UnreadableEntries(resident_entries(store))
+    store._resident_rows = type(store._resident_rows).prepared(unreadable_entries)
+    unreadable_entries.blocked = True
     assert store.client_delivery("indexed").status == "queued"
     store.close()
 
@@ -1393,7 +1403,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
                 isinstance(block, TextContent) and block.text == "later"
                 for block in message.content
             )
-            for message in resumed.runtime.opened.store.messages()
+            for message in branch_messages(resumed.runtime.opened.store)
         )
     finally:
         await close_serve(resumed, writer)

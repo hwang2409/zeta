@@ -19,6 +19,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
@@ -1121,7 +1122,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     async def reject(*args: object, **kwargs: object) -> str:
         del args, kwargs
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return "child finished"
 
     monkeypatch.setattr(agent_runtime, "send_to_run", reject)
@@ -1133,7 +1134,7 @@ async def test_child_send_rejection_preserves_text_and_does_not_submit_main(
     assert session.default_buffer.text == "keep me"
     assert any("child finished" in notice for notice in notices)
     assert await asyncio.to_thread(child.pending_prompts) == []
-    assert store.messages() == []
+    assert branch_messages(store) == []
     await app.close()
 
 
@@ -1153,7 +1154,7 @@ async def test_child_send_exception_preserves_text_and_shows_notice(
     await asyncio.sleep(0.05)
     assert session.default_buffer.text == "keep me"
     assert any("send failed" in notice for notice in notices)
-    assert store.messages() == []
+    assert branch_messages(store) == []
     await app.close()
 
 
@@ -1192,7 +1193,7 @@ async def test_child_send_success_keeps_same_text_typed_after_edit(
 
     assert await asyncio.to_thread(persisted_prompts) == ["same"]
     assert buffer.text == "same"
-    assert store.messages() == []
+    assert branch_messages(store) == []
     await app.close()
 
 
@@ -1221,7 +1222,7 @@ async def test_close_waits_for_in_flight_child_send_outcome(
     release.set()
     await asyncio.wait_for(closing, 5)
     assert [entry.data["text"] for entry in await asyncio.to_thread(child.pending_prompts)] == ["at exit"]
-    assert store.messages() == []
+    assert branch_messages(store) == []
     assert notices == notices_before_release
 
 
@@ -1323,7 +1324,7 @@ async def test_child_send_finishing_after_its_session_left_does_not_touch_ui(
     ] == ["during exit"]
     assert session.default_buffer.text == "during exit"
     assert notices == notices_before
-    assert store.messages() == []
+    assert branch_messages(store) == []
     assert app._active_session is session
     await app.close()
 
@@ -1342,7 +1343,7 @@ async def test_child_send_double_enter_queues_once(
         nonlocal calls
         calls += 1
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return await real_send(*args, **kwargs)
 
     monkeypatch.setattr(agent_runtime, "send_to_run", send)
@@ -1354,7 +1355,7 @@ async def test_child_send_double_enter_queues_once(
     await asyncio.sleep(0.05)
     assert calls == 1
     assert len(await asyncio.to_thread(child.pending_prompts)) == 1
-    assert store.messages() == []
+    assert branch_messages(store) == []
     await app.close()
 
 
@@ -1439,7 +1440,7 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
     await asyncio.wait_for(queued.wait(), timeout=2)
     assert session.default_buffer.text == ""
     assert [entry.data["text"] for entry in await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts)] == ["follow up"]
-    assert store.messages() == []
+    assert branch_messages(store) == []
     assert "queued message for root:worker" in notices
     await app.close()
 
@@ -1485,7 +1486,7 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     assert app._submit_input(session.default_buffer.text) is False
     assert session.default_buffer.text == "keep this"
     assert await asyncio.to_thread(ConversationStore(child.parent, session_id=child.name).pending_prompts) == []
-    assert not any(message.role is MessageRole.USER for message in store.messages())
+    assert not any(message.role is MessageRole.USER for message in branch_messages(store))
     assert any("return to main" in notice for notice in notices)
     await app.close()
 

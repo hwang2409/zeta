@@ -335,6 +335,13 @@ async def test_p06_below_epoch_real_tui_serve_journey(
     from tests.test_server import _ready_extensions, _request
     from zeta.cli.main import main as cli_main
 
+    def serve_result(
+        response_frames: list[dict[str, object]], method: str, request_id: str
+    ) -> dict[str, object]:
+        response = response_frames[-1]
+        assert "result" in response, f"{method} {request_id}: {response!r}"
+        return response["result"]  # type: ignore[return-value]
+
     home = tmp_path / "home"
     for epoch in range(5):
         advance(home, expected_epoch=epoch, target_epoch=epoch + 1)
@@ -358,15 +365,17 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             cli_main, ["project", "init", str(project_dir)]
         ) == 0
         reader, writer, serve_session_id = await _ready_extensions(server)
-        project_result = (
+        project_result = serve_result(
             await _request(
                 reader,
                 writer,
                 "project-init",
                 "slash_run",
                 {"session_id": serve_session_id, "text": "/project"},
-            )
-        )[-1]["result"]
+            ),
+            "slash_run",
+            "project-init",
+        )
         assert "project" in project_result["text"].lower()
         registry = server.runtime.manager.project_registry
         assert registry is not None
@@ -448,7 +457,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 why="normal journey",
                 options=("yes",),
             )
-            reply = (
+            reply = serve_result(
                 await _request(
                     reader,
                     writer,
@@ -458,8 +467,10 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                         "session_id": serve_session_id,
                         "text": f"/decisions reply {record.id} yes",
                     },
-                )
-            )[-1]["result"]
+                ),
+                "slash_run",
+                "attention-reply",
+            )
             assert reply["text"] == f"replied to {record.id}"
             assert (
                 await asyncio.to_thread(
@@ -962,7 +973,7 @@ def test_p06_installed_callbacks_drain_in_append_order_after_rank_release(
 
         durable = [
             (row.data["message"]["content"][0]["text"], row.id)
-            for row in store._entries
+            for row in (store.entry(ref) for ref in store.resident_refs())
             if row.type == "message"
         ]
         assert delivered == durable
@@ -1117,9 +1128,9 @@ async def test_p06_2_child_lineage_stays_off_event_loop(
         assert observed == ["sentinel", "released"], _LOOP_BLOCKED
         assert isinstance(outcome, RuntimeError), repr(outcome)
         links = await asyncio.to_thread(registry.list_session_links, project_id)
-        assert f"{opened.store.session_id}:1" in {
+        assert {
             row["session_id"] for row in links
-        }
+        } == {opened.store.session_id}
     finally:
         try:
             await asyncio.wait_for(loop.close(), 10)

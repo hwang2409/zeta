@@ -121,6 +121,7 @@ class RuntimeCloseMixin:
             )
             if self._hooks is not None:
                 attempt(lambda: setattr(self._hooks, "notice_sink", None))
+            self._update_notice_callback = None
             self._active_session = None
             self._draft_session = None
             self._session = None

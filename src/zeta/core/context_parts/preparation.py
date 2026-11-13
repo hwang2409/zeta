@@ -107,7 +107,7 @@ class ContextPreparation:
         try:
             while True:
                 assembly_budget = self.budget(reserved_estimator_tokens)
-                branch = self._store.active_branch_snapshot()
+                branch = tuple(self._store.entry(ref) for ref in self._store.branch_refs())
                 branch_id = branch[-1].id if branch else None
                 prompt_generation, system_prompt = self._prompt_state()
                 preparation = await asyncio.to_thread(

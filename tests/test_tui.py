@@ -60,8 +60,10 @@ import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
 import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
+import zeta.tui.runtime.prompt as prompt_runtime_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.completion import completion_control
 from tests.support.credentials import (
     anthropic_credentials,
@@ -119,12 +121,8 @@ from zeta.tui.agent_card import (
     AgentTranscriptControl,
     read_agent_transcript,
 )
-from zeta.tui.app import (
-    FullScreenPromptSession,
-    TUIApp,
-    background_notice,
-    build_backend,
-)
+from zeta.tui.app import FullScreenPromptSession, TUIApp, build_backend
+from zeta.tui.bootstrap import background_notice
 from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
@@ -3765,7 +3763,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     ) -> str:
         del arguments, abort_signal
         publisher.publish("first\n", "stdout")
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return "unreachable"
 
     store = ConversationStore(tmp_path)
@@ -3788,7 +3786,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
 
     await wait_until(lambda: app._tool_region is not None)
     app.abort_active()
-    await task
+    await asyncio.wait_for(task, 10)
 
     expected = render_event(
         StreamEvent(
@@ -3827,7 +3825,7 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
     assert "  ↳ [stdout] first" not in tool_region
     assert app._loop_state == "interrupted"
     results = [
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     ]
     assert len(results) == 1
     assert results[0] is not None
@@ -4710,7 +4708,7 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
     assert app._active_task is not None
     await asyncio.wait_for(app._active_task, 10)
 
-    messages = store.messages()
+    messages = branch_messages(store)
     assert [message.role for message in messages] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
@@ -4813,7 +4811,7 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
     await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -4853,7 +4851,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
             Message(MessageRole.USER, [TextContent("old")]), MessageOrigin.USER
         )
     )
-    baseline = [entry.id for entry in store.replay()]
+    baseline = [entry.id for entry in branch_entries(store)]
     backend = PartialThenErrorBackend()
     assembler = ContextAssembler(
         store,
@@ -4882,7 +4880,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     assert "provider failure · stream_error" in rendered
     assert "compaction stream aborted" in rendered
     assert store.compaction_marker_count() == 0
-    assert [entry.id for entry in store.replay()][: len(baseline)] == baseline
+    assert [entry.id for entry in branch_entries(store)][: len(baseline)] == baseline
     assert store.turn_in_flight() is False
 
     app.retry_failed_turn()
@@ -4890,7 +4888,7 @@ async def test_compaction_error_event_aborts_and_preserves_source(
     await asyncio.wait_for(app._active_task, 10)
 
     assert backend.calls == 3
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -4926,7 +4924,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         "".join(f"{json.dumps(row)}\n" for row in rows), encoding="utf-8"
     )
     store = ConversationStore(root, session_id=store.session_id)
-    historical = store.messages()[0]
+    historical = branch_messages(store)[0]
     output = StringIO()
     backend = ErrorThenSuccessBackend()
     app = TUIApp(
@@ -4949,7 +4947,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
     await asyncio.wait_for(app._active_task, 10)
 
     users = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert users == [historical]
     assert users[0].metadata == {}
@@ -5050,7 +5048,7 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
     await await_or_fail(task, what="draft response completion")
 
     assert session.app.current_buffer.text == "draft while streaming"
-    failed_message = app.loop.store.messages()[-1]
+    failed_message = branch_messages(app.loop.store)[-1]
     assert failed_message.metadata["turn_failed"] is True
 
 
@@ -5152,7 +5150,7 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
     assert first_image.exists()
     assert second_image.exists()
     user_messages = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert user_messages[0].content[1].path == str(first_image)
     assert user_messages[1].content[1].path == str(second_image)
@@ -6218,7 +6216,7 @@ async def test_recovered_canceled_agent_card_expands_with_child_tail(
     )
     await loop.activate()
     result = next(
-        message.tool_result for message in store.messages() if message.tool_result
+        message.tool_result for message in branch_messages(store) if message.tool_result
     )
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,
@@ -7588,11 +7586,50 @@ def test_thought_updates_keep_active_unit_after_interleaved_output(
     assert "tool output" in rendered
 
 
+def test_thought_duration_survives_unrelated_background_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = iter((10.0, 10.25))
+    monkeypatch.setattr("zeta.tui.runtime.stream.time.monotonic", lambda: next(ticks))
+    output = StringIO()
+    app = _test_tui_app(ConversationStore(tmp_path), output)
+    app._active_session = app._make_session()
+
+    try:
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=ThinkingContent("plan"),
+            )
+        )
+        app._handle_background_event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "kind": "task_exited",
+                    "task_id": "background-task",
+                    "headline": "finished",
+                    "exit_code": 0,
+                },
+            )
+        )
+        app._flush_pending_stream()
+
+        rendered = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(120)
+        )
+        assert "✱ thought · 0.2s" in rendered
+        assert "plan" in rendered
+    finally:
+        monkeypatch.undo()
+        asyncio.run(app.close())
+
+
 def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ticks = iter((10.0, 10.25))
-    monkeypatch.setattr("zeta.tui.app.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("zeta.tui.runtime.stream.time.monotonic", lambda: next(ticks))
     output = StringIO()
     app = TUIApp(
         AgentLoop(
@@ -8162,7 +8199,7 @@ def test_completed_message_replaces_streaming_unit_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.runtime.stream.render_markdown", spy)
     app._consume_text(
         StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent(source))
     )
@@ -8203,7 +8240,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.runtime.stream.render_markdown", spy)
     before = "**before tool**"
     after = "**after tool**"
     events = [
@@ -8752,17 +8789,17 @@ async def test_exit_during_activation_keeps_accepted_input_in_draft(
 
     async def blocked_activation() -> None:
         activation_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
 
     async def type_then_exit(session: FullScreenPromptSession, owner: object) -> object:
         del session, owner
-        await activation_started.wait()
+        await await_or_fail(activation_started.wait(), what="activation start")
         assert app._submit_input("do not lose me")
         app.request_exit()
         return None
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_exit)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", type_then_exit)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -8801,18 +8838,18 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
 
     async def blocked_activation() -> None:
         activation_started.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
 
     async def type_then_crash(
         session: FullScreenPromptSession, owner: object
     ) -> object:
         del session, owner
-        await activation_started.wait()
+        await await_or_fail(activation_started.wait(), what="activation start")
         assert app._submit_input("queued before render crash")
         raise RuntimeError("render crash")
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_crash)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", type_then_crash)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -8855,7 +8892,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
     async def blocked_activation() -> None:
         activation_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="activation cancellation")
         except asyncio.CancelledError:
             activation_cancelled.set()
             raise
@@ -8864,14 +8901,14 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         del session, owner
         prompt_started.set()
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="prompt cancellation")
         except asyncio.CancelledError:
             prompt_cancelled.set()
             raise
         return None
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", waiting_prompt)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", waiting_prompt)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -8890,7 +8927,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         assert app._submit_input("accepted before cancel")
         run.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await run
+            await asyncio.wait_for(run, 10)
 
     assert prompt_cancelled.is_set(), "prompt task outlived the cancelled run"
     assert activation_cancelled.is_set(), "activation task outlived the cancelled run"
@@ -9020,7 +9057,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import zeta.agent.background_lifecycle
-    from zeta.tui import app as tui_app
+    import zeta.tui.runtime.prompt as prompt_runtime_module
 
     root = ConversationStore(tmp_path / "sessions")
     for number in range(1, 4):
@@ -9054,13 +9091,13 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_release = threading.Event()
     activation_cancelled = asyncio.Event()
     recover_agent_children = zeta.agent.background_lifecycle._recover_agent_children
-    cancel_activation = tui_app.cancel_activation
+    cancel_activation = prompt_runtime_module.cancel_activation
 
     async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
         activation_cancelled.set()
         await cancel_activation(task)
 
-    monkeypatch.setattr(tui_app, "cancel_activation", observed_cancel_activation)
+    monkeypatch.setattr(prompt_runtime_module, "cancel_activation", observed_cancel_activation)
 
     recovery_steps = 0
     gated_once = False
@@ -9096,7 +9133,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         resumed=True,
     )
     monkeypatch.setattr(
-        "zeta.tui.app.start_tui_stall_watchdog", lambda *args, **kwargs: None
+        "zeta.tui.runtime.prompt.start_tui_stall_watchdog", lambda *args, **kwargs: None
     )
 
     with create_pipe_input() as pipe:
@@ -9575,7 +9612,7 @@ def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "transcript recovered; preserved corrupt bytes in quarantine" in rendered
-    assert recovered.entries[-1].data["quarantine_id"] in rendered
+    assert resident_entries(recovered)[-1].data["quarantine_id"] in rendered
 
 
 def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
@@ -11510,19 +11547,19 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
         await await_or_fail(backend.started.wait(), what="queued response start")
         pipe.send_text("second\r")
         backend.release.set()
-        await wait_until(lambda: len(store.messages()) == 4)
+        await wait_until(lambda: len(branch_messages(store)) == 4)
         pipe.send_text("\x04")
         await await_or_fail(run_task, what="queued TUI run")
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
     ]
     assert user_texts == ["first", "second"]
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.USER,
@@ -11589,7 +11626,7 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
 
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11622,7 +11659,7 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
 
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11664,7 +11701,7 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     assert [request.key for request in app.pending_approvals] == [call.id]
     assert [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11694,7 +11731,7 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11726,7 +11763,7 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
 
     user_texts = [
         block.text
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.role is MessageRole.USER
         for block in message.content
         if isinstance(block, TextContent)
@@ -11778,7 +11815,7 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
 
     async def block(arguments: dict[str, object]) -> str:
         tool_started.set()
-        await asyncio.Event().wait()
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return "unreachable"
 
     store = ConversationStore(tmp_path / "sessions")
@@ -11794,19 +11831,19 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
-        await tool_started.wait()
+        await asyncio.wait_for(tool_started.wait(), 10)
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
+                len(branch_messages(store)) == 3
+                and branch_messages(store)[-1].tool_result is not None
             )
         )
         pipe.send_text("draft")
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, 10)
 
-    result = store.messages()[-1].tool_result
+    result = branch_messages(store)[-1].tool_result
     assert result is not None
     assert result.tool_call_id == call.id
     assert result.content == "tool execution canceled"
@@ -11833,18 +11870,18 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
-        await backend.tool_update.wait()
+        await asyncio.wait_for(backend.tool_update.wait(), 10)
         pipe.send_text("\x03")
         await wait_until(
             lambda: (
-                len(store.messages()) == 3
-                and store.messages()[-1].tool_result is not None
+                len(branch_messages(store)) == 3
+                and branch_messages(store)[-1].tool_result is not None
             )
         )
         pipe.send_text("\x04")
-        await run_task
+        await asyncio.wait_for(run_task, 10)
 
-    messages = store.messages()
+    messages = branch_messages(store)
     calls = [
         block.tool_call
         for block in messages[1].content
@@ -13359,7 +13396,7 @@ def test_new_session_continues_after_failed_draft_save(
         ("render_error", False, 1),
         ("restart", False, 0),
         ("keyboard_interrupt", False, None),
-        ("unexpected_error", False, None),
+        ("unexpected_error", False, 1),
         ("render_error", True, 1),
         ("restart", True, 0),
     ),
@@ -13437,12 +13474,14 @@ def test_failed_active_draft_is_printed_on_every_exit(
     if exit_kind == "keyboard_interrupt":
         with pytest.raises(KeyboardInterrupt):
             cli_main_module.main([])
-    elif exit_kind == "unexpected_error":
-        with pytest.raises(RuntimeError, match="unexpected failure"):
-            cli_main_module.main([])
     else:
         assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
+    assert ("zeta: crashed; details in" in stderr) is (exit_kind == "unexpected_error")
+    assert "unexpected failure" not in stderr
+    if exit_kind == "unexpected_error":
+        log = Path(os.environ["ZETA_HOME"]) / "logs" / "tui-errors.jsonl"
+        assert "RuntimeError: unexpected failure" in log.read_text()
     expected_drafts = 2 if with_replaced_draft else 1
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == expected_drafts
@@ -13453,14 +13492,14 @@ def test_failed_active_draft_is_printed_on_every_exit(
 
 @pytest.mark.parametrize(
     ("exit_kind", "expected_status"),
-    (("render_error", 1), ("restart", 0), ("unexpected_error", None)),
+    (("render_error", 1), ("restart", 0), ("unexpected_error", 1)),
 )
 def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     exit_kind: str,
-    expected_status: int | None,
+    expected_status: int,
 ) -> None:
     names = iter(("old", "new"))
     runs = 0
@@ -13519,12 +13558,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
         cli_main_module, "patch_stdout", lambda **_kwargs: nullcontext()
     )
 
-    if exit_kind == "unexpected_error":
-        with pytest.raises(RuntimeError, match="unexpected failure"):
-            cli_main_module.main([])
-    else:
-        assert cli_main_module.main([]) == expected_status
+    assert cli_main_module.main([]) == expected_status
     stderr = stderr_before_restart + capsys.readouterr().err
+    assert ("zeta: crashed; details in" in stderr) is (exit_kind == "unexpected_error")
     assert "unsaved composer draft:" in stderr
     assert stderr.count("unsaved composer draft:") == 1
     assert "draft one" in stderr
@@ -13928,7 +13964,7 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
     assert app._active_task is not None
     await asyncio.wait_for(app._active_task, 10)
 
-    message = store.messages()[0]
+    message = branch_messages(store)[0]
     assert message.content == [
         TextContent(f"@./{secret.name} $ARGUMENTS !`echo unsafe`")
     ]
@@ -14130,7 +14166,7 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
     await asyncio.wait_for(app._active_task, 10)
 
     user_messages = [
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     ]
     assert isinstance(user_messages[-1].content[1], ImageContent)
     assert user_messages[-1].content[1].data == base64.b64encode(PNG).decode()
@@ -14747,7 +14783,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
     monkeypatch.setattr(AccountStore, "list_display", checked_list_display)
 
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     output = StringIO()
     Console(file=output, force_terminal=False, width=80).print(rendered[0])
     plain = Text.from_ansi(output.getvalue()).plain
@@ -14769,6 +14805,145 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
         "codex": "codex:second"
     }
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_picker_is_view_only_during_turn_then_switches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    rendered: list[Panel] = []
+    app._presenter.print_unit = rendered.append
+    busy = True
+    monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
+
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+    assert app.accounts_picker_active
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert "codex:first" in plain
+    assert "codex:second" in plain
+    assert "usage" in plain
+    assert "view only · switching waits until the turn ends" in plain
+    assert "↑/↓ · r refresh · esc" in plain
+
+    app.accounts_picker_move(1)
+    assert app.accounts_picker_select() is None
+    assert app.accounts_picker_default() is None
+    app.accounts_picker_login()
+    assert app.accounts_picker_logout() is None
+    app.accounts_picker_rename()
+    assert await asyncio.to_thread(context.resolve, "codex") == first
+    assert app.accounts_picker_active
+    assert app._accounts_picker.switching_unavailable == (
+        "switching waits until the turn ends"
+    )
+
+    busy = False
+    switched = app.accounts_picker_select()
+    assert switched is not None
+    await asyncio.wait_for(switched, 10)
+    assert await asyncio.to_thread(context.resolve, "codex") == second
+    await app.close()
+    opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_accounts_switch_keeps_background_child_account_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    parent_backend = FakeBackend([])
+    loop = AgentLoop(parent_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._presenter.print_unit = lambda _renderable: None
+    monkeypatch.setattr(
+        type(loop), "background_children_running", property(lambda _loop: True)
+    )
+    child_context = await asyncio.to_thread(context.child_snapshot, "codex")
+    child_store = ConversationStore(tmp_path / "child")
+    child_backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("first")], delay=0.2),
+            ScriptedTurn(content=[TextContent("second")]),
+        ]
+    )
+    child_loop = AgentLoop(child_backend, child_store, skill_catalog=SkillCatalog.empty())
+    child_loop.account_context = child_context
+    child_loop.tool_registry.account_context = child_context
+    child_turn = asyncio.create_task(
+        _collect(child_loop.run_turn("child request", origin=MessageOrigin.USER))
+    )
+    try:
+        await wait_until(lambda: len(child_backend.calls) == 1)
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+
+        monkeypatch.setattr(
+            "zeta.tui.slash_handlers.build_backend",
+            lambda *_args, **_kwargs: (parent_backend, "codex"),
+        )
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        assert app._accounts_picker is not None
+        assert app._accounts_picker.background_notice == "running children keep their account"
+        app.accounts_picker_move(1)
+        switch_task = app.accounts_picker_select()
+        assert switch_task is not None
+        await asyncio.wait_for(switch_task, 10)
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+
+        await asyncio.wait_for(child_turn, 10)
+        await asyncio.wait_for(
+            _collect(child_loop.run_turn("child follow-up", origin=MessageOrigin.USER)), 10
+        )
+        assert await asyncio.to_thread(child_context.resolve, "codex") == first
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+    finally:
+        await app.close()
+        await child_loop.close()
+        child_store.close()
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -14804,20 +14979,96 @@ async def test_account_picker_ignores_repeat_select_while_switching(
         nonlocal calls
         calls += 1
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
-    assert await app.slash_accounts("") == ""
+    assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     app.accounts_picker_move(1)
 
     first_task = app.accounts_picker_select()
     assert first_task is not None
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 10)
     assert app.accounts_picker_select() is None
     assert calls == 1
     release.set()
-    await asyncio.wait_for(first_task, 1)
+    await asyncio.wait_for(first_task, 10)
     opened.store.close()
+
+
+@pytest.mark.asyncio
+async def test_account_switch_serializes_real_prompt_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    first = AccountId("codex", "first")
+    second = AccountId("codex", "second")
+    for account in (first, second):
+        await asyncio.to_thread(
+            named_account_credentials(home, account.provider, account.name).save,
+            OAuthTokens(account.name, "refresh", 9_999_999_999),
+        )
+    await asyncio.to_thread(AccountStore(home).set_default, first)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        manager.create, provider="codex", model="offline", cwd=tmp_path
+    )
+    context = await asyncio.to_thread(
+        SessionAccountContext.load, home, manager, opened.metadata
+    )
+    initial_backend = FakeBackend([])
+    switched_backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    loop = AgentLoop(initial_backend, opened.store, skill_catalog=SkillCatalog.empty())
+    loop.manager = manager
+    loop.session_metadata = opened.metadata
+    loop.account_context = context
+    loop.tool_registry.account_context = context
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app._active_session = app._make_session()
+    app._presenter.print_unit = lambda _renderable: None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_switch = SessionAccountContext.switch_active
+    async def held_switch(self, *args: object, **kwargs: object) -> None:
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+        await original_switch(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionAccountContext, "switch_active", held_switch)
+    monkeypatch.setattr(
+        "zeta.tui.slash_handlers.build_backend",
+        lambda *_args, **_kwargs: (switched_backend, "codex"),
+    )
+    try:
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
+        app.accounts_picker_move(1)
+        switch_task = app.accounts_picker_select()
+        assert switch_task is not None
+        await asyncio.wait_for(entered.wait(), 10)
+
+        app._submit_input("hello")
+        await wait_until(lambda: app._submissions.active)
+        assert all(entry.state.value != "dispatched" for entry in app._submissions._entries.values())
+        assert switched_backend.calls == []
+        assert initial_backend.calls == []
+
+        release.set()
+        await asyncio.wait_for(switch_task, 10)
+        await asyncio.sleep(0)
+        assert not app.account_switch_pending
+        assert loop.backend is switched_backend
+        await wait_until(
+            lambda: any(
+                entry.state.value == "dispatched"
+                for entry in app._submissions._entries.values()
+            )
+        )
+        await wait_until(lambda: not app._submissions.active)
+        assert await asyncio.to_thread(context.resolve, "codex") == second
+        assert initial_backend.calls == []
+    finally:
+        release.set()
+        await app.close()
+        opened.store.close()
 
 
 @pytest.mark.asyncio
@@ -14930,6 +15181,7 @@ async def test_account_switch_applies_prepared_compaction_budget(
             original(metadata, account, **kwargs), compaction_budget=1_000_000
         )
 
+    # test-contract: seam this test replaces the manager boundary to verify budget propagation.
     monkeypatch.setattr(manager, "_apply_account_selection", prepare_with_larger_budget)
     try:
         await context.switch_active(
@@ -14980,6 +15232,11 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         del provider, build_backend
         await asyncio.to_thread(checked_switch, selected, boundary=boundary)
 
+    async def switch_account(_account, context, _prepare_backend):
+        await context.switch_active(
+            None, _account, boundary=0, provider="claude", build_backend=None
+        )
+
     app = SimpleNamespace(
         _accounts_picker=SimpleNamespace(highlighted=account),
         _account_switch_task=None,
@@ -14995,11 +15252,13 @@ async def test_tui_session_account_switch_runs_store_off_loop() -> None:
         model="offline",
         _dismiss_accounts_picker=lambda: None,
         _print_system=lambda _message: None,
+        _switch_account=switch_account,
+        _account_switch_done=lambda _task: None,
     )
 
     task = TUIApp.accounts_picker_select(app)
     assert task is not None
-    await task
+    await asyncio.wait_for(task, 10)
 
     assert switched == [(account, 0)]
 
@@ -15066,7 +15325,7 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     publisher.start()
     assert publisher_waiting.wait(10)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         assert app._accounts_picker is not None
         assert publisher.is_alive()
     finally:
@@ -15161,7 +15420,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
 
     monkeypatch.setattr(AccountUsage, "refresh_stale", refresh_stale)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
@@ -15229,7 +15488,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     holder.start()
     assert locked.wait(1)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await await_or_fail(
             refresh_rendered.wait(), what="busy account refresh render"
@@ -15295,7 +15554,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
     # test-contract: seam no public account-refresh completion event exists
     monkeypatch.setattr(app, "_repaint_accounts_picker", repaint_and_signal)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_refresh()
         await asyncio.wait_for(refresh_done.wait(), timeout=10)
         # test-contract: seam no public account-refresh executor identity exists
@@ -15505,7 +15764,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
     monkeypatch.setattr(AccountStore, "logout", checked_logout)
     try:
-        assert await app.slash_accounts("") == ""
+        assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
@@ -15517,7 +15776,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
 
         task = app.accounts_picker_logout()
         assert task is not None
-        await task
+        await asyncio.wait_for(task, 10)
 
         assert off_loop_calls == 1
         assert not await asyncio.to_thread(AccountStore(home).contains, removed)

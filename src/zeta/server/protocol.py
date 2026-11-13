@@ -229,6 +229,7 @@ class EventDescriptor(StrEnum):
     CHILD_ENDED = "child_ended"
     BACKGROUND_TASK_UPDATED = "background_task_updated"
     TODO_UPDATED = "todo_updated"
+    ZETA_UPDATED = "zeta_updated"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -257,6 +258,7 @@ FEATURES = (
     "approval_reconnect",
     "session_history_backward",
     "session_host_commands",
+    "session_mcp_bindings",
     "session_history_fidelity",
     "session_replay_seq",
     "child_run_history",
@@ -268,6 +270,7 @@ FEATURES = (
     "child_runs",
     "delivery_session_guard",
     "run_work",
+    "zeta_updated",
     "approval_restart_reason",
 )
 

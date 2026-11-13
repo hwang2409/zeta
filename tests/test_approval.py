@@ -6,6 +6,7 @@ from threading import Event
 
 import pytest
 
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
@@ -185,8 +186,8 @@ skill_catalog=SkillCatalog.empty(),
     pending = (await asyncio.wait_for(restarted_policy.pending_requests(), 10))
 
     assert pending == [ApprovalRequest(call.id, call)]
-    assert restarted_store.entries[-1].type == "message"
-    assert restarted_store.entries[-1].data["approval_requests"]
+    assert resident_entries(restarted_store)[-1].type == "message"
+    assert resident_entries(restarted_store)[-1].data["approval_requests"]
 
     assert restarted_policy.approve(call.id)
     restarted_registry = ToolRegistry(
@@ -260,10 +261,10 @@ skill_catalog=SkillCatalog.empty(),
         ).run_turn("start", origin=MessageOrigin.USER)
     )
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result == ToolResult(call.id, "tool execution denied", True)
-    assert store.messages()[-1].content[0].text == "done"
+    assert branch_messages(store)[-1].content[0].text == "done"
 
 
 @pytest.mark.asyncio
@@ -306,11 +307,11 @@ skill_catalog=SkillCatalog.empty(),
     registry.abort()
     events = await asyncio.wait_for(task, timeout=10)
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert results == [ToolResult(call.id, "tool execution canceled", True)]
     assert (await asyncio.wait_for(policy.pending_requests(), 10)) == []
     assert events[-1].type.value == "agent_end"
-    assert [message.role for message in store.messages()] == [
+    assert [message.role for message in branch_messages(store)] == [
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL_RESULT,
@@ -383,7 +384,7 @@ skill_catalog=SkillCatalog.empty(),
     assert not any(event.type is StreamEventType.TOOL_EXECUTION_START for event in events)
     assert all(
         not any(isinstance(block, ToolUseContent) for block in message.content)
-        for message in restarted.messages()
+        for message in branch_messages(restarted)
     )
     assert (await ApprovalPolicy(default="ask", store=restarted).pending_requests()) == []
 
@@ -408,7 +409,7 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
     assert not any(
-        entry.type == "approval_resolution" for entry in reopened.entries
+        entry.type == "approval_resolution" for entry in resident_entries(reopened)
     )
 
 
@@ -417,7 +418,7 @@ def test_approval_resolution_reason_is_bounded_and_abort_only(approval_root: Pat
     call = ToolCall("reason-call", "echo", {})
     store.append_approval_request(call.id, call)
     store.append_approval_resolution(call.id, "abort", reason="controller_disconnected")
-    assert store.entries[-1].data["reason"] == "controller_disconnected"
+    assert resident_entries(store)[-1].data["reason"] == "controller_disconnected"
     with pytest.raises(ValueError):
         store.append_approval_resolution(call.id, "allow", reason="turn_canceled")
 
@@ -1069,7 +1070,7 @@ def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> N
     assert sorted(results) == [False, True]
     resolutions = [
         entry
-        for entry in store.entries
+        for entry in resident_entries(store)
         if entry.type == "approval_resolution"
     ]
     assert len(resolutions) == 1

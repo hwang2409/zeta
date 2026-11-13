@@ -1,3 +1,4 @@
+
 """Rendering failures must restore the terminal and preserve resumable state."""
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.cli import main as cli
 from zeta.core.session import SessionManager
@@ -155,7 +157,7 @@ def test_render_failure_exits_without_input_and_restores_session(
         assert f"resume with: zeta --resume {store.session_id}" in error
         reopened = manager.open(store.session_id)
         try:
-            assert reopened.store.messages() == [saved]
+            assert branch_messages(reopened.store) == [saved]
             assert DraftPersistence(reopened.store.session_dir / "draft").load() == "unsent draft"
         finally:
             reopened.store.close()

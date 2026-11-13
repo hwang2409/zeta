@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import request
@@ -45,8 +46,11 @@ class _HistoryStore:
         self._log_offset = len(entries)
         self._entry_prefix_digest = bytes([len(entries)])
 
-    def active_branch_snapshot(self) -> list[object]:
+    def branch_refs(self) -> list[object]:
         return list(self.entries)
+
+    def entry(self, ref):
+        return ref
 
 
 def _runtime(store: object) -> SimpleNamespace:
@@ -442,7 +446,7 @@ async def test_real_socket_branch_during_read_returns_current_branch(
             asyncio.to_thread(wait_for_page), what="history index page"
         )
         server.runtime.opened.store.append_message_fork(
-            server.runtime.opened.store.active_branch_snapshot()[0].id
+            branch_entries(server.runtime.opened.store)[0].id
         )
         release_page.set()
         response = (await await_or_fail(pending, what="history request"))[-1]
@@ -462,7 +466,7 @@ async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: p
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         assert first["messages"][0]["content"][0]["text"].startswith("message-")
-        user_id = server.runtime.opened.store.active_branch_snapshot()[0].id
+        user_id = branch_entries(server.runtime.opened.store)[0].id
         fork = (await request(reader, writer, 4, "fork_message", {"session_id": session_id, "message_id": user_id}))[-1]
         assert "error" not in fork
         response = (await request(reader, writer, 5, "session_history", {

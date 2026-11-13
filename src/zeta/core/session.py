@@ -22,7 +22,7 @@ from ..skills import SkillCatalog
 from ..storage_format import advance, mapping_mutations, open_writer, release_later
 from ..skills.agent_catalog import AgentCatalog
 from .checkpoints import ConversationIntegrityError, load_session_json
-from .project_context import discover_or_find_project
+from .project_context import associate_project_discovery, discover_project
 from .store import ConversationStore, TranscriptLoadError
 from .transcript_recovery import (
     RepairResult,
@@ -191,10 +191,15 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             raise SessionError("invalid project role")
         if project_id is None and auto_project and self.project_registry is not None:
             try:
-                project = discover_or_find_project(
-                    self.project_registry, resolved_cwd, self.user_home
+                discovery = associate_project_discovery(
+                    discover_project(resolved_cwd, user_home=self.user_home),
+                    self.project_registry,
                 )
-                project_id = project.project_id if project is not None else None
+                project_id = (
+                    discovery.project.project_id
+                    if discovery.project is not None
+                    else None
+                )
             except (ProjectRegistryError, OSError, ValueError) as exc:
                 logger.warning(
                     "project discovery unavailable; continuing without project: %s", exc
@@ -715,7 +720,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             ValueError,
         ) as exc:
             logger.warning(
-                "project session linkage remains pending for %s: %s", session_id, exc
+                "project session linkage remains pending for %s (%s): %s",
+                session_id,
+                type(exc).__name__,
+                exc,
             )
 
     def _reconcile_child_links(

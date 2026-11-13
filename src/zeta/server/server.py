@@ -36,6 +36,7 @@ from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
+    EventDescriptor,
     FrameCodec,
     FrameWriteOwner,
     MethodDescriptor,
@@ -279,6 +280,15 @@ class ZetaServer:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def publish_update(self, old_revision: str, new_revision: str) -> None:
+        if self.connections is not None:
+            await self.connections.publish_feature_event(
+                "zeta_updated",
+                EventDescriptor.ZETA_UPDATED,
+                self.runtime.session_id if self.runtime.opened is not None else None,
+                data={"old_revision": old_revision, "new_revision": new_revision},
+            )
 
     @property
     def address(self) -> str:
@@ -619,6 +629,16 @@ class _Client:
     ) -> tuple[bool, object]:
         if method == "hello":
             result = self._hello(params)
+            reconnect_bindings = None
+            if "mcp_bindings" in params:
+                if self.role != "controller":
+                    raise ProtocolError(
+                        ErrorDescriptor.INVALID_PARAMS,
+                        "mcp_bindings require a controller connection",
+                    )
+                from .handlers.lifecycle import reconnect_mcp_bindings
+
+                reconnect_bindings = await reconnect_mcp_bindings(self, params)
             if self.role == "controller":
                 reconnect = "approval_reconnect" in self.features
                 claimed = await self.server.control.controller_claimed(
@@ -631,6 +651,13 @@ class _Client:
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
+                if reconnect_bindings is not None:
+                    headers, configs = reconnect_bindings
+                    loop = self.server.runtime.loop
+                    assert loop is not None
+                    await loop.set_mcp_bindings(headers, configs)
+                    await loop._ensure_mcp_servers()
+                    self.server.control._active_mcp_bindings = headers
                 self.server._client_active = True
                 self.server._client = self
                 self.connections.activate_controller(self)

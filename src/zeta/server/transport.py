@@ -238,7 +238,12 @@ class WebSocketConnection:
 
 
 async def run_server(server: ZetaServer) -> None:
+    from .. import __file__ as package_file
+    from ..runtime.update_notice import process_update_monitor
+
     loop = asyncio.get_running_loop()
+    monitor = process_update_monitor(package_file or "")
+    unsubscribe = monitor.subscribe(server.publish_update)
     stopped = asyncio.Event()
     installed: list[signal.Signals] = []
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -248,13 +253,16 @@ async def run_server(server: ZetaServer) -> None:
             continue
         installed.append(signum)
     await server.start()
+    monitor.start()
     serving = asyncio.create_task(server.serve_forever())
     try:
         await stopped.wait()
     finally:
+        unsubscribe()
         await server.close()
         serving.cancel()
         await asyncio.gather(serving, return_exceptions=True)
+        await monitor.close()
         for signum in installed:
             loop.remove_signal_handler(signum)
 

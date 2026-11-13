@@ -43,6 +43,7 @@ from ..providers.factory import build_backend as build_network_backend
 from ..runtime import compose_runtime
 from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
+from ..runtime.update_notice import subscribe_tui_update_notice
 from ..skills import (
     discover_session_skills,
 )
@@ -608,9 +609,20 @@ def _create_app_with_root(
     budget_pinned = composition.budget_pinned
     theme_notices = _apply_startup_theme(config.theme, home)
     _validate_keybindings(config.keybindings)
+    project_registry_notice = (
+        (
+            (
+                "project memory and inbox are off for this session: the project registry "
+                "was busy; restart to retry"
+            ),
+        )
+        if composition.project_registry_busy
+        else ()
+    )
     startup_notices = (
         tuple(loaded_settings.notices)
         + project_context.notices
+        + project_registry_notice
         + external_tools.notices
         + theme_notices
     )
@@ -681,6 +693,7 @@ def _create_app_with_root(
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system
+    subscribe_tui_update_notice(app)
     return app
 
 

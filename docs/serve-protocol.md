@@ -403,12 +403,14 @@ next turn. A failed `new_session` or `resume` keeps the previous binding while
 the session runtime still exists, and clears it when the runtime is gone.
 After a controller disconnect, a host-bound session rejects new `send` and
 `send_images` turns with `-32003` and `data.code: "host_binding_required"`
-until a controller sends `resume` with the binding again. A tool call that
-resumes after approval uses the binding that is current at that time.
+until a controller supplies the binding again. An idle session accepts it on
+`resume`.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123","host_commands":[{"name":"gamma-render","executable":"/opt/gamma/bin/render","summary":"render a file in the web surface","environment":{"GAMMA_SESSION":"s-1"}}]}}
 ```
+
+With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume`, or a reconnecting controller's `hello` during a live turn, supplies the binding again. During a running turn or pending approval, the reconnecting controller negotiates both `approval_reconnect` and `session_mcp_bindings` and supplies `session_id` and `mcp_bindings` on `hello`. The session id and server-name set must exactly match the active bound session. A tool call that resumes after approval uses the binding from the replacement attachment. Bound servers are not inherited by child sessions. serve-only: no TUI surface.
 
 ### `resume`
 
@@ -936,6 +938,14 @@ that gets no answer within its own timeout can treat the server as hung.
 
 All examples below use the common event envelope:
 
+The `zeta_updated` event requires the negotiated `zeta_updated` feature and
+contains `data.old_revision` and `data.new_revision`. When a session is open,
+it also carries `session_id`; otherwise that field is absent. `old_revision` is the
+revision the process is running, fixed when it starts. `new_revision` is the
+latest revision found on disk. These values are opaque strings: they are a git
+SHA when the source is in a git checkout, or a source hash when it is not.
+Clients must not parse either value.
+
 ```json
 {"jsonrpc":"2.0","method":"event","params":{"event":"turn_start","session_id":"abc123","data":{"turn":1,"turn_id":"5ec6b9bb4c8c44d29bfa315da83a4190"}}}
 ```
@@ -1043,6 +1053,13 @@ the project inbox poller state; its data has `kind` (`project_inbox_health`),
 (at most 200 characters, present only when degraded). It is live only: it is
 not persisted and is never replayed. Below 1.2 it rides `sub_agent_receipt`.
 
+When project association cannot acquire the project registry lock during
+session setup, the server sends one live `project_registry_busy` notification
+for the new session or resumed session. Its `data` has `notification_id`,
+`kind` (`project_registry_busy`), and `text`; the notification is not persisted
+or replayed. It uses the existing `sub_agent_receipt` event envelope, so this is
+additive and older clients can ignore the unknown `kind` and continue normally.
+
 `child_hold` is sent once per hold when a
 background child waits more than 15 minutes on a provider rate limit or a
 subscription limit; its data has `reason` (`rate_limit` or
@@ -1059,7 +1076,10 @@ When a controller negotiated `approval_reconnect`, a disconnect keeps its live
 approval wait for the configured grace. The first replacement controller that
 also negotiates the feature receives each still-pending `approval_request`
 after its successful `hello`, with the original `request_id`; `approve` or
-`deny` then resumes the original turn. If the replacement does not negotiate
+`deny` then resumes the original turn. For a session with transient MCP
+bindings, that `hello` also includes the exact active `session_id` and the same
+server-name set in `mcp_bindings`; headers are validated and attached before
+the approval is replayed. If the replacement does not negotiate
 the feature, or the grace expires first, the server durably aborts the approval
 once with reason `grace_expired`; a later decision returns `-32006`. Clients
 without the feature keep immediate disconnect abort and the prior wire shapes.
@@ -1320,6 +1340,7 @@ Event fields are:
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
+| `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1875,6 +1896,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
+| `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
@@ -1884,6 +1906,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `path_completion` | adds controller-only `path_complete` using the active session working directory and the TUI path-completion rules |
 | `delivery_session_guard` | advertises that `send`, `steer`, and `send_images` reject a `session_id` that is not the attached session (see "delivery session guard"); the guard applies whether or not the feature was negotiated, and older servers ignore `session_id` on `send` and `steer` |
 | `run_work` | adds `run_work_list` and `background_task_cancel`, plus background task and todo update events |
+| `zeta_updated` | emits one `zeta_updated` event when the running source revision changes; revision values are opaque strings and clients must not parse them |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 

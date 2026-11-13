@@ -11,6 +11,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -299,7 +300,7 @@ async def test_todo_empty_list_clears_state_and_does_not_pollute_transcript(
     }
     assert reopened.todo_items() == []
     assert "todo_items" not in json.loads(reopened.state_path.read_text())
-    assert reopened.messages() == []
+    assert branch_messages(reopened) == []
 
 
 def test_todo_items_persist_across_store_resume(tmp_path: Path) -> None:

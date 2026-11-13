@@ -142,6 +142,9 @@ class ServeControl:
         self.slash_lock = SlashLock(offload=self._run_blocking)
         self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
+        self._active_mcp_bindings: dict[str, dict[str, str]] = {}
+        self._mcp_binding_servers: frozenset[str] = frozenset()
+        self._mcp_binding_required = False
         self._host_binding_required = False
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
@@ -205,7 +208,10 @@ class ServeControl:
         self._approvals.reject_if_unhealthy()
 
     def reject_client_turn_if_detached(self) -> None:
-        if self._host_binding_required and self._active_host_commands is None:
+        if (
+            (self._host_binding_required and self._active_host_commands is None)
+            or (self._mcp_binding_required and not self._active_mcp_bindings)
+        ):
             raise ProtocolError(
                 ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
@@ -389,9 +395,18 @@ class ServeControl:
 
     def _controller_release(self, reconnect: bool) -> Awaitable[None]:
         self._active_host_commands = None
+        had_mcp_bindings = bool(self._active_mcp_bindings)
+        self._active_mcp_bindings = {}
+        async def clear_mcp() -> None:
+            loop = self.server.runtime.loop
+            if loop is not None:
+                await loop.clear_mcp_bindings()
+        clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
         if reconnect and self._grace_task is not None:
 
             async def wait_for_grace() -> None:
+                if clear_task is not None:
+                    await asyncio.shield(clear_task)
                 assert self._grace_task is not None
                 await asyncio.shield(self._grace_task)
 
@@ -401,6 +416,8 @@ class ServeControl:
             self._grace_task = asyncio.create_task(self._expire_grace())
 
             async def start_grace() -> None:
+                if clear_task is not None:
+                    await asyncio.shield(clear_task)
                 if self.server.approval_reconnect_grace == 0:
                     assert self._grace_task is not None
                     await self._grace_task
@@ -408,6 +425,8 @@ class ServeControl:
             return start_grace()
 
         async def disconnect() -> None:
+            if clear_task is not None:
+                await asyncio.shield(clear_task)
             await self._terminate_pending_approvals(suppress_write_errors=True)
             await self._disconnect_turn()
 

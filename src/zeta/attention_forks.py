@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +89,37 @@ def read_attention_fork(
     if any(not isinstance(item, str) or not item for item in value.values()):
         raise ValueError("invalid attention fork metadata")
     return AttentionFork(**value)
+
+
+def remove_attention_source_links(
+    sessions_root: Path,
+    session_ids: tuple[str, ...],
+    *,
+    charge: Callable[[], None],
+) -> None:
+    """Durably clear fork metadata whose source was quarantined."""
+    remove_ids = set(session_ids)
+    if not remove_ids:
+        return
+    try:
+        entries = sorted(Path(sessions_root).iterdir(), key=lambda path: path.name)
+    except FileNotFoundError:
+        return
+    for session_dir in entries:
+        charge()
+        if (
+            len(session_dir.name) != 32
+            or any(character not in "0123456789abcdef" for character in session_dir.name)
+        ):
+            continue
+        fd = os.open(session_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fork = read_attention_fork(session_dir, directory_fd=fd)
+            if fork is not None and fork.forked_from_session in remove_ids:
+                os.unlink("attention_fork.json", dir_fd=fd)
+                os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def validate_attention_fork(
@@ -346,7 +377,7 @@ def create_discussion_fork(
             if record.fork_session_id:
                 return record.fork_session_id
             source_metadata = source.metadata
-            branch = source.store.replay()
+            branch = [source.store.entry(ref) for ref in source.store.branch_refs()]
             anchor_index = next(
                 (
                     index
@@ -388,7 +419,7 @@ def create_discussion_fork(
                     current = attention_store.get(attention_id)
                     if (
                         reopened_source.metadata != source_metadata
-                        or reopened_source.store.replay() != branch
+                        or [reopened_source.store.entry(ref) for ref in reopened_source.store.branch_refs()] != branch
                         or current != record
                         or current.status == "resolved"
                     ):

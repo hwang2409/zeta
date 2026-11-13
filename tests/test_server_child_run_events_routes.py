@@ -1,3 +1,4 @@
+
 """child_run_events: terminal routes and delegated approvals over real ``zeta serve``.
 
 Every test runs a real ``zeta serve`` over a unix socket and an authenticated websocket
@@ -15,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
@@ -256,7 +258,7 @@ LIVE_ROUTES = [
 def _receipt_entry(store: Any, route: LiveRoute, run_id: str, call_id: str) -> Any:
     """The immediate parent's durable terminal receipt: a tool result or a notification."""
     matches = []
-    for entry in store.entries:
+    for entry in resident_entries(store):
         if route.background:
             if (
                 entry.type == "notification"
@@ -532,7 +534,7 @@ def _seed_crashed_session(home: Path, route: RecoveredRoute) -> tuple[str, Path]
 
 def _receipts(store: Any, run_id: str) -> list[Any]:
     found = []
-    for entry in store.entries:
+    for entry in resident_entries(store):
         if entry.type == "notification":
             if entry.data.get("child_instance_id") == run_id and not entry.data.get("display_only"):
                 found.append(entry)
@@ -1101,7 +1103,7 @@ async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
         assert len(ends) == 1, live
         assert ends[0]["child"]["status"] == "failed" and "finished_at" in ends[0]["child"]
         [receipt] = [
-            entry for entry in serve.store.entries
+            entry for entry in resident_entries(serve.store)
             if entry.type == "message"
             and (entry.data["message"].get("tool_result") or {}).get("tool_call_id") == "agent-1"
         ]

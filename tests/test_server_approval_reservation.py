@@ -1,3 +1,4 @@
+
 """Race and wire regressions for serve-owned approval reservation."""
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import pytest
 
 import zeta.core.session as session_module
 import zeta.core.store._async_writes as async_writes_module
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -428,7 +430,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             expected = "allow"
         await server.control.wait_for_approval_settlement()
         assert (await store.approval_resolution(call.id))["decision"] == expected
-        rows = [entry for entry in store.entries if entry.type == "approval_resolution"]
+        rows = [entry for entry in resident_entries(store) if entry.type == "approval_resolution"]
         assert len(rows) == 1
         pending = await server.control.pending_approvals()
         assert all(item["request_id"] != wire_id for item in pending)
@@ -481,7 +483,7 @@ async def test_same_tick_approval_reservation_winner(
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
             entry
-            for entry in server.runtime.opened.store.entries
+            for entry in resident_entries(server.runtime.opened.store)
             if entry.type == "approval_resolution"
         ]
         assert len(rows) == 1
@@ -651,7 +653,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         await server.control.wait_for_approval_settlement()
 
         history = [
-            entry.data for entry in parent.entries if entry.type == "approval_history"
+            entry.data for entry in resident_entries(parent) if entry.type == "approval_history"
         ]
         assert [row["event"] for row in history] == [
             "approval_request",
@@ -835,7 +837,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         if path == "delegated":
             history = [
                 entry.data
-                for entry in server.runtime.opened.store.entries
+                for entry in resident_entries(server.runtime.opened.store)
                 if entry.type == "approval_history"
             ]
             assert [row["event"] for row in history] == [
@@ -1122,7 +1124,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
         }
         old_state = server.runtime.state
         old_metadata = server.runtime.metadata.to_dict()
-        old_entries = tuple(server.runtime.opened.store.entries)
+        old_entries = tuple(resident_entries(server.runtime.opened.store))
         for request_id, method in enumerate(params_by_method, 20):
             response = (
                 await _request(
@@ -1133,7 +1135,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             assert response["error"]["code"] == -32000, method
             assert server.runtime.state is old_state
             assert server.runtime.metadata.to_dict() == old_metadata
-            assert tuple(server.runtime.opened.store.entries) == old_entries
+            assert tuple(resident_entries(server.runtime.opened.store)) == old_entries
 
         read_requests = {
             "delivery_status": {"delivery_id": "unknown"},
@@ -1765,7 +1767,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
         if path == "delegated":
             history = [
                 entry.data
-                for entry in server.runtime.opened.store.entries
+                for entry in resident_entries(server.runtime.opened.store)
                 if entry.type == "approval_history"
             ]
             assert [row["event"] for row in history] == [
@@ -1841,12 +1843,14 @@ async def test_concurrent_delegated_history_uses_store_durable_writer(
             "reason": "child_cleanup",
         }
         await store.append_approval_history_async(request)
-        await store.append_approval_history_async(end)
+        await asyncio.wait_for(store.append_approval_history_async(end), 10)
 
     try:
-        await asyncio.gather(write_pair("wire-a"), write_pair("wire-b"))
+        await asyncio.wait_for(
+            asyncio.gather(write_pair("wire-a"), write_pair("wire-b")), 10
+        )
         history = [
-            entry.data for entry in store.entries if entry.type == "approval_history"
+            entry.data for entry in resident_entries(store) if entry.type == "approval_history"
         ]
         assert len(history) == 4
         for request_id in ("wire-a", "wire-b"):
@@ -1941,7 +1945,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
         }
         assert ("child", call.id) not in server.control._approvals.state.records
         history = [
-            entry.data for entry in parent.entries if entry.type == "approval_history"
+            entry.data for entry in resident_entries(parent) if entry.type == "approval_history"
         ]
         assert history == []
     finally:
@@ -2230,7 +2234,7 @@ async def test_approval_reconnect_expiry_aborts_once(tmp_path: Path) -> None:
         await server.control.wait_for_approval_settlement()
         rows = [
             row
-            for row in server.runtime.opened.store.entries
+            for row in resident_entries(server.runtime.opened.store)
             if row.type == "approval_resolution" and row.data["request_id"] == call.id
         ]
         assert len(rows) == 1

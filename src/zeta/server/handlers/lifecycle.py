@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING, Any
 
 from ...core.session_execution import SessionOwnedError
 from ...core.session_files import SessionIdAmbiguousError, SessionNotFoundError
+from ...mcp.config import (
+    MCPServerConfig,
+    home_config_path,
+    load_mcp_config,
+    load_mcp_config_overlay,
+)
+from ...protocol.types import StreamEvent, StreamEventType
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -16,8 +24,47 @@ if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
 
 
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_RESERVED_HEADERS = frozenset({
+    "connection",
+    "content-length",
+    "expect",
+    "forwarded",
+    "host",
+    "http2-settings",
+    "keep-alive",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "via",
+    "x-real-ip",
+})
+_RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-", "x-forwarded-")
+
+
+async def _publish_project_registry_notice(self) -> None:
+    runtime = self.server.runtime
+    if runtime.project_registry_busy:
+        await self.server.control._event(
+            StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "notification_id": f"project-registry-busy:{runtime.session_id}",
+                    "kind": "project_registry_busy",
+                    "text": (
+                        "project memory and inbox are off for this session: "
+                        "the project registry was busy; restart to retry"
+                    ),
+                },
+            ),
+            session_id=runtime.session_id,
+        )
+
+
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
     try:
+        bindings = await mcp_bindings(self, params)
         initial_model = validation.optional_string(params, "model")
         initial_mode = validation.optional_string(params, "approval_mode")
         if initial_mode is not None:
@@ -42,6 +89,16 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 await model_selection.apply_rpc(
                     self.server.runtime, initial_model, initial_mode
                 )
+            if bindings is not None:
+                headers, configs = bindings
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_servers = frozenset(headers)
+                self.server.control._mcp_binding_required = bool(headers)
+            elif self.server.runtime.loop is not None:
+                self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_servers = frozenset()
+                self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
             self.server.control._host_binding_required = (
                 "session_host_commands" in self.features
@@ -49,6 +106,7 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
+            await _publish_project_registry_notice(self)
             await self.server.control.publish_session_grant_reset()
             return {"session": session_snapshot(self)}
     except BaseException:
@@ -60,6 +118,9 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
 
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
+        bindings = await mcp_bindings(self, params)
+        state = self.server.runtime.state
+        previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
             self.server.connections.replay_session_replaced()
@@ -116,6 +177,16 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
+            if bindings is not None:
+                headers, configs = bindings
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                self.server.control._active_mcp_bindings = headers
+                self.server.control._mcp_binding_servers = frozenset(headers)
+                self.server.control._mcp_binding_required = bool(headers)
+            elif previous_session_id != session_id:
+                self.server.control._active_mcp_bindings = {}
+                self.server.control._mcp_binding_servers = frozenset()
+                self.server.control._mcp_binding_required = False
             self.server.control._active_host_commands = candidate
             self.server.control._host_binding_required = (
                 "session_host_commands" in self.features
@@ -123,6 +194,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control.session_replaced()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
+            await _publish_project_registry_notice(self)
             await self.server.control.publish_session_grant_reset()
             return {"session": session_snapshot(self)}
     except BaseException:
@@ -130,6 +202,112 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control._active_host_commands = None
             self.server.control._host_binding_required = False
         raise
+
+
+async def mcp_bindings(
+    self, params: dict[str, Any]
+) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
+    if "mcp_bindings" not in params:
+        return None
+    validation.require_feature(self, "session_mcp_bindings", "mcp_bindings")
+    parsed = parse_mcp_bindings(params["mcp_bindings"])
+    configs = await resolve_mcp_bindings(self, parsed, params.get("cwd"))
+    return parsed, configs
+
+
+async def reconnect_mcp_bindings(
+    self, params: dict[str, Any]
+) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
+    if "mcp_bindings" not in params:
+        return None
+    validation.require_feature(self, "approval_reconnect", "mcp_bindings")
+    bindings = await mcp_bindings(self, params)
+    assert bindings is not None
+    session_id = validation.required_string(params, "session_id")
+    state = self.server.runtime.state
+    control = self.server.control
+    if (
+        state is None
+        or state.session_id != session_id
+        or not control._mcp_binding_required
+        or frozenset(bindings[0]) != control._mcp_binding_servers
+    ):
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "mcp_bindings must match the active session",
+        )
+    return bindings
+
+
+def _valid_mcp_header(header: object, value: object) -> bool:
+    if type(header) is not str or type(value) is not str or not header:
+        return False
+    folded = header.casefold()
+    return (
+        _HEADER_NAME.fullmatch(header) is not None
+        and folded not in _RESERVED_HEADERS
+        and not folded.startswith(_RESERVED_HEADER_PREFIXES)
+        and not any(ord(char) < 32 and char not in "\t" for char in value)
+        and not any(ord(char) > 126 for char in value)
+        and len(header.encode()) <= 256
+        and len(value.encode()) <= 8192
+    )
+
+
+def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
+    if type(raw) is not list:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "mcp_bindings must be a list")
+    result: dict[str, dict[str, str]] = {}
+    for item in raw:
+        if type(item) is not dict or type(item.get("server")) is not str:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
+        name = item["server"]
+        headers = item.get("headers")
+        if name in result or type(headers) is not dict or len(headers) > 64:
+            raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
+        parsed: dict[str, str] = {}
+        for header, value in headers.items():
+            if not _valid_mcp_header(header, value):
+                raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid MCP binding")
+            parsed[header] = value
+        result[name] = parsed
+    return result
+
+
+async def resolve_mcp_bindings(
+    self, bindings: dict[str, dict[str, str]], project_dir: object = None
+) -> dict[str, MCPServerConfig]:
+    home_path = home_config_path(self.server.runtime.home)
+    loop = self.server.runtime.loop
+    project_dir = (
+        loop.tool_registry.cwd
+        if loop is not None and project_dir is None
+        else project_dir if project_dir is not None else self.server.runtime.cwd
+    )
+    config, effective = await asyncio.gather(
+        asyncio.to_thread(load_mcp_config, home_path),
+        asyncio.to_thread(
+            load_mcp_config_overlay,
+            home=self.server.runtime.home,
+            project_dir=project_dir,
+        ),
+    )
+    resolved: dict[str, MCPServerConfig] = {}
+    for name in bindings:
+        source = config.sources.get(name, config.path)
+        server = config.configured_servers.get(name)
+        effective_source = effective.sources.get(name, effective.path)
+        if (
+            server is None
+            or source != config.path
+            or effective_source != config.path
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                f"MCP server is not a trusted global server: {name}",
+            )
+        resolved[name] = server
+    return resolved
 
 
 def host_commands(self, params: dict[str, Any]) -> SessionHostCommands:

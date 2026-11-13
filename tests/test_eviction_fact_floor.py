@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.context_accounting import message_token_count
 from zeta.context_eviction import valid_eviction_view
@@ -451,7 +452,7 @@ async def test_corrupt_floor_keeps_view_and_next_eviction_rebuilds_floor(
     reopened = ConversationStore(
         tmp_path / "sessions", session_id=session_id, _must_exist=True
     )
-    marker = next(entry for entry in reopened.replay() if entry.type == "compaction")
+    marker = next(entry for entry in branch_entries(reopened) if entry.type == "compaction")
     assembled = await ContextAssembler(
         reopened, token_budget=100_000, retained_tail=1
     ).assemble_context()
@@ -467,7 +468,7 @@ async def test_corrupt_floor_keeps_view_and_next_eviction_rebuilds_floor(
     await ContextAssembler(
         reopened, token_budget=2_000, retained_tail=1
     ).assemble_context(force=True)
-    rebuilt = ContextAssembler._active_markers(reopened.replay())
+    rebuilt = ContextAssembler._active_markers(branch_entries(reopened))
     assert len(rebuilt) == 1
     assert rebuilt[0].id != marker.id
     assert validate_fact_floor(rebuilt[0].data.get("fact_floor"))
@@ -501,7 +502,7 @@ async def test_repeated_real_eviction_keeps_floor_out_of_generic_view(
             )
 
         planned = await assembler.assemble_context(force=True)
-        branch = store.replay()
+        branch = branch_entries(store)
         marker = ContextAssembler._active_markers(branch)[0]
         active_source_seqs = {
             entry.seq for entry in branch if entry.type in {"message", "compaction"}
@@ -523,7 +524,7 @@ async def test_repeated_real_eviction_keeps_floor_out_of_generic_view(
         marker_count = sum(entry.type == "compaction" for entry in branch)
         readback = await assembler.assemble_context()
         assert readback.token_count == planned.token_count
-        assert sum(entry.type == "compaction" for entry in store.replay()) == marker_count
+        assert sum(entry.type == "compaction" for entry in branch_entries(store)) == marker_count
 
         store.append_message(_assistant("short follow-up"))
         store.append_message(
@@ -533,7 +534,7 @@ async def test_repeated_real_eviction_keeps_floor_out_of_generic_view(
         )
         assembled = await assembler.assemble_context()
         assert abs(assembled.token_count - planned.token_count) < 100
-        assert sum(entry.type == "compaction" for entry in store.replay()) == marker_count
+        assert sum(entry.type == "compaction" for entry in branch_entries(store)) == marker_count
 
 
 def test_floor_projects_after_view_and_before_retained_rows() -> None:
@@ -584,7 +585,7 @@ async def test_public_eviction_persists_floor_accounting_and_no_fact_compatibili
             store, token_budget=2_000, retained_tail=1
         ).assemble_context(force=True)
         marker = next(
-            entry for entry in reversed(store.replay()) if entry.type == "compaction"
+            entry for entry in reversed(branch_entries(store)) if entry.type == "compaction"
         )
         return marker.data, context.messages
 

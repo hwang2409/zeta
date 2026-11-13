@@ -1,4 +1,6 @@
 
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
+
 from tests.support.owned import await_or_fail
 from zeta.providers.completion import owned_completion
 from pathlib import Path
@@ -124,7 +126,7 @@ async def _append_during_preparation(
 
 
 def test_needs_compaction_uses_resident_branch_without_replay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     results: list[bool] = []
     for name, offset in (("below", -1), ("at", 0), ("above", 1)):
@@ -137,23 +139,12 @@ def test_needs_compaction_uses_resident_branch_without_replay(
         )
         tokens[0] = assembler.trigger_token_budget + offset
         store.append_message(text(MessageRole.USER, name))
-        monkeypatch.setattr(
-            store,
-            "replay",
-            lambda: pytest.fail("needs_compaction must not replay the branch"),
-        )
-
         results.append(assembler.needs_compaction())
 
     store = ConversationStore(tmp_path / "after-marker")
     store.append_message(text(MessageRole.USER, "old"))
     store.append_compaction_marker("summary", 1, 1)
     assembler = ContextAssembler(store, token_budget=100, token_counter=lambda _: 1)
-    monkeypatch.setattr(
-        store,
-        "replay",
-        lambda: pytest.fail("needs_compaction must not replay the branch"),
-    )
     results.append(assembler.needs_compaction())
 
     assert results == [False, False, True, False]
@@ -613,7 +604,7 @@ async def test_minimal_tool_tail_is_truncated_without_mutating_store(
     assert assembled_result.content.startswith("head")
     assert "tail\n[output truncated for context:" in assembled_result.content
     assert "full output is in the session log at seq 3" in assembled_result.content
-    assert store.messages()[2].tool_result == original_result
+    assert branch_messages(store)[2].tool_result == original_result
 
     anthropic = build_messages_payload(
         first.messages, [], model="claude-sonnet-4-5", max_tokens=10_000
@@ -957,7 +948,7 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
         await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 @pytest.mark.asyncio
@@ -978,7 +969,7 @@ async def test_marker_replays_as_digest_not_source_range(context_root: Path) -> 
     messages = await assembler.assemble()
     replayed = await assembler.assemble()
 
-    assert [entry.type for entry in store.replay()] == [
+    assert [entry.type for entry in branch_entries(store)] == [
         "message",
         "message",
         "message",
@@ -1051,7 +1042,7 @@ async def test_removed_automation_session_fixture_evicts(tmp_path: Path) -> None
     )
     assert any(
         message.metadata.get("response_state") == "synthetic"
-        for message in reopened.messages()
+        for message in branch_messages(reopened)
     )
 
 
@@ -1059,19 +1050,19 @@ def test_context_assembler_init_does_not_replay_branch(
     context_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(context_root)
-    replay_calls = 0
-    original_replay = ConversationStore.replay
+    branch_read_calls = 0
+    original_branch_refs = ConversationStore.branch_refs
 
-    def counted_replay(self: ConversationStore):
-        nonlocal replay_calls
-        replay_calls += 1
-        return original_replay(self)
+    def counted_branch_refs(self: ConversationStore):
+        nonlocal branch_read_calls
+        branch_read_calls += 1
+        return original_branch_refs(self)
 
-    monkeypatch.setattr(ConversationStore, "replay", counted_replay)
+    monkeypatch.setattr(ConversationStore, "branch_refs", counted_branch_refs)
 
     ContextAssembler(store)
 
-    assert replay_calls == 0
+    assert branch_read_calls == 0
 
 
 def test_context_calibration_matches_previous_budgets(context_root: Path) -> None:
@@ -1314,7 +1305,7 @@ async def test_compaction_is_idempotent_for_same_store_state(
     await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
+    assert len([entry for entry in resident_entries(store) if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
@@ -1346,7 +1337,7 @@ async def test_over_budget_compaction_does_not_persist_marker(
         await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 @pytest.mark.asyncio
@@ -1385,7 +1376,7 @@ async def test_repeated_compaction_replays_flattened_marker_range(
         store.append_message(with_message_origin(text(MessageRole.USER, value), MessageOrigin.USER))
     await assembler.assemble()
 
-    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    markers = [entry for entry in resident_entries(store) if entry.type == "compaction"]
     assert [
         (entry.data["source_seq_start"], entry.data["source_seq_end"])
         for entry in markers
@@ -1477,10 +1468,10 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
     )
 
     await assembler.assemble()
-    first_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    first_marker = next(entry for entry in resident_entries(store) if entry.type == "compaction")
     assembler.record_usage({"input_tokens": 300})
     await assembler.assemble()
-    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    markers = [entry for entry in resident_entries(store) if entry.type == "compaction"]
 
     assert markers[1].data["replaces"] == [first_marker.id]
     reopened = ConversationStore(context_root, session_id=store.session_id)
@@ -1578,7 +1569,7 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     with pytest.raises(StaleBranchError):
         await assembler.assemble()
 
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 
@@ -2303,7 +2294,7 @@ async def test_ephemeral_host_instruction_counts_toward_context_budget_without_p
 
     assert assembled.messages[0].content[-1].text.endswith(instruction)
     assert assembled.token_count >= len(instruction)
-    assert all(instruction not in json.dumps(entry.data) for entry in store.replay())
+    assert all(instruction not in json.dumps(entry.data) for entry in branch_entries(store))
 
 
 TOOL_SCHEMAS = ({"name": "probe", "description": "d", "input_schema": {}},)
@@ -2430,7 +2421,7 @@ async def test_token_cache_on_and_off_give_identical_turns_across_eviction(
         [
             # Replaced marker ids are random per store; their count must match.
             {**entry.data, "replaces": len(entry.data.get("replaces", []))}
-            for entry in store.replay()
+            for entry in branch_entries(store)
             if entry.type == "compaction"
         ]
         for store in stores

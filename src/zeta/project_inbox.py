@@ -149,6 +149,95 @@ def _validate_json_shape(value: object) -> None:
             stack.append((child, depth + 1))
 
 
+def _validate_inbox_fields(value: dict[str, Any]) -> None:
+    _text(value.setdefault("origin", LEGACY_LOCAL_ORIGIN), "message origin")
+    if value.get("to_session") is not None:
+        _id(value["to_session"], "target session")
+    sender = value["from"]
+    if not isinstance(sender, dict) or not all(
+        field in sender for field in ("project", "session")
+    ):
+        raise InboxError("invalid message sender")
+    _text(sender.get("project"), "sender project")
+    _id(sender.get("session"), "sender session")
+    _text(value.get("to_project"), "target project")
+    try:
+        require_closed_variant("inbox.kind", value.get("kind"))
+    except ValueError as exc:
+        raise InboxError("invalid message kind") from exc
+    _text(value.get("title"), "title")
+    _text(value.get("created_at"), "created_at")
+    if "claimer_session" in value:
+        _id(value["claimer_session"], "claimer session")
+    for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
+        if field in value:
+            _text(value[field], field)
+    if "reply" in value and value["reply"] is not None:
+        _text(value["reply"], "reply", empty=True)
+    if "reply_id" in value and value["reply_id"] is not None:
+        _id(value["reply_id"], "reply id")
+    if value.get("in_reply_to") is not None:
+        _id(value["in_reply_to"], "in_reply_to")
+
+
+def _validate_inbox_body(value, message_id, bodies_fd, resolve_body) -> None:
+    body = value["body"]
+    if not isinstance(body, dict):
+        _text(body, "body", empty=True)
+        return
+    if body != {"file": f"bodies/{message_id}.txt"} or bodies_fd is None:
+        raise InboxError("invalid body reference")
+    try:
+        with os.fdopen(
+            open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb"
+        ) as stream:
+            if resolve_body:
+                value["body"] = stream.read().decode("utf-8")
+    except (OSError, SessionError, UnicodeDecodeError) as exc:
+        raise InboxError("unsafe or missing message body") from exc
+
+
+def validate_inbox_record(
+    value: object,
+    name: str,
+    *,
+    bodies_fd: int | None = None,
+    resolve_body: bool = False,
+) -> dict[str, Any]:
+    """Validate one stored inbox record without changing inbox state."""
+    _validate_json_shape(value)
+    if not isinstance(value, dict):
+        raise InboxError(f"unknown inbox schema: {name}")
+    value = dict(value)
+    try:
+        require_closed_variant("inbox.schema_version", value.get("schema_version"))
+    except ValueError as exc:
+        raise InboxError(f"unknown inbox schema: {name}") from exc
+    message_id = _id(value.get("id"))
+    if name != f"{message_id}.json":
+        raise InboxError("message id does not match filename")
+    required = {
+        "schema_version", "id", "from", "to_project", "kind", "title",
+        "body", "in_reply_to", "created_at",
+    }
+    if not required.issubset(value):
+        raise InboxError(f"invalid inbox message fields: {name}")
+    _validate_inbox_fields(value)
+    _validate_inbox_body(value, message_id, bodies_fd, resolve_body)
+    return value
+
+
+def _remove_terminal_body(bodies_fd: int, message_id: str) -> None:
+    body_name = f"{message_id}.txt"
+    try:
+        body_info = os.stat(body_name, dir_fd=bodies_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(body_info.st_mode) or body_info.st_nlink != 1:
+        raise InboxError("unsafe done history body")
+    os.unlink(body_name, dir_fd=bodies_fd)
+
+
 class ProjectInbox:
     """Own inbox storage, validation, claiming, completion, and stale recovery."""
 
@@ -692,6 +781,89 @@ class ProjectInbox:
             os.fsync(new_fd)
             return self._read_record(claimed_fd, name, bodies_fd)
 
+    def _select_terminal_records(self, project_id, remove_ids, charge):
+        selected = []
+        with self._held_directories(project_id) as dirs:
+            _new_fd, _claimed_fd, done_fd, bodies_fd = dirs[:4]
+            for name in sorted(os.listdir(done_fd)):
+                charge()
+                if not name.endswith(".json"):
+                    raise InboxError(f"unexpected inbox file: {name}")
+                record = self._read_record(
+                    done_fd, name, bodies_fd, resolve_body=False
+                )
+                sender = record["from"]
+                assert isinstance(sender, dict)
+                if (
+                    sender["session"] in remove_ids
+                    or record.get("to_session") in remove_ids
+                    or record.get("claimer_session") in remove_ids
+                ):
+                    selected.append(record)
+        return selected
+
+    def _remove_sender_history(self, selected, charge) -> None:
+        by_sender: dict[str, list[str]] = {}
+        for record in selected:
+            sender = record["from"]
+            assert isinstance(sender, dict)
+            by_sender.setdefault(str(sender["session"]), []).append(record["id"])
+        for sender_id, message_ids in by_sender.items():
+            charge()
+            tracker = SentMessageTracker(
+                self.sessions_root,
+                sender_id,
+                observed_epoch=self.observed_epoch,
+            )
+            if tracker.path.exists():
+                tracker.remove_terminal(
+                    message_ids,
+                    _storage_lease=self.registry._storage_lease,
+                )
+
+    def _delete_terminal_records(self, project_id, selected, charge) -> None:
+        with self._held_directories(project_id) as dirs:
+            _new_fd, _claimed_fd, done_fd, bodies_fd = dirs[:4]
+            for selected_record in selected:
+                charge()
+                name = f"{selected_record['id']}.json"
+                record = self._read_record(
+                    done_fd, name, bodies_fd, resolve_body=False
+                )
+                if record != selected_record:
+                    raise InboxError("terminal inbox record changed during cleanup")
+                os.unlink(name, dir_fd=done_fd)
+                _remove_terminal_body(bodies_fd, selected_record["id"])
+            os.fsync(done_fd)
+            os.fsync(bodies_fd)
+
+    def remove_terminal_session_references(
+        self,
+        project_ids: tuple[str, ...],
+        session_ids: tuple[str, ...],
+        *,
+        charge: Callable[[], None],
+    ) -> None:
+        """Durably remove terminal rows and their external sender history."""
+        remove_ids = set(session_ids)
+        if any(
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id) > 4_096
+            or "/" in session_id
+            or "\x00" in session_id
+            for session_id in remove_ids
+        ):
+            raise InboxError("invalid retention session id")
+        if not remove_ids:
+            return
+        for project_id in project_ids:
+            charge()
+            selected = self._select_terminal_records(project_id, remove_ids, charge)
+            self._remove_sender_history(selected, charge)
+            if selected:
+                self._delete_terminal_records(project_id, selected, charge)
+
     def done(
         self,
         project: str,
@@ -934,76 +1106,9 @@ class ProjectInbox:
             data = stream.read(_MAX_FILE_BYTES + 1)
         if len(data) > _MAX_FILE_BYTES:
             raise InboxError(f"inbox message is too large: {name}")
-        value = json.loads(data)
-        _validate_json_shape(value)
-        if not isinstance(value, dict):
-            raise InboxError(f"unknown inbox schema: {name}")
-        schema_version = value.get("schema_version")
-        try:
-            require_closed_variant("inbox.schema_version", schema_version)
-        except ValueError as exc:
-            raise InboxError(f"unknown inbox schema: {name}") from exc
-        message_id = _id(value.get("id"))
-        if name != f"{message_id}.json":
-            raise InboxError("message id does not match filename")
-        required = {
-            "schema_version",
-            "id",
-            "from",
-            "to_project",
-            "kind",
-            "title",
-            "body",
-            "in_reply_to",
-            "created_at",
-        }
-        if not required.issubset(value):
-            raise InboxError(f"invalid inbox message fields: {name}")
-        origin = value.setdefault("origin", LEGACY_LOCAL_ORIGIN)
-        _text(origin, "message origin")
-        if value.get("to_session") is not None:
-            _id(value["to_session"], "target session")
-        sender = value["from"]
-        if not isinstance(sender, dict) or not all(
-            field in sender for field in ("project", "session")
-        ):
-            raise InboxError("invalid message sender")
-        _text(sender.get("project"), "sender project")
-        _id(sender.get("session"), "sender session")
-        _text(value.get("to_project"), "target project")
-        try:
-            require_closed_variant("inbox.kind", value.get("kind"))
-        except ValueError as exc:
-            raise InboxError("invalid message kind") from exc
-        _text(value.get("title"), "title")
-        _text(value.get("created_at"), "created_at")
-        if "claimer_session" in value:
-            _id(value["claimer_session"], "claimer session")
-        for field in ("claimed_at", "recovery_note", "outcome", "done_at"):
-            if field in value:
-                _text(value[field], field)
-        if "reply" in value and value["reply"] is not None:
-            _text(value["reply"], "reply", empty=True)
-        if "reply_id" in value and value["reply_id"] is not None:
-            _id(value["reply_id"], "reply id")
-        if value.get("in_reply_to") is not None:
-            _id(value["in_reply_to"], "in_reply_to")
-        body = value["body"]
-        if isinstance(body, dict):
-            if body != {"file": f"bodies/{message_id}.txt"}:
-                raise InboxError("invalid body reference")
-            try:
-                with os.fdopen(
-                    open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY),
-                    "rb",
-                ) as stream:
-                    if resolve_body:
-                        value["body"] = stream.read().decode("utf-8")
-            except (OSError, SessionError, UnicodeDecodeError) as exc:
-                raise InboxError("unsafe or missing message body") from exc
-        else:
-            _text(body, "body", empty=True)
-        return value
+        return validate_inbox_record(
+            json.loads(data), name, bodies_fd=bodies_fd, resolve_body=resolve_body
+        )
 
     def _read_directory(
         self,
