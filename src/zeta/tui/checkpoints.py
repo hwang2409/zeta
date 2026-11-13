@@ -698,8 +698,10 @@ class CheckpointTranscriptMixin:
             if entry.type == "notification_tui_presented"
         }
         provider = session_replay_provider(self.loop.store.session_dir)
+        transcript = getattr(self, "_transcript", None)
         for entry in branch:
-            self._transcript.begin_history_entry(entry.id)
+            if transcript is not None:
+                transcript.begin_history_entry(entry.id)
             try:
                 if entry.type == "checkpoint":
                     self._print_system(
@@ -805,7 +807,8 @@ class CheckpointTranscriptMixin:
                     )
                 yield
             finally:
-                self._transcript.end_history_entry()
+                if transcript is not None:
+                    transcript.end_history_entry()
 
 
 def render_replayed_message(
