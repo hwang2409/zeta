@@ -20,7 +20,12 @@ from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..session_retention.activation import make_retention_owner
-from ..storage_format import drain_releases, pending_releases
+from ..storage_format import (
+    StorageFeature,
+    drain_releases,
+    feature_enabled,
+    pending_releases,
+)
 from . import (
     accounts,
     login,
@@ -257,7 +262,13 @@ class ZetaServer:
                     else load_settings(home=self.home).settings.retention_days
                 ),
             )
-            if not self._borrowed
+            if (
+                not self._borrowed
+                and feature_enabled(
+                    self.runtime.manager._storage_lease.observed_epoch,
+                    StorageFeature.SESSION_RETENTION,
+                )
+            )
             else None
         )
         self._account_warnings: tuple[str, ...] = ()

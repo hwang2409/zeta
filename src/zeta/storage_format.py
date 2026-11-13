@@ -47,7 +47,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.ATTENTION_KINDS: 5,
     StorageFeature.PROJECT_LOCKS: 6,
     StorageFeature.INBOX_DELEGATION: 7,
-    StorageFeature.SESSION_RETENTION: 8,
+    StorageFeature.SESSION_RETENTION: 11,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.

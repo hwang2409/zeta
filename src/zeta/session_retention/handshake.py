@@ -12,6 +12,12 @@ from pathlib import Path
 
 from ..core.session_execution import SessionInUseError
 from ..locking import RETENTION_HOME_ID, domain_lock_name
+from ..storage_format import (
+    StorageFeature,
+    StorageFormatError,
+    _read_manifest,
+    feature_enabled,
+)
 
 
 class RetentionYieldError(RuntimeError):
@@ -142,6 +148,13 @@ def open_with_retention_yield(
     create_locks: bool = True,
 ) -> object:
     """Give retention a bounded chance to leave before running one open."""
+    if (home / "storage-format.json").exists():
+        try:
+            epoch = _read_manifest(home, absent_epoch=0)
+        except StorageFormatError:
+            return operation()
+        if not feature_enabled(epoch, StorageFeature.SESSION_RETENTION):
+            return operation()
     acquire = _fd if create_locks else _existing_fd
     request_fd = acquire(home, "user-open-request")
     active_fd = acquire(home, "planner-active")

@@ -71,7 +71,7 @@ def run(
     manager = SessionManager(env_home())
     if verb == "list":
         return open_with_retention_yield(
-            manager.home, lambda: _run_list(manager, out)
+            manager.home, lambda: _run_list(manager, out), create_locks=False
         )
     if verb == "rename":
         try:

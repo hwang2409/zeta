@@ -21,11 +21,10 @@ def _hold_active(home: str, ready, release) -> None:
 
 
 def test_open_yields_to_a_planner_in_another_process(tmp_path: Path) -> None:
-    ready = multiprocessing.Event()
-    release = multiprocessing.Event()
-    process = multiprocessing.get_context("spawn").Process(
-        target=_hold_active, args=(str(tmp_path), ready, release)
-    )
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(target=_hold_active, args=(str(tmp_path), ready, release))
     process.start()
     try:
         assert ready.wait(10)

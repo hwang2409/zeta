@@ -18,7 +18,7 @@ class _EntryScan:
             )
             self._entries = os.scandir(self._fd)
         except OSError as exc:
-            raise RetentionPlannerError("unsafe retention directory") from exc
+            raise PlannerError("unsafe retention directory") from exc
         self.charge = charge
         self._pending = None
         self._closed = False
@@ -34,7 +34,7 @@ class _EntryScan:
             except StopIteration:
                 raise
             except OSError as exc:
-                raise RetentionPlannerError("unsafe retention entry") from exc
+                raise PlannerError("unsafe retention entry") from exc
             self._pending = (entry, info.st_size if stat.S_ISREG(info.st_mode) else 0)
         entry, size = self._pending
         self.charge(size)
@@ -63,7 +63,7 @@ def _next_root(sweep: _Sweep) -> str | None:
         if entry.name.startswith("."):
             continue
         if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-            raise RetentionPlannerError("unsafe session root entry")
+            raise PlannerError("unsafe session root entry")
         return entry.name
     sweep.discovery_done = True
     return None
@@ -82,7 +82,7 @@ def _lease_file(stack, directory_fd, name) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise RetentionPlannerError(f"unsafe store lock: {name}") from exc
+        raise PlannerError(f"unsafe store lock: {name}") from exc
     stack.callback(os.close, fd)
     _flock_nb(fd)
 
@@ -90,9 +90,9 @@ def _lease_file(stack, directory_fd, name) -> None:
 def _walk_directory(flight: _InFlight, walk: _Walk, budget: _Budget):
     comps = walk.frontier.pop()
     if len(comps) > _MAX_TREE_DEPTH:
-        raise RetentionPlannerError("tree is too deep")
+        raise PlannerError("tree is too deep")
     if comps[-2:-1] == (_AGENTS_DIRNAME,) and comps not in flight.store_dirs:
-        raise RetentionPlannerError("child store appeared during walk")
+        raise PlannerError("child store appeared during walk")
     with _descend(flight.root_fd, comps) as dfd:
         info = os.fstat(dfd)
         entries = _EntryScan(dfd, budget.charge_entry)
@@ -109,9 +109,9 @@ def _visit(walk: _Walk, dfd, comps, entry) -> None:
         walk.frontier.append((*comps, name))
         return
     if not stat.S_ISREG(info.st_mode):
-        raise RetentionPlannerError("unsafe entry in tree")
+        raise PlannerError("unsafe entry in tree")
     if info.st_nlink != 1:
-        raise RetentionPlannerError("hard-linked file in tree")
+        raise PlannerError("hard-linked file in tree")
     walk.bytes += info.st_size
     walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
 
@@ -169,7 +169,7 @@ def _authority_transcript_recovery_reason(
                 if classify_recovery_records(dfd, target, names):
                     return "unresolved transcript recovery"
             except (OSError, SessionError, ValueError) as exc:
-                raise RetentionPlannerError("broken transcript recovery") from exc
+                raise PlannerError("broken transcript recovery") from exc
     return None
 
 
@@ -179,13 +179,13 @@ def _read_authority_bytes(directory_fd: int, name: str) -> bytes | None:
     except FileNotFoundError:
         return None
     except (OSError, SessionError) as exc:
-        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
+        raise PlannerError(f"unsafe retention read: {name}") from exc
     try:
         with os.fdopen(fd, "rb") as stream:
             fd = -1
             return stream.read()
     except OSError as exc:
-        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
+        raise PlannerError(f"unsafe retention read: {name}") from exc
     finally:
         if fd != -1:
             os.close(fd)
@@ -217,7 +217,7 @@ def _authority_store_reason(flight: _InFlight, scan: _ClosureBudget) -> str | No
             pending = _read_json(dfd, _PENDING_LINK_NAME, scan)
             if pending is not None:
                 if not valid_pending_link(pending):
-                    raise RetentionPlannerError("malformed pending project link")
+                    raise PlannerError("malformed pending project link")
                 return "pending project link"
             if _pending_child_link(dfd, scan):
                 return "pending child link"
@@ -239,7 +239,7 @@ def _has_child_marker(directory_fd, scan) -> bool:
     if value is None:
         return False
     if type(value) is not dict:
-        raise RetentionPlannerError("malformed session state")
+        raise PlannerError("malformed session state")
     try:
         bash_cwd = value.get("bash_cwd")
         if type(bash_cwd) is not str or not bash_cwd:
@@ -249,17 +249,17 @@ def _has_child_marker(directory_fd, scan) -> bool:
             raise ValueError
         parsed = _parse_agent_state(value, Path(_SESSION_STATE_NAME))
     except (TypeError, ValueError, SessionError) as exc:
-        raise RetentionPlannerError("malformed session state") from exc
+        raise PlannerError("malformed session state") from exc
     return bool(parsed["agent_children"] or parsed["agent_parent"])
 
 
 def _lifecycle_terminal(value) -> bool:
     if type(value) is not dict:
-        raise RetentionPlannerError("malformed child lifecycle")
+        raise PlannerError("malformed child lifecycle")
     try:
         record = parse_legacy_child_lifecycle(value)
     except (TypeError, ValueError) as exc:
-        raise RetentionPlannerError("malformed child lifecycle") from exc
+        raise PlannerError("malformed child lifecycle") from exc
     return record.phase in {
         ChildRunPhase.COMPLETED, ChildRunPhase.CANCELED, ChildRunPhase.FAILED
     }
@@ -267,15 +267,15 @@ def _lifecycle_terminal(value) -> bool:
 
 def _canonical_metadata(value, session_id: str) -> SessionMetadata:
     if type(value) is not dict:
-        raise RetentionPlannerError("malformed metadata")
+        raise PlannerError("malformed metadata")
     try:
         metadata = SessionMetadata.from_dict(
             value, path=Path("sessions") / session_id / _METADATA_NAME
         )
     except (TypeError, ValueError, SessionError) as exc:
-        raise RetentionPlannerError("malformed metadata") from exc
+        raise PlannerError("malformed metadata") from exc
     if metadata.session_id != session_id:
-        raise RetentionPlannerError("metadata id does not match directory")
+        raise PlannerError("metadata id does not match directory")
     return metadata
 
 
@@ -284,7 +284,7 @@ def _metadata_activity(value) -> int:
     if value is None:
         return 0
     if type(value) is not dict:
-        raise RetentionPlannerError("malformed metadata")
+        raise PlannerError("malformed metadata")
     latest = 0
     for name in _TIMESTAMP_FIELDS:
         text = value.get(name)
@@ -293,7 +293,7 @@ def _metadata_activity(value) -> int:
         try:
             moment = datetime.fromisoformat(text)
         except (TypeError, ValueError) as exc:
-            raise RetentionPlannerError("malformed metadata timestamp") from exc
+            raise PlannerError("malformed metadata timestamp") from exc
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=UTC)
         latest = max(latest, int(moment.timestamp() * 1_000_000_000))
@@ -306,9 +306,9 @@ def _authority_parent_id(sessions_fd, session_id, scan) -> str | None:
         with child_directory(sessions_fd, session_id) as session_fd:
             meta = _read_json(session_fd, _METADATA_NAME, scan)
     except FileNotFoundError as exc:
-        raise RetentionPlannerError("missing metadata ancestor") from exc
+        raise PlannerError("missing metadata ancestor") from exc
     if meta is None:
-        raise RetentionPlannerError("malformed metadata")
+        raise PlannerError("malformed metadata")
     return _canonical_metadata(meta, session_id).parent_session_id
 
 
@@ -318,7 +318,7 @@ def _authority_inbox_reason(home_fd, ids, scan: _ClosureBudget) -> str | None:
             for entry in entries:
                 name = entry.name
                 if not name.endswith(".json"):
-                    raise RetentionPlannerError("unexpected inbox file")
+                    raise PlannerError("unexpected inbox file")
                 if _classify_inbox_record(
                     _read_json(status_fd, name, scan), name, ids, bodies_fd
                 ):
@@ -336,7 +336,7 @@ def _authority_inbox_dirs(home_fd, scan):
             for entry in projects:
                 project = entry.name
                 if entry.is_symlink():
-                    raise RetentionPlannerError("unsafe project directory")
+                    raise PlannerError("unsafe project directory")
                 if not entry.is_dir(follow_symlinks=False):
                     continue  # e.g. projects/.lock
                 with ExitStack() as inner:
@@ -356,7 +356,7 @@ def _open_dir(stack, directory_fd, name) -> int | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise RetentionPlannerError(f"unsafe directory: {name}") from exc
+        raise PlannerError(f"unsafe directory: {name}") from exc
     stack.callback(os.close, fd)
     return fd
 
@@ -369,7 +369,7 @@ def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | N
             if other == root_id or other.startswith("."):
                 continue
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-                raise RetentionPlannerError("unsafe possible dependent")
+                raise PlannerError("unsafe possible dependent")
             if _dependent_reason(sessions_fd, other, root_id, scan):
                 return "published top-level dependent"
     return None
@@ -386,7 +386,7 @@ def _dependent_reason(sessions_fd, other, root_id, scan) -> bool:
                     if fork_value is not None else None
                 )
             except (TypeError, ValueError, SessionError) as exc:
-                raise RetentionPlannerError("malformed attention fork") from exc
+                raise PlannerError("malformed attention fork") from exc
             attention = _attention_reference(other_fd, root_id, scan)
     except FileNotFoundError:
         return False
@@ -405,14 +405,14 @@ def _attention_reference(other_fd, root_id, scan) -> bool:
         with scan.iter_entries(attention_fd) as records:
             for entry in records:
                 if not entry.name.endswith(".json"):
-                    raise RetentionPlannerError("malformed attention record")
+                    raise PlannerError("malformed attention record")
                 value = _read_json(attention_fd, entry.name, scan)
                 try:
                     record = AttentionRecord.from_dict(value)
                 except (TypeError, ValueError, KeyError) as exc:
-                    raise RetentionPlannerError("malformed attention record") from exc
+                    raise PlannerError("malformed attention record") from exc
                 if entry.name != f"{record.id}.json":
-                    raise RetentionPlannerError("attention id does not match filename")
+                    raise PlannerError("attention id does not match filename")
                 if record.fork_session_id == root_id:
                     return True
     return False
@@ -421,7 +421,7 @@ def _attention_reference(other_fd, root_id, scan) -> bool:
 def _authority_store_dirs(root_fd, scan, prefix=()):
     """Yield component paths for every child store directory under a root."""
     if len(prefix) > _MAX_TREE_DEPTH:
-        raise RetentionPlannerError("tree is too deep")
+        raise PlannerError("tree is too deep")
     try:
         with (
             _descend(root_fd, (*prefix, _AGENTS_DIRNAME)) as agents_fd,
@@ -438,7 +438,9 @@ def _authority_store_dirs(root_fd, scan, prefix=()):
 
 
 def _generation_value(home, scan) -> int:
-    value = read_reference_generation(home)
+    from . import read_reference_generation as current_reader
+
+    value = current_reader(home)
     scan.charge(0)
     return value
 
@@ -453,20 +455,20 @@ def _reservation_present(home_fd, root_id, scan) -> bool:
             value = _read_json(reservations_fd, f"{root_id}.json", scan)
             if value is not None:
                 if type(value) is not dict:
-                    raise RetentionPlannerError("malformed retention reservation")
+                    raise PlannerError("malformed retention reservation")
                 try:
                     validate_retention_reservation(value)
                 except StorageFormatError as exc:
-                    raise RetentionPlannerError("malformed retention reservation") from exc
+                    raise PlannerError("malformed retention reservation") from exc
                 if value["session_id"] != root_id:
-                    raise RetentionPlannerError("reservation id does not match filename")
+                    raise PlannerError("reservation id does not match filename")
                 return True
         try:
             info = os.stat(root_id, dir_fd=trash_fd, follow_symlinks=False)
         except FileNotFoundError:
             return False
         if not stat.S_ISDIR(info.st_mode):
-            raise RetentionPlannerError("unsafe retention trash evidence")
+            raise PlannerError("unsafe retention trash evidence")
         scan.charge_entry(0)
         return True
 
@@ -479,10 +481,10 @@ def _pending_child_link(directory_fd, scan) -> bool:
         with scan.iter_entries(fd) as entries:
             for entry in entries:
                 if not entry.name.endswith(".json"):
-                    raise RetentionPlannerError("malformed pending child link")
+                    raise PlannerError("malformed pending child link")
                 value = _read_json(fd, entry.name, scan)
                 if not valid_child_pending_link(value):
-                    raise RetentionPlannerError("malformed pending child link")
+                    raise PlannerError("malformed pending child link")
                 return True
     return False
 
@@ -491,7 +493,7 @@ def _classify_inbox_record(record, name, ids, bodies_fd) -> bool:
     try:
         record = validate_inbox_record(record, name, bodies_fd=bodies_fd)
     except (InboxError, TypeError, ValueError) as exc:
-        raise RetentionPlannerError("malformed inbox record") from exc
+        raise PlannerError("malformed inbox record") from exc
     sender = record["from"]
     return (
         sender["session"] in ids

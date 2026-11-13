@@ -925,6 +925,8 @@ class _ClosureAuthority:
         return self._store_names
 
 
+PlannerError = RetentionPlannerError
+
 from ._helpers import (
     _attention_reference,
     _authority_dependents,

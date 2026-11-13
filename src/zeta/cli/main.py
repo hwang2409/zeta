@@ -18,7 +18,13 @@ from ..core.commands.completion import completion_script
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..remote.update import add_remote_parser, run_remote_update
-from ..storage_format import StorageFormatError, advance, writer_epoch
+from ..storage_format import (
+    StorageFeature,
+    StorageFormatError,
+    advance,
+    feature_enabled,
+    writer_epoch,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -890,9 +896,10 @@ def _create_tui_app(
                     open_with_retention_yield,
                     env_home(),
                     lambda: create_app(args),
+                    create_locks=False,
                 )
             )
-        return open_with_retention_yield(env_home(), lambda: create_app(args))
+        return open_with_retention_yield(env_home(), lambda: create_app(args), create_locks=False)
     except SessionError as exc:
         parser.error(str(exc))
     except StorageFormatError:
@@ -926,7 +933,7 @@ def _run_tui_lifecycle_captured(
                 exit_status = 1
                 break
             current_session_id = app.loop.store.session_id
-            if retention_owner is None and not args.no_session:
+            if retention_owner is None and not args.no_session and feature_enabled(app.loop.store._storage_lease.observed_epoch, StorageFeature.SESSION_RETENTION):
                 from ..session_retention.activation import make_retention_owner
                 retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
