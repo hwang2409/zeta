@@ -364,7 +364,10 @@ class ZetaServer:
         if self._unix_listener is not None:
             await attempt(self._unix_listener.close())
         elif self._server is not None:
-            self._server.close()
+            try:
+                self._server.close()
+            except BaseException as error:  # noqa: BLE001 - close preserves first failure
+                errors.append(error)
             await attempt(self._server.wait_closed())
         self._server = None
         self._unix_listener = None

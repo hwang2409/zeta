@@ -450,7 +450,7 @@ class ServeControl:
         await self.controller_released()
 
     async def close_background_events(self) -> None:
-        await self._background_events.close(CONTROLLER_HANDOFF_DEADLINE_SECONDS)
+        await self._background_events.close(10.0)
 
     async def user_message(
         self,
