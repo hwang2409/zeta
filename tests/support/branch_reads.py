@@ -12,6 +12,10 @@ def branch_entries(store: ConversationStore) -> list[ConversationEntry]:
     return [copy.deepcopy(store.entry(ref)) for ref in store.branch_refs()]
 
 
+def resident_entries(store: ConversationStore) -> list[ConversationEntry]:
+    return [copy.deepcopy(store.entry(ref)) for ref in store.resident_refs()]
+
+
 def branch_messages(store: ConversationStore) -> list[Message]:
     return [
         Message.from_dict(entry.data["message"])

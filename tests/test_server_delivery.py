@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
@@ -1239,7 +1239,7 @@ def test_delivery_lookup_does_not_read_log_after_load(tmp_path: Path) -> None:
                 raise AssertionError("delivery lookup read the conversation log")
             return super().__reversed__()
 
-    unreadable_entries = UnreadableEntries(store._entries)
+    unreadable_entries = UnreadableEntries(resident_entries(store))
     store._resident_rows = type(store._resident_rows).prepared(unreadable_entries)
     unreadable_entries.blocked = True
     assert store.client_delivery("indexed").status == "queued"

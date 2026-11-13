@@ -6,7 +6,7 @@ from threading import Event
 
 import pytest
 
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
@@ -186,8 +186,8 @@ skill_catalog=SkillCatalog.empty(),
     pending = (await asyncio.wait_for(restarted_policy.pending_requests(), 10))
 
     assert pending == [ApprovalRequest(call.id, call)]
-    assert restarted_store.entries[-1].type == "message"
-    assert restarted_store.entries[-1].data["approval_requests"]
+    assert resident_entries(restarted_store)[-1].type == "message"
+    assert resident_entries(restarted_store)[-1].data["approval_requests"]
 
     assert restarted_policy.approve(call.id)
     restarted_registry = ToolRegistry(
@@ -409,7 +409,7 @@ def test_resolution_rejects_a_parent_outside_the_request_ancestry(
 
     reopened = ConversationStore(approval_root, session_id=store.session_id)
     assert not any(
-        entry.type == "approval_resolution" for entry in reopened.entries
+        entry.type == "approval_resolution" for entry in resident_entries(reopened)
     )
 
 
@@ -418,7 +418,7 @@ def test_approval_resolution_reason_is_bounded_and_abort_only(approval_root: Pat
     call = ToolCall("reason-call", "echo", {})
     store.append_approval_request(call.id, call)
     store.append_approval_resolution(call.id, "abort", reason="controller_disconnected")
-    assert store.entries[-1].data["reason"] == "controller_disconnected"
+    assert resident_entries(store)[-1].data["reason"] == "controller_disconnected"
     with pytest.raises(ValueError):
         store.append_approval_resolution(call.id, "allow", reason="turn_canceled")
 
@@ -1070,7 +1070,7 @@ def test_concurrent_approval_resolution_has_one_winner(approval_root: Path) -> N
     assert sorted(results) == [False, True]
     resolutions = [
         entry
-        for entry in store.entries
+        for entry in resident_entries(store)
         if entry.type == "approval_resolution"
     ]
     assert len(resolutions) == 1

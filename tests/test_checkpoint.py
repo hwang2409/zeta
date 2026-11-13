@@ -8,7 +8,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
 from zeta.core.checkpoints import CheckpointForkMixin
@@ -252,7 +252,7 @@ def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
     ]
     assert branch_entries(store)[0].id == first.id
     assert all(entry.id != abandoned.id for entry in branch_entries(store))
-    assert len(store.entries) == 6
+    assert len(resident_entries(store)) == 6
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
     assert branch_entries(reopened)[-1].id == fork.id

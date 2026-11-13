@@ -87,7 +87,7 @@ def _session(home: Path, stage: str) -> dict[str, object] | None:
             warnings.simplefilter("ignore", RuntimeWarning)
             repaired = manager.open(opened.metadata.session_id)
         try:
-            warning = repaired.store.entries[-1]
+            warning = repaired.store.entry(repaired.store.resident_refs()[-1])[-1]
             if warning.type != "warning" or warning.data.get("kind") != "transcript_recovery":
                 raise RuntimeError("predecessor did not record transcript recovery")
         finally:

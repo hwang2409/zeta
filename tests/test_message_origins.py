@@ -13,7 +13,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.agent_lifecycle import wait_background_owner
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -88,7 +88,7 @@ async def test_serve_user_message_is_labeled_user(tmp_path: Path) -> None:
     async for _event in loop.run_turn("sent through serve", origin=MessageOrigin.USER):
         pass
 
-    assert _label(store.entries[0].to_dict()) == "user"
+    assert _label(resident_entries(store)[0].to_dict()) == "user"
     await loop.close()
 
 
@@ -111,7 +111,7 @@ async def test_headless_prompt_is_labeled_user(tmp_path: Path) -> None:
     )
 
     assert code == 0
-    assert _label(store.entries[0].to_dict()) == "user"
+    assert _label(resident_entries(store)[0].to_dict()) == "user"
     await loop.close()
 
 
@@ -442,7 +442,7 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
     await await_or_fail(app._active_task, what="active prompt task")
     user_rows = [
         entry.to_dict()
-        for entry in store.entries
+        for entry in resident_entries(store)
         if entry.type == "message" and entry.data["message"]["role"] == "user"
     ]
     row = user_rows[-1] if path == "steer/queued input" else user_rows[0]
@@ -555,7 +555,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
             assert reused[-1]["error"]["code"] == -32602
         messages = [
             entry.to_dict()
-            for entry in server.runtime.opened.store.entries
+            for entry in resident_entries(server.runtime.opened.store)
             if entry.type == "message"
             and entry.data["message"]["role"] == MessageRole.USER.value
         ]
@@ -634,7 +634,7 @@ async def _audit_production_row(path: str, tmp_path: Path) -> dict[str, object]:
 
         loop._inbox_scanner = Scanner()
         await loop._check_project_inbox()
-        row = store.entries[-1].to_dict()
+        row = resident_entries(store)[-1].to_dict()
         await loop.close()
         return row
     raise AssertionError(f"missing audit production path: {path}")
@@ -701,7 +701,7 @@ def test_headless_entry_persists_user_origin(
     )
 
     assert code == 0
-    row = store.entries[0].to_dict()
+    row = resident_entries(store)[0].to_dict()
     metadata = row["data"]["message"]["metadata"]
     assert metadata[MESSAGE_ORIGIN_METADATA] == "user"
     assert "zeta.user_display_text" not in metadata
@@ -722,7 +722,7 @@ async def test_child_spawn_persists_agent_prompt_origin(tmp_path: Path) -> None:
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     row = next(
         entry.to_dict()
-        for entry in child_store.entries
+        for entry in resident_entries(child_store)
         if entry.type == "message"
         and entry.data["message"]["role"] == MessageRole.USER.value
     )
@@ -756,7 +756,7 @@ async def test_agent_send_entry_persists_agent_send_origin(tmp_path: Path) -> No
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     row = next(
         entry.to_dict()
-        for entry in child_store.entries
+        for entry in resident_entries(child_store)
         if entry.type == "message"
         and entry.data["message"]["metadata"].get(MESSAGE_ORIGIN_METADATA)
         == MessageOrigin.AGENT_SEND.value
@@ -807,7 +807,7 @@ def test_new_user_message_without_origin_is_rejected_by_store_append_paths(
         before = store.path.read_bytes()
         with pytest.raises(ValueError, match="origin"):
             getattr(store, method_name)(_unmarked_user_message())
-        assert store.entries == []
+        assert resident_entries(store) == []
         assert store.path.read_bytes() == before
 
 
@@ -861,7 +861,7 @@ async def test_new_user_message_without_origin_is_rejected_by_run_turn(
         ):
             pass
 
-    assert store.entries == []
+    assert resident_entries(store) == []
     assert store.path.read_bytes() == before
     await loop.close()
 
@@ -889,4 +889,4 @@ def test_historical_unmarked_user_row_still_replays_and_reconciles_as_harness_un
     assert branch_messages(reopened) == [
         Message(MessageRole.USER, [TextContent("historical text")])
     ]
-    assert _label(reopened.entries[-1].to_dict()) == "harness_unknown"
+    assert _label(resident_entries(reopened)[-1].to_dict()) == "harness_unknown"

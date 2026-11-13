@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.branch_reads import branch_entries
+from tests.support.branch_reads import branch_entries, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -289,7 +289,7 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
                 MessageOrigin.USER,
             )
         )
-        blocks = store._entries[-1].data["message"]["tool_result"]["content_blocks"]
+        blocks = resident_entries(store)[-1].data["message"]["tool_result"]["content_blocks"]
         blocks[0].update({"size": 99, "caption": "known"})
         blocks[1]["data"] = "YWJj"
         blocks[1].update({"width": 2, "height": 3})

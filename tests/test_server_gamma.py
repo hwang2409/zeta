@@ -18,7 +18,7 @@ from types import MethodType
 import pytest
 from PIL import Image
 
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -1835,7 +1835,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         else:
             raise AssertionError("controller was not released")
 
-        durable_rows = tuple(server.runtime.opened.store.entries)
+        durable_rows = tuple(resident_entries(server.runtime.opened.store))
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )
@@ -1864,7 +1864,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
             "data": {"code": "host_binding_required"},
         }
         assert backend.calls == []
-        assert tuple(server.runtime.opened.store.entries) == durable_rows
+        assert tuple(resident_entries(server.runtime.opened.store)) == durable_rows
     finally:
         await close_serve(server, replay_writer or writer)
 
@@ -1940,7 +1940,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
             str(server.socket_path)
         )
         await _hello(replay_reader, replay_writer, features)
-        durable_rows = tuple(server.runtime.opened.store.entries)
+        durable_rows = tuple(resident_entries(server.runtime.opened.store))
         duplicate = await _request(
             replay_reader,
             replay_writer,
@@ -1953,7 +1953,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
             "duplicate": True,
         }
         assert len(backend.calls) == 1
-        assert tuple(server.runtime.opened.store.entries) == durable_rows
+        assert tuple(resident_entries(server.runtime.opened.store)) == durable_rows
     finally:
         await close_serve(server, replay_writer or writer)
 
@@ -2324,7 +2324,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             len(
                 [
                     row
-                    for row in server.runtime.opened.store.entries
+                    for row in resident_entries(server.runtime.opened.store)
                     if row.type == "approval_resolution"
                     and row.data.get("request_id") == call.id
                 ]

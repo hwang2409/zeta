@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import resident_entries
 from zeta.attention_records import AttentionStore, observed_epoch_for_session
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
@@ -962,7 +963,7 @@ def test_p06_installed_callbacks_drain_in_append_order_after_rank_release(
 
         durable = [
             (row.data["message"]["content"][0]["text"], row.id)
-            for row in store._entries
+            for row in resident_entries(store)
             if row.type == "message"
         ]
         assert delivered == durable

@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
 from zeta.core import agent_state, transcript_recovery
@@ -120,7 +120,7 @@ async def test_loop_append_defers_sqlite_to_an_off_loop_rebuild(
         store.append_many([("warning", {"message": "committed"})])
         assert not called
         assert not index.available
-        await asyncio.to_thread(store._sync_history_index, store._entries)
+        await asyncio.to_thread(store._sync_history_index, resident_entries(store))
         assert index.available
     finally:
         store.close()
@@ -145,7 +145,7 @@ def test_history_index_failure_never_turns_a_committed_append_into_failure(
 
     reopened = ConversationStore(tmp_path, session_id="history-index-failure")
     try:
-        assert [entry.data.get("message") for entry in reopened.entries].count("committed") == 1
+        assert [entry.data.get("message") for entry in resident_entries(reopened)].count("committed") == 1
     finally:
         reopened.close()
 
@@ -161,7 +161,7 @@ def test_corrupt_history_index_never_blocks_a_valid_transcript_open(
 
     reopened = ConversationStore(tmp_path, session_id="history-index-corrupt")
     try:
-        assert reopened.entries[-1].data["message"] == "authority"
+        assert resident_entries(reopened)[-1].data["message"] == "authority"
         assert reopened._history_index.available
     finally:
         reopened.close()
@@ -174,7 +174,7 @@ def test_corrupt_history_index_never_blocks_a_valid_transcript_open(
     )
     unavailable = ConversationStore(tmp_path, session_id="history-index-corrupt")
     try:
-        assert unavailable.entries[-1].data["message"] == "authority"
+        assert resident_entries(unavailable)[-1].data["message"] == "authority"
         with pytest.raises(HistoryIndexUnavailableError):
             unavailable._history_index.page(
                 {"offset": 0}, unavailable._history_index_facts()
@@ -286,7 +286,7 @@ def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
                 self.iterations += 1
                 return super().__iter__()
 
-        entries = CountingEntries(store._entries)
+        entries = CountingEntries(resident_entries(store))
         store._resident_rows = type(store._resident_rows).prepared(entries)
         entries.iterations = 0
         store.commit_compaction_marker(
@@ -304,7 +304,7 @@ def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> N
         store.append_many(
             [("warning", {"message": "second"}), ("warning", {"message": "third"})]
         )
-        expected_ids = {entry.id for entry in store.entries}
+        expected_ids = {entry.id for entry in resident_entries(store)}
         assert store._entry_ids == expected_ids
 
         with patch("zeta.core.store._store.uuid.uuid4") as generated:
@@ -343,7 +343,7 @@ def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> N
         assert store._entry_ids == expected_ids
 
     with ConversationStore(tmp_path, session_id=session_id) as reopened:
-        assert reopened._entry_ids == {entry.id for entry in reopened.entries}
+        assert reopened._entry_ids == {entry.id for entry in resident_entries(reopened)}
         assert reopened._entry_ids == expected_ids
 
 
@@ -592,7 +592,7 @@ def test_load_accepts_legacy_notifications_without_origin(tmp_path: Path) -> Non
     assert reopened.agent_notifications()
     kinds = {
         entry.data.get("kind")
-        for entry in reopened.entries
+        for entry in resident_entries(reopened)
         if entry.type == "notification"
     }
     assert "task_exited" in kinds
@@ -997,7 +997,7 @@ def test_installed_hook_emits_after_durable_resident_single_append(
         assert write_returned
         assert delta != "reset"
         assert delta[-1].id in store._entry_ids
-        assert store._entries[-1].id == delta[-1].id
+        assert resident_entries(store)[-1].id == delta[-1].id
         durable = json.loads(store.path.read_bytes().splitlines()[-1])
         assert (durable["seq"], durable["id"]) == (delta[-1].seq, delta[-1].id)
         observed.append(delta)
@@ -1026,8 +1026,8 @@ def test_installed_hook_failure_does_not_fail_committed_append(
     entry = store.append_message(message(MessageRole.ASSISTANT, "committed"))
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
-    assert store._entries[-1].id == entry.id
-    assert reopened._entries[-1] == entry
+    assert resident_entries(store)[-1].id == entry.id
+    assert resident_entries(reopened)[-1] == entry
     observed: list[tuple[ConversationEntry, ...] | str] = []
     store.on_entries_installed = observed.append
     later = store.append_message(message(MessageRole.ASSISTANT, "later"))
@@ -1051,8 +1051,8 @@ def test_installed_hook_receives_owned_delta(tmp_path: Path) -> None:
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert entry.data["message"]["content"][0]["text"] == "original"
-    assert store._entries[-1].data["message"]["content"][0]["text"] == "original"
-    assert reopened._entries[-1].data["message"]["content"][0]["text"] == "original"
+    assert resident_entries(store)[-1].data["message"]["content"][0]["text"] == "original"
+    assert resident_entries(reopened)[-1].data["message"]["content"][0]["text"] == "original"
 
 
 def test_installed_hook_runs_after_flock_and_can_reenter(
@@ -1087,7 +1087,7 @@ def test_installed_hook_runs_after_flock_and_can_reenter(
     assert outer.id != observed[0]
     monkeypatch.undo()
     store.close()
-    assert [row.data["message"]["content"][0]["text"] for row in store._entries] == [
+    assert [row.data["message"]["content"][0]["text"] for row in resident_entries(store)] == [
         "outer",
         "inner",
     ]
@@ -1157,7 +1157,7 @@ def test_installed_hook_reentrant_append_emits_in_log_order(tmp_path: Path) -> N
 
     store.append_message(message(MessageRole.ASSISTANT, "outer"))
 
-    durable = [row.data["message"]["content"][0]["text"] for row in store._entries]
+    durable = [row.data["message"]["content"][0]["text"] for row in resident_entries(store)]
     assert observed == durable == ["outer", "inner"]
 
 
@@ -1245,7 +1245,7 @@ def test_installed_hook_emits_batch_in_log_order(tmp_path: Path) -> None:
         [("warning", {"message": "one"}), ("warning", {"message": "two"})]
     )
 
-    assert observed == [tuple(store._entries)]
+    assert observed == [tuple(resident_entries(store))]
     assert [(row.seq, row.id) for row in observed[0]] == [
         (row.seq, row.id) for row in entries
     ]
@@ -1280,8 +1280,8 @@ async def test_installed_hook_async_failure_keeps_receipt_bookkeeping(
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert receipts_accepted
-    assert store._entries[-1].id == entry.id
-    assert reopened._entries[-1] == entry
+    assert resident_entries(store)[-1].id == entry.id
+    assert resident_entries(reopened)[-1] == entry
     assert [record.getMessage() for record in caplog.records].count(
         "installed-row callback failed"
     ) == 1
@@ -1321,7 +1321,7 @@ async def test_installed_hook_async_writer_publishes_on_owner_thread(
     assert owner_thread not in copy_threads
     assert observed[0][0] == owner_thread
     assert observed[0][1][0].id == entry.id
-    assert store._entries[-1].data["message"]["content"][0]["text"] == "worker"
+    assert resident_entries(store)[-1].data["message"]["content"][0]["text"] == "worker"
 
 
 def test_installed_hook_incremental_reload_emits_foreign_suffix_once(
@@ -1391,7 +1391,7 @@ def test_installed_hook_changed_content_with_same_identity_emits_reset(
     store.refresh()
 
     assert observed == ["reset"]
-    assert store._entries[0].data["message"]["content"][0]["text"] == "after"
+    assert resident_entries(store)[0].data["message"]["content"][0]["text"] == "after"
 
 
 def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
@@ -1424,8 +1424,8 @@ def test_installed_hook_non_prefix_reload_emits_reset(tmp_path: Path) -> None:
     store.refresh()
 
     assert observed == ["reset"]
-    assert store._entries[0].id == "replacement-id"
-    assert store._entries[-1].id == final.id
+    assert resident_entries(store)[0].id == "replacement-id"
+    assert resident_entries(store)[-1].id == final.id
 
 
 def test_installed_hook_fork_keeps_log_order_with_backward_parent(
@@ -1439,7 +1439,7 @@ def test_installed_hook_fork_keeps_log_order_with_backward_parent(
 
     fork = store.append_fork(str(checkpoint.seq))
 
-    assert observed == [(store._entries[-1],)]
+    assert observed == [(resident_entries(store)[-1],)]
     assert fork.seq > checkpoint.seq
     assert fork.parent_id == checkpoint.id
 
@@ -1469,7 +1469,7 @@ def test_installed_hook_does_not_access_resident_branch(tmp_path: Path) -> None:
             self._check()
             return super().__getitem__(key)
 
-    guarded_entries = BranchAccessGuard(store._entries)
+    guarded_entries = BranchAccessGuard(resident_entries(store))
     store._resident_rows = type(store._resident_rows).prepared(guarded_entries)
     guarded_entries.blocked = True
     store._publish_entries_installed((entry,))
@@ -1508,7 +1508,7 @@ async def test_async_append_runs_off_loop_and_is_durable_on_return(
 
     assert append_threads and append_threads[0] != event_loop_thread
     reopened = ConversationStore(tmp_path, session_id="async-writer")
-    assert reopened.entries[-1].id == entry.id
+    assert resident_entries(reopened)[-1].id == entry.id
 
 
 @pytest.mark.asyncio
@@ -1546,7 +1546,7 @@ async def test_async_append_never_loads_transcript_on_event_loop_after_foreign_c
     assert load_threads
     assert owner_thread not in load_threads
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
 
 
 @pytest.mark.asyncio
@@ -1673,7 +1673,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     observe_loop_access = False
     observe_row_facts = False
     store._resident_rows = type(store._resident_rows).prepared(
-        ObservedEntries(store._entries)
+        ObservedEntries(resident_entries(store))
     )
     observe_loop_access = True
     observe_row_facts = True
@@ -1689,7 +1689,7 @@ async def test_async_publish_loads_large_branch_off_loop_with_bounded_install(
     assert loop_entry_accesses == 0
     assert row_fact_threads.count(owner_thread) <= 2
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
     assert branch_messages(store) == branch_messages(fresh)
     assert store.agent_notifications() == fresh.agent_notifications()
     assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
@@ -2087,7 +2087,7 @@ async def test_async_publication_cannot_be_starved_by_owner_writes(
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
     assert refreshes == 1
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
     assert [item.content[0].text for item in branch_messages(store)] == [
         "worker",
         *(f"owner {index}" for index in range(20)),
@@ -2196,7 +2196,7 @@ async def test_async_write_failure_discards_writer_before_next_write(
         await store.append_pending_prompt_async("succeeds")
 
     assert open_count == 2
-    assert [entry.data["text"] for entry in store._entries] == ["failed", "succeeds"]
+    assert [entry.data["text"] for entry in resident_entries(store)] == ["failed", "succeeds"]
 
 
 @pytest.mark.asyncio
@@ -2220,7 +2220,7 @@ async def test_mixed_async_writes_keep_fifo_order(tmp_path: Path) -> None:
         what="test await",
     )
 
-    assert [entry.seq for entry in store._entries] == [1, 2, 3]
+    assert [entry.seq for entry in resident_entries(store)] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -2241,7 +2241,7 @@ async def test_async_write_cancelled_before_worker_start_writes_nothing(
     with pytest.raises(asyncio.CancelledError):
         await await_or_fail(task, what="test await")
     assert not started.is_set()
-    assert store._entries == []
+    assert resident_entries(store) == []
 
 
 @pytest.mark.asyncio
@@ -2264,7 +2264,7 @@ async def test_async_write_cancelled_after_worker_start_is_durable(
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(task, what="test await")
 
-    assert store._entries
+    assert resident_entries(store)
 
 
 @pytest.mark.asyncio
@@ -2292,7 +2292,7 @@ async def test_async_publish_matches_fresh_load_after_interleaved_appends(
     await store.append_message_async(message(MessageRole.ASSISTANT, "done"))
 
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
     assert branch_messages(store) == branch_messages(fresh)
     assert store.agent_notifications() == fresh.agent_notifications()
     assert store.delivery_fold.active_prompts == fresh.delivery_fold.active_prompts
@@ -2321,7 +2321,7 @@ async def test_async_batch_is_never_partially_visible_in_memory(
     def observe_while_blocked() -> None:
         # test-contract: seam coordinates the private install-order hook
         assert install_blocked.wait(timeout=2)
-        visible_during_install.update(entry.type for entry in store.entries)
+        visible_during_install.update(entry.type for entry in resident_entries(store))
         release_install.set()
 
     # test-contract: seam exercises the store mutation boundary
@@ -2338,7 +2338,7 @@ async def test_async_batch_is_never_partially_visible_in_memory(
 
     markers = {"notification_tui_presented", "notification_ack"}
     assert not (visible_during_install & markers) or markers <= visible_during_install
-    assert markers <= {entry.type for entry in store.entries}
+    assert markers <= {entry.type for entry in resident_entries(store)}
 
 
 @pytest.mark.asyncio
@@ -2402,17 +2402,17 @@ def test_notification_delivery_batch_matches_separate_row_order(
     fsync.assert_called_once()
 
     assert (
-        [entry.type for entry in separate.entries]
-        == [entry.type for entry in batched.entries]
+        [entry.type for entry in resident_entries(separate)]
+        == [entry.type for entry in resident_entries(batched)]
         == ["notification", "notification_tui_presented", "notification_ack"]
     )
-    assert separate.entries[0].data == batched.entries[0].data
+    assert resident_entries(separate)[0].data == resident_entries(batched)[0].data
     assert [
         {**entry.data, "notification_id": "notification"}
-        for entry in separate.entries[1:]
+        for entry in resident_entries(separate)[1:]
     ] == [
         {**entry.data, "notification_id": "notification"}
-        for entry in batched.entries[1:]
+        for entry in resident_entries(batched)[1:]
     ]
 
 
@@ -2577,7 +2577,7 @@ def test_full_load_validates_the_final_branch_once(
 
     reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
 
-    assert len(reopened.entries) == 119
+    assert len(resident_entries(reopened)) == 119
     assert len(branch_entries(reopened)) == 2
     assert validations == 2
     reopened.close()
@@ -2626,17 +2626,17 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
         reopened = ConversationStore(tmp_path, session_id=store.session_id)
 
     assert [item.content[0].text for item in branch_messages(reopened)] == ["kept"]
-    assert reopened.entries[-1].type == "warning"
-    assert reopened.entries[-1].data["kind"] == "transcript_recovery"
-    quarantine_id = reopened.entries[-1].data["quarantine_id"]
+    assert resident_entries(reopened)[-1].type == "warning"
+    assert resident_entries(reopened)[-1].data["kind"] == "transcript_recovery"
+    quarantine_id = resident_entries(reopened)[-1].data["quarantine_id"]
     assert (
         reopened.path.with_name(
             f"conversation.quarantine.{quarantine_id}.jsonl"
         ).read_bytes()
         == damaged
     )
-    warning_id = reopened.entries[-1].id
-    warning_seq = reopened.entries[-1].seq
+    warning_id = resident_entries(reopened)[-1].id
+    warning_seq = resident_entries(reopened)[-1].seq
     assert reopened.path.read_bytes().endswith(b"\n")
 
     with warnings.catch_warnings(record=True) as caught:
@@ -2644,9 +2644,9 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
         reopened_again = ConversationStore(tmp_path, session_id=reopened.session_id)
 
     assert caught == []
-    assert reopened_again.entries[-1].id == warning_id
-    assert reopened_again.entries[-1].seq == warning_seq
-    assert reopened_again.entries[-1].parent_id == reopened.entries[-1].parent_id
+    assert resident_entries(reopened_again)[-1].id == warning_id
+    assert resident_entries(reopened_again)[-1].seq == warning_seq
+    assert resident_entries(reopened_again)[-1].parent_id == resident_entries(reopened)[-1].parent_id
     assert reopened_again.path.read_bytes() == reopened.path.read_bytes()
 
 
@@ -2674,7 +2674,7 @@ from pathlib import Path
 from zeta.core.store import ConversationStore
 store = ConversationStore(Path(__import__('sys').argv[1]), session_id=__import__('sys').argv[2])
 print(json.dumps({
-    'data': store.entries[-1].data,
+    'data': store.entry(store.resident_refs()[-1]).data,
     'recovery': list(store.session_dir.glob('conversation.recovery.*')),
     'quarantine': list(store.session_dir.glob('conversation.quarantine.*')),
 }))
@@ -2716,7 +2716,7 @@ def test_fixed_epoch_repair_survives_a_newer_writer_epoch(
     reopened = ConversationStore(sessions, session_id=store.session_id)
 
     assert list(store.session_dir.glob("conversation.quarantine.*"))
-    assert reopened.entries[-1].data["kind"] == "transcript_recovery"
+    assert resident_entries(reopened)[-1].data["kind"] == "transcript_recovery"
     reopened.close()
 
 
@@ -2792,7 +2792,7 @@ def test_non_utf8_tail_uses_termination_rule(tmp_path: Path, tail: bytes) -> Non
     else:
         with pytest.warns(RuntimeWarning, match="torn"):
             reopened = ConversationStore(tmp_path, session_id=store.session_id)
-        assert reopened.entries[-1].type == "warning"
+        assert resident_entries(reopened)[-1].type == "warning"
 
 
 def test_huge_integer_row_is_rejected_with_typed_error(tmp_path: Path) -> None:
@@ -3117,7 +3117,7 @@ def test_concurrent_constructors_repair_once(tmp_path: Path) -> None:
 
     rows = [json.loads(row) for row in stores[0].path.read_text().splitlines()]
     assert [row["type"] for row in rows] == ["header", "message", "warning"]
-    assert all(len(store.entries) == 2 for store in stores)
+    assert all(len(resident_entries(store)) == 2 for store in stores)
 
 
 def test_invalid_parent_is_rejected_on_append(tmp_path: Path) -> None:
@@ -3999,9 +3999,9 @@ def test_live_store_repairs_external_torn_tail_before_append(tmp_path: Path) -> 
     with pytest.warns(RuntimeWarning, match="dropped torn final"):
         store.append_message(message(MessageRole.ASSISTANT, "after"))
 
-    assert [entry.type for entry in store.entries] == ["message", "warning", "message"]
+    assert [entry.type for entry in resident_entries(store)] == ["message", "warning", "message"]
     reopened = ConversationStore(tmp_path, session_id="live-torn")
-    assert [entry.type for entry in reopened.entries] == [
+    assert [entry.type for entry in resident_entries(reopened)] == [
         "message",
         "warning",
         "message",
@@ -4057,7 +4057,7 @@ def test_live_store_full_reloads_growing_in_place_rewrite(tmp_path: Path) -> Non
 
     store.refresh()
 
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
     assert [item.content[0].text for item in branch_messages(store)] == ["kept"]
 
 
@@ -4120,8 +4120,8 @@ def test_live_stores_reload_under_session_lock(tmp_path: Path) -> None:
         [future.result() for future in futures]
 
     reopened = ConversationStore(tmp_path, session_id="shared")
-    assert [entry.seq for entry in reopened.entries] == [1, 2]
-    assert len({entry.id for entry in reopened.entries}) == 2
+    assert [entry.seq for entry in resident_entries(reopened)] == [1, 2]
+    assert len({entry.id for entry in resident_entries(reopened)}) == 2
 
 
 def test_duplicate_generated_id_is_rejected_on_append(tmp_path: Path) -> None:

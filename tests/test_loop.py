@@ -18,7 +18,7 @@ import zeta.agent.runner as agent_runner_module
 import zeta.providers.anthropic as anthropic_module
 import zeta.providers.codex as codex_module
 import zeta.providers.completion as completion_module
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -1116,7 +1116,7 @@ async def test_bash_streams_in_order_and_persists_one_result(tmp_path: Path) -> 
     persisted_context = backend.calls[1][0]
     assert sum(message.tool_result is not None for message in persisted_context) == 1
     assert "tool_execution_update" not in json.dumps(
-        [entry.to_dict() for entry in store.entries]
+        [entry.to_dict() for entry in resident_entries(store)]
     )
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
     replayed_context = await ContextAssembler(reopened).assemble()
@@ -1256,7 +1256,7 @@ async def test_bash_cancel_stops_updates_before_terminal_event(tmp_path: Path) -
     assert len(results) == 1
     assert results[0].content == "tool execution canceled"
     assert "tool_execution_update" not in json.dumps(
-        [entry.to_dict() for entry in store.entries]
+        [entry.to_dict() for entry in resident_entries(store)]
     )
 
 
@@ -1288,7 +1288,7 @@ async def test_streamed_message_log_is_cadence_stable(tmp_path: Path) -> None:
         )
         messages = [
             entry.data["message"]
-            for entry in store.entries
+            for entry in resident_entries(store)
             if entry.type == "message"
         ]
         return json.dumps(messages, sort_keys=True, separators=(",", ":"))

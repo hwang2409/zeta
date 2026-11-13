@@ -1,3 +1,5 @@
+from tests.support.branch_reads import resident_entries
+
 """Key-shaped recent row lookup through the public ConversationStore accessors."""
 
 import json
@@ -115,7 +117,7 @@ def test_delivered_message_matches_the_tagged_send_row(
         {"accepted": True, "session_id": store.session_id},
         message=_user("hello"),
     )
-    tagged = store.entries[-1]
+    tagged = resident_entries(store)[-1]
 
     assert tagged.type == "message"
     assert store.recent_row_seq(DeliveredMessage("send-1")) == tagged.seq
@@ -152,10 +154,10 @@ def test_window_floor_hides_older_rows(store: ConversationStore) -> None:
         store.append_message(_user(f"filler {index}"))
     floor = store.recent_row_floor()
 
-    assert floor == old.seq + 1 == len(store.entries) - RECENT_ROW_WINDOW + 1
+    assert floor == old.seq + 1 == len(resident_entries(store)) - RECENT_ROW_WINDOW + 1
     assert store.recent_row_seq(ApprovalHistory("approval_end", "approval-old")) is None
     assert store.row_id_at(old.seq) is None
-    assert store.row_id_at(floor) == store.entries[floor - 1].id
+    assert store.row_id_at(floor) == resident_entries(store)[floor - 1].id
     # Rows after the mark start below the floor, so the first match is unknown.
     assert (
         store.recent_row_seq(UserTurnMessageAfter(old.seq - 1, MessageOrigin.USER))
@@ -303,7 +305,7 @@ def test_torn_tail_repair_of_a_rewritten_log_publishes_one_reset(
     assert installed == ["reset"]
     assert store.reset_generation() == start + 1
     assert store.row_id_at(first.seq) == "replacement-id" != first.id
-    assert store.entries[-1].type == "warning"
+    assert resident_entries(store)[-1].type == "warning"
 
 
 def test_torn_tail_repair_of_an_extended_log_publishes_the_suffix(
@@ -321,5 +323,5 @@ def test_torn_tail_repair_of_an_extended_log_publishes_the_suffix(
         store.refresh()
 
     assert [[entry.type for entry in delta] for delta in installed] == [["warning"]]
-    assert installed[0][0].id == store.entries[-1].id
+    assert installed[0][0].id == resident_entries(store)[-1].id
     assert store.reset_generation() == start

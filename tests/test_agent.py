@@ -32,7 +32,7 @@ from tests.support.agent_lifecycle import (
     wait_background_owner,
     watch_delegated_registrations,
 )
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.completion import completion_control
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
@@ -668,7 +668,7 @@ async def test_agent_loop_uses_fallback_after_empty_summary_retries(
     assert len(backend.calls) == 4
     assert not any(event.type is StreamEventType.ERROR for event in events)
     assert any(event.type is StreamEventType.TURN_END for event in events)
-    marker = next(entry for entry in store.entries if entry.type == "compaction")
+    marker = next(entry for entry in resident_entries(store) if entry.type == "compaction")
     assert marker.data["summary"].startswith(
         "[automatic fallback summary: model returned no summary]"
     )
@@ -6044,14 +6044,14 @@ async def test_run_agent_tool_writes_child_run_started_before_child_work(
     original_lifecycle = ConversationStore.start_agent_lifecycle
 
     def start_lifecycle(self, *args, **kwargs):
-        assert any(entry.type == "child_run_started" for entry in store.entries)
+        assert any(entry.type == "child_run_started" for entry in resident_entries(store))
         milestones.append("lifecycle")
         return original_lifecycle(self, *args, **kwargs)
 
     original_build = agent_runner_module._build_child_loop
 
     async def build_child(*args, **kwargs):
-        assert any(entry.type == "child_run_started" for entry in store.entries)
+        assert any(entry.type == "child_run_started" for entry in resident_entries(store))
         milestones.append("build")
         return await original_build(*args, **kwargs)
 
@@ -6062,7 +6062,7 @@ async def test_run_agent_tool_writes_child_run_started_before_child_work(
 
     def complete(messages, tool_schemas, *, control):
         if len(backend.calls) == 1:
-            assert any(entry.type == "child_run_started" for entry in store.entries)
+            assert any(entry.type == "child_run_started" for entry in resident_entries(store))
             milestones.append("output")
         return original_complete(messages, tool_schemas, control=control)
 
@@ -6072,7 +6072,7 @@ async def test_run_agent_tool_writes_child_run_started_before_child_work(
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         assert milestones == ["lifecycle", "build", "output"]
         row = next(
-            entry for entry in store.entries if entry.type == "child_run_started"
+            entry for entry in resident_entries(store) if entry.type == "child_run_started"
         )
         assert len(row.data["task"].encode()) <= 1024
     finally:
@@ -11262,7 +11262,7 @@ async def test_step_delivery_never_reads_log_on_loop_after_foreign_change(
 
     assert owner_calls == []
     fresh = ConversationStore(tmp_path, session_id=store.session_id)
-    assert store.entries == fresh.entries
+    assert resident_entries(store) == resident_entries(fresh)
 
 
 @pytest.mark.asyncio
@@ -12654,7 +12654,7 @@ async def test_agent_send_cancellation_reports_durable_outcome(
         assert result["content"][0]["text"].startswith("queued a follow-up")
         assert [
             entry.data["text"]
-            for entry in child_store.entries
+            for entry in resident_entries(child_store)
             if entry.type == "pending_prompt"
         ] == ["follow up"]
         assert [
@@ -22579,7 +22579,7 @@ async def test_notification_defers_when_capacity_below_minimal_digest(
     assert deferred.deferred_low_capacity is True
     assert deferred.notification_ids == ()
     assert len(store.agent_notifications()) == 1
-    assert not any(entry.type == "notification_ack" for entry in store.entries)
+    assert not any(entry.type == "notification_ack" for entry in resident_entries(store))
 
     flow.release_active()
     assembler.update_token_budget(400_000)

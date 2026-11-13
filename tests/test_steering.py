@@ -20,7 +20,7 @@ from rich.console import Console
 
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.providers.completion as completion_module
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -792,7 +792,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
     app._submissions.wake()
     async with asyncio.timeout(10):
         await captured.get()
-    entries = app.loop.store.entries
+    entries = resident_entries(app.loop.store)
     assert [entry.type for entry in entries].count("notification_ack") == 0
     assert (
         sum(message.role is MessageRole.SYSTEM for message in branch_messages(app.loop.store))
@@ -836,7 +836,7 @@ async def test_failed_notification_turn_after_persistence_retries_from_history(
         )
         == 1
     )
-    assert [entry.type for entry in app.loop.store.entries].count(
+    assert [entry.type for entry in resident_entries(app.loop.store)].count(
         "notification_ack"
     ) == 1
 

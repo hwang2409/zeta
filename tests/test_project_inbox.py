@@ -21,7 +21,7 @@ from rich.console import Console
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.project_inbox as project_inbox_module
 import zeta.storage_format as storage_format_module
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.cli.inbox import run as run_inbox_cli
@@ -2264,7 +2264,7 @@ async def test_crash_between_note_append_and_receipt_does_not_duplicate(
         await _collect_turn(loop, "first")
     assert sum(
         message.metadata.get("zeta_event") == "project_inbox_sent_status"
-        for message in store.entries
+        for message in resident_entries(store)
         if message.type == "message"
         for message in [Message.from_dict(message.data["message"])]
     ) == 1

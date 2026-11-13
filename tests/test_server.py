@@ -35,7 +35,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.core.slash as core_slash
 import zeta.server.handlers.history as history_module
 import zeta.server.protocol as protocol_module
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
@@ -2173,7 +2173,7 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
         reopened = SessionManager(tmp_path).open(session_id).store
-        assert "reason" not in reopened.entries[-1].data
+        assert "reason" not in resident_entries(reopened)[-1].data
 
         history = (
             await _request(
@@ -6056,7 +6056,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
         text="heads up",
     )
     assert unknown is not None
-    loaded = next(entry for entry in store._entries if entry.id == unknown.id)
+    loaded = next(entry for entry in resident_entries(store) if entry.id == unknown.id)
     loaded.data["kind"] = "monitor_alert"  # Simulate a future kind loaded from disk.
     try:
         history = (

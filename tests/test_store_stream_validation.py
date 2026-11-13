@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from zeta.core.checkpoints import ConversationIntegrityError, load_session_json
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -46,7 +47,7 @@ def test_full_load_never_requests_one_transcript_sized_read(
         tmp_path, session_id="streamed-full-load", _read_only=True
     )
     try:
-        assert len(reopened.entries) == 2
+        assert len(resident_entries(reopened)) == 2
         assert transcript_size not in requested_reads, (
             "full load requested one transcript-sized read"
         )

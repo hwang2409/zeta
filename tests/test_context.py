@@ -1,5 +1,5 @@
 
-from tests.support.branch_reads import branch_entries, branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 
 from tests.support.owned import await_or_fail
 from zeta.providers.completion import owned_completion
@@ -948,7 +948,7 @@ async def test_failed_summary_leaves_store_unchanged(context_root: Path) -> None
         await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 @pytest.mark.asyncio
@@ -1305,7 +1305,7 @@ async def test_compaction_is_idempotent_for_same_store_state(
     await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert len([entry for entry in store.entries if entry.type == "compaction"]) == 1
+    assert len([entry for entry in resident_entries(store) if entry.type == "compaction"]) == 1
 
 
 @pytest.mark.asyncio
@@ -1337,7 +1337,7 @@ async def test_over_budget_compaction_does_not_persist_marker(
         await assembler.assemble()
 
     assert store.path.read_bytes() == before
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 @pytest.mark.asyncio
@@ -1376,7 +1376,7 @@ async def test_repeated_compaction_replays_flattened_marker_range(
         store.append_message(with_message_origin(text(MessageRole.USER, value), MessageOrigin.USER))
     await assembler.assemble()
 
-    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    markers = [entry for entry in resident_entries(store) if entry.type == "compaction"]
     assert [
         (entry.data["source_seq_start"], entry.data["source_seq_end"])
         for entry in markers
@@ -1468,10 +1468,10 @@ async def test_same_state_recompaction_survives_cold_reload(context_root: Path) 
     )
 
     await assembler.assemble()
-    first_marker = next(entry for entry in store.entries if entry.type == "compaction")
+    first_marker = next(entry for entry in resident_entries(store) if entry.type == "compaction")
     assembler.record_usage({"input_tokens": 300})
     await assembler.assemble()
-    markers = [entry for entry in store.entries if entry.type == "compaction"]
+    markers = [entry for entry in resident_entries(store) if entry.type == "compaction"]
 
     assert markers[1].data["replaces"] == [first_marker.id]
     reopened = ConversationStore(context_root, session_id=store.session_id)
@@ -1569,7 +1569,7 @@ async def test_stale_branch_discards_summary(context_root: Path) -> None:
     with pytest.raises(StaleBranchError):
         await assembler.assemble()
 
-    assert not any(entry.type == "compaction" for entry in store.entries)
+    assert not any(entry.type == "compaction" for entry in resident_entries(store))
 
 
 
