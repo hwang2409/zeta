@@ -1059,9 +1059,13 @@ async def run_agent_tool(
         # child's own abort path) must not both write; a failed write releases it.
         child_canceled = True
         try:
-            return await persist_confirmed_cancel(
+            confirmed = await persist_confirmed_cancel(
                 terminal_fence, child_store, tool_call.id
             )
+            if confirmed:
+                child_loop.admit_abort()
+                child_loop.tool_registry.abort()
+            return confirmed
         except BaseException:
             child_canceled = False
             raise
@@ -1075,8 +1079,6 @@ async def run_agent_tool(
             return
         if not confirmed:
             return
-        child_loop.admit_abort()
-        child_loop.tool_registry.abort()
         child_loop.store.drop_client_steering("abort")
         loop._background_owner.cancel_subtree(child_instance_id)
         if not child_task.done():
