@@ -1810,19 +1810,34 @@ class ForegroundNestedBackgroundBackend(CompletionBackend):
 
 
 class FinishGateBackend(CompletionBackend):
-    def __init__(self, gate_action: str, *, background_child: bool = False) -> None:
+    def __init__(
+        self,
+        gate_action: str,
+        *,
+        background_child: bool = False,
+        hold_gate_check: bool = False,
+    ) -> None:
         self.gate_action = gate_action
         self.background_child = background_child
+        self.hold_gate_check = hold_gate_check
         self.grandchild_started = asyncio.Event()
+        self.child_final_attempt_served = asyncio.Event()
+        self.grandchild_completion_published = asyncio.Event()
         self.release_grandchild = asyncio.Event()
+        self.child_turn_returned = asyncio.Event()
         self.gate_seen = asyncio.Event()
+        self.gate_check_started = asyncio.Event()
+        self.release_gate_check = asyncio.Event()
         self.gate_response_completed = asyncio.Event()
         self.model_bound_reached = asyncio.Event()
         self.child_final_responses: list[str] = []
+        self.completion_notification_text: str | None = None
         self.gate_calls = 0
         self.invalid_handoff_sent = False
         self.handoff_schema_seen = False
         self.handoff_schema_seen_before_gate = False
+        self.request_count = 0
+        self.request_limit: int | None = None
 
     @owned_completion
     async def complete(
@@ -1830,6 +1845,11 @@ class FinishGateBackend(CompletionBackend):
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
     ) -> AsyncIterator[StreamEvent]:
+        self.request_count += 1
+        if self.request_limit is not None and self.request_count > self.request_limit:
+            raise AssertionError(
+                f"finish-gate script exceeded {self.request_limit} model requests"
+            )
         last_user = next(
             (
                 block.text
@@ -1887,6 +1907,7 @@ class FinishGateBackend(CompletionBackend):
             await await_or_fail(self.release_grandchild.wait(), what="self.release_grandchild.wait()")
             blocks = [TextContent("evidence ready")]
         elif grandchild_started and gate is None and not notification:
+            self.child_final_attempt_served.set()
             blocks = [TextContent("premature child answer")]
         elif last_user == "child prompt" and gate is None:
             grandchild = _background_agent_call("grandchild")
@@ -1897,6 +1918,12 @@ class FinishGateBackend(CompletionBackend):
             blocks = [TextContent("child canceled unused work and finished")]
         elif gate is not None and not notification:
             self.gate_calls += 1
+            if self.hold_gate_check and self.gate_calls == 1:
+                self.gate_check_started.set()
+                await await_or_fail(
+                    self.release_gate_check.wait(),
+                    what="self.release_gate_check.wait()",
+                )
             self.gate_seen.set()
             gate_text = next(
                 block.text for block in gate.content if isinstance(block, TextContent)
@@ -1943,17 +1970,30 @@ class FinishGateBackend(CompletionBackend):
             else:
                 blocks = [TextContent("I will wait for the evidence.")]
         elif notification:
-            blocks = [TextContent("merged result: evidence ready")]
+            self.grandchild_completion_published.set()
+            notification_text = next(
+                block.text
+                for message in messages
+                if message.metadata.get("zeta_event") == "agent_notifications"
+                for block in message.content
+                if isinstance(block, TextContent)
+            )
+            self.completion_notification_text = notification_text
+            blocks = [TextContent(notification_text)]
         else:
             blocks = [TextContent("root complete")]
         for block in blocks:
             if isinstance(block, TextContent) and (
-                "child" in block.text or "merged result" in block.text
+                "child" in block.text
+                or "merged result" in block.text
+                or block.text == self.completion_notification_text
             ):
                 self.child_final_responses.append(block.text)
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        if last_user == "child prompt":
+            self.child_turn_returned.set()
         # the completion owner closes the stream at MESSAGE_END; signal first.
         if gate is not None:
             self.gate_response_completed.set()
@@ -3323,7 +3363,7 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
 
     await asyncio.wait_for(backend.grandchild_started.wait(), timeout=10)
     sibling_done = asyncio.Event()
-    sibling_task = asyncio.create_task(sibling_done.wait())
+    sibling_task = asyncio.create_task(asyncio.wait_for(sibling_done.wait(), 10))
     loop._background_owner.register(
         "root:sibling",
         sibling_task.cancel,
@@ -3344,48 +3384,222 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     }
     assert not sibling_task.done()
     loop._background_owner.cancel("root:sibling")
-    await asyncio.gather(sibling_task, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(sibling_task, return_exceptions=True),
+        what="sibling task cleanup",
+    )
+    grandchild_store.close()
     await loop.close()
 
 
-@pytest.mark.asyncio
-async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
-    tmp_path: Path,
+async def _finish_gate_before_end_turn(
+    backend: FinishGateBackend,
+    gate_engaged: asyncio.Event,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+    dump_order: Callable[[], str],
 ) -> None:
-    backend = FinishGateBackend("wait")
+    await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+    await await_or_fail(
+        backend.child_final_attempt_served.wait(), what="child final attempt"
+    )
+    await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+    backend.release_grandchild.set()
+    release_gate_engagement.set()
+    backend.release_gate_check.set()
+    await await_or_fail(backend.gate_seen.wait(), what="finish-gate model turn")
+    assert backend.gate_calls >= 1
+    await await_or_fail(task, what=dump_order)
+
+
+async def _finish_gate_before_gate(
+    backend: FinishGateBackend,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+    dump_order: Callable[[], str],
+) -> None:
+    await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+    backend.release_grandchild.set()
+    await await_or_fail(
+        backend.grandchild_completion_published.wait(),
+        what="grandchild completion publication",
+    )
+    release_gate_engagement.set()
+    backend.release_gate_check.set()
+    await await_or_fail(task, what=dump_order)
+
+
+async def _finish_gate_after_gate(
+    backend: FinishGateBackend,
+    gate_engaged: asyncio.Event,
+    release_gate_engagement: asyncio.Event,
+    task: asyncio.Task[list[object]],
+) -> None:
+    await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+    release_gate_engagement.set()
+    await await_or_fail(
+        backend.gate_check_started.wait(), what="finish-gate check"
+    )
+    assert not backend.gate_seen.is_set()
+    backend.release_gate_check.set()
+    await await_or_fail(backend.gate_seen.wait(), what="finish-gate model turn")
+    assert not task.done()
+
+
+async def _run_child_finish_gate_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch | None,
+    release_order: str | None,
+) -> None:
+    if release_order is None:
+        release_order = "before_gate"
+    backend = FinishGateBackend("wait", hold_gate_check=monkeypatch is not None)
+    backend.request_limit = 6
+    original_finish_lifecycle = ConversationStore.finish_agent_lifecycle
+
+    def finish_lifecycle_barrier(
+        store: ConversationStore, state: str, **kwargs: object
+    ) -> None:
+        original_finish_lifecycle(store, state, **kwargs)
+        if state == "completed":
+            backend.grandchild_completion_published.set()
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            ConversationStore,
+            "finish_agent_lifecycle",
+            finish_lifecycle_barrier,
+        )
+    gate_engaged = asyncio.Event()
+    release_gate_engagement = asyncio.Event()
+    if monkeypatch is None:
+        gate_engaged.set()
+        release_gate_engagement.set()
+    original_run_finish_gate = agent_runner_module.run_finish_gate
+
+    async def hold_gate_engagement(*args: object, **kwargs: object) -> FinishGateResult:
+        gate_engaged.set()
+        await await_or_fail(
+            release_gate_engagement.wait(), what="release_gate_engagement.wait()"
+        )
+        return await original_run_finish_gate(*args, **kwargs)
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(agent_runner_module, "run_finish_gate", hold_gate_engagement)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
     task = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await asyncio.wait_for(backend.gate_seen.wait(), timeout=2)
-    assert not task.done()
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    gate_message = next(
-        message
-        for message in child_store.messages()
-        if message.metadata.get("zeta_event") == "agent_finish_gate"
-    )
-    assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
-    assert "collect evidence" in next(
-        block.text for block in gate_message.content if isinstance(block, TextContent)
-    )
+    child_store: ConversationStore | None = None
+    expect_gate_call = release_order != "before_end_turn"
 
-    child_store.close()
-    backend.release_grandchild.set()
-    await asyncio.wait_for(task, timeout=10)
+    def dump_order() -> str:
+        if child_store is not None:
+            child_store.refresh()
+        print(
+            "finish-gate order dump",
+            release_order,
+            "lifecycle=",
+            child_store.agent_lifecycle() if child_store is not None else None,
+            "task_done=",
+            task.done(),
+            "running_tasks=",
+            loop.tool_registry.background_tasks.running_count,
+            "registry=",
+            loop.tool_registry.background_tasks.snapshot(),
+            "grandchild_started=",
+            backend.grandchild_started.is_set(),
+            "gate_engaged=",
+            gate_engaged.is_set(),
+            "gate_seen=",
+            backend.gate_seen.is_set(),
+            "child_turn_returned=",
+            backend.child_turn_returned.is_set(),
+        )
+        return "finish-gate order completion"
 
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    lifecycle = child_store.agent_lifecycle()
-    assert lifecycle is not None
-    assert lifecycle["final_result"].startswith("merged result: evidence ready")
-    assert backend.child_final_responses.index("premature child answer") < (
-        backend.child_final_responses.index("merged result: evidence ready")
-    )
-    assert not store.agent_children()
-    child_store.close()
-    await loop.close()
+    try:
+        if monkeypatch is None:
+            backend.release_grandchild.set()
+            await await_or_fail(task, what="finish-gate completion")
+        elif release_order == "before_end_turn":
+            await _finish_gate_before_end_turn(
+                backend,
+                gate_engaged,
+                release_gate_engagement,
+                task,
+                dump_order,
+            )
+        elif release_order == "before_gate":
+            await await_or_fail(gate_engaged.wait(), what="finish-gate engagement")
+            await _finish_gate_before_gate(
+                backend, release_gate_engagement, task, dump_order
+            )
+        else:
+            await _finish_gate_after_gate(
+                backend, gate_engaged, release_gate_engagement, task
+            )
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        if expect_gate_call:
+            gate_message = next(
+                message
+                for message in child_store.messages()
+                if message.metadata.get("zeta_event") == "agent_finish_gate"
+            )
+            assert gate_message.metadata["zeta.origin"] == MessageOrigin.HARNESS_NUDGE.value
+            assert "collect evidence" in next(
+                block.text
+                for block in gate_message.content
+                if isinstance(block, TextContent)
+            )
+
+        child_store.close()
+        child_store = None
+        backend.release_grandchild.set()
+        await await_or_fail(task, what="finish-gate completion")
+
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        lifecycle = child_store.agent_lifecycle()
+        assert lifecycle is not None
+        assert backend.completion_notification_text is not None
+        assert lifecycle["final_result"].startswith(
+            backend.completion_notification_text
+        )
+        assert "Background updates only." in backend.completion_notification_text
+        assert "evidence ready" in backend.completion_notification_text
+        assert lifecycle["final_result"].count("evidence ready") == 1
+        assert backend.child_final_responses.index("premature child answer") < (
+            backend.child_final_responses.index(backend.completion_notification_text)
+        )
+        assert not store.agent_children()
+    finally:
+        if child_store is not None:
+            child_store.close()
+        if not task.done():
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="finish-gate task cleanup",
+        )
+        store.close()
+        await loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_order", ["before_end_turn", "before_gate", "after_gate"])
+async def test_child_finish_gate_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_order: str
+) -> None:
+    await _run_child_finish_gate_order(tmp_path, monkeypatch, release_order)
+
+
+@pytest.mark.asyncio
+async def test_child_finish_gate_waits_for_grandchild_and_merges_result(
+    tmp_path: Path,
+) -> None:
+    await _run_child_finish_gate_order(tmp_path, None, None)
 
 
 @pytest.mark.asyncio
@@ -3919,7 +4133,7 @@ async def test_child_finish_gate_text_handoff_is_not_control_signal(
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
     assert lifecycle is not None
-    assert lifecycle["final_result"].startswith("merged result: evidence ready")
+    assert "evidence ready" in lifecycle["final_result"]
     assert not store.agent_children()
     child_store.close()
     await loop.close()
@@ -5160,8 +5374,10 @@ async def test_child_finish_gate_model_bound_waits_for_grandchild(
     root_run = asyncio.create_task(
         _collect(loop.run_turn("start", origin=MessageOrigin.USER))
     )
-    await backend.gate_seen.wait()
-    await backend.gate_response_completed.wait()
+    await await_or_fail(backend.gate_seen.wait(), what="gate seen")
+    await await_or_fail(
+        backend.gate_response_completed.wait(), what="gate response completed"
+    )
 
     child_store = ConversationStore(store.session_dir / "agents", session_id="1")
     lifecycle = child_store.agent_lifecycle()
@@ -5176,14 +5392,14 @@ async def test_child_finish_gate_model_bound_waits_for_grandchild(
 
     child_store.close()
     backend.release_grandchild.set()
-    await root_run
+    await await_or_fail(root_run, what="root finish-gate run")
     await wait_background_owner(loop)
     assert (
         store.agent_notifications(pending_only=False)[-1].data["status"] == "completed"
     )
     receipt = store.tool_result("child")
     assert receipt is not None
-    assert "merged result: evidence ready" in receipt.content
+    assert "evidence ready" in receipt.content
     await loop.close()
 
 
@@ -17303,10 +17519,29 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
     )
     idle_entries: asyncio.Queue[None] = asyncio.Queue()
     forced_extra_idle = asyncio.Event()
-    answer_idle_entered = asyncio.Event()
+    answer_notice_started = asyncio.Event()
+    release_answer_notice = asyncio.Event()
+    answer_notice_published = asyncio.Event()
     force_extra_idle = False
     answer_consumed = False
     prompts: list[str] = []
+
+    channel = loop._background_owner.conversation_channel
+    original_publish_idle = channel.publish_idle
+
+    async def gated_publish_idle(**kwargs):
+        if kwargs.get("text") == "after Re q-reset: approved":
+            answer_notice_started.set()
+            await await_or_fail(
+                release_answer_notice.wait(),
+                what="release answered child idle notice",
+            )
+            result = await original_publish_idle(**kwargs)
+            answer_notice_published.set()
+            return result
+        return await original_publish_idle(**kwargs)
+
+    monkeypatch.setattr(channel, "publish_idle", gated_publish_idle)
 
     async def consume(_loop, prompt, **kwargs):
         nonlocal answer_consumed
@@ -17338,18 +17573,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         idle_entries.put_nowait(None)
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
-        if answer_consumed:
-            notices = [
-                entry
-                for entry in parent.agent_notifications(pending_only=False)
-                if entry.data.get("kind") == "child_idle"
-            ]
-            if any(
-                entry.data.get("text") == "after Re q-reset: approved"
-                for entry in notices
-            ):
-                answer_idle_entered.set()
-        await asyncio.wait_for(wake(), 10)
+        await await_or_fail(wake(), what="idle notice wake")
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
@@ -17371,7 +17595,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         "root:1", run.cancel, run, parent_store=parent, active_store=child
     )
     try:
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await await_or_fail(idle_entries.get(), what="first idle entry")
         assert (
             await send_to_run(
                 parent,
@@ -17382,7 +17606,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(idle_entries.get(), 10)
+        await await_or_fail(idle_entries.get(), what="question idle entry")
         assert (
             len(
                 [
@@ -17399,7 +17623,9 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         if extra_idle_wake:
             force_extra_idle = True
             loop._background_owner.conversation_channel.wake("root:1")
-            await asyncio.wait_for(forced_extra_idle.wait(), 10)
+            await await_or_fail(
+                forced_extra_idle.wait(), what="forced extra idle entry"
+            )
         assert (
             await send_to_run(
                 parent,
@@ -17410,7 +17636,13 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             )
             is None
         )
-        await asyncio.wait_for(answer_idle_entered.wait(), 10)
+        await await_or_fail(
+            answer_notice_started.wait(), what="answered idle notice start"
+        )
+        release_answer_notice.set()
+        await await_or_fail(
+            answer_notice_published.wait(), what="answered idle notice publication"
+        )
         notices = [
             entry
             for entry in parent.agent_notifications(pending_only=False)
@@ -17420,6 +17652,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         assert notices[0].id != notices[1].id
         assert notices[1].data["text"] == "after Re q-reset: approved"
     finally:
+        release_answer_notice.set()
         loop._background_owner.unregister("root:1")
         await _cancel_idle_fixture(run, registry, parent, child)
 
@@ -17756,6 +17989,27 @@ async def test_non_explicit_finish_child_gets_no_reminder(
     store, registry, loop = _reminder_loop(tmp_path)
     loop.explicit_finish = False
     prompts: list[str] = []
+    terminal_write_started = asyncio.Event()
+    terminal_write_completed = asyncio.Event()
+    release_terminal_write = asyncio.Event()
+    original_admit = ConversationStore.admit_step_delivery_terminal
+
+    async def gated_admit(
+        target: ConversationStore,
+        intent: str,
+        *,
+        _store: ConversationStore = store,
+    ):
+        if target is _store:
+            terminal_write_started.set()
+            await await_or_fail(
+                release_terminal_write.wait(),
+                what="release non-explicit child terminal store write",
+            )
+            result = await original_admit(target, intent)
+            terminal_write_completed.set()
+            return result
+        return await original_admit(target, intent)
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(store, kwargs)
@@ -17767,13 +18021,34 @@ async def test_non_explicit_finish_child_gets_no_reminder(
         }
 
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
-    await asyncio.wait_for(
-        agent_runner_module.consume_run(loop, "work", child_store=store), 2
+    monkeypatch.setattr(ConversationStore, "admit_step_delivery_terminal", gated_admit)
+    run = asyncio.create_task(
+        agent_runner_module.consume_run(loop, "work", child_store=store)
     )
-    assert prompts == ["work"]
-    assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
-    await registry.close()
-    store.close()
+    try:
+        await await_or_fail(
+            terminal_write_started.wait(),
+            what="non-explicit child terminal store write",
+        )
+        release_terminal_write.set()
+        await await_or_fail(run, what="non-explicit child completion")
+        await await_or_fail(
+            terminal_write_completed.wait(),
+            what="non-explicit child terminal store write completion",
+        )
+        assert terminal_write_completed.is_set()
+        assert prompts == ["work"]
+        assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
+    finally:
+        release_terminal_write.set()
+        if not run.done():
+            run.cancel()
+        await await_or_fail(
+            asyncio.gather(run, return_exceptions=True),
+            what="non-explicit child cleanup",
+        )
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio

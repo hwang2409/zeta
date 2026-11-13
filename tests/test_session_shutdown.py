@@ -135,14 +135,16 @@ def test_entrypoint_shutdown_releases_every_lease(
         finally:
             await server.close()
 
-    expected = pytest.raises(RuntimeError, match="injected") if failure else nullcontext()
+    # The TUI command logs a crash and exits 1 instead of raising.
+    raises = failure is not None and entry != "tui-new"
+    expected = pytest.raises(RuntimeError, match="injected") if raises else nullcontext()
     with expected:
         if entry == "server":
             asyncio.run(server())
         elif entry == "headless":
             assert run_headless(args, "hello") == 0
         elif entry == "tui-new":
-            assert main(["--provider", "codex"]) == 0
+            assert main(["--provider", "codex"]) == (0 if failure is None else 1)
         else:
             asyncio.run(build_app(args).run())
 
