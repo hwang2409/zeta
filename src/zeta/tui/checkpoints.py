@@ -658,7 +658,9 @@ class CheckpointTranscriptMixin:
             rendered_notifications, asynchronous=True
         )
         if marker_write is not None:
-            asyncio.create_task(marker_write)
+            task = asyncio.create_task(marker_write)
+            self._history_marker_tasks.add(task)
+            task.add_done_callback(self._history_marker_tasks.discard)
 
     def _render_history_entries(
         self, branch: tuple[Any, ...], rendered_notifications: list[str]

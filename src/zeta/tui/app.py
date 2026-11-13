@@ -270,6 +270,7 @@ class TUIApp(
         self._history_source = RootTUIHistorySource(self.loop.store)
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
@@ -712,6 +713,11 @@ class TUIApp(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._history_search_task = None
+
+    async def _close_history_markers(self) -> None:
+        tasks = tuple(self._history_marker_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     def _history_finder_open(self, buffer: Any) -> None:
         if self._agent_navigation.child_view_active:

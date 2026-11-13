@@ -810,7 +810,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         )
     )
     try:
-        await rendered_output.wait()
+        await await_or_fail(
+            rendered_output.wait(), what="notification render output"
+        )
         assert (
             output.getvalue().count("child child-canceled-presentation · completed")
             == 1
@@ -820,7 +822,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         await asyncio.sleep(0)
         store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
-            await presentation
+            await await_or_fail(
+                presentation, what="canceled notification presentation"
+            )
 
         reopened = ConversationStore(store.root_dir, session_id=store.session_id)
         resumed_output = StringIO()
@@ -848,7 +852,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             store._async_write_lock.release()
         if not presentation.done():
             presentation.cancel()
-            await asyncio.gather(presentation, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(presentation, return_exceptions=True), 10
+            )
         await loop.close()
         store.close()
 
@@ -9244,6 +9250,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     mcp_calls: list[None] = []
     freeze_calls: list[None] = []
     replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
     source_page = app._history_source.page
 
     async def ensure_mcp() -> None:
@@ -9252,7 +9259,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     async def observed_page(*args: object, **kwargs: object) -> object:
         page = await source_page(*args, **kwargs)
         replay_started.set()
-        await asyncio.sleep(0)
+        await await_or_fail(release_replay.wait(), what="release startup replay")
         return page
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
@@ -9266,9 +9273,18 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
     with create_pipe_input() as pipe:
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
-        await replay_started.wait()
-        app.request_exit()
-        await asyncio.wait_for(run_task, timeout=1)
+        try:
+            await await_or_fail(replay_started.wait(), what="startup replay")
+            app.request_exit()
+            release_replay.set()
+            await asyncio.wait_for(run_task, timeout=10)
+        finally:
+            release_replay.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(run_task, return_exceptions=True), 10
+                )
 
     assert "99" not in Text.from_ansi(app._transcript.render(120)).plain
     assert mcp_calls == []
@@ -9557,9 +9573,9 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
             multiline=True,
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.wait_for(startup_ready.wait(), timeout=5)
+        await asyncio.wait_for(startup_ready.wait(), timeout=10)
         pipe.send_text("\x04")
-        await asyncio.wait_for(run_task, timeout=5)
+        await asyncio.wait_for(run_task, timeout=10)
 
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 

@@ -66,6 +66,7 @@ class RuntimeCloseMixin:
                 await attempt_async(prepare_ui_session_change)
             await attempt_async(self._close_finder_workers)
             await attempt_async(self._close_history_search)
+            await attempt_async(self._close_history_markers)
             await attempt_async(self._history_pager.close)
             await attempt_async(self._prompt_history.close)
             await attempt_async(self._close_approval_labels)
