@@ -376,6 +376,21 @@ class MCPMount:
             raise ValueError(f"unknown MCP server: {name}")
         actor.set_primary_registry_only(enabled)
 
+    async def suspend_server(
+        self,
+        server_config: MCPServerConfig,
+        *,
+        source: Path,
+    ) -> None:
+        """Suspend one connection while keeping its actor available for replacement."""
+        async with self._config_lock:
+            actor = self._actors.get(server_config.name)
+            if actor is None or self._closed:
+                raise ValueError(f"unknown MCP server: {server_config.name}")
+            self.configs[server_config.name] = server_config
+            self.sources[server_config.name] = source
+        await actor.suspend(server_config, source)
+
     async def replace_server(
         self,
         server_config: MCPServerConfig,

@@ -41,6 +41,7 @@ from .actors.lifecycle import (
     ChildFinished as _ChildFinished,
     Close as _Close,
     Remove as _Remove,
+    Suspend as _Suspend,
     TransportFailure as _TransportFailure,
 )
 from .actors.resource import (
@@ -258,6 +259,14 @@ class MCPServerActor(MCPDefinitionPublisher):
             "manual", notice_sink, config=config, source=source
         )
 
+    async def suspend(self, config: MCPServerConfig, source: Path) -> None:
+        """Withdraw definitions and close the client without terminating the actor."""
+        if self.is_terminal:
+            return
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._queue.put_nowait(_Suspend(config, source, future))
+        await asyncio.shield(future)
+
     async def remove(self) -> None:
         if self.is_terminal:
             return
@@ -401,6 +410,8 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._handle_cancel_request(message)
                 elif isinstance(message, _ChildFinished):
                     self._children.discard(message.task)
+                elif isinstance(message, _Suspend):
+                    await self._handle_suspend(message)
                 elif isinstance(message, _Remove):
                     await self._handle_remove(message.result)
                     return
@@ -990,6 +1001,52 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._resource_requests.pop(message.identifier, None)
         _set_result(message.acknowledged, None)
 
+    async def _handle_suspend(self, message: _Suspend) -> None:
+        operation = self._operation
+        if operation is not None:
+            self._cancel_current_operation()
+            if operation.task is not None:
+                await asyncio.gather(operation.task, return_exceptions=True)
+            self._finish_cancelled(operation)
+        while self._pending_starts:
+            self._resolve_message(self._pending_starts.pop(0))
+        for request in self._requests.values():
+            if request.task is not None:
+                request.task.cancel()
+            if isinstance(request, _CallRequest):
+                _set_result(request.result, _unavailable_result(self.name))
+            else:
+                cancel_prompt_request(request, self.name)
+        self._requests.clear()
+        cancel_terminated_resources(self)
+        await self._tool_refresh.close()
+        client = self._client
+        self._client = None
+        self._tools = ()
+        self._prompts = ()
+        self._generation += 1
+        self._unregister_tools()
+        if client is not None:
+            await self._schedule_close(client)
+        if self._scheduled_closes:
+            await asyncio.gather(
+                *(task for _, task in self._scheduled_closes.values()),
+                return_exceptions=True,
+            )
+        self.config = message.config
+        self.source = message.source
+        self._set_status(
+            MCPServerStatus(
+                self.name,
+                self.config.transport,
+                "degraded",
+                reason="binding detached",
+                stderr_log_path=str(mcp_log_path(self.name)),
+            )
+        )
+        self._tool_refresh.settle()
+        _set_result(message.result, None)
+
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
 
@@ -1093,7 +1150,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._resolve_message(message)
 
     def _resolve_message(self, message: object | None) -> None:
-        if isinstance(message, (_Remove, _Close)):
+        if isinstance(message, (_Suspend, _Remove, _Close)):
             _set_result(message.result, None)
         elif isinstance(message, (_CancelOperation, _CancelRequest)):
             _set_result(message.acknowledged, None)

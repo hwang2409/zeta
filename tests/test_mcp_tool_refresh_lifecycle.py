@@ -210,3 +210,32 @@ async def test_disconnect_publishes_degraded_catalog_before_settling_held_refres
         client.refresh_release.set()
         await mount.close()
         await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_suspend_publishes_degraded_catalog_before_settling_held_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = MCPServerConfig("server", "stdio", "unused")
+    client = _HeldRefreshClient(config)
+    registry, mount = await _mounted_refresh(tmp_path, monkeypatch, client)
+    waiter = asyncio.create_task(_wait_catalog(mount, registry))
+    suspend = asyncio.create_task(
+        mount.suspend_server(config, source=tmp_path / "mcp.json")
+    )
+    try:
+        assert await await_or_fail(waiter, what="suspend refresh settlement") == (
+            "degraded",
+            set(),
+        )
+        await _assert_following_turn_does_not_wait(mount)
+        await await_or_fail(suspend, what="server suspension")
+    finally:
+        client.refresh_release.set()
+        if not suspend.done():
+            suspend.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(suspend, return_exceptions=True), 10
+            )
+        await mount.close()
+        await registry.close()
