@@ -25,6 +25,7 @@ from ..storage_format import (
     feature_enabled,
     writer_epoch,
 )
+from .retention import create_tui_app
 
 if TYPE_CHECKING:
     import httpx
@@ -837,6 +838,12 @@ def _tui_print(message: str) -> None:
     write_terminal(message)
 
 
+def _create_tui_app(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> object | None:
+    return create_tui_app(args, parser, _tui_print, _has_console_message)
+
+
 def _print_exit_hint(app: object) -> None:
     if app.ephemeral_root is not None:
         return
@@ -891,11 +898,9 @@ def _run_tui_lifecycle_captured(
     exit_status = 0
     app: object | None = None
     retention_owner: object | None = None
-    from .retention import create_tui_app
-
     try:
         while True:
-            app = create_tui_app(args, parser, _tui_print, _has_console_message)
+            app = _create_tui_app(args, parser)
             if app is None:
                 exit_status = 1
                 break
@@ -954,6 +959,8 @@ def _run_tui_lifecycle_captured(
             _print_exit_hint(app)
             break
     finally:
+        if retention_owner is not None:
+            asyncio.run(retention_owner.stop())
         _retain_active_draft(app, retained_drafts)
         for retained_draft in retained_drafts:
             _print_unsaved_draft(
