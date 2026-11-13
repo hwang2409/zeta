@@ -574,13 +574,23 @@ class SlashHandlerMixin:
         )
 
     async def slash_retention(self, args: str) -> str:
+        from ..cards.retention import render_retention_card
+
         command = args.strip()
         home = self._zeta_home or env_home()
         if command == "":
             history = await asyncio.to_thread(read_retention_history, home)
-            return "retention: none" if not history else f"retention: {history[-1]}"
+            if not history:
+                return "retention: none"
+            projection = history[-1]
+            self._presenter.print_unit(render_retention_card(projection))
+            return "retention: " + ", ".join(
+                f"{key}={projection[key]}" for key in ("mode", "days", "count", "preview_id")
+            )
         if command == "disarm":
             result = await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
+            if result.projection["mode"] != "none" or result.projection["errors"]:
+                self._presenter.print_unit(render_retention_card(result.projection))
             return result.message
         if command == "arm":
             days = load_settings(home=home).settings.retention_days
@@ -588,6 +598,8 @@ class SlashHandlerMixin:
                 retention_authority, home, self.loop.store._storage_lease,
                 days=days,
             )
+            if result.projection["mode"] != "none" or result.projection["errors"]:
+                self._presenter.print_unit(render_retention_card(result.projection))
             return result.message
         return "usage: /retention [arm|disarm]"
 

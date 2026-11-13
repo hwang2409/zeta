@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.serve_contract import ServeContract
+from zeta.server.protocol import EventDescriptor, FrameCodec
 
 PIN = Path(__file__).parent / "fixtures" / "serve_wire_pin.jsonl"
 
@@ -15,6 +16,20 @@ def _pin() -> tuple[dict[str, object], list[dict[str, object]]]:
     rows = [json.loads(line) for line in PIN.read_text().splitlines()[1:]]
     metadata = next(row for row in rows if row.get("kind") == "method_sets")
     return metadata, [row for row in rows if row.get("kind") != "method_sets"]
+
+
+def test_session_retention_event_codec_pin() -> None:
+    row = next(json.loads(line) for line in PIN.read_text().splitlines() if 'session_retention_event' in line)
+    projection = {
+        "timestamp": "2026-01-01T00:00:00+00:00", "mode": "preview", "days": 30,
+        "armed_by_zeta_version": None, "preview_id": "preview",
+        "cutoff": "2025-12-02T00:00:00+00:00", "root_ids": ["root"],
+        "count": 1, "descendant_count": 0, "bytes": 12, "skip_counts": {},
+        "progress_counts": {}, "errors": [], "disable_pending": False,
+    }
+    frame = FrameCodec().notification(EventDescriptor.SESSION_RETENTION, "session", data=projection)
+    assert frame is not None
+    assert frame.decode() == row["frame"]
 
 
 def _w4_delta(raw: str, method: str) -> str:
@@ -76,7 +91,7 @@ async def test_real_unix_wire_pin_allows_only_w4_deltas(tmp_path: Path) -> None:
 
     groups: dict[tuple[str, str, tuple[str, ...]], list[dict[str, object]]] = {}
     for pin in pins:
-        if pin.get("kind") is None:
+        if pin.get("kind") is None or pin.get("kind") == "session_retention_event":
             continue
         role = pin.get("role", "controller")
         version = pin.get("protocol_version", "1.2")

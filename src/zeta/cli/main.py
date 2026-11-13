@@ -934,6 +934,13 @@ def _run_tui_lifecycle_captured(
                 )
             run_app = app
             run_app._retention_owner = retention_owner
+            if retention_owner is not None:
+                from ..tui.cards.retention import render_retention_card
+
+                retention_owner.set_publish(
+                    lambda projection, app=app: app._print_unit(render_retention_card(projection))
+                    if projection.get("mode") != "none" else None
+                )
             restart_requested = False
             restart_cancels_work = False
             new_session_requested = False

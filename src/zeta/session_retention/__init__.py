@@ -175,6 +175,24 @@ def retention_result(
     return result
 
 
+def project_retention_result(result: PassResult, *, days: int, timestamp: str) -> dict[str, object]:
+    """Project one planner result into the shared client-visible mapping."""
+    preview = result.preview
+    if not result.enabled:
+        return retention_result(timestamp=timestamp, mode="disabled", days=0)
+    if preview is None:
+        errors = tuple(reason.reason for reason in result.reasons if reason.reason)
+        return retention_result(
+            timestamp=timestamp, mode="preview", days=days,
+            errors=errors, progress_counts={"roots": len(result.reasons)},
+        )
+    return retention_result(
+        timestamp=timestamp, mode="preview", days=days,
+        root_ids=preview.root_ids, count=preview.count, bytes=preview.bytes,
+        preview_id=preview.preview_id, cutoff=preview.cutoff,
+    )
+
+
 def append_retention_history(home: str | Path, lease: WriterLease, result: Mapping[str, object]) -> None:
     """Durably replace the bounded, validated retention history."""
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):

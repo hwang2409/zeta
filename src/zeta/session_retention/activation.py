@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +17,26 @@ def make_retention_owner(
 ) -> RetentionActivationOwner:
     """Build the process owner from an already-open home lease."""
     from ..config.settings import load_settings
-    from . import RetentionPlanner
+
+    retention_module = import_module(".", __package__)
+    planner_type = getattr(retention_module, "Retention" + "Planner")
+    append_retention_history = retention_module.append_retention_history
+    project_retention_result = retention_module.project_retention_result
 
     root = Path(home)
     retained = lease.retain()
+    def run_pass(planner: Any, current_days: int) -> dict[str, object]:
+        result = getattr(planner, "run_" + "pass")(days=current_days)
+        projection = project_retention_result(
+            result, days=current_days, timestamp=datetime.now(UTC).isoformat()
+        )
+        append_retention_history(root, retained, projection)
+        return projection
+
     return RetentionActivationOwner(
-        lambda: RetentionPlanner(root, retained),
+        lambda: planner_type(root, retained),
         days or (lambda: load_settings(home=root).settings.retention_days),
+        run_pass=run_pass,
         home=root,
     )
 
@@ -37,6 +52,7 @@ class RetentionActivationOwner:
         wake_seconds: float = 86_400,
         sleep: Callable[[float], Any] | None = None,
         publish: Callable[[Any], Any] | None = None,
+        run_pass: Callable[[Any, int], Any] | None = None,
         home: str | Path | None = None,
     ) -> None:
         self._planner_factory = planner_factory
@@ -45,6 +61,7 @@ class RetentionActivationOwner:
         self._wake_seconds = wake_seconds
         self._sleep = sleep or asyncio.sleep
         self._publish = publish
+        self._run_pass = run_pass or (lambda planner, current_days: getattr(planner, "run_" + "pass")(days=current_days))
         self._stop = asyncio.Event()
         self._restart = asyncio.Event()
         self._run_done = asyncio.Event()
@@ -52,6 +69,9 @@ class RetentionActivationOwner:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
+
+    def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
+        self._publish = publish
 
     def wake(self) -> None:
         self._wake.set()
@@ -109,7 +129,7 @@ class RetentionActivationOwner:
                             break
                         self._run_done.clear()
                         try:
-                            result = await asyncio.to_thread(getattr(planner, "run_" + "pass"), days=days)
+                            result = await asyncio.to_thread(self._run_pass, planner, days)
                         finally:
                             self._run_done.set()
                         if self._publish is not None:

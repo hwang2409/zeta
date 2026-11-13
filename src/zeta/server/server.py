@@ -344,6 +344,18 @@ class ZetaServer:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
         if self._retention_owner is not None:
+            async def publish_retention(projection: dict[str, object]) -> None:
+                if projection.get("mode") == "none" and not projection.get("errors"):
+                    return
+                if self.connections is None or self.runtime.opened is None:
+                    return
+                await self.connections.publish_feature_event(
+                    "session_retention", EventDescriptor.SESSION_RETENTION,
+                    self.runtime.opened.metadata.session_id, data=projection,
+                )
+
+            self.runtime.retention_event_sink = publish_retention
+            self._retention_owner.set_publish(publish_retention)
             self._retention_owner.start()
 
     async def serve_forever(self) -> None:

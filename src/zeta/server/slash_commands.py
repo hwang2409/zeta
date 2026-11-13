@@ -19,6 +19,7 @@ from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
 from ..attention_decisions import DecisionItem, open_decisions
 from ..attention_records import Broken
+from ..config.settings import load_settings
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
 from ..core.commands.slash_registry import BusyPolicy, SlashLock, SlashSurface
 from ..core.project_context import project_command_view
@@ -41,6 +42,11 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
 from ..runtime.status import capture_slash_status
+from ..session_retention import (
+    disarm_retention,
+    read_retention_history,
+    retention_authority,
+)
 from ..session_retention.pin import set_retention_pin
 from .handlers import validation
 from .model_selection import apply as apply_settings
@@ -139,6 +145,38 @@ class ServerSlashSession:
             self._runtime.manager._storage_lease,
             pinned=False,
         )
+
+    async def slash_retention(self, args: str) -> str:
+        command = args.strip()
+        if command == "":
+            history = await asyncio.to_thread(read_retention_history, self._runtime.home)
+            if not history:
+                return "retention: none"
+            latest = history[-1]
+            return "retention: " + ", ".join(
+                f"{key}={latest[key]}" for key in ("mode", "days", "count", "preview_id")
+            )
+        _loop, _opened = self._active_loop_and_session()
+        if command == "disarm":
+            result = await asyncio.to_thread(
+                disarm_retention, self._runtime.home,
+                self._runtime.manager._storage_lease,
+            )
+            publish = getattr(self._runtime, "retention_event_sink", None)
+            if publish is not None:
+                await publish(result.projection)
+            return result.message
+        if command == "arm":
+            days = load_settings(home=self._runtime.home).settings.retention_days
+            result = await asyncio.to_thread(
+                retention_authority, self._runtime.home,
+                self._runtime.manager._storage_lease, days=days,
+            )
+            publish = getattr(self._runtime, "retention_event_sink", None)
+            if publish is not None:
+                await publish(result.projection)
+            return result.message
+        return "usage: /retention [arm|disarm]"
 
     async def slash_decisions(self, args: str) -> str:
         _loop, opened = self._active_loop_and_session()
