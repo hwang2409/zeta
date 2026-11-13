@@ -1253,6 +1253,7 @@ async def test_binding_added_by_resume_is_hidden_from_existing_child(
         await _request(reader, writer, 4, "send", {"text": "delegate"})
         await asyncio.wait_for(backend.child_started[child_prompt].wait(), TIMEOUT)
         await _event(reader, "turn_end")
+        await _event(reader, "agent_end")
 
         resumed = (await _request(reader, writer, 5, "resume", {
             "session_id": created["session"]["session_id"],
