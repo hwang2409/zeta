@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from zeta.cli import main as cli_main
 from zeta.cli.main import _exec_restart, _restart_argv
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tui import layout
 from zeta.tui.app import TUIApp
 from zeta.tui.composer import FullScreenPromptSession
 from zeta.tui.fork_session import ForkStackController
@@ -53,6 +55,49 @@ def test_restart_argv_replaces_session_selection(
         "/usr/local/bin/zeta",
         *expected,
     ]
+
+
+@pytest.mark.asyncio
+async def test_status_footer_composes_update_and_restart_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    monitor = SimpleNamespace(current=None)
+    monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)
+
+    async with owned_app(app):
+        neither = "".join(text for _style, text in layout.status_toolbar(app, 120))
+        assert "zeta updated · /restart" not in neither
+        assert "restart pending" not in neither
+
+        restart_pending = False
+        monkeypatch.setattr(
+            TUIApp, "restart_pending", property(lambda _app: restart_pending)
+        )
+        restart_pending = True
+        restart_only = "".join(
+            text for _style, text in layout.status_toolbar(app, 120)
+        )
+        assert "restart pending" in restart_only
+        assert "zeta updated · /restart" not in restart_only
+
+        monitor.current = ("old", "new")
+        both = "".join(text for _style, text in layout.status_toolbar(app, 120))
+        assert "restart pending · zeta updated · /restart" in both
+
+        restart_pending = False
+        update_only = "".join(
+            text for _style, text in layout.status_toolbar(app, 120)
+        )
+        assert update_only.startswith("zeta updated · /restart")
 
 
 def test_exec_restart_failure_prints_manual_resume_command(
