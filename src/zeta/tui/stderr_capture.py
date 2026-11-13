@@ -113,11 +113,17 @@ def restore_stderr_for_cli() -> None:
 
 
 def run_tui_session(app: Any, args: Any, run_tui: Any) -> tuple[bool, bool]:
+    async def run() -> tuple[bool, bool]:
+        from ..runtime.update_notice import start_tui_update_notice
+
+        start_tui_update_notice()
+        return await run_tui(app, args)
+
     with patch_stdout(raw=True):
         # prompt_toolkit temporarily proxies stderr to the terminal; incidental
         # diagnostics must keep using the already redirected descriptor.
         sys.stderr = sys.__stderr__
-        return asyncio.run(run_tui(app, args))
+        return asyncio.run(run())
 
 
 def run_tui_lifecycle(args: Any, parser: Any, lifecycle: Any) -> tuple[int, str | None]:
