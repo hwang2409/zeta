@@ -35,7 +35,7 @@ from ..core.session_metadata import SessionMetadata
 from ..core.store import ConversationStore
 from ..core.transcript_recovery import RepairTarget, validate_recovery_records
 from ..locking import shape_lock
-from ..session_retention import RETENTION_PIN_FILENAME
+from ..session_retention.pin import RETENTION_PIN_FILENAME
 from ..storage_format import WriterLease, open_writer
 from .errors import RemoteSyncError
 from .memory import (

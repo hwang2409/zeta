@@ -656,6 +656,10 @@ class SlashSession(Protocol):
 
     def slash_repair_transcript(self, args: str) -> str | Awaitable[str]: ...
 
+    async def slash_pin(self, args: str) -> str: ...
+
+    async def slash_unpin(self, args: str) -> str: ...
+
     def slash_inbox(self, args: str) -> str: ...
 
     def slash_theme(self, args: str) -> str: ...
@@ -1090,6 +1094,19 @@ def create_slash_registry(
         ("tasks", "slash_tasks", "inspect background processes", loop_owned),
     ):
         registry.register(safe(name, _delegate(method), description, reason=reason))
+    for name, method, description in (
+        ("pin", "slash_pin", "pin the attached root session"),
+        ("unpin", "slash_unpin", "unpin the attached root session"),
+    ):
+        registry.register(
+            safe(
+                name,
+                _delegate(method, strip=True),
+                description,
+                serve=ServeSlash(mutates=always, runs_while_busy=_no_args),
+                reason=native,
+            )
+        )
     registry.register(
         safe(
             "decisions",
