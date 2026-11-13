@@ -289,3 +289,6 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
         await close_serve(server, writer)
         if holder is not None:
             assert holder.exitcode == 0
+        if owner_state == "mid-preview":
+            await asyncio.to_thread(_seed_preview, home)
+            assert (home / "retention-state.json").is_file()
