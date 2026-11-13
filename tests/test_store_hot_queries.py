@@ -25,7 +25,7 @@ from zeta.protocol.types import (
 
 
 @pytest.mark.parametrize("old_version", [3, 999])
-def test_approval_index_rebuilds_non_v4_without_changing_authority(
+def test_approval_index_rebuilds_noncurrent_schema_without_changing_authority(
     tmp_path: Path, old_version: int
 ) -> None:
     store = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
@@ -58,7 +58,7 @@ def test_approval_index_rebuilds_non_v4_without_changing_authority(
         rebuilt = json.loads(
             connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
         )
-        assert rebuilt["schema_version"] == 4
+        assert rebuilt["schema_version"] == 5
         assert connection.execute(
             "SELECT request_entry_id FROM active_approval_requests WHERE request_id=?",
             (call.id,),
