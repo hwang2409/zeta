@@ -8227,6 +8227,50 @@ def test_completed_message_replaces_streaming_unit_once(
     assert "completed" in "\n".join(app._transcript.lines(80))
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("> top-level", ("│ top-level",)),
+        ("1. **x:**\n   > quoted\n   after", ("quoted", "after")),
+        ("> first\n> second", ("first", "second")),
+    ],
+)
+@pytest.mark.asyncio
+async def test_completed_assistant_renders_blockquotes(
+    tmp_path: Path, source: str, expected: tuple[str, ...]
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent(source),
+            )
+        )
+        app._finish_message(
+            StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+            )
+        )
+
+        plain = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert all(value in plain for value in expected)
+        assert "│" in plain
+
+
 def test_mixed_assistant_tool_transcript_commits_each_text_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

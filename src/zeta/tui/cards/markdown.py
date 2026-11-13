@@ -232,6 +232,22 @@ def _render_list(
                 rendered.append_text(
                     _render_list(child, console, width, depth + 1, deadline)
                 )
+            elif child.token.type == "blockquote_open":
+                inner = _with_blank_lines(
+                    _render_blocks(child.children, console, width, deadline)
+                )
+                quote = _Prefixed(
+                    Group(*inner),
+                    indent + "  │ ",
+                    f"dim {theme.DIM}",
+                )
+                rendered.append("\n")
+                for index, line in enumerate(
+                    quote.__rich_console__(console, console.options.update_width(width))
+                ):
+                    if index:
+                        rendered.append("\n")
+                    rendered.append_text(line)
     return rendered
 
 
