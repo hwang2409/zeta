@@ -1820,6 +1820,8 @@ The shared slash registry has this order and surface availability:
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
 | `tasks` | no | inspect background processes |
+| `pin` | yes | pin the attached root session |
+| `unpin` | yes | unpin the attached root session |
 | `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |

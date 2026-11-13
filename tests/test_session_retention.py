@@ -22,10 +22,9 @@ from zeta.project_inbox import ProjectInbox
 from zeta.project_inbox_sent import SentMessageTracker
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent
-from zeta.session_retention import (
+from zeta.session_retention import RetentionBounds, RetentionPlanner
+from zeta.session_retention.pin import (
     RETENTION_PIN_FILENAME,
-    RetentionBounds,
-    RetentionPlanner,
     is_retention_pinned,
     remove_retention_pin,
     write_retention_pin,
@@ -417,7 +416,7 @@ def test_planner_entry_points_have_no_production_callers():
     root = Path(__file__).resolve().parents[1] / "src" / "zeta"
     offenders = []
     for path in root.rglob("*.py"):
-        if path.name == "session_retention.py":
+        if path.relative_to(root) == Path("session_retention/__init__.py"):
             continue  # the module that defines the planner
         text = path.read_text(encoding="utf-8")
         if "RetentionPlanner" in text or ".run_pass(" in text:
@@ -1722,7 +1721,7 @@ def _drive_fault_transaction(home, root):
 
 
 def _run_fault_transaction(home, details, monkeypatch, *, fail_at=None, cancel=False):
-    from zeta import session_retention_transaction as transaction
+    from zeta.session_retention import transaction
     from zeta.storage_format import WriterLease
 
     steps = []
