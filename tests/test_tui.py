@@ -8227,6 +8227,59 @@ def test_completed_message_replaces_streaming_unit_once(
     assert "completed" in "\n".join(app._transcript.lines(80))
 
 
+@pytest.mark.parametrize(
+    ("source", "sentinel"),
+    [
+        ("- item\n\n  > blockquote-sentinel", "blockquote-sentinel"),
+        ("- item\n\n  ```text\n  fenced-sentinel\n  ```", "fenced-sentinel"),
+        (
+            "- item\n\n  | name |\n  | --- |\n  | table-sentinel |",
+            "table-sentinel",
+        ),
+        ("- item\n\n  # heading-sentinel", "heading-sentinel"),
+        ("- item\n  - nested-list-sentinel", "nested-list-sentinel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_assistant_preserves_blocks_nested_in_list_items(
+    tmp_path: Path, source: str, sentinel: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent(source),
+            )
+        )
+        streaming = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert sentinel in streaming
+
+        app._finish_message(
+            StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+            )
+        )
+
+        completed = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert sentinel in completed
+
+
 def test_mixed_assistant_tool_transcript_commits_each_text_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
