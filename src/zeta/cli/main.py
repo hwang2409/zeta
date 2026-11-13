@@ -879,13 +879,20 @@ def _create_tui_app(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
 ) -> object | None:
+    from ..session_retention.handshake import open_with_retention_yield
     from ..tui.bootstrap import create_app
 
     try:
         if args.continue_session or args.resume is not None:
             _tui_print("Loading session…")
-            return asyncio.run(asyncio.to_thread(create_app, args))
-        return create_app(args)
+            return asyncio.run(
+                asyncio.to_thread(
+                    open_with_retention_yield,
+                    env_home(),
+                    lambda: create_app(args),
+                )
+            )
+        return open_with_retention_yield(env_home(), lambda: create_app(args))
     except SessionError as exc:
         parser.error(str(exc))
     except StorageFormatError:
