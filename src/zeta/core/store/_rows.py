@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+
+from ...agent.receipt import encode_json
 
 from ...protocol.types import Message, is_passive_harness_message
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
@@ -37,6 +41,8 @@ class RowRef:
     parent_id: str | None
     lane: str
     type: str
+    offset: int = 0
+    length: int = 0
     facts: object | None = None
 
 
@@ -143,6 +149,10 @@ class ResidentRows:
         self.rows: list[RowRef] = []
         self._by_id: dict[str, ConversationEntry] = {}
         self._rows_by_id: dict[str, RowRef] = {}
+        self.payloads: dict[int, ConversationEntry] = {}
+        self._payload_lru: OrderedDict[int, int] = OrderedDict()
+        self.payload_cache_bytes = int(os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", 16 * 1024 * 1024))
+        self.resident_payload_bytes = 0
         self.branch: list[ConversationEntry] = []
         self.replace(entries)
 
@@ -150,8 +160,13 @@ class ResidentRows:
         previous = self.entries[-1] if self.entries else None
         self.entries.append(entry)
         self._by_id[entry.id] = entry
-        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry))
+        size = len(encode_json(entry.to_dict()))
+        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, 0, size, row_facts(entry))
         self.rows.append(row)
+        self.payloads[entry.seq] = entry
+        self._payload_lru[entry.seq] = size
+        self.resident_payload_bytes += size
+        self._trim_payload_cache()
         self._rows_by_id[entry.id] = row
         if (previous is None and entry.parent_id is None) or (
             previous is not None and entry.parent_id == previous.id
@@ -168,7 +183,7 @@ class ResidentRows:
         self.entries.extend(additions)
         self._by_id.update((entry.id, entry) for entry in additions)
         new_rows = [
-            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
+            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, 0, len(encode_json(e.to_dict())), row_facts(e))
             for e in additions
         ]
         self.rows.extend(new_rows)
@@ -197,11 +212,16 @@ class ResidentRows:
         rows = cls.__new__(cls)
         rows.entries = entries if isinstance(entries, list) else list(entries)
         rows.rows = [
-            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
+            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, 0, len(encode_json(e.to_dict())), row_facts(e))
             for e in rows.entries
         ]
         rows._by_id = {entry.id: entry for entry in rows.entries}
         rows._rows_by_id = {row.id: row for row in rows.rows}
+        rows.payload_cache_bytes = int(os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", 16 * 1024 * 1024))
+        rows.payloads = {entry.seq: entry for entry in rows.entries}
+        rows._payload_lru = OrderedDict((row.seq, row.length) for row in rows.rows)
+        rows.resident_payload_bytes = sum(rows._payload_lru.values())
+        rows._trim_payload_cache()
         rows._rebuild_branch()
         return rows
 
@@ -212,6 +232,10 @@ class ResidentRows:
         self._by_id = prepared._by_id
         self._rows_by_id = prepared._rows_by_id
         self.branch = prepared.branch
+        self.payloads = prepared.payloads
+        self._payload_lru = prepared._payload_lru
+        self.payload_cache_bytes = prepared.payload_cache_bytes
+        self.resident_payload_bytes = prepared.resident_payload_bytes
 
     def _rebuild_branch(self) -> None:
         current = self.entries[-1] if self.entries else None
@@ -237,10 +261,18 @@ class ResidentRows:
             None,
         )
 
+    def _trim_payload_cache(self) -> None:
+        while self.resident_payload_bytes > max(0, self.payload_cache_bytes) and self._payload_lru:
+            seq, size = self._payload_lru.popitem(last=False)
+            self.payloads.pop(seq, None)
+            self.resident_payload_bytes -= size
+
     def entry(self, ref: RowRef) -> ConversationEntry:
-        entry = self._by_id.get(ref.id)
+        entry = self.payloads.get(ref.seq) or self._by_id.get(ref.id)
         if entry is None or entry.seq != ref.seq:
             raise KeyError(ref.seq)
+        if ref.seq in self._payload_lru:
+            self._payload_lru.move_to_end(ref.seq)
         return entry
 
     def stream_rows(self, refs: Iterable[RowRef], *, batch: int = 256) -> Iterator[ConversationEntry]:
