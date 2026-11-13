@@ -19,7 +19,7 @@ class BackgroundEventTooLarge(RuntimeError):
     """One event cannot fit in the semantic publication budget."""
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _QueuedEvent:
     session_id: str
     event: StreamEvent
@@ -50,6 +50,12 @@ class BackgroundEventPublisher:
         self._changed = asyncio.Event()
         self._changed.set()
         self._closed = False
+        self._sealed = False
+        self._active: set[_QueuedEvent] = set()
+
+    @staticmethod
+    def _close_error() -> RuntimeError:
+        return RuntimeError("background event publisher is closed")
 
     @staticmethod
     def _size(session_id: str, event: StreamEvent) -> int:
@@ -80,10 +86,11 @@ class BackgroundEventPublisher:
         self._waiting.append(item)
         self._admit_waiters()
         try:
-            await item.admitted
+            await asyncio.shield(item.admitted)
         except asyncio.CancelledError:
             if not item.admitted.done():
                 self._waiting.remove(item)
+                item.admitted.cancel()
                 self._admit_waiters()
                 self._mark_changed()
                 raise
@@ -105,14 +112,18 @@ class BackgroundEventPublisher:
 
     def _admit_waiters(self) -> None:
         while self._waiting:
+            if self._sealed:
+                return
             item = self._waiting[0]
             if self._events >= self._max_events or self._bytes + item.size > self._max_bytes:
                 return
             self._waiting.popleft()
             self._events += 1
             self._bytes += item.size
+            self._active.add(item)
             self._queue.put_nowait(item)
-            item.admitted.set_result(None)
+            if not item.admitted.done():
+                item.admitted.set_result(None)
             if self._task is None or self._task.done():
                 self._task = asyncio.create_task(self._drain())
         self._mark_changed()
@@ -134,12 +145,17 @@ class BackgroundEventPublisher:
             finally:
                 self._events -= 1
                 self._bytes -= item.size
+                self._active.discard(item)
                 self._queue.task_done()
+                if error is None and self._sealed:
+                    error = self._close_error()
                 if error is None:
-                    item.result.set_result(None)
-                else:
+                    if not item.result.done():
+                        item.result.set_result(None)
+                elif not item.result.done():
                     item.result.set_exception(error)
-                self._admit_waiters()
+                if not self._sealed:
+                    self._admit_waiters()
                 self._mark_changed()
 
     async def flush(self) -> None:
@@ -150,6 +166,25 @@ class BackgroundEventPublisher:
         if self._failures:
             raise self._failures[0]
 
+    def _settle_close(self) -> None:
+        error = self._close_error()
+        while self._waiting:
+            item = self._waiting.popleft()
+            if not item.admitted.done():
+                item.admitted.set_exception(error)
+            if not item.result.done():
+                item.result.cancel()
+        for item in self._active:
+            if not item.result.done():
+                item.result.set_exception(error)
+        self._active.clear()
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+        self._events = 0
+        self._bytes = 0
+        self._mark_changed()
+
     async def close(self, timeout: float) -> None:
         self._closed = True
         error: BaseException | None = None
@@ -157,9 +192,12 @@ class BackgroundEventPublisher:
             await asyncio.wait_for(self.flush(), timeout)
         except BaseException as exc:  # noqa: BLE001 - close preserves the first failure
             error = exc
-        task, self._task = self._task, None
+        self._sealed = True
+        task = self._task
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        self._settle_close()
+        self._task = None
         if error is not None:
             raise error

@@ -119,6 +119,7 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
+from zeta.server.background_events import BackgroundEventPublisher
 from zeta.server.connections import Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
@@ -2722,6 +2723,8 @@ async def test_background_event_cancellation_after_admission_records_once(
             StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="accepted"),
         )
     )
+    bounded: BackgroundEventPublisher | None = None
+    second: asyncio.Task[None] | None = None
     try:
         await await_or_fail(started.wait(), what="accepted event start")
         producer.cancel()
@@ -2736,10 +2739,94 @@ async def test_background_event_cancellation_after_admission_records_once(
         publisher = server.control._background_events
         assert publisher._events == 0
         assert publisher._bytes == 0
+
+        # test-contract: cancellation before bounded admission removes only the waiter
+        admission_started = asyncio.Event()
+        admission_release = asyncio.Event()
+        admission_recorded: list[str] = []
+
+        async def admit_event(session_id: str, event: StreamEvent) -> None:
+            del event
+            admission_recorded.append(session_id)
+            if session_id == "first":
+                admission_started.set()
+                await await_or_fail(
+                    admission_release.wait(), what="admission release"
+                )
+
+        bounded = BackgroundEventPublisher(admit_event, max_events=1, max_bytes=1024)
+        first = asyncio.create_task(
+            bounded.publish(
+                "first", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="first")
+            )
+        )
+        second = asyncio.create_task(
+            bounded.publish(
+                "second", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="second")
+            )
+        )
+        await await_or_fail(admission_started.wait(), what="bounded first event")
+        second.cancel()
+        admission_release.set()
+        await await_or_fail(first, what="bounded first producer")
+        assert second.done(), "cancelled admission producer must finish"
+        [second_result] = await await_or_fail(
+            asyncio.gather(second, return_exceptions=True),
+            what="cancelled admission waiter",
+        )
+        assert isinstance(second_result, asyncio.CancelledError)
+        await await_or_fail(
+            bounded.publish(
+                "third", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="third")
+            ),
+            what="event after cancelled waiter",
+        )
+        assert admission_recorded == ["first", "third"]
+        await await_or_fail(bounded.close(1), what="bounded publisher close")
+
+        # test-contract: close timeout seals queued work and reports close errors
+        close_started = asyncio.Event()
+
+        async def never_finish(session_id: str, event: StreamEvent) -> None:
+            del event
+            if session_id == "first":
+                close_started.set()
+                await await_or_fail(asyncio.Event().wait(), what="close-held event")
+
+        closing = BackgroundEventPublisher(never_finish, max_events=1, max_bytes=1024)
+        close_first = asyncio.create_task(
+            closing.publish(
+                "first", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="first")
+            )
+        )
+        close_second = asyncio.create_task(
+            closing.publish(
+                "second", StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="second")
+            )
+        )
+        await await_or_fail(close_started.wait(), what="close-held first event")
+        close_task = asyncio.create_task(closing.close(0.01))
+        with pytest.raises(TimeoutError):
+            await await_or_fail(close_task, what="bounded close timeout")
+        close_results = await await_or_fail(
+            asyncio.gather(close_first, close_second, return_exceptions=True),
+            what="closed producer results",
+        )
+        assert all(isinstance(result, RuntimeError) for result in close_results)
+        assert closing._task is None
+        assert closing._events == 0
+        assert not closing._waiting
     finally:
         release.set()
+        if bounded is not None:
+            for item in bounded._waiting:
+                item.admitted.cancel()
+                item.result.set_exception(RuntimeError("test cleanup"))
+        cleanup = [producer]
+        if second is not None:
+            cleanup.append(second)
         await await_or_fail(
-            asyncio.gather(producer, return_exceptions=True),
+            asyncio.gather(*cleanup, return_exceptions=True),
             what="cancelled producer cleanup",
         )
         await await_or_fail(server.close(), what="server close")
