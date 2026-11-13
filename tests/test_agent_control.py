@@ -45,7 +45,7 @@ async def test_late_grandchild_inherits_retired_parent_cancellation(
     release = asyncio.Event()
 
     async def wait_for_release() -> None:
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     parent = asyncio.create_task(wait_for_release())
     grandchild: asyncio.Task[None] | None = None
@@ -68,7 +68,9 @@ async def test_late_grandchild_inherits_retired_parent_cancellation(
     finally:
         release.set()
         tasks = [parent] if grandchild is None else [parent, grandchild]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), 10
+        )
         store.close()
 
 
