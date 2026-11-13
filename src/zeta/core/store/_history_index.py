@@ -443,7 +443,7 @@ class HistoryIndex:
                             self._value(self._warm_facts(getattr(ref, "facts", None))),
                         )
                     )
-                    if len(entry_batch) == 512:
+                    if len(entry_batch) == 2048:
                         connection.executemany(
                             "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
                             "VALUES(?,?,?,?,?,?,?)",
