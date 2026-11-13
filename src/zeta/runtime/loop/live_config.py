@@ -156,7 +156,7 @@ class LiveConfigMixin:
             if publish and candidate.notice:
                 self._live_config_notices.append(candidate.notice)
             if publish and candidate.payload is not None:
-                await self._publish_background_event(
+                await self._wait_for_background_event(
                     StreamEvent(StreamEventType.CONFIG_CHANGED, data=candidate.payload)
                 )
 

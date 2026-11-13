@@ -135,9 +135,7 @@ class ServeControl:
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
-        self._background_events = BackgroundEventPublisher(
-            self._publish_background_event_to_wire
-        )
+        self._background_events = BackgroundEventPublisher(self._publish_background_event_to_wire)
         self._grace_expiring = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
@@ -526,9 +524,7 @@ class ServeControl:
             Decide(ApprovalDecision(method), request_id, scope)
         )
         assert isinstance(result, dict)
-        # The Decide just wrote on this thread, so the memoized `*_now` seam has
-        # the resolution without an await (and without the B1 stale-read risk of
-        # an off-loop read here). Resume only a request the Decide resolved.
+        # Decide memoizes resolution here, avoiding a stale off-loop read.
         state = (
             loop.store.approval_state_now(core_key)
             if isinstance(core_key, str)
@@ -897,10 +893,7 @@ class ServeControl:
             self._schedule_background_wake(session_id)
 
     async def _publish_config_changed(
-        self,
-        event: StreamEvent,
-        session_id: str | None,
-        send: NotificationSender,
+        self, event: StreamEvent, session_id: str | None, send: NotificationSender
     ) -> None:
         if self.server.connections is None:
             return
@@ -1072,10 +1065,7 @@ class ServeControl:
                 },
             )
             return
-        if kind is StreamEventType.COMPACTION_START:
-            await send(wire_event, session_id, data=dict(event.data))
-            return
-        if kind is StreamEventType.COMPACTION_END:
+        if kind in (StreamEventType.COMPACTION_START, StreamEventType.COMPACTION_END):
             await send(wire_event, session_id, data=dict(event.data))
             return
         if foreground and kind is StreamEventType.AGENT_END:
@@ -1091,19 +1081,13 @@ class ServeControl:
 
     def _protocol_version(self) -> str:
         connections = self.server.connections
-        controller = (
-            connections.controller_metadata() if connections is not None else None
-        )
+        controller = connections.controller_metadata() if connections is not None else None
         return controller.protocol_version if controller is not None else "1.0"
 
-    async def _publish_background_event_to_wire(
-        self, session_id: str, event: StreamEvent
-    ) -> None:
+    async def _publish_background_event_to_wire(self, session_id: str, event: StreamEvent) -> None:
         await self._event(event, session_id=session_id, background=True)
 
-    def _publish_background_event(
-        self, session_id: str, event: StreamEvent
-    ) -> Awaitable[None]:
+    def _publish_background_event(self, session_id: str, event: StreamEvent) -> Awaitable[None]:
         return self._background_events.publish(session_id, event)
 
     async def flush_background_events(self) -> None:
@@ -1159,7 +1143,8 @@ class ServeControl:
             return True
         if session_id is None and self.server.runtime.opened is not None:
             session_id = self.server.runtime.session_id
-        return self._admit_controller(event, session_id, **fields).kind == "admitted"
+        admission = self._admit_controller(event, session_id, **fields)
+        return admission.kind == "admitted"
 
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object

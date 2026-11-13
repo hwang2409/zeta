@@ -403,6 +403,11 @@ class AgentLoop(
             if inspect.isawaitable(result):
                 await result
 
+    async def _wait_for_background_event(self, event: StreamEvent) -> None:
+        result = self._publish_background_event(event)
+        if inspect.isawaitable(result):
+            await result
+
     def _create_task[TaskResult](
         self,
         coroutine: Coroutine[Any, Any, TaskResult],

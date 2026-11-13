@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -100,13 +101,13 @@ async def consume_child(
     *,
     origin: MessageOrigin,
     child_path: str,
-    publish: Callable[[str], Awaitable[None]],
+    publish: Callable[[str], Awaitable[None] | None],
     child_turns: Callable[[], int],
     update_turns: Callable[[int], None],
     update_step: Callable[[str], None],
     record_tool_call: Callable[[], None],
     finish_lifecycle: Callable[[str, str], dict[str, object]],
-    publish_lifecycle: Callable[..., Awaitable[None]],
+    publish_lifecycle: Callable[..., Awaitable[None] | None],
     child_result: Callable[..., dict[str, object]],
     error_message: Callable[[BaseException], str],
     record_report: Callable[[str], None] | None = None,
@@ -121,6 +122,11 @@ async def consume_child(
     hold_wake: HoldWake = NO_HOLD_WAKE,
 ) -> dict[str, object]:
     """Consume one child loop, including nested lifecycle events."""
+
+    async def wait_for_publication(result: Awaitable[None] | None) -> None:
+        if inspect.isawaitable(result):
+            await result
+
     final_message: Message | None = None
     last_message: Message | None = None
     failure_message: str | None = None
@@ -151,12 +157,14 @@ async def consume_child(
     async def emit_lifecycle(
         kind: str, event: StreamEvent, *, tool_result: ToolResult | None = None
     ) -> None:
-        await publish_lifecycle(
-            kind,
-            event.tool_call,
-            tool_result=tool_result,
-            depth=lifecycle_depth(event.tool_call),
-            owner=event.data.get("agent_instance_id"),
+        await wait_for_publication(
+            publish_lifecycle(
+                kind,
+                event.tool_call,
+                tool_result=tool_result,
+                depth=lifecycle_depth(event.tool_call),
+                owner=event.data.get("agent_instance_id"),
+            )
         )
 
     async def consume_events(
@@ -170,18 +178,18 @@ async def consume_child(
             if event.type is StreamEventType.TURN_START:
                 status = f"turn {child_turns() + 1}: thinking"
                 update_step(status)
-                await publish(status)
+                await wait_for_publication(publish(status))
             elif await hold_wake.observe(event):
                 if not background and foreground_hold_abandoned(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
                 update_step(status)
-                await publish(status)
+                await wait_for_publication(publish(status))
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
                 name = event.tool_call.name if event.tool_call is not None else "tool"
                 status = f"turn {child_turns() + 1}: approval pending: {name}"
                 update_step(status)
-                await publish(status)
+                await wait_for_publication(publish(status))
                 await emit_lifecycle("approval_start", event)
             elif event.type is StreamEventType.TOOL_APPROVAL_END:
                 await emit_lifecycle("approval_end", event)
@@ -194,7 +202,7 @@ async def consume_child(
                 summary = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
                 status = f"turn {child_turns() + 1}: tool: {name} {summary}"
                 update_step(status)
-                await publish(status)
+                await wait_for_publication(publish(status))
                 await emit_lifecycle("execution_start", event)
             elif event.type is StreamEventType.TOOL_EXECUTION_END:
                 if (
@@ -873,7 +881,7 @@ async def run_agent_tool(
             event_data: dict[str, object] = {"stream": "stdout"}
             if loop.agent_instance_id is not None:
                 event_data["agent_instance_id"] = loop.agent_instance_id
-            await loop._publish_background_event(
+            await loop._wait_for_background_event(
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_UPDATE,
                     tool_call=tool_call,
@@ -972,7 +980,7 @@ async def run_agent_tool(
         data = {"depth": child_depth if depth is None else depth}
         data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
         if background:
-            await loop._publish_background_event(
+            await loop._wait_for_background_event(
                 StreamEvent(
                     event_type,
                     tool_call=call,
