@@ -1398,3 +1398,198 @@ def test_register_rejects_a_subject_that_is_not_a_parameter(
             parameters={"type": "object", "properties": {"text": {"type": "string"}}},
             approval_subject=subject,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_same_call_id_in_parent_and_child_approval_records_runs_both(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    child_store = ConversationStore(tmp_path / "child")
+    call = ToolCall("same-call", "echo", {})
+    for store in (parent_store, child_store):
+        store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call, {"action": None}, {})],
+        )
+        store.resolve_approval(call.id, "allow")
+    parent = ToolRegistry(
+        tmp_path,
+        approval_policy=ApprovalPolicy(default="allow"),
+        approval_store=parent_store,
+        session_store=parent_store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    runs = 0
+
+    async def run(_arguments: dict[str, object]) -> str:
+        nonlocal runs
+        runs += 1
+        return "ok"
+
+    parent.register("echo", run, binding="shared")
+    child = parent.clone_for_session(child_store)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(parent.execute(call), child.execute(call)), 10
+        )
+
+        assert runs == 2
+        assert all(result["isError"] is False for result in results)
+    finally:
+        await asyncio.wait_for(child.close(), 10)
+        await asyncio.wait_for(parent.close(), 10)
+        child_store.close()
+        parent_store.close()
+
+
+@pytest.mark.parametrize("decision", ["allow", "deny"])
+@pytest.mark.asyncio
+async def test_terminal_approval_claims_do_not_accumulate_across_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str
+) -> None:
+    calls = [ToolCall(f"call-{index}", "echo", {}) for index in range(100)]
+    backend = FakeBackend(
+        [
+            turn
+            for call in calls
+            for turn in (
+                ScriptedTurn(tool_calls=[call]),
+                ScriptedTurn(content=[TextContent("done")]),
+            )
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    policy = ApprovalPolicy(default="ask")
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register("echo", lambda arguments: "ran")
+    approval_published = asyncio.Event()
+    append_with_approvals = store.append_message_with_approval_requests
+
+    def publish_approval(*args: object, **kwargs: object) -> object:
+        result = append_with_approvals(*args, **kwargs)
+        if len(args) > 1 and args[1]:
+            approval_published.set()
+        return result
+
+    monkeypatch.setattr(store, "append_message_with_approval_requests", publish_approval)
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        for call in calls:
+            task = asyncio.create_task(
+                collect(loop.run_turn("next", origin=MessageOrigin.USER))
+            )
+            try:
+                await asyncio.wait_for(approval_published.wait(), 10)
+                approval_published.clear()
+                resolve = policy.approve if decision == "allow" else policy.deny
+                assert resolve(call.id)
+                await asyncio.wait_for(task, 10)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(task, return_exceptions=True), 10
+                    )
+            assert store._pending_approval_executions == {}
+    finally:
+        await asyncio.wait_for(loop.close(), 10)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_claim_blocks_a_delayed_loser_until_turn_end(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    first = ("first", ("host", None))
+    second = ("second", ("host", None))
+    try:
+        store.remember_pending_approval_execution(*first)
+        assert store.claim_pending_approval_execution(*first) == "claimed"
+        store.release_pending_approval_execution(first[0])
+        store.remember_pending_approval_execution(*second)
+        assert store.claim_pending_approval_execution(*second) == "claimed"
+        store.release_pending_approval_execution(second[0])
+
+        async def delayed_claim() -> str:
+            await asyncio.sleep(0)
+            return store.claim_pending_approval_execution(*first)
+
+        delayed = asyncio.create_task(delayed_claim())
+        try:
+            assert await asyncio.wait_for(delayed, 10) == "duplicate"
+        finally:
+            if not delayed.done():
+                delayed.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(delayed, return_exceptions=True), 10
+                )
+        assert len(store._pending_approval_executions) == 2
+
+        store.retire_terminal_approval_executions()
+        assert store._pending_approval_executions == {}
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("approved", "current"),
+    [("host", "mcp"), ("mcp", "host"), ("page", "other")],
+)
+@pytest.mark.asyncio
+async def test_approved_tool_rejects_a_different_definition_kind(
+    tmp_path: Path, approved: str, current: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("changed-call", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call, {"action": None}, {})],
+    )
+    store.resolve_approval(call.id, "allow")
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        approval_store=store,
+        session_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    runs = 0
+
+    async def run(_arguments: dict[str, object]) -> str:
+        nonlocal runs
+        runs += 1
+        return "wrong"
+
+    registry.register("echo", run)
+    if approved != "host":
+        store.remember_pending_approval_execution(call.id, ("mcp", approved))
+    else:
+        store.remember_pending_approval_execution(call.id, ("host", None))
+    if current != "host":
+        registry._mcp_owned["echo"] = (  # test-contract: replace the approved actor
+            type("Owner", (), {"config": type("Config", (), {"name": current})()})(),
+            1,
+        )
+
+    try:
+        result = await registry.execute(call)
+
+        assert runs == 0
+        assert result["isError"] is True
+        assert "tool changed after approval" in result["content"][0]["text"]
+    finally:
+        await asyncio.wait_for(registry.close(), 10)
+        store.close()

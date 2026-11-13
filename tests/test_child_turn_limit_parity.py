@@ -163,7 +163,7 @@ async def _unset_child_snapshot(
                 console=Console(file=tui_output, force_terminal=False),
             )
             async with owned_app(app):
-                app._rebuild_transcript()
+                await app._rebuild_transcript_async()
             rendered = Text.from_ansi(tui_output.getvalue()).plain
             serve_rows = [
                 row

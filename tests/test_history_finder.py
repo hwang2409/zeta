@@ -151,9 +151,9 @@ def test_candidates_are_newest_first_deduplicated_and_multiline() -> None:
 def test_session_history_is_scoped_and_navigation_restores_draft() -> None:
     history = SessionPromptHistory()
     history.replace("a", ("a one", "a two"))
-    history.replace("b", ("b one",))
     assert history.older("a", Document("draft")).text == "a two"
     assert history.older("a", Document("a two")).text == "a one"
+    history.replace("b", ("b one",))
     assert history.older("b", Document("draft")).text == "b one"
     assert history.newer("b").text == "draft"
 

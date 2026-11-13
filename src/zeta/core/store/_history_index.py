@@ -9,19 +9,16 @@ import os
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
-from ...protocol.types import (
-    ToolCall,
-    is_passive_harness_message,
-    is_visible_harness_notice,
-)
+from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ..transcript_recovery import recovery_status
+from . import _row_history
 
 _HISTORY_PAGE_ATTEMPTS = 16
 
@@ -91,7 +88,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 8
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -195,24 +192,6 @@ class HistoryIndex:
             if hasattr(value, key)
         }
 
-    @staticmethod
-    def _starts_next_group(entry_type: str, data: Mapping[str, object]) -> bool:
-        if entry_type == "message":
-            message = data.get("message")
-            return isinstance(message, dict) and not (
-                is_passive_harness_message(message)
-                and not is_visible_harness_notice(message)
-            )
-        return entry_type == "notification" or (
-            entry_type == "warning" and data.get("kind") == "transcript_recovery"
-        )
-
-    @staticmethod
-    def _belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
-        return HistoryIndex._starts_next_group(entry_type, data) or entry_type in {
-            "client_delivery", "approval_resolution", "approval_history", "turn_end"
-        }
-
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)"
@@ -221,11 +200,12 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS entries ("
             "seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, parent_id TEXT, "
             "lane TEXT NOT NULL, type TEXT NOT NULL, data BLOB NOT NULL, "
-            "history_group INTEGER)"
+            "history_group INTEGER, tui_group INTEGER)"
         )
         connection.execute("CREATE INDEX IF NOT EXISTS entries_parent ON entries(parent_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS entries_type ON entries(type)")
         connection.execute("CREATE INDEX IF NOT EXISTS entries_history_group ON entries(history_group,seq)")
+        connection.execute("CREATE INDEX IF NOT EXISTS entries_tui_group ON entries(tui_group,seq)")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS approval_calls ("
             "request_id TEXT PRIMARY KEY, tool_call BLOB NOT NULL)"
@@ -234,6 +214,17 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS accepted_messages ("
             "delivery_id TEXT PRIMARY KEY, message BLOB NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS message_tool_calls ("
+            "entry_seq INTEGER NOT NULL, tool_ordinal INTEGER NOT NULL, "
+            "entry_id TEXT NOT NULL, call_id TEXT NOT NULL, call_data BLOB NOT NULL, "
+            "PRIMARY KEY(entry_seq,tool_ordinal))"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS message_tool_calls_lookup "
+            "ON message_tool_calls(call_id,entry_seq)"
+        )
+        _row_history.create_schema(connection)
         connection.execute(
             "CREATE TABLE IF NOT EXISTS active_approval_requests ("
             "request_id TEXT PRIMARY KEY, request_seq INTEGER NOT NULL, "
@@ -249,10 +240,19 @@ class HistoryIndex:
         return self._facts(json.loads(row[0])) if row is not None else None
 
     def _set_meta(
-        self, connection: sqlite3.Connection, facts: object, *, total: int
+        self,
+        connection: sqlite3.Connection,
+        facts: object,
+        *,
+        total: int,
+        tui_total: int,
     ) -> None:
         payload = self._facts(facts)
-        payload.update(schema_version=self.SCHEMA_VERSION, history_groups=total)
+        payload.update(
+            schema_version=self.SCHEMA_VERSION,
+            history_groups=total,
+            tui_groups=tui_total,
+        )
         connection.execute(
             "INSERT INTO meta(key,value) VALUES('facts',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -293,22 +293,35 @@ class HistoryIndex:
             connection = self._connection(write=True)
             self._create_schema(connection)
             group = 0
+            tui_group = 0
             with connection:
                 for entry in rows:
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
                     data = json.loads(encoded)
                     active = entry_id in active_ids
                     history_group = (
-                        group if active and self._belongs_in_history(entry_type, data) else None
+                        group if active and _row_history.belongs_in_history(entry_type, data) else None
                     )
-                    if active and self._starts_next_group(entry_type, data):
+                    if active and _row_history.starts_next_group(entry_type, data):
                         group += 1
+                    tui_history_group = tui_group if active else None
+                    if active:
+                        tui_group += 1
                     connection.execute(
-                        "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
-                        "VALUES(?,?,?,?,?,?,?)",
-                        (seq, entry_id, parent_id, lane, entry_type, encoded, history_group),
+                        "INSERT INTO entries("
+                        "seq,id,parent_id,lane,type,data,history_group,tui_group) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            seq, entry_id, parent_id, lane, entry_type, encoded,
+                            history_group, tui_history_group,
+                        ),
                     )
+                    if active:
+                        _row_history.write_text(
+                            connection, seq, entry_id, entry_type, data
+                        )
                     if active and entry_type == "message":
+                        self._write_tool_calls(connection, seq, entry_id, data)
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
                                 "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -328,7 +341,9 @@ class HistoryIndex:
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
                         )
-                self._set_meta(connection, source_facts, total=group)
+                self._set_meta(
+                    connection, source_facts, total=group, tui_total=tui_group
+                )
             self._available = True
         finally:
             if connection is not None:
@@ -345,64 +360,57 @@ class HistoryIndex:
         expected: Mapping[str, object],
         rows: Sequence[object],
     ) -> int | None:
-        if stored.get("schema_version") != self.SCHEMA_VERSION or any(
-            stored.get(key) != expected.get(key)
-            for key in ("st_dev", "st_ino", "repair_generation")
-        ):
-            return None
-        stored_boundary = stored.get("byte_boundary")
-        expected_boundary = expected.get("byte_boundary")
-        if (
-            not isinstance(stored_boundary, int)
-            or not isinstance(expected_boundary, int)
-            or stored_boundary > expected_boundary
-        ):
-            return None
-        start = stored.get("last_seq")
-        if not isinstance(start, int) or not 0 <= start <= len(rows):
-            return None
-        boundary = rows[start - 1] if start else None
-        if stored.get("last_id") != (self._row(boundary)[1] if boundary else None):
-            return None
-        if stored.get("last_parent") != (self._row(boundary)[2] if boundary else None):
-            return None
-        digest_hex = stored.get("prefix_digest")
-        if not isinstance(digest_hex, str):
-            return None
-        try:
-            digest = bytes.fromhex(digest_hex)
-        except ValueError:
-            return None
-        suffix = rows[start:]
-        if not suffix:
-            return None
-        parent_id = stored.get("last_id")
-        for entry in suffix:
-            row = self._row(entry)
-            if row[2] != parent_id:
-                return None
-            parent_id = row[1]
-            digest = self._entry_digest(digest, entry)
-        return start if digest.hex() == expected.get("prefix_digest") else None
+        return _row_history.history_index_suffix_start(
+            stored, expected, rows, schema_version=self.SCHEMA_VERSION,
+            row=self._row, digest_entry=self._entry_digest,
+        )
 
     def _project_entries(
-        self, entries: tuple[object, ...], total: int
-    ) -> tuple[list[tuple[object, int | None]], int]:
-        projected: list[tuple[object, int | None]] = []
-        for entry in entries:
-            data = dict(entry.data)
-            group = total if self._belongs_in_history(entry.type, data) else None
-            projected.append((entry, group))
-            if self._starts_next_group(entry.type, data):
-                total += 1
-        return projected, total
+        self, entries: tuple[object, ...], total: int, tui_total: int
+    ) -> tuple[list[tuple[object, int | None, int]], int, int]:
+        return _row_history.project_history_entries(
+            entries, total, tui_total, data=lambda entry: dict(entry.data),
+            belongs=_row_history.belongs_in_history, starts=_row_history.starts_next_group,
+        )
+
+    def _write_tool_calls(
+        self,
+        connection: sqlite3.Connection,
+        seq: int,
+        entry_id: str,
+        data: Mapping[str, object],
+    ) -> None:
+        message = data.get("message")
+        if not isinstance(message, Mapping):
+            return
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        ordinal = 0
+        for block in content:
+            if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+                continue
+            call = block.get("tool_call")
+            call_id = call.get("id") if isinstance(call, Mapping) else None
+            if not isinstance(call_id, str):
+                continue
+            connection.execute(
+                "INSERT OR REPLACE INTO message_tool_calls("
+                "entry_seq,tool_ordinal,entry_id,call_id,call_data) VALUES(?,?,?,?,?)",
+                (seq, ordinal, entry_id, call_id, self._value(call)),
+            )
+            ordinal += 1
 
     def _write_correlations(
         self, connection: sqlite3.Connection, entries: tuple[object, ...]
     ) -> None:
         for entry in entries:
             data = dict(entry.data)
+            _row_history.write_text(
+                connection, entry.seq, entry.id, entry.type, data
+            )
             if entry.type == "message":
+                self._write_tool_calls(connection, entry.seq, entry.id, data)
                 for approval in data.get("approval_requests", ()):
                     connection.execute(
                         "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -443,17 +451,25 @@ class HistoryIndex:
         if expected_seq != self._row(entries[0])[0]:
             raise HistoryIndexUnavailableError("history index delta is not contiguous")
         stored = self._stored_facts(connection) or {}
-        projected, total = self._project_entries(
-            entries, int(stored.get("history_groups", 0))
+        projected, total, tui_total = self._project_entries(
+            entries,
+            int(stored.get("history_groups", 0)),
+            int(stored.get("tui_groups", 0)),
         )
         with connection:
             connection.executemany(
-                "INSERT INTO entries(seq,id,parent_id,lane,type,data,history_group) "
-                "VALUES(?,?,?,?,?,?,?)",
-                ((*self._row(entry), group) for entry, group in projected),
+                "INSERT INTO entries("
+                "seq,id,parent_id,lane,type,data,history_group,tui_group) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    (*self._row(entry), group, tui_group)
+                    for entry, group, tui_group in projected
+                ),
             )
             self._write_correlations(connection, entries)
-            self._set_meta(connection, facts, total=total)
+            self._set_meta(
+                connection, facts, total=total, tui_total=tui_total
+            )
 
     def catch_up_validated(
         self, source_facts: object, validated_rows: Sequence[object]
@@ -664,6 +680,145 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
+    def tui_page(self, request: object, g0: object) -> IndexedHistoryPage:
+        with self._lock:
+            self._check_open()
+            connection = self._connection(write=False)
+            try:
+                page_request = request if isinstance(request, Mapping) else vars(request)
+                stored = self._stored_facts(connection)
+                requested = self._facts(g0)
+                if stored is None or any(
+                    stored.get(key) != value for key, value in requested.items()
+                ):
+                    raise StaleHistorySnapshot
+                current_total = int(stored.get("tui_groups", 0))
+                total = int(page_request.get("end", current_total))
+                if total < 0 or total > current_total:
+                    raise StaleHistorySnapshot
+                start, stop = self._page_bounds(page_request, total)
+                rows = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                    "WHERE tui_group>=? AND tui_group<? ORDER BY tui_group",
+                    (start, stop),
+                ).fetchall()
+                groups = tuple(
+                    (
+                        ConversationEntry(
+                            seq, entry_id, parent_id, lane, entry_type, json.loads(data)
+                        ),
+                    )
+                    for seq, entry_id, parent_id, lane, entry_type, data in rows
+                )
+                endpoint = connection.execute(
+                    "SELECT id FROM entries WHERE tui_group=?", (total - 1,)
+                ).fetchone() if total else None
+                return IndexedHistoryPage(
+                    groups,
+                    start,
+                    total,
+                    {},
+                    endpoint[0] if endpoint else None,
+                    stored.get("repair_generation")
+                    if isinstance(stored.get("repair_generation"), str)
+                    else None,
+                )
+            finally:
+                connection.close()
+
+    def tui_search(
+        self,
+        query: str,
+        limit: int,
+        g0: object,
+        cancel: threading.Event | None = None,
+    ) -> tuple[tuple[str, int], ...]:
+        with self._lock:
+            self._check_open()
+            connection = self._connection(write=False)
+            try:
+                stored = self._stored_facts(connection)
+                requested = self._facts(g0)
+                if stored is None or any(
+                    stored.get(key) != value for key, value in requested.items()
+                ):
+                    raise StaleHistorySnapshot
+                return _row_history.search(connection, query, limit, cancel)
+            finally:
+                connection.close()
+
+    def user_dependency(
+        self, before_seq: int, g0: object
+    ) -> ConversationEntry | None:
+        with self._lock:
+            self._check_open()
+            connection = self._connection(write=False)
+            try:
+                stored = self._stored_facts(connection)
+                if stored is None or any(
+                    stored.get(key) != value
+                    for key, value in self._facts(g0).items()
+                ):
+                    raise StaleHistorySnapshot
+                row = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                    "WHERE seq<? AND tui_group IS NOT NULL AND type='message' "
+                    "AND json_extract(data,'$.message.role')='user' "
+                    "AND COALESCE(json_extract(data,"
+                    "'$.message.metadata.\"zeta.origin\"'),'')!='harness_nudge' "
+                    "ORDER BY seq DESC LIMIT 1",
+                    (before_seq,),
+                ).fetchone()
+                if row is None:
+                    return None
+                seq, entry_id, parent_id, lane, entry_type, data = row
+                return ConversationEntry(
+                    seq, entry_id, parent_id, lane, entry_type, json.loads(data)
+                )
+            finally:
+                connection.close()
+
+    def tool_call_dependency(
+        self, call_id: str, before_seq: int, g0: object
+    ) -> ConversationEntry | None:
+        with self._lock:
+            self._check_open()
+            connection = self._connection(write=False)
+            try:
+                stored = self._stored_facts(connection)
+                if stored is None or any(
+                    stored.get(key) != value
+                    for key, value in self._facts(g0).items()
+                ):
+                    raise StaleHistorySnapshot
+                row = connection.execute(
+                    "SELECT e.seq,e.id,e.parent_id,e.lane,t.call_data "
+                    "FROM message_tool_calls t JOIN entries e ON e.seq=t.entry_seq "
+                    "WHERE t.call_id=? AND t.entry_seq<? AND e.history_group IS NOT NULL "
+                    "ORDER BY t.entry_seq DESC,t.tool_ordinal DESC LIMIT 1",
+                    (call_id, before_seq),
+                ).fetchone()
+                if row is None:
+                    return None
+                seq, entry_id, parent_id, lane, call_data = row
+                return ConversationEntry(
+                    seq,
+                    entry_id,
+                    parent_id,
+                    lane,
+                    "message",
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "tool_call": json.loads(call_data)}
+                            ],
+                        }
+                    },
+                )
+            finally:
+                connection.close()
+
     def _approval_query(
         self,
         facts: object,
@@ -820,28 +975,29 @@ def _read_stable_page(
     return None
 
 
-def _overlay_resident_entries(
-    store: ConversationStore, page: IndexedHistoryPage
-) -> IndexedHistoryPage:
-    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._resident_rows.entries):
-            return entry
-        resident = store._resident_rows.entries[entry.seq - 1]
-        if resident.id != entry.id:
-            return entry
-        accepted = entry.data.get("_accepted_message")
-        if accepted is None:
-            return resident
-        return replace(
-            resident,
-            data={**resident.data, "_accepted_message": accepted},
-        )
-
-    groups = tuple(
-        tuple(resident_entry(entry) for entry in group)
-        for group in page.groups
-    )
-    return replace(page, groups=groups)
+def _read_stable_tui_page(
+    store: ConversationStore,
+    index: HistoryIndex,
+    request: Mapping[str, object],
+) -> IndexedHistoryPage | None:
+    attempts = _HISTORY_PAGE_ATTEMPTS if "end" in request else 1
+    for attempt in range(attempts):
+        try:
+            if not index.available:
+                _rebuild_history_index(store)
+            facts = store._history_index_facts()
+            page = index.tui_page(request, facts)
+        except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+            index._mark_unavailable()
+            if store._read_only or attempt == attempts - 1:
+                return None
+            continue
+        if store._history_index_facts() == facts:
+            return page
+        if store._read_only or attempt == attempts - 1:
+            return None
+        index._mark_unavailable()
+    return None
 
 
 def _decide_approval(
@@ -1022,6 +1178,82 @@ class HistoryPageStoreMixin:
             )
         )
 
+    def tui_history_search(
+        self: ConversationStore,
+        query: str,
+        *,
+        limit: int = 200,
+        cancel: threading.Event | None = None,
+    ) -> tuple[tuple[str, int], ...]:
+        index = self._history_index
+        if self._closed or index is None:
+            return ()
+        for _attempt in range(_HISTORY_PAGE_ATTEMPTS):
+            try:
+                if not index.available:
+                    _rebuild_history_index(self)
+                facts = self._history_index_facts()
+                result = index.tui_search(query, limit, facts, cancel)
+            except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+                index._mark_unavailable()
+                if self._read_only:
+                    return ()
+                continue
+            if self._history_index_facts() == facts:
+                return result
+            index._mark_unavailable()
+        return ()
+
+    def _tui_dependency(
+        self: ConversationStore,
+        read: Callable[[HistoryIndex, Mapping[str, object]], ConversationEntry | None],
+    ) -> ConversationEntry | None:
+        index = self._history_index
+        if self._closed or index is None:
+            return None
+        for _attempt in range(2):
+            try:
+                facts = self._history_index_facts()
+                dependency = read(index, facts)
+            except (StaleHistorySnapshot, HistoryIndexUnavailableError):
+                index._mark_unavailable()
+                if self._read_only:
+                    return None
+                _rebuild_history_index(self)
+                continue
+            if self._history_index_facts() == facts:
+                return dependency
+        return None
+
+    def tui_user_dependency(
+        self: ConversationStore, before_seq: int
+    ) -> ConversationEntry | None:
+        return self._tui_dependency(
+            lambda index, facts: index.user_dependency(before_seq, facts)
+        )
+
+    def tui_tool_call_dependency(
+        self: ConversationStore, call_id: str, before_seq: int
+    ) -> ConversationEntry | None:
+        return self._tui_dependency(
+            lambda index, facts: index.tool_call_dependency(call_id, before_seq, facts)
+        )
+
+    def tui_history_index_page(
+        self: ConversationStore, request: Mapping[str, object]
+    ) -> IndexedHistoryPage | None:
+        index = self._history_index
+        if self._closed:
+            return None
+        if index is None or (self._read_only and not index.available):
+            return None
+        page = _read_stable_tui_page(self, index, request)
+        return (
+            _row_history.overlay_resident_entries(self, page)
+            if page is not None
+            else None
+        )
+
     def history_index_page(
         self: ConversationStore, request: Mapping[str, object]
     ) -> IndexedHistoryPage | None:
@@ -1032,4 +1264,8 @@ class HistoryPageStoreMixin:
         if index is None or (self._read_only and not index.available):
             return None
         page = _read_stable_page(self, index, request)
-        return _overlay_resident_entries(self, page) if page is not None else None
+        return (
+            _row_history.overlay_resident_entries(self, page)
+            if page is not None
+            else None
+        )
