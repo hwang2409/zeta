@@ -46,7 +46,10 @@ from ..tools.finish import register as register_finish
 from ..tools.registry import ToolExecutionContext
 from . import budget
 from . import child_context as _child_context
-from .background_lifecycle import _complete_despite_cancellation, finish_background_child
+from .background_lifecycle import (
+    _complete_despite_cancellation,
+    finish_background_child,
+)
 from .background_owner import CancellationRequest
 from .child_context import (
     _child_base_system_prompt,
