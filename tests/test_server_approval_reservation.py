@@ -1843,7 +1843,7 @@ async def test_concurrent_delegated_history_uses_store_durable_writer(
             "reason": "child_cleanup",
         }
         await store.append_approval_history_async(request)
-        await store.append_approval_history_async(end)
+        await asyncio.wait_for(store.append_approval_history_async(end), 10)
 
     try:
         await asyncio.gather(write_pair("wire-a"), write_pair("wire-b"))

@@ -140,7 +140,7 @@ def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Pat
             deadline = entered_loop.time() + .05
             while entered_loop.time() < deadline:
                 ticks += 1
-                await asyncio.sleep(0)
+                await asyncio.wait_for(asyncio.sleep(0), 10)
             assert ticks > 1
             milestones.append("fsync-held")
             release.set()
