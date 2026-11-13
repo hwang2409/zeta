@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +43,11 @@ from .core.transcript_recovery import RepairTarget, classify_recovery_records
 from .memory.reconciliation_state import classify_reconciliation_records
 from .project_inbox import InboxError, validate_inbox_record
 from .project_inbox_sent import SentMessageTracker, _Broken, _Loaded
+from .session_retention_transaction import (
+    Candidate,
+    CandidateRejected,
+    _QuarantineTransaction,
+)
 from .storage_format import (
     StorageFeature,
     StorageFormatError,
@@ -422,6 +427,29 @@ class RetentionPlanner:
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
             self._latest = state["preview"] if state is not None else None
+        transaction = _QuarantineTransaction(
+            self.home,
+            self.lease,
+            entries=self.bounds.entries_total,
+            worker_ns=self.bounds.worker_ns,
+            clock=self._now_ns,
+        )
+        outcome = transaction.advance(
+            days=days,
+            preview=self._latest if type(self._latest) is dict else None,
+            verify=self._verify_candidate,
+        )
+        if outcome.advanced or outcome.blocked is not None:
+            reasons = (
+                (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
+                if outcome.blocked is not None else ()
+            )
+            return PassResult(
+                enabled=True,
+                complete=False,
+                reasons=reasons,
+                preview=_preview_snapshot(self._latest),
+            )
         budget = _Budget(self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns)
         sweep = self._sweep
         if sweep is None or sweep.days != days:
@@ -449,6 +477,41 @@ class RetentionPlanner:
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
         )
+
+    @contextmanager
+    def _verify_candidate(self, root_id: str, days: int):
+        """Repeat the full closure proof while the transaction owns authority."""
+        budget = _Budget(
+            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns
+        )
+        sweep = _Sweep(days, self._now_ns(), current_root=root_id)
+        scan = _ClosureBudget(budget)
+        home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with child_directory(home_fd, "sessions") as sessions_fd:
+                flight = self._hold(sessions_fd, root_id, scan)
+                if not self._walk(flight, budget):
+                    raise CandidateRejected("final candidate walk exceeded its bound")
+                reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
+                if reason is not None:
+                    raise CandidateRejected(reason)
+                generation = read_reference_generation(self.home)
+                descendants = tuple(
+                    root_id + ":" + ":".join(part for part in comps if part != _AGENTS_DIRNAME)
+                    for comps in flight.store_dirs
+                    if comps
+                )
+                yield Candidate(
+                    root_id,
+                    flight.device,
+                    flight.inode,
+                    descendants,
+                    flight.walk.bytes,
+                    generation,
+                )
+        finally:
+            self._close_flight()
+            os.close(home_fd)
 
     def _advance(self, home_fd, sweep: _Sweep, budget: _Budget) -> list[RootOutcome]:
         reasons: list[RootOutcome] = []

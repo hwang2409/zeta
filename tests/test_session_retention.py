@@ -1163,7 +1163,7 @@ def test_armed_completed_preview_quarantines_eligible_root(tmp_path):
                     "gate_version": 1,
                     "armed_by_zeta_version": "test",
                     "armed_at": _OLD,
-                    "preview_id": preview.preview_id,
+                    "preview_id": preview.preview.preview_id,
                 }
             )
             + "\n"
