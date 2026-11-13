@@ -8768,7 +8768,10 @@ async def test_aborted_descendant_stops_after_cancelled_tool_result(
         release_result.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="cancelled tool task cleanup",
+        )
         await loop.close()
         store.close()
 
