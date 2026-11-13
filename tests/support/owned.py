@@ -14,6 +14,19 @@ from zeta.tui.app import TUIApp
 T = TypeVar("T")
 
 
+def start_task_stack_watchdog(timeout: float, *, what: str) -> asyncio.Task[None]:
+    async def dump_after_timeout() -> None:
+        await asyncio.sleep(timeout)
+        output = io.StringIO()
+        output.write(f"{what} task stacks after {timeout:g} s:\n")
+        for task in asyncio.all_tasks():
+            if not task.done():
+                task.print_stack(file=output)
+        print(output.getvalue(), file=sys.__stderr__, flush=True)
+
+    return asyncio.create_task(dump_after_timeout())
+
+
 async def _cancel_and_drain(
     tasks: list[asyncio.Future[object]],
     *,
@@ -61,7 +74,7 @@ async def await_or_fail[T](
         if not task.done():
             task.print_stack(file=task_stacks)
     task_dump = task_stacks.getvalue()
-    print(task_dump, file=sys.stderr, flush=True)
+    print(task_dump, file=sys.__stderr__, flush=True)
     timeout_error = TimeoutError(f"{what} did not finish within {timeout} s")
     timeout_error.add_note(task_dump)
     try:
