@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -592,7 +592,7 @@ async def _background_event_transcript_count(
                 model="offline",
                 console=Console(file=resumed_output, force_terminal=False, width=160),
             )
-            resumed_app._rebuild_transcript()
+            await resumed_app._rebuild_transcript_async()
             resumed = (
                 Text.from_ansi(resumed_app._transcript.render(160)).plain
                 + "\n"
@@ -754,7 +754,7 @@ async def test_live_notification_presentation_survives_tui_resume(
         console=Console(file=resumed_output, force_terminal=False, width=160),
     )
     try:
-        resumed_app._rebuild_transcript()
+        await resumed_app._rebuild_transcript_async()
         visible = output.getvalue() + resumed_output.getvalue()
         assert visible.count("child child-presentation · completed") == 1
     finally:
@@ -837,7 +837,7 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         )
         try:
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
-            resumed_app._rebuild_transcript()
+            await resumed_app._rebuild_transcript_async()
             visible = output.getvalue() + resumed_output.getvalue()
             assert visible.count("child child-canceled-presentation · completed") == 1
         finally:
@@ -892,7 +892,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         count, rendered = await await_or_fail(transcript, what="test await")
         assert count == 1, rendered
-        markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
+        markers = {ref.type for ref in apps[0].loop.store.branch_refs()}
         assert "notification_tui_presented" in markers
     finally:
         release_ack.set()
@@ -2946,11 +2946,11 @@ async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) 
 
     try:
         async with owned_app(app):
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             assert_indexes_match()
             app._presenter.print_unit(Text("reloaded"))
             assert_indexes_match()
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             assert_indexes_match()
     finally:
         await app.loop.close()
@@ -4934,7 +4934,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         console=Console(file=output, force_terminal=False),
     )
 
-    app._rebuild_transcript()
+    await app._rebuild_transcript_async()
 
     assert app.retry_available()
     rendered = Text.from_ansi(output.getvalue()).plain
@@ -9244,23 +9244,20 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     mcp_calls: list[None] = []
     freeze_calls: list[None] = []
     replay_started = asyncio.Event()
-    replay_completed: list[None] = []
-    rebuild_steps = app._rebuild_transcript_steps
+    source_page = app._history_source.page
 
     async def ensure_mcp() -> None:
         mcp_calls.append(None)
 
-    def observed_rebuild_steps(
-        rendered_notifications: list[str],
-    ) -> Iterator[None]:
-        for step in rebuild_steps(rendered_notifications):
-            replay_started.set()
-            yield step
-        replay_completed.append(None)
+    async def observed_page(*args: object, **kwargs: object) -> object:
+        page = await source_page(*args, **kwargs)
+        replay_started.set()
+        await asyncio.sleep(0)
+        return page
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
-    # test-contract: seam Observe transcript rebuild through the application boundary.
-    monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
+    # test-contract: seam Pause after the bounded page read, before TUI paint.
+    monkeypatch.setattr(app._history_source, "page", observed_page)
     # test-contract: seam Observe the production heap-freeze boundary.
     monkeypatch.setattr(
         "zeta.tui.checkpoints.freeze_long_lived_heap",
@@ -9273,7 +9270,7 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         app.request_exit()
         await asyncio.wait_for(run_task, timeout=1)
 
-    assert replay_completed == []
+    assert "99" not in Text.from_ansi(app._transcript.render(120)).plain
     assert mcp_calls == []
     assert freeze_calls == []
 
@@ -9425,7 +9422,7 @@ async def test_rebuild_transcript_matches_character_stream(
     await app._consume_turn("prompt")
 
     live = app._transcript.render(120)
-    app._rebuild_transcript()
+    await app._rebuild_transcript_async()
     replayed = app._transcript.render(120)
     assert replayed == live
 
@@ -9567,9 +9564,8 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
-def test_rebuild_renders_closed_turn_end_reasons(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.asyncio
+async def test_history_page_renders_closed_turn_end_reasons(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     replay = tuple(
         SimpleNamespace(
@@ -9577,7 +9573,6 @@ def test_rebuild_renders_closed_turn_end_reasons(
         )
         for reason in ("user_stop", "completed", "error", "disconnect")
     )
-    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -9585,13 +9580,13 @@ def test_rebuild_renders_closed_turn_end_reasons(
     )
     app._active_session = app._make_session()
 
-    app._rebuild_transcript()
-
-    rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "turn stopped by the user" in rendered
-    assert "turn ended with an error" in rendered
-    assert "turn ended when the controller disconnected" in rendered
-    assert "completed" not in rendered
+    async with owned_app(app):
+        list(app._render_history_entries(replay, []))
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "turn stopped by the user" in rendered
+        assert "turn ended with an error" in rendered
+        assert "turn ended when the controller disconnected" in rendered
+        assert "completed" not in rendered
 
 
 def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
@@ -14399,7 +14394,7 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     )
 
     try:
-        app._rebuild_transcript()
+        await app._rebuild_transcript_async()
 
         rendered = Text.from_ansi(output.getvalue()).plain
         assert "here is the answer" in rendered
@@ -16129,7 +16124,7 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
         app = TUIApp(loop, provider="codex", model="offline")
         async with owned_app(app):
             app._full_screen_active = lambda: True
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "sent history is incomplete (invalid_json)" in rendered
             assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
@@ -16236,3 +16231,104 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
         snapshot = Text.from_ansi(output.getvalue()).plain
         assert "… +" not in snapshot
         assert "short summary" in snapshot or "short reason" in snapshot
+
+@pytest.mark.asyncio
+async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("long-open", "read", {"path": "old.txt"}))],
+        )
+    )
+    parent_id = store.branch_refs()[-1].id
+    log_path = store.path
+    store.close()
+    with log_path.open("a", encoding="utf-8") as handle:
+        for index in range(50_000):
+            entry_id = f"{index + 2:032x}"
+            row = {
+                "seq": index + 2,
+                "id": entry_id,
+                "parent_id": parent_id,
+                "lane": "main",
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": f"history-{index}"}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            }
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            parent_id = entry_id
+    store = ConversationStore(store.root_dir, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "history-49999" in rendered
+        assert "history-0" not in rendered
+        assert len(app._transcript.units) <= 256
+        assert len(app._history_pager.pages) <= 4
+        assert len(app._history_pager.descriptors) <= 4
+        assert len(app._history_pager.scalar_tokens) == 6
+        matches = await app._history_pager.search("history-0")
+        assert len(matches) == 1
+        await app._history_pager.reveal(matches[0])
+        app._render_resident_history()
+        assert "history-0" in Text.from_ansi(app._transcript.render(120)).plain
+
+@pytest.mark.asyncio
+async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("same-call", "read", {"path": "old.txt"}))],
+        )
+    )
+    for index in range(10):
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent(str(index))]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("same-call", "read", {"path": "new.txt"}))],
+        )
+    )
+    for index in range(140):
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent(f"gap-{index}")]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult("same-call", "nearest result"),
+        )
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "new.txt" in rendered
+        assert "old.txt" not in rendered
+        assert rendered.count("new.txt") == 1
+        assert rendered.count("nearest result") == 1

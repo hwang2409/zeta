@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Protocol, Literal
-
-from prompt_toolkit.document import Document
+from typing import Any, Literal, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +65,12 @@ class TUIHistorySource(Protocol):
         direction: Literal["older", "newer"] = "older",
     ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]: ...
 
+    async def adjacent_visible_user(
+        self, entry_id: str, *, direction: Literal["older", "newer"]
+    ) -> str | None: ...
+
+    async def search(self, query: str, *, limit: int = 200) -> tuple[str, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class PageDescriptor:
@@ -92,11 +95,20 @@ class PagedTranscriptHistory:
         self._newest_tail: HistoryCursor | None = None
         self._anchor: tuple[str, int, int] | None = None
         self._reveal_target: str | None = None
-        self._loads: dict[tuple[int, str, str | None], asyncio.Task[TUIHistoryPage]] = {}
+        self._loads: dict[
+            tuple[int, str | None, str, str | None], asyncio.Task[TUIHistoryPage]
+        ] = {}
 
     @property
     def pages(self) -> tuple[TUIHistoryPage, ...]:
-        return tuple(descriptor.page for descriptor in self._pages.values())
+        def position(descriptor: PageDescriptor) -> int:
+            cursor = descriptor.page.older
+            return int(cursor.value) if cursor is not None else -1
+
+        return tuple(
+            descriptor.page
+            for descriptor in sorted(self._pages.values(), key=position)
+        )
 
     @property
     def descriptors(self) -> tuple[PageDescriptor, ...]:
@@ -120,6 +132,12 @@ class PagedTranscriptHistory:
     def set_anchor(self, entry_id: str, unit_ordinal: int, text_offset: int) -> None:
         self._anchor = (entry_id, unit_ordinal, text_offset)
 
+    async def close(self) -> None:
+        tasks = tuple(self._loads.values())
+        self.reset()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1
         for task in self._loads.values():
@@ -139,7 +157,12 @@ class PagedTranscriptHistory:
 
     async def load(self, direction: Literal["older", "newer"] = "older") -> TUIHistoryPage:
         cursor = self._older if direction == "older" else self._newer
-        key = (self.generation, direction, cursor.value if cursor else None)
+        key = (
+            self.generation,
+            self.endpoint_id,
+            direction,
+            cursor.value if cursor else None,
+        )
         task = self._loads.get(key)
         if task is None:
             generation = self.generation
@@ -174,8 +197,14 @@ class PagedTranscriptHistory:
         if page.newer is None:
             self._newest_tail = cursor
         while len(self._pages) > self.max_pages:
-            # Keep the newest insertion and discard the oldest resident page.
-            self._pages.pop(next(iter(self._pages)))
+            candidates = [
+                candidate
+                for candidate, descriptor in self._pages.items()
+                if candidate != key and descriptor.page.newer is not None
+            ]
+            if not candidates:
+                candidates = [candidate for candidate in self._pages if candidate != key]
+            self._pages.pop(candidates[0])
 
     def evict(self, key: str) -> None:
         self._pages.pop(key, None)
@@ -188,82 +217,15 @@ class PagedTranscriptHistory:
             self.adopt(page)
         return page
 
+    async def navigate_user(
+        self, entry_id: str, direction: Literal["older", "newer"]
+    ) -> str | None:
+        target = await self.source.adjacent_visible_user(
+            entry_id, direction=direction
+        )
+        if target is not None:
+            await self.reveal(target)
+        return target
 
-class SessionPromptHistory:
-    """Bounded prompt navigation over one active viewed session."""
-
-    max_pages = 2
-    max_prompts = 128
-    max_text_bytes = 256 * 1024
-
-    def __init__(self, source: TUIHistorySource | None = None) -> None:
-        self.source = source
-        self.session_path: Path | None = None
-        self.generation = 0
-        self._pages: list[tuple[tuple[str, str], ...]] = []
-        self._older: HistoryCursor | None = None
-        self._newer: HistoryCursor | None = None
-        self._selected: str | None = None
-        self._draft: Document | None = None
-
-    @property
-    def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
-        return tuple(self._pages)
-
-    def bind(self, session_path: Path, source: TUIHistorySource | None = None) -> None:
-        if source is not None:
-            self.source = source
-        if session_path == self.session_path:
-            return
-        self.generation += 1
-        self.session_path = session_path
-        self._pages.clear()
-        self._older = self._newer = None
-        self._selected = None
-        self._draft = None
-
-    async def load(self, direction: Literal["older", "newer"] = "older") -> None:
-        if self.source is None:
-            return
-        cursor = self._older if direction == "older" else self._newer
-        rows, older, newer = await self.source.prompt_page(cursor, direction=direction)
-        if direction == "older":
-            self._older = older
-        else:
-            self._newer = newer
-        self._pages.append(rows)
-        while len(self._pages) > self.max_pages:
-            self._pages.pop(0 if direction == "older" else -1)
-
-    def append(self, prompt_id: str, text: str) -> None:
-        if not text:
-            return
-        if not self._pages:
-            self._pages.append(())
-        page = (*self._pages[-1], (prompt_id, text))
-        if len(page) > self.max_prompts or sum(len(value.encode()) for _, value in page) > self.max_text_bytes:
-            self._pages.append(((prompt_id, text),))
-        else:
-            self._pages[-1] = page
-        while len(self._pages) > self.max_pages:
-            self._pages.pop(0)
-        self._selected = None
-
-    def start(self, draft: Document) -> None:
-        self._draft = draft
-        self._selected = None
-
-    def select(self, prompt_id: str) -> Document | None:
-        for page in reversed(self._pages):
-            for candidate_id, text in reversed(page):
-                if candidate_id == prompt_id:
-                    self._selected = candidate_id
-                    return Document(text, cursor_position=len(text))
-        return None
-
-    def clear(self) -> None:
-        self.generation += 1
-        self._pages.clear()
-        self._older = self._newer = None
-        self._selected = None
-        self._draft = None
+    async def search(self, query: str) -> tuple[str, ...]:
+        return await self.source.search(query)

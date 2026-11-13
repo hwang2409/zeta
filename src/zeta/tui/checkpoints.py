@@ -27,10 +27,8 @@ from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
     FAILED_TURN_MARKER,
-    MESSAGE_ORIGIN_METADATA,
     ErrorInfo,
     Message,
-    MessageOrigin,
     MessageRole,
     RedactedThinkingContent,
     StreamEvent,
@@ -50,7 +48,6 @@ from .render import (
     render_markdown,
     render_thought,
 )
-from .user import displayed_user_text
 
 FORCE_FLAGS = frozenset({"--force", "-f", "!"})
 _MAX_DEFERRED_TOOL_UPDATES = 64
@@ -307,7 +304,7 @@ class CheckpointTranscriptMixin:
             _, restore_note = _restore_workspace(
                 snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
             )
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             header = (
                 f"forked to user message {index} at seq {source.seq} "
@@ -340,7 +337,7 @@ class CheckpointTranscriptMixin:
             _, restore_note = _restore_workspace(
                 snapshots, target_snapshot, self.loop.store.bash_cwd, forced=forced
             )
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             message = (
                 f"forked to checkpoint '{entry.data['label']}' at seq "
@@ -379,7 +376,7 @@ class CheckpointTranscriptMixin:
                 await self.loop.store.switch_to_branch_async(target.head.id)
             except (ValueError, ConversationIntegrityError) as exc:
                 return f"tree: switch failed: {exc}"
-            self._rebuild_transcript()
+            await self._rebuild_transcript_async()
             self._fork_rebuilt = True
             return f"switched to branch {index} (head seq {target.head.seq})"
 
@@ -603,78 +600,73 @@ class CheckpointTranscriptMixin:
         return None
 
     def _rebuild_transcript(self) -> None:
-        """Synchronously rebuild for explicit commands outside app startup."""
+        """Reset root paging after a branch or repair change."""
 
-        rendered_notifications: list[str] = []
-        replay_error: BaseException | None = None
+        self._history_pager.reset(endpoint_id=self.loop.store.active_branch_head_id())
         try:
-            for _ in self._rebuild_transcript_steps(rendered_notifications):
-                pass
-        except BaseException as error:
-            replay_error = error
-            raise
-        finally:
-            try:
-                self._persist_rendered_notifications(rendered_notifications)
-            except BaseException:
-                if replay_error is None:
-                    raise
-                _LOGGER.exception(
-                    "failed to persist rendered notifications after replay error"
-                )
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._load_transcript_page(reset=True))
+        else:
+            loop.create_task(self._load_transcript_page(reset=True))
 
     async def _rebuild_transcript_async(self, *, batch_size: int = 1) -> bool:
-        """Rebuild after first paint, yielding between bounded entry batches."""
+        """Load only the newest bounded history page after first paint."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        rendered_notifications: list[str] = []
-        replay_error: BaseException | None = None
-        try:
-            await asyncio.sleep(0)
-            if self._exit_requested:
-                return False
-            for index, _ in enumerate(
-                self._rebuild_transcript_steps(rendered_notifications), start=1
-            ):
-                if self._exit_requested:
-                    return False
-                if index % batch_size == 0:
-                    await asyncio.sleep(0)
-            if self._exit_requested:
-                return False
-        except BaseException as error:
-            replay_error = error
-            raise
-        finally:
-            try:
-                marker_write = self._persist_rendered_notifications(
-                    rendered_notifications, asynchronous=True
-                )
-                if marker_write is not None:
-                    await marker_write
-            except BaseException:
-                if replay_error is None:
-                    raise
-                _LOGGER.exception(
-                    "failed to persist rendered notifications after replay error"
-                )
+        await asyncio.sleep(0)
+        if self._exit_requested:
+            return False
+        await self._load_transcript_page(reset=True)
+        if self._exit_requested:
+            return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
 
-    def _rebuild_transcript_steps(
-        self, rendered_notifications: list[str]
-    ) -> Iterator[None]:
-        """Render the transcript one durable entry at a time."""
+    async def _load_transcript_page(
+        self, *, reset: bool = False, direction: str = "older"
+    ) -> None:
+        """Read one page off-loop, then repaint the bounded resident window."""
 
+        if reset:
+            self._history_pager.reset(
+                endpoint_id=self.loop.store.active_branch_head_id()
+            )
+        page = await self._history_pager.load(direction)
+        if not page.units or self._exit_requested:
+            return
+        self._render_resident_history()
+        self._invalidate_prompt()
+
+    def _render_resident_history(self) -> None:
+        rendered_notifications: list[str] = []
         self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
+        pages = sorted(
+            self._history_pager.pages,
+            key=lambda page: min(
+                (unit.value.seq for unit in page.units), default=0
+            ),
+        )
+        entries = tuple(unit.value for page in pages for unit in page.units)
+        for _ in self._render_history_entries(entries, rendered_notifications):
+            pass
+        marker_write = self._persist_rendered_notifications(
+            rendered_notifications, asynchronous=True
+        )
+        if marker_write is not None:
+            asyncio.create_task(marker_write)
+
+    def _render_history_entries(
+        self, branch: tuple[Any, ...], rendered_notifications: list[str]
+    ) -> Iterator[None]:
+        """Render one already bounded, detached history page."""
+
         tool_calls: dict[str, ToolCall] = {}
         last_user: Message | None = None
-        prompts: list[str] = []
-        branch = self.loop.store.tui_replay_entries()
         acknowledged_notifications = {
             entry.data["notification_id"]
             for entry in branch
@@ -752,8 +744,6 @@ class CheckpointTranscriptMixin:
             if message.role is MessageRole.USER:
                 self._failed_turn = None
                 last_user = message
-                if message.metadata.get(MESSAGE_ORIGIN_METADATA) == MessageOrigin.USER:
-                    prompts.append(displayed_user_text(message))
                 self._print_user(message)
             elif message.role is MessageRole.ASSISTANT:
                 render_replayed_message(
@@ -792,7 +782,6 @@ class CheckpointTranscriptMixin:
                     provider=provider,
                 )
             yield
-        self._prompt_history.replace(self.loop.store.session_dir, prompts)
 
 
 def render_replayed_message(

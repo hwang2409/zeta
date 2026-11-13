@@ -7,10 +7,10 @@ import pytest
 from prompt_toolkit.document import Document
 from rich.text import Text
 
+from zeta.tui.session_prompt_history import SessionPromptHistory
 from zeta.tui.transcript.paged_history import (
     HistoryCursor,
     PagedTranscriptHistory,
-    SessionPromptHistory,
     TUIHistoryPage,
     TUIHistoryUnit,
     TUIPaintSegment,
@@ -27,7 +27,7 @@ class FakeSource:
     async def page(self, cursor=None, *, direction="older"):
         self.calls += 1
         self.started.set()
-        await self.release.wait()
+        await asyncio.wait_for(self.release.wait(), 10)
         number = self.calls
         return TUIHistoryPage(
             (TUIPaintSegment((TUIHistoryUnit(str(number), Text(str(number))),),),),
@@ -73,12 +73,14 @@ def test_widget_bulk_adopt_and_remove_uses_real_render_path() -> None:
 
 def test_prompt_owner_keeps_only_two_pages_and_exact_draft() -> None:
     owner = SessionPromptHistory()
-    owner.bind(Path("session"))
-    owner.append("one", "a")
-    owner.start(Document("draft", cursor_position=2))
-    assert owner.select("one") == Document("a", cursor_position=1)
-    for index in range(300):
-        owner.append(str(index), "x")
+    path = Path("session")
+    owner.bind(path)
+    owner.append(path, "a")
+    assert owner.older(path, Document("draft", cursor_position=2)) == Document(
+        "a", cursor_position=1
+    )
+    for _index in range(300):
+        owner.append(path, "x")
     assert len(owner.pages) <= 2
     owner.clear()
     assert owner.pages == ()
