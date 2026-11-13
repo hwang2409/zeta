@@ -17,11 +17,13 @@ class RetentionActivationOwner:
         *,
         wake_seconds: float = 86_400,
         sleep: Callable[[float], Any] | None = None,
+        publish: Callable[[Any], Any] | None = None,
     ) -> None:
         self._planner_factory = planner_factory
         self._days = days
         self._wake_seconds = wake_seconds
         self._sleep = sleep or asyncio.sleep
+        self._publish = publish
         self._stop = asyncio.Event()
         self._restart = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -58,6 +60,8 @@ class RetentionActivationOwner:
                 try:
                     while not self._stop.is_set() and not self._restart.is_set():
                         result = await asyncio.to_thread(getattr(planner, "run_" + "pass"), days=self._days())
+                        if self._publish is not None:
+                            await self._publish(result)
                         if not result.complete:
                             continue
                         try:

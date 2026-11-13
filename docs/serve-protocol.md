@@ -1341,6 +1341,7 @@ Event fields are:
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
+| `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1911,6 +1912,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `zeta_updated` | emits one `zeta_updated` event when the running source revision changes; revision values are opaque strings and clients must not parse them |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
+| `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
