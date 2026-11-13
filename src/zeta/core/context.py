@@ -179,7 +179,7 @@ class ContextAssembler(ContextMarkerMixin):
         """Return whether the next assembly must compact the active branch."""
         if force:
             return True
-        branch = self.store.active_branch_snapshot()
+        branch = tuple(self.store.entry(ref) for ref in self.store.branch_refs())
         items = self._visible_items(branch)
         self._track_token_counts(items)
         system_prompt = self._system_prompt_message(system_append)
@@ -723,7 +723,7 @@ class ContextAssembler(ContextMarkerMixin):
                     self._record_compaction_telemetry(plan.telemetry or {})
                     self._request_budget.reset_provider_total()
             if stale:
-                branch = list(self.store.active_branch_snapshot())
+                branch = [self.store.entry(ref) for ref in self.store.branch_refs()]
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:

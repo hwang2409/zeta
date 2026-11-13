@@ -27,6 +27,7 @@ from zeta.runtime.loop.mcp_session import MCPSession
 from zeta.server import ZetaServer
 
 SECRET = "page-secret-never-persisted"
+_REAL_ASYNC_HTTP_REQUEST = httpx.AsyncHTTPTransport.handle_async_request
 
 
 class LocalGETStream:
@@ -41,18 +42,19 @@ class LocalGETStream:
         self.writer = writer
 
     async def run(self) -> None:
-        self.writer.write(
-            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
-        )
+        response_headers = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+        if self.owner.chunked_notifications:
+            response_headers += b"transfer-encoding: chunked\r\n"
+        self.writer.write(response_headers + b"\r\n")
         await self.writer.drain()
         self.owner.notification_opened.set()
         while True:
             client_closed = asyncio.create_task(self.reader.read())
             drop = asyncio.create_task(
-                asyncio.wait_for(self.owner.drop_notification.wait(), 10)
+                asyncio.wait_for(self.owner.drop_notification.wait(), TIMEOUT)
             )
             send = asyncio.create_task(
-                asyncio.wait_for(self.owner.send_tool_change.wait(), 10)
+                asyncio.wait_for(self.owner.send_tool_change.wait(), TIMEOUT)
             )
             try:
                 done, _ = await asyncio.wait_for(
@@ -60,7 +62,7 @@ class LocalGETStream:
                         (client_closed, drop, send),
                         return_when=asyncio.FIRST_COMPLETED,
                     ),
-                    10,
+                    TIMEOUT,
                 )
                 if send in done:
                     self.owner.send_tool_change.clear()
@@ -68,7 +70,12 @@ class LocalGETStream:
                         "jsonrpc": "2.0",
                         "method": "notifications/tools/list_changed",
                     }).encode()
-                    self.writer.write(b"data: " + payload + b"\n\n")
+                    if self.owner.chunked_notifications:
+                        event = b"data:" + payload + b"\r\n\r\n"
+                        event = f"{len(event):x}\r\n".encode() + event + b"\r\n"
+                    else:
+                        event = b"data: " + payload + b"\n\n"
+                    self.writer.write(event)
                     await self.writer.drain()
                     self.owner.tool_change_sent.set()
                     continue
@@ -82,15 +89,24 @@ class LocalGETStream:
                     asyncio.gather(
                         client_closed, drop, send, return_exceptions=True
                     ),
-                    10,
+                    TIMEOUT,
                 )
 
 
 class LocalMCP:
     def __init__(
-        self, *, error_with_header: bool = False, reject_missing_auth: bool = False
+        self,
+        *,
+        error_with_header: bool = False,
+        reject_missing_auth: bool = False,
+        chunked_notifications: bool = False,
     ) -> None:
         self.headers: list[str | None] = []
+        self.get_headers: dict[str, str] = {}
+        self.chunked_notifications = chunked_notifications
+        self.include_x = False
+        self.tools_list_calls = 0
+        self.tools_refetched = asyncio.Event()
         self.methods: list[str] = []
         self.error_with_header = error_with_header
         self.reject_missing_auth = reject_missing_auth
@@ -114,9 +130,12 @@ class LocalMCP:
             raw = await reader.readuntil(b"\r\n\r\n")
             lines = raw.decode().split("\r\n")
             http_method = lines[0].split()[0]
-            headers = dict(
-                line.split(": ", 1) for line in lines[1:] if ": " in line
-            )
+            headers = {
+                name.lower(): value
+                for name, value in (
+                    line.split(": ", 1) for line in lines[1:] if ": " in line
+                )
+            }
             authorization = headers.get("authorization")
             self.headers.append(authorization)
             self.request_received.set()
@@ -135,6 +154,7 @@ class LocalMCP:
             if authorization is not None:
                 self.auth_received.set()
             if http_method == "GET":
+                self.get_headers = headers
                 self.methods.append("GET")
                 await LocalGETStream(self, reader, writer).run()
                 return
@@ -159,9 +179,25 @@ class LocalMCP:
                 await writer.drain()
                 return
             if method == "initialize":
-                result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}}
+                result = {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": True}},
+                }
             elif method == "tools/list":
-                result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}]}
+                self.tools_list_calls += 1
+                names = ["echo", "x"] if self.include_x else ["echo"]
+                result = {
+                    "tools": [
+                        {
+                            "name": name,
+                            "description": name,
+                            "inputSchema": {"type": "object"},
+                        }
+                        for name in names
+                    ]
+                }
+                if self.include_x:
+                    self.tools_refetched.set()
             elif method == "tools/call":
                 result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
             else:
@@ -183,6 +219,12 @@ class LocalMCP:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def add_tool(self) -> None:
+        await asyncio.wait_for(self.notification_opened.wait(), TIMEOUT)
+        self.include_x = True
+        self.send_tool_change.set()
+        await asyncio.wait_for(self.tool_change_sent.wait(), TIMEOUT)
 
     async def close(self) -> None:
         assert self.server is not None
@@ -565,6 +607,99 @@ async def test_http_list_changed_refreshes_next_turn_catalog(
         mcp.notification_release.set()
         await server.close()
         await mcp.aclose()
+
+
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
+@pytest.mark.asyncio
+async def test_socket_http_list_changed_refreshes_next_turn_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound: bool,
+) -> None:
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport,
+        "handle_async_request",
+        _REAL_ASYNC_HTTP_REQUEST,
+    )
+    mcp = LocalMCP(chunked_notifications=True)
+    port = await mcp.start()
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "page": {
+                        "transport": "streamable-http",
+                        "url": f"http://127.0.0.1:{port}",
+                        **(
+                            {}
+                            if bound
+                            else {"headers": {"Authorization": f"Bearer {SECRET}"}}
+                        ),
+                    }
+                }
+            }
+        )
+    )
+    backend = FakeBackend(
+        [
+            ScriptedTurn(content=[TextContent("first")]),
+            ScriptedTurn(content=[TextContent("second")]),
+        ]
+    )
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {
+                "protocol_version": "1.2",
+                "features": ["session_mcp_bindings"],
+            },
+        )
+        new_session: dict[str, Any] = {"provider": "codex"}
+        if bound:
+            new_session["mcp_bindings"] = [
+                {
+                    "server": "page",
+                    "headers": {"Authorization": f"Bearer {SECRET}"},
+                }
+            ]
+        await _request(reader, writer, 2, "new_session", new_session)
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await _event(reader, "agent_end")
+        first_names = {schema["name"] for schema in backend.calls[0][1]}
+        assert "page__echo" in first_names
+        assert mcp.get_headers["mcp-session-id"] == "local-session"
+        assert mcp.get_headers["accept"] == "text/event-stream"
+        assert mcp.get_headers["authorization"] == f"Bearer {SECRET}"
+
+        await mcp.add_tool()
+        try:
+            await asyncio.wait_for(mcp.tools_refetched.wait(), 10)
+        except TimeoutError:
+            pass
+        assert mcp.tools_list_calls == 2, "GET notification did not trigger tools/list"
+
+        await _request(reader, writer, 4, "send", {"text": "second"})
+        await _event(reader, "agent_end")
+        second_names = {schema["name"] for schema in backend.calls[1][1]}
+        assert "page__x" in second_names
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
 
 
 @pytest.mark.asyncio

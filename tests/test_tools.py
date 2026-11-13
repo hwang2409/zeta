@@ -22,6 +22,7 @@ import zeta.tools._shared.tool_spawn as tool_spawn_module
 import zeta.tools.bash as bash_module
 import zeta.tools.read as read_module
 import zeta.tools.write as write_module
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.processes import read_pid_file, wait_pid_exited
@@ -302,8 +303,9 @@ async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path
         ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
     )
 
+    max_niceness = 20 if sys.platform == "darwin" else 19
     assert int(result["structuredContent"]["stdout"]) == min(
-        19, parent_niceness + 10
+        max_niceness, parent_niceness + 10
     )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
@@ -2229,7 +2231,7 @@ async def test_agent_loop_executes_tool_calls_through_registry(tmp_path: Path) -
         async for event in AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty()).run_turn("read it", origin=MessageOrigin.USER)
     ]
 
-    result_message = store.messages()[2]
+    result_message = branch_messages(store)[2]
     assert result_message.role is MessageRole.TOOL_RESULT
     assert result_message.tool_result is not None
     assert result_message.tool_result.content == "from registry"
@@ -2275,7 +2277,7 @@ skill_catalog=SkillCatalog.empty(),
         ).run_turn("go", origin=MessageOrigin.USER)
     ]
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None and result.is_error
     assert "invalid arguments" in result.content
     assert not called
@@ -2305,7 +2307,7 @@ skill_catalog=SkillCatalog.empty(),
         )
     )
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result.content == "unknown tool: bash"
     assert result.is_error
@@ -2329,7 +2331,7 @@ async def test_agent_loop_keeps_boundary_abort_for_pending_tools(tmp_path: Path)
             registry.abort()
             aborted = True
 
-    result = store.messages()[2].tool_result
+    result = branch_messages(store)[2].tool_result
     assert result is not None
     assert result == ToolResult("call-1", "tool execution canceled", True)
 
@@ -2362,7 +2364,7 @@ async def test_agent_loop_refreshes_abort_signal_each_turn(tmp_path: Path) -> No
         AgentLoop(backend, store, tools={"step": step}, skill_catalog=SkillCatalog.empty())
     )
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert [result.content for result in results] == [
         "abort",
         "tool execution canceled",
@@ -2393,12 +2395,12 @@ async def test_registry_abort_cancels_loop_batch_and_next_tool(tmp_path: Path) -
 
     registry = ToolRegistry(tmp_path, pre_execute_hook=hook, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(_collect_loop(AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     await asyncio.sleep(0.05)
     registry.abort()
-    await task
+    await asyncio.wait_for(task, 10)
 
-    results = [message.tool_result for message in store.messages() if message.tool_result]
+    results = [message.tool_result for message in branch_messages(store) if message.tool_result]
     assert [result.content for result in results] == [
         "tool execution canceled",
         "tool execution canceled",
@@ -2815,8 +2817,9 @@ async def test_run_background_lowers_child_priority_without_changing_parent(
         ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
     )
 
+    max_niceness = 20 if sys.platform == "darwin" else 19
     assert int(output["structuredContent"]["output"]) == min(
-        19, parent_niceness + 10
+        max_niceness, parent_niceness + 10
     )
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()

@@ -768,8 +768,7 @@ async def test_sse_cleanup_failure_still_releases_reservation(
     value = "x" * 40
 
     class BrokenResponse:
-        async def aiter_bytes(self, *, chunk_size: int):
-            assert chunk_size == 65_536
+        async def aiter_bytes(self):
             yield b"data: " + json.dumps({"value": value}).encode()
             raise OSError("injected stream failure")
 

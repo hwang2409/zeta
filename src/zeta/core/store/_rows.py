@@ -6,7 +6,12 @@ import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
-from ...protocol.types import Message, is_passive_harness_message
+from ...protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    is_passive_harness_message,
+)
 from ..checkpoints import ConversationEntry, ConversationIntegrityError
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
@@ -18,6 +23,16 @@ class ContextCalibrationRecord:
     ratio: float | None = None
     estimate: int | None = None
     actual: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageFacts:
+    calibration: ContextCalibrationRecord | None
+    receipts: tuple[tuple[str, str], ...]
+    approval_request_ids: tuple[str, ...]
+    is_user: bool
+    is_user_forkpoint: bool
+    message_preview: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,18 +102,35 @@ class StartupFactsMixin:
         return tuple(self._sent_message_receipts)
 
     def context_calibration_records(self) -> tuple[ContextCalibrationRecord, ...]:
-        return tuple(
-            record
-            for entry in self._active_branch()
-            if (record := context_calibration_record(entry)) is not None
-        )
+        records: list[ContextCalibrationRecord] = []
+        for ref in self._resident_rows.branch_refs():
+            facts = ref.facts
+            if isinstance(facts, MessageFacts) and facts.calibration is not None:
+                records.append(facts.calibration)
+        return tuple(records)
+
+
+def _message_facts(entry: ConversationEntry) -> MessageFacts:
+    message = Message.from_dict(entry.data["message"])
+    is_user = message.role is MessageRole.USER
+    text = " ".join(
+        block.text.strip()
+        for block in message.content
+        if isinstance(block, TextContent) and block.text.strip()
+    )
+    return MessageFacts(
+        context_calibration_record(entry),
+        sent_message_receipts(entry),
+        tuple(request["request_id"] for request in entry.data.get("approval_requests", ())),
+        is_user,
+        is_user and not is_passive_harness_message(message),
+        " ".join(text.split())[:48] if text else None,
+    )
 
 
 def row_facts(entry: ConversationEntry) -> object | None:
     if entry.type == "message":
-        calibration = context_calibration_record(entry)
-        receipts = sent_message_receipts(entry)
-        return (calibration, receipts) if calibration is not None or receipts else None
+        return _message_facts(entry)
     if entry.type == "compaction":
         data = entry.data
         return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))
@@ -114,13 +146,18 @@ class ResidentRows:
     def __init__(self, entries: Iterable[ConversationEntry] = ()) -> None:
         self.entries: list[ConversationEntry] = []
         self.rows: list[RowRef] = []
+        self._by_id: dict[str, ConversationEntry] = {}
+        self._rows_by_id: dict[str, RowRef] = {}
         self.branch: list[ConversationEntry] = []
         self.replace(entries)
 
     def append(self, entry: ConversationEntry) -> None:
         previous = self.entries[-1] if self.entries else None
         self.entries.append(entry)
-        self.rows.append(RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry)))
+        self._by_id[entry.id] = entry
+        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry))
+        self.rows.append(row)
+        self._rows_by_id[entry.id] = row
         if (previous is None and entry.parent_id is None) or (
             previous is not None and entry.parent_id == previous.id
         ):
@@ -134,10 +171,13 @@ class ResidentRows:
             return
         previous = self.entries[-1] if self.entries else None
         self.entries.extend(additions)
-        self.rows.extend(
+        self._by_id.update((entry.id, entry) for entry in additions)
+        new_rows = [
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in additions
-        )
+        ]
+        self.rows.extend(new_rows)
+        self._rows_by_id.update((row.id, row) for row in new_rows)
         parent = previous.id if previous is not None else None
         linear = True
         for entry in additions:
@@ -153,6 +193,8 @@ class ResidentRows:
     def truncate_to(self, length: int) -> None:
         del self.entries[length:]
         del self.rows[length:]
+        self._by_id = {entry.id: entry for entry in self.entries}
+        self._rows_by_id = {row.id: row for row in self.rows}
         self._rebuild_branch()
 
     @classmethod
@@ -163,6 +205,8 @@ class ResidentRows:
             RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
             for e in rows.entries
         ]
+        rows._by_id = {entry.id: entry for entry in rows.entries}
+        rows._rows_by_id = {row.id: row for row in rows.rows}
         rows._rebuild_branch()
         return rows
 
@@ -170,10 +214,11 @@ class ResidentRows:
         prepared = type(self).prepared(entries)
         self.entries = prepared.entries
         self.rows = prepared.rows
+        self._by_id = prepared._by_id
+        self._rows_by_id = prepared._rows_by_id
         self.branch = prepared.branch
 
     def _rebuild_branch(self) -> None:
-        by_id = {self.entries[index].id: self.entries[index] for index in range(len(self.entries))}
         current = self.entries[-1] if self.entries else None
         branch: list[ConversationEntry] = []
         seen: set[str] = set()
@@ -182,14 +227,26 @@ class ResidentRows:
                 raise ConversationIntegrityError(f"conversation parent cycle at {current.id}")
             seen.add(current.id)
             branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
+            current = self._by_id.get(current.parent_id) if current.parent_id else None
         self.branch = list(reversed(branch))
 
+    def branch_refs(self) -> tuple[RowRef, ...]:
+        return tuple(self._rows_by_id[entry.id] for entry in self.branch)
+
+    def resident_refs(self) -> tuple[RowRef, ...]:
+        return tuple(self.rows)
+
+    def last_message_ref(self) -> RowRef | None:
+        return next(
+            (ref for ref in reversed(self.branch_refs()) if ref.type == "message"),
+            None,
+        )
+
     def entry(self, ref: RowRef) -> ConversationEntry:
-        for entry in self.entries:
-            if entry.seq == ref.seq and entry.id == ref.id:
-                return entry
-        raise KeyError(ref.seq)
+        entry = self._by_id.get(ref.id)
+        if entry is None or entry.seq != ref.seq:
+            raise KeyError(ref.seq)
+        return entry
 
     def stream_rows(self, refs: Iterable[RowRef], *, batch: int = 256) -> Iterator[ConversationEntry]:
         del batch

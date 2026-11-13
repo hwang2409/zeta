@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.background_lifecycle import recover_agent_children
@@ -86,7 +87,7 @@ async def test_corrupt_child_stays_unavailable_until_tui_repair_then_reopens(
                 MessageOrigin.USER,
             )
         )
-        assert [message.content[0].text for message in reopened.messages()] == [
+        assert [message.content[0].text for message in branch_messages(reopened)] == [
             "retained",
             "usable",
         ]

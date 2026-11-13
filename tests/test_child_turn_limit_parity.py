@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.text import Text
 
 import zeta.agent.runner as agent_runner_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import owned_app
 from zeta.agent.presets import AgentPreset
@@ -166,7 +167,7 @@ async def _unset_child_snapshot(
             rendered = Text.from_ansi(tui_output.getvalue()).plain
             serve_rows = [
                 row
-                for entry in store.replay()
+                for entry in branch_entries(store)
                 if entry.type in {"message", "notification"}
                 for row in _history_entry_rows(entry, {}, fidelity=True)
             ]
@@ -182,7 +183,7 @@ async def _unset_child_snapshot(
                     if message.tool_result is not None
                     else None,
                 }
-                for message in child.messages()
+                for message in branch_messages(child)
             ]
             def stable(value: object) -> object:
                 text = json.dumps(value)
@@ -241,7 +242,7 @@ async def _unset_child_snapshot(
                 },
                 "notice_count": sum(
                     message.metadata.get("zeta_event") == "child_turn_limit"
-                    for message in child.messages()
+                    for message in branch_messages(child)
                 ),
                 "marker": "[zeta:turn-limit" in result.content,
                 "handoff": (child_path / "turn-limit-handoff.md").exists(),

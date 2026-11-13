@@ -1,3 +1,4 @@
+from tests.support.branch_reads import branch_entries, branch_messages
 from zeta.providers.completion import owned_completion
 from zeta.skills import SkillCatalog
 
@@ -377,14 +378,14 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
 
     await app._handle_prompt_value("please $review this branch")
     assert app._active_task is not None
-    await app._active_task
+    await asyncio.wait_for(app._active_task, 10)
 
     expected = "review body\n\nUser request:\nplease $review this branch"
     sent = next(
         message for message in backend.calls[0][0] if message.role is MessageRole.USER
     )
     persisted = next(
-        message for message in store.messages() if message.role is MessageRole.USER
+        message for message in branch_messages(store) if message.role is MessageRole.USER
     )
     assert sent.content[0].text == expected
     assert persisted.content[0].text == expected
@@ -1377,7 +1378,7 @@ def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
         source[-1].seq,
     )
 
-    history = compaction_history(store.replay(), token_count)
+    history = compaction_history(branch_entries(store), token_count)
 
     assert history == (CompactionSummary(2, 4, 32),)
 
@@ -1417,7 +1418,7 @@ def test_repeated_compaction_counts_only_new_source_entries(tmp_path: Path) -> N
         replaces=[first_marker.id],
     )
 
-    history = compaction_history(store.replay(), token_count)
+    history = compaction_history(branch_entries(store), token_count)
 
     assert history[0] == CompactionSummary(1, 2, 14)
     assert history[1] == CompactionSummary(3, 4, 36)

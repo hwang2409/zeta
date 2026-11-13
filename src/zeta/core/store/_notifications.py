@@ -54,7 +54,7 @@ class NotificationStateMixin:
         return next(
             (
                 self._snapshot_entry(entry)
-                for entry in reversed(self._entries)
+                for entry in reversed(self._resident_rows.entries)
                 if entry.type == "notification"
                 and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
                 and entry.data.get("task_id") == task_id
@@ -438,7 +438,8 @@ class NotificationStateMixin:
     def tui_replay_entries(self: ConversationStore) -> tuple[TUIReplayEntry, ...]:
         """Project the active branch into detached data needed by TUI replay."""
         projected: list[TUIReplayEntry] = []
-        for entry in self._active_branch():
+        for ref in self.branch_refs():
+            entry = self.entry(ref)
             message = None
             if entry.type == "message":
                 parsed = Message.from_dict(entry.data["message"])
@@ -502,7 +503,9 @@ class NotificationStateMixin:
             self._delivery_fold.active_notifications.values()
             if pending_only
             else (
-                entry for entry in self._active_branch() if entry.type == "notification"
+                self.entry(ref)
+                for ref in self.branch_refs()
+                if ref.type == "notification"
             )
         )
         return [
