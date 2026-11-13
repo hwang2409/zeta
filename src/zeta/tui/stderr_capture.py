@@ -54,39 +54,37 @@ def _retain_logs(directory: Path) -> None:
                 os.close(fd)
         except OSError:
             continue
+    candidates: list[tuple[Path, os.stat_result]] = []
     try:
-        files = sorted(directory.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
+        for path in directory.glob("*.log"):
+            try:
+                candidates.append((path, os.stat(path, follow_symlinks=False)))
+            except OSError:
+                continue
     except OSError:
         return
-    retained: list[tuple[Path, int, int]] = []
-    for path in files:
+    candidates.sort(key=lambda item: item[1].st_mtime_ns)
+    total = sum(stat.st_size for _, stat in candidates)
+    if total <= _TUI_STDERR_MAX_BYTES:
+        return
+    for path, candidate in candidates:
+        if total <= _TUI_STDERR_MAX_BYTES:
+            break
         fd: int | None = None
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            retained.append((path, os.fstat(fd).st_size, fd))
-        except OSError:
-            if fd is not None:
-                os.close(fd)
-            continue
-    total = sum(size for _, size, _ in retained)
-    for path, size, fd in retained:
-        try:
-            if total <= _TUI_STDERR_MAX_BYTES:
-                continue
             locked = os.fstat(fd)
-            try:
-                current = os.stat(path, follow_symlinks=False)
-            except OSError:
-                continue
+            current = os.stat(path, follow_symlinks=False)
             if (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino):
                 continue
             os.unlink(path)
-            total -= size
+            total -= candidate.st_size
         except OSError:
-            pass
+            continue
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
 
 def _open_capture(path: Path) -> int:

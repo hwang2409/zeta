@@ -387,6 +387,41 @@ def test_completed_log_retention_holds_lock_until_unlink(tmp_path: Path, monkeyp
     assert live.exists()
 
 
+def test_completed_log_retention_holds_at_most_one_fd(tmp_path: Path, monkeypatch) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    for index in range(250):
+        path = directory / f"{index:03d}.log"
+        with path.open("wb") as file:
+            file.truncate(1024 * 1024)
+        os.utime(path, (index + 1, index + 1))
+
+    original_open = capture.os.open
+    original_close = capture.os.close
+    open_fds: set[int] = set()
+    peak = 0
+
+    def track_open(path, flags, mode=0o777):
+        nonlocal peak
+        fd = original_open(path, flags, mode)
+        if str(path).endswith(".log"):
+            open_fds.add(fd)
+            peak = max(peak, len(open_fds))
+        return fd
+
+    def track_close(fd: int) -> None:
+        open_fds.discard(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(capture.os, "open", track_open)
+    monkeypatch.setattr(capture.os, "close", track_close)
+    capture._retain_logs(directory)
+    assert peak == 1
+    assert not open_fds
+
+
 def test_retention_skips_replaced_path(tmp_path: Path, monkeypatch) -> None:
     import zeta.tui.stderr_capture as capture
 
