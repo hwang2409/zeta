@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable
 
 from ...protocol.types import ToolCall
 from .approval_grants import ApprovalKey
@@ -21,17 +21,16 @@ class ApprovalResumeOwner:
     def mark_mcp_reconnect(
         self,
         keys: Iterable[ApprovalKey],
-        servers: Mapping[str, object],
+        mcp_tool_names: Collection[str],
         approval_state: ApprovalState,
     ) -> None:
         session_id = self._session_id()
-        prefixes = tuple(f"{server}__" for server in servers)
         self._mcp_reconnect = {
             (session_id, key)
             for key in keys
             if isinstance(key, str)
             and (state := approval_state(key)) is not None
-            and state[0].name.startswith(prefixes)
+            and state[0].name in mcp_tool_names
         }
 
     def should_resume(

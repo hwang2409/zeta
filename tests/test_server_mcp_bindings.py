@@ -934,7 +934,7 @@ async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
     allow_local_http(monkeypatch)
     project = tmp_path / "project"
     project.mkdir()
-    marker = tmp_path / "bash-runs"
+    marker = tmp_path / "host-runs"
     mcp = LocalMCP()
     port = await mcp.start()
     (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
@@ -942,12 +942,8 @@ async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
     }}}))
     backend = FakeBackend([
         ScriptedTurn(content=[TextContent("mounted")]),
-        ScriptedTurn(tool_calls=[ToolCall(
-            "bash-call",
-            "bash",
-            {"command": f"printf 'run\\n' >> {shlex.quote(str(marker))}"},
-        )]),
-        ScriptedTurn(content=[TextContent("bash done")]),
+        ScriptedTurn(tool_calls=[ToolCall("host-call", "page__x", {})]),
+        ScriptedTurn(content=[TextContent("host done")]),
         ScriptedTurn(tool_calls=[ToolCall("page-call", "page__echo", {})]),
         ScriptedTurn(content=[TextContent("mcp done")]),
     ])
@@ -977,8 +973,14 @@ async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
         await _request(reader, writer, 3, "send", {"text": "warm"})
         await _event(reader, "agent_end")
 
-        await _request(reader, writer, 4, "send", {"text": "run bash"})
-        bash_approval = await _event(reader, "approval_request")
+        async def host_tool(arguments: dict[str, object], abort_signal: object) -> str:
+            marker.write_text(marker.read_text() + "run\n" if marker.exists() else "run\n")
+            return "ok"
+
+        assert server.runtime.loop is not None
+        server.runtime.loop.tool_registry.register("page__x", host_tool)
+        await _request(reader, writer, 4, "send", {"text": "run host tool"})
+        host_approval = await _event(reader, "approval_request")
         writer.close()
         await writer.wait_closed()
         await _wait_for_controller_release(server)
@@ -992,7 +994,7 @@ async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
             "mcp_bindings": [binding],
         })
         allowed = await _request(reader2, writer2, 6, "approve", {
-            "request_id": bash_approval["request_id"]
+            "request_id": host_approval["request_id"]
         })
         assert "error" not in allowed[-1]
         await _event(reader2, "agent_end")

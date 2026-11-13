@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time  # noqa: F401 - kept as the monkey-patch seam for tests
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
@@ -163,6 +163,18 @@ class MCPMount:
             abort_signal or AbortSignal(),
             generation=actor.generation,
         )
+
+    def owned_tool_names(self, servers: Iterable[str]) -> set[str]:
+        """Return registered definitions owned by the selected server actors."""
+
+        if self.registry is None:
+            return set()
+        return {
+            tool
+            for server in servers
+            if (actor := self._actors.get(server)) is not None
+            for tool in self.registry.mcp_owned_names(actor)
+        }
 
     def client_for(self, name: str) -> MCPClient | None:
         """Return the live client for non-tool operations."""
