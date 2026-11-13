@@ -10,7 +10,6 @@ tests/test_server.py::test_canceled_write_to_stalled_client_aborts_within_grace:
 tests/test_server.py::test_foreground_aborts_after_notification_retry_report_idle::590301b1abee1a0d::1
 tests/test_server.py::test_notification_presentation_retries_after_cancel_before_write::b38280a1ad3fcaee::1
 tests/test_server.py::test_reconnect_runs_pending_notification_turn_once::16214b547694a729::1
-tests/test_server.py::test_send_immediately_after_reconnect_does_not_steal_wake_turn::a1f9377620efdbaf::1
 tests/test_server_process.py::_connect_ready::d338aec8cb07492d::1
 tests/test_session_shutdown.py::test_closed_tui_drops_pending_paste_callbacks_without_gc::2560082da49342c3::1
 tests/test_tui.py::ticker::4a2db75abb42a587::1
