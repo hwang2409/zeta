@@ -720,7 +720,10 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
             ValueError,
         ) as exc:
             logger.warning(
-                "project session linkage remains pending for %s: %s", session_id, exc
+                "project session linkage remains pending for %s (%s): %s",
+                session_id,
+                type(exc).__name__,
+                exc,
             )
 
     def _reconcile_child_links(
