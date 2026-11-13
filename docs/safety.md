@@ -22,7 +22,12 @@ available. Tool policy is separate from approval policy: an allowed tool can
 still require approval.
 
 Settings can define `tools` and `disallowed_tools` in `~/.zeta/settings.toml`
-and in a project `.zeta/settings.toml`. Project allowlists are cumulative with
+and in a project `.zeta/settings.toml`. Retention uses a global-only setting:
+`[retention]` with `days = 30` by default. The value must be an integer from 0
+through 3650; `0` disables retention. A project-layer `[retention]` table is
+ignored. Pin and unpin remain separate from retention activation.
+
+Project allowlists are cumulative with
 the global allowlist, and project denylists add to the global denylist. A
 project cannot widen the global approval or execution settings. CLI policy
 flags are trusted invocation overrides. On resume, the saved and current

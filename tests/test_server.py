@@ -78,6 +78,7 @@ from zeta.attention_records import AttentionStore
 from zeta.config.settings import SettingsError
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.session import SessionManager, SessionMetadata, persist_metadata_change
+from zeta.core.session_files import read_reference_generation
 from zeta.core.slash import compaction_history as original_history
 from zeta.core.store import (
     ConversationEntry,
@@ -137,6 +138,7 @@ from zeta.server.protocol import (
 )
 from zeta.server.server import _Client
 from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
+from zeta.session_retention.pin import RETENTION_PIN_FILENAME
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
@@ -8836,6 +8838,72 @@ async def test_session_swap_project_registry_frames(
             }
         else:
             assert [frame.get("id") for frame in frames] == [2, 3]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_retention_pin_table_uses_public_slash_run(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        for text, expected, generation in (
+            ("/pin", "session pinned", 1),
+            ("/pin", "session pinned", 1),
+            ("/unpin", "session unpinned", 2),
+            ("/unpin", "session unpinned", 2),
+            ("/pin extra", "usage: /pin", 2),
+        ):
+            response = await _request(
+                reader, writer, text, "slash_run", {"session_id": session_id, "text": text}
+            )
+            assert response[-1]["result"] == {"kind": "output", "output": expected}
+            assert read_reference_generation(server.home) == generation
+        sidecar = server.home / "sessions" / session_id / RETENTION_PIN_FILENAME
+        assert not sidecar.exists()
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_retention_pin_unsafe_sidecar_fails_closed(tmp_path: Path) -> None:
+    server = ZetaServer(home=tmp_path / "home", cwd=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        sidecar = server.home / "sessions" / session_id / RETENTION_PIN_FILENAME
+        sidecar.write_bytes(b"unsafe")
+        before = read_reference_generation(server.home)
+        response = await _request(
+            reader, writer, "unsafe", "slash_run", {"session_id": session_id, "text": "/unpin"}
+        )
+        assert response[-1]["result"] == {
+            "kind": "output",
+            "output": "retention pin unsafe: refusing change",
+        }
+        assert sidecar.read_bytes() == b"unsafe"
+        assert read_reference_generation(server.home) == before
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_slash_run_rejects_pin_mutation_below_retention_epoch(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "storage-format.json").write_text('{"writer_epoch":7}\\n')
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    try:
+        response = await _request(
+            reader, writer, "old", "slash_run", {"session_id": session_id, "text": "/pin"}
+        )
+        assert response[-1]["result"] == {
+            "kind": "output",
+            "output": "retention pins unavailable: upgrade the home before pinning",
+        }
+        assert not (server.home / RETENTION_PIN_FILENAME).exists()
+        assert not (server.home / "session-reference-generation").exists()
+        assert not (server.home / ".domain-locks").exists()
     finally:
         await close_serve(server, writer)
 

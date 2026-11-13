@@ -78,16 +78,58 @@ def set_retention_pin(
     """Pin or unpin one root in one off-loop reference transaction."""
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
         return "retention pins unavailable: upgrade the home before pinning"
+    root = Path(home)
     with reference_publication(
-        Path(home), lease, installed_ids=(session_id,)
-    ), session_directory(
-        Path(home) / "sessions", session_id, lifetime=True
+        root, lease, referenced_ids=(session_id,)
+    ) as authority, session_directory(
+        root / "sessions", session_id, lifetime=True
     ) as (_root_fd, session_fd):
+        sidecar_exists = _sidecar_exists(session_fd)
+        current = is_retention_pinned(session_fd)
+        # Any present unsafe sidecar is conservatively pinned. Never replace
+        # or remove it through a public operation.
+        if sidecar_exists and not _safe_sidecar(session_fd):
+            return "retention pin unsafe: refusing change"
+        if sidecar_exists and current:
+            return "session pinned" if pinned else "session unpinned"
+        authority.gate.bump_generation()
         if pinned:
             write_retention_pin(session_fd)
             return "session pinned"
         remove_retention_pin(session_fd)
         return "session unpinned"
+
+
+def _sidecar_exists(directory_fd: int) -> bool:
+    try:
+        os.stat(RETENTION_PIN_FILENAME, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _safe_sidecar(directory_fd: int) -> bool:
+    fd = -1
+    try:
+        fd = open_session_file(directory_fd, RETENTION_PIN_FILENAME, os.O_RDONLY)
+        info = os.fstat(fd)
+        if (
+            info.st_size > _MAX_PIN_BYTES
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            return False
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            return stream.read(_MAX_PIN_BYTES + 1) == _PIN_DATA
+    except (OSError, SessionError):
+        return False
+    finally:
+        if fd != -1:
+            os.close(fd)
 
 
 class _PinEntryScan:

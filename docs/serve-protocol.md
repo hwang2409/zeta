@@ -1815,7 +1815,9 @@ The shared slash registry has this order and surface availability:
 | `name` | no | name the current session for the picker |
 | `project` | yes | show or initialize the current project |
 | `inbox` | yes | list this project's inbox |
-| `memory` | yes | show, retry, or undo automatic memory updates |
+| `memory` | yes | show, retry, or undo automatic memory
+| `pin` | yes | pin the attached root session
+| `unpin` | yes | unpin the attached root session updates |
 | `repair-transcript` | yes | repair one corrupt transcript: `/repair-transcript <session> confirm` |
 | `theme` | no | list themes or switch the active theme |
 | `runs` | no | list live agent runs |
