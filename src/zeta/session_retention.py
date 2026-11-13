@@ -39,6 +39,8 @@ from .core.session_files import (
 )
 from .core.session_links import valid_child_pending_link, valid_pending_link
 from .core.todo import parse_todo_items
+from .core.transcript_recovery import RepairTarget, classify_recovery_records
+from .memory.reconciliation_state import classify_reconciliation_records
 from .project_inbox import InboxError, validate_inbox_record
 from .project_inbox_sent import SentMessageTracker, _Broken, _Loaded
 from .storage_format import (
@@ -641,6 +643,7 @@ class _ClosureAuthority:
         self.flight = flight
         self.sweep = sweep
         self.scan = scan
+        self._store_names = None
 
     def classify(self) -> str | None:
         root_id = self.flight.root_id
@@ -653,6 +656,12 @@ class _ClosureAuthority:
         checks = (
             lambda: "session is being deleted" if _reservation_present(self.home_fd, root_id, self.scan) else None,
             lambda: _authority_store_reason(self.flight, self.scan),
+            lambda: _authority_transcript_recovery_reason(
+                self.flight, self._names_by_store()
+            ),
+            lambda: _authority_memory_reconciliation_reason(
+                self.flight, self._names_by_store()
+            ),
             lambda: self.planner._authority_sent_reason(self.flight, self.scan),
             lambda: "pinned" if self.planner._pinned(self.sessions_fd, self.flight.root_fd, root_id, self.scan) else None,
             lambda: _authority_inbox_reason(self.home_fd, ids, self.scan),
@@ -665,6 +674,18 @@ class _ClosureAuthority:
         if _generation_value(self.planner.home, self.scan) != generation:
             return "references changed during scan"
         return None
+
+    def _names_by_store(self):
+        if self._store_names is None:
+            stores = []
+            for comps in self.flight.store_dirs:
+                with (
+                    _descend(self.flight.root_fd, comps) as dfd,
+                    self.scan.iter_entries(dfd) as entries,
+                ):
+                    stores.append((comps, [entry.name for entry in entries]))
+            self._store_names = stores
+        return self._store_names
 
 
 _descend = descend_directory
@@ -814,6 +835,60 @@ def _sent_file_reason(directory_fd, scan) -> str | None:
     for record in state.records:
         if "done" not in record["reported"]:
             return "unacknowledged sent message"
+    return None
+
+
+def _authority_transcript_recovery_reason(
+    flight: _InFlight, stores
+) -> str | None:
+    for comps, names in stores:
+        with _descend(flight.root_fd, comps) as dfd:
+            child = ":".join(part for part in comps if part != _AGENTS_DIRNAME)
+            target = RepairTarget(
+                flight.root_id, f"{flight.root_id}:{child}" if child else None
+            )
+            try:
+                if classify_recovery_records(dfd, target, names):
+                    return "unresolved transcript recovery"
+            except (OSError, SessionError, ValueError) as exc:
+                raise RetentionPlannerError("broken transcript recovery") from exc
+    return None
+
+
+def _read_authority_bytes(directory_fd: int, name: str) -> bytes | None:
+    try:
+        fd = open_session_file(directory_fd, name, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except (OSError, SessionError) as exc:
+        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            return stream.read()
+    except OSError as exc:
+        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _authority_memory_reconciliation_reason(
+    flight: _InFlight, stores
+) -> str | None:
+    for comps, store_names in stores:
+        names = set(store_names)
+        with _descend(flight.root_fd, comps) as dfd:
+            cursor = (
+                _read_authority_bytes(dfd, "memory-reconcile.json")
+                if "memory-reconcile.json" in names else None
+            )
+            receipts = (
+                _read_authority_bytes(dfd, "memory-reconcile-receipts.jsonl")
+                if "memory-reconcile-receipts.jsonl" in names else None
+            )
+            if classify_reconciliation_records(cursor, receipts):
+                return "unresolved memory reconciliation"
     return None
 
 

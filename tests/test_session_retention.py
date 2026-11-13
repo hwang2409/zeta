@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -14,6 +15,7 @@ import pytest
 from zeta import session_retention
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.session_files import SessionError, session_root
+from zeta.core.transcript_recovery import EvidenceManifest, RecoveryRecord, RepairTarget
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.session_retention import (
     RETENTION_PIN_FILENAME,
@@ -553,6 +555,8 @@ _MATRIX_KINDS = (
     "pending_child_link", "sent_root", "inbox", "dependent_meta",
     "dependent_fork", "source_attention", "child_sent", "child_inbox",
     "pin", "age", "generation", "discovery", "walk",
+    "transcript_recovery", "child_transcript_recovery",
+    "memory_reconciliation", "child_memory_reconciliation",
 )
 _MATRIX_MODES = ("absent", "present", "malformed")
 _MATRIX_ROWS = [(kind, mode) for kind in _MATRIX_KINDS for mode in _MATRIX_MODES]
@@ -678,9 +682,54 @@ def _setup_dependent(manager, stack, home, root, kind, mode):
         (attention / name).write_text(json.dumps(value))
 
 
+def _write_recovery_state(directory, target, mode):
+    quarantine_id = "a" * 32
+    if mode == "malformed":
+        (directory / f"conversation.recovery.{quarantine_id}.json").write_text("{")
+        return
+    payload = b"quarantined transcript\n"
+    source_digest = hashlib.sha256(payload).hexdigest()
+    repaired_digest = "b" * 64
+    manifest = EvidenceManifest(
+        quarantine_id, target, source_digest, len(payload), 2, 0, 0, 0,
+        repaired_digest, _OLD, source_digest, len(payload),
+    )
+    record = RecoveryRecord(
+        quarantine_id, target, "committed", source_digest, repaired_digest, 0,
+        _OLD, "review_pending" if mode == "present" else "not_required",
+    )
+    (directory / f"conversation.quarantine.{quarantine_id}.jsonl").write_bytes(payload)
+    (directory / f"conversation.quarantine.{quarantine_id}.json").write_text(
+        json.dumps(manifest.to_dict())
+    )
+    (directory / f"conversation.recovery.{quarantine_id}.json").write_text(
+        json.dumps(record.to_dict())
+    )
+
+
+def _write_reconciliation_state(directory, mode):
+    cursor = {} if mode == "absent" else {"recovery_paused": True}
+    (directory / "memory-reconcile.json").write_text(
+        "{" if mode == "malformed" else json.dumps(cursor)
+    )
+    receipt = {
+        "key": "terminal", "seq_start": 1, "seq_end": 1,
+        "attempt_count": 3, "validation_summary": "failed", "occurred_at": _OLD,
+    }
+    (directory / "memory-reconcile-receipts.jsonl").write_text(
+        json.dumps(receipt) + "\n"
+    )
+
+
 def _setup_child_authority(home, root, root_dir, kind, mode):
     state = "running" if kind == "child_lifecycle" and mode == "present" else "completed"
     child = _child_store(root_dir, state)
+    if kind == "child_transcript_recovery":
+        _write_recovery_state(child, RepairTarget(root, f"{root}:1"), mode)
+        return
+    if kind == "child_memory_reconciliation":
+        _write_reconciliation_state(child, mode)
+        return
     if kind == "child_lifecycle":
         if mode == "malformed":
             (child / "agent_lifecycle.json").write_text('{"state":"completed"}')
@@ -707,10 +756,17 @@ def _setup_authority(tmp_path, manager, stack, root, kind, mode):
         _setup_reservation(tmp_path, root, mode)
     elif kind == "session_state":
         _setup_session_state(root_dir, mode)
-    elif kind in {"child_lifecycle", "child_sent", "child_inbox"}:
+    elif kind in {
+        "child_lifecycle", "child_sent", "child_inbox",
+        "child_transcript_recovery", "child_memory_reconciliation",
+    }:
         _setup_child_authority(tmp_path, root, root_dir, kind, mode)
     elif kind in {"pending_link", "pending_child_link"}:
         _setup_pending(root_dir, root, kind, mode)
+    elif kind == "transcript_recovery":
+        _write_recovery_state(root_dir, RepairTarget(root), mode)
+    elif kind == "memory_reconciliation":
+        _write_reconciliation_state(root_dir, mode)
     elif kind == "sent_root":
         reported = ["done"] if mode == "absent" else ["claimed"]
         _write_sent_ledger(tmp_path, root, reported)
@@ -912,6 +968,10 @@ _DEADLINE_TARGETS = {
     "generation": ("_generation_value", None),
     "discovery": ("_next_root", None),
     "walk": ("_walk", None),
+    "transcript_recovery": ("_names_by_store", None),
+    "child_transcript_recovery": ("_names_by_store", None),
+    "memory_reconciliation": ("_names_by_store", None),
+    "child_memory_reconciliation": ("_names_by_store", None),
 }
 
 
@@ -983,7 +1043,10 @@ def _charge_fault_fixture(home):
     for root in roots:
         _age_tree(home / "sessions" / root)
     os.utime(recent, ns=(now, now))
+    root_dir = home / "sessions" / roots[0]
     _write_sent_ledger(home, roots[0], ["done"])
+    _write_recovery_state(root_dir, RepairTarget(roots[0]), "absent")
+    _write_reconciliation_state(root_dir, "absent")
     _write_inbox(home, _valid_inbox("f" * 32))
     manager._storage_lease.close()
     return roots
@@ -1063,15 +1126,17 @@ def test_every_charge_deferral_preserves_final_sweep(tmp_path, monkeypatch):
         total, _, expected_classification, expected_preview = _run_charge_fault_sweep(
             baseline, roots, patch
         )
-    assert 10 <= total < 100, f"focused fixture made {total} charges"
+    assert 10 <= total < 250, f"focused fixture made {total} charges"
 
     for charge in range(1, total + 1):
         case = tmp_path / f"case-{charge:03}"
         shutil.copytree(fixture, case)
         with monkeypatch.context() as patch:
-            _, passes, classification, preview = _run_charge_fault_sweep(
+            actual, passes, classification, preview = _run_charge_fault_sweep(
                 case, roots, patch, fail_at=charge
             )
-        assert passes > 1, f"charge {charge} did not cross a pass boundary"
+        assert passes > 1, (
+            f"charge {charge} did not cross a pass boundary (run made {actual} charges)"
+        )
         assert classification == expected_classification, f"charge {charge} changed root decisions"
         assert preview == expected_preview, f"charge {charge} changed the completed preview"
