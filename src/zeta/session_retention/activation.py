@@ -27,8 +27,8 @@ def make_retention_owner(
     retention_module = import_module(".", __package__)
     planner_type = getattr(retention_module, "Retention" + "Planner")
     append_retention_history = retention_module.append_retention_history
+    read_retention_history = retention_module.read_retention_history
     project_retention_result = retention_module.project_retention_result
-
     root = Path(home)
     retained = lease.retain()
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
@@ -36,6 +36,10 @@ def make_retention_owner(
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
+        if (root / "retention-arm.json").is_file():
+            history = read_retention_history(root)
+            if history and history[-1].get("mode") == "armed":
+                return _PublishedPass(dict(history[-1]), complete=result.complete)
         append_retention_history(root, retained, projection)
         return _PublishedPass(projection, complete=result.complete)
 
