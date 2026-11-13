@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,15 @@ from typing import Any
 from ...protocol.types import ToolCall
 from ..checkpoints import ConversationEntry
 from ._history_index import HistoryIndex, IndexedPendingApprovalPage
+
+_PREPARED_APPROVAL_EXECUTION = object()
+_COMPLETED_APPROVAL_EXECUTION = object()
+
+
+@dataclass(slots=True)
+class _PendingApprovalExecution:
+    definition: tuple[str, str | None]
+    owner: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +212,69 @@ class ApprovalHistoryStoreMixin:
         self, request_id: str
     ) -> tuple[ToolCall, str | None] | None:
         return self._approval_now_snapshot().states.get(request_id)
+
+    def remember_pending_approval_execution(
+        self, request_id: str, definition: tuple[str, str | None]
+    ) -> None:
+        self._pending_approval_executions.setdefault(
+            request_id, _PendingApprovalExecution(definition)
+        )
+
+    def claim_pending_approval_execution(
+        self,
+        request_id: str,
+        definition: tuple[str, str | None],
+        *,
+        prepared: bool = False,
+    ) -> str:
+        record = self._pending_approval_executions.get(request_id)
+        if record is None:
+            return "none"
+        owner = asyncio.current_task()
+        if definition[0] != "missing" and record.definition != definition:
+            record.owner = owner
+            return "changed"
+        if prepared:
+            if record.owner is not _PREPARED_APPROVAL_EXECUTION:
+                return "duplicate"
+            record.owner = owner
+            return "claimed"
+        if record.owner is not None:
+            return "duplicate"
+        record.owner = owner
+        return "claimed"
+
+    def prepare_pending_approval_execution(
+        self, request_id: str, definition: tuple[str, str | None]
+    ) -> bool:
+        record = self._pending_approval_executions.get(request_id)
+        if record is None:
+            self.remember_pending_approval_execution(request_id, definition)
+            record = self._pending_approval_executions[request_id]
+        if record.owner is not None:
+            return False
+        record.owner = _PREPARED_APPROVAL_EXECUTION
+        return True
+
+    def release_pending_approval_execution(self, request_id: str) -> None:
+        record = self._pending_approval_executions.get(request_id)
+        if record is not None and (
+            record.owner in (
+                None,
+                _PREPARED_APPROVAL_EXECUTION,
+                asyncio.current_task(),
+            )
+            or isinstance(record.owner, asyncio.Task)
+            and record.owner.done()
+        ):
+            record.owner = _COMPLETED_APPROVAL_EXECUTION
+
+    def retire_terminal_approval_executions(self) -> None:
+        self._pending_approval_executions = {
+            key: record
+            for key, record in self._pending_approval_executions.items()
+            if record.owner is not _COMPLETED_APPROVAL_EXECUTION
+        }
 
     def approval_resolution_now(self, request_id: str) -> Mapping[str, Any] | None:
         return self._approval_now_snapshot().resolutions.get(request_id)

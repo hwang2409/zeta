@@ -163,16 +163,17 @@ async def test_message_fork_cancellation_restores_workspace_and_transcript(
         workspace_file.write_text("first")
         return True, None
 
-    def rebuild_transcript() -> None:
+    async def rebuild_transcript() -> bool:
         nonlocal transcript_rebuilt
         transcript_rebuilt = True
+        return True
 
     # test-contract: seam hold the submitted store command.
     monkeypatch.setattr(ConversationStore, "append_message_fork_async", held_append)
     # test-contract: seam patch the composite operation's workspace restore.
     monkeypatch.setattr("zeta.tui.checkpoints._restore_workspace", restore_workspace)
     # test-contract: seam patch the composite operation's post-commit rebuild.
-    monkeypatch.setattr(app, "_rebuild_transcript", rebuild_transcript)
+    monkeypatch.setattr(app, "_rebuild_transcript_async", rebuild_transcript)
     task = asyncio.ensure_future(app.slash_fork("1"))
     try:
         assert await asyncio.to_thread(started.wait, 10)

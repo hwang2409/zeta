@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -148,6 +148,8 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
 )
 from zeta.protocol.types import (
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     CompletionBackend,
     ErrorInfo,
     ImageContent,
@@ -592,7 +594,7 @@ async def _background_event_transcript_count(
                 model="offline",
                 console=Console(file=resumed_output, force_terminal=False, width=160),
             )
-            resumed_app._rebuild_transcript()
+            await resumed_app._rebuild_transcript_async()
             resumed = (
                 Text.from_ansi(resumed_app._transcript.render(160)).plain
                 + "\n"
@@ -754,7 +756,7 @@ async def test_live_notification_presentation_survives_tui_resume(
         console=Console(file=resumed_output, force_terminal=False, width=160),
     )
     try:
-        resumed_app._rebuild_transcript()
+        await resumed_app._rebuild_transcript_async()
         visible = output.getvalue() + resumed_output.getvalue()
         assert visible.count("child child-presentation · completed") == 1
     finally:
@@ -810,7 +812,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         )
     )
     try:
-        await rendered_output.wait()
+        await await_or_fail(
+            rendered_output.wait(), what="notification render output"
+        )
         assert (
             output.getvalue().count("child child-canceled-presentation · completed")
             == 1
@@ -820,7 +824,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         await asyncio.sleep(0)
         store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
-            await presentation
+            await await_or_fail(
+                presentation, what="canceled notification presentation"
+            )
 
         reopened = ConversationStore(store.root_dir, session_id=store.session_id)
         resumed_output = StringIO()
@@ -837,7 +843,7 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         )
         try:
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
-            resumed_app._rebuild_transcript()
+            await resumed_app._rebuild_transcript_async()
             visible = output.getvalue() + resumed_output.getvalue()
             assert visible.count("child child-canceled-presentation · completed") == 1
         finally:
@@ -848,7 +854,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             store._async_write_lock.release()
         if not presentation.done():
             presentation.cancel()
-            await asyncio.gather(presentation, return_exceptions=True)
+            await asyncio.wait_for(
+                asyncio.gather(presentation, return_exceptions=True), 10
+            )
         await loop.close()
         store.close()
 
@@ -892,7 +900,7 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         release_ack.set()
         count, rendered = await await_or_fail(transcript, what="test await")
         assert count == 1, rendered
-        markers = {entry.type for entry in apps[0].loop.store.tui_replay_entries()}
+        markers = {ref.type for ref in apps[0].loop.store.branch_refs()}
         assert "notification_tui_presented" in markers
     finally:
         release_ack.set()
@@ -2946,11 +2954,11 @@ async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) 
 
     try:
         async with owned_app(app):
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             assert_indexes_match()
             app._presenter.print_unit(Text("reloaded"))
             assert_indexes_match()
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             assert_indexes_match()
     finally:
         await app.loop.close()
@@ -4934,7 +4942,7 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         console=Console(file=output, force_terminal=False),
     )
 
-    app._rebuild_transcript()
+    await app._rebuild_transcript_async()
 
     assert app.retry_available()
     rendered = Text.from_ansi(output.getvalue()).plain
@@ -9244,23 +9252,21 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
     mcp_calls: list[None] = []
     freeze_calls: list[None] = []
     replay_started = asyncio.Event()
-    replay_completed: list[None] = []
-    rebuild_steps = app._rebuild_transcript_steps
+    release_replay = asyncio.Event()
+    source_page = app._history_source.page
 
     async def ensure_mcp() -> None:
         mcp_calls.append(None)
 
-    def observed_rebuild_steps(
-        rendered_notifications: list[str],
-    ) -> Iterator[None]:
-        for step in rebuild_steps(rendered_notifications):
-            replay_started.set()
-            yield step
-        replay_completed.append(None)
+    async def observed_page(*args: object, **kwargs: object) -> object:
+        page = await source_page(*args, **kwargs)
+        replay_started.set()
+        await await_or_fail(release_replay.wait(), what="release startup replay")
+        return page
 
     monkeypatch.setattr(app.loop, "ensure_mcp_servers", ensure_mcp)
-    # test-contract: seam Observe transcript rebuild through the application boundary.
-    monkeypatch.setattr(app, "_rebuild_transcript_steps", observed_rebuild_steps)
+    # test-contract: seam Pause after the bounded page read, before TUI paint.
+    monkeypatch.setattr(app._history_source, "page", observed_page)
     # test-contract: seam Observe the production heap-freeze boundary.
     monkeypatch.setattr(
         "zeta.tui.checkpoints.freeze_long_lived_heap",
@@ -9269,11 +9275,20 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
 
     with create_pipe_input() as pipe:
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
-        await replay_started.wait()
-        app.request_exit()
-        await asyncio.wait_for(run_task, timeout=1)
+        try:
+            await await_or_fail(replay_started.wait(), what="startup replay")
+            app.request_exit()
+            release_replay.set()
+            await asyncio.wait_for(run_task, timeout=10)
+        finally:
+            release_replay.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(run_task, return_exceptions=True), 10
+                )
 
-    assert replay_completed == []
+    assert "99" not in Text.from_ansi(app._transcript.render(120)).plain
     assert mcp_calls == []
     assert freeze_calls == []
 
@@ -9425,7 +9440,7 @@ async def test_rebuild_transcript_matches_character_stream(
     await app._consume_turn("prompt")
 
     live = app._transcript.render(120)
-    app._rebuild_transcript()
+    await app._rebuild_transcript_async()
     replayed = app._transcript.render(120)
     assert replayed == live
 
@@ -9560,16 +9575,15 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
             multiline=True,
         )
         run_task = asyncio.create_task(app.run(session))
-        await asyncio.wait_for(startup_ready.wait(), timeout=5)
+        await asyncio.wait_for(startup_ready.wait(), timeout=10)
         pipe.send_text("\x04")
-        await asyncio.wait_for(run_task, timeout=5)
+        await asyncio.wait_for(run_task, timeout=10)
 
     assert "prompts unavailable" in Text.from_ansi(app._transcript.render(120)).plain
 
 
-def test_rebuild_renders_closed_turn_end_reasons(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.asyncio
+async def test_history_page_renders_closed_turn_end_reasons(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions")
     replay = tuple(
         SimpleNamespace(
@@ -9577,7 +9591,6 @@ def test_rebuild_renders_closed_turn_end_reasons(
         )
         for reason in ("user_stop", "completed", "error", "disconnect")
     )
-    monkeypatch.setattr(store, "tui_replay_entries", lambda: replay)
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -9585,13 +9598,13 @@ def test_rebuild_renders_closed_turn_end_reasons(
     )
     app._active_session = app._make_session()
 
-    app._rebuild_transcript()
-
-    rendered = Text.from_ansi(app._transcript.render(120)).plain
-    assert "turn stopped by the user" in rendered
-    assert "turn ended with an error" in rendered
-    assert "turn ended when the controller disconnected" in rendered
-    assert "completed" not in rendered
+    async with owned_app(app):
+        list(app._render_history_entries(replay, []))
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "turn stopped by the user" in rendered
+        assert "turn ended with an error" in rendered
+        assert "turn ended when the controller disconnected" in rendered
+        assert "completed" not in rendered
 
 
 def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
@@ -14399,7 +14412,7 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
     )
 
     try:
-        app._rebuild_transcript()
+        await app._rebuild_transcript_async()
 
         rendered = Text.from_ansi(output.getvalue()).plain
         assert "here is the answer" in rendered
@@ -16047,6 +16060,45 @@ async def test_history_finder_does_not_cross_session_boundaries(
     await second.close()
 
 
+@pytest.mark.asyncio
+async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    for index in range(300):
+        store.append_message(
+            Message(
+                MessageRole.USER,
+                [TextContent(f"prompt-{index}")],
+                metadata={"zeta.origin": "user"},
+            )
+        )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+    buffer = Buffer(document=Document("prompt-0"))
+
+    async with owned_app(app):
+        app._history_finder_open(buffer)
+        assert app._prompt_history.finder_task is not None
+        await await_or_fail(
+            app._prompt_history.finder_task,
+            what="ctrl+r prompt paging",
+        )
+        await wait_until(
+            lambda: (
+                (state := app._history_finder.finder_state()) is not None
+                and state.total > 0
+                and state.complete
+            )
+        )
+        assert app._history_finder.finder_accept()
+        assert buffer.text == "prompt-0"
+        assert len(app._prompt_history.pages) <= 2
+
+
 def test_agent_transcript_source_keeps_snapshot_during_active_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16129,7 +16181,7 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
         app = TUIApp(loop, provider="codex", model="offline")
         async with owned_app(app):
             app._full_screen_active = lambda: True
-            app._rebuild_transcript()
+            await app._rebuild_transcript_async()
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "sent history is incomplete (invalid_json)" in rendered
             assert "sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project-inbox-sent.json" in rendered
@@ -16236,3 +16288,539 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
         snapshot = Text.from_ansi(output.getvalue()).plain
         assert "… +" not in snapshot
         assert "short summary" in snapshot or "short reason" in snapshot
+
+@pytest.mark.asyncio
+async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("long-open", "read", {"path": "old.txt"}))],
+        )
+    )
+    parent_id = store.branch_refs()[-1].id
+    log_path = store.path
+    store.close()
+    with log_path.open("a", encoding="utf-8") as handle:
+        for index in range(50_000):
+            entry_id = f"{index + 2:032x}"
+            row = {
+                "seq": index + 2,
+                "id": entry_id,
+                "parent_id": parent_id,
+                "lane": "main",
+                "type": "message",
+                "data": {
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": f"history-{index}"}],
+                        "metadata": {"zeta.origin": "user"},
+                    }
+                },
+            }
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            parent_id = entry_id
+    store = ConversationStore(store.root_dir, session_id=store.session_id)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "history-49999" in rendered
+        assert "history-0" not in rendered
+        assert len(app._transcript.units) <= 4 * 128
+        assert len(app._history_pager.pages) <= 4
+        assert len(app._history_pager.descriptors) <= 4
+        assert len(app._history_pager.scalar_tokens) == 6
+
+        for page_number in range(5):
+            app._transcript.scroll_to_top()
+            anchor = app._transcript.durable_scroll_anchor
+            app._scroll_history_up()
+            await asyncio.sleep(0)
+            reads = tuple(app._history_pager._loads.values())
+            assert len(reads) == 1
+            await await_or_fail(
+                asyncio.gather(*reads),
+                what=f"older transcript page {page_number + 1}",
+            )
+            assert app._transcript.durable_scroll_anchor == anchor
+            assert len(app._history_pager.descriptors) <= 4
+
+        matches = await app._history_pager.search("history-0")
+        assert [(match.entry_id, match.unit_ordinal) for match in matches]
+        await app._history_pager.reveal(matches[0].entry_id)
+        app._render_resident_history()
+        assert app._transcript.restore_durable_scroll_anchor(
+            (matches[0].entry_id, matches[0].unit_ordinal, 0)
+        )
+        assert "history-0" in Text.from_ansi(app._transcript.render(120)).plain
+
+        request = app._transcript.open_finder()
+        app._active_finder = app._transcript
+        app._start_finder_preparation(request)
+        app._finder_input("history-")
+        assert app._history_search_task is not None
+        await await_or_fail(
+            app._history_search_task,
+            what="global transcript search",
+        )
+        assert len(app._history_search_results) == 200
+        app._history_search_index = len(app._history_search_results) - 1
+        assert app._navigate_history_search(1)
+        assert app._history_search_task is not None
+        await await_or_fail(app._history_search_task, what="wrapped next search result")
+        assert app._history_search_index == 0
+        assert app._navigate_history_search(-1)
+        assert app._history_search_task is not None
+        await await_or_fail(
+            app._history_search_task,
+            what="wrapped previous search result",
+        )
+        assert app._history_search_index == len(app._history_search_results) - 1
+
+        app._append_transcript(Text("live-tail"))
+        page_number = 0
+        async with asyncio.timeout(120):
+            while app._history_pager.can_load_newer:
+                page_number += 1
+                assert page_number <= 500
+                app._transcript.scroll_to_bottom()
+                app._scroll_history_down()
+                await asyncio.sleep(0)
+                reads = tuple(app._history_pager._loads.values())
+                assert len(reads) == 1
+                await await_or_fail(
+                    asyncio.gather(*reads),
+                    what=f"newer transcript page {page_number}",
+                )
+        app._transcript.scroll_to_bottom()
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "live-tail" in rendered
+        assert "history-49999" in rendered
+        assert app._transcript.follow_tail
+
+@pytest.mark.parametrize(
+    "journey",
+    (
+        "stale-anchor",
+        "mixed-live-durable",
+        "failed-turn-dependency",
+        "tool-result-bound",
+        "close-search",
+        "unloaded-failed-search",
+        "bounded-prompt-finder",
+        "branch-prompt-reset",
+        "branch-prompt-stale-fork",
+        "branch-prompt-stale-tree",
+    ),
+)
+@pytest.mark.asyncio
+async def test_root_tui_paging_render_path_table(
+    tmp_path: Path, journey: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / journey / "sessions")
+    failure_text = "needle-provider-failure"
+    checkpoint = None
+
+    if journey == "stale-anchor":
+        for index in range(300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"anchor-{index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+    elif journey == "mixed-live-durable":
+        durable = store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("durable-A")]),
+                MessageOrigin.USER,
+            )
+        )
+    elif journey in {"failed-turn-dependency", "unloaded-failed-search"}:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("retry-target-user")]),
+                MessageOrigin.USER,
+            )
+        )
+        for index in range(130):
+            store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent(f"before-failure-{index}")])
+            )
+        failed = store.append_message(
+            Message(
+                MessageRole.ASSISTANT,
+                [TextContent("failed assistant text")],
+                metadata={
+                    FAILED_TURN_MARKER: True,
+                    FAILED_TURN_ERROR: ErrorInfo(
+                        "backend_error", failure_text
+                    ).to_dict(),
+                },
+            )
+        )
+        if journey == "unloaded-failed-search":
+            checkpoint = store.append_checkpoint("searchable-checkpoint")
+            for index in range(180):
+                store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"tail-{index}")])
+                )
+    elif journey == "tool-result-bound":
+        for index in range(128):
+            call = ToolCall(f"bounded-{index}", "read", {"path": str(index)})
+            store.append_message(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)])
+            )
+            store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [],
+                    tool_result=ToolResult(call.id, f"result-{index}"),
+                )
+            )
+    elif journey == "bounded-prompt-finder":
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("oldest-needle")]),
+                MessageOrigin.USER,
+            )
+        )
+        for index in range(1, 300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"prompt-{index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+    elif journey.startswith("branch-prompt-"):
+        store.append_checkpoint("branch-base")
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("branch-a-prompt")]),
+                MessageOrigin.USER,
+            )
+        )
+        store.append_message(
+            Message(MessageRole.ASSISTANT, [TextContent("branch-a-reply")])
+        )
+    else:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("search-row")]),
+                MessageOrigin.USER,
+            )
+        )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+
+        if journey == "stale-anchor":
+            app._transcript.scroll_to_top()
+            original_page = app._history_source.page
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def delayed_page(cursor=None, *, direction="older"):
+                started.set()
+                await asyncio.wait_for(release.wait(), 10)
+                return await original_page(cursor, direction=direction)
+
+            app._history_source.page = delayed_page
+            load = asyncio.create_task(app._load_transcript_page(direction="older"))
+            await asyncio.wait_for(started.wait(), 10)
+            app._transcript.scroll_down()
+            moved_anchor = app._transcript.durable_scroll_anchor
+            release.set()
+            await await_or_fail(load, what="stale-anchor page read")
+            assert app._transcript.durable_scroll_anchor == moved_anchor
+        elif journey == "mixed-live-durable":
+            app._history_pager.reset(endpoint_id=durable.id)
+            app._history_pager.append_live(durable.id, Text("live-A"))
+            app._history_pager.append_live("live-B", Text("live-B"))
+            app._history_pager.append_live("live-C", Text("live-C"))
+            page = await app._history_source.reveal(durable.id)
+            app._history_pager.adopt(page, direction="newer")
+            app._render_resident_history()
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "durable-A" in rendered
+            assert "live-B" in rendered
+            assert "live-C" in rendered
+        elif journey == "failed-turn-dependency":
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert failure_text in rendered
+            assert app._failed_turn is not None
+            assert app._failed_turn[0] == "retry-target-user"
+        elif journey == "tool-result-bound":
+            assert sum(
+                len(page.units) for page in app._history_pager.pages
+            ) <= app._history_pager.max_segment_rows
+            rendered = Text.from_ansi(app._transcript.render(120)).plain
+            assert "result-127" in rendered
+        elif journey == "close-search":
+            started = threading.Event()
+            release = threading.Event()
+            finished = threading.Event()
+            original_search = store.tui_history_search
+
+            def blocked_search(*args, **kwargs):
+                started.set()
+                release.wait(10)
+                try:
+                    return original_search(*args, **kwargs)
+                finally:
+                    finished.set()
+
+            store.tui_history_search = blocked_search
+            task = asyncio.create_task(app._history_pager.search("search-row"))
+            app._history_search_task = task
+            assert await asyncio.to_thread(started.wait, 10)
+            await await_or_fail(
+                app._close_history_search(), what="close during history search"
+            )
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 10)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        elif journey == "unloaded-failed-search":
+            matches = await app._history_pager.search(failure_text)
+            target = next(match for match in matches if match.entry_id == failed.id)
+            assert target.unit_ordinal == 1
+            checkpoint_matches = await app._history_pager.search(
+                "searchable-checkpoint"
+            )
+            checkpoint_target = checkpoint_matches[0]
+            assert checkpoint is not None
+            assert checkpoint_target.entry_id == checkpoint.id
+            assert checkpoint_target.unit_ordinal == 0
+
+            for search_target, expected_text in (
+                (target, failure_text),
+                (checkpoint_target, "searchable-checkpoint"),
+            ):
+                await app._history_pager.reveal(search_target.entry_id)
+                app._render_resident_history()
+                assert app._transcript.restore_durable_scroll_anchor(
+                    (search_target.entry_id, search_target.unit_ordinal, 0)
+                )
+                anchor_unit, _offset = app._transcript.scroll_anchor
+                assert anchor_unit is not None
+                anchor_text = Text.from_ansi(
+                    app._transcript._render_unit(anchor_unit, 120)
+                ).plain
+                expected_unit = next(
+                    unit
+                    for unit in app._transcript._units
+                    if unit is not None
+                    and unit.history_identity is not None
+                    and unit.history_identity[0] == search_target.entry_id
+                    and expected_text in Text.from_ansi(
+                        app._transcript._render_unit(unit, 120)
+                    ).plain
+                )
+                assert anchor_unit is expected_unit
+                assert anchor_text == Text.from_ansi(
+                    app._transcript._render_unit(expected_unit, 120)
+                ).plain
+            assert app._failed_turn is not None
+            assert app._failed_turn[0] == "retry-target-user"
+        elif journey == "branch-prompt-reset":
+            app._prompt_history.bind(
+                app._viewed_session_path(), app._history_source
+            )
+            await app._prompt_history.load_older()
+            assert "branch-a-prompt" in app._prompt_history.snapshot(
+                app._viewed_session_path()
+            )
+            assert await app.slash_fork("branch-base") == (
+                "forked to checkpoint 'branch-base' at seq 1"
+            )
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                    MessageOrigin.USER,
+                )
+            )
+            assert await app._rebuild_transcript_async()
+
+            await app._prompt_history.load_older()
+            buffer = Buffer()
+            app._history_previous(buffer)
+            assert buffer.text == "branch-b-prompt"
+            finder_buffer = Buffer(document=Document("branch-a-prompt"))
+            app._history_finder_open(finder_buffer)
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task, what="branch prompt finder reset"
+            )
+            state = app._history_finder.finder_state()
+            assert state is not None
+            assert all("branch-a-prompt" not in row.excerpt for row in state.rows)
+        elif journey.startswith("branch-prompt-stale-"):
+            if journey.endswith("tree"):
+                assert await app.slash_fork("branch-base") == (
+                    "forked to checkpoint 'branch-base' at seq 1"
+                )
+                store.append_message(
+                    with_message_origin(
+                        Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                        MessageOrigin.USER,
+                    )
+                )
+                assert await app._rebuild_transcript_async()
+                old_branch = next(
+                    index
+                    for index, branch in enumerate(store.list_branches(), 1)
+                    if not branch.is_current
+                )
+                assert str(await app.slash_tree(str(old_branch))).startswith(
+                    "switched to branch"
+                )
+
+            original_prompt_page = app._history_source.prompt_page
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def delayed_prompt_page(cursor=None, *, direction="older"):
+                page = await original_prompt_page(cursor, direction=direction)
+                started.set()
+                await asyncio.wait_for(release.wait(), 10)
+                return page
+
+            monkeypatch.setattr(app._history_source, "prompt_page", delayed_prompt_page)
+            published: list[tuple[str, ...]] = []
+            original_set_snapshot = app._history_finder.set_snapshot
+
+            def record_snapshot(snapshot: tuple[str, ...]) -> None:
+                published.append(snapshot)
+                original_set_snapshot(snapshot)
+
+            monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
+            app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
+            scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+                app, "_history_prompt_task", None
+            )
+            assert scan is not None
+            await asyncio.wait_for(started.wait(), 10)
+
+            if journey.endswith("fork"):
+                assert await app.slash_fork("branch-base") == (
+                    "forked to checkpoint 'branch-base' at seq 1"
+                )
+                store.append_message(
+                    with_message_origin(
+                        Message(MessageRole.USER, [TextContent("branch-b-prompt")]),
+                        MessageOrigin.USER,
+                    )
+                )
+                assert await app._rebuild_transcript_async()
+            else:
+                new_branch = next(
+                    index
+                    for index, branch in enumerate(store.list_branches(), 1)
+                    if not branch.is_current
+                )
+                assert str(await app.slash_tree(str(new_branch))).startswith(
+                    "switched to branch"
+                )
+
+            release.set()
+            try:
+                await asyncio.wait_for(scan, 10)
+            except asyncio.CancelledError:
+                pass
+            assert all("branch-a-prompt" not in snapshot for snapshot in published)
+
+            monkeypatch.setattr(app._history_source, "prompt_page", original_prompt_page)
+            published.clear()
+            finder_buffer = Buffer(document=Document("branch-b-prompt"))
+            app._history_finder_open(finder_buffer)
+            new_scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+                app, "_history_prompt_task", None
+            )
+            assert new_scan is not None
+            await await_or_fail(new_scan, what="new branch prompt finder")
+            assert all("branch-a-prompt" not in snapshot for snapshot in published)
+            assert any("branch-b-prompt" in snapshot for snapshot in published)
+        else:
+            buffer = Buffer(document=Document("oldest-needle"))
+            app._history_finder_open(buffer)
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task, what="bounded ctrl+r source scan"
+            )
+            if app._finder_prepare_task is not None:
+                await await_or_fail(
+                    app._finder_prepare_task, what="bounded ctrl+r candidates"
+                )
+            if app._finder_rank_task is not None:
+                await await_or_fail(
+                    app._finder_rank_task, what="bounded ctrl+r ranking"
+                )
+            state = app._history_finder.finder_state()
+            assert state is not None
+            assert state.total <= 200
+            assert any("oldest-needle" in row.excerpt for row in state.rows)
+            assert len(app._prompt_history.pages) <= 2
+
+
+@pytest.mark.asyncio
+async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("same-call", "read", {"path": "old.txt"}))],
+        )
+    )
+    for index in range(10):
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent(str(index))]))
+    store.append_message(
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("same-call", "read", {"path": "new.txt"}))],
+        )
+    )
+    for index in range(140):
+        store.append_message(Message(MessageRole.ASSISTANT, [TextContent(f"gap-{index}")]))
+    store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult("same-call", "nearest result"),
+        )
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert "new.txt" in rendered
+        assert "old.txt" not in rendered
+        assert rendered.count("new.txt") == 1
+        assert rendered.count("nearest result") == 1

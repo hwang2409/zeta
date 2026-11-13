@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import sqlite3
+import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...protocol.types import (
@@ -12,8 +14,15 @@ from ...protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
+    FAILED_TURN_ERROR,
+    FAILED_TURN_MARKER,
     MESSAGE_ORIGIN_METADATA,
+    Message,
     MessageOrigin,
+    MessageRole,
+    assistant_text,
+    is_passive_harness_message,
+    is_visible_harness_notice,
 )
 from ...storage_format import reject_unknown_keys
 from ._async_writes import _AppendTurnEndCommand
@@ -21,11 +30,54 @@ from ._client_delivery import CLIENT_DELIVERY_METADATA
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
+    from ._history_index import IndexedHistoryPage
     from ._store import ConversationStore
 
 
 # The newest rows a lookup can see; older rows are unknown, not absent.
 RECENT_ROW_WINDOW = 1024
+
+
+def starts_next_group(entry_type: str, data: Mapping[str, object]) -> bool:
+    if entry_type == "message":
+        message = data.get("message")
+        return isinstance(message, dict) and not (
+            is_passive_harness_message(message)
+            and not is_visible_harness_notice(message)
+        )
+    return entry_type == "notification" or (
+        entry_type == "warning" and data.get("kind") == "transcript_recovery"
+    )
+
+
+def belongs_in_history(entry_type: str, data: Mapping[str, object]) -> bool:
+    return starts_next_group(entry_type, data) or entry_type in {
+        "client_delivery", "approval_resolution", "approval_history", "turn_end"
+    }
+
+
+def overlay_resident_entries(
+    store: ConversationStore, page: IndexedHistoryPage
+) -> IndexedHistoryPage:
+    def resident_entry(entry: ConversationEntry) -> ConversationEntry:
+        if entry.seq > len(store._resident_rows.entries):
+            return entry
+        resident = store._resident_rows.entries[entry.seq - 1]
+        if resident.id != entry.id:
+            return entry
+        accepted = entry.data.get("_accepted_message")
+        if accepted is None:
+            return resident
+        return replace(
+            resident,
+            data={**resident.data, "_accepted_message": accepted},
+        )
+
+    groups = tuple(
+        tuple(resident_entry(entry) for entry in group)
+        for group in page.groups
+    )
+    return replace(page, groups=groups)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,3 +276,187 @@ class RecentRowsMixin:
         """
         self._assert_owner_thread()
         return self._reset_generation
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS message_search ("
+        "entry_seq INTEGER NOT NULL, entry_id TEXT NOT NULL, "
+        "unit_ordinal INTEGER NOT NULL, text TEXT NOT NULL, "
+        "PRIMARY KEY(entry_seq,unit_ordinal))"
+    )
+
+
+def searchable_units(
+    entry_type: str, data: Mapping[str, object]
+) -> tuple[str, ...]:
+    """Return the visible search text for each unit painted by root replay."""
+
+    if entry_type == "message":
+        try:
+            message = Message.from_dict(data["message"])
+        except (KeyError, TypeError, ValueError):
+            return ()
+        if is_passive_harness_message(message):
+            text = assistant_text(message)
+            return (text,) if text else ()
+        if message.role is MessageRole.USER:
+            text = assistant_text(message)
+            return (text,) if text else ()
+        if message.role is MessageRole.ASSISTANT:
+            units = [text] if (text := assistant_text(message)) else []
+            if message.metadata.get(FAILED_TURN_MARKER):
+                error = message.metadata.get(FAILED_TURN_ERROR)
+                if isinstance(error, Mapping):
+                    units.append(" ".join(str(value) for value in error.values()))
+                else:
+                    units.append("provider failure")
+            return tuple(units)
+        if message.role is MessageRole.TOOL_RESULT and message.tool_result is not None:
+            return (str(message.tool_result.content),)
+        return ()
+    if entry_type == "checkpoint":
+        return (f"checkpoint '{data.get('label', '')}' at seq",)
+    if entry_type == "fork":
+        label = data.get("label", data.get("name", ""))
+        return (f"forked {label} seq {data.get('from_seq', '')}",)
+    if entry_type == "compaction":
+        return (
+            (
+                "compaction marker entries "
+                f"{data.get('source_seq_start', '')} {data.get('source_seq_end', '')}"
+            ),
+        )
+    if entry_type == "turn_end":
+        reason = data.get("reason")
+        text = {
+            "user_stop": "turn stopped by the user",
+            "error": "turn ended with an error",
+            "disconnect": "turn ended when the controller disconnected",
+        }.get(reason)
+        return (text,) if text is not None else ()
+    if entry_type == "warning" and data.get("kind") == "transcript_recovery":
+        return (
+            (
+                "transcript recovered preserved corrupt bytes in quarantine "
+                f"{data.get('quarantine_id', '')}"
+            ),
+        )
+    if entry_type == "notification":
+        text = "\n".join(
+            value
+            for key in ("title", "message", "body", "summary", "question")
+            if isinstance((value := data.get(key)), str)
+        )
+        return (text,) if text else ()
+    return ()
+
+
+def write_text(
+    connection: sqlite3.Connection,
+    seq: int,
+    entry_id: str,
+    entry_type: str,
+    data: Mapping[str, object],
+) -> None:
+    for unit_ordinal, text in enumerate(searchable_units(entry_type, data)):
+        connection.execute(
+            "INSERT INTO message_search(entry_seq,entry_id,unit_ordinal,text) "
+            "VALUES(?,?,?,?)",
+            (seq, entry_id, unit_ordinal, text.casefold()),
+        )
+
+
+def search(
+    connection: sqlite3.Connection,
+    query: str,
+    limit: int,
+    cancel: threading.Event | None = None,
+) -> tuple[tuple[str, int], ...]:
+    needle = query.casefold()
+    cursor = connection.execute(
+        "SELECT s.entry_id,s.unit_ordinal,s.text FROM message_search s "
+        "JOIN entries e ON e.seq=s.entry_seq "
+        "WHERE e.tui_group IS NOT NULL "
+        "ORDER BY s.entry_seq DESC,s.unit_ordinal DESC"
+    )
+    matches: list[tuple[str, int]] = []
+    while rows := cursor.fetchmany(256):
+        if cancel is not None and cancel.is_set():
+            break
+        for entry_id, unit_ordinal, text in rows:
+            if needle in text:
+                matches.append((entry_id, unit_ordinal))
+                if len(matches) >= limit:
+                    return tuple(matches)
+    return tuple(matches)
+
+
+def history_index_suffix_start(
+    stored: Mapping[str, object],
+    expected: Mapping[str, object],
+    rows: Sequence[object],
+    *,
+    schema_version: int,
+    row: Callable[[object], tuple[int, str, str | None, str, str, str]],
+    digest_entry: Callable[[bytes, object], bytes],
+) -> int | None:
+    if stored.get("schema_version") != schema_version or any(
+        stored.get(key) != expected.get(key)
+        for key in ("st_dev", "st_ino", "repair_generation")
+    ):
+        return None
+    stored_boundary = stored.get("byte_boundary")
+    expected_boundary = expected.get("byte_boundary")
+    if (
+        not isinstance(stored_boundary, int)
+        or not isinstance(expected_boundary, int)
+        or stored_boundary > expected_boundary
+    ):
+        return None
+    start = stored.get("last_seq")
+    if not isinstance(start, int) or not 0 <= start <= len(rows):
+        return None
+    boundary = rows[start - 1] if start else None
+    if stored.get("last_id") != (row(boundary)[1] if boundary else None):
+        return None
+    if stored.get("last_parent") != (row(boundary)[2] if boundary else None):
+        return None
+    digest_hex = stored.get("prefix_digest")
+    if not isinstance(digest_hex, str):
+        return None
+    try:
+        digest = bytes.fromhex(digest_hex)
+    except ValueError:
+        return None
+    suffix = rows[start:]
+    if not suffix:
+        return None
+    parent_id = stored.get("last_id")
+    for entry in suffix:
+        projected = row(entry)
+        if projected[2] != parent_id:
+            return None
+        parent_id = projected[1]
+        digest = digest_entry(digest, entry)
+    return start if digest.hex() == expected.get("prefix_digest") else None
+
+
+def project_history_entries(
+    entries: tuple[object, ...],
+    total: int,
+    tui_total: int,
+    *,
+    data: Callable[[object], Mapping[str, object]],
+    belongs: Callable[[str, Mapping[str, object]], bool],
+    starts: Callable[[str, Mapping[str, object]], bool],
+) -> tuple[list[tuple[object, int | None, int]], int, int]:
+    projected: list[tuple[object, int | None, int]] = []
+    for entry in entries:
+        entry_data = data(entry)
+        group = total if belongs(entry.type, entry_data) else None
+        projected.append((entry, group, tui_total))
+        tui_total += 1
+        if starts(entry.type, entry_data):
+            total += 1
+    return projected, total, tui_total

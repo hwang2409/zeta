@@ -12,6 +12,7 @@ import pytest
 
 from tests.support.branch_reads import branch_entries
 from zeta.core.store import ConversationStore
+from zeta.core.store._history_index import HistoryIndex
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -58,7 +59,7 @@ def test_approval_index_rebuilds_noncurrent_schema_without_changing_authority(
         rebuilt = json.loads(
             connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()[0]
         )
-        assert rebuilt["schema_version"] == 5
+        assert rebuilt["schema_version"] == HistoryIndex.SCHEMA_VERSION
         assert connection.execute(
             "SELECT request_entry_id FROM active_approval_requests WHERE request_id=?",
             (call.id,),

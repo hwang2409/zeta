@@ -38,7 +38,11 @@ class TurnPersistenceMixin:
         calls: Sequence[ToolCall],
         slots: Sequence[ToolResult | None],
     ) -> list[ToolResult]:
-        results = finalize_agent_results(self, calls, slots)
+        try:
+            results = finalize_agent_results(self, calls, slots)
+        finally:
+            for call in calls:
+                self.store.release_pending_approval_execution(call.id)
         for removed, fallback in self.tool_registry.take_cwd_recovery_notices():
             self.store.append_message(
                 harness_notice(

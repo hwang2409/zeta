@@ -17,7 +17,7 @@ import pytest
 from PIL import Image
 from rich.console import Console
 
-from tests.support.branch_reads import branch_messages
+from tests.support.branch_reads import branch_entries, branch_messages
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
 from zeta.media import image_normalization
@@ -48,6 +48,7 @@ from zeta.tools import ToolRegistry
 from zeta.tui.checkpoints import CheckpointTranscriptMixin
 from zeta.tui.render import render_event
 from zeta.tui.session_prompt_history import SessionPromptHistory
+from zeta.tui.transcript.root_history_source import _project_entry
 
 LEGACY_IMAGE_SIZE = 4 * 1024 * 1024
 OPENAI_IMAGE_URL_MAX_LENGTH = 20_971_520
@@ -682,7 +683,11 @@ def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> 
     app._print_unit = printed.append
     app._print_system = printed.append
 
-    app._rebuild_transcript()
+    list(
+        app._render_history_entries(
+            [_project_entry(entry) for entry in branch_entries(reopened)], []
+        )
+    )
 
     assert len(printed) == 1
     output = io.StringIO()

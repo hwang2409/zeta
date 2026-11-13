@@ -512,6 +512,7 @@ def test_live_and_replay_agent_notification_bytes_match(
     replay_bytes = app._transcript.render(120).encode()
 
     assert replay_bytes == live_bytes
+    asyncio.run(app.close())
 
 
 def test_display_only_agent_notification_remains_visible_in_tui_replay(
@@ -539,6 +540,7 @@ def test_display_only_agent_notification_remains_visible_in_tui_replay(
     assert "grandchild work" in app._transcript.render(120)
     assert store.is_agent_notification_presented_to_tui(entry.id)
     assert store.agent_notifications() == []
+    asyncio.run(app.close())
 
 
 def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
@@ -587,6 +589,8 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
     replay_bytes = replay_app._transcript.render(120).encode()
 
     assert replay_bytes == live_bytes
+    asyncio.run(replay_app.close())
+    asyncio.run(live_app.close())
 
 
 async def test_fork_rejects_running_background_agents_then_allows_completion(

@@ -339,14 +339,16 @@ async def _approval_server(
     protocol_version: str = "1.0",
     features: list[str] | None = None,
     approval_reconnect_grace: int = 90,
+    backend: FakeBackend | None = None,
 ) -> tuple[ZetaServer, asyncio.StreamReader, asyncio.StreamWriter, ToolCall]:
+    backend = backend or FakeBackend([])
     server = ZetaServer(
         home=tmp_path,
         socket_path=_socket_path(tmp_path),
         provider="codex",
         cwd="/tmp",
         backend_factory=lambda provider, model, home: (
-            FakeBackend([]),
+            backend,
             model or "offline",
         ),
         approval_reconnect_grace=approval_reconnect_grace,
@@ -378,6 +380,47 @@ def _end_event(call: ToolCall, decision: str = "abort") -> StreamEvent:
         tool_call=call,
         data={"decision": decision},
     )
+
+
+@pytest.mark.asyncio
+async def test_aborted_approval_without_live_turn_starts_no_recovery_turn(
+    tmp_path: Path,
+) -> None:
+    server, _reader, writer, call = await _approval_server(tmp_path)
+    try:
+        await server.control._event(_start_event(call))
+        server.runtime.opened.store.resolve_approval(
+            call.id, "abort", reason="child_cleanup"
+        )
+        result = await server.control.resolve_approval("deny", call.id)
+
+        assert result["decision"] == "abort"
+        assert server.control._turn_task is None
+        assert server.runtime.opened.store.approval_state_now(call.id) == (call, "abort")
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_denied_approval_without_live_turn_resumes_model(tmp_path: Path) -> None:
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, call = await _approval_server(tmp_path, backend=backend)
+    try:
+        await server.control._event(_start_event(call))
+        await server.control.resolve_approval("deny", call.id)
+
+        resume = server.control._turn_task
+        assert resume is not None
+        await await_or_fail(resume, what="denied approval recovery")
+        await _request(reader, writer, 3, "send", {"text": "continue"})
+        await _frames_until_event(reader, "agent_end")
+        assert any(
+            message.tool_result is not None
+            and message.tool_result.content == "tool execution denied"
+            for message in backend.calls[0][0]
+        )
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

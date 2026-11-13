@@ -205,6 +205,7 @@ class ConversationStore(
             # ((head_seq, head_id), snapshot); memoizes the resident approval
             # projection read by the `*_now` seam. None until the first read.
             self._approval_now_cache = None
+            self._pending_approval_executions = {}
             self._owner_thread_id: int | None = None
             self._transcript_generation = 0
             self._initialize_async_writes()
