@@ -79,7 +79,9 @@ class ProjectInboxScanner:
         signature = self._generation_signature()
         if self._signature is not None and signature == self._signature:
             return None, ()
-        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
+        message_ids = self.inbox.new_ids(
+            self.project_id, session_id=self.session_id, wait=False
+        )
         sent = self.scan_sent()
         # Commit the pre-scan generation; a mutation during the scan only causes
         # one extra conservative rescan on the next poll.
@@ -100,7 +102,9 @@ class ProjectInboxScanner:
         current = self._directory_fingerprint()
         if self._fingerprint is not None and current == self._fingerprint:
             return None
-        message_ids = self.inbox.new_ids(self.project_id, session_id=self.session_id)
+        message_ids = self.inbox.new_ids(
+            self.project_id, session_id=self.session_id, wait=False
+        )
         self._fingerprint = (
             current
             if any(item is not None for item in current)

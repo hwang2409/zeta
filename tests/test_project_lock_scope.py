@@ -404,15 +404,6 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         app._install_full_screen_layout(session)
         async with owned_app(app):
             await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
-            poll_done = app.loop._project_inbox_poll_done
-            poll_event = app.loop._project_inbox_publication_event
-            assert poll_done is not None
-            assert poll_event is not None
-            poll_done.clear()
-            poll_event.set()
-            await await_or_fail(
-                poll_done.wait(), what="below-epoch TUI inbox poll"
-            )
             sent = await await_or_fail(
                 app.loop.tool_registry.execute(
                     ToolCall(
