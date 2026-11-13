@@ -35,6 +35,8 @@ from .core.session_files import (
     descend_directory,
     open_session_file,
     read_reference_generation,
+    reference_publication,
+    session_directory,
     unlink_session_file,
 )
 from .core.session_links import valid_child_pending_link, valid_pending_link
@@ -105,6 +107,20 @@ def write_retention_pin(directory_fd: int) -> None:
 def remove_retention_pin(directory_fd: int) -> None:
     """Remove the pin sidecar; an absent sidecar is already unpinned."""
     unlink_session_file(directory_fd, RETENTION_PIN_FILENAME)
+
+
+def set_retention_pin(home: str | Path, session_id: str, lease: WriterLease, *, pinned: bool) -> str:
+    """Pin or unpin one root in one off-loop reference transaction."""
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+        return "retention pins unavailable: upgrade the home before pinning"
+    with reference_publication(Path(home), lease, installed_ids=(session_id,)), session_directory(
+        Path(home) / "sessions", session_id, lifetime=True
+    ) as (_root_fd, session_fd):
+            if pinned:
+                write_retention_pin(session_fd)
+                return "session pinned"
+            remove_retention_pin(session_fd)
+            return "session unpinned"
 
 
 _STATE_FILENAME = "retention-state.json"

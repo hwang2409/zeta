@@ -45,6 +45,7 @@ from ...project_registry import ProjectRegistryError
 from ...protocol.types import StreamEvent, StreamEventType
 from ...providers.factory import build_backend
 from ...runtime.status import capture_slash_status
+from ...session_retention import set_retention_pin
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -543,6 +544,28 @@ class SlashHandlerMixin:
         self._accounts_picker_unit = None
         if unit is not None:
             self._transcript.remove(unit, leading_blank=True)
+
+    async def slash_pin(self, args: str) -> str:
+        if args.strip():
+            return "usage: /pin"
+        return await asyncio.to_thread(
+            set_retention_pin,
+            self._zeta_home or env_home(),
+            self.loop.store.session_id,
+            self.loop.store._storage_lease,
+            pinned=True,
+        )
+
+    async def slash_unpin(self, args: str) -> str:
+        if args.strip():
+            return "usage: /unpin"
+        return await asyncio.to_thread(
+            set_retention_pin,
+            self._zeta_home or env_home(),
+            self.loop.store.session_id,
+            self.loop.store._storage_lease,
+            pinned=False,
+        )
 
     async def slash_model(self, args: str) -> str:
         """Pick a model from a card, or switch straight to a named one."""

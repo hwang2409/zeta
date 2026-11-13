@@ -41,6 +41,7 @@ from ..project_inbox import InboxError, ProjectInbox
 from ..project_memory_commands import run_memory_command
 from ..project_registry import ProjectRegistryError
 from ..runtime.status import capture_slash_status
+from ..session_retention import set_retention_pin
 from .handlers import validation
 from .model_selection import apply as apply_settings
 from .protocol import (
@@ -114,6 +115,30 @@ class ServerSlashSession:
         self.slash_lock = SlashLock() if slash_lock is None else slash_lock
 
     # --- runnable server-side ---
+
+    async def slash_pin(self, args: str) -> str:
+        if args.strip():
+            return "usage: /pin"
+        _loop, opened = self._active_loop_and_session()
+        return await asyncio.to_thread(
+            set_retention_pin,
+            self._runtime.home,
+            opened.metadata.session_id,
+            self._runtime.manager._storage_lease,
+            pinned=True,
+        )
+
+    async def slash_unpin(self, args: str) -> str:
+        if args.strip():
+            return "usage: /unpin"
+        _loop, opened = self._active_loop_and_session()
+        return await asyncio.to_thread(
+            set_retention_pin,
+            self._runtime.home,
+            opened.metadata.session_id,
+            self._runtime.manager._storage_lease,
+            pinned=False,
+        )
 
     async def slash_decisions(self, args: str) -> str:
         _loop, opened = self._active_loop_and_session()
