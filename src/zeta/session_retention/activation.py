@@ -179,6 +179,8 @@ class RetentionActivationOwner:
         failure: Exception | None = None
         planner = None
         try:
+            if self._home is not None and not (self._home / "retention-arm.json").is_file():
+                return projections, None
             planner = self._planner_factory()
             self._planner = planner
             self._planner_closed.clear()
