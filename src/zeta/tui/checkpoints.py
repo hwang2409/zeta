@@ -662,8 +662,12 @@ class CheckpointTranscriptMixin:
             ),
         )
         entries = tuple(unit.value for page in pages for unit in page.units)
-        for _ in self._render_history_entries(entries, rendered_notifications):
-            pass
+        self._rendering_history = True
+        try:
+            for _ in self._render_history_entries(entries, rendered_notifications):
+                pass
+        finally:
+            self._rendering_history = False
         if self._live_renderables:
             self._transcript.adopt_units(tuple(self._live_renderables))
         marker_write = self._persist_rendered_notifications(

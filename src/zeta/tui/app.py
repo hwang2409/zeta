@@ -274,6 +274,7 @@ class TUIApp(
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._history_rebuild_tasks: set[asyncio.Task[None]] = set()
         self._live_renderables: list[RenderableType] = []
+        self._rendering_history = False
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
@@ -889,7 +890,8 @@ class TUIApp(
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
         if renderable is not None:
-            self._live_renderables.append(renderable)
+            if not self._rendering_history:
+                self._live_renderables.append(renderable)
             self._transcript.append(renderable)
 
     def _print(self, renderable: RenderableType | None) -> None:
