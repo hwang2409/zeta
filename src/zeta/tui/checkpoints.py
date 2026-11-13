@@ -638,6 +638,8 @@ class CheckpointTranscriptMixin:
         if not page.units or self._exit_requested:
             return
         self._render_resident_history()
+        if self._history_marker_tasks:
+            await asyncio.gather(*tuple(self._history_marker_tasks))
         self._invalidate_prompt()
 
     def _render_resident_history(self) -> None:

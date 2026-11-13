@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Callable, Mapping
+import sqlite3
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -13,7 +15,10 @@ from ...protocol.types import (
     ASSISTANT_RESPONSE_FAILED,
     ASSISTANT_RESPONSE_STATE,
     MESSAGE_ORIGIN_METADATA,
+    Message,
     MessageOrigin,
+    ToolUseContent,
+    assistant_text,
 )
 from ...storage_format import reject_unknown_keys
 from ._async_writes import _AppendTurnEndCommand
@@ -224,3 +229,127 @@ class RecentRowsMixin:
         """
         self._assert_owner_thread()
         return self._reset_generation
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS message_search ("
+        "entry_seq INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, text TEXT NOT NULL)"
+    )
+
+
+def write_text(
+    connection: sqlite3.Connection,
+    seq: int,
+    entry_id: str,
+    data: Mapping[str, object],
+) -> None:
+    try:
+        message = Message.from_dict(data["message"])
+    except (KeyError, TypeError, ValueError):
+        return
+    parts = [assistant_text(message)]
+    for content in message.content:
+        if isinstance(content, ToolUseContent):
+            parts.extend(
+                (
+                    content.tool_call.name,
+                    json.dumps(content.tool_call.arguments, sort_keys=True),
+                )
+            )
+    if message.tool_result is not None:
+        parts.append(str(message.tool_result.content))
+    connection.execute(
+        "INSERT INTO message_search(entry_seq,entry_id,text) VALUES(?,?,?)",
+        (seq, entry_id, "\n".join(parts).casefold()),
+    )
+
+
+def search(
+    connection: sqlite3.Connection, query: str, limit: int
+) -> tuple[str, ...]:
+    pattern = (
+        "%"
+        + query.casefold()
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+        + "%"
+    )
+    rows = connection.execute(
+        "SELECT entry_id FROM message_search "
+        "WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE "
+        "ORDER BY entry_seq DESC LIMIT ?",
+        (pattern, limit),
+    ).fetchall()
+    return tuple(row[0] for row in rows)
+
+
+def history_index_suffix_start(
+    stored: Mapping[str, object],
+    expected: Mapping[str, object],
+    rows: Sequence[object],
+    *,
+    schema_version: int,
+    row: Callable[[object], tuple[int, str, str | None, str, str, str]],
+    digest_entry: Callable[[bytes, object], bytes],
+) -> int | None:
+    if stored.get("schema_version") != schema_version or any(
+        stored.get(key) != expected.get(key)
+        for key in ("st_dev", "st_ino", "repair_generation")
+    ):
+        return None
+    stored_boundary = stored.get("byte_boundary")
+    expected_boundary = expected.get("byte_boundary")
+    if (
+        not isinstance(stored_boundary, int)
+        or not isinstance(expected_boundary, int)
+        or stored_boundary > expected_boundary
+    ):
+        return None
+    start = stored.get("last_seq")
+    if not isinstance(start, int) or not 0 <= start <= len(rows):
+        return None
+    boundary = rows[start - 1] if start else None
+    if stored.get("last_id") != (row(boundary)[1] if boundary else None):
+        return None
+    if stored.get("last_parent") != (row(boundary)[2] if boundary else None):
+        return None
+    digest_hex = stored.get("prefix_digest")
+    if not isinstance(digest_hex, str):
+        return None
+    try:
+        digest = bytes.fromhex(digest_hex)
+    except ValueError:
+        return None
+    suffix = rows[start:]
+    if not suffix:
+        return None
+    parent_id = stored.get("last_id")
+    for entry in suffix:
+        projected = row(entry)
+        if projected[2] != parent_id:
+            return None
+        parent_id = projected[1]
+        digest = digest_entry(digest, entry)
+    return start if digest.hex() == expected.get("prefix_digest") else None
+
+
+def project_history_entries(
+    entries: tuple[object, ...],
+    total: int,
+    tui_total: int,
+    *,
+    data: Callable[[object], Mapping[str, object]],
+    belongs: Callable[[str, Mapping[str, object]], bool],
+    starts: Callable[[str, Mapping[str, object]], bool],
+) -> tuple[list[tuple[object, int | None, int]], int, int]:
+    projected: list[tuple[object, int | None, int]] = []
+    for entry in entries:
+        entry_data = data(entry)
+        group = total if belongs(entry.type, entry_data) else None
+        projected.append((entry, group, tui_total))
+        tui_total += 1
+        if starts(entry.type, entry_data):
+            total += 1
+    return projected, total, tui_total

@@ -16,15 +16,13 @@ from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
 from ...protocol.types import (
-    Message,
     ToolCall,
-    ToolUseContent,
-    assistant_text,
     is_passive_harness_message,
     is_visible_harness_notice,
 )
 from ..checkpoints import ConversationEntry
 from ..transcript_recovery import recovery_status
+from . import _row_history
 
 _HISTORY_PAGE_ATTEMPTS = 16
 
@@ -248,10 +246,7 @@ class HistoryIndex:
             "CREATE INDEX IF NOT EXISTS message_tool_calls_lookup "
             "ON message_tool_calls(call_id,entry_seq)"
         )
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS message_search ("
-            "entry_seq INTEGER PRIMARY KEY, entry_id TEXT NOT NULL, text TEXT NOT NULL)"
-        )
+        _row_history.create_schema(connection)
         connection.execute(
             "CREATE TABLE IF NOT EXISTS active_approval_requests ("
             "request_id TEXT PRIMARY KEY, request_seq INTEGER NOT NULL, "
@@ -345,7 +340,7 @@ class HistoryIndex:
                     )
                     if active and entry_type == "message":
                         self._write_tool_calls(connection, seq, entry_id, data)
-                        self._write_search_text(connection, seq, entry_id, data)
+                        _row_history.write_text(connection, seq, entry_id, data)
                         for approval in data.get("approval_requests", ()):
                             connection.execute(
                                 "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -384,79 +379,17 @@ class HistoryIndex:
         expected: Mapping[str, object],
         rows: Sequence[object],
     ) -> int | None:
-        if stored.get("schema_version") != self.SCHEMA_VERSION or any(
-            stored.get(key) != expected.get(key)
-            for key in ("st_dev", "st_ino", "repair_generation")
-        ):
-            return None
-        stored_boundary = stored.get("byte_boundary")
-        expected_boundary = expected.get("byte_boundary")
-        if (
-            not isinstance(stored_boundary, int)
-            or not isinstance(expected_boundary, int)
-            or stored_boundary > expected_boundary
-        ):
-            return None
-        start = stored.get("last_seq")
-        if not isinstance(start, int) or not 0 <= start <= len(rows):
-            return None
-        boundary = rows[start - 1] if start else None
-        if stored.get("last_id") != (self._row(boundary)[1] if boundary else None):
-            return None
-        if stored.get("last_parent") != (self._row(boundary)[2] if boundary else None):
-            return None
-        digest_hex = stored.get("prefix_digest")
-        if not isinstance(digest_hex, str):
-            return None
-        try:
-            digest = bytes.fromhex(digest_hex)
-        except ValueError:
-            return None
-        suffix = rows[start:]
-        if not suffix:
-            return None
-        parent_id = stored.get("last_id")
-        for entry in suffix:
-            row = self._row(entry)
-            if row[2] != parent_id:
-                return None
-            parent_id = row[1]
-            digest = self._entry_digest(digest, entry)
-        return start if digest.hex() == expected.get("prefix_digest") else None
+        return _row_history.history_index_suffix_start(
+            stored, expected, rows, schema_version=self.SCHEMA_VERSION,
+            row=self._row, digest_entry=self._entry_digest,
+        )
 
     def _project_entries(
         self, entries: tuple[object, ...], total: int, tui_total: int
     ) -> tuple[list[tuple[object, int | None, int]], int, int]:
-        projected: list[tuple[object, int | None, int]] = []
-        for entry in entries:
-            data = dict(entry.data)
-            group = total if self._belongs_in_history(entry.type, data) else None
-            projected.append((entry, group, tui_total))
-            tui_total += 1
-            if self._starts_next_group(entry.type, data):
-                total += 1
-        return projected, total, tui_total
-
-    @staticmethod
-    def _write_search_text(
-        connection: sqlite3.Connection,
-        seq: int,
-        entry_id: str,
-        data: Mapping[str, object],
-    ) -> None:
-        try:
-            message = Message.from_dict(data["message"])
-        except (KeyError, TypeError, ValueError):
-            return
-        text = assistant_text(message)
-        for block in message.content:
-            if isinstance(block, ToolUseContent):
-                text += f"\n{block.tool_call.name} {block.tool_call.arguments}"
-        if message.tool_result is not None:
-            text = f"{text}\n{message.tool_result.content}"
-        connection.execute(
-            "INSERT INTO message_search(entry_seq,entry_id,text) VALUES(?,?,?)",
-            (seq, entry_id, text.casefold()),
+        return _row_history.project_history_entries(
+            entries, total, tui_total, data=lambda entry: dict(entry.data),
+            belongs=self._belongs_in_history, starts=self._starts_next_group,
         )
 
     def _write_tool_calls(
@@ -494,7 +427,7 @@ class HistoryIndex:
             data = dict(entry.data)
             if entry.type == "message":
                 self._write_tool_calls(connection, entry.seq, entry.id, data)
-                self._write_search_text(connection, entry.seq, entry.id, data)
+                _row_history.write_text(connection, entry.seq, entry.id, data)
                 for approval in data.get("approval_requests", ()):
                     connection.execute(
                         "INSERT OR REPLACE INTO approval_calls(request_id,tool_call) VALUES(?,?)",
@@ -765,8 +698,6 @@ class HistoryIndex:
                     connection.close()
 
     def tui_page(self, request: object, g0: object) -> IndexedHistoryPage:
-        """Return one physical-row page for bounded TUI replay."""
-
         with self._lock:
             self._check_open()
             connection = self._connection(write=False)
@@ -815,8 +746,6 @@ class HistoryIndex:
     def tui_search(
         self, query: str, limit: int, g0: object
     ) -> tuple[str, ...]:
-        """Return newest visible-message ids containing a literal query."""
-
         with self._lock:
             self._check_open()
             connection = self._connection(write=False)
@@ -827,26 +756,13 @@ class HistoryIndex:
                     stored.get(key) != value for key, value in requested.items()
                 ):
                     raise StaleHistorySnapshot
-                pattern = (
-                    "%"
-                    + query.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    + "%"
-                )
-                rows = connection.execute(
-                    "SELECT entry_id FROM message_search "
-                    "WHERE text LIKE ? ESCAPE '\\' COLLATE NOCASE "
-                    "ORDER BY entry_seq DESC LIMIT ?",
-                    (pattern, limit),
-                ).fetchall()
-                return tuple(row[0] for row in rows)
+                return _row_history.search(connection, query, limit)
             finally:
                 connection.close()
 
     def tool_call_dependency(
         self, call_id: str, before_seq: int, g0: object
     ) -> ConversationEntry | None:
-        """Return the nearest preceding active-chain occurrence for TUI replay."""
-
         with self._lock:
             self._check_open()
             connection = self._connection(write=False)
@@ -1313,8 +1229,6 @@ class HistoryPageStoreMixin:
     def tui_history_index_page(
         self: ConversationStore, request: Mapping[str, object]
     ) -> IndexedHistoryPage | None:
-        """Read one stable physical-row page for the root TUI."""
-
         index = self._history_index
         if self._closed:
             return None

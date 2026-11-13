@@ -270,6 +270,7 @@ class TUIApp(
         self._history_source = RootTUIHistorySource(self.loop.store)
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        self._history_prompt_task: asyncio.Task[None] | None = None
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
@@ -678,8 +679,12 @@ class TUIApp(
 
     def _finder_input(self, query: str) -> None:
         FinderRuntimeMixin._finder_input(self, query)
-        if self._history_search_task is not None:
-            self._history_search_task.cancel()
+        history_pager = getattr(self, "_history_pager", None)
+        if history_pager is None:
+            return
+        history_search_task = getattr(self, "_history_search_task", None)
+        if history_search_task is not None:
+            history_search_task.cancel()
         if (
             not query
             or self._agent_navigation.child_view_active
@@ -688,16 +693,16 @@ class TUIApp(
             return
 
         async def reveal_match() -> None:
-            matches = await self._history_pager.search(query)
+            matches = await history_pager.search(query)
             resident = {
                 unit.entry_id
-                for page in self._history_pager.pages
+                for page in history_pager.pages
                 for unit in page.units
             }
             target = next((entry_id for entry_id in matches if entry_id not in resident), None)
             if target is None or not self._transcript.finder_active:
                 return
-            await self._history_pager.reveal(target)
+            await history_pager.reveal(target)
             self._render_resident_history()
             request = self._transcript.open_finder()
             self._active_finder = self._transcript
@@ -708,11 +713,17 @@ class TUIApp(
         self._history_search_task = asyncio.create_task(reveal_match())
 
     async def _close_history_search(self) -> None:
-        task = self._history_search_task
-        if task is not None:
+        tasks = tuple(
+            task
+            for task in (self._history_search_task, self._history_prompt_task)
+            if task is not None
+        )
+        for task in tasks:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._history_search_task = None
+        self._history_prompt_task = None
 
     async def _close_history_markers(self) -> None:
         tasks = tuple(self._history_marker_tasks)
@@ -720,18 +731,21 @@ class TUIApp(
             await asyncio.gather(*tasks)
 
     def _history_finder_open(self, buffer: Any) -> None:
-        if self._agent_navigation.child_view_active:
+        prompt_history = getattr(self, "_prompt_history", None)
+        if self._agent_navigation.child_view_active or prompt_history is None:
+            FinderRuntimeMixin._history_finder_open(self, buffer)
+            return
+        path = self._viewed_session_path()
+        prompt_history.bind(path, self._history_source)
+        if prompt_history.snapshot(path):
             FinderRuntimeMixin._history_finder_open(self, buffer)
             return
 
         async def load() -> None:
-            self._prompt_history.bind(
-                self._viewed_session_path(), self._history_source
-            )
-            await self._prompt_history.load_older()
+            await prompt_history.load_older()
             FinderRuntimeMixin._history_finder_open(self, buffer)
 
-        asyncio.create_task(load())
+        self._history_prompt_task = asyncio.create_task(load())
 
     def _history_previous(self, buffer: Any) -> None:
         path = self._viewed_session_path()
