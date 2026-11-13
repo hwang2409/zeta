@@ -1081,6 +1081,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             tool_call, prepared=_pending_execution_claimed
         )
         if claim_error is not None:
+            if claim_error[1] == "duplicate_tool_execution":
+                await self._session_store.wait_pending_approval_execution(tool_call.id)
+                if (result := self._session_store.tool_result(tool_call.id)) is not None:
+                    return await finalize(_legacy_result(result))
             return await finalize(_error_result(claim_error[0], kind=claim_error[1]))
         current = self._current_execution(tool_call)
         if isinstance(current, dict):
