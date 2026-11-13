@@ -175,7 +175,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
             watchdog_events.append(("start", session_id))
             return Watchdog()
 
-        monkeypatch.setattr("zeta.tui.app.start_tui_stall_watchdog", start_watchdog)
+        monkeypatch.setattr("zeta.tui.prompt_runtime.start_tui_stall_watchdog", start_watchdog)
 
         class Loop:
             store = SimpleNamespace(session_id="test-session")
@@ -264,7 +264,7 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
                 pass
 
         monkeypatch.setattr(
-            "zeta.tui.app.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
+            "zeta.tui.prompt_runtime.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
         )
 
         class Loop:
@@ -358,7 +358,7 @@ def test_fork_suspend_continues_after_failed_draft_save(
             return None
 
         monkeypatch.setattr(
-            "zeta.tui.app.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
+            "zeta.tui.prompt_runtime.start_tui_stall_watchdog", lambda *a, **k: Watchdog()
         )
         app.loop = Loop()
         app._zeta_home = None

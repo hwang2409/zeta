@@ -60,6 +60,7 @@ import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
 import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
+import zeta.tui.prompt_runtime as prompt_runtime_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
 from tests.support.completion import completion_control
@@ -119,12 +120,8 @@ from zeta.tui.agent_card import (
     AgentTranscriptControl,
     read_agent_transcript,
 )
-from zeta.tui.app import (
-    FullScreenPromptSession,
-    TUIApp,
-    background_notice,
-    build_backend,
-)
+from zeta.tui.app import FullScreenPromptSession, TUIApp, build_backend
+from zeta.tui.bootstrap import background_notice
 from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
@@ -7592,7 +7589,7 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ticks = iter((10.0, 10.25))
-    monkeypatch.setattr("zeta.tui.app.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("zeta.tui.stream_events.time.monotonic", lambda: next(ticks))
     output = StringIO()
     app = TUIApp(
         AgentLoop(
@@ -8162,7 +8159,7 @@ def test_completed_message_replaces_streaming_unit_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.stream_events.render_markdown", spy)
     app._consume_text(
         StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent(source))
     )
@@ -8203,7 +8200,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.app.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.stream_events.render_markdown", spy)
     before = "**before tool**"
     after = "**after tool**"
     events = [
@@ -8762,7 +8759,7 @@ async def test_exit_during_activation_keeps_accepted_input_in_draft(
         return None
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_exit)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", type_then_exit)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -8812,7 +8809,7 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
         raise RuntimeError("render crash")
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", type_then_crash)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", type_then_crash)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -8871,7 +8868,7 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         return None
 
     monkeypatch.setattr(app.loop, "activate", blocked_activation)
-    monkeypatch.setattr(tui_app_module, "run_prompt_toolkit", waiting_prompt)
+    monkeypatch.setattr(prompt_runtime_module, "run_prompt_toolkit", waiting_prompt)
     with create_pipe_input() as pipe:
         session = FullScreenPromptSession(
             input=pipe,
@@ -9020,7 +9017,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import zeta.agent.background_lifecycle
-    from zeta.tui import app as tui_app
+    from zeta.tui import prompt_runtime as prompt_runtime_module
 
     root = ConversationStore(tmp_path / "sessions")
     for number in range(1, 4):
@@ -9054,13 +9051,13 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     recovery_release = threading.Event()
     activation_cancelled = asyncio.Event()
     recover_agent_children = zeta.agent.background_lifecycle._recover_agent_children
-    cancel_activation = tui_app.cancel_activation
+    cancel_activation = prompt_runtime_module.cancel_activation
 
     async def observed_cancel_activation(task: asyncio.Task[None]) -> None:
         activation_cancelled.set()
         await cancel_activation(task)
 
-    monkeypatch.setattr(tui_app, "cancel_activation", observed_cancel_activation)
+    monkeypatch.setattr(prompt_runtime_module, "cancel_activation", observed_cancel_activation)
 
     recovery_steps = 0
     gated_once = False
@@ -9096,7 +9093,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         resumed=True,
     )
     monkeypatch.setattr(
-        "zeta.tui.app.start_tui_stall_watchdog", lambda *args, **kwargs: None
+        "zeta.tui.prompt_runtime.start_tui_stall_watchdog", lambda *args, **kwargs: None
     )
 
     with create_pipe_input() as pipe:
