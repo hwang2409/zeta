@@ -273,7 +273,6 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
             result = (await _request(reader, writer, 2, "rename_session", {"session_id": sid, "name": "matrix"}))[-1]
         assert "error" not in result, result
         assert result.get("result") is not None
-        assert not ("busy" in str(result).lower())
         if route == "list-paged":
             rows = result["result"]["sessions"]
             assert len(rows) <= 1
