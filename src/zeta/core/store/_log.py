@@ -98,6 +98,7 @@ class _DetachedLogState:
 class _PhysicalRow:
     row_number: int
     byte_offset: int
+    length: int
     prefix_digest: str
     value: dict[str, Any] | None
     terminated: bool
@@ -233,7 +234,9 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
-        self.state._resident_rows.append(entry)
+        self.state._resident_rows.append(
+            entry, offset=row.byte_offset, length=row.length
+        )
         self.by_id[entry.id] = entry
         self.rows_by_id[entry.id] = row
         self.state._entry_ids.add(entry.id)
@@ -335,6 +338,7 @@ class _FullLoadValidator:
             for attribute in self._STATE_ATTRIBUTES:
                 setattr(self.store, attribute, getattr(self.state, attribute))
             self.store._resident_rows = self.state._resident_rows
+            self.store._resident_rows.bind_source(self.store.directory_fd)
 
     @property
     def resets_resident_rows(self) -> bool:
@@ -742,6 +746,7 @@ class ConversationLogMixin:
                 row = _PhysicalRow(
                     raw_row.row_number,
                     raw_row.byte_offset,
+                    len(raw_row.data),
                     raw_row.prefix_digest,
                     None,
                     raw_row.terminated,
@@ -777,6 +782,7 @@ class ConversationLogMixin:
             row = _PhysicalRow(
                 raw_row.row_number,
                 raw_row.byte_offset,
+                len(raw_row.data),
                 raw_row.prefix_digest,
                 value if isinstance(value, dict) else None,
                 raw_row.terminated,

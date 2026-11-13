@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from ...agent.receipt import encode_json
 
 from ...protocol.types import Message, is_passive_harness_message
-from ..checkpoints import ConversationEntry, ConversationIntegrityError
+from ..checkpoints import ConversationEntry, ConversationIntegrityError, load_session_json
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -154,14 +154,18 @@ class ResidentRows:
         self.payload_cache_bytes = int(os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", 16 * 1024 * 1024))
         self.resident_payload_bytes = 0
         self.branch: list[ConversationEntry] = []
+        self._source_dir_fd: int | None = None
         self.replace(entries)
 
-    def append(self, entry: ConversationEntry) -> None:
+    def bind_source(self, directory_fd: int) -> None:
+        self._source_dir_fd = directory_fd
+
+    def append(self, entry: ConversationEntry, *, offset: int = 0, length: int = 0) -> None:
         previous = self.entries[-1] if self.entries else None
         self.entries.append(entry)
         self._by_id[entry.id] = entry
-        size = len(encode_json(entry.to_dict()))
-        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, 0, size, row_facts(entry))
+        size = length or len(encode_json(entry.to_dict()))
+        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, offset, size, row_facts(entry))
         self.rows.append(row)
         self.payloads[entry.seq] = entry
         self._payload_lru[entry.seq] = size
@@ -269,6 +273,18 @@ class ResidentRows:
 
     def entry(self, ref: RowRef) -> ConversationEntry:
         entry = self.payloads.get(ref.seq) or self._by_id.get(ref.id)
+        if entry is None and self._source_dir_fd is not None and ref.length:
+            fd = os.open("conversation.jsonl", os.O_RDONLY, dir_fd=self._source_dir_fd)
+            try:
+                raw = os.pread(fd, ref.length, ref.offset)
+            finally:
+                os.close(fd)
+            value = load_session_json(raw)
+            entry = ConversationEntry.from_dict(value)
+            self.payloads[ref.seq] = entry
+            self._payload_lru[ref.seq] = ref.length
+            self.resident_payload_bytes += ref.length
+            self._trim_payload_cache()
         if entry is None or entry.seq != ref.seq:
             raise KeyError(ref.seq)
         if ref.seq in self._payload_lru:
