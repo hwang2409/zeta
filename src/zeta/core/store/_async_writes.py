@@ -660,7 +660,7 @@ class AsyncDurableWritesMixin:
                 self._reset_generation,
                 lambda: self._reset_generation,
             )
-            self._entry_ids = {entry.id for entry in entries}
+            self._entry_ids = {ref.id for ref in self._resident_rows.rows}
         elif entries:
             self._before_incremental_state_install()
             if delta._resident_patch.raw_entries:
@@ -692,7 +692,7 @@ class AsyncDurableWritesMixin:
         self._log_offset = cursor.offset
         self._log_mtime_ns = cursor.mtime_ns
         self._log_prefix_fingerprint = cursor.prefix_fingerprint
-        if entries:
+        if entries or delta._resident_patch.replace_entries:
             self._transcript_generation += 1
         return (
             "reset"
@@ -740,14 +740,11 @@ class AsyncDurableWritesMixin:
         )
         if current == baseline.cursor:
             return None
-        entries_to_install = writer._owned_installed_delta(
-            tuple(writer._resident_rows.stream_rows(writer._resident_rows.rows))
-        )
         return CommittedDelta(
             generation_before=baseline.generation,
             generation_after=writer.conversation_generation,
             committed_entries=(),
-            entries_to_install=entries_to_install,
+            entries_to_install=(),
             _resident_patch=_ResidentPatch(
                 {field: copy.deepcopy(getattr(writer, field)) for field in _PATCH_FIELDS},
                 baseline.patch,

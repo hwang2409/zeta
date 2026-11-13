@@ -770,7 +770,9 @@ class ConversationStore(
         finally:
             self._write_deadline = previous_deadline
         if linear:
-            self._apply_history_index_entries((entry,))
+            self._apply_history_index_entries(
+                (entry,), rebuild_unavailable=deadline is None
+            )
         # A fork is rebuilt by _sync_history_index below: skipping the
         # incremental apply leaves the stored boundary behind, so the sync
         # detects the non-contiguous tail and fully rebuilds the active branch.

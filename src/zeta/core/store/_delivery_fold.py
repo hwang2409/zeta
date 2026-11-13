@@ -46,6 +46,7 @@ class DeliveryFold:
         "presented",
         "prompt_ids",
         "prompt_messages",
+        "queue_closed",
         "tool_result_receipts",
         "tool_result_seqs",
     )
@@ -63,6 +64,7 @@ class DeliveryFold:
         self.prompt_ids: set[str] = set()
         self.active_prompts: dict[str, ConversationEntry] = {}
         self.prompt_messages: dict[str, Message] = {}
+        self.queue_closed = False
         self.delivery_message: Message | None = None
         self.last_message: Message | None = None
         self.last_turn_end: ConversationEntry | None = None
@@ -107,6 +109,7 @@ class DeliveryFold:
         new.prompt_ids = set(self.prompt_ids)
         new.active_prompts = dict(self.active_prompts)
         new.prompt_messages = dict(self.prompt_messages)
+        new.queue_closed = self.queue_closed
         new.delivery_message = self.delivery_message
         new.last_message = self.last_message
         new.last_turn_end = self.last_turn_end
@@ -160,6 +163,8 @@ class DeliveryFold:
         elif entry_type == "pending_prompt":
             self.prompt_ids.add(entry.id)
             self.active_prompts[entry.id] = entry
+        elif entry_type == "pending_queue_closed":
+            self.queue_closed = True
         elif entry_type == "pending_prompt_ack":
             prompt_id = entry.data.get("prompt_id")
             if prompt_id not in self.prompt_ids:

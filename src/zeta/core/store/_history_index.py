@@ -1325,6 +1325,7 @@ class HistoryPageStoreMixin:
         entries: tuple[ConversationEntry, ...],
         *,
         leave_stale_on_loop: bool = False,
+        rebuild_unavailable: bool = True,
     ) -> None:
         if self._history_index is None or not entries:
             return
@@ -1336,7 +1337,7 @@ class HistoryPageStoreMixin:
             if not leave_stale_on_loop:
                 self._history_index._mark_unavailable()
             return
-        if not self._history_index.available:
+        if not self._history_index.available and rebuild_unavailable:
             self._sync_history_index(
                 self.entry(ref) for ref in self.branch_refs()
             )
