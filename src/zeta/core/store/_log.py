@@ -351,6 +351,7 @@ class _FullLoadValidator:
             )
         if self.state._resident_rows.rows:
             self._select_branch(self.state._resident_rows.rows[-1])
+        self.state._resident_rows._rebalance_resident()
         self.state._rebuild_client_deliveries(iter(self._client_delivery_entries))
         if install:
             if self.resets_resident_rows:

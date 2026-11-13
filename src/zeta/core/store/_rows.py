@@ -390,12 +390,6 @@ class ResidentRows:
             self._context_refs.append(row)
             self._pinned.add(row.seq)
             self._payload_lru.pop(row.seq, None)
-            if len(self._branch_refs) > self._RECENT_WINDOW:
-                stale = self._branch_refs[-self._RECENT_WINDOW - 1]
-                if stale.type != "compaction":
-                    self._pinned.discard(stale.seq)
-                    if stale.seq in self.payloads:
-                        self._payload_lru[stale.seq] = self._payload_sizes[stale.seq]
             self._trim_payload_cache()
 
     def extend(

@@ -151,6 +151,7 @@ def test_resident_payloads_stay_bounded_after_compaction() -> None:
             )
         )
         parent_id = entry_id
+    rows._rebalance_resident()
 
     # test-contract: seam covered and uncovered turns stay in context without retaining their payloads
     assert sum(ref.type == "message" for ref in rows.context_refs()) == 1200
