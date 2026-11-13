@@ -98,6 +98,7 @@ _RAW_DELETION = {
     ("core/session_files.py", "write_session_file_if_absent", "unlink"),
     ("core/session_links.py", "_remove_entry", "unlink"),
     ("core/store/_history_index.py", "_remove_file", "unlink"),
+    ("tui/stderr_capture.py", "_open_capture", "unlink"),
     ("tui/stderr_capture.py", "_retain_logs", "unlink"),
     ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
