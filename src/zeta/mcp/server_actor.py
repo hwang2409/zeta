@@ -451,6 +451,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         preserve_degraded = self._status.state == "degraded"
         if message.kind == "manual" and self._client is not None:
             old_client = self._client
+            self._tool_refresh.cancel()
             self._client = None
             self._tools = ()
             self._prompts = ()
@@ -464,6 +465,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                     stderr_log_path=str(mcp_log_path(self.name)),
                 )
             )
+            self._tool_refresh.settle()
             self._schedule_close(old_client)
         setup_generation = self._generation + 1
         operation = _Operation(
@@ -793,6 +795,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         client = self._client
         if client is None:
             return
+        self._tool_refresh.cancel()
         self._client = None
         self._prompts = ()
         self._unregister_tools(keep_primary=True)
@@ -809,6 +812,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 next_retry_at=time.monotonic(),
             )
         )
+        self._tool_refresh.settle()
 
     def _handle_call(self, request: _CallRequest) -> None:
         if not self.config.allows_tool(request.tool_name) or not any(
@@ -1060,6 +1064,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self._publish_callback(self, terminal_status, None)
             except BaseException:  # noqa: BLE001 - finalization must complete
                 logger.exception("failed to publish terminal MCP state")
+        self._tool_refresh.settle()
         self._drain_queue()
         await self._shutdown_children()
         if result is not None:

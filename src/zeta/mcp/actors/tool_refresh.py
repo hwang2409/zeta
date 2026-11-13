@@ -57,7 +57,7 @@ class ToolRefreshActor:
             self._setup_client = None
         if self._setup_notification_client is client:
             self._setup_notification_client = None
-            self._settled.set()
+            self.settle()
 
     def notify(self, client: MCPClient, method: str) -> None:
         if method != "notifications/tools/list_changed":
@@ -105,13 +105,11 @@ class ToolRefreshActor:
             self._task = None
         if message.client is not owner._client or owner._status.state != "mounted":
             self._pending = False
-            self._settled.set()
             return
         try:
             tools = owner._filter_tools(message.task.result(), owner._notice_sink)
         except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
             self._pending = False
-            self._settled.set()
             owner._degrade_current(error_text(exc))
             return
         owner._unregister_tools()
@@ -135,12 +133,22 @@ class ToolRefreshActor:
             self._pending = False
             self.handle_changed(ToolsListChanged(message.client))
         else:
+            self.settle()
+
+    def cancel(self) -> asyncio.Task[list[MCPTool]] | None:
+        task = self._task
+        self._task = None
+        self._pending = False
+        if task is not None:
+            task.cancel()
+        return task
+
+    def settle(self) -> None:
+        self._pending = False
+        if not self._settled.is_set():
             self._settled.set()
 
     async def close(self) -> None:
-        self._settled.set()
-        if self._task is None:
-            return
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
-        self._task = None
+        task = self.cancel()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
