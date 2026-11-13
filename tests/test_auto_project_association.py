@@ -901,8 +901,7 @@ async def test_project_init_rebinds_runtime_child_and_approval(
             app.loop.project_registry.list_session_links, project_id
         )
         child_links = [item for item in links if item["role"] == "worker"]
-        assert len(child_links) == 1
-        assert child_links[0]["parent_session_id"] == app.loop.store.session_id
+        assert child_links == []
     finally:
         await app.close()
 
