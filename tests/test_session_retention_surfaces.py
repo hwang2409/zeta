@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,8 @@ from rich.text import Text
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _event, _request
+from zeta.core.session import SessionManager
+from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.server import ZetaServer
 from zeta.session_retention import (
     RetentionPlanner,
@@ -186,3 +191,101 @@ async def test_retention_policy_stays_preview_only_until_later_armed_pass(tmp_pa
     assert result.message == "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
     assert (home / "retention-arm.json").is_file()
     assert not list(home.glob("retention-quarantine*"))
+
+
+SERVE_RETENTION_STATES = ("idle", "mid-preview", "crashed", "armed-mid-pass")
+SERVE_RETENTION_ROUTES = ("resume", "resume-history-backward", "resume-approval-setup", "resume-yolo", "resume-corrupt-transcript", "resume-reconnect", "list-paged", "delete", "rename")
+
+
+def _retention_lock_path(home: Path, domain: str) -> Path:
+    return home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, domain)
+
+
+def _hold_retention_root(home_text: str, session_id: str, ready, command, crashed: bool) -> None:
+    home = Path(home_text)
+    active = os.open(_retention_lock_path(home, "planner-active"), os.O_RDWR)
+    root = os.open(home / "sessions" / session_id, os.O_RDONLY)
+    fcntl.flock(active, fcntl.LOCK_SH)
+    fcntl.flock(root, fcntl.LOCK_EX)
+    ready.send(True)
+    if crashed:
+        return
+    from zeta.session_retention.handshake import planner_request_pending
+
+    while not planner_request_pending(home) and not command.poll():
+        pass
+    fcntl.flock(root, fcntl.LOCK_UN)
+    fcntl.flock(active, fcntl.LOCK_UN)
+    os.close(root)
+    os.close(active)
+
+
+def _start_retention_holder(home: Path, session_id: str, *, crashed: bool = False):
+    lock_dir = home / ".domain-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    for domain in ("planner-active", "user-open-request"):
+        _retention_lock_path(home, domain).touch(exist_ok=True)
+    context = multiprocessing.get_context("spawn")
+    ready_recv, ready_send = context.Pipe(False)
+    command_recv, command_send = context.Pipe(False)
+    process = context.Process(
+        target=_hold_retention_root,
+        args=(str(home), session_id, ready_send, command_recv, crashed),
+    )
+    process.start()
+    assert ready_recv.recv()
+    return process, command_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_state", SERVE_RETENTION_STATES)
+@pytest.mark.parametrize("route", SERVE_RETENTION_ROUTES)
+async def test_real_serve_access_matrix_never_busy_or_partial(
+    tmp_path: Path, owner_state: str, route: str,
+) -> None:
+    """Every serve access keeps its normal result while preview owns a root."""
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    manager = SessionManager(home)
+    opened = await asyncio.to_thread(
+        lambda: manager.create(provider="codex", model="offline", cwd=tmp_path)
+    )
+    sid = opened.metadata.session_id
+    opened.store.close()
+    if owner_state == "armed-mid-pass":
+        (home / "retention-arm.json").write_text("{}\n")
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    holder = command = None
+    try:
+        await _hello(reader, writer, 1, features=["list_sessions_paging"])
+        if owner_state != "idle":
+            holder, command = _start_retention_holder(
+                home, sid, crashed=owner_state == "crashed"
+            )
+        if route == "resume" or route.startswith("resume-"):
+            result = (await _request(reader, writer, 2, "resume", {"session_id": sid}))[-1]
+        elif route == "list-paged":
+            result = (await _request(reader, writer, 2, "list_sessions", {"offset": 0, "limit": 1}))[-1]
+        elif route == "delete":
+            result = (await _request(reader, writer, 2, "delete_session", {"session_id": sid}))[-1]
+        else:
+            result = (await _request(reader, writer, 2, "rename_session", {"session_id": sid, "name": "matrix"}))[-1]
+        assert "error" not in result, result
+        assert result.get("result") is not None
+        assert not ("busy" in str(result).lower())
+        if route == "list-paged":
+            rows = result["result"]["sessions"]
+            assert len(rows) <= 1
+        if owner_state == "mid-preview":
+            assert holder is not None
+            assert not holder.is_alive()
+            if route == "list-paged":
+                assert sid in {row["session_id"] for row in rows}
+    finally:
+        if holder is not None and holder.is_alive():
+            command.send(True)
+            holder.join(10)
+        await close_serve(server, writer)
+        if holder is not None:
+            assert holder.exitcode == 0
