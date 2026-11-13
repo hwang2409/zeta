@@ -10,11 +10,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from uuid import uuid4
 
-from ..core.approval import (
-    ApprovalPolicy,
-    ApprovalRequest,
-    child_instance_in_subtree,
-)
+from ..core.approval import ApprovalPolicy, ApprovalRequest, child_instance_in_subtree
 from ..core.store import ConversationStore
 from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from . import approval_settlement, event_contract
@@ -640,8 +636,7 @@ class ApprovalLifecycle:
         settlements: list[asyncio.Task[object]] = []
         for key, record in tuple(self._state.records.items()):
             if not isinstance(key, tuple) or not child_instance_in_subtree(
-                key[0], child_instance_id
-            ):
+                key[0], child_instance_id):
                 continue
             if (reserved := self._reserve(record, "child_cleanup")) is not None:
                 if reserved.phase == "starting":
