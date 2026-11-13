@@ -30,15 +30,18 @@ from ..core.session_files import (
     SessionError,
     SessionInUseError,
     SessionNotFoundError,
+    SessionReferenceGate,
     atomic_publish_file,
     child_directory,
     descend_directory,
     open_session_file,
     read_reference_generation,
+    unlink_session_file,
 )
 from ..core.session_links import valid_child_pending_link, valid_pending_link
 from ..core.todo import parse_todo_items
 from ..core.transcript_recovery import RepairTarget, classify_recovery_records
+from ..locking import RETENTION_HOME_ID, domain_authority
 from ..memory.reconciliation_state import classify_reconciliation_records
 from ..project_inbox import InboxError, validate_inbox_record
 from ..project_inbox_sent import SentMessageTracker, _Broken, _Loaded
@@ -47,6 +50,7 @@ from ..storage_format import (
     StorageFormatError,
     WriterLease,
     feature_enabled,
+    validate_retention_arm,
     validate_retention_history,
     validate_retention_reservation,
     validate_retention_state,
@@ -62,6 +66,9 @@ from .transaction import (
 _STATE_FILENAME = "retention-state.json"
 _HISTORY_FILENAME = "retention-history.jsonl"
 _MAX_HISTORY = 128
+_ARM_FILENAME = "retention-arm.json"
+_COORDINATOR_DOMAIN = "coordinator"
+_ARM_WARNING = "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
 _METADATA_NAME = "meta.json"
 _SESSION_STATE_NAME = "session_state.json"
 _PENDING_LINK_NAME = "project_link_pending.json"
@@ -195,6 +202,53 @@ def append_retention_history(home: str | Path, lease: WriterLease, result: Mappi
         )
     finally:
         os.close(home_fd)
+
+
+def retention_arm_warning() -> str:
+    return _ARM_WARNING
+
+
+def retention_authority(
+    home: str | Path, lease: WriterLease, *, days: int, zeta_version: str,
+    now: Callable[[], str] = lambda: datetime.now(UTC).isoformat(),
+) -> str:
+    """Arm, disarm, or disable retention in one off-loop transaction."""
+    try:
+        import asyncio
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise SessionError("retention authority requested on an asyncio event-loop thread")
+    if type(days) is not int or not 0 <= days <= 3650:
+        raise RetentionPlannerError("retention days must be in 0..3650")
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+        return "retention unavailable: upgrade the home before arming"
+    root = Path(home)
+    with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True), SessionReferenceGate(root, lease).exclusive():
+        home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if days == 0:
+                unlink_session_file(home_fd, _ARM_FILENAME)
+                return "retention disabled"
+            state = _load_state(home_fd)
+            preview = state.get("preview") if state else None
+            if not isinstance(preview, dict) or preview.get("days") != days:
+                return "retention arm requires a completed preview for the current days"
+            arm = {
+                "schema_version": 1, "gate_version": 1,
+                "armed_by_zeta_version": zeta_version,
+                "armed_at": now(), "preview_id": preview["preview_id"],
+            }
+            validate_retention_arm(arm)
+            atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\\n").encode())
+            return _ARM_WARNING
+        finally:
+            os.close(home_fd)
+
+
+def disarm_retention(home: str | Path, lease: WriterLease) -> str:
+    return retention_authority(home, lease, days=0, zeta_version="")
 
 
 def read_retention_history(home: str | Path) -> tuple[dict[str, object], ...]:
