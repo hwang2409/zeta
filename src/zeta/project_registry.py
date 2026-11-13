@@ -216,6 +216,18 @@ def resolve_project_ref(registry: ProjectRegistry, text: str) -> str | None:
             return None
 
 
+def _retained_session_links(existing, remove_ids, charge):
+    retained = []
+    for record in existing:
+        charge()
+        if (
+            record["session_id"] not in remove_ids
+            and record.get("parent_session_id") not in remove_ids
+        ):
+            retained.append(record)
+    return retained
+
+
 class ProjectRegistry(
     ProjectLockingMixin, ProjectContextProjectionMixin, ProjectMemoryHistoryMixin
 ):
@@ -919,14 +931,7 @@ class ProjectRegistry(
                     )
                 finally:
                     os.close(directory_fd)
-                for _record in existing:
-                    charge()
-                retained = [
-                    record
-                    for record in existing
-                    if record["session_id"] not in remove_ids
-                    and record.get("parent_session_id") not in remove_ids
-                ]
+                retained = _retained_session_links(existing, remove_ids, charge)
                 if len(retained) != len(existing):
                     self._update_sessions_locked(
                         project_fd,

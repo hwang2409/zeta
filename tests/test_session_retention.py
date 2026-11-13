@@ -1222,6 +1222,124 @@ def test_quarantine_restart_resumes_to_durable_removal(tmp_path):
     assert not list((tmp_path / "session-trash" / "transactions").iterdir())
 
 
+def test_one_arm_authorizes_fresh_proofs_across_transactions_and_restart(tmp_path):
+    manager = _manager(tmp_path)
+    with ExitStack() as stack:
+        roots = sorted(_create_closed(manager, stack) for _ in range(2))
+        for root in roots:
+            _age_tree(tmp_path / "sessions" / root)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        preview, reasons = _run_sweep(planner)
+        assert all(reasons[root] == (True, None) for root in roots)
+        arm = tmp_path / "retention-arm.json"
+        arm.write_text(json.dumps({
+            "schema_version": 1, "gate_version": 1,
+            "armed_by_zeta_version": "test", "armed_at": _OLD,
+            "preview_id": preview.preview.preview_id,
+        }) + "\n")
+        arm.chmod(0o600)
+        armed_bytes = arm.read_bytes()
+
+        for _ in range(200):
+            planner.run_pass(days=30)
+            remaining = [root for root in roots if (tmp_path / "sessions" / root).exists()]
+            reservations = list((tmp_path / "session-trash" / "reservations").glob("*.json"))
+            if len(remaining) == 1 and not reservations:
+                break
+        else:
+            raise AssertionError("first armed transaction did not finish in 200 public passes")
+
+        planner.close()
+        resumed = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        for _ in range(200):
+            resumed.run_pass(days=30)
+            if not any((tmp_path / "sessions" / root).exists() for root in roots):
+                reservations = list(
+                    (tmp_path / "session-trash" / "reservations").glob("*.json")
+                )
+                if not reservations:
+                    break
+        else:
+            raise AssertionError(
+                "the existing arm did not authorize a fresh proof after restart"
+            )
+
+    assert arm.read_bytes() == armed_bytes, "a later transaction rewrote the durable arm"
+
+
+def test_same_id_transaction_rejects_stale_removal_frontier(tmp_path):
+    from zeta.remote_sync import LocalTransport, push_session
+
+    manager = _manager(tmp_path)
+    import_home = tmp_path.parent / f"{tmp_path.name}-same-id"
+    with ExitStack() as stack:
+        root = _create_closed(manager, stack)
+        _age_tree(tmp_path / "sessions" / root)
+        shutil.copytree(tmp_path, import_home)
+        lease = stack.enter_context(_opened_lease(tmp_path))
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        preview, _ = _run_sweep(planner)
+        arm = tmp_path / "retention-arm.json"
+        arm.write_text(json.dumps({
+            "schema_version": 1, "gate_version": 1,
+            "armed_by_zeta_version": "test", "armed_at": _OLD,
+            "preview_id": preview.preview.preview_id,
+        }) + "\n")
+        arm.chmod(0o600)
+        for _ in range(200):
+            planner.run_pass(days=30)
+            if not (tmp_path / "session-trash" / "reservations" / f"{root}.json").exists():
+                break
+        else:
+            raise AssertionError("first same-id transaction did not finish")
+        stale_frontier = (tmp_path / "retention-state.json").read_bytes()
+
+        push_session(import_home, LocalTransport(tmp_path), session_id=root, force=True)
+        _age_tree(tmp_path / "sessions" / root)
+        planner.close()
+        planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
+        preview, reasons = _run_sweep(planner)
+        assert reasons[root] == (True, None)
+        assert preview.preview.root_ids == (root,)
+        arm.write_text(json.dumps({
+            "schema_version": 1, "gate_version": 1,
+            "armed_by_zeta_version": "test", "armed_at": _OLD,
+            "preview_id": preview.preview.preview_id,
+        }) + "\n")
+        for _ in range(200):
+            planner.run_pass(days=30)
+            manifests = list(
+                (tmp_path / "session-trash" / "transactions").glob("*/manifest.json")
+            )
+            if manifests and json.loads(manifests[0].read_text())["stage"] == "removing":
+                break
+        else:
+            raise AssertionError("second same-id transaction did not reach removal")
+        (tmp_path / "retention-state.json").write_bytes(stale_frontier)
+
+        tree_removed_with_evidence = False
+        for _ in range(200):
+            planner.run_pass(days=30)
+            manifests = list(
+                (tmp_path / "session-trash" / "transactions").glob("*/manifest.json")
+            )
+            trees = list((tmp_path / "session-trash" / "transactions").glob("*/tree"))
+            reservation = tmp_path / "session-trash" / "reservations" / f"{root}.json"
+            if manifests and json.loads(manifests[0].read_text())["stage"] == "removed":
+                assert not trees, "transaction 2 advanced before removing its owned tree"
+            if not trees and manifests and reservation.exists():
+                tree_removed_with_evidence = True
+            if not reservation.exists():
+                break
+        else:
+            raise AssertionError("second same-id transaction did not finish")
+
+    assert tree_removed_with_evidence, (
+        "transaction 2 removed its manifest or reservation before its tree"
+    )
+
+
 def _retention_manifest(home: Path) -> tuple[Path, dict]:
     manifests = list((home / "session-trash" / "transactions").glob("*/manifest.json"))
     assert len(manifests) == 1

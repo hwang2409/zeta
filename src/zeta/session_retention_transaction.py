@@ -54,7 +54,6 @@ _TREE_NAME = "tree"
 _COORDINATOR_DOMAIN = "coordinator"
 _MAX_JSON_BYTES = 1 << 20
 _MAX_DEPTH = 64
-_MAX_TRANSACTIONS = 32
 
 
 class TransactionError(Exception):
@@ -90,6 +89,7 @@ class TransactionOutcome:
     advanced: bool
     blocked: str | None = None
     session_id: str | None = None
+    completed: bool = False
 
 
 class _ChargedScan:
@@ -249,14 +249,18 @@ class _QuarantineTransaction:
             raise TransactionError("retention reservation trash mismatch")
         if txns_fd is None:
             self.lease.delete(reservations_fd, name)
-            return TransactionOutcome(True, session_id=reservation["session_id"])
+            return TransactionOutcome(
+                True, session_id=reservation["session_id"], completed=True
+            )
         try:
             txn_fd = os.open(
                 txid, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=txns_fd
             )
         except FileNotFoundError:
             self.lease.delete(reservations_fd, name)
-            return TransactionOutcome(True, session_id=reservation["session_id"])
+            return TransactionOutcome(
+                True, session_id=reservation["session_id"], completed=True
+            )
         try:
             try:
                 tree_fd = os.open(
@@ -268,9 +272,14 @@ class _QuarantineTransaction:
                     txn_fd, _MANIFEST_NAME, validate_retention_manifest
                 )
                 if manifest is None:
-                    if _remove_empty_transaction(txns_fd, txn_fd, txid):
+                    completed = _remove_empty_transaction(txns_fd, txn_fd, txid)
+                    if completed:
                         self.lease.delete(reservations_fd, name)
-                    return TransactionOutcome(True, session_id=reservation["session_id"])
+                    return TransactionOutcome(
+                        True,
+                        session_id=reservation["session_id"],
+                        completed=completed,
+                    )
                 _match_manifest(reservation, manifest)
                 if manifest["stage"] == "removing":
                     self._publish(
@@ -282,9 +291,14 @@ class _QuarantineTransaction:
                 if manifest["stage"] != "removed":
                     raise TransactionError("retention tree disappeared before removal")
                 self.lease.delete(txn_fd, _MANIFEST_NAME)
-                if _remove_empty_transaction(txns_fd, txn_fd, txid):
+                completed = _remove_empty_transaction(txns_fd, txn_fd, txid)
+                if completed:
                     self.lease.delete(reservations_fd, name)
-                return TransactionOutcome(True, session_id=reservation["session_id"])
+                return TransactionOutcome(
+                    True,
+                    session_id=reservation["session_id"],
+                    completed=completed,
+                )
             try:
                 info = os.fstat(tree_fd)
                 if (info.st_dev, info.st_ino) != (
@@ -321,7 +335,7 @@ class _QuarantineTransaction:
         self, days: int, preview: dict | None, verify: CandidateVerifier
     ) -> TransactionOutcome:
         arm = self._read_arm()
-        if arm is None or preview is None or arm["preview_id"] != preview.get("preview_id"):
+        if arm is None or preview is None:
             return TransactionOutcome(False)
         if preview.get("days") != days or not preview.get("root_ids"):
             return TransactionOutcome(False, "retention arm does not match current preview")
@@ -421,7 +435,7 @@ class _QuarantineTransaction:
             ):
                 raise TransactionError("retention transaction directory is not empty")
             self.lease.delete(reservations_fd, reservation_name)
-            return TransactionOutcome(True, session_id=session_id)
+            return TransactionOutcome(True, session_id=session_id, completed=True)
         return TransactionOutcome(False, "retention transaction is blocked", session_id)
 
     def _project_registry(self) -> ProjectRegistry:
@@ -483,7 +497,7 @@ class _QuarantineTransaction:
             )
         finally:
             os.close(home_fd)
-        if state is None or state.get("phase") != "removing" or state.get("root_id") != manifest["session_id"]:
+        if not _state_matches_manifest(state, manifest):
             state = _removal_state(manifest)
         frontier = [tuple(path) for path in state["frontier"]]
         if not frontier:
@@ -731,6 +745,18 @@ def _match_manifest(reservation: dict, manifest: dict) -> None:
     for name in ("session_id", "transaction_id", "device", "inode"):
         if reservation[name] != manifest[name]:
             raise TransactionError("retention manifest does not match reservation")
+
+
+def _state_matches_manifest(state: dict | None, manifest: dict) -> bool:
+    return state is not None and all(
+        (
+            state.get("phase") == "removing",
+            state.get("root_id") == manifest["session_id"],
+            state.get("device") == manifest["device"],
+            state.get("inode") == manifest["inode"],
+            state.get("lease_epoch") == manifest["transaction_id"],
+        )
+    )
 
 
 def _removal_state(manifest: dict) -> dict:

@@ -46,6 +46,7 @@ from .project_inbox_sent import SentMessageTracker, _Broken, _Loaded
 from .session_retention_transaction import (
     Candidate,
     CandidateRejected,
+    TransactionOutcome,
     _QuarantineTransaction,
 )
 from .storage_format import (
@@ -439,17 +440,9 @@ class RetentionPlanner:
             preview=self._latest if type(self._latest) is dict else None,
             verify=self._verify_candidate,
         )
-        if outcome.advanced or outcome.blocked is not None:
-            reasons = (
-                (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
-                if outcome.blocked is not None else ()
-            )
-            return PassResult(
-                enabled=True,
-                complete=False,
-                reasons=reasons,
-                preview=_preview_snapshot(self._latest),
-            )
+        transaction_result = self._transaction_result(outcome)
+        if transaction_result is not None:
+            return transaction_result
         budget = _Budget(self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns)
         sweep = self._sweep
         if sweep is None or sweep.days != days:
@@ -476,6 +469,23 @@ class RetentionPlanner:
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
+        )
+
+    def _transaction_result(self, outcome: TransactionOutcome) -> PassResult | None:
+        if not outcome.advanced and outcome.blocked is None:
+            return None
+        if outcome.completed:
+            self._latest = None
+        reasons = (
+            (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
+            if outcome.blocked is not None
+            else ()
+        )
+        return PassResult(
+            enabled=True,
+            complete=False,
+            reasons=reasons,
+            preview=_preview_snapshot(self._latest),
         )
 
     @contextmanager

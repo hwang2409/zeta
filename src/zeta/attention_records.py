@@ -430,12 +430,16 @@ def remove_fork_session_links(
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             raise ValueError("unsafe session directory during attention cleanup")
         store = AttentionStore(session_dir, writer_epoch=writer_epoch)
-        for record in store.list():
-            charge()
-            if isinstance(record, Broken):
-                raise TypeError(f"broken attention record: {record.reason}")
-            if record.fork_session_id in remove_ids:
-                store.replace(replace(record, fork_session_id=None))
+        _remove_store_fork_links(store, remove_ids, charge)
+
+
+def _remove_store_fork_links(store, remove_ids, charge) -> None:
+    for record in store.list():
+        charge()
+        if isinstance(record, Broken):
+            raise TypeError(f"broken attention record: {record.reason}")
+        if record.fork_session_id in remove_ids:
+            store.replace(replace(record, fork_session_id=None))
 
 
 def _check_id(attention_id: str) -> None:
