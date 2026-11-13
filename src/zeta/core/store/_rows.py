@@ -459,6 +459,7 @@ class ResidentRows:
         rows._branch_refs = list(self._branch_refs)
         rows._context_refs = list(self._context_refs)
         rows._context_source_seqs = set(self._context_source_seqs)
+        rows._legacy_pinned_source_seqs = dict(self._legacy_pinned_source_seqs)
         rows.payloads = dict(self.payloads)
         rows._payload_sizes = dict(self._payload_sizes)
         rows._pinned = set(self._pinned)
