@@ -12,6 +12,7 @@ from zeta.core.approval import (
     ApprovalAbortPolicy,
     ApprovalDecision,
     ApprovalPolicy,
+    ApprovalRequest,
 )
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
@@ -237,6 +238,44 @@ async def test_nested_child_abort_reaches_serve_with_innermost_identity(
     for store in reversed(child_stores):
         store.close()
     parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_child_cleanup_settles_nested_approval_only(
+    tmp_path: Path,
+) -> None:
+    parent_store = ConversationStore(tmp_path / "parent")
+    policy = ApprovalPolicy(store=parent_store)
+    stores: dict[str, ConversationStore] = {}
+    requests: dict[str, ApprovalRequest] = {}
+    try:
+        for index, child_id in enumerate(("session:1:1", "session:10", "session:1x")):
+            store = ConversationStore(tmp_path / f"child-{index}")
+            call = ToolCall(f"call-{index}", "read", {"path": "input"})
+            store.append_message_with_approval_requests(
+                Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+                [(call.id, call)],
+            )
+            request = ApprovalRequest(call.id, call, child_instance_id=child_id)
+            policy.register_delegated(request, store, child_instance_id=child_id)
+            stores[child_id] = store
+            requests[child_id] = request
+
+        assert policy.cleanup_delegated("session:1") is None
+
+        nested = requests["session:1:1"]
+        assert (await stores["session:1:1"].approval_resolution(nested.request_id))[
+            "decision"
+        ] == "deny"
+        pending = {request.key for request in await policy.pending_requests()}
+        assert pending == {
+            requests["session:10"].key,
+            requests["session:1x"].key,
+        }
+    finally:
+        for store in stores.values():
+            store.close()
+        parent_store.close()
 
 
 @pytest.mark.asyncio
