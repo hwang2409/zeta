@@ -1516,10 +1516,10 @@ async def test_terminal_claim_blocks_a_delayed_loser_until_turn_end(
     try:
         store.remember_pending_approval_execution(*first)
         assert store.claim_pending_approval_execution(*first) == "claimed"
-        store.release_pending_approval_execution(first[0])
+        store.complete_pending_approval_execution(first[0])
         store.remember_pending_approval_execution(*second)
         assert store.claim_pending_approval_execution(*second) == "claimed"
-        store.release_pending_approval_execution(second[0])
+        store.complete_pending_approval_execution(second[0])
 
         async def delayed_claim() -> str:
             await asyncio.sleep(0)

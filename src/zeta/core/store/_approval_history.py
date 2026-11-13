@@ -266,7 +266,7 @@ class ApprovalHistoryStoreMixin:
         if record is not None:
             await record.completed.wait()
 
-    def release_pending_approval_execution(self, request_id: str) -> None:
+    def complete_pending_approval_execution(self, request_id: str) -> None:
         record = self._pending_approval_executions.get(request_id)
         if record is not None:
             record.owner = _COMPLETED_APPROVAL_EXECUTION
