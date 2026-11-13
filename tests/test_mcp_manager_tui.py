@@ -85,6 +85,13 @@ async def test_public_mcp_views_repair_a_committed_cancelled_add(
         def summary(self):
             return f"mcp: {len(self.configs)} mounted, 0 failed"
 
+        @property
+        def tool_refresh_pending(self):
+            return False
+
+        async def wait_for_tool_refreshes(self):
+            return None
+
         async def add_server(self, config, **_kwargs):
             self.configs[config.name] = config
 
