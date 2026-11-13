@@ -65,16 +65,22 @@ def _retain_logs(directory: Path) -> None:
 def _open_capture(path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
-    _retain_logs(path.parent)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(
-        path,
+        temp_path,
         os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
         0o600,
     )
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.rename(temp_path, path)
+        _retain_logs(path.parent)
     except BaseException:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
         os.close(fd)
         raise
     return fd

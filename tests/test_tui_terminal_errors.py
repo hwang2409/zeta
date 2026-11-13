@@ -186,6 +186,52 @@ with sc.stderr_to_log():
     assert logs[0].read_bytes() == expected
 
 
+def test_new_log_is_not_visible_before_it_is_locked(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    code = """
+import fcntl
+import os
+from zeta.tui import stderr_capture
+original_flock = fcntl.flock
+blocked = False
+def delayed_flock(fd, operation):
+    global blocked
+    if operation == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not blocked:
+        blocked = True
+        os.write(int(os.environ["READY_FD"]), b"ready")
+        os.read(int(os.environ["RELEASE_FD"]), 1)
+    return original_flock(fd, operation)
+stderr_capture.fcntl.flock = delayed_flock
+with stderr_capture.stderr_to_log():
+    os.write(2, b'ZLOCKED\\n')
+"""
+    env = _capture_env(home) | {
+        "READY_FD": str(ready_write),
+        "RELEASE_FD": str(release_read),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], env=env, pass_fds=(ready_write, release_read)
+    )
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        assert os.read(ready_read, 5) == b"ready"
+        assert not list((home / "logs" / "tui-stderr").glob("*.log"))
+        os.write(release_write, b"x")
+        assert process.wait(timeout=10) == 0
+    finally:
+        if process.poll() is None:
+            os.write(release_write, b"x")
+            reap_process(process, timeout=10)
+        os.close(ready_read)
+        os.close(release_write)
+    logs = list((home / "logs" / "tui-stderr").glob("*.log"))
+    assert len(logs) == 1
+    assert logs[0].read_text() == "ZLOCKED\n"
+
+
 def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     code = """
