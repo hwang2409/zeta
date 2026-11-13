@@ -1258,7 +1258,7 @@ class AgentLoop(
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
-            if tool_canceled:
+            if self.agent_depth > 0 and tool_canceled:
                 return
         if self.child_turn_control is not None and self.child_turn_control.exhausted:
             yield StreamEvent(StreamEventType.AGENT_END)
