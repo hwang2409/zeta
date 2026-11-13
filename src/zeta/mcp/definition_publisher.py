@@ -16,13 +16,23 @@ from collections.abc import Callable
 from ..core.abort import AbortSignal
 from ..protocol.types import StructuredToolResult
 from ..tools.registry import ToolRegistry
-from .client import MCPTool, notice
+from .client import MCPTool, make_error_result, notice
 from .config import MCPServerConfig, tool_prefix
 
 logger = logging.getLogger(__name__)
 
 
 class MCPDefinitionPublisher:
+    def set_primary_registry_only(self, enabled: bool) -> None:
+        """Keep this actor callable only through its primary registry."""
+        self._primary_registry_only = enabled
+        if enabled:
+            for registry in tuple(self._owned_registries):
+                if registry is not self._registry:
+                    registry.unregister_mcp_owner(self)
+        else:
+            self._republish_definitions()
+
     def register_registry(self, registry: ToolRegistry) -> None:
         self._owned_registries.add(registry)
         # Seed the remembered set from whatever this registry already holds for
@@ -53,6 +63,7 @@ class MCPDefinitionPublisher:
             target is None
             or self._client is None
             or not self.config.allows_tool(tool.name)
+            or (self._primary_registry_only and target is not self._registry)
         ):
             return False
         if getattr(target, "_closed", False):
@@ -64,6 +75,8 @@ class MCPDefinitionPublisher:
         async def handler(
             arguments: dict[str, object], abort_signal: AbortSignal
         ) -> StructuredToolResult:
+            if self._primary_registry_only and target is not self._registry:
+                return make_error_result(f"MCP server '{self.name}' is not available")
             return await self.call_tool(
                 tool.name, arguments, abort_signal, generation=generation
             )
@@ -132,7 +145,11 @@ class MCPDefinitionPublisher:
                     continue
                 base = full[len(prefix) :]
                 tool = tools_by_name.get(base)
-                if tool is None or full in registry._mcp_excluded_names:
+                if (
+                    tool is None
+                    or full in registry._mcp_excluded_names
+                    or self.name in registry._mcp_excluded_servers
+                ):
                     continue
                 self._register_tool(tool, self._generation, registry=registry)
 

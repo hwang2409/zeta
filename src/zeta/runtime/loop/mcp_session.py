@@ -3,6 +3,7 @@
 import asyncio
 import shlex
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Self
 
@@ -22,6 +23,7 @@ from ...mcp.commands import (
     run_mcp_resource_attach,
     run_mcp_resources_list,
 )
+from ...mcp.config import MCPServerConfig
 from ...mcp.oauth import MCPOAuthError
 from ...mcp.oauth_store import (
     MCPCredentialStoreError,
@@ -70,10 +72,16 @@ class MCPSession:
             service = self._mcp_management
             config = await service.runtime_config()
             self._mcp_mount = await mount_mcp_servers(
-                self.tool_registry,
-                config,
-                notice_sink=self._mcp_notice_sink,
+                self.tool_registry, config, notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
+                **(
+                    {
+                        "bindings": self._mcp_bindings,
+                        "binding_configs": self._mcp_binding_configs,
+                    }
+                    if self._mcp_bindings
+                    else {}
+                ),
             )
             service.mount = self._mcp_mount
         except (MCPConfigError, MCPManagementError) as exc:
@@ -94,6 +102,50 @@ class MCPSession:
         self._mcp_mount = mount
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+
+    async def set_mcp_bindings(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig] | None = None,
+    ) -> None:
+        """Set transient per-attachment headers without replacing tool handlers."""
+        await self.clear_mcp_bindings()
+        self._mcp_bindings = {name: dict(headers) for name, headers in bindings.items()}
+        self._mcp_binding_configs = dict(configs or {})
+        if self._mcp_mount is not None:
+            for name in bindings:
+                self._mcp_mount.set_primary_registry_only(name, True)
+            await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
+
+    async def clear_mcp_bindings(self) -> None:
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            self._mcp_mount_task.cancel()
+            await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
+            self._mcp_mount_task = None
+            self._mcp_mount_attempted = self._mcp_mount is not None
+        if self._mcp_mount is not None and self._mcp_bindings:
+            await self._replace_mcp_binding_configs(
+                {name: {} for name in self._mcp_bindings},
+                self._mcp_binding_configs,
+            )
+            for name in self._mcp_bindings:
+                self._mcp_mount.set_primary_registry_only(name, False)
+        self._mcp_bindings = {}
+        self._mcp_binding_configs = {}
+
+    async def _replace_mcp_binding_configs(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        mount = self._mcp_mount
+        assert mount is not None
+        for name, headers in bindings.items():
+            config = configs[name]
+            await mount.replace_server(
+                replace(config, headers={**config.headers, **headers}),
+                source=mount.sources[name],
+            )
 
     def set_mcp_scope(
         self,
