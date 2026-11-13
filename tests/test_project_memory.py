@@ -2181,7 +2181,9 @@ async def test_child_link_backlog_continues_without_reopen(
     manager, project, root_id = await asyncio.to_thread(
         _reconcile_fixture, tmp_path
     )
+    # test-contract: seam bound the pass to force continuation
     monkeypatch.setattr(session_links, "_CHILD_LINK_MAX_ENTRIES_PER_PASS", 256)
+    # test-contract: seam remove retry delay without waiting in the test
     monkeypatch.setattr(
         session_links, "_CHILD_RECONCILIATION_RETRY_DELAYS", (0,), raising=False
     )
@@ -2201,8 +2203,9 @@ async def test_child_link_backlog_continues_without_reopen(
 
     async def drained() -> None:
         pending = manager.sessions_dir / root_id / session_links.PENDING_CHILD_LINKS_DIRNAME
-        while await asyncio.to_thread(lambda: any(pending.iterdir())):
-            await asyncio.sleep(0)
+        async with asyncio.timeout(10):
+            while await asyncio.to_thread(lambda: any(pending.iterdir())):
+                await asyncio.sleep(0)
 
     await await_or_fail(drained(), what="child link backlog did not drain")
     assert list(
@@ -2234,7 +2237,9 @@ async def test_child_link_retry_logs_transient_error(
             raise OSError("injected transient failure")
         return real_collect(*args, **kwargs)
 
+    # test-contract: seam inject one transient collection failure
     monkeypatch.setattr(session_links, "_collect_pending_intents", fail_once)
+    # test-contract: seam remove retry delay without waiting in the test
     monkeypatch.setattr(
         session_links, "_CHILD_RECONCILIATION_RETRY_DELAYS", (0,), raising=False
     )
@@ -2249,11 +2254,12 @@ async def test_child_link_retry_logs_transient_error(
             what="child link retry did not complete",
         )
         async def published() -> None:
-            while not await asyncio.to_thread(
-                lambda: child_id
-                in _child_link_ids(manager.project_registry, project.project_id)
-            ):
-                await asyncio.sleep(0)
+            async with asyncio.timeout(10):
+                while not await asyncio.to_thread(
+                    lambda: child_id
+                    in _child_link_ids(manager.project_registry, project.project_id)
+                ):
+                    await asyncio.sleep(0)
 
         await await_or_fail(published(), what="child link was not retried")
     assert "injected transient failure" in caplog.text
