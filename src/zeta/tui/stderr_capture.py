@@ -18,6 +18,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from ..core.session import env_home
 
 _TUI_STDERR_MAX_BYTES = 50 * 1024 * 1024
+_TUI_STDERR_TEMP_MAX_AGE_NS = 60 * 60 * 1_000_000_000
 _SETUP = False
 _LOCK_FD: int | None = None
 _TERMINAL_FD: int | None = None
@@ -34,47 +35,88 @@ def _log_path(directory: Path) -> Path:
 
 
 def _retain_logs(directory: Path) -> None:
-    try:
-        files = sorted(directory.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
-    except OSError:
-        return
-    retained: list[tuple[Path, int]] = []
-    for path in files:
+    now_ns = time.time_ns()
+    for temp in directory.glob(".*.tmp"):
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(temp, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                size = os.fstat(fd).st_size
-                retained.append((path, size))
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                stale = now_ns - os.fstat(fd).st_mtime_ns > _TUI_STDERR_TEMP_MAX_AGE_NS
+                if stale:
+                    locked = os.fstat(fd)
+                    try:
+                        current = os.stat(temp, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if (locked.st_dev, locked.st_ino) == (current.st_dev, current.st_ino):
+                        os.unlink(temp)
             finally:
                 os.close(fd)
         except OSError:
             continue
-    total = sum(size for _, size in retained)
-    for path, size in retained:
+    candidates: list[tuple[Path, os.stat_result]] = []
+    try:
+        for path in directory.glob("*.log"):
+            try:
+                candidates.append((path, os.stat(path, follow_symlinks=False)))
+            except OSError:
+                continue
+    except OSError:
+        return
+    candidates.sort(key=lambda item: item[1].st_mtime_ns)
+    total = sum(stat.st_size for _, stat in candidates)
+    if total <= _TUI_STDERR_MAX_BYTES:
+        return
+    for path, candidate in candidates:
         if total <= _TUI_STDERR_MAX_BYTES:
             break
+        fd: int | None = None
         try:
-            path.unlink()
-            total -= size
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = os.fstat(fd)
+            current = os.stat(path, follow_symlinks=False)
+            if (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino):
+                continue
+            os.unlink(path)
+            total -= candidate.st_size
         except OSError:
-            pass
+            continue
+        finally:
+            if fd is not None:
+                os.close(fd)
 
 
 def _open_capture(path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
-    _retain_logs(path.parent)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(
-        path,
+        temp_path,
         os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW,
         0o600,
     )
     try:
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        published = path
+        for suffix in range(100):
+            if suffix:
+                published = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+            try:
+                os.link(temp_path, published)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(path)
+        os.unlink(temp_path)
+        _retain_logs(path.parent)
     except BaseException:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
         os.close(fd)
         raise
     return fd
