@@ -324,7 +324,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         # unrelated custom tools or stale definitions in another session.
         self._mcp_owned: dict[str, tuple[object, int]] = {}
         self._mcp_hidden: set[str] = set()
-        self._pending_execution_claims: set[str] = set()
         self._closed = False
         self.web_clients = SessionWebClients()
         self._cleanup_callbacks: list[Callable[[], Awaitable[None]]] = []
@@ -764,16 +763,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         """Rotate the active signal before a new tool batch."""
         self.abort_signal = self._abort_registry.new_generation()
 
-    def claim_pending_execution(self, tool_call_id: str) -> bool:
-        """Atomically reserve one approved call on the event loop."""
-        if tool_call_id in self._pending_execution_claims:
-            return False
-        self._pending_execution_claims.add(tool_call_id)
-        return True
-
-    def release_pending_execution(self, tool_call_id: str) -> None:
-        self._pending_execution_claims.discard(tool_call_id)
-
     def bind_approval_store(self, store: ConversationStore) -> None:
         if self.approval_policy is not None:
             self.approval_policy.bind_store(store)
@@ -1060,6 +1049,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             )
             if abort_result is not None:
                 return await finalize(abort_result)
+        self.remember_approval_definition(
+            tool_call, capability, persist=_persist_approval
+        )
         execution_token = uuid.uuid4().hex
         cleanup_binding = (
             self.approval_policy.cleanup_execution_binding
@@ -1099,17 +1091,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
-        if (
-            approved_execution is not None
-            and not _pending_execution_claimed
-            and not self.claim_pending_execution(tool_call.id)
-        ):
-            return await finalize(
-                _error_result(
-                    f"tool execution already claimed: {tool_call.id}",
-                    kind="duplicate_tool_execution",
-                )
-            )
+        claim_error = self.approval_execution_error(
+            tool_call, prepared=_pending_execution_claimed
+        )
+        if claim_error is not None:
+            return await finalize(_error_result(claim_error[0], kind=claim_error[1]))
         definition = self._tools.get(tool_call.name)
         if definition is None:
             return await finalize(

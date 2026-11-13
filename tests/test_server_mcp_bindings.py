@@ -785,12 +785,16 @@ async def test_socket_http_approved_tool_runs_once(
 
         await _request(reader, writer, 4, "send", {"text": "use x"})
         approval = await _event(reader, "approval_request")
+        live_turn = server.control._turn_task
+        assert live_turn is not None
+        server.control._turn_task = None
         approved = await _request(reader, writer, 5, "approve", {
             "request_id": approval["request_id"],
         })
         assert "error" not in approved[-1]
-        await asyncio.wait_for(mcp.tool_called.wait(), TIMEOUT)
-        await _event(reader, "agent_end")
+        recovery_turn = server.control._turn_task
+        assert recovery_turn is not None
+        await asyncio.wait_for(asyncio.gather(live_turn, recovery_turn), TIMEOUT)
 
         assert mcp.methods.count("tools/call") == 1
         assert sum(
@@ -925,13 +929,17 @@ async def test_socket_approved_bash_after_turn_end_runs_once(
         await _request(reader, writer, 4, "send", {"text": "run bash"})
         approval = await _event(reader, "approval_request")
         assert not server.control.turn_busy()
+        live_turn = server.control._turn_task
+        assert live_turn is not None
+        server.control._turn_task = None
         allowed = await _request(reader, writer, 5, "approve", {
             "request_id": approval["request_id"]
         })
         assert "error" not in allowed[-1]
+        recovery_turn = server.control._turn_task
+        assert recovery_turn is not None
         release_first_agent_end.set()
-        await _event(reader, "tool_end")
-        await _event(reader, "agent_end")
+        await asyncio.wait_for(asyncio.gather(live_turn, recovery_turn), TIMEOUT)
 
         assert marker.read_text().splitlines() == ["run"]
 

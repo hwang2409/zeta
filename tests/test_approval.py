@@ -1398,3 +1398,103 @@ def test_register_rejects_a_subject_that_is_not_a_parameter(
             parameters={"type": "object", "properties": {"text": {"type": "string"}}},
             approval_subject=subject,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_same_call_id_in_parent_and_child_approval_records_runs_both(
+    tmp_path: Path,
+) -> None:
+    counts = [0, 0]
+    registries = []
+    stores = []
+    for index in range(2):
+        store = ConversationStore(tmp_path / f"store-{index}")
+        stores.append(store)
+        call = ToolCall("same-call", "echo", {})
+        store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call, {"action": None}, {})],
+        )
+        store.resolve_approval(call.id, "allow")
+        policy = ApprovalPolicy(default="ask", store=store)
+        registry = ToolRegistry(
+            tmp_path,
+            approval_policy=policy,
+            approval_store=store,
+            session_store=store,
+            register_builtin=False,
+            skill_catalog=SkillCatalog.empty(),
+        )
+
+        async def run(_arguments: dict[str, object], *, owner: int = index) -> str:
+            counts[owner] += 1
+            return "ok"
+
+        registry.register("echo", run)
+        registries.append(registry)
+
+    try:
+        results = await asyncio.gather(
+            *(registry.execute(ToolCall("same-call", "echo", {})) for registry in registries)
+        )
+
+        assert counts == [1, 1]
+        assert all(result["isError"] is False for result in results)
+    finally:
+        for registry in registries:
+            await registry.close()
+        for store in stores:
+            store.close()
+
+
+@pytest.mark.parametrize(
+    ("approved", "current"),
+    [("host", "mcp"), ("mcp", "host"), ("page", "other")],
+)
+@pytest.mark.asyncio
+async def test_approved_tool_rejects_a_different_definition_kind(
+    tmp_path: Path, approved: str, current: str
+) -> None:
+    store = ConversationStore(tmp_path)
+    call = ToolCall("changed-call", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call, {"action": None}, {})],
+    )
+    store.resolve_approval(call.id, "allow")
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        approval_store=store,
+        session_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    runs = 0
+
+    async def run(_arguments: dict[str, object]) -> str:
+        nonlocal runs
+        runs += 1
+        return "wrong"
+
+    registry.register("echo", run)
+    if approved != "host":
+        store.remember_pending_approval_execution(call.id, ("mcp", approved))
+    else:
+        store.remember_pending_approval_execution(call.id, ("host", None))
+    if current != "host":
+        registry._mcp_owned["echo"] = (  # test-contract: replace the approved actor
+            type("Owner", (), {"config": type("Config", (), {"name": current})()})(),
+            1,
+        )
+
+    try:
+        result = await registry.execute(call)
+
+        assert runs == 0
+        assert result["isError"] is True
+        assert "tool changed after approval" in result["content"][0]["text"]
+    finally:
+        await registry.close()
+        store.close()
