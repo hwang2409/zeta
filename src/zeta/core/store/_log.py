@@ -140,9 +140,6 @@ class _FullLoadValidator:
         self.state._reset_incremental_validation_state()
         self.state._task_notification_ids = set()
         self.state._sent_message_receipts = []
-        self._linear_branch = True
-        self._linear_approvals = _ApprovalValidationOverlay()
-        self._linear_error: tuple[_PhysicalRow, ConversationIntegrityError] | None = None
         self._client_delivery_entries: list[ConversationEntry] = []
         self.by_id: dict[str, RowRef] = {}
         self.rows_by_id: dict[str, _PhysicalRow] = {}
@@ -246,23 +243,9 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
-        previous = (
-            self.state._resident_rows.rows[-1]
-            if self.state._resident_rows.rows
-            else None
-        )
-        linear = previous is None or entry.parent_id == previous.id
         self.state._resident_rows.append(
             entry, offset=row.byte_offset, length=row.length
         )
-        if self._linear_branch and linear:
-            if self._linear_error is None:
-                try:
-                    self.state._apply_to_working_fold(entry, self._linear_approvals)
-                except ConversationIntegrityError as exc:
-                    self._linear_error = (row, exc)
-        else:
-            self._linear_branch = False
         metadata = (
             entry.data["message"].get("metadata", {})
             if entry.type == "message"
@@ -309,7 +292,9 @@ class _FullLoadValidator:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
         approvals = _ApprovalValidationOverlay()
-        for entry in self.state._resident_rows.stream_rows(reversed(branch)):
+        for entry in self.state._resident_rows.stream_validated_entries(
+            reversed(branch)
+        ):
             try:
                 self.state._apply_to_working_fold(entry, approvals)
             except ConversationIntegrityError as exc:
@@ -364,15 +349,8 @@ class _FullLoadValidator:
                 prefix_digest=hashlib.sha256().hexdigest(),
                 source_digest=self.source.finish_digest(),
             )
-        if self.state._resident_rows.rows and not self._linear_branch:
+        if self.state._resident_rows.rows:
             self._select_branch(self.state._resident_rows.rows[-1])
-        elif self._linear_error is not None:
-            row, exc = self._linear_error
-            raise self._error(
-                row,
-                kind="broken_links",
-                reason_code=self._semantic_reason(exc),
-            ) from exc
         self.state._rebuild_client_deliveries(iter(self._client_delivery_entries))
         if install:
             if self.resets_resident_rows:

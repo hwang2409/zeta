@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections import OrderedDict
@@ -683,7 +684,7 @@ class ResidentRows:
             raise StaleHistorySnapshot("conversation row generation changed")
         return fd
 
-    def _decode(self, fd: int, ref: RowRef) -> ConversationEntry:
+    def _raw(self, fd: int, ref: RowRef) -> bytes:
         offset = ref.offset
         if self._relative_offsets:
             header = os.pread(fd, 4096, 0)
@@ -696,7 +697,10 @@ class ResidentRows:
         if len(raw) != ref.length:
             from ._history_index import StaleHistorySnapshot
             raise StaleHistorySnapshot("conversation row offset is stale")
-        value = load_session_json(raw)
+        return raw
+
+    def _decode(self, fd: int, ref: RowRef) -> ConversationEntry:
+        value = load_session_json(self._raw(fd, ref))
         entry = ConversationEntry.from_dict(value)
         if entry.seq != ref.seq or entry.id != ref.id:
             from ._history_index import StaleHistorySnapshot
@@ -740,3 +744,52 @@ class ResidentRows:
         finally:
             if fd is not None:
                 os.close(fd)
+
+    def stream_validated_rows(
+        self, refs: Iterable[RowRef]
+    ) -> Iterator[object]:
+        """Read rows whose payloads were already validated against these refs."""
+        generation = self._source_generation
+        fd: int | None = None
+        try:
+            for ref in refs:
+                entry = self.payloads.get(ref.seq)
+                if entry is None:
+                    fd = self._open_source() if fd is None else fd
+                    entry = json.loads(self._raw(fd, ref))
+                    if (
+                        entry.get("seq") != ref.seq
+                        or entry.get("id") != ref.id
+                        or entry.get("parent_id") != ref.parent_id
+                        or entry.get("lane", "main") != ref.lane
+                        or entry.get("type") != ref.type
+                    ):
+                        from ._history_index import StaleHistorySnapshot
+                        raise StaleHistorySnapshot("conversation row offset is stale")
+                yield entry
+            if (
+                self._generation_reader is not None
+                and self._generation_reader() != generation
+            ):
+                from ._history_index import StaleHistorySnapshot
+                raise StaleHistorySnapshot("conversation row generation changed")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def stream_validated_entries(
+        self, refs: Iterable[RowRef]
+    ) -> Iterator[ConversationEntry]:
+        """Read validated rows as entries without repeating payload validation."""
+        for value in self.stream_validated_rows(refs):
+            if isinstance(value, ConversationEntry):
+                yield value
+            else:
+                yield ConversationEntry(
+                    seq=value["seq"],
+                    id=value["id"],
+                    parent_id=value.get("parent_id"),
+                    lane=value.get("lane", "main"),
+                    type=value["type"],
+                    data=value["data"],
+                )

@@ -417,7 +417,11 @@ class HistoryIndex:
                 for ref, entry in zip(row_refs, validated_rows, strict=True):
                     count += 1
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
-                    data = json.loads(encoded)
+                    data = (
+                        entry["data"]
+                        if isinstance(entry, Mapping)
+                        else json.loads(encoded)
+                    )
                     active = entry_id in active_ids
                     history_group = (
                         group if active and self._belongs_in_history(entry_type, data) else None
@@ -1116,7 +1120,7 @@ class HistoryPageStoreMixin:
             self._history_index.sync_validated(
                 self._history_index_facts(),
                 refs,
-                lambda: self._resident_rows.stream_rows(refs),
+                lambda: self._resident_rows.stream_validated_rows(refs),
             )
         else:
             self._history_index._mark_unavailable()
