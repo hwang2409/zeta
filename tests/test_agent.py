@@ -8693,12 +8693,19 @@ async def test_grandchild_approval_composes_with_parent_policy(
     grandchild_store = ConversationStore(
         store.session_dir / "agents" / "1" / "agents", session_id="1"
     )
+    grandchild_messages = branch_messages(grandchild_store)
     bash_result = next(
         message.tool_result
-        for message in branch_messages(grandchild_store)
+        for message in grandchild_messages
         if message.tool_result is not None
     )
     assert expected in bash_result.content
+    if action == "abort":
+        assert [message.role for message in grandchild_messages] == [
+            MessageRole.USER,
+            MessageRole.ASSISTANT,
+            MessageRole.TOOL_RESULT,
+        ]
     await loop.close()
 
 

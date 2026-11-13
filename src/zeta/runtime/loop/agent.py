@@ -1218,9 +1218,16 @@ class AgentLoop(
                 abort_signal=turn_abort_signal,
                 host_environment=host_environment,
             )
+            tool_canceled = False
             try:
                 async for event in dispatch:
                     recovery_state.record_event(event)
+                    if (
+                        event.type is StreamEventType.TOOL_EXECUTION_END
+                        and event.tool_result is not None
+                        and event.tool_result.is_canceled
+                    ):
+                        tool_canceled = True
                     yield event
             except (asyncio.CancelledError, GeneratorExit):
                 # The assistant message is already durable, so finalization prevents
@@ -1251,6 +1258,8 @@ class AgentLoop(
                 message=assistant_message,
                 data={"turn": turn_number, "tool_calls": len(calls)},
             )
+            if tool_canceled:
+                return
         if self.child_turn_control is not None and self.child_turn_control.exhausted:
             yield StreamEvent(StreamEventType.AGENT_END)
             return
