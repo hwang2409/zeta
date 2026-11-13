@@ -255,6 +255,7 @@ async def test_on_loop_non_retention_holder_keeps_typed_error(
         lock_dir / domain_lock_name(RETENTION_HOME_ID, "planner-active"),
         os.O_RDWR | os.O_CREAT,
     )
+    # test-contract: seam exercise the primitive's cheap active-lock probe
     monkeypatch.setattr("zeta.core.retention_access._active", lambda _: active_fd)
     try:
         with pytest.raises(RuntimeError, match="original"):
