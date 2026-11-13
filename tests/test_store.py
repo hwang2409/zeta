@@ -135,9 +135,25 @@ def test_resident_payloads_stay_bounded_after_compaction() -> None:
             },
         )
     )
+    parent_id = "compaction"
+    for seq in range(1102, 1202):
+        entry_id = f"tail-{seq}"
+        stored_message = message(MessageRole.ASSISTANT, "x" * 4096).to_dict()
+        stored_message["metadata"] = {"turn_failed": True}
+        rows.append(
+            ConversationEntry(
+                seq=seq,
+                id=entry_id,
+                parent_id=parent_id,
+                lane="main",
+                type="message",
+                data={"message": stored_message},
+            )
+        )
+        parent_id = entry_id
 
-    # test-contract: seam covered failed turns stay in context without retaining their payloads
-    assert sum(ref.type == "message" for ref in rows.context_refs()) == 1100
+    # test-contract: seam covered and uncovered turns stay in context without retaining their payloads
+    assert sum(ref.type == "message" for ref in rows.context_refs()) == 1200
     assert len(rows.payloads) <= 65
     assert rows.resident_payload_bytes < 5 * 1024 * 1024
     assert 1 not in rows.payloads

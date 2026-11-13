@@ -278,10 +278,9 @@ def decode_row_facts(raw: str | bytes) -> object:
 
 
 class ResidentRows:
-    _BULK_TYPES = frozenset({"message", "compaction", "notification"})
-
     """One owner for the row skeleton and its bounded resident payload set."""
 
+    _BULK_TYPES = frozenset({"message", "compaction", "notification"})
     _RECENT_WINDOW = 64
 
     def __init__(self, entries: Iterable[ConversationEntry] = ()) -> None:
@@ -391,6 +390,12 @@ class ResidentRows:
             self._context_refs.append(row)
             self._pinned.add(row.seq)
             self._payload_lru.pop(row.seq, None)
+            if len(self._branch_refs) > self._RECENT_WINDOW:
+                stale = self._branch_refs[-self._RECENT_WINDOW - 1]
+                if stale.type != "compaction":
+                    self._pinned.discard(stale.seq)
+                    if stale.seq in self.payloads:
+                        self._payload_lru[stale.seq] = self._payload_sizes[stale.seq]
             self._trim_payload_cache()
 
     def extend(
@@ -617,8 +622,7 @@ class ResidentRows:
             ),
             default=0,
         )
-        required.update(ref.seq for ref in self._branch_refs if ref.seq > coverage_end)
-
+        context_required.update(ref.seq for ref in self._branch_refs if ref.seq > coverage_end)
         recent = self.rows[-self._RECENT_WINDOW :]
         required.update(
             ref.seq
