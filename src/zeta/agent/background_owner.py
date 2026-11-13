@@ -304,6 +304,8 @@ class BackgroundAgentOwner:
         )
         if description is not None:
             self._descriptions[instance_id] = description
+        if parent_instance_id in self._cancel_requested:
+            self._request_cancellation(instance_id)
 
     def unregister(self, instance_id: str) -> None:
         self._cancellers.pop(instance_id, None)
@@ -313,7 +315,7 @@ class BackgroundAgentOwner:
         self._descriptions.pop(instance_id, None)
         self._parent_ids.pop(instance_id, None)
         self._original_parent_ids.pop(instance_id, None)
-        self._cancel_requested.discard(instance_id)
+        # A late descendant must inherit this completed cancellation.
         self._cancel_confirmations.pop(instance_id, None)
         self.causal_episodes.release_member(instance_id)
 
