@@ -395,11 +395,7 @@ class ServeControl:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         if reconnect and had_mcp_bindings and (loop := self.server.runtime.loop) is not None:
-            self._approval_resume.mark_mcp_reconnect(
-                self._approvals.active_keys(),
-                loop.mcp_tool_names_owned_by(self._active_mcp_bindings),
-                loop.store.approval_state_now,
-            )
+            self._approval_resume.mark_mcp_reconnect(self._approvals.active_keys(), loop.mcp_tool_names_owned_by(self._active_mcp_bindings), loop.store.approval_state_now)
         self._active_mcp_bindings = {}
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
