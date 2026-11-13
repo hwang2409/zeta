@@ -65,6 +65,7 @@ def make_retention_owner(
         on_error=record_error,
         home=root,
         close_lease=retained.close,
+        access_enabled=retained.observed_epoch >= 11,
     )
 
 
@@ -83,6 +84,7 @@ class RetentionActivationOwner:
         on_error: Callable[[Exception, int], Any] | None = None,
         home: str | Path | None = None,
         close_lease: Callable[[], Any] | None = None,
+        access_enabled: bool = True,
     ) -> None:
         self._planner_factory = planner_factory
         self._home = Path(home) if home is not None else None
@@ -106,6 +108,7 @@ class RetentionActivationOwner:
         self._request_pending = threading.Event()
         self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
         self._close_lease = close_lease
+        self._access_enabled = access_enabled
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -139,6 +142,8 @@ class RetentionActivationOwner:
 
     async def run_user_access(self, operation: Callable[[], Any]) -> Any:
         """Hold the user-access lease for one complete public operation."""
+        if not self._access_enabled:
+            return await operation()
         request_fd = None
         if self._home is not None:
             request_fd = await asyncio.to_thread(acquire_user_open_request, self._home)
@@ -177,6 +182,8 @@ class RetentionActivationOwner:
             planner = self._planner_factory()
             self._planner = planner
             self._planner_closed.clear()
+            if not getattr(planner, "enabled", True):
+                return projections, None
             from .handshake import planner_active
             context = planner_active(self._home) if self._home is not None else _null_context()
             with context:
