@@ -74,6 +74,8 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
+            if self.server._retention_owner is not None:
+                await self.server._retention_owner.yield_to_open()
             self.server.connections.replay_session_replaced()
             cwd = None
             if "cwd" in params:
@@ -104,6 +106,8 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.wake()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -123,6 +127,8 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
         with self.server.control.reserve_session_swap():
+            if self.server._retention_owner is not None:
+                await self.server._retention_owner.yield_to_open()
             self.server.connections.replay_session_replaced()
             session_id = validation.required_string(params, "session_id")
             try:
@@ -192,6 +198,8 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.wake()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)

@@ -12,12 +12,14 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from ..config.settings import load_settings
 from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from ..runtime.foreground_events import ForegroundEventPublisher
+from ..session_retention.activation import make_retention_owner
 from ..storage_format import drain_releases, pending_releases
 from . import (
     accounts,
@@ -245,6 +247,19 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
+        self._retention_owner = (
+            make_retention_owner(
+                self.home,
+                self.runtime.manager._storage_lease,
+                lambda: (
+                    0
+                    if self.runtime.opened is None
+                    else load_settings(home=self.home).settings.retention_days
+                ),
+            )
+            if not self._borrowed
+            else None
+        )
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
         self._prebound_socket = prebound_socket
@@ -328,6 +343,8 @@ class ZetaServer:
         if self._foreground_event_publisher is not None:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
+        if self._retention_owner is not None:
+            self._retention_owner.start()
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -337,6 +354,8 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
+        if self._retention_owner is not None:
+            await self._retention_owner.stop()
         if self._idle_drain is not None:
             self._idle_drain.cancel()
             await asyncio.wait([self._idle_drain])

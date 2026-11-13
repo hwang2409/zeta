@@ -918,6 +918,7 @@ def _run_tui_lifecycle_captured(
     restart_session_id: str | None = None
     exit_status = 0
     app: object | None = None
+    retention_owner: object | None = None
     try:
         while True:
             app = _create_tui_app(args, parser)
@@ -925,7 +926,14 @@ def _run_tui_lifecycle_captured(
                 exit_status = 1
                 break
             current_session_id = app.loop.store.session_id
+            if retention_owner is None and not args.no_session:
+                from ..session_retention.activation import make_retention_owner
+
+                retention_owner = make_retention_owner(
+                    env_home(), app.loop.store._storage_lease
+                )
             run_app = app
+            run_app._retention_owner = retention_owner
             restart_requested = False
             restart_cancels_work = False
             new_session_requested = False
@@ -940,7 +948,7 @@ def _run_tui_lifecycle_captured(
                 from ..tui.stderr_capture import run_tui_session
 
                 restart_requested, restart_cancels_work = run_tui_session(
-                    run_app, args, _run_tui
+                    run_app, args, _run_tui, retention_owner
                 )
                 new_session_requested = run_app.new_session_requested
                 if new_session_requested:
@@ -1075,6 +1083,9 @@ async def _run_tui(app: object, args: argparse.Namespace) -> tuple[bool, bool]:
         return create_app(fork_args)
 
     async def build_fork(fork_id: str) -> object:
+        owner = getattr(app, "_retention_owner", None)
+        if owner is not None:
+            await owner.yield_to_open()
         return await asyncio.to_thread(_build_fork, fork_id)
 
     return await run_fork_stack(app, build_fork)

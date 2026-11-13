@@ -10,6 +10,22 @@ from typing import Any
 from .handshake import open_with_retention_yield, user_open_request
 
 
+def make_retention_owner(
+    home: str | Path, lease: Any, days: Callable[[], int] | None = None
+) -> RetentionActivationOwner:
+    """Build the process owner from an already-open home lease."""
+    from ..config.settings import load_settings
+    from . import RetentionPlanner
+
+    root = Path(home)
+    retained = lease.retain()
+    return RetentionActivationOwner(
+        lambda: RetentionPlanner(root, retained),
+        days or (lambda: load_settings(home=root).settings.retention_days),
+        home=root,
+    )
+
+
 class RetentionActivationOwner:
     """Own one planner episode without blocking the frontend event loop."""
 
@@ -36,6 +52,9 @@ class RetentionActivationOwner:
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._planner: Any = None
+
+    def wake(self) -> None:
+        self._wake.set()
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -71,6 +90,7 @@ class RetentionActivationOwner:
 
     async def _run(self) -> None:
         try:
+            await asyncio.sleep(0)
             while not self._stop.is_set():
                 if self._days() == 0:
                     self._wake.clear()
