@@ -848,12 +848,16 @@ def _check_authority_case(tmp_path, monkeypatch, kind, mode):
             _generation_reader(monkeypatch)
         lease = stack.enter_context(_opened_lease(tmp_path))
         planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
-        result, reasons = _run_sweep(planner) if not (
+        blocked_evidence = kind == "reservation" or (
             kind == "discovery" and mode == "malformed"
-        ) else (planner.run_pass(days=30), {})
-    if kind == "discovery" and mode == "malformed":
+        )
+        result, reasons = (
+            (planner.run_pass(days=30), {})
+            if blocked_evidence else _run_sweep(planner)
+        )
+    if blocked_evidence:
         assert not result.complete
-        assert result.preview is None
+        assert (tmp_path / "sessions" / root).exists()
         return
     expected_clear = mode == "absent" or (kind == "discovery" and mode == "present")
     assert reasons[root][0] is expected_clear
@@ -953,7 +957,7 @@ def _check_over_bound_case(tmp_path, kind):
         assert root not in result.preview.root_ids
 
 _DEADLINE_TARGETS = {
-    "reservation": ("_reservation_present", None),
+    "reservation": ("_recover_one", None),
     "session_state": ("_has_child_marker", "session_state.json"),
     "child_lifecycle": ("_authority_store_reason", "agent_lifecycle.json"),
     "pending_link": ("_authority_store_reason", "project_link_pending.json"),
@@ -1156,7 +1160,8 @@ def test_armed_completed_preview_quarantines_eligible_root(tmp_path):
         planner = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         preview, reasons = _run_sweep(planner)
         assert reasons[root] == (True, None)
-        (tmp_path / "retention-arm.json").write_text(
+        arm_path = tmp_path / "retention-arm.json"
+        arm_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
@@ -1168,6 +1173,7 @@ def test_armed_completed_preview_quarantines_eligible_root(tmp_path):
             )
             + "\n"
         )
+        arm_path.chmod(0o600)
         planner.close()
         resumed = _planner(stack, tmp_path, lease, now_ns=_future_ns)
         resumed.run_pass(days=30)

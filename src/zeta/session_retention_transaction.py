@@ -13,7 +13,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -190,8 +190,9 @@ class _QuarantineTransaction:
             return TransactionOutcome(False, _bounded(str(exc)))
 
     def _recover_one(self, budget: _Budget) -> TransactionOutcome | None:
-        try:
-            with (
+        if not _entry_exists(self.home, _TRASH_NAME):
+            return None
+        with (
                 self._trash_directories(create=False) as (
                     _trash_fd, reservations_fd, txns_fd
                 ),
@@ -209,8 +210,6 @@ class _QuarantineTransaction:
                         return self._recover_reservation(
                             reservations_fd, txns_fd, entry.name, reservation, budget
                         )
-        except FileNotFoundError:
-            return None
         return None
 
     def _recover_reservation(
@@ -221,10 +220,15 @@ class _QuarantineTransaction:
         if name != expected_name:
             raise TransactionError("retention reservation name mismatch")
         txid = reservation["transaction_id"]
+        _hex_id(txid, "transaction id")
+        _component(reservation["session_id"], "session id")
         if reservation["source_path"] != f"sessions/{reservation['session_id']}":
             raise TransactionError("retention reservation source mismatch")
         if reservation["trash_path"] != f"session-trash/transactions/{txid}/tree":
             raise TransactionError("retention reservation trash mismatch")
+        if txns_fd is None:
+            self.lease.delete(reservations_fd, name)
+            return TransactionOutcome(True, session_id=reservation["session_id"])
         try:
             txn_fd = os.open(
                 txid, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=txns_fd
@@ -333,7 +337,7 @@ class _QuarantineTransaction:
         manifest, budget,
     ) -> TransactionOutcome:
         session_id = manifest["session_id"]
-        if (self.home / "sessions" / session_id).exists():
+        if _entry_exists(self.home / "sessions", session_id):
             if manifest["stage"] != "id_republished":
                 manifest = {**manifest, "stage": "id_republished"}
                 self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
@@ -444,9 +448,20 @@ class _QuarantineTransaction:
         try:
             home_fd = _open_home(self.home)
             stack.callback(os.close, home_fd)
-            trash_fd = stack.enter_context(child_directory(home_fd, _TRASH_NAME, create=create))
-            reservations_fd = stack.enter_context(child_directory(trash_fd, _RESERVATIONS_NAME, create=create))
-            txns_fd = stack.enter_context(child_directory(trash_fd, _TRANSACTIONS_NAME, create=create))
+            trash_fd = stack.enter_context(
+                _durable_child_directory(home_fd, _TRASH_NAME, create=create)
+            )
+            reservations_fd = stack.enter_context(
+                _durable_child_directory(trash_fd, _RESERVATIONS_NAME, create=create)
+            )
+            try:
+                txns_fd = stack.enter_context(
+                    _durable_child_directory(
+                        trash_fd, _TRANSACTIONS_NAME, create=create
+                    )
+                )
+            except FileNotFoundError:
+                txns_fd = None
             return _StackedDirectories(stack, trash_fd, reservations_fd, txns_fd)
         except BaseException:
             stack.close()
@@ -469,6 +484,44 @@ def _open_home(home: Path) -> int:
     return os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
+@contextmanager
+def _durable_child_directory(parent_fd: int, name: str, *, create: bool):
+    existed = True
+    if create:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        else:
+            existed = False
+    with child_directory(parent_fd, name) as directory_fd:
+        if not existed:
+            os.fsync(parent_fd)
+        yield directory_fd
+
+
+def _entry_exists(parent: Path, name: str) -> bool:
+    parent_fd = _open_home(parent)
+    try:
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(parent_fd)
+
+
+def _component(value: str, what: str) -> None:
+    if not value or value in {".", ".."} or "/" in value or "\x00" in value:
+        raise TransactionError(f"invalid retention {what}")
+
+
+def _hex_id(value: str, what: str) -> None:
+    if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+        raise TransactionError(f"invalid retention {what}")
+
+
 def _read_validated_json(directory_fd, name, validate) -> dict:
     value = _read_optional_validated_json(directory_fd, name, validate)
     if value is None:
@@ -483,7 +536,13 @@ def _read_optional_validated_json(directory_fd, name, validate) -> dict | None:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > _MAX_JSON_BYTES:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > _MAX_JSON_BYTES
+        ):
             raise TransactionError(f"unsafe retention record: {name}")
         with os.fdopen(fd, "rb") as stream:
             fd = -1
@@ -551,9 +610,12 @@ def _descend(parent_fd: int, components: tuple[str, ...]) -> int:
 
 
 def _remove_empty_transaction(txns_fd: int, txn_fd: int, txid: str) -> None:
-    if os.listdir(txn_fd):
-        return
-    os.rmdir(txid, dir_fd=txns_fd)
+    try:
+        os.rmdir(txid, dir_fd=txns_fd)
+    except OSError as exc:
+        if exc.errno == 39:  # ENOTEMPTY: evidence remains authoritative.
+            return
+        raise
     os.fsync(txns_fd)
 
 
