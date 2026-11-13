@@ -16578,7 +16578,9 @@ async def test_root_tui_paging_render_path_table(
             task = asyncio.create_task(app._history_pager.search("search-row"))
             app._history_search_task = task
             assert await asyncio.to_thread(started.wait, 10)
-            await asyncio.wait_for(app._close_history_search(), 0.2)
+            await await_or_fail(
+                app._close_history_search(), what="close during history search"
+            )
             release.set()
             assert await asyncio.to_thread(finished.wait, 10)
             with pytest.raises(asyncio.CancelledError):
