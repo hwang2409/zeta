@@ -1143,40 +1143,54 @@ async def run_agent_tool(
             )
 
         async def finish_background() -> None:
-            await finish_background_child(
-                child_task=child_task,
-                child_store=child_store,
-                parent_store=loop.store,
-                tool_call=tool_call,
-                child_instance_id=child_instance_id,
-                child_path=child_path,
-                description=description,
-                child_turns=child_turns,
-                build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
-                    child_result(
-                        text,
-                        error=error,
-                        status=status,
-                        stats=stats,
-                        include_stats=True,
-                        notice=notice,
-                        notice_items=notice_items,
-                        max_bytes=background_receipt_bytes,
-                    )
-                ),
-                validate_result=validate_result,
-                publish_event=loop._publish_background_event,
-                cleanup=cleanup_background_child,
-                close_child=close_background_child,
-                error_message=error_message,
-                marker_key=child_marker_key,
-                agent_instance_id=loop.agent_instance_id,
-                background_owner=loop._background_owner,
-                max_receipt_bytes=background_receipt_bytes,
-                explicit_finish=terminal_fence is not None,
-                child_loop=child_loop,
-                finish_gate_state=finish_gate_state,
+            lifecycle = asyncio.create_task(
+                finish_background_child(
+                    child_task=child_task,
+                    child_store=child_store,
+                    parent_store=loop.store,
+                    tool_call=tool_call,
+                    child_instance_id=child_instance_id,
+                    child_path=child_path,
+                    description=description,
+                    child_turns=child_turns,
+                    build_result=lambda text, error, status, stats, notice=None, notice_items=None: (
+                        child_result(
+                            text,
+                            error=error,
+                            status=status,
+                            stats=stats,
+                            include_stats=True,
+                            notice=notice,
+                            notice_items=notice_items,
+                            max_bytes=background_receipt_bytes,
+                        )
+                    ),
+                    validate_result=validate_result,
+                    publish_event=loop._publish_background_event,
+                    cleanup=cleanup_background_child,
+                    close_child=close_background_child,
+                    error_message=error_message,
+                    marker_key=child_marker_key,
+                    agent_instance_id=loop.agent_instance_id,
+                    background_owner=loop._background_owner,
+                    max_receipt_bytes=background_receipt_bytes,
+                    explicit_finish=terminal_fence is not None,
+                    child_loop=child_loop,
+                    finish_gate_state=finish_gate_state,
+                )
             )
+            cancelled = False
+            while not lifecycle.done():
+                try:
+                    await asyncio.shield(lifecycle)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+            lifecycle.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
         watcher = loop._create_task(finish_background())
         loop._background_child_watchers[tool_call.id] = watcher
