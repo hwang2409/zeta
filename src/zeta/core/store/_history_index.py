@@ -314,8 +314,10 @@ class HistoryIndex:
                     "w.byte_length,w.facts FROM entries e JOIN warm_rows w USING(seq) "
                     "ORDER BY e.seq"
                 ).fetchall()
+                resident_start = max(0, len(rows) - 1024)
                 if len(rows) != facts.get("last_seq") or any(
-                    row[4] not in {"message", "compaction"} for row in rows
+                    row[0] <= resident_start and row[4] not in {"message", "compaction"}
+                    for row in rows
                 ):
                     return None
                 unsupported_message = connection.execute(
@@ -1321,11 +1323,8 @@ class HistoryPageStoreMixin:
             self._history_index._mark_unavailable()
 
     def _apply_history_index_entries(
-        self: ConversationStore,
-        entries: tuple[ConversationEntry, ...],
-        *,
-        leave_stale_on_loop: bool = False,
-        rebuild_unavailable: bool = True,
+        self: ConversationStore, entries: tuple[ConversationEntry, ...], *,
+        leave_stale_on_loop: bool = False, rebuild_unavailable: bool = True,
     ) -> None:
         if self._history_index is None or not entries:
             return
