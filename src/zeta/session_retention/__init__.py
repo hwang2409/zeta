@@ -57,6 +57,7 @@ from ..storage_format import (
     validate_retention_reservation,
     validate_retention_state,
 )
+from .handshake import planner_active, planner_request_pending
 from .pin import is_retention_pinned
 from .transaction import (
     Candidate,
@@ -389,9 +390,12 @@ class _Budget:
     entries: int = 0
     records: int = 0
     record_bytes: int = 0
+    yield_check: Callable[[], bool] | None = None
 
     def charge_entry(self, size: int = 0) -> None:
         self.entries += 1
+        if self.yield_check is not None and self.yield_check():
+            raise _Deferred
         if self.entries > self.bounds.entries_total or self.clock() >= self.deadline:
             raise _Deferred
 
@@ -550,11 +554,17 @@ class RetentionPlanner:
             raise RetentionPlannerError("retention days must be in 1..3650")
         if not self.enabled:
             return PassResult(enabled=False, complete=False)
-        home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            return self._run_pass(home_fd, days)
-        finally:
-            os.close(home_fd)
+        if planner_request_pending(self.home):
+            self.close()
+            return PassResult(enabled=True, complete=False)
+        with planner_active(self.home):
+            home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                return self._run_pass(home_fd, days)
+            finally:
+                os.close(home_fd)
+                if planner_request_pending(self.home):
+                    self.close()
 
     def _run_pass(self, home_fd: int, days: int) -> PassResult:
         if self._latest is _UNLOADED:
@@ -575,7 +585,10 @@ class RetentionPlanner:
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
             return transaction_result
-        budget = _Budget(self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns)
+        budget = _Budget(
+            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
+            yield_check=lambda: planner_request_pending(self.home),
+        )
         sweep = self._sweep
         if sweep is None or sweep.days != days:
             self.close()
@@ -624,7 +637,8 @@ class RetentionPlanner:
     def _verify_candidate(self, root_id: str, days: int):
         """Repeat the full closure proof while the transaction owns authority."""
         budget = _Budget(
-            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns
+            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
+            yield_check=lambda: planner_request_pending(self.home),
         )
         sweep = _Sweep(days, self._now_ns(), current_root=root_id)
         scan = _ClosureBudget(budget)

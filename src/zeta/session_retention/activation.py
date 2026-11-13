@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+
+from .handshake import open_with_retention_yield, user_open_request
 
 
 class RetentionActivationOwner:
@@ -18,8 +21,10 @@ class RetentionActivationOwner:
         wake_seconds: float = 86_400,
         sleep: Callable[[float], Any] | None = None,
         publish: Callable[[Any], Any] | None = None,
+        home: str | Path | None = None,
     ) -> None:
         self._planner_factory = planner_factory
+        self._home = Path(home) if home is not None else None
         self._days = days
         self._wake_seconds = wake_seconds
         self._sleep = sleep or asyncio.sleep
@@ -48,12 +53,21 @@ class RetentionActivationOwner:
         if task is not None:
             await task
 
-    async def yield_to_open(self) -> None:
+    async def yield_to_open(self, operation: Callable[[], Any] | None = None) -> Any:
         """Abandon the current preview before an interactive open proceeds."""
-        self._restart.set()
-        self._wake.set()
-        # run_pass owns the planner; closing it here would race with the worker.
-        await self._run_done.wait()
+        if self._home is None:
+            self._restart.set()
+            self._wake.set()
+            await self._run_done.wait()
+            return None if operation is None else await asyncio.to_thread(operation)
+        with user_open_request(self._home):
+            self._restart.set()
+            self._wake.set()
+            # run_pass owns the planner; closing it here would race with the worker.
+            await self._run_done.wait()
+            if operation is None:
+                return None
+            return await asyncio.to_thread(open_with_retention_yield, self._home, operation)
 
     async def _run(self) -> None:
         try:

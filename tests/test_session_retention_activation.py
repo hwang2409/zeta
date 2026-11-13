@@ -50,6 +50,18 @@ async def test_yield_to_open_closes_only_after_worker_pass() -> None:
     assert not owner.task
 
 
+async def test_yield_to_open_runs_operation_after_worker_pass(tmp_path) -> None:
+    opened = threading.Event()
+    owner = RetentionActivationOwner(
+        lambda: _Planner(threading.Event(), threading.Event()),
+        lambda: 0,
+        home=tmp_path,
+    )
+    result = await owner.yield_to_open(lambda: (opened.set(), "opened")[1])
+    assert result == "opened"
+    assert opened.is_set()
+
+
 async def test_zero_days_skips_planner_pass() -> None:
     created = 0
 
