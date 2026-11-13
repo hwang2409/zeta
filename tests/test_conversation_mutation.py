@@ -11,6 +11,7 @@ from typing import ClassVar
 
 import pytest
 
+from tests.support.branch_reads import branch_entries, resident_entries
 from tests.support.owned import await_or_fail
 from zeta.core.checkpoints import mutation as mutation_module
 from zeta.core.store import (
@@ -77,7 +78,7 @@ def test_commit_installs_one_multirow_delta_and_rejects_stale_generation(
     assert len(installed) == 1
     before = (
         store.path.read_bytes(),
-        tuple(store.entries),
+        tuple(resident_entries(store)),
         store.conversation_generation,
     )
     with pytest.raises(ConversationGenerationConflict) as raised:
@@ -85,7 +86,7 @@ def test_commit_installs_one_multirow_delta_and_rejects_stale_generation(
     assert raised.value.actual_generation == delta.generation_after
     assert (
         store.path.read_bytes(),
-        tuple(store.entries),
+        tuple(resident_entries(store)),
         store.conversation_generation,
     ) == before
     store.close()
@@ -97,7 +98,7 @@ def test_invalid_second_row_changes_neither_durable_nor_resident_state(
     store = ConversationStore(tmp_path)
     before = (
         store.path.read_bytes(),
-        tuple(store.entries),
+        tuple(resident_entries(store)),
         store.conversation_generation,
     )
 
@@ -111,7 +112,7 @@ def test_invalid_second_row_changes_neither_durable_nor_resident_state(
 
     assert (
         store.path.read_bytes(),
-        tuple(store.entries),
+        tuple(resident_entries(store)),
         store.conversation_generation,
     ) == before
     store.close()
@@ -139,7 +140,7 @@ def test_dedupe_survives_restart_and_wins_before_stale_generation(
     assert duplicate.committed_entries[0].id == first_id
     assert duplicate.entries_to_install == ()
     assert installed == []
-    assert sum(entry.id == first_id for entry in reopened.entries) == 1
+    assert sum(entry.id == first_id for entry in resident_entries(reopened)) == 1
     with pytest.raises(ConversationDedupeConflict):
         reopened.commit(
             AppendConversationRows((_warning("changed"),), key),
@@ -163,7 +164,7 @@ def test_dedupe_survives_compaction_marker(tmp_path: Path) -> None:
 
         assert duplicate.duplicate
         assert duplicate.committed_entries == first.committed_entries
-        assert store.replay() == [*first.committed_entries, marker]
+        assert branch_entries(store) == [*first.committed_entries, marker]
     finally:
         store.close()
 
@@ -182,14 +183,14 @@ def test_dedupe_returns_inactive_branch_publication_without_copying_it(
         AppendConversationRows((_warning("new branch", parent_id=anchor.id),)),
         store.conversation_generation,
     )
-    count = len(store.entries)
+    count = len(resident_entries(store))
 
     duplicate = store.commit(command, store.conversation_generation)
 
     assert duplicate.duplicate is True
     assert duplicate.committed_entries == publication.committed_entries
-    assert len(store.entries) == count
-    assert store.entries[-1].data["message"] == "new branch"
+    assert len(resident_entries(store)) == count
+    assert resident_entries(store)[-1].data["message"] == "new branch"
     store.close()
 
 
@@ -229,7 +230,7 @@ async def test_commit_async_defers_cancellation_until_delta_is_installed(
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
-        assert [entry.data["message"] for entry in store.entries] == ["durable"]
+        assert [entry.data["message"] for entry in resident_entries(store)] == ["durable"]
         generation = store.conversation_generation
     finally:
         release.set()
@@ -243,7 +244,7 @@ async def test_commit_async_defers_cancellation_until_delta_is_installed(
     )
     try:
         assert reopened.conversation_generation == generation
-        assert [entry.data["message"] for entry in reopened.entries] == ["durable"]
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == ["durable"]
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -271,7 +272,7 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
     monkeypatch.setattr(store, "_before_committed_mutation", pause_before_write)
     before = (
         store.path.read_bytes(),
-        tuple(store.entries),
+        tuple(resident_entries(store)),
         store.conversation_generation,
     )
     task = asyncio.create_task(
@@ -291,7 +292,7 @@ async def test_commit_async_cancelled_before_write_changes_nothing(
             await asyncio.wait_for(task, 10)
         assert (
             store.path.read_bytes(),
-            tuple(store.entries),
+            tuple(resident_entries(store)),
             store.conversation_generation,
         ) == before
     finally:
@@ -465,7 +466,7 @@ async def test_mutation_cancellation_policy_table(
             expected = 0
         elif phase == "duplicate" and policy == "finalize_once_submitted":
             expected = 2
-        resident = tuple(entry.to_dict() for entry in store.entries)
+        resident = tuple(entry.to_dict() for entry in resident_entries(store))
         assert len(resident) == expected
         assert len(publications) == expected
         assert final_callbacks == (
@@ -481,7 +482,7 @@ async def test_mutation_cancellation_policy_table(
 
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert tuple(entry.to_dict() for entry in reopened.entries) == resident
+        assert tuple(entry.to_dict() for entry in resident_entries(reopened)) == resident
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -689,7 +690,7 @@ async def test_mutation_target_cancellation_policy_table(
     if scenario == "duplicate_after_recovery":
         assert result is not None and result.duplicate is True
 
-    resident = tuple(entry.to_dict() for entry in store.entries)
+    resident = tuple(entry.to_dict() for entry in resident_entries(store))
     if target_kind == "resident" and not aborted_at_gate:
         assert len(publications) == 1
         if scenario != "success":
@@ -699,28 +700,28 @@ async def test_mutation_target_cancellation_policy_table(
 
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        durable = tuple(entry.to_dict() for entry in reopened.entries)
+        durable = tuple(entry.to_dict() for entry in resident_entries(reopened))
         if target_kind == "resident" and not aborted_at_gate:
             assert durable == resident
         if aborted_at_gate:
             assert not any(
                 entry.data.get("message") == "policy target"
-                for entry in reopened.entries
+                for entry in resident_entries(reopened)
             )
         elif scenario == "command_failure_after_recovery":
-            assert [entry.type for entry in reopened.entries] == ["warning"]
-            assert reopened.entries[0].data["kind"] == "transcript_recovery"
+            assert [entry.type for entry in resident_entries(reopened)] == ["warning"]
+            assert resident_entries(reopened)[0].data["kind"] == "transcript_recovery"
         elif scenario == "duplicate_after_recovery":
-            assert [entry.type for entry in reopened.entries] == ["warning", "warning"]
+            assert [entry.type for entry in resident_entries(reopened)] == ["warning", "warning"]
             assert sum(
                 entry.data.get("message") == "policy target"
-                for entry in reopened.entries
+                for entry in resident_entries(reopened)
             ) == 1
         elif torn:
-            assert [entry.type for entry in reopened.entries] == ["warning", "warning"]
-            assert reopened.entries[0].data["kind"] == "transcript_recovery"
+            assert [entry.type for entry in resident_entries(reopened)] == ["warning", "warning"]
+            assert resident_entries(reopened)[0].data["kind"] == "transcript_recovery"
         else:
-            assert [entry.data["message"] for entry in reopened.entries] == [
+            assert [entry.data["message"] for entry in resident_entries(reopened)] == [
                 "policy target"
             ]
     finally:
@@ -728,7 +729,7 @@ async def test_mutation_target_cancellation_policy_table(
 
     second = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert tuple(entry.to_dict() for entry in second.entries) == durable
+        assert tuple(entry.to_dict() for entry in resident_entries(second)) == durable
     finally:
         await asyncio.to_thread(second.close)
 
@@ -751,7 +752,7 @@ async def test_address_commit_uses_registered_resident_target(
             address, AppendConversationRows((_warning("resident"),))
         )
         assert delta.committed_entries[0] is not None
-        assert [entry.data["message"] for entry in store.entries] == ["resident"]
+        assert [entry.data["message"] for entry in resident_entries(store)] == ["resident"]
     finally:
         await asyncio.to_thread(store.close)
 
@@ -827,7 +828,7 @@ async def test_address_commit_without_resident_replays_on_later_open(
     assert delta.duplicate is False
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert [entry.data["message"] for entry in reopened.entries] == ["transient"]
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == ["transient"]
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -878,7 +879,7 @@ def test_dedupe_scope_includes_namespace_and_conversation(tmp_path: Path) -> Non
             first.conversation_generation,
         )
         assert different.duplicate is False
-        assert [entry.data["message"] for entry in first.entries] == [
+        assert [entry.data["message"] for entry in resident_entries(first)] == [
             "first",
             "different",
         ]
@@ -925,7 +926,7 @@ async def test_address_commit_cancellation_after_resident_durable_commit(
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
-        assert [entry.data["message"] for entry in store.entries] == ["address durable"]
+        assert [entry.data["message"] for entry in resident_entries(store)] == ["address durable"]
         generation = store.conversation_generation
     finally:
         release.set()
@@ -936,7 +937,7 @@ async def test_address_commit_cancellation_after_resident_durable_commit(
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert reopened.conversation_generation == generation
-        assert [entry.data["message"] for entry in reopened.entries] == [
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == [
             "address durable"
         ]
     finally:
@@ -1002,7 +1003,7 @@ async def test_commit_async_cancel_before_lock_writes_nothing(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 10)
         assert store.path.read_bytes() == before
-        assert store.entries == []
+        assert resident_entries(store) == []
     finally:
         if store._async_write_lock.locked():
             store._async_write_lock.release()
@@ -1052,7 +1053,7 @@ async def test_commit_async_close_race_keeps_durable_result(
         ConversationStore, tmp_path, session_id=store.session_id
     )
     try:
-        assert [entry.data["message"] for entry in reopened.entries] == ["close race"]
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == ["close race"]
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -1177,7 +1178,7 @@ async def test_address_concurrent_resident_commits_are_serialized(
             what="resident address commits",
         )
         assert not [result for result in results if isinstance(result, BaseException)]
-        messages = [entry.data["message"] for entry in store.entries]
+        messages = [entry.data["message"] for entry in resident_entries(store)]
         assert sorted(messages) == [f"resident-{i}" for i in range(8)]
         generation = store.conversation_generation
     finally:
@@ -1190,7 +1191,7 @@ async def test_address_concurrent_resident_commits_are_serialized(
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
         assert reopened.conversation_generation == generation
-        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+        assert sorted(entry.data["message"] for entry in resident_entries(reopened)) == [
             f"resident-{i}" for i in range(8)
         ]
     finally:
@@ -1265,7 +1266,7 @@ async def test_address_transient_waiter_retries_after_owner_release(
         )
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+        assert sorted(entry.data["message"] for entry in resident_entries(reopened)) == [
             "owner",
             "waiter",
         ]
@@ -1344,7 +1345,7 @@ async def test_transient_waiter_cancellation_does_not_release_owner(
         )
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert sorted(entry.data["message"] for entry in reopened.entries) == [
+        assert sorted(entry.data["message"] for entry in resident_entries(reopened)) == [
             "owner",
             "third",
         ]
@@ -1418,7 +1419,7 @@ async def test_transient_owner_failure_wakes_waiter(
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert [entry.data["message"] for entry in reopened.entries] == ["survivor"]
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == ["survivor"]
     finally:
         await asyncio.to_thread(reopened.close)
 
@@ -1494,6 +1495,6 @@ async def test_transient_owner_cancellation_after_worker_start_defers_release(
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
     reopened = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert [entry.data["message"] for entry in reopened.entries] == ["waiter"]
+        assert [entry.data["message"] for entry in resident_entries(reopened)] == ["waiter"]
     finally:
         await asyncio.to_thread(reopened.close)

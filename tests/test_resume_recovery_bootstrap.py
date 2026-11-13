@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
@@ -190,7 +191,7 @@ async def test_warm_writer_sees_external_append_between_open_and_start(
     await flow.initialize()
     try:
         assert reloads == 0
-        assert resident.messages()[-1].content == [TextContent("external")]
+        assert branch_messages(resident)[-1].content == [TextContent("external")]
     finally:
         await asyncio.to_thread(resident.close)
 
@@ -279,21 +280,21 @@ async def test_warm_writer_appends_are_structurally_isolated(tmp_path: Path) -> 
     try:
         writer = resident._durable_writer
         assert writer is not None
-        original = resident._entries[0].data["message"]["content"][0]["text"]
+        original = resident_entries(resident)[0].data["message"]["content"][0]["text"]
         writer.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("writer payload")]),
                 MessageOrigin.USER,
             )
         )
-        assert resident._entries[0].data["message"]["content"][0]["text"] == original
+        assert resident_entries(resident)[0].data["message"]["content"][0]["text"] == original
         resident.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("resident payload 2")]),
                 MessageOrigin.USER,
             )
         )
-        assert writer._entries[0].data["message"]["content"][0]["text"] == original
+        assert resident_entries(writer)[0].data["message"]["content"][0]["text"] == original
     finally:
         await asyncio.to_thread(resident.close)
 
@@ -310,7 +311,7 @@ async def test_resume_recovery_restores_durable_completion(tmp_path: Path) -> No
         assert runtime.opened.store.agent_children() == {}
         results = [
             message.tool_result
-            for message in runtime.opened.store.messages()
+            for message in branch_messages(runtime.opened.store)
             if message.tool_result is not None
         ]
         assert [result.tool_call_id for result in results] == ["call-0"]

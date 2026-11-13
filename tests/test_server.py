@@ -35,6 +35,7 @@ import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.core.slash as core_slash
 import zeta.server.handlers.history as history_module
 import zeta.server.protocol as protocol_module
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.completion import completion_control
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
@@ -1944,20 +1945,13 @@ def test_session_history_uses_one_immutable_snapshot_and_one_linear_scan() -> No
     calls = 0
 
     class Store:
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             nonlocal calls
             calls += 1
             return entries
 
-        def replay(self):
-            raise AssertionError("session_history must not replay the store")
-
-        @property
-        def entries(self):
-            raise AssertionError("session_history must not read store.entries")
-
-        def messages(self):
-            raise AssertionError("session_history must not read store.messages()")
+        def entry(self, ref):
+            return ref
 
     runtime = SimpleNamespace(opened=SimpleNamespace(store=Store()))
     result = history_module.history(runtime, {}, include_delivery_id=False)
@@ -2179,7 +2173,7 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
         reopened = SessionManager(tmp_path).open(session_id).store
-        assert "reason" not in reopened.entries[-1].data
+        assert "reason" not in resident_entries(reopened)[-1].data
 
         history = (
             await _request(
@@ -2226,7 +2220,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
                     ).tool_result
                     is not None
                     and message.tool_result.tool_call_id == call.id
-                    for entry in server.runtime.opened.store.replay()
+                    for entry in branch_entries(server.runtime.opened.store)
                 )
             return await original_notify(event, session_id, **fields)
 
@@ -2381,7 +2375,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert server.runtime.opened is not None
         assert any(
             isinstance(block, TextContent) and block.text == "parent done"
-            for message in server.runtime.opened.store.messages()
+            for message in branch_messages(server.runtime.opened.store)
             for block in message.content
         )
         child_store = ConversationStore(
@@ -2390,7 +2384,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         try:
             assert any(
                 isinstance(block, TextContent) and block.text == "child done"
-                for message in child_store.messages()
+                for message in branch_messages(child_store)
                 for block in message.content
             )
         finally:
@@ -3464,7 +3458,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert canceled_tool_end["tool_call"]["id"] == call.id
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
-        history = server.runtime.opened.store.messages()
+        history = branch_messages(server.runtime.opened.store)
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
@@ -3494,7 +3488,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert [
             name for name in next_names if name in {"turn_start", "turn_end"}
         ] == ["turn_start", "turn_end"]
-        history = server.runtime.opened.store.messages()
+        history = branch_messages(server.runtime.opened.store)
         assert next_reply in json.dumps([message.to_dict() for message in history])
     finally:
         allow_approval_end.set()
@@ -4464,7 +4458,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     writer.close()
     await writer.wait_closed()
     await asyncio.sleep(0.1)
-    messages = server.runtime.manager.open(session_id).store.messages()
+    messages = branch_messages(server.runtime.manager.open(session_id).store)
     assert any(
         message.role.value == "assistant"
         and "first" in "".join(getattr(block, "text", "") for block in message.content)
@@ -5626,8 +5620,8 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         restored = (await rpc("session_history"))["result"]["messages"]
         assert restored == history["messages"]
         reopened = SessionManager(tmp_path).open(sid)
-        assert [m.to_dict() for m in reopened.store.messages()] == [
-            m.to_dict() for m in server.runtime.loop.store.messages()
+        assert [m.to_dict() for m in branch_messages(reopened.store)] == [
+            m.to_dict() for m in branch_messages(server.runtime.loop.store)
         ]
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
@@ -5649,15 +5643,7 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
         "activation test",
         project_root,
     )
-    entries_reads = 0
-    original_entries = ConversationStore.entries
-
-    def counted_entries(store: ConversationStore):
-        nonlocal entries_reads
-        entries_reads += 1
-        return original_entries.__get__(store, ConversationStore)
-
-    monkeypatch.setattr(ConversationStore, "entries", property(counted_entries))
+    assert not hasattr(ConversationStore, "entries")
     server = ZetaServer(
         home=home,
         cwd=project_root,
@@ -5671,7 +5657,6 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
     try:
         await server.runtime.create_session()
         assert "inbox" in server.runtime.loop.tool_registry.registered_names
-        assert entries_reads == 0
     finally:
         await server.close()
 
@@ -6104,7 +6089,9 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
         text="heads up",
     )
     assert unknown is not None
-    loaded = next(entry for entry in store._entries if entry.id == unknown.id)
+    loaded = next(
+        store.entry(ref) for ref in store.resident_refs() if ref.id == unknown.id
+    )
     loaded.data["kind"] = "monitor_alert"  # Simulate a future kind loaded from disk.
     try:
         history = (
@@ -6352,7 +6339,7 @@ async def test_history_pages_large_messages_with_bounded_tool_arguments(
             }
         assert all(
             message.content[-1].tool_call.arguments == {"content": "x" * 135_000}
-            for message in store.messages()
+            for message in branch_messages(store)
         )
     finally:
         await close_serve(server, writer)
@@ -6386,7 +6373,7 @@ async def test_history_advances_past_single_oversized_persisted_message(tmp_path
         assert [row["id"] for row in page["messages"]] == [oversized.id, following.id]
         assert "truncated" in page["messages"][0]["content"][0]["text"]
         assert page["messages"][1]["content"] == [{"type": "text", "text": "after"}]
-        assert len(store.messages()[0].content) == 140
+        assert len(branch_messages(store)[0].content) == 140
     finally:
         await close_serve(server, writer)
 
@@ -6568,7 +6555,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
         assert not (server.runtime.opened.store.session_dir / "attachments").exists()
         assert (await send([image]))["result"]["accepted"]
         await _event(reader, "agent_end")
-        message = server.runtime.loop.store.messages()[0]
+        message = branch_messages(server.runtime.loop.store)[0]
         attachment = next(
             block for block in message.content if isinstance(block, ImageContent)
         )
@@ -6589,7 +6576,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
             "size": len(png),
         }
         assert "data" not in history[0]["content"][1]
-        assert SessionManager(tmp_path).open(sid).store.messages()[0] == message
+        assert branch_messages(SessionManager(tmp_path).open(sid).store)[0] == message
     finally:
         await close_serve(server, writer)
 
@@ -6919,7 +6906,7 @@ async def test_attachment_failure_removes_entire_batch(
         assert attachments.exists() == existing
         assert set(attachments.rglob("*")) == before
         assert all(path.read_bytes() == png for path in before if path.is_file())
-        assert runtime.opened.store.messages() == []
+        assert branch_messages(runtime.opened.store) == []
     finally:
         await runtime.close()
 
@@ -6993,7 +6980,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
                 MessageOrigin.USER,
             )
         )
-        history = opened.store.messages()
+        history = branch_messages(opened.store)
         runtime.usage["input_tokens"] = 123
         with monkeypatch.context() as patch:
             if failure == "metadata":
@@ -7019,7 +7006,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
         assert (
             runtime.state is state and runtime.loop is loop and runtime.opened is opened
         )
-        assert opened.store.messages() == history
+        assert branch_messages(opened.store) == history
         assert runtime.usage == {"input_tokens": 123}
         if failure:
             assert response["error"]["code"] == -32000
@@ -7046,7 +7033,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
             }
             await _request(reader, writer, 4, "send", {"text": "use new backend"})
             await _event(reader, "agent_end")
-            assert runtime.opened.store.messages()[-1].content == [TextContent("codex")]
+            assert branch_messages(runtime.opened.store)[-1].content == [TextContent("codex")]
             await _request(reader, writer, 5, "resume", {"session_id": sid})
             assert runtime.provider == "codex" and runtime.model == "gpt-5.4"
             assert runtime.loop.context_assembler.token_budget == expected
@@ -11181,14 +11168,16 @@ async def test_failed_wake_turn_keeps_durable_notification_input(
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
+        for _ in range(10000):
+            if server.runtime.loop.notification_turn_state == "idle":
+                break
             await asyncio.sleep(0)
         assert backend.calls == 1
         assert [entry.data["text"] for entry in store.agent_notifications()] == ["done"]
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11232,14 +11221,16 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
         frames = await _request(reader, writer, 5, "abort", {"scope": "foreground"})
         assert frames[-1]["result"]["aborted"] is True
         await _frames_until_event(reader, "agent_end")
-        while store.agent_notifications():
+        for _ in range(10000):
+            if not store.agent_notifications():
+                break
             await asyncio.sleep(0)
         assert len(backend.calls) == 2
         assert store.agent_notifications() == []
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11299,7 +11290,7 @@ async def test_session_abort_does_not_retry_notification_turn(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11354,7 +11345,7 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11459,7 +11450,9 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         writer.close()
         await writer.wait_closed()
-        while server._client_active:
+        for _ in range(10000):
+            if not server._client_active:
+                break
             await asyncio.sleep(0)
         assert len(store.agent_notifications()) == 1
 
@@ -11471,7 +11464,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         assert (
             sum(
                 message.metadata.get("zeta_event") == "agent_notifications"
-                for message in store.messages()
+                for message in branch_messages(store)
             )
             == 1
         )
@@ -11512,8 +11505,9 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         rejected = await _request(reader, writer, 5, "send", {"text": "user now"})
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
-        while server._client is not None and server.control.turn_busy():
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while server._client is not None and server.control.turn_busy():
+                await asyncio.sleep(0)
 
         await _request(reader, writer, 6, "send", {"text": "user now"})
         await _frames_until_event(reader, "agent_end")
@@ -11977,7 +11971,7 @@ async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None
                     MessageOrigin.USER,
                 )
             )
-            assert [message.content[0].text for message in reopened.messages()] == [
+            assert [message.content[0].text for message in branch_messages(reopened)] == [
                 "retained",
                 "usable",
             ]

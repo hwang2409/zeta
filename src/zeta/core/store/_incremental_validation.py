@@ -98,7 +98,7 @@ class IncrementalValidationMixin:
         than re-running per-entry validation; only the candidate row is checked.
         """
         relations: dict[str, str | None] = {}
-        for entry in self._active_branch():
+        for entry in self.approval_payloads():
             if entry.type == "message":
                 for request in entry.data.get("approval_requests", ()):
                     request_id = request.get("request_id")
@@ -132,13 +132,13 @@ class IncrementalValidationMixin:
         """Build O(1) integrity indexes after a complete validation pass."""
         self._reset_incremental_validation_state()
         by_id: dict[str, ConversationEntry] = {}
-        for index, entry in enumerate(self._entries):
+        for index, entry in enumerate(self._resident_rows.entries):
             if index and index % 64 == 0:
                 time.sleep(0.0001)
             self._entry_ids.add(entry.id)
             by_id[entry.id] = entry
         branch: list[ConversationEntry] = []
-        current = self._entries[-1] if self._entries else None
+        current = self._resident_rows.entries[-1] if self._resident_rows.entries else None
         while current is not None:
             branch.append(current)
             current = by_id.get(current.parent_id) if current.parent_id else None
@@ -153,7 +153,7 @@ class IncrementalValidationMixin:
     def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
         """Validate a tail against staged state, then publish it as one update."""
         staged = copy.copy(self)
-        staged._resident_rows = type(self._resident_rows)(self._entries)
+        staged._resident_rows = type(self._resident_rows)(self._resident_rows.entries)
         staged._entry_ids = set(self._entry_ids)
         staged._entry_prefix_digest = self._entry_prefix_digest
         staged._delivery_fold = self._delivery_fold.staged()
@@ -183,7 +183,7 @@ class IncrementalValidationMixin:
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
-        self._resident_rows.replace(staged._entries)
+        self._resident_rows.replace(staged._resident_rows.entries)
         self._record_client_delivery_entries(entries)
         return True
 
@@ -194,14 +194,14 @@ class IncrementalValidationMixin:
         self, entry: ConversationEntry, approvals: _ApprovalValidationOverlay
     ) -> bool:
         """Validate and install one linear tail entry, or request a full reload."""
-        expected_seq = self._entries[-1].seq + 1 if self._entries else 1
+        expected_seq = self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1
         if entry.seq != expected_seq:
             raise ConversationIntegrityError(
                 f"non-monotonic conversation sequence at {entry.id}"
             )
         if entry.id in self._entry_ids:
             raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
-        if self._entries and entry.parent_id is None:
+        if self._resident_rows.entries and entry.parent_id is None:
             raise ConversationIntegrityError(
                 f"conversation entry {entry.id} is an orphaned root"
             )
@@ -211,7 +211,7 @@ class IncrementalValidationMixin:
             )
         # A non-tip parent changes the active branch. It is uncommon and its
         # integrity state is deliberately rebuilt by the complete validator.
-        if self._entries and entry.parent_id != self._entries[-1].id:
+        if self._resident_rows.entries and entry.parent_id != self._resident_rows.entries[-1].id:
             return False
         self._validate_entry_payload(entry)
         if entry.type == "fork":
@@ -228,7 +228,7 @@ class IncrementalValidationMixin:
         self, entries: list[ConversationEntry]
     ) -> None:
         """Install worker-validated tail rows and publish the entry list once."""
-        previous = self._entries[-1] if self._entries else None
+        previous = self._resident_rows.entries[-1] if self._resident_rows.entries else None
         fold = self._delivery_fold.staged()
         for entry in entries:
             expected_seq = previous.seq + 1 if previous is not None else 1

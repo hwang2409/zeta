@@ -1,3 +1,4 @@
+
 """End-to-end serve history fidelity coverage."""
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -287,7 +289,8 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
                 MessageOrigin.USER,
             )
         )
-        blocks = store._entries[-1].data["message"]["tool_result"]["content_blocks"]
+        last_ref = store.resident_refs()[-1]
+        blocks = store.entry(last_ref).data["message"]["tool_result"]["content_blocks"]
         blocks[0].update({"size": 99, "caption": "known"})
         blocks[1]["data"] = "YWJj"
         blocks[1].update({"width": 2, "height": 3})
@@ -679,7 +682,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
                 store.root_dir, session_id=session_id, _must_exist=True
             )
             try:
-                return reopened.replay()
+                return branch_entries(reopened)
             finally:
                 reopened.close()
 

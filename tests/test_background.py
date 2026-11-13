@@ -1,3 +1,4 @@
+
 """Tests for session-scoped background process tools."""
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from rich.text import Text
 import zeta.agent.pending_delivery as pending_delivery_module
 import zeta.tools._shared.background_task_owner as owner_module
 import zeta.tools._shared.process as process_module
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,
@@ -1160,7 +1162,7 @@ async def test_background_task_owner_state_table(
                     entry.type == "compaction"
                     and entry.data["source_seq_start"] <= receipt.seq
                     <= entry.data["source_seq_end"]
-                    for entry in resumed_store.replay()
+                    for entry in branch_entries(resumed_store)
                 )
                 for receipt in receipts
             )
@@ -1294,7 +1296,7 @@ async def test_background_task_owner_state_table(
             )
             marker = next(
                 entry
-                for entry in store.replay()
+                for entry in branch_entries(store)
                 if entry.type == "compaction"
                 and entry.data["source_seq_start"] <= receipt.seq
                 <= entry.data["source_seq_end"]
@@ -1821,7 +1823,7 @@ def test_store_replay_accepts_task_and_unknown_notification_kinds(
     reloaded = ConversationStore(tmp_path, session_id="kinds")
     kinds = [
         entry.data.get("kind", "agent_completion")
-        for entry in reloaded.replay()
+        for entry in branch_entries(reloaded)
         if entry.type == "notification"
     ]
     assert kinds == ["task_exited", "agent_completion", "monitor_alert"]
@@ -2571,7 +2573,7 @@ def test_task_output_old_transcript_arguments_replay(tmp_path: Path) -> None:
             )
         )
     with ConversationStore(store_dir, session_id="old-task-output") as replayed:
-        call = replayed.messages()[0].content[0].tool_call
+        call = branch_messages(replayed)[0].content[0].tool_call
         assert call.arguments["wait_seconds"] == 5
 
 

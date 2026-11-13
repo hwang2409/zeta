@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import resident_entries
 from zeta.core.abort import AbortSignal
 from zeta.core.approval import (
     ApprovalAbortPolicy,
@@ -829,7 +830,7 @@ async def test_replayed_allow_without_binding_fails_closed_for_cwd(
             )
         ],
     )
-    persisted = child_store.entries[-1].data["approval_requests"][0]
+    persisted = resident_entries(child_store)[-1].data["approval_requests"][0]
     assert persisted["approval_display"] == {
         "effective_cwd": str(tmp_path),
         "resolved_path": None,

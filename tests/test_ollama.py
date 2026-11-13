@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.completion import ManualDeadlineClock, completion_control
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
@@ -1719,7 +1720,7 @@ async def test_ollama_agent_loop_thinking_is_live_only_after_resume(tmp_path: Pa
         store = ConversationStore(tmp_path)
         loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
         first_events = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
-        assistant = store.messages()[-1]
+        assistant = branch_messages(store)[-1]
         assert assistant.role is MessageRole.ASSISTANT
         assert assistant.content == [TextContent("Hello from Ollama.")]
         assert any(

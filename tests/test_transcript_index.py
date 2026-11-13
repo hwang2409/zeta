@@ -20,6 +20,7 @@ import pytest
 
 import zeta.transcript_search.index as index_module
 import zeta.transcript_search.refresh as refresh_module
+from tests.support.branch_reads import branch_entries
 from tests.support.processes import reap_process
 from zeta.cli.main import build_parser
 from zeta.cli.project import run as run_project
@@ -1691,7 +1692,7 @@ async def test_failed_durable_append_refresh_stays_degraded_until_retry(
     index = TranscriptIndex(projects_root / PROJECT_A, PROJECT_A)
     assert any(
         entry.data["message"]["content"][0]["text"] == "durableretrycanary"
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "message"
     )
     assert index.search("first indexed question")

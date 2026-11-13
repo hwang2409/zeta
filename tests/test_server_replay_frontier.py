@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
@@ -650,7 +651,7 @@ async def test_premise_row_backed_frame_covers_its_history_row(
     assert scenario != "missing", f"route table entry {route} has no premise scenario"
     serve, history = await _run_scenario(tmp_path, transport, scenario)
     try:
-        seqs = {entry.id: entry.seq for entry in serve.store.entries}
+        seqs = {entry.id: entry.seq for entry in resident_entries(serve.store)}
         records = serve.records(route)
         assert records, f"{scenario} published no {route} frame"
         for fields, facts, covers in records:

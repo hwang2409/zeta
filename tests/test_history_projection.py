@@ -31,7 +31,12 @@ def _runtime(store: object) -> SimpleNamespace:
     return SimpleNamespace(opened=SimpleNamespace(store=store))
 
 
-class _HistoryStore:
+class _RefStore:
+    def entry(self, ref):
+        return ref
+
+
+class _HistoryStore(_RefStore):
     repair_generation = None
 
     def __init__(self, entries: list[object]) -> None:
@@ -39,7 +44,7 @@ class _HistoryStore:
         self._log_offset = len(entries)
         self._entry_prefix_digest = bytes([len(entries)])
 
-    def active_branch_snapshot(self) -> list[object]:
+    def branch_refs(self) -> list[object]:
         return list(self.entries)
 
 
@@ -58,11 +63,11 @@ def test_session_history_full_paging_visits_each_entry_once() -> None:
                 visits += 1
                 yield entry
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return Snapshot(entries)
 
     runtime = _runtime(Store())
@@ -78,11 +83,11 @@ def test_session_history_full_paging_visits_each_entry_once() -> None:
 def test_session_history_first_page_is_entry_capped() -> None:
     entries = tuple(_entry(i) for i in range(2_000))
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     runtime = _runtime(Store())
@@ -158,11 +163,11 @@ def test_session_history_keeps_frame_fitting_approval_and_notification_bytes() -
         ),
     )
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     result = history.history(_runtime(Store()), {})
@@ -309,11 +314,11 @@ def test_session_history_oversized_group_uses_group_marker(tmp_path) -> None:
 def test_session_history_marks_every_large_projected_field(
     entries: tuple[object, ...],
 ) -> None:
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     result = history.history(_runtime(Store()), {})
@@ -342,11 +347,11 @@ def test_session_history_page_construction_is_linear(
 
     monkeypatch.setattr(FrameCodec, "_json_bytes", staticmethod(counting_json_bytes))
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     result = history.history(_runtime(Store()), {})
@@ -369,11 +374,11 @@ def test_session_history_sizes_each_group_once_per_generation(
 
     monkeypatch.setattr(FrameCodec, "_json_bytes", staticmethod(counting_json_bytes))
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     runtime = _runtime(Store())
@@ -439,11 +444,11 @@ def test_session_history_exact_size_and_real_frame_bound(
 
     entries = tuple(_entry(i, "é" * 8_000) for i in range(1_200))
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             return entries
 
     # The page builder must use incremental accounting, not whole-page probes.
@@ -474,11 +479,11 @@ def test_session_history_applies_entry_cap_only_at_offset_zero(
     entries = tuple(_entry(i, f"row {i} 日本語") for i in range(19))
     snapshot_calls = 0
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             nonlocal snapshot_calls
             snapshot_calls += 1
             return entries
@@ -506,11 +511,11 @@ def test_session_history_applies_entry_cap_only_at_offset_zero(
 async def test_session_history_projection_constructed_once_off_event_loop() -> None:
     snapshot_threads: list[threading.Thread] = []
 
-    class Store:
+    class Store(_RefStore):
         _log_offset = 1
         _entry_prefix_digest = b"one"
 
-        def active_branch_snapshot(self):
+        def branch_refs(self):
             snapshot_threads.append(threading.current_thread())
             return tuple(_entry(i) for i in range(300))
 

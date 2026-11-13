@@ -290,7 +290,7 @@ def _resolve_append_dedupe[ResultT](
     key = command.dedupe_key
     if key is None:
         return None
-    by_id = {entry.id: entry for entry in store._entries}
+    by_id = {entry.id: entry for entry in store._resident_rows.entries}
     existing = tuple(by_id.get(entry_id) for entry_id in deterministic_ids)
     next_exists = _dedupe_id(store, key, len(command.rows)) in by_id
     if not any(entry is not None for entry in existing) and not next_exists:
@@ -321,8 +321,8 @@ def _build_append_entries(
     deterministic_ids: tuple[str, ...],
 ) -> list[ConversationEntry]:
     prior_ids = set(store._entry_ids)
-    parent_id = store._entries[-1].id if store._entries else None
-    next_seq = store._entries[-1].seq + 1 if store._entries else 1
+    parent_id = store._resident_rows.entries[-1].id if store._resident_rows.entries else None
+    next_seq = store._resident_rows.entries[-1].seq + 1 if store._resident_rows.entries else 1
     entries: list[ConversationEntry] = []
     for index, row in enumerate(rows):
         if index == 0 and row.parent_id is not None:
@@ -357,14 +357,14 @@ def _build_append_entries(
     try:
         store._validate_entries()
     finally:
-        store._resident_rows.truncate_to(len(store._entries) - len(entries))
+        store._resident_rows.truncate_to(len(store._resident_rows.entries) - len(entries))
     return entries
 
 
 def _install_appended_entries(
     store: ConversationStore, entries: list[ConversationEntry]
 ) -> None:
-    linear = not store._entries or entries[0].parent_id == store._entries[-1].id
+    linear = not store._resident_rows.entries or entries[0].parent_id == store._resident_rows.entries[-1].id
     for entry in entries:
         store._resident_rows.append(entry)
         store._record_entry_prefix(entry)
@@ -379,7 +379,7 @@ def _install_appended_entries(
     else:
         store._validate_entries()
         store._rebuild_incremental_validation_state()
-        store._sync_history_index(store._entries)
+        store._sync_history_index(store._resident_rows.entries)
     store._record_client_delivery_entries(entries)
 
 
@@ -409,7 +409,7 @@ def _execute_append[ResultT](
         store._write_bytes(
             b"".join(store._encoded_entry_line(entry) for entry in entries)
         )
-        if not store._entries or entries[0].parent_id == store._entries[-1].id:
+        if not store._resident_rows.entries or entries[0].parent_id == store._resident_rows.entries[-1].id:
             store._apply_history_index_entries(tuple(entries))
         # A fork is rebuilt by _install_appended_entries below.
         _install_appended_entries(store, entries)
@@ -443,7 +443,7 @@ def _execute_store_command[ResultT](
             expected_generation, store.conversation_generation
         )
     baseline_count = (
-        len(store._entries)
+        len(store._resident_rows.entries)
         if command.baseline_count is None
         else command.baseline_count
     )
@@ -459,15 +459,15 @@ def _execute_store_command[ResultT](
     )
     baseline_patch = _snapshot_patch(store, command.patch_fields)
     writer_baseline_matches = (
-        len(store._entries) == baseline_count
+        len(store._resident_rows.entries) == baseline_count
         and store._entry_prefix_digest == baseline_digest
     )
     full_reload_count = store._full_reload_count
     result = command.apply(store)
-    entries = store._owned_installed_delta(tuple(store._entries[baseline_count:]))
+    entries = store._owned_installed_delta(tuple(store._resident_rows.entries[baseline_count:]))
     baseline_parent_id = (
-        store._entries[baseline_count - 1].id
-        if 0 < baseline_count <= len(store._entries)
+        store._resident_rows.entries[baseline_count - 1].id
+        if 0 < baseline_count <= len(store._resident_rows.entries)
         else None
     )
     replace_entries = (
@@ -477,7 +477,7 @@ def _execute_store_command[ResultT](
         or bool(entries and entries[0].parent_id != baseline_parent_id)
     )
     if replace_entries:
-        entries = store._owned_installed_delta(tuple(store._entries))
+        entries = store._owned_installed_delta(tuple(store._resident_rows.entries))
     changed_patch = {
         field: copy.deepcopy(getattr(store, field))
         for field, old in baseline_patch.items()

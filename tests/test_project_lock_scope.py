@@ -973,7 +973,7 @@ def test_p06_installed_callbacks_drain_in_append_order_after_rank_release(
 
         durable = [
             (row.data["message"]["content"][0]["text"], row.id)
-            for row in store._entries
+            for row in (store.entry(ref) for ref in store.resident_refs())
             if row.type == "message"
         ]
         assert delivered == durable
