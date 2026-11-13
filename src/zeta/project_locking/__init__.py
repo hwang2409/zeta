@@ -21,8 +21,7 @@ from ..project_errors import (
 from ..storage_format import StorageFeature, WriterLease, feature_enabled
 
 _READ_RETRIES = 10
-# User writes may outwait a slow scanner poll; scanner-owned calls still use try-once.
-_PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 10.0
+_PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
 _PROJECT_REGISTRY_LOCK_POLL_SECONDS = 0.05
 _T = TypeVar("_T")
 _ACTIVE_WRITER_LEASE: ContextVar[WriterLease | None] = ContextVar(
