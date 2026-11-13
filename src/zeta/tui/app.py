@@ -788,6 +788,28 @@ class TUIApp(
         if tasks:
             await asyncio.gather(*tasks)
 
+    def _finder_input(self, query: str) -> None:
+        FinderRuntimeMixin._finder_input(self, query)
+        if (
+            self._active_finder is self._history_finder
+            and not self._agent_navigation.child_view_active
+        ):
+            self._prompt_history.start_finder_scan(
+                query, self._publish_prompt_history_snapshot
+            )
+
+    def _publish_prompt_history_snapshot(
+        self, snapshot: tuple[str, ...], buffer: Any | None = None
+    ) -> None:
+        request = self._history_finder.set_snapshot(snapshot)
+        if request is None:
+            if buffer is not None:
+                FinderRuntimeMixin._history_finder_open(self, buffer)
+            return
+        if self._finder_prepare_task is not None:
+            self._finder_prepare_task.cancel()
+        self._start_finder_preparation(request)
+
     def _history_finder_open(self, buffer: Any) -> None:
         prompt_history = getattr(self, "_prompt_history", None)
         if self._agent_navigation.child_view_active or prompt_history is None:
@@ -796,13 +818,7 @@ class TUIApp(
         prompt_history.bind(self._viewed_session_path(), self._history_source)
 
         def publish(snapshot: tuple[str, ...]) -> None:
-            request = self._history_finder.set_snapshot(snapshot)
-            if request is None:
-                FinderRuntimeMixin._history_finder_open(self, buffer)
-            else:
-                if self._finder_prepare_task is not None:
-                    self._finder_prepare_task.cancel()
-                self._start_finder_preparation(request)
+            self._publish_prompt_history_snapshot(snapshot, buffer)
 
         prompt_history.start_finder_scan(buffer.text, publish)
 

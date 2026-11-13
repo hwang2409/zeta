@@ -16128,6 +16128,14 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
                 MessageOrigin.USER,
             )
         )
+    if journey == "finder":
+        for index in range(300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"recent prompt {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -16154,12 +16162,18 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
                 return original_branch_refs()
 
             monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
-            buffer = Buffer(document=Document("nightly wipe"))
+            buffer = Buffer()
             app._history_finder_open(buffer)
             assert app._prompt_history.finder_task is not None
             await await_or_fail(
                 app._prompt_history.finder_task,
-                what="ctrl+r prompt scan",
+                what="initial empty ctrl+r prompt scan",
+            )
+            app._finder_input("nightly wipe")
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task,
+                what="typed ctrl+r prompt scan",
             )
             if app._finder_prepare_task is not None:
                 await await_or_fail(
@@ -16173,7 +16187,7 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
                     and any("nightly wipe" in row.excerpt for row in state.rows)
                 )
             )
-            assert branch_ref_reads == 1, "ctrl+r rebuilt the branch prompt list"
+            assert branch_ref_reads == 2, "ctrl+r rebuilt a prompt list within a scan"
 
 
 def test_agent_transcript_source_keeps_snapshot_during_active_append(
