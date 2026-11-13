@@ -152,7 +152,7 @@ class HistoryIndex:
                 connection.execute("PRAGMA busy_timeout=0")
             else:
                 # The transcript is authoritative and repairs interrupted cache writes.
-                connection.execute("PRAGMA journal_mode=MEMORY")
+                connection.execute("PRAGMA journal_mode=OFF")
                 connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA foreign_keys=ON")
             return connection

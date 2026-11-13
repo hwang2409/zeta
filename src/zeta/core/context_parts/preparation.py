@@ -114,7 +114,7 @@ class ContextPreparation:
                     else self._store.context_refs()
                 )
                 branch = await asyncio.to_thread(
-                    tuple, self._store.stream_rows(refs)
+                    lambda refs=refs: tuple(self._store.stream_rows(refs))
                 )
                 active_source_seqs = self._store.context_source_seqs()
                 branch_id = self._store.active_branch_head_id()
