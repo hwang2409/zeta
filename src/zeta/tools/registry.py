@@ -967,6 +967,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _skip_approval: bool = False,
         _host_environment: Mapping[str, str] | None = None,
         _pending_execution_claimed: bool = False,
+        _pending_execution_owner: asyncio.Task[object] | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
@@ -1078,7 +1079,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
         claim_error = self.approval_execution_error(
-            tool_call, prepared=_pending_execution_claimed
+            tool_call,
+            prepared=_pending_execution_claimed,
+            owner=_pending_execution_owner,
         )
         if claim_error is not None:
             if claim_error[1] == "duplicate_tool_execution":

@@ -19,6 +19,7 @@ from tests.support.fake_backend import (
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.owned import await_or_fail
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
 from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
@@ -794,7 +795,11 @@ async def test_socket_http_approved_tool_runs_once(
         assert "error" not in approved[-1]
         recovery_turn = server.control._turn_task
         assert recovery_turn is not None
-        await asyncio.wait_for(asyncio.gather(live_turn, recovery_turn), TIMEOUT)
+        await await_or_fail(
+            asyncio.gather(live_turn, recovery_turn),
+            timeout=TIMEOUT,
+            what="approved MCP live and recovery turns",
+        )
 
         assert mcp.methods.count("tools/call") == 1
         assert sum(
@@ -938,6 +943,7 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         recovery_released = asyncio.Event()
         live_claimed = asyncio.Event()
         live_claims: list[str] = []
+        live_claim_owners: list[object] = []
         prepare_execution = loop.store.prepare_pending_approval_execution
         claim_execution = loop.store.claim_pending_approval_execution
 
@@ -956,6 +962,10 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
             claim = claim_execution(*args, **kwargs)
             if kwargs.get("prepared") is not True:
                 live_claims.append(claim)
+                # test-contract: the resident record exposes the claimed task identity.
+                live_claim_owners.append(
+                    loop.store._pending_approval_executions[args[0]].owner
+                )
                 asyncio.get_running_loop().call_soon(live_claimed.set)
             return claim
 
@@ -1012,6 +1022,7 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         else:
             assert mcp.methods.count("tools/call") == 1
         assert live_claims == ["claimed"]
+        assert live_claim_owners == [live_turn]
         approval_results = [
             message.tool_result
             for message in backend.calls[-1][0]
