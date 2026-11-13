@@ -8,6 +8,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
 from zeta.core.checkpoints import CheckpointForkMixin
@@ -96,7 +97,7 @@ def test_replay_uses_codex_message_metadata_after_provider_switch(
     )
 
     rendered: list[object] = []
-    for message in opened.store.messages():
+    for message in branch_messages(opened.store):
         render_replayed_message(
             message,
             presenter=object(),
@@ -243,18 +244,18 @@ def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
 
     fork = store.append_fork("saved")
     assert fork.parent_id == checkpoint.id
-    assert [entry.type for entry in store.replay()] == [
+    assert [entry.type for entry in branch_entries(store)] == [
         "message",
         "message",
         "checkpoint",
         "fork",
     ]
-    assert store.replay()[0].id == first.id
-    assert all(entry.id != abandoned.id for entry in store.replay())
-    assert len(store.entries) == 6
+    assert branch_entries(store)[0].id == first.id
+    assert all(entry.id != abandoned.id for entry in branch_entries(store))
+    assert len(resident_entries(store)) == 6
 
     reopened = ConversationStore(tmp_path, session_id=store.session_id)
-    assert reopened.replay()[-1].id == fork.id
+    assert branch_entries(reopened)[-1].id == fork.id
 
 
 def test_numeric_checkpoint_labels_are_reserved_for_sequence_selectors(

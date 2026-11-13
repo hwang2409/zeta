@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
@@ -406,7 +407,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
         await event(reader, "turn_aborted")
         transcript = Transcript(
             SESSION,
-            tuple(entry.to_dict() for entry in server.runtime.opened.store.replay()),
+            tuple(entry.to_dict() for entry in branch_entries(server.runtime.opened.store)),
         )
 
         reconciliation = prepare_request(transcript, {}, as_of=TODAY)

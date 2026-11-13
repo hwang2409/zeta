@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
 from zeta.cli.main import main as cli_main
@@ -383,7 +384,7 @@ def test_session_push_copies_consistent_history_and_excludes_credentials(
         remote / "sessions", session_id=result.session_id, _read_only=True
     )
     try:
-        assert any(entry.type == "child_run_started" for entry in transferred.replay())
+        assert any(entry.type == "child_run_started" for entry in branch_entries(transferred))
     finally:
         transferred.close()
     assert not (remote / "oauth.json").exists()

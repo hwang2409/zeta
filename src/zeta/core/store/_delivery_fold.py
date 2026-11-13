@@ -2,8 +2,7 @@
 
 The fold answers every hot delivery read (active notifications, presentations,
 pending prompts, receipts, tool results, the terminal transition) in O(1) off
-one resident object, instead of the O(n) branch and ``replay()`` scans the store
-used before. It is branch-scoped: a branch switch or rewind rebuilds it from the
+one resident object, instead of the O(n) branch scans used before. It is branch-scoped: a branch switch or rewind rebuilds it from the
 selected branch, exactly where the store rebuilt the old per-field indexes.
 
 Immutable after install

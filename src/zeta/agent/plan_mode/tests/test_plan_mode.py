@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.tui_render import render_full_screen
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
@@ -270,7 +271,7 @@ async def test_plan_mode_filters_and_rejects_actions_with_one_policy(
     assert executed == []
     result = next(
         message.tool_result
-        for message in loop.store.messages()
+        for message in branch_messages(loop.store)
         if message.tool_result is not None
     )
     assert result.is_error is True
@@ -422,7 +423,7 @@ skill_catalog=SkillCatalog.empty(),
 
     child_result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     )
     assert child_result.is_error is False
@@ -466,7 +467,7 @@ skill_catalog=SkillCatalog.empty(),
 
     result = next(
         message.tool_result
-        for message in store.messages()
+        for message in branch_messages(store)
         if message.tool_result is not None
     )
     assert result.is_error is True

@@ -1,3 +1,4 @@
+
 """The optional delivery session_id guard over the real serve socket."""
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_client import event as _event
@@ -123,7 +125,7 @@ async def test_mismatched_session_id_delivers_nothing_before_delivery_id_lookup(
             await _call(reader, writer, 3, "send", {"text": "start"})
             await await_or_fail(backend.started.wait(), what="turn start")
         store = server.runtime.opened.store
-        rows_before = [entry.id for entry in store.entries]
+        rows_before = [entry.id for entry in resident_entries(store)]
         mismatch = {
             "code": -32003,
             "message": "session is not active",
@@ -140,7 +142,7 @@ async def test_mismatched_session_id_delivers_nothing_before_delivery_id_lookup(
         )
         assert rejected.get("error") == mismatch, rejected
         assert _echoes(before) == []
-        assert [entry.id for entry in store.entries] == rows_before
+        assert [entry.id for entry in resident_entries(store)] == rows_before
         _, status = await _call(reader, writer, 5, "delivery_status", {"delivery_id": "g1"})
         assert status["result"] == {"delivery_id": "g1", "status": "unknown"}
 
@@ -156,13 +158,13 @@ async def test_mismatched_session_id_delivers_nothing_before_delivery_id_lookup(
         assert status["result"]["status"] == expected
 
         # a retry of the delivered id aimed at another session is still rejected
-        rows_after_match = [entry.id for entry in store.entries]
+        rows_after_match = [entry.id for entry in resident_entries(store)]
         before, retried = await _call(
             reader, writer, 8, method, _params(method, "other-session", "g1")
         )
         assert retried.get("error") == mismatch, retried
         assert _echoes(before) == []
-        assert [entry.id for entry in store.entries] == rows_after_match
+        assert [entry.id for entry in resident_entries(store)] == rows_after_match
 
         backend.release.set()
         await _event(reader, "agent_end")

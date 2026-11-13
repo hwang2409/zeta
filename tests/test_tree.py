@@ -1,3 +1,4 @@
+
 """ZETA-80: fork from arbitrary user messages and the /tree branch browser."""
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
 from zeta.core.store import ConversationStore
@@ -73,7 +75,7 @@ def test_append_message_fork_reanchors_at_target_user_message(
     assert fork.data["from_entry_id"] == first.id
     assert fork.data["from_seq"] == first.seq
 
-    replay = store.replay()
+    replay = branch_entries(store)
     assert [entry.type for entry in replay] == ["message", "fork"]
     assert replay[0].id == first.id
     replayed_texts = [
@@ -115,7 +117,7 @@ async def test_message_fork_never_splits_tool_call_result_pair(
     result = app.slash_fork("1")
     assert result == "fork unavailable while a tool call is pending"
     assert not any(
-        entry.type == "fork" for entry in store.replay()
+        entry.type == "fork" for entry in branch_entries(store)
     )
 
     store.append_message(
@@ -128,7 +130,7 @@ async def test_message_fork_never_splits_tool_call_result_pair(
     assert store.has_outstanding_tool_calls() is False
     result = await app.slash_fork("1")
     assert "forked to user message 1" in result
-    assert store.replay()[0].id == user_message.id
+    assert branch_entries(store)[0].id == user_message.id
     await close_owned_app(app)
 
 
@@ -180,7 +182,7 @@ async def test_message_fork_cancellation_restores_workspace_and_transcript(
             await asyncio.wait_for(task, 10)
         assert workspace_file.read_text() == "first"
         assert transcript_rebuilt
-        assert store.replay()[-1].type == "fork"
+        assert branch_entries(store)[-1].type == "fork"
     finally:
         release.set()
         if not task.done():
@@ -199,8 +201,8 @@ def test_message_fork_persists_and_reopens(tmp_path: Path) -> None:
     fork = store.append_message_fork(first.id)
 
     reopened = ConversationStore(tmp_path, session_id="s1")
-    assert reopened.replay()[-1].id == fork.id
-    assert reopened.replay()[0].id == first.id
+    assert branch_entries(reopened)[-1].id == fork.id
+    assert branch_entries(reopened)[0].id == first.id
 
 
 def test_slash_fork_picker_lists_prior_user_messages(tmp_path: Path) -> None:
@@ -300,7 +302,7 @@ async def test_slash_tree_switches_branches_and_reanchors(tmp_path: Path) -> Non
         if branch.head.id == other.head.id
     )))
     assert result.startswith("switched to branch ")
-    replay = store.replay()
+    replay = branch_entries(store)
     assert replay[-2].id == other.head.id
     await close_owned_app(app)
 
@@ -388,7 +390,7 @@ def test_switch_between_branches_round_trips_replay(tmp_path: Path) -> None:
         branch for branch in store.list_branches() if not branch.is_current
     )
     store.switch_to_branch(original_leaf.head.id)
-    replay = store.replay()
+    replay = branch_entries(store)
     assert [
         block.text
         for entry in replay
@@ -450,7 +452,7 @@ def test_fork_entry_reopens_without_checkpoint_source(tmp_path: Path) -> None:
     store.append_message_fork(first.id)
 
     reopened = ConversationStore(tmp_path, session_id="s1")
-    assert reopened.replay()[-1].type == "fork"
+    assert branch_entries(reopened)[-1].type == "fork"
 
 
 def test_list_branches_empty_store(tmp_path: Path) -> None:
@@ -485,7 +487,7 @@ def test_fork_entries_record_source_type_for_each_flavor(tmp_path: Path) -> None
     store.append_message_fork(root.id)
     reopened = ConversationStore(branch_dir, session_id="branchsession")
     leaves = [branch.head for branch in reopened.list_branches()]
-    current_head_id = reopened.replay()[-1].id
+    current_head_id = branch_entries(reopened)[-1].id
     target = next(leaf for leaf in leaves if leaf.id != current_head_id)
     assert reopened.switch_to_branch(target.id).data["source_type"] == "branch"
 
@@ -664,7 +666,7 @@ async def test_tree_switch_runs_off_loop_and_cancel_still_finalizes(
         assert isinstance(result, str) and result.startswith("switched to branch ")
         # The switch re-anchors by appending a fork row parented at the target
         # leaf, so the target leaf is now second from the tail.
-        assert store.active_branch_snapshot()[-2].id == other.head.id
+        assert branch_entries(store)[-2].id == other.head.id
 
         # Phase 2: cancel-before-install still finalizes the durable switch.
         back = next(b for b in store.list_branches() if not b.is_current)
@@ -681,7 +683,7 @@ async def test_tree_switch_runs_off_loop_and_cancel_still_finalizes(
         cold = ConversationStore(tmp_path, session_id="offloop")
         try:
             assert store.active_branch_head_id() == cold.active_branch_head_id()
-            assert store.active_branch_snapshot()[-2].id == back.head.id
+            assert branch_entries(store)[-2].id == back.head.id
         finally:
             cold.close()
     finally:

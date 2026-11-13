@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from ...context_eviction import (
@@ -13,7 +14,8 @@ from ..registry import ToolRegistry
 
 
 async def _recall_history(registry: ToolRegistry, arguments: dict[str, Any]) -> str:
-    return recall_history(
+    return await asyncio.to_thread(
+        recall_history,
         registry.session_store,
         query=arguments.get("query"),
         seq_start=arguments.get("seq_start"),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from zeta.core.session_files import session_directory
 from zeta.core.store import ConversationStore, TranscriptLoadError
 from zeta.protocol.types import (
@@ -130,7 +131,7 @@ def test_transaction_preserves_complete_evidence_and_strictly_reopens(
 
     repaired = ConversationStore(root, session_id="damaged", _read_only=True)
     try:
-        warning = repaired.entries[-1]
+        warning = resident_entries(repaired)[-1]
         assert warning.type == "warning"
         assert warning.data["kind"] == "transcript_recovery"
         assert warning.data["quarantine_id"] == result.quarantine_id

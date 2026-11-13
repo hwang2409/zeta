@@ -1,3 +1,4 @@
+
 """One owner cancels a tool handler task: every route sends it at most one cancel."""
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.core.abort import AbortSignal
@@ -183,7 +185,7 @@ class Harness:
     def transcript(self) -> tuple[str, ...]:
         return tuple(
             summarize(message.tool_result)
-            for message in self.store.messages()
+            for message in branch_messages(self.store)
             if message.tool_result is not None
         )
 
@@ -434,7 +436,7 @@ async def durable_inline(h: Harness) -> Outcome:
     await await_or_fail(asyncio.wait({task}), what="durable task end")
     results = tuple(
         summarize(message.tool_result)
-        for message in opened.store.messages()
+        for message in branch_messages(opened.store)
         if message.tool_result is not None
     )
     return h.outcome(results)

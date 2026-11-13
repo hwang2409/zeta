@@ -295,7 +295,7 @@ def history_projection(
 
     # The store is loop-owned; the serve worker reads its validated snapshot.
     generation = _generation(store)
-    branch = store.active_branch_snapshot()
+    branch = tuple(store.entry(ref) for ref in store.branch_refs())
     stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}

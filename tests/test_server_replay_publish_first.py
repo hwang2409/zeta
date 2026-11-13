@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
@@ -564,7 +565,7 @@ async def test_failed_assistant_row_reaches_each_stream_once(tmp_path: Path, tra
         await gates.reached("terminal")
         states = [
             entry.data["message"].get("metadata", {}).get("response_state")
-            for entry in serve.store.entries
+            for entry in resident_entries(serve.store)
             if entry.type == "message" and entry.data["message"]["role"] == "assistant"
         ]
         assert states == ["failed"], states
@@ -675,7 +676,7 @@ async def test_empty_failed_assistant_row_releases_the_held_reply_once(
         await gates.reached("terminal")
         rows = [
             entry.data["message"]
-            for entry in serve.store.entries
+            for entry in resident_entries(serve.store)
             if entry.type == "message" and entry.data["message"]["role"] == "assistant"
         ]
         assert [(row.get("metadata", {}).get("response_state"), row["content"]) for row in rows] == [

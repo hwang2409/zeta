@@ -12,6 +12,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background_lifecycle import recover_agent_children
 from zeta.core.store import ConversationStore
@@ -331,7 +332,7 @@ def test_recovery_uses_point_notification_queries_for_many_children(
 def _presented_notification_ids(store: ConversationStore) -> set[str]:
     return {
         entry.data["notification_id"]
-        for entry in store.replay()
+        for entry in branch_entries(store)
         if entry.type == "notification_tui_presented"
     }
 
@@ -451,7 +452,7 @@ async def test_tui_replay_scans_notifications_constant_times_and_batches_markers
         assert f"notification child-{index}" in rendered
 
     reopened = ConversationStore(tmp_path, session_id="tui-scan")
-    rows = reopened.replay()
+    rows = branch_entries(reopened)
     presented = {
         entry.data["notification_id"]
         for entry in rows
@@ -500,7 +501,7 @@ async def test_batched_presentation_markers_are_visible_after_reopen(
     fsync.assert_called_once()
     assert fsync_threads[0] != event_loop_thread
     reopened = ConversationStore(tmp_path, session_id="presentation-batch")
-    rows = reopened.replay()
+    rows = branch_entries(reopened)
     assert {
         entry.data["notification_id"]
         for entry in rows

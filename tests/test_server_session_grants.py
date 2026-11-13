@@ -1,3 +1,4 @@
+
 """Real-transport coverage for negotiated session-grant control."""
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from websockets.asyncio.client import connect
 
 import zeta.agent.pending_delivery as pending_delivery_module
 from tests.support import server_client
+from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
@@ -2147,7 +2149,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert len(approval_ends) == 1, approval_ends
             durable_ends = [
                 entry
-                for entry in server.runtime.opened.store.replay()
+                for entry in branch_entries(server.runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]
@@ -2685,7 +2687,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     assert server.runtime.opened is not None
                     history = [
                         entry.data
-                        for entry in server.runtime.opened.store.replay()
+                        for entry in branch_entries(server.runtime.opened.store)
                         if entry.type == "approval_history"
                     ]
                     assert [row["event"] for row in history] == ["approval_end"]
@@ -2865,7 +2867,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert server.runtime.opened is not None
             durable_ends = [
                 entry
-                for entry in server.runtime.opened.store.replay()
+                for entry in branch_entries(server.runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]

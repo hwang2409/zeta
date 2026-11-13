@@ -19,6 +19,7 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -1264,7 +1265,7 @@ async def test_unmapped_durable_approval_is_finalized(
         old_result = next(
             (
                 message.tool_result
-                for message in store.messages()
+                for message in branch_messages(store)
                 if message.tool_result is not None
                 and message.tool_result.tool_call_id == old_call.id
             ),
@@ -1274,10 +1275,10 @@ async def test_unmapped_durable_approval_is_finalized(
         assert {request.key for request in app.pending_approvals} == {inline_key}
 
         await app._handle_prompt_value(f"/approve {inline_key}")
-        await submission_task
-        await app._preprocessing_task
+        await asyncio.wait_for(submission_task, 10)
+        await asyncio.wait_for(app._preprocessing_task, 10)
         app._preprocessing_task = None
-        await app._active_task
+        await asyncio.wait_for(app._active_task, 10)
         assert backend.calls
         user_message = next(
             message
@@ -1306,7 +1307,7 @@ async def test_resumed_durable_tool_abort_is_processed_by_submission_consumer(
     async def block(arguments: dict[str, object], abort_signal: object) -> str:
         del arguments
         started.set()
-        await abort_signal.wait()  # type: ignore[attr-defined]
+        await asyncio.wait_for(abort_signal.wait(), 10)  # type: ignore[attr-defined]
         return "unreachable"
 
     app = TUIApp(
@@ -1338,7 +1339,7 @@ skill_catalog=SkillCatalog.empty(),
         result = next(
             (
                 message.tool_result
-                for message in store.messages()
+                for message in branch_messages(store)
                 if message.tool_result is not None
                 and message.tool_result.tool_call_id == old_call.id
             ),
@@ -1366,7 +1367,7 @@ async def test_submission_waits_for_resumed_durable_tool_result(
     async def block(arguments: dict[str, object], abort_signal: object) -> str:
         del arguments, abort_signal
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return "done"
 
     backend = FakeBackend([ScriptedTurn(content=[TextContent("later reply")])])
@@ -1395,7 +1396,7 @@ skill_catalog=SkillCatalog.empty(),
         owner.task(durable_task)
         await app._submissions.submit_text("later")
         assert backend.calls == []
-        assert [message.role for message in store.messages()] == [MessageRole.ASSISTANT]
+        assert [message.role for message in branch_messages(store)] == [MessageRole.ASSISTANT]
 
         release.set()
         await asyncio.wait_for(asyncio.shield(durable_task), timeout=10)
@@ -1404,7 +1405,7 @@ skill_catalog=SkillCatalog.empty(),
         # test-contract: durability durable finalization releases one provider dispatch.
         assert len(backend.calls) == 1, "submission was not dispatched after durable result"
 
-        messages = store.messages()
+        messages = branch_messages(store)
         assert [message.role for message in messages] == [
             MessageRole.ASSISTANT,
             MessageRole.TOOL_RESULT,
@@ -2007,10 +2008,10 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         owner.task(task)
         await asyncio.wait_for(approval_presented.wait(), timeout=10)
         assert "command=printf approved-now" in output.getvalue()
-        assert store.messages() == []
+        assert branch_messages(store) == []
         assert policy.approve(app.pending_approvals[0].key)
-        await task
-        assert store.messages() == []
+        await asyncio.wait_for(task, 10)
+        assert branch_messages(store) == []
 
 
 def test_exec_macro_approval_card_keeps_script_and_every_argv_value() -> None:
@@ -2133,7 +2134,7 @@ async def test_exec_macro_deny_renders_denied_receipt(
 
         assert "/deploy · denied" in output.getvalue()
         assert "/deploy · failed" not in output.getvalue()
-        assert store.messages() == []
+        assert branch_messages(store) == []
 
 
 @pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])

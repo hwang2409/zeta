@@ -15,6 +15,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_entries, resident_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
@@ -74,7 +75,7 @@ def test_child_run_started_truncates_long_task_and_name_to_utf8_bytes(tmp_path: 
     store = ConversationStore(tmp_path, session_id="session")
     try:
         store.append_child_run_started("session:1", None, name, task, "now")
-        row = store.entries[-1].data
+        row = resident_entries(store)[-1].data
         assert len(row["name"].encode()) <= 1024
         assert len(row["task"].encode()) <= 1024
         row["name"].encode().decode()
@@ -113,7 +114,7 @@ def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Pat
         milestones.append("installed")
         callback_thread.append(threading.get_ident())
         assert rows != "reset"
-        assert store.entries[-1].type == "child_run_started"
+        assert resident_entries(store)[-1].type == "child_run_started"
 
     store.on_entries_installed = installed
 
@@ -139,7 +140,7 @@ def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Pat
             deadline = entered_loop.time() + .05
             while entered_loop.time() < deadline:
                 ticks += 1
-                await asyncio.sleep(0)
+                await asyncio.wait_for(asyncio.sleep(0), 10)
             assert ticks > 1
             milestones.append("fsync-held")
             release.set()
@@ -152,7 +153,7 @@ def test_start_row_is_durable_before_child_execution_and_published(tmp_path: Pat
         assert fsync_thread and fsync_thread[0] != loop_thread
         assert callback_thread
         assert milestones == ["fsync-held", "installed"]
-        assert store.entries[-1].type == "child_run_started"
+        assert resident_entries(store)[-1].type == "child_run_started"
     finally:
         store.close()
 
@@ -186,9 +187,9 @@ def test_crash_after_start_row_recovers(tmp_path: Path) -> None:
         child.close()
     store = ConversationStore(tmp_path, session_id="session", _read_only=True)
     try:
-        assert len(store.entries) == 1
-        assert store.entries[0].type == "child_run_started"
-        assert store.entries[0].data["run_id"] == "session:1"
+        assert len(resident_entries(store)) == 1
+        assert resident_entries(store)[0].type == "child_run_started"
+        assert resident_entries(store)[0].data["run_id"] == "session:1"
     finally:
         store.close()
 
@@ -206,10 +207,10 @@ def test_discussion_fork_copy_loads_start_row(tmp_path: Path) -> None:
     log.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
     fork = ConversationStore(tmp_path, session_id="fork", _read_only=True)
     try:
-        assert any(e.type == "child_run_started" for e in fork.entries)
-        row = next(e for e in fork.entries if e.type == "child_run_started")
+        assert any(e.type == "child_run_started" for e in resident_entries(fork))
+        row = next(e for e in resident_entries(fork) if e.type == "child_run_started")
         assert row.data["run_id"] == "source:4"
-        fork.replay()
+        branch_entries(fork)
     finally:
         fork.close()
 
@@ -219,8 +220,8 @@ def test_pre_feature_session_loads_unchanged(tmp_path: Path) -> None:
     store.close()
     reopened = ConversationStore(tmp_path, session_id="old", _read_only=True)
     try:
-        assert list(reopened.replay()) == []
-        assert reopened.entries == []
+        assert list(branch_entries(reopened)) == []
+        assert resident_entries(reopened) == []
     finally:
         reopened.close()
 
@@ -243,7 +244,7 @@ def test_store_full_and_incremental_validation_accept_start_row(tmp_path: Path) 
 
     reopened = ConversationStore(tmp_path, session_id="session", _read_only=True)
     try:
-        assert [entry.type for entry in reopened.replay()] == [
+        assert [entry.type for entry in branch_entries(reopened)] == [
             "message",
             "child_run_started",
             "message",

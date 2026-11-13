@@ -18,6 +18,7 @@ import pytest
 
 import zeta.server.accounts as server_accounts
 import zeta.tui.slash_handlers as tui_slash_handlers
+from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.accounts import (
@@ -972,10 +973,10 @@ async def test_account_switch_never_replays_transcript(
 ) -> None:
     context, opened, first, second = await asyncio.to_thread(_account_context, tmp_path)
 
-    def fail_replay(_store: ConversationStore) -> list[object]:
-        raise AssertionError("account switching must not replay the transcript")
+    def fail_branch_read(_store: ConversationStore) -> list[object]:
+        raise AssertionError("account switching must not read the transcript")
 
-    monkeypatch.setattr(ConversationStore, "replay", fail_replay)
+    monkeypatch.setattr(ConversationStore, "branch_refs", fail_branch_read)
     monkeypatch.setattr(
         tui_slash_handlers,
         "build_backend",
@@ -1085,7 +1086,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
         assert requests == 1
         assert not any(
             isinstance(block, TextContent) and block.text
-            for message in opened.store.messages()
+            for message in branch_messages(opened.store)
             if message.role is MessageRole.ASSISTANT
             for block in message.content
         )
@@ -1108,7 +1109,7 @@ async def test_codex_limit_end_to_end_emits_account_limit_once_and_holds(
             ),
         )
 
-        boundary = opened.store.replay()[-1].seq
+        boundary = branch_entries(opened.store)[-1].seq
         await context.switch_active(
             loop,
             second,

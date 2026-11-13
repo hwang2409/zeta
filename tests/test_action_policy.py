@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.config.settings import load_settings
 from zeta.config.tool_policy import ToolPolicy, parse_tool_selector
@@ -701,7 +702,7 @@ async def test_provider_turn_persists_approves_and_executes_action_call(
     assert pending == [ApprovalRequest(call.id, call, action="start")]
     approval_record = next(
         request
-        for entry in store.entries
+        for entry in resident_entries(store)
         for request in entry.data.get("approval_requests", [])
     )
     assert approval_record["approval_facts"] == {"action": "start"}

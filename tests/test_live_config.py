@@ -13,6 +13,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -195,7 +196,7 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
     assert all(schema["name"] != "agent" for schema in backend.calls[0][1])
     result = next(
         message.tool_result
-        for message in loop.store.messages()
+        for message in branch_messages(loop.store)
         if message.tool_result
         and message.tool_result.tool_call_id == "blocked-specialist"
     )

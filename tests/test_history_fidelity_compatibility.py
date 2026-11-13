@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.branch_reads import branch_entries
 from zeta.core.store import ConversationIntegrityError, ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -45,7 +46,7 @@ def test_predecessor_store_rejects_new_history_shapes_without_mutation(
             sessions, session_id="history-fidelity", _must_exist=True
         )
         try:
-            rows = reopened.replay()
+            rows = branch_entries(reopened)
             accepted = {
                 row.type for row in rows if row.type in {"client_delivery", "turn_end"}
             } == {"client_delivery", "turn_end"}
@@ -80,7 +81,7 @@ def test_predecessor_store_rejects_new_history_shapes_without_mutation(
                 "root, session_id = Path(sys.argv[1]), sys.argv[2]; store = None\n"
                 "try:\n"
                 " store = ConversationStore(root, session_id=session_id, _must_exist=True)\n"
-                " store.replay()\n"
+                " branch_entries(store)\n"
                 "except Exception as exc:\n"
                 " print(type(exc).__name__, str(exc), file=sys.stderr)\n"
                 " sys.exit(17)\n"

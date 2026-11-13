@@ -1,3 +1,4 @@
+
 """Real-transport tests for the browser WebSocket serve adapter."""
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from tests.support.branch_reads import resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path as _socket_path
@@ -296,7 +298,7 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
                 and any(
                     entry.type == "approval_resolution"
                     and entry.data.get("decision") == "abort"
-                    for entry in opened.store.entries
+                    for entry in resident_entries(opened.store)
                 )
             ):
                 break
@@ -308,7 +310,7 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
     assert any(
         entry.type == "approval_resolution"
         and entry.data.get("decision") == "abort"
-        for entry in opened.store.entries
+        for entry in resident_entries(opened.store)
     )
     assert [
         record
