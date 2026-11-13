@@ -14,7 +14,7 @@ import os
 import stat
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -47,6 +47,7 @@ from ..storage_format import (
     StorageFormatError,
     WriterLease,
     feature_enabled,
+    validate_retention_history,
     validate_retention_reservation,
     validate_retention_state,
 )
@@ -59,6 +60,8 @@ from .transaction import (
 )
 
 _STATE_FILENAME = "retention-state.json"
+_HISTORY_FILENAME = "retention-history.jsonl"
+_MAX_HISTORY = 128
 _METADATA_NAME = "meta.json"
 _SESSION_STATE_NAME = "session_state.json"
 _PENDING_LINK_NAME = "project_link_pending.json"
@@ -128,6 +131,88 @@ class PassResult:
 
 class RetentionPlannerError(Exception):
     """Raised when the planner cannot proceed safely."""
+
+
+def retention_result(
+    *,
+    timestamp: str,
+    mode: str,
+    days: int,
+    root_ids: tuple[str, ...] = (),
+    count: int | None = None,
+    preview_id: str | None = None,
+    cutoff: str | None = None,
+    armed_by_zeta_version: str | None = None,
+    descendant_count: int = 0,
+    bytes: int = 0,
+    skip_counts: dict[str, int] | None = None,
+    progress_counts: dict[str, int] | None = None,
+    errors: tuple[str, ...] = (),
+    disable_pending: bool = False,
+) -> dict[str, object]:
+    """Build the single strict result projection used by all surfaces."""
+    result = {
+        "timestamp": timestamp, "mode": mode, "days": days,
+        "armed_by_zeta_version": armed_by_zeta_version, "preview_id": preview_id,
+        "cutoff": cutoff, "root_ids": list(root_ids),
+        "count": len(root_ids) if count is None else count,
+        "descendant_count": descendant_count, "bytes": bytes,
+        "skip_counts": dict(skip_counts or {}),
+        "progress_counts": dict(progress_counts or {}),
+        "errors": list(errors), "disable_pending": disable_pending,
+    }
+    validate_retention_history(result)
+    return result
+
+
+def append_retention_history(home: str | Path, lease: WriterLease, result: Mapping[str, object]) -> None:
+    """Durably replace the bounded, validated retention history."""
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+        return
+    validate_retention_history(result)
+    path = Path(home) / _HISTORY_FILENAME
+    rows: list[dict[str, object]] = []
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if type(value) is not dict:
+                    raise RetentionPlannerError("malformed retention history")
+                validate_retention_history(value)
+                rows.append(value)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, StorageFormatError) as exc:
+        raise RetentionPlannerError("malformed retention history") from exc
+    rows = (rows + [dict(result)])[-_MAX_HISTORY:]
+    home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        atomic_publish_file(
+            home_fd, _HISTORY_FILENAME,
+            ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\\n" for row in rows)).encode(),
+        )
+    finally:
+        os.close(home_fd)
+
+
+def read_retention_history(home: str | Path) -> tuple[dict[str, object], ...]:
+    """Read and validate the bounded history projection."""
+    try:
+        lines = (Path(home) / _HISTORY_FILENAME).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ()
+    if len(lines) > _MAX_HISTORY:
+        raise RetentionPlannerError("retention history exceeds bound")
+    output = []
+    for line in lines:
+        value = json.loads(line)
+        if type(value) is not dict:
+            raise RetentionPlannerError("malformed retention history")
+        validate_retention_history(value)
+        output.append(value)
+    return tuple(output)
 
 
 def _read_json(directory_fd: int, name: str, scan=None) -> object | None:

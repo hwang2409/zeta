@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 10
+WRITER_EPOCH: Final = 11
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -221,6 +221,7 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "retention_preview": frozenset({"preview_id", "days", "cutoff", "root_ids", "count", "bytes", "created_at"}),
     "retention_reservation": frozenset({"schema_version", "session_id", "transaction_id", "source_path", "trash_path", "device", "inode"}),
     "retention_manifest": frozenset({"schema_version", "session_id", "transaction_id", "device", "inode", "descendants", "bytes", "stage", "generation"}),
+    "retention_history": frozenset({"timestamp", "mode", "days", "armed_by_zeta_version", "preview_id", "cutoff", "root_ids", "count", "descendant_count", "bytes", "skip_counts", "progress_counts", "errors", "disable_pending"}),
     "sent_message_ledger.v2_root": frozenset({"schema_version", "records"}),
     "sent_message_ledger.v2_record": frozenset(
         {"id", "created_at", "target_project", "publication", "envelope", "reported"}
@@ -260,6 +261,7 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "retention.phase": frozenset({
         "discover", "lease", "walk", "references", "ready", "quarantined", "removing"
     }),
+    "retention.mode": frozenset({"preview", "armed", "disarmed", "deleted", "disabled", "none"}),
     "retention.manifest_stage": frozenset({
         "quarantined", "projects", "inbox", "attention", "indexes",
         "references-clean", "removing", "removed", "id_republished"
@@ -381,6 +383,40 @@ def validate_retention_preview(payload: Mapping[str, object]) -> None:
     if _retention_count(payload.get("count"), "count") != len(roots):
         raise StorageFormatError("retention preview count does not match roots")
     _retention_count(payload.get("bytes"), "bytes")
+
+
+def validate_retention_history(payload: Mapping[str, object]) -> None:
+    reject_unknown_keys(payload, "retention_history")
+    _retention_text(payload.get("timestamp"), "timestamp")
+    require_closed_variant("retention.mode", payload.get("mode"))
+    days = payload.get("days")
+    if type(days) is not int or not 0 <= days <= 3650:
+        raise StorageFormatError("invalid retention days")
+    for name in ("armed_by_zeta_version", "preview_id", "cutoff"):
+        value = payload.get(name)
+        if value is not None:
+            _retention_text(value, name)
+    roots = payload.get("root_ids")
+    if type(roots) is not list or any(type(item) is not str or not item for item in roots):
+        raise StorageFormatError("invalid retention root ids")
+    if len(set(roots)) != len(roots):
+        raise StorageFormatError("duplicate retention root id")
+    if _retention_count(payload.get("count"), "count") != len(roots):
+        raise StorageFormatError("retention history count does not match roots")
+    for name in ("descendant_count", "bytes"):
+        _retention_count(payload.get(name), name)
+    for name in ("skip_counts", "progress_counts"):
+        value = payload.get(name)
+        if type(value) is not dict or any(
+            type(key) is not str or type(item) is not int or item < 0
+            for key, item in value.items()
+        ):
+            raise StorageFormatError(f"invalid retention {name}")
+    errors = payload.get("errors")
+    if type(errors) is not list or any(type(item) is not str or not item for item in errors):
+        raise StorageFormatError("invalid retention errors")
+    if type(payload.get("disable_pending")) is not bool:
+        raise StorageFormatError("invalid retention disable_pending")
 
 
 def validate_retention_reservation(payload: Mapping[str, object]) -> None:
