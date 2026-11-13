@@ -179,17 +179,20 @@ class RetentionActivationOwner:
         failure: Exception | None = None
         planner = None
         try:
-            if self._home is not None and not (self._home / "retention-arm.json").is_file():
+            from .handshake import planner_active, planner_request_pending
+
+            if self._home is not None and planner_request_pending(self._home):
                 return projections, None
             planner = self._planner_factory()
             self._planner = planner
             self._planner_closed.clear()
             if not getattr(planner, "enabled", True):
                 return projections, None
-            from .handshake import planner_active
             context = planner_active(self._home) if self._home is not None else _null_context()
             with context:
                 while not self._stop.is_set() and not self._request_pending.is_set():
+                    if self._home is not None and planner_request_pending(self._home):
+                        break
                     days = self._days()
                     if days == 0:
                         break
