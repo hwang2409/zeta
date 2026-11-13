@@ -31,7 +31,7 @@ if [ -z "$record" ]; then
     fi
     short_head=$(git rev-parse --short HEAD)
     timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-    record="${ZETA_TEST_RECORD_DIR:-$HOME/.zeta/scratch/test-runs}/$branch-$short_head-$timestamp.txt"
+    record="${ZETA_TEST_RECORD_DIR:-$HOME/.zeta/scratch/test-runs}/$branch-$short_head-$timestamp-$$.txt"
 fi
 mkdir -p "$(dirname "$record")"
 
