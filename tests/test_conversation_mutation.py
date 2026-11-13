@@ -729,7 +729,7 @@ async def test_mutation_target_cancellation_policy_table(
 
     second = await asyncio.to_thread(ConversationStore, sessions, session_id="root")
     try:
-        assert tuple(entry.to_dict() for entry in second.entries) == durable
+        assert tuple(entry.to_dict() for entry in resident_entries(second)) == durable
     finally:
         await asyncio.to_thread(second.close)
 
@@ -879,7 +879,7 @@ def test_dedupe_scope_includes_namespace_and_conversation(tmp_path: Path) -> Non
             first.conversation_generation,
         )
         assert different.duplicate is False
-        assert [entry.data["message"] for entry in first.entries] == [
+        assert [entry.data["message"] for entry in resident_entries(first)] == [
             "first",
             "different",
         ]

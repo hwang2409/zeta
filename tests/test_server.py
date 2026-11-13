@@ -5601,15 +5601,7 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
         "activation test",
         project_root,
     )
-    entries_reads = 0
-    original_entries = ConversationStore.entries
-
-    def counted_entries(store: ConversationStore):
-        nonlocal entries_reads
-        entries_reads += 1
-        return original_entries.__get__(store, ConversationStore)
-
-    monkeypatch.setattr(ConversationStore, "entries", property(counted_entries))
+    assert not hasattr(ConversationStore, "entries")
     server = ZetaServer(
         home=home,
         cwd=project_root,
@@ -5623,7 +5615,6 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
     try:
         await server.runtime.create_session()
         assert "inbox" in server.runtime.loop.tool_registry.registered_names
-        assert entries_reads == 0
     finally:
         await server.close()
 
@@ -11472,8 +11463,9 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         rejected = await _request(reader, writer, 5, "send", {"text": "user now"})
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
-        while server._client is not None and server.control.turn_busy():
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while server._client is not None and server.control.turn_busy():
+                await asyncio.sleep(0)
 
         await _request(reader, writer, 6, "send", {"text": "user now"})
         await _frames_until_event(reader, "agent_end")
