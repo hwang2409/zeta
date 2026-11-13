@@ -78,12 +78,8 @@ class ProjectLockingMixin:
         return lock_fd
 
     @staticmethod
-    def _acquire_lock(lock_fd: int, mode: int, *, wait: bool = True) -> None:
-        deadline = (
-            time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
-            if wait
-            else time.monotonic()
-        )
+    def _acquire_lock(lock_fd: int, mode: int) -> None:
+        deadline = time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
@@ -176,7 +172,6 @@ class ProjectLockingMixin:
         domains: tuple[tuple[str, str], ...],
         *,
         exclusive: bool,
-        wait: bool = True,
     ) -> Iterator[tuple[int, ...]]:
         with ExitStack() as stack:
             stack.enter_context(identity_lock())
@@ -184,12 +179,9 @@ class ProjectLockingMixin:
             stack.callback(os.close, root_fd)
             lock_fd = self._open_lock(root_fd, create=True)
             assert lock_fd is not None
-            if wait:
-                self._acquire_lock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            else:
-                self._acquire_lock(
-                    lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH, wait=False
-                )
+            self._acquire_lock(
+                lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            )
             stack.callback(self._release_lock, lock_fd)
             project_fds = tuple(
                 self._validated_project_fd(root_fd, project_id)
@@ -205,7 +197,6 @@ class ProjectLockingMixin:
         domains: tuple[tuple[str, str], ...],
         *,
         exclusive: bool,
-        wait: bool = True,
     ) -> Iterator[tuple[int, ...]]:
         with ExitStack() as stack:
             root_fd, _ = self._open_root()
@@ -217,16 +208,9 @@ class ProjectLockingMixin:
                 project_fds.append(project_fd)
                 stack.callback(os.close, project_fd)
                 lock_fd = self._named_lock_fd(project_fd, domain)
-                if wait:
-                    self._acquire_lock(
-                        lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-                    )
-                else:
-                    self._acquire_lock(
-                        lock_fd,
-                        fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
-                        wait=False,
-                    )
+                self._acquire_lock(
+                    lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                )
                 stack.callback(self._release_lock, lock_fd)
             yield tuple(project_fds)
 
@@ -236,7 +220,6 @@ class ProjectLockingMixin:
         domains: tuple[tuple[str, str], ...],
         *,
         exclusive: bool,
-        wait: bool = True,
     ) -> Iterator[tuple[int, ...]]:
         require_off_loop_lock("project domain authority", ProjectRegistryError)
         if domains != tuple(sorted(set(domains))):
@@ -250,7 +233,7 @@ class ProjectLockingMixin:
                 if not feature_enabled(lease.observed_epoch, StorageFeature.PROJECT_LOCKS)
                 else self._named_project_locks
             )
-            with locks(domains, exclusive=exclusive, wait=wait) as project_fds:
+            with locks(domains, exclusive=exclusive) as project_fds:
                 yield project_fds
 
     def _identity_read(self, operation: Callable[[int], _T]) -> _T:
@@ -308,10 +291,10 @@ class ProjectLockingMixin:
 
     @contextmanager
     def _project_lock(
-        self, project_id: str, domain: str, *, exclusive: bool, wait: bool = True
+        self, project_id: str, domain: str, *, exclusive: bool
     ) -> Iterator[int]:
         with self._project_locks(
-            ((project_id, domain),), exclusive=exclusive, wait=wait
+            ((project_id, domain),), exclusive=exclusive
         ) as project_fds:
             yield project_fds[0]
 

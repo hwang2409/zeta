@@ -602,13 +602,13 @@ class ProjectInbox:
             return read(project_fd)
 
     def new_ids(
-        self, project: str, *, session_id: str | None = None, wait: bool = True
+        self, project: str, *, session_id: str | None = None
     ) -> tuple[str, ...]:
         """Return validated new-message IDs without loading spilled bodies."""
         target = self._resolve_project(project)
-        self._ensure_directories(target.project_id, wait=wait)
+        self._ensure_directories(target.project_id)
         invalid: list[dict[str, str]] = []
-        with self._directories(target.project_id, create=True, wait=wait) as dirs:
+        with self._directories(target.project_id, create=True) as dirs:
             self._recover_stale(
                 *dirs[:3], bodies_fd=dirs[3], inbox_fd=dirs[5], invalid=invalid
             )
@@ -792,14 +792,14 @@ class ProjectInbox:
                 raise InboxError(f"project not found: {value}") from None
             return matches[0]
 
-    def _ensure_directories(self, project_id: str, *, wait: bool = True) -> None:
+    def _ensure_directories(self, project_id: str) -> None:
         inbox = self.registry.root / project_id / "inbox"
         if all(
             (inbox / name).is_dir()
             for name in ("new", "claimed", "done", "bodies", "wake")
         ):
             return
-        with self._directories(project_id, create=True, wait=wait):
+        with self._directories(project_id, create=True):
             pass
 
     @contextmanager
@@ -829,35 +829,31 @@ class ProjectInbox:
             yield (*fds, inbox_fd)  # type: ignore[misc]
 
     @contextmanager
-    def _lock(
-        self, project_id: str, *, exclusive: bool, wait: bool = True
-    ) -> Iterator[int]:
+    def _lock(self, project_id: str, *, exclusive: bool) -> Iterator[int]:
         with self.registry._project_lock(
-            project_id, "inbox", exclusive=exclusive, wait=wait
+            project_id, "inbox", exclusive=exclusive
         ) as project_fd:
             yield project_fd
 
     @contextmanager
     def _directories(
-        self, project_id: str, *, create: bool, wait: bool = True
+        self, project_id: str, *, create: bool
     ) -> Iterator[tuple[int, int, int, int, int, int]]:
         if not create:
             raise AssertionError(
                 "read operations must use the registry read transaction"
             )
-        with _storage_errors(), self._held_directories(project_id, wait=wait) as fds:
+        with _storage_errors(), self._held_directories(project_id) as fds:
             yield fds
 
     @contextmanager
     def _held_directories(
-        self, project_id: str, *, wait: bool = True
+        self, project_id: str
     ) -> Iterator[tuple[int, int, int, int, int, int]]:
         """Hold the exclusive inbox authority; only acquisition errors are translated."""
         with ExitStack() as stack:
             with _storage_errors():
-                project_fd = stack.enter_context(
-                    self._lock(project_id, exclusive=True, wait=wait)
-                )
+                project_fd = stack.enter_context(self._lock(project_id, exclusive=True))
                 fds = stack.enter_context(
                     self._directory_handles(project_fd, create=True)
                 )
