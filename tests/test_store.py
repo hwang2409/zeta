@@ -281,10 +281,9 @@ def test_warm_index_invalidations_read_authoritative_transcript(
         physical_reads += 1
         return original(store, source, validated_prefix)
 
-    # test-contract: each stale, replaced, incomplete, or corrupt sidecar route must return to the transcript authority
+    # test-contract: seam each invalid sidecar route must return to transcript authority
     monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
     with ConversationStore(tmp_path, session_id="warm-invalidations") as reopened:
-        # test-contract: seam public messages stay authoritative after sidecar invalidation
         assert [item.content[0].text for item in branch_messages(reopened)] == expected_messages
 
     # test-contract: seam every invalid sidecar route reads the authoritative transcript
