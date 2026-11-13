@@ -701,11 +701,13 @@ class TUIApp(
         self._history_search_results = ()
         self._history_search_index = 0
         FinderRuntimeMixin._finder_input(self, query)
+        prompt_history = getattr(self, "_prompt_history", None)
         if (
-            self._active_finder is self._history_finder
+            prompt_history is not None
+            and self._active_finder is getattr(self, "_history_finder", None)
             and not self._agent_navigation.child_view_active
         ):
-            self._prompt_history.start_finder_scan(
+            prompt_history.start_finder_scan(
                 query, self._publish_prompt_history_snapshot
             )
         history_pager = getattr(self, "_history_pager", None)
