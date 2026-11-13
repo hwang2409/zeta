@@ -134,6 +134,12 @@ def _boundary_row() -> bytes:
     return prefix + (b"x" * (64 * 1024 - len(prefix) - len(suffix))) + suffix
 
 
+def _split_boundary_crlf_row() -> bytes:
+    prefix = b'{"text":"'
+    suffix = b'"}'
+    return prefix + (b"x" * (64 * 1024 - len(prefix) - len(suffix) - 1)) + suffix + b"\r\n"
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -142,10 +148,13 @@ def _boundary_row() -> bytes:
         pytest.param(_json_line({"a": 1}) + b'{"b":', id="torn-tail"),
         pytest.param(_json_line({"a": 1}, b""), id="missing-final-newline"),
         pytest.param(_json_line({"a": 1}, b"\r\n") + _json_line({"b": 2}, b"\r\n"), id="crlf"),
+        pytest.param(_json_line({"a": 1}, b"\r") + _json_line({"b": 2}, b"\r"), id="cr"),
+        pytest.param(_json_line({"a": 1}) + b"\n" + _json_line({"b": 2}), id="empty-line"),
         pytest.param(_json_line({"text": "carriage\rline\u2028next\u0085nel"}), id="embedded-line-characters"),
         pytest.param(_json_line({"text": "x" * (128 * 1024)}), id="larger-than-chunk"),
         pytest.param(b"", id="empty"),
         pytest.param(_boundary_row() + _json_line({"after": True}), id="exact-chunk-boundary"),
+        pytest.param(_split_boundary_crlf_row() + _json_line({"after": True}), id="split-boundary-crlf"),
     ],
 )
 def test_stream_classification_matches_whole_file_splitlines(
