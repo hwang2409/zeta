@@ -46,6 +46,7 @@ from .approval_lifecycle import (
     Start,
     Terminate,
 )
+from .approval_settlement.resume import ApprovalResumeOwner
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
 from .host_commands import SessionHostCommands
 from .protocol import (
@@ -135,7 +136,6 @@ class ServeControl:
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
-        self._mcp_reconnect_approvals: set[str] = set()
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
         # Serve reads requests serially per connection and has one controller,
@@ -147,20 +147,17 @@ class ServeControl:
         self._mcp_binding_servers: frozenset[str] = frozenset()
         self._mcp_binding_required = False
         self._host_binding_required = False
+        self._approval_resume = ApprovalResumeOwner()
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
             policy=lambda: self.server.runtime.policy,
-            session_id=lambda: (
-                self.server.runtime.session_id
-                if self.server.runtime.opened is not None
-                else None
-            ),
-            parent_store=lambda: (
-                self.server.runtime.opened.store
-                if self.server.runtime.opened is not None
-                else None
-            ),
+            session_id=lambda: self.server.runtime.session_id
+            if self.server.runtime.opened is not None
+            else None,
+            parent_store=lambda: self.server.runtime.opened.store
+            if self.server.runtime.opened is not None
+            else None,
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
             grant_published=self._publish_session_grant,
@@ -322,11 +319,8 @@ class ServeControl:
         return bound_reconnect_approvals(merged)
 
     def clear_approvals(self) -> None:
-        self._mcp_reconnect_approvals.clear()
         self._approvals.clear_approvals()
-
     def session_replaced(self) -> None:
-        self._mcp_reconnect_approvals.clear()
         self._approvals.session_replaced()
 
     async def wait_for_approval_settlement(self, timeout: float | None = None) -> None:
@@ -400,9 +394,7 @@ class ServeControl:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         if reconnect and had_mcp_bindings:
-            self._mcp_reconnect_approvals.update(
-                key for key in self._approvals.active_keys() if isinstance(key, str)
-            )
+            self._approval_resume.mark_mcp_reconnect(self.server.runtime.session_id, self._approvals.active_keys())
         self._active_mcp_bindings = {}
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
@@ -553,19 +545,8 @@ class ServeControl:
             if isinstance(core_key, str)
             else None
         )
-        turn_task = self._turn_task
-        reconnected = (
-            isinstance(core_key, str) and core_key in self._mcp_reconnect_approvals
-        )
-        if isinstance(core_key, str):
-            self._mcp_reconnect_approvals.discard(core_key)
         if (
-            (
-                reconnected
-                or turn_task is None
-                or turn_task.done()
-                or turn_task.cancelling()
-            )
+            self._approval_resume.should_resume(self.server.runtime.session_id, core_key, self._turn_task)
             and state is not None
             and state[1] is not None
             and loop.prepare_resume_pending_tool(state[0])
