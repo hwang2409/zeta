@@ -411,6 +411,7 @@ class HistoryIndex:
             self._remove_file()
             connection = self._connection(write=True)
             # This file is a replaceable cache; the transcript repairs an interrupted rebuild.
+            connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
             self._create_schema(connection)
             for index in ("entries_parent", "entries_type", "entries_history_group"):
