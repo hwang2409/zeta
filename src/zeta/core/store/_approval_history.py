@@ -216,6 +216,14 @@ class ApprovalHistoryStoreMixin:
     def remember_pending_approval_execution(
         self, request_id: str, definition: tuple[str, str | None]
     ) -> None:
+        completed = [
+            key
+            for key, record in self._pending_approval_executions.items()
+            if record.owner is _COMPLETED_APPROVAL_EXECUTION
+            and self.approval_state_now(key) is None
+        ]
+        for key in completed:
+            self._pending_approval_executions.pop(key, None)
         self._pending_approval_executions.setdefault(
             request_id, _PendingApprovalExecution(definition)
         )
