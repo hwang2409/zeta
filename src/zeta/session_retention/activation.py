@@ -229,11 +229,15 @@ class RetentionActivationOwner:
                 self._episode_task = None
                 for projection in projections:
                     if self._publish is not None:
-                        await self._publish(projection)
+                        published = self._publish(projection)
+                        if inspect.isawaitable(published):
+                            await published
                 if failure is not None and not self._stop.is_set():
                     error = await asyncio.to_thread(self._on_error, failure, self._days())
                     if self._publish is not None:
-                        await self._publish(error)
+                        published = self._publish(error)
+                        if inspect.isawaitable(published):
+                            await published
                 if self._stop.is_set():
                     return
                 if self._request_pending.is_set() or self._restart.is_set():

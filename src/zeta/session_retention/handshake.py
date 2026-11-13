@@ -54,6 +54,19 @@ def _fd(home: Path, domain: str) -> int:
     return _lock_file(home, domain_lock_name(RETENTION_HOME_ID, domain))
 
 
+def _existing_fd(home: Path, domain: str) -> int | None:
+    path = home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, domain)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise OSError("retention lock must be a regular, unshared file")
+    return fd
+
+
 @contextmanager
 def user_open_request(home: Path) -> Iterator[None]:
     fd = _fd(home, "user-open-request")
@@ -126,10 +139,18 @@ def open_with_retention_yield(
     clock: Callable[[], float] = time.monotonic,
     wait: Callable[[float], None] = time.sleep,
     timeout: float = _WAIT_DEADLINE,
+    create_locks: bool = True,
 ) -> object:
     """Give retention a bounded chance to leave before running one open."""
-    request_fd = _fd(home, "user-open-request")
-    active_fd = _fd(home, "planner-active")
+    acquire = _fd if create_locks else _existing_fd
+    request_fd = acquire(home, "user-open-request")
+    active_fd = acquire(home, "planner-active")
+    if request_fd is None or active_fd is None:
+        if request_fd is not None:
+            os.close(request_fd)
+        if active_fd is not None:
+            os.close(active_fd)
+        return operation()
     try:
         fcntl.flock(request_fd, fcntl.LOCK_SH)
         acknowledged = _wait_exclusive(

@@ -928,19 +928,12 @@ def _run_tui_lifecycle_captured(
             current_session_id = app.loop.store.session_id
             if retention_owner is None and not args.no_session:
                 from ..session_retention.activation import make_retention_owner
-
-                retention_owner = make_retention_owner(
-                    env_home(), app.loop.store._storage_lease
-                )
+                retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
             run_app._retention_owner = retention_owner
             if retention_owner is not None:
                 from ..tui.cards.retention import render_retention_card
-
-                retention_owner.set_publish(
-                    lambda projection, app=app: app._print_unit(render_retention_card(projection))
-                    if projection.get("mode") != "none" else None
-                )
+                retention_owner.set_publish(lambda projection, app=app: app._print_unit(render_retention_card(projection)) if projection.get("mode") != "none" else None)
             restart_requested = False
             restart_cancels_work = False
             new_session_requested = False
@@ -948,12 +941,10 @@ def _run_tui_lifecycle_captured(
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
-
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
                 from ..tui.stderr_capture import run_tui_session
-
                 restart_requested, restart_cancels_work = run_tui_session(
                     run_app, args, _run_tui, retention_owner
                 )
@@ -972,7 +963,6 @@ def _run_tui_lifecycle_captured(
                 if _has_console_message(exc):
                     raise
                 from ..tui.loop_errors import log_tui_crash
-
                 _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
                 _print_exit_hint(app)
                 exit_status = 1
@@ -980,6 +970,7 @@ def _run_tui_lifecycle_captured(
             finally:
                 _cleanup_ephemeral(run_app)
             if new_session_requested:
+                retention_owner = None
                 continue
             if restart_requested:
                 if restart_cancels_work:
@@ -996,11 +987,8 @@ def _run_tui_lifecycle_captured(
                 current_session_id=current_session_id,
             )
     return exit_status, restart_session_id
-
-
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
     """Replace the original session selector while preserving all other flags."""
-
     rewritten: list[str] = []
     index = 0
     while index < len(argv):
@@ -1019,11 +1007,8 @@ def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str
         rewritten.append(token)
         index += 1
     return [entrypoint, *rewritten, "--resume", session_id]
-
-
 def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     from ..tui.stderr_capture import restore_stderr_for_cli
-
     restore_stderr_for_cli()
     command = _restart_argv(entrypoint, argv, session_id)
     try:
@@ -1033,14 +1018,9 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
         print(f"resume manually: zeta --resume {session_id}", file=sys.stderr)
         return 1
     return 0
-
-
 def _has_console_message(exc: Exception) -> bool:
     from ..accounts import AccountError
-
     return isinstance(exc, StorageFormatError | AccountError)
-
-
 def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
@@ -1048,10 +1028,8 @@ def _run_console(run: Callable[[], int]) -> int:
         if not _has_console_message(exc):
             raise
         from ..tui.stderr_capture import write_terminal
-
         write_terminal(f"zeta: {exc}")
         return 2
-
 
 def _run_tui_command(
     args: argparse.Namespace,

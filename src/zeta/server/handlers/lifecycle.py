@@ -487,6 +487,7 @@ def list_sessions(
         return open_with_retention_yield(
             self.server.runtime.manager.home,
             lambda: _list_sessions(self, request_id, params),
+            create_locks=False,
         )
     return _list_sessions(self, request_id, params)
 

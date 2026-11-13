@@ -1823,6 +1823,7 @@ The shared slash registry has this order and surface availability:
 | `tasks` | no | inspect background processes |
 | `pin` | yes | pin the attached root session |
 | `unpin` | yes | unpin the attached root session |
+| `retention` | yes | show or change session retention: /retention [arm|disarm] |
 | `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |

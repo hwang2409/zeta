@@ -29,8 +29,12 @@ from zeta.server.slash_commands import run_command
 def _server(tmp_path: Path) -> ZetaServer:
     cwd = tmp_path / "launch"
     cwd.mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    # keep the separate background retention writer idle during filesystem snapshots
+    (home / "settings.toml").write_text("[retention]\ndays = 0\n")
     return ZetaServer(
-        home=tmp_path / "home",
+        home=home,
         cwd=cwd,
         provider="codex",
         port=0,
