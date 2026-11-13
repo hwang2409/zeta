@@ -8,16 +8,16 @@ import os
 import threading
 import uuid
 from collections.abc import Iterator
-from pathlib import Path
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from ...locking import execution_lock
-from ..retention_access import acquire_after_retention_yield
 from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
+from ..retention_access import acquire_after_retention_yield
 from ..session_files import SessionInUseError, open_session_file
 
 RUNTIME_LEASE_NAME = "runtime.lease"

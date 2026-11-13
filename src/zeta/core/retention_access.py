@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..locking import RETENTION_HOME_ID, domain_lock_name
-from ..storage_format import StorageFeature, feature_enabled, _read_manifest
+from ..storage_format import StorageFeature, _read_manifest, feature_enabled
 
 
 class RetentionYieldError(RuntimeError):

@@ -10,6 +10,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+
 class _PublishedPass(dict[str, object]):
     def __init__(self, projection: dict[str, object], *, complete: bool) -> None:
         super().__init__(projection)
