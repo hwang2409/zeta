@@ -1121,6 +1121,9 @@ def test_project_registry_preserves_orphan_and_non_child_workers(
         [
             _registry_session_record(root_id),
             _registry_session_record(
+                f"{root_id}:1", role="worker", parent_session_id=root_id
+            ),
+            _registry_session_record(
                 orphan_id, role="worker", parent_session_id="2" * 32
             ),
             _registry_session_record(
