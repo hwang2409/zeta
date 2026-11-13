@@ -7,13 +7,13 @@ import weakref
 from prompt_toolkit import PromptSession
 from rich.text import Text
 
-from ..core.session import env_home
-from ..diagnostics.tui_stalls import start_tui_stall_watchdog
-from . import theme
-from .composer import FullScreenPromptSession
-from .fork_session import RuntimeResult
-from .layout import detach_completion_menus, full_screen_content
-from .loop_errors import (
+from ...core.session import env_home
+from ...diagnostics.tui_stalls import start_tui_stall_watchdog
+from .. import theme
+from ..composer import FullScreenPromptSession
+from ..fork_session import RuntimeResult
+from ..layout import detach_completion_menus, full_screen_content
+from ..loop_errors import (
     cancel_activation,
     run_prompt_toolkit,
     start_prompt_during_activation,

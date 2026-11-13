@@ -60,7 +60,7 @@ import zeta.accounts.session as account_session_module
 import zeta.cli.main as cli_main_module
 import zeta.providers.login as provider_login_module
 import zeta.tui.app as tui_app_module
-import zeta.tui.prompt_runtime as prompt_runtime_module
+import zeta.tui.runtime.prompt as prompt_runtime_module
 import zeta.tui.slash_handlers as slash_handlers_module
 from tests.support.account_processes import hold_provider_login_lock
 from tests.support.completion import completion_control
@@ -7589,7 +7589,7 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ticks = iter((10.0, 10.25))
-    monkeypatch.setattr("zeta.tui.stream_events.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("zeta.tui.runtime.stream.time.monotonic", lambda: next(ticks))
     output = StringIO()
     app = TUIApp(
         AgentLoop(
@@ -8159,7 +8159,7 @@ def test_completed_message_replaces_streaming_unit_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.stream_events.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.runtime.stream.render_markdown", spy)
     app._consume_text(
         StreamEvent(StreamEventType.MESSAGE_UPDATE, content=TextContent(source))
     )
@@ -8200,7 +8200,7 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         calls.append(value)
         return real_renderer(value)
 
-    monkeypatch.setattr("zeta.tui.stream_events.render_markdown", spy)
+    monkeypatch.setattr("zeta.tui.runtime.stream.render_markdown", spy)
     before = "**before tool**"
     after = "**after tool**"
     events = [
@@ -9017,7 +9017,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import zeta.agent.background_lifecycle
-    from zeta.tui import prompt_runtime as prompt_runtime_module
+    import zeta.tui.runtime.prompt as prompt_runtime_module
 
     root = ConversationStore(tmp_path / "sessions")
     for number in range(1, 4):
@@ -9093,7 +9093,7 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         resumed=True,
     )
     monkeypatch.setattr(
-        "zeta.tui.prompt_runtime.start_tui_stall_watchdog", lambda *args, **kwargs: None
+        "zeta.tui.runtime.prompt.start_tui_stall_watchdog", lambda *args, **kwargs: None
     )
 
     with create_pipe_input() as pipe:

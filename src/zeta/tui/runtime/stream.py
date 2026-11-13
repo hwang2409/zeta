@@ -6,17 +6,17 @@ import time
 from prompt_toolkit.application import get_app
 from rich.text import Text
 
-from ..protocol.types import (
+from ...protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
     ThinkingContent,
     assistant_text,
 )
-from . import render, theme
-from .bootstrap import background_notice
-from .render import render_markdown, render_thought, render_thought_live_delta
-from .transcript import stream_key
+from .. import render, theme
+from ..bootstrap import background_notice
+from ..render import render_markdown, render_thought, render_thought_live_delta
+from ..transcript import stream_key
 
 
 class StreamEventMixin:

@@ -76,7 +76,8 @@ from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .paste_runtime import PasteRuntime
-from .prompt_runtime import PromptRuntimeMixin
+from .runtime.prompt import PromptRuntimeMixin
+from .runtime.stream import StreamEventMixin
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
@@ -88,7 +89,6 @@ from .slash_handlers.mcp_manager import MCPManagerMixin
 from .slash_handlers.model_picker import ModelPicker
 from .slash_handlers.remote import RemoteViewMixin
 from .slash_handlers.tasks_panel import BackgroundTasksMixin
-from .stream_events import StreamEventMixin
 from .theme import RICH_THEME
 from .todo import TodoWidget
 from .transcript import (
