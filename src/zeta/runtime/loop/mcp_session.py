@@ -1,6 +1,7 @@
 """MCP session lifecycle operations for AgentLoop."""
 
 import asyncio
+import logging
 import shlex
 from collections.abc import Callable
 from dataclasses import replace
@@ -15,6 +16,7 @@ from ...mcp import (
     mount_mcp_servers,
     tool_prefix,
 )
+from ...mcp.call_deadline import MCPCallDeadline
 from ...mcp.commands import (
     MCP_USAGE,
     MCPCommandError,
@@ -31,6 +33,10 @@ from ...mcp.oauth_store import (
     public_credential_store_error,
 )
 from ...model_input import ModelInputEnvelope
+
+logger = logging.getLogger(__name__)
+
+MCP_REFRESH_TURN_WAIT_SECONDS = 1.0
 
 
 class MCPCommandOutput(str):
@@ -56,16 +62,32 @@ class MCPSession:
         return self._mcp_home_hint
 
     async def _ensure_mcp_servers(self) -> None:
-        if self._mcp_mount_attempted:
+        if not self._mcp_mount_attempted:
+            if (
+                self._mcp_management.project_dir == self.tool_registry.cwd
+                and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
+            ):
+                self._mcp_management.project_dir = None
+            if self._mcp_mount_task is None:
+                self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
+            await asyncio.shield(self._mcp_mount_task)
+        await self._wait_for_pending_mcp_refreshes()
+
+    async def _wait_for_pending_mcp_refreshes(
+        self, *, deadline: MCPCallDeadline | None = None
+    ) -> None:
+        mount = self._mcp_mount
+        if mount is None or not mount.tool_refresh_pending:
             return
-        if (
-            self._mcp_management.project_dir == self.tool_registry.cwd
-            and not await asyncio.to_thread(self.tool_registry.cwd.is_dir)
-        ):
-            self._mcp_management.project_dir = None
-        if self._mcp_mount_task is None:
-            self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
-        await asyncio.shield(self._mcp_mount_task)
+        deadline = deadline or MCPCallDeadline.start(MCP_REFRESH_TURN_WAIT_SECONDS)
+        if deadline.expired:
+            logger.warning("MCP tool refresh was late; using the current tool catalog")
+            return
+        try:
+            async with asyncio.timeout_at(deadline.expires_at):
+                await mount.wait_for_tool_refreshes()
+        except TimeoutError:
+            logger.warning("MCP tool refresh was late; using the current tool catalog")
 
     async def _mount_mcp_servers(self) -> None:
         try:

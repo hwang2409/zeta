@@ -32,6 +32,8 @@ class ToolRefreshActor:
         self._setup_client: MCPClient | None = None
         self._task: asyncio.Task[list[MCPTool]] | None = None
         self._pending = False
+        self._settled = asyncio.Event()
+        self._settled.set()
         self._setup_notification_client: MCPClient | None = None
 
     def start_setup(self, client: MCPClient) -> None:
@@ -55,17 +57,26 @@ class ToolRefreshActor:
             self._setup_client = None
         if self._setup_notification_client is client:
             self._setup_notification_client = None
+            self._settled.set()
 
     def notify(self, client: MCPClient, method: str) -> None:
         if method != "notifications/tools/list_changed":
             return
         owner = self._owner
-        if (
-            client is owner._client or client is self._setup_client
-        ) and owner._status.state != "mounted":
+        if client is not owner._client and client is not self._setup_client:
+            return
+        self._settled.clear()
+        if owner._status.state != "mounted":
             self._setup_notification_client = client
         else:
             owner._queue.put_nowait(ToolsListChanged(client))
+
+    @property
+    def pending(self) -> bool:
+        return not self._settled.is_set()
+
+    async def wait(self) -> None:
+        await self._settled.wait()
 
     def handle_changed(self, message: ToolsListChanged) -> None:
         owner = self._owner
@@ -94,11 +105,13 @@ class ToolRefreshActor:
             self._task = None
         if message.client is not owner._client or owner._status.state != "mounted":
             self._pending = False
+            self._settled.set()
             return
         try:
             tools = owner._filter_tools(message.task.result(), owner._notice_sink)
         except Exception as exc:  # noqa: BLE001 - refresh failure degrades the server
             self._pending = False
+            self._settled.set()
             owner._degrade_current(error_text(exc))
             return
         owner._unregister_tools()
@@ -121,8 +134,11 @@ class ToolRefreshActor:
         if self._pending:
             self._pending = False
             self.handle_changed(ToolsListChanged(message.client))
+        else:
+            self._settled.set()
 
     async def close(self) -> None:
+        self._settled.set()
         if self._task is None:
             return
         self._task.cancel()

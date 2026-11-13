@@ -357,6 +357,19 @@ class MCPMount:
             await old_actor.close()
         return await actor.reconnect(notice_sink=notice_sink)
 
+    @property
+    def tool_refresh_pending(self) -> bool:
+        return any(actor._tool_refresh.pending for actor in self._actors.values())
+
+    async def wait_for_tool_refreshes(self) -> None:
+        waits = [
+            actor._tool_refresh.wait()
+            for actor in self._actors.values()
+            if actor._tool_refresh.pending
+        ]
+        if waits:
+            await asyncio.gather(*waits)
+
     def set_primary_registry_only(self, name: str, enabled: bool) -> None:
         actor = self._actors.get(name)
         if actor is None or self._closed:
