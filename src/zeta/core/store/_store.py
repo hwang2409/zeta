@@ -662,11 +662,12 @@ class ConversationStore(
             if touched
             else _ApprovalValidationOverlay()
         )
+        resident_length = len(self._resident_rows.entries)
         self._resident_rows.extend(entries)
         try:
             self._validate_entries(approvals, {entry.id for entry in entries})
         finally:
-            self._resident_rows.truncate_to(len(self._entries) - len(entries))
+            self._resident_rows.truncate_to(resident_length)
         encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
         self._write_bytes(encoded)
         self._apply_history_index_entries(tuple(entries))
@@ -726,11 +727,12 @@ class ConversationStore(
                 # A fork re-selects the active branch, so the active-branch
                 # index cannot seed a sibling branch. Validate the whole
                 # candidate branch before any bytes reach disk.
+                resident_length = len(self._resident_rows.entries)
                 self._resident_rows.append(entry)
                 try:
                     self._validate_entries()
                 finally:
-                    self._resident_rows.truncate_to(len(self._entries) - 1)
+                    self._resident_rows.truncate_to(resident_length)
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -1127,6 +1129,9 @@ class ConversationStore(
 
     def branch_refs(self):
         return self._resident_rows.branch_refs()
+
+    def resident_refs(self):
+        return self._resident_rows.resident_refs()
 
     def entry(self, ref):
         return self._resident_rows.entry(ref)

@@ -93,7 +93,7 @@ def tree(runtime: ServerRuntime) -> dict:
     # deep-copying ``entries`` property: this read runs off the loop (via
     # run_read) and only inspects ids/parents, so a per-row copy of a 17k-row
     # branch is wasted.
-    entries = tuple(store.entry(ref) for ref in store.branch_refs())
+    entries = tuple(store.entry(ref) for ref in store.resident_refs())
     children: dict[str, int] = {}
     for entry in entries:
         if entry.parent_id:
