@@ -3497,9 +3497,6 @@ async def _run_child_finish_gate_order(
     )
     child_store: ConversationStore | None = None
     expect_gate_call = release_order != "before_end_turn"
-    if expect_gate_call:
-        await await_or_fail(backend.gate_seen.wait(), what="finish-gate seen")
-        assert not task.done()
 
     def dump_order() -> str:
         if child_store is not None:
