@@ -36,6 +36,7 @@ from .protocol import (
     FEATURES,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
+    EventDescriptor,
     FrameCodec,
     FrameWriteOwner,
     MethodDescriptor,
@@ -279,6 +280,15 @@ class ZetaServer:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def publish_update(self, old_revision: str, new_revision: str) -> None:
+        if self.connections is not None:
+            await self.connections.publish_feature_event(
+                "zeta_updated",
+                EventDescriptor.ZETA_UPDATED,
+                self.runtime.session_id if self.runtime.opened is not None else None,
+                data={"old_revision": old_revision, "new_revision": new_revision},
+            )
 
     @property
     def address(self) -> str:

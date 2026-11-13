@@ -106,6 +106,7 @@ EVENT_FEATURES = {
     EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
     EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
     EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
+    EventDescriptor.ZETA_UPDATED: frozenset({"zeta_updated"}),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime.foreground_events import ForegroundEventPublisher
+from ..server.protocol import EventDescriptor
 from ..server.runtime import ServerRuntime
 from ..server.server import ZetaServer
 from .descriptor import (
@@ -104,6 +105,14 @@ class ObserverHost:
                 await self.close()
             return str(exc) or type(exc).__name__
         return None
+
+    async def publish_update(self, old_revision: str, new_revision: str) -> None:
+        if self._server is not None:
+            await self._server.control._notify(
+                EventDescriptor.ZETA_UPDATED,
+                self.session_id,
+                data={"old_revision": old_revision, "new_revision": new_revision},
+            )
 
     async def close(self) -> None:
         server, self._server = self._server, None
