@@ -599,7 +599,7 @@ class TUIApp(
             composer_agent_navigation_ready=lambda: (
                 app.composer_can_focus_agent_list()
             ),
-            interaction_ready=lambda: not app._startup_replay_active,
+            interaction_ready=app.interaction_ready,
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -963,6 +963,9 @@ class TUIApp(
 
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
+
+    def interaction_ready(self) -> bool:
+        return not self._startup_replay_active
 
     def composer_can_focus_agent_list(self) -> bool:
         session = self._active_session

@@ -75,6 +75,7 @@ async def _enter_child(app: TUIApp, pipe) -> None:
                 ),
                 what="visible composer before picker key",
             )
+        await _wait_until(app.interaction_ready, what="ready TUI interaction")
         await _wait_until(
             app.composer_can_focus_agent_list,
             what="composer ready to open the visible agent picker",
