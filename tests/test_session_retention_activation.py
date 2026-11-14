@@ -172,32 +172,18 @@ async def test_two_owners_append_without_lost_rows(
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     lease = await asyncio.to_thread(open_writer, home)
     barrier = threading.Barrier(2)
-    planner_roles: dict[RetentionPlanner, str] = {}
     thread_roles: dict[int, str] = {}
-    planner_lock = threading.Lock()
     b_reached = threading.Event()
     a_holds_coordinator = threading.Event()
     original_run_pass = RetentionPlanner.run_pass
     original_publish = retention_module.atomic_publish_file
     original_authority = activation_module.domain_authority
 
-    def synchronized_run_pass(planner, *, days, commit_state=True, yield_check=None):
-        thread_id = threading.get_ident()
-        with planner_lock:
-            first_pass = planner not in planner_roles
-            if first_pass:
-                planner_roles[planner] = "a" if not planner_roles else "b"
-            thread_roles[thread_id] = planner_roles[planner]
-        if first_pass:
-            try:
-                barrier.wait(10)
-            except threading.BrokenBarrierError as exc:
-                raise AssertionError("owners did not reach the first-pass rendezvous") from exc
-        if commit_state:
-            result = original_run_pass(planner, days=days, yield_check=yield_check)
-        else:
-            result = original_run_pass(planner, days=days, commit_state=False, yield_check=yield_check)
-        if first_pass and planner_roles[planner] == "b":
+    def signal_second_commit(planner, *, days, commit_state=True, yield_check=None):
+        result = original_run_pass(
+            planner, days=days, commit_state=commit_state, yield_check=yield_check
+        )
+        if thread_roles.get(threading.get_ident()) == "b":
             b_reached.set()
         return result
 
@@ -216,12 +202,32 @@ async def test_two_owners_append_without_lost_rows(
             assert b_reached.wait(10), "owner b did not reach its commit attempt"
         original_publish(directory_fd, name, data, **kwargs)
 
-    monkeypatch.setattr(RetentionPlanner, "run_pass", synchronized_run_pass)
+    monkeypatch.setattr(RetentionPlanner, "run_pass", signal_second_commit)
     monkeypatch.setattr(activation_module, "domain_authority", observed_authority)
     monkeypatch.setattr(retention_module, "atomic_publish_file", ordered_publish)
     try:
         first = make_retention_owner(home, lease, lambda: 30)
         second = make_retention_owner(home, lease, lambda: 31)
+        first_factory, second_factory = first._planner_factory, second._planner_factory
+
+        def first_planner():
+            thread_roles[threading.get_ident()] = "a"
+            try:
+                barrier.wait(10)
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError("owners did not reach the planner rendezvous") from exc
+            return first_factory()
+
+        def second_planner():
+            thread_roles[threading.get_ident()] = "b"
+            try:
+                barrier.wait(10)
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError("owners did not reach the planner rendezvous") from exc
+            return second_factory()
+
+        first._planner_factory = first_planner
+        second._planner_factory = second_planner
         results = await asyncio.wait_for(
             asyncio.gather(
                 asyncio.to_thread(first._run_episode), asyncio.to_thread(second._run_episode)
