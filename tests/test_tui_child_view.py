@@ -86,7 +86,13 @@ async def _enter_child(app: TUIApp, pipe) -> None:
         await _wait_until(navigation.list_focused, what="agent picker focus")
     while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
         before = navigation.selected_index
-        await _send(pipe, "\x1b[B")
+        target = next(
+            index
+            for index, entry in enumerate(navigation.entries)
+            if entry.path.name == CHILD_ID
+        )
+        key = "\x1b[B" if before < target else "\x1b[A"
+        await _send(pipe, key)
         await _wait_until(
             lambda before=before: navigation.selected_index != before,
             what="next visible child picker row",
