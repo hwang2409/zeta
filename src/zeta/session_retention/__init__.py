@@ -701,6 +701,7 @@ class RetentionPlanner:
             worker_ns=self.bounds.worker_ns,
             clock=self._now_ns,
         )
+        deadline_ns = self._now_ns() + self.bounds.worker_ns
         transaction.prepare()
         with _coordinator_authority(self.home) as token:
             outcome = transaction.advance(
@@ -708,6 +709,7 @@ class RetentionPlanner:
                 preview=self._latest if type(self._latest) is dict else None,
                 verify=self._verify_candidate,
                 token=token,
+                deadline_ns=deadline_ns,
                 yield_check=yield_check or (lambda: planner_request_pending(self.home)),
             )
         transaction_result = self._transaction_result(outcome)

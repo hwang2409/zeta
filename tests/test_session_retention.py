@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta import session_retention
 from zeta.attention_records import AttentionStore
 from zeta.core.session import SessionManager, SessionMetadata
@@ -44,20 +45,42 @@ def _directory(path):
 
 
 def test_retention_durable_writers_have_one_owner():
-    root = Path(__file__).parents[1] / "src"
-    retention_names = {
+    package = Path(__file__).parents[1] / "src" / "zeta" / "session_retention"
+    source = Path(__file__).parents[1] / "src"
+    names = {
         "retention-history.jsonl", "retention-state.json", "retention-arm.json",
-        "reservations", "transactions", "manifest.json",
+        "reservations", "transactions", "manifest.json", "session-trash",
     }
-    low_level = {
-        "open", "write_text", "write_bytes", "write", "replace", "rename", "link",
-        "unlink", "atomic_publish_file", "publish_json", "os_write",
+    constants = {
+        "_STATE_NAME", "_STATE_FILENAME", "_ARM_NAME", "_ARM_FILENAME",
+        "_HISTORY_FILENAME", "_MANIFEST_NAME", "_TRASH_NAME", "_RESERVATIONS_NAME",
+        "_TRANSACTIONS_NAME",
+    }
+    primitives = {
+        "open", "write", "write_text", "write_bytes", "replace", "rename", "link",
+        "unlink", "rmdir", "mkdir", "atomic_publish_file", "publish_json", "delete",
+        "_delete", "_publish", "_publish_state", "unlink_session_file",
     }
     seams = {
-        "append_retention_history", "_store_state", "_publish_arm", "_remove_sidecars",
-        "_publish", "_publish_state",
+        ("__init__.py", "append_retention_history"),
+        ("__init__.py", "_store_state"),
+        ("__init__.py", "_publish_arm"),
+        ("__init__.py", "_remove_sidecars"),
+        ("transaction.py", "_publish"),
+        ("transaction.py", "_publish_state"),
+        ("transaction.py", "_delete"),
+        ("transaction.py", "_move_to_trash"),
+        ("transaction.py", "_unlink_tree_entry"),
+        ("transaction.py", "_remove_empty_tree_directory"),
+        ("transaction.py", "_remove_empty_transaction"),
+        ("transaction.py", "_durable_child_directory"),
+        ("transaction.py", "_start_one"),
     }
-    allowed = {"append_retention_history", "_store_state", "_publish_arm", "_remove_sidecars", "_publish", "_publish_state", "_delete"}
+    readonly = {
+        ("zeta/session_retention/activation.py", "_run_episode"),
+        ("zeta/core/session_files.py", "reservation_path"),
+        ("zeta/core/session_files.py", "quarantine_path"),
+    }
     violations = []
 
     def call_name(call):
@@ -65,50 +88,139 @@ def test_retention_durable_writers_have_one_owner():
             call.func.attr if isinstance(call.func, ast.Attribute) else None
         )
 
-    def has_retention_target(call):
-        return any(
-            (isinstance(value, ast.Constant) and value.value in retention_names)
-            or (isinstance(value, ast.Name) and value.id in {"_STATE_NAME", "_STATE_FILENAME", "_ARM_NAME", "_ARM_FILENAME", "_HISTORY_FILENAME", "_MANIFEST_NAME"})
-            for arg in call.args for value in ast.walk(arg)
+    def is_write(call):
+        return call_name(call) != "open" or any(
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, int)
+            and value.value & (os.O_WRONLY | os.O_CREAT)
+            for value in ast.walk(call)
         )
 
-    for path in root.rglob("*.py"):
+    def owner(node, parents):
+        parts = []
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                parts.append(current.name)
+        return parts
+
+    def mentions_target(node, assigned):
+        return any(
+            (isinstance(value, ast.Constant) and value.value in names)
+            or (isinstance(value, ast.Name) and value.id in constants)
+            or (isinstance(value, ast.Name) and value.id in assigned)
+            for value in ast.walk(node)
+        )
+
+    for path in source.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        parents = {}
-        functions = {}
-        for parent in ast.walk(tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
-            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                functions[parent] = parent.name
+        relative = path.relative_to(source).as_posix()
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        assigned = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and mentions_target(node.value, set())
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = call_name(node)
-            if name not in low_level | seams:
+            if name not in primitives:
                 continue
-            owners = []
-            parent = node
-            while parent is not None:
-                parent = parents.get(parent)
-                if parent in functions:
-                    owners.append(functions[parent])
-            owner = next((value for value in owners if value in allowed), owners[0] if owners else None)
-            target = has_retention_target(node) or name in seams or (
-                name in {"atomic_publish_file", "unlink_session_file", "publish_json"}
-                and any(value in allowed for value in owners)
-            )
-            if not target:
+            if name == "open" and not any(
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, int)
+                and value.value & (os.O_WRONLY | os.O_CREAT)
+                for value in ast.walk(node)
+            ):
                 continue
-            if name in seams:
-                if not node.args:
-                    violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} missing coordinator token")
+            owners = owner(node, parents)
+            path_in_package = path.is_relative_to(package)
+            if not path_in_package:
                 continue
-            if owner not in allowed:
-                violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} can write retention durable data outside a token seam")
-            elif owner in {"_publish", "_publish_state"} and owner == "_publish" and not node.args:
-                violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} missing coordinator token")
+            if not mentions_target(node, assigned):
+                continue
+            path_name = path.relative_to(package).as_posix()
+            if name in {"_publish", "_publish_state", "_delete"}:
+                if not node.args or not isinstance(node.args[0], ast.Name) or node.args[0].id != "token":
+                    violations.append(f"{relative}:{node.lineno}: {name} missing coordinator token")
+                continue
+            if any((path_name, value) in seams for value in owners):
+                continue
+            violations.append(f"{relative}:{node.lineno}: {name} is outside an exact token seam")
+        if not path_in_package:
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Constant) and node.value in names
+                    or isinstance(node, ast.Name) and node.id in constants
+                ):
+                    continue
+                owners = owner(node, parents)
+                if (relative, ".".join(reversed(owners))) not in readonly:
+                    violations.append(f"{relative}:{node.lineno}: durable retention name outside read-only allowlist")
+            continue
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            seam = (path.relative_to(package).as_posix(), function.name)
+            if seam not in seams:
+                continue
+            args = {arg.arg for arg in function.args.args}
+            if "token" not in args:
+                violations.append(f"{seam[0]}:{function.lineno}: seam has no token parameter")
+                continue
+            writes = [node for node in ast.walk(function) if isinstance(node, ast.Call) and call_name(node) in primitives and is_write(node)]
+            first_write = min(writes, key=lambda node: node.lineno) if writes else None
+            checks = [node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "require_active" and isinstance(node.func.value, ast.Name) and node.func.value.id == "token"]
+            if first_write is None or not any(check.lineno < first_write.lineno for check in checks):
+                violations.append(f"{seam[0]}:{function.lineno}: seam does not require token before its first write")
     assert not violations, "\\n".join(violations)
+
+
+def test_transaction_deadline_includes_prepare(tmp_path, monkeypatch):
+    from zeta.session_retention import transaction
+
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    now = [0]
+
+    def clock():
+        return now[0]
+
+    with _opened_lease(home) as lease:
+        planner = RetentionPlanner(
+            home, lease, now_ns=clock,
+            bounds=RetentionBounds(entries_total=10, worker_ns=10),
+        )
+        real_prepare = transaction._QuarantineTransaction.prepare
+        seen = False
+
+        def prepare(owner):
+            real_prepare(owner)
+            now[0] = 11
+
+        def advance(owner, **kwargs):
+            nonlocal seen
+            seen = True
+            deadline_ns = kwargs.get("deadline_ns", clock() + 10)
+            budget = transaction._Budget(
+                entries=10, deadline_ns=deadline_ns, clock=clock,
+            )
+            with pytest.raises(transaction.TransactionError, match="bound reached"):
+                budget.charge()
+            assert kwargs["deadline_ns"] == 10
+            return transaction.TransactionOutcome(False, "retention transaction bound reached")
+
+        monkeypatch.setattr(transaction._QuarantineTransaction, "prepare", prepare)
+        monkeypatch.setattr(transaction._QuarantineTransaction, "advance", advance)
+        planner.run_pass(days=30)
+        planner.close()
+        assert seen
 
 
 def test_retention_publication_rejects_token_after_authority_exit(tmp_path):
