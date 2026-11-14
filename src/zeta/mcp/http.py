@@ -116,6 +116,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._spill_store.configure_transient_limit(self._limits.max_wire_bytes)
         self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
+        self._session_recovery_lock = asyncio.Lock()
         self._credential_store = MCPCredentialStore(home=home)
 
     def set_failure_sink(self, sink: Callable[[str], None] | None) -> None:
@@ -127,6 +128,10 @@ class StreamableHTTPMCPClient(MCPClient):
     async def connect(self) -> None:
         if self._closed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
+        await self._initialize_session()
+        self._notification_task = asyncio.create_task(self._listen_notifications())
+
+    async def _initialize_session(self) -> None:
         result = await self._request("initialize", initialize_params())
         protocol_version = result.get("protocolVersion")
         if type(protocol_version) is not str or not protocol_version:
@@ -135,7 +140,6 @@ class StreamableHTTPMCPClient(MCPClient):
         capabilities = result.get("capabilities")
         self.capabilities = dict(capabilities) if type(capabilities) is dict else None
         await self._send_notification("notifications/initialized", {})
-        self._notification_task = asyncio.create_task(self._listen_notifications())
 
     async def list_tools(self) -> list[MCPTool]:
         return await _drain_pages(
@@ -473,7 +477,10 @@ class StreamableHTTPMCPClient(MCPClient):
         request_id: int,
         state: _ActiveRequest,
         oauth_token: MCPOAuthToken | None,
+        *,
+        recover_session: bool = True,
     ) -> dict[str, object]:
+        carried_session_id = self._session_id
         try:
             async with self._checked_stream(
                 "POST",
@@ -502,8 +509,41 @@ class StreamableHTTPMCPClient(MCPClient):
                 except ValueError as exc:
                     raise MCPProtocolError("MCP HTTP response was not JSON") from exc
                 return parse_rpc_response(value, request_id)
+        except MCPHTTPError as exc:
+            if (
+                recover_session
+                and exc.status_code == 404
+                and carried_session_id is not None
+            ):
+                # an unknown session means the server rejected the request, so retrying is safe
+                await self._recover_session(carried_session_id)
+                return await self._send(
+                    payload,
+                    request_id,
+                    state,
+                    oauth_token,
+                    recover_session=False,
+                )
+            raise
         finally:
             state.response = None
+
+    async def _recover_session(self, old_session_id: str) -> None:
+        async with self._session_recovery_lock:
+            if self._session_id != old_session_id:
+                return
+            if self._notification_task is not None:
+                self._notification_task.cancel()
+                await asyncio.gather(
+                    self._notification_task, return_exceptions=True
+                )
+                self._notification_task = None
+            self._session_id = None
+            self._notification_event_id = None
+            await self._initialize_session()
+            self._notification_task = asyncio.create_task(self._listen_notifications())
+            if self._notification_sink is not None:
+                self._notification_sink("notifications/tools/list_changed")
 
     async def _listen_notifications(self) -> None:
         if self._session_id is None:
