@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -30,6 +31,7 @@ from zeta.core.store import (
     TranscriptLoadError,
     _async_writes,
     _log,
+    _rows,
 )
 from zeta.core.store._delivery_fold import DeliveryFold
 from zeta.core.store._history_index import (
@@ -99,6 +101,79 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
         ] == ["0", "1", "2"]
     finally:
         reopened.close()
+
+
+def test_large_fork_load_trims_payloads_in_linear_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row_count = 50_000
+    store = ConversationStore(tmp_path, session_id="large-fork")
+    path = store.path
+    store.close()
+    stored_message = message(MessageRole.ASSISTANT, "old").to_dict()
+    parent_id = None
+    with path.open("a", encoding="utf-8") as handle:
+        for seq in range(1, row_count + 1):
+            entry_id = f"entry-{seq}"
+            if seq == row_count:
+                parent_id = f"entry-{row_count - 100}"
+            entry = ConversationEntry(
+                seq=seq,
+                id=entry_id,
+                parent_id=parent_id,
+                lane="main",
+                type="message",
+                data={"message": stored_message},
+            )
+            handle.write(json.dumps(entry.to_dict(), separators=(",", ":")) + "\n")
+            parent_id = entry_id
+
+    class CountedValuesOrderedDict(OrderedDict):
+        values_calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.total = 0
+            super().__init__(*args, **kwargs)
+
+        def __setitem__(self, key, value) -> None:
+            self.total -= self.get(key, 0)
+            super().__setitem__(key, value)
+            self.total += value
+
+        def pop(self, key, default=None):
+            if key not in self:
+                return default
+            value = super().pop(key)
+            self.total -= value
+            return value
+
+        def popitem(self, last=True):
+            key, value = super().popitem(last=last)
+            self.total -= value
+            return key, value
+
+        def values(self):
+            type(self).values_calls += 1
+            return (self.total,)
+
+    drops = 0
+    original_drop = ResidentRows._drop_payload
+
+    def counted_drop(rows: ResidentRows, seq: int) -> None:
+        nonlocal drops
+        drops += 1
+        original_drop(rows, seq)
+
+    monkeypatch.setattr(_rows, "OrderedDict", CountedValuesOrderedDict)
+    # test-contract: seam count payload evictions during the real public constructor
+    monkeypatch.setattr(ResidentRows, "_drop_payload", counted_drop)
+    with ConversationStore(tmp_path, session_id="large-fork", _must_exist=True) as reopened:
+        assert len(reopened.branch_refs()) == row_count - 99
+
+    # test-contract: seam a full load performs at most one payload eviction per physical row
+    assert drops <= row_count
+    # test-contract: seam trimming never rescans the resident LRU while evicting rows
+    assert CountedValuesOrderedDict.values_calls == 0
 
 
 def test_resident_payloads_stay_bounded_after_compaction() -> None:

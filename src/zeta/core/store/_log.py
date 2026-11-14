@@ -243,7 +243,7 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
-        self.state._resident_rows.append(
+        self.state._resident_rows.append_loaded(
             entry, offset=row.byte_offset, length=row.length
         )
         metadata = (
@@ -349,6 +349,7 @@ class _FullLoadValidator:
                 prefix_digest=hashlib.sha256().hexdigest(),
                 source_digest=self.source.finish_digest(),
             )
+        self.state._resident_rows._rebuild_branch()
         if self.state._resident_rows.rows:
             self._select_branch(self.state._resident_rows.rows[-1])
         self.state._resident_rows._rebalance_resident()

@@ -303,6 +303,7 @@ class ResidentRows:
         self._payload_sizes: dict[int, int] = {}
         self._pinned: set[int] = set()
         self._payload_lru: OrderedDict[int, int] = OrderedDict()
+        self._payload_lru_bytes = 0
         self.payload_cache_bytes = int(
             os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
         )
@@ -364,6 +365,33 @@ class ResidentRows:
         offset: int = 0,
         length: int = 0,
     ) -> None:
+        previous, row = self._append_row(entry, offset=offset, length=length)
+        linear = (previous is None and row.parent_id is None) or (
+            previous is not None and row.parent_id == previous.id
+        )
+        if linear:
+            self._branch_refs.append(row)
+        else:
+            self._rebuild_branch()
+        if row.type in {"message", "compaction"}:
+            self._context_source_seqs.add(row.seq)
+        if row.type == "compaction" or not linear:
+            self._rebalance_resident()
+        else:
+            self._context_refs.append(row)
+            self._pinned.add(row.seq)
+            self._remove_lru(row.seq)
+            self._trim_payload_cache()
+
+    def append_loaded(
+        self, entry: ConversationEntry, *, offset: int, length: int
+    ) -> None:
+        self._append_row(entry, offset=offset, length=length)
+        self._trim_payload_cache()
+
+    def _append_row(
+        self, entry: ConversationEntry, *, offset: int, length: int
+    ) -> tuple[RowRef | None, RowRef]:
         previous = self.rows[-1] if self.rows else None
         size = length or len(encode_json(entry.to_dict())) + 1
         if not self.rows and offset == 0:
@@ -383,22 +411,7 @@ class ResidentRows:
         self.rows.append(row)
         self._rows_by_id[row.id] = row
         self._store_payload(row, entry)
-        linear = (previous is None and row.parent_id is None) or (
-            previous is not None and row.parent_id == previous.id
-        )
-        if linear:
-            self._branch_refs.append(row)
-        else:
-            self._rebuild_branch()
-        if row.type in {"message", "compaction"}:
-            self._context_source_seqs.add(row.seq)
-        if row.type == "compaction" or not linear:
-            self._rebalance_resident()
-        else:
-            self._context_refs.append(row)
-            self._pinned.add(row.seq)
-            self._payload_lru.pop(row.seq, None)
-            self._trim_payload_cache()
+        return previous, row
 
     def extend(
         self,
@@ -471,6 +484,7 @@ class ResidentRows:
         rows._payload_sizes = dict(self._payload_sizes)
         rows._pinned = set(self._pinned)
         rows._payload_lru = OrderedDict(self._payload_lru)
+        rows._payload_lru_bytes = self._payload_lru_bytes
         rows.payload_cache_bytes = self.payload_cache_bytes
         rows.resident_payload_bytes = self.resident_payload_bytes
         rows._source_dir_fd = self._source_dir_fd
@@ -642,34 +656,41 @@ class ResidentRows:
         self._pinned = required
         for seq in tuple(self._payload_lru):
             if seq in required:
-                self._payload_lru.pop(seq, None)
+                self._remove_lru(seq)
         for seq in tuple(self.payloads):
             if seq not in required and seq not in self._payload_lru:
-                self._payload_lru[seq] = self._payload_sizes[seq]
+                size = self._payload_sizes[seq]
+                self._payload_lru[seq] = size
+                self._payload_lru_bytes += size
         self._trim_payload_cache()
+
+    def _remove_lru(self, seq: int) -> None:
+        size = self._payload_lru.pop(seq, None)
+        if size is not None:
+            self._payload_lru_bytes -= size
 
     def _store_payload(self, ref: RowRef, entry: ConversationEntry) -> None:
         old_size = self._payload_sizes.get(ref.seq, 0)
         self.payloads[ref.seq] = entry
         self._payload_sizes[ref.seq] = ref.length
         self.resident_payload_bytes += ref.length - old_size
+        self._remove_lru(ref.seq)
         if ref.seq not in self._pinned:
             self._payload_lru[ref.seq] = ref.length
-            self._payload_lru.move_to_end(ref.seq)
+            self._payload_lru_bytes += ref.length
 
     def _drop_payload(self, seq: int) -> None:
         if self.payloads.pop(seq, None) is not None:
             self.resident_payload_bytes -= self._payload_sizes.get(seq, 0)
         self._payload_sizes.pop(seq, None)
-        self._payload_lru.pop(seq, None)
+        self._remove_lru(seq)
         self._pinned.discard(seq)
 
     def _trim_payload_cache(self) -> None:
-        while (
-            sum(self._payload_lru.values()) > max(0, self.payload_cache_bytes)
-            and self._payload_lru
-        ):
-            seq, _ = self._payload_lru.popitem(last=False)
+        limit = max(0, self.payload_cache_bytes)
+        while self._payload_lru_bytes > limit and self._payload_lru:
+            seq, size = self._payload_lru.popitem(last=False)
+            self._payload_lru_bytes -= size
             if seq not in self._pinned:
                 self._drop_payload(seq)
 
