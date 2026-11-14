@@ -190,6 +190,9 @@ def append_retention_history(
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
         return
     validate_retention_history(result)
+    if not authority_held:
+        with domain_authority(Path(home), RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
+            return append_retention_history(home, lease, result, authority_held=True)
     path = Path(home) / _HISTORY_FILENAME
     rows: list[dict[str, object]] = []
     try:
@@ -217,11 +220,7 @@ def append_retention_history(
             )
         finally:
             os.close(home_fd)
-    if authority_held:
-        publish()
-    else:
-        with domain_authority(Path(home), RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
-            publish()
+    publish()
 
 
 def retention_arm_warning() -> str:

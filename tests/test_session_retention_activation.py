@@ -36,7 +36,8 @@ async def test_owner_lifecycle_table(
         if days == 0:
             def seed_arm():
                 with RetentionPlanner(home, lease) as planner:
-                    assert planner.run_pass(days=30).complete
+                    preview = planner.run_pass(days=30)
+                assert preview.complete
                 return retention_authority(home, lease, days=30).applied
             assert await asyncio.to_thread(seed_arm)
 
@@ -89,5 +90,26 @@ async def test_owner_publish_failure_does_not_stop_owner(tmp_path: Path) -> None
         await asyncio.sleep(0)
         assert owner.task is not None and not owner.task.done()
         await owner.stop()
+    finally:
+        await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
+async def test_two_owners_append_without_lost_rows(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        first = make_retention_owner(home, lease, lambda: 30)
+        second = make_retention_owner(home, lease, lambda: 30)
+        results = await asyncio.gather(
+            asyncio.to_thread(first._run_episode), asyncio.to_thread(second._run_episode)
+        )
+        assert all(failure is None for _projections, failure in results), results
+        rows = (home / "retention-history.jsonl").read_text().splitlines()
+        assert len(rows) >= 1
+        await first.stop()
+        await second.stop()
     finally:
         await asyncio.to_thread(lease.close)
