@@ -1245,6 +1245,7 @@ async def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held
         os.close(lock_fd)
     assert result is not None and "timed out" in result
     assert await asyncio.to_thread(child.pending_prompts) == []
+    await app.close()
 
 
 @pytest.mark.parametrize("missing", ["conversation", "session"])
@@ -1289,6 +1290,7 @@ async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Pa
         entry.data["text"]
         for entry in await asyncio.to_thread(child.pending_prompts)
     ] == ["while locked"]
+    await app.close()
 
 
 @pytest.mark.asyncio

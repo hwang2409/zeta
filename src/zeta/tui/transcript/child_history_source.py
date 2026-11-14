@@ -43,13 +43,7 @@ class ChildLogHistorySource:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.replay_provider: str | None = None
-        self._store = ConversationStore(
-            path.parent,
-            session_id=path.name,
-            _read_only=True,
-            _observer_snapshot=True,
-            _must_exist=True,
-        )
+        self._store: ConversationStore | None = None
         self._closed = False
         self._operation_lock = asyncio.Lock()
         self.pending_prompts: tuple[str, ...] = ()
@@ -57,7 +51,22 @@ class ChildLogHistorySource:
     async def close(self) -> None:
         self._closed = True
         async with self._operation_lock:
-            await asyncio.to_thread(self._store.close)
+            pass
+
+    def _run_sync(self, operation: Any, *args: Any) -> Any:
+        store = ConversationStore(
+            self.path.parent,
+            session_id=self.path.name,
+            _read_only=True,
+            _observer_snapshot=True,
+            _must_exist=True,
+        )
+        self._store = store
+        try:
+            return operation(*args)
+        finally:
+            self._store = None
+            store.close()
 
     def _refresh_refs(self) -> tuple[Any, ...]:
         if self._closed:
@@ -186,7 +195,9 @@ class ChildLogHistorySource:
         direction: Literal["older", "newer"] = "older",
     ) -> TUIHistoryPage:
         async with self._operation_lock:
-            return await asyncio.to_thread(self._page_sync, cursor, direction)
+            return await asyncio.to_thread(
+                self._run_sync, self._page_sync, cursor, direction
+            )
 
     def _entry_page_sync(self, entry_id: str) -> TUIHistoryPage:
         refs = self._refresh_refs()
@@ -201,7 +212,9 @@ class ChildLogHistorySource:
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
         async with self._operation_lock:
-            return await asyncio.to_thread(self._entry_page_sync, entry_id)
+            return await asyncio.to_thread(
+                self._run_sync, self._entry_page_sync, entry_id
+            )
 
     def _prompt_refs(self, refs: tuple[Any, ...]) -> list[Any]:
         return [
@@ -270,18 +283,24 @@ class ChildLogHistorySource:
         direction: Literal["older", "newer"] = "older",
     ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]:
         async with self._operation_lock:
-            return await asyncio.to_thread(self._prompt_page_sync, cursor, direction)
+            return await asyncio.to_thread(
+                self._run_sync, self._prompt_page_sync, cursor, direction
+            )
 
     async def prompt_pages(self) -> AsyncIterator[tuple[tuple[str, str], ...]]:
         async with self._operation_lock:
             users = await asyncio.to_thread(
-                lambda: self._prompt_refs(self._refresh_refs())
+                self._run_sync, lambda: self._prompt_refs(self._refresh_refs())
             )
         cursor: HistoryCursor | None = None
         while True:
             async with self._operation_lock:
                 rows, older, _newer = await asyncio.to_thread(
-                    self._prompt_page_from_refs, users, cursor, "older"
+                    self._run_sync,
+                    self._prompt_page_from_refs,
+                    users,
+                    cursor,
+                    "older",
                 )
             if rows:
                 yield rows
@@ -311,7 +330,7 @@ class ChildLogHistorySource:
     ) -> str | None:
         async with self._operation_lock:
             return await asyncio.to_thread(
-                self._adjacent_user_sync, entry_id, direction
+                self._run_sync, self._adjacent_user_sync, entry_id, direction
             )
 
     def _search_sync(
@@ -346,7 +365,9 @@ class ChildLogHistorySource:
         cancel = threading.Event()
         async with self._operation_lock:
             worker = asyncio.create_task(
-                asyncio.to_thread(self._search_sync, query, limit, cancel)
+                asyncio.to_thread(
+                    self._run_sync, self._search_sync, query, limit, cancel
+                )
             )
             try:
                 return await asyncio.shield(worker)
