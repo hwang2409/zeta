@@ -2696,6 +2696,80 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
 
 
 @pytest.mark.asyncio
+async def test_cancel_child_admits_grandchild_abort_before_any_await(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: cancelling a child must stop its background grandchild before
+    # the grandchild's settled approval lets it dispatch one more provider turn.
+    # The abort used to be admitted only inside the asynchronous cancellation
+    # confirmation (after a durable store write). The server settles the
+    # grandchild's pending approval on a separate path, so under load the
+    # grandchild resumed and dispatched a second turn before that confirmation
+    # ran. cancel() must now admit the grandchild's abort synchronously, before
+    # any await, so the grandchild's abort check always wins that race and the
+    # grandchild never dispatches a second turn.
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = NestedDelegatedApprovalBackend(target)
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _ready(server)
+    assert server.runtime.loop is not None
+    owner = server.runtime.loop._background_owner
+
+    # test-contract: seam no public hook exposes the grandchild's loop object.
+    grandchild_loops: list[AgentLoop] = []
+    original_run_turn_impl = AgentLoop._run_turn_impl
+
+    def capture_grandchild_loop(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if self.agent_depth == 2 and self not in grandchild_loops:
+            grandchild_loops.append(self)
+        return original_run_turn_impl(self, *args, **kwargs)
+
+    monkeypatch.setattr(AgentLoop, "_run_turn_impl", capture_grandchild_loop)
+
+    child_watcher: asyncio.Task[object] | None = None
+    try:
+        await _request(reader, writer, 3, "send", {"text": "delegate"})
+        approval = await _event(reader, "approval_request")
+        grandchild_id = approval["agent_instance_id"]
+        child_id = grandchild_id.rsplit(":", 1)[0]
+        child_watcher = owner._watchers[child_id]
+        grandchild_watcher = owner._watchers[grandchild_id]
+        assert len(grandchild_loops) == 1
+        grandchild_loop = grandchild_loops[0]
+
+        # cancel() returns synchronously; no await runs between it and the
+        # assert, so the confirmation task has not run yet. The abort must
+        # already be admitted on the grandchild's loop.
+        assert owner.cancel(child_id)
+        assert grandchild_loop._abort_admitted
+
+        # The admitted abort must keep the grandchild to a single turn once its
+        # settled approval lets its loop resume.
+        await await_or_fail(
+            asyncio.gather(grandchild_watcher, return_exceptions=True),
+            timeout=TIMEOUT,
+            what="grandchild watcher cleanup",
+        )
+        assert len(backend.grandchild.calls) == 1
+    finally:
+        if child_watcher is not None and not child_watcher.done():
+            child_watcher.cancel()
+            await await_or_fail(
+                asyncio.gather(child_watcher, return_exceptions=True),
+                timeout=TIMEOUT,
+                what="child watcher cleanup",
+            )
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_closed(
     tmp_path: Path,
 ) -> None:
