@@ -13,6 +13,7 @@ from rich.text import Text
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _event, _request
+from zeta.cli import main as cli_main_module
 from zeta.core.session import SessionManager
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.protocol.types import (
@@ -382,3 +383,86 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
         if owner_state == "mid-preview":
             await asyncio.to_thread(_seed_preview, home)
             assert (home / "retention-state.json").is_file()
+
+
+@pytest.mark.parametrize("owner_state", ("idle", "mid-preview", "crashed"))
+def test_cli_session_list_and_rename_survive_retention_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    owner_state: str,
+) -> None:
+    home = tmp_path / "home"
+    sid = _seed_matrix_session(home, tmp_path, "rename")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    holder = command = None
+    try:
+        if owner_state != "idle":
+            holder, command = _start_retention_holder(
+                home, sid, crashed=owner_state == "crashed"
+            )
+        assert cli_main_module.main(["session", "list"]) == 0
+        listed = capsys.readouterr().out
+        assert sid[:8] in listed
+        assert cli_main_module.main(["session", "rename", sid, "from-cli"]) == 0
+        assert f"renamed {sid}" in capsys.readouterr().out
+        assert SessionManager(home).read_metadata(sid).name == "from-cli"
+        if owner_state == "mid-preview":
+            assert holder is not None and not holder.is_alive()
+    finally:
+        if holder is not None and holder.is_alive():
+            command.send(True)
+            holder.join(10)
+        if holder is not None:
+            assert holder.exitcode == 0
+
+
+@pytest.mark.parametrize("owner_state", ("idle", "mid-preview", "crashed"))
+def test_tui_resume_entry_survives_retention_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_state: str,
+) -> None:
+    home = tmp_path / "home"
+    sid = _seed_matrix_session(home, tmp_path, "resume")
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    holder = command = None
+    seen: list[str] = []
+
+    class _App:
+        new_session_requested = False
+        ephemeral_root = None
+
+        def __init__(self, opened: object) -> None:
+            self.loop = type("Loop", (), {})()
+            self.loop.store = opened.store
+            self._draft = type("Draft", (), {"pending_text": ""})()
+            self._pending_attachments = []
+
+    app: _App | None = None
+
+    def create_app(*_args: object) -> _App:
+        nonlocal app
+        app = _App(SessionManager(home).open(sid))
+        return app
+
+    async def run_tui(current: object, _args: object) -> tuple[bool, bool]:
+        seen.append(current.loop.store.session_id)
+        current.loop.store.close()
+        return False, False
+
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", create_app)
+    monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
+    try:
+        if owner_state != "idle":
+            holder, command = _start_retention_holder(
+                home, sid, crashed=owner_state == "crashed"
+            )
+        assert cli_main_module.main(["--resume", sid]) == 0
+        assert seen == [sid]
+        if owner_state == "mid-preview":
+            assert holder is not None and not holder.is_alive()
+    finally:
+        if app is not None and not app.loop.store._closed:
+            app.loop.store.close()
+        if holder is not None and holder.is_alive():
+            command.send(True)
+            holder.join(10)
+        if holder is not None:
+            assert holder.exitcode == 0

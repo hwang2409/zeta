@@ -1084,6 +1084,30 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def blocking_session_locks_leave_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[None, None, None]:
+    """Make every test catch direct blocking session access on an event loop."""
+    from zeta.core import session_files
+
+    original = session_files.require_off_loop_lock
+
+    def guard(kind: str, error=RuntimeError) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            original(kind, error)
+            return
+        raise error(
+            f"{kind} lock requested on an asyncio event-loop thread; "
+            "use asyncio.to_thread"
+        )
+
+    monkeypatch.setattr(session_files, "require_off_loop_lock", guard)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def approval_settlement_tasks_do_not_leak(
     monkeypatch: pytest.MonkeyPatch,
 ):

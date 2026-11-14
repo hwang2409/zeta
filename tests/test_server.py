@@ -6587,7 +6587,9 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
         # Resume the ORIGINAL session — its stored metadata still has
         # `approval_mode: null` on disk (we never called `set_settings`).
         # The resume response must surface the effective policy anyway.
-        stored = SessionManager(tmp_path).read_metadata(sid_a)
+        stored = await asyncio.to_thread(
+            SessionManager(tmp_path).read_metadata, sid_a
+        )
         assert stored.approval_mode is None
         resumed = (await _request(reader, writer, 5, "resume", {"session_id": sid_a}))[
             -1
@@ -6601,7 +6603,10 @@ async def test_new_session_resume_and_status_report_effective_yolo_mode(tmp_path
         assert status_final["session"]["approval_mode"] == "allow"
         # And the disk metadata is UNCHANGED — the projection is a
         # read-side transform, not a write-through.
-        assert SessionManager(tmp_path).read_metadata(sid_a).approval_mode is None
+        persisted = await asyncio.to_thread(
+            SessionManager(tmp_path).read_metadata, sid_a
+        )
+        assert persisted.approval_mode is None
     finally:
         await close_serve(server, writer)
 
