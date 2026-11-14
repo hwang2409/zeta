@@ -292,8 +292,8 @@ class _FullLoadValidator:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
         approvals = _ApprovalValidationOverlay()
-        for entry in self.state._resident_rows.stream_validated_entries(
-            reversed(branch)
+        for entry in self.state._resident_rows.stream_loaded_entries(
+            reversed(branch), self.source.fd
         ):
             try:
                 self.state._apply_to_working_fold(entry, approvals)

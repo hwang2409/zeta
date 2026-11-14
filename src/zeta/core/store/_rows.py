@@ -805,6 +805,13 @@ class ResidentRows:
             if fd is not None:
                 os.close(fd)
 
+    def stream_loaded_entries(
+        self, refs: Iterable[RowRef], fd: int
+    ) -> Iterator[ConversationEntry]:
+        """Read loaded rows from the descriptor that supplied their references."""
+        for ref in refs:
+            yield self.payloads.get(ref.seq) or self._decode(fd, ref)
+
     def stream_validated_entries(
         self, refs: Iterable[RowRef]
     ) -> Iterator[ConversationEntry]:
