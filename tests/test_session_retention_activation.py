@@ -103,8 +103,11 @@ async def test_two_owners_append_without_lost_rows(tmp_path: Path) -> None:
     try:
         first = make_retention_owner(home, lease, lambda: 30)
         second = make_retention_owner(home, lease, lambda: 30)
-        results = await asyncio.gather(
-            asyncio.to_thread(first._run_episode), asyncio.to_thread(second._run_episode)
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                asyncio.to_thread(first._run_episode), asyncio.to_thread(second._run_episode)
+            ),
+            10,
         )
         assert all(failure is None for _projections, failure in results), results
         rows = (home / "retention-history.jsonl").read_text().splitlines()
@@ -112,4 +115,36 @@ async def test_two_owners_append_without_lost_rows(tmp_path: Path) -> None:
         await first.stop()
         await second.stop()
     finally:
+        await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_owner_cancel_mid_episode_releases_lease(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    entered = threading.Event()
+    release = threading.Event()
+    original = RetentionPlanner.run_pass
+
+    def blocked(planner, *, days):
+        entered.set()
+        assert release.wait(10)
+        return original(planner, days=days)
+
+    monkeypatch.setattr(RetentionPlanner, "run_pass", blocked)
+    owner = make_retention_owner(home, lease, lambda: 30)
+    try:
+        owner.start()
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
+        stopping = asyncio.create_task(owner.stop())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(stopping, 10)
+        replacement = await asyncio.to_thread(open_writer, home)
+        replacement.close()
+    finally:
+        release.set()
         await asyncio.to_thread(lease.close)

@@ -277,6 +277,7 @@ def retention_authority(
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
                     unlink_session_file(home_fd, _ARM_FILENAME)
+                    unlink_session_file(home_fd, _STATE_FILENAME)
                 finally:
                     os.close(home_fd)
             projection = retention_result(timestamp=now(), mode="disarmed", days=0)

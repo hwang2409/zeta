@@ -10,7 +10,7 @@ from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _request
 from tests.test_session_retention_surfaces import _hello
 from zeta.server import ZetaServer
-from zeta.session_retention import RetentionPlanner
+from zeta.session_retention import RetentionPlanner, retention_authority
 from zeta.storage_format import open_writer
 
 
@@ -59,3 +59,35 @@ async def test_public_authority_table(tmp_path: Path, epoch: int, writes: bool) 
     else:
         assert not arm.exists()
         assert not history.exists()
+
+@pytest.mark.asyncio
+async def test_authority_zero_to_thirty_requires_fresh_preview(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+
+    def cycle() -> tuple[bool, bool, bool]:
+        lease = open_writer(home)
+        try:
+            planner = RetentionPlanner(home, lease)
+            try:
+                assert planner.run_pass(days=30).complete
+            finally:
+                planner.close()
+            assert retention_authority(home, lease, days=30).applied
+            assert retention_authority(home, lease, days=0).applied
+            stale = retention_authority(home, lease, days=30).applied
+            planner = RetentionPlanner(home, lease)
+            try:
+                fresh = planner.run_pass(days=30).complete
+            finally:
+                planner.close()
+            reapplied = retention_authority(home, lease, days=30).applied
+            return stale, fresh, reapplied
+        finally:
+            lease.close()
+
+    stale, fresh, reapplied = await asyncio.to_thread(cycle)
+    assert not stale
+    assert fresh
+    assert reapplied
