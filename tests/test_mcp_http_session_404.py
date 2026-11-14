@@ -143,13 +143,36 @@ async def test_http_404_retries_tool_call_once(client, restarting_mcp):
 
 
 @pytest.mark.asyncio
-async def test_http_404_concurrent_requests_share_reinitialize(client, restarting_mcp):
+async def test_http_404_concurrent_requests_share_reinitialize(
+    client, restarting_mcp, monkeypatch
+):
     await client.list_tools()
     restarting_mcp.restart()
+    restarting_mcp.block_next_initialize()
 
+    first = asyncio.create_task(client.list_tools())
     await await_or_fail(
-        asyncio.gather(client.list_tools(), client.list_tools()),
-        what="concurrent list requests",
+        restarting_mcp.initialize_started.wait(), what="recovery initialize start"
+    )
+
+    second_entered = asyncio.Event()
+    original = client._send_with_auth
+
+    async def observe_send(payload, request_id, state, **kwargs):
+        if payload["method"] == "tools/list":
+            second_entered.set()
+        return await original(payload, request_id, state, **kwargs)
+
+    monkeypatch.setattr(client, "_send_with_auth", observe_send)
+    second = asyncio.create_task(client.list_tools())
+    await await_or_fail(second_entered.wait(), what="second list request start")
+
+    assert not second.done()
+    assert sum(method == "initialize" for method, _session in restarting_mcp.requests) == 2
+
+    restarting_mcp.release_initialize.set()
+    await await_or_fail(
+        asyncio.gather(first, second), what="concurrent list requests"
     )
 
     assert sum(method == "initialize" for method, _session in restarting_mcp.requests) == 2
