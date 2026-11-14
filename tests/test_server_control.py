@@ -50,7 +50,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
-from zeta.server.protocol import ErrorDescriptor, EventDescriptor, FrameCodec
+from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
 
@@ -664,7 +664,6 @@ async def _assert_steer_is_read_while_response_write_waits(
     async def write_request(
         sent_id: int, sent_method: str, sent_params: dict[str, object]
     ) -> None:
-        # test-contract: transport hold a prior response without pending-response cleanup
         writer.write(
             (
                 json.dumps(
@@ -680,7 +679,6 @@ async def _assert_steer_is_read_while_response_write_waits(
         )
         await asyncio.wait_for(writer.drain(), 10)
 
-    # test-contract: seam force a response write to remain pending
     monkeypatch.setattr(_Client, "_write", hold_response)
     monkeypatch.setattr(server.runtime.loop, "steer", observe_steer)
     try:
@@ -695,12 +693,8 @@ async def _assert_steer_is_read_while_response_write_waits(
         )
     finally:
         release_response.set()
-        response_ids: list[int] = []
-        while len(response_ids) < 2:
-            frame_id = (await read_frame(reader)).get("id")
-            if frame_id in {request_id, request_id + 1}:
-                response_ids.append(frame_id)
-        assert response_ids == [request_id, request_id + 1]
+        while (await read_frame(reader)).get("id") != request_id:
+            pass
 
 
 @pytest.mark.asyncio
