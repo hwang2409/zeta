@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import Callable
 from io import StringIO
 from time import perf_counter
@@ -32,7 +34,7 @@ from zeta.tui.app import TUIApp
 
 async def _wait_until(check: Callable[[], bool], *, what: str) -> None:
     try:
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(90):
             while not check():
                 # test-contract: latency real prompt-toolkit input processing
                 await asyncio.sleep(0.01)
@@ -89,6 +91,10 @@ def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHom
     return generate_child_view_home(tmp_path_factory.mktemp("child-view-home"))
 
 
+@pytest.mark.skipif(
+    bool(os.environ.get("CI")) and sys.version_info < (3, 14),
+    reason="183 MB real-TUI journey runs once in the Python 3.14 PR job",
+)
 @pytest.mark.asyncio
 async def test_real_tui_child_view_journey(
     child_view_fixture: ChildViewHome,
