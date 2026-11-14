@@ -560,11 +560,20 @@ class SlashStatusSnapshot:
     base: SlashStatus
     transcript_entries: tuple[ConversationEntry, ...] | TranscriptRows
     token_counter: Callable[[Message], int]
+    status_projection: tuple[int, int, tuple[CompactionSummary, ...]] | None = None
 
 
 def build_slash_status(snapshot: SlashStatusSnapshot) -> SlashStatus:
     """Finish the shared projection, including transcript-sized work."""
 
+    if snapshot.status_projection is not None:
+        marker_count, checkpoint_count, history = snapshot.status_projection
+        return replace(
+            snapshot.base,
+            compaction_marker_count=marker_count,
+            checkpoint_count=checkpoint_count,
+            compaction_history=history,
+        )
     source = snapshot.transcript_entries
     rows = source.read() if isinstance(source, TranscriptRows) else source
     entries = copy.deepcopy(active_branch(rows))

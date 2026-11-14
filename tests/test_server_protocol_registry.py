@@ -1121,6 +1121,12 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"session missing","data":{"code":"session_not_found","session_id":"s1"}}}\n',
     ),
     (
+        ErrorDescriptor.MCP_TOOL_REFRESH_FAILED,
+        "MCP tool refresh failed",
+        {"session_id": "s1", "server": "page", "reason": "request failed"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"MCP tool refresh failed","data":{"code":"mcp_tool_refresh_failed","session_id":"s1","server":"page","reason":"request failed"}}}\n',
+    ),
+    (
         ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
         "transcript repair needs the stored-format upgrade (home epoch 2, needs 4)",
         {"home_epoch": 2, "required_epoch": 4},

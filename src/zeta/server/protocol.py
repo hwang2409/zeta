@@ -147,6 +147,11 @@ class ErrorDescriptor(Enum):
         "session_mismatch",
         "the requested session is not the attached session",
     )
+    MCP_TOOL_REFRESH_FAILED = (
+        -32005,
+        "mcp_tool_refresh_failed",
+        "an MCP tools/list refresh failed",
+    )
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -274,6 +279,7 @@ FEATURES = (
     "zeta_updated",
     "approval_restart_reason",
     "session_retention",
+    "mcp_refresh_tools",
 )
 
 
@@ -368,6 +374,12 @@ class MethodDescriptor(Enum):
     )
     CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.READ)
     CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
+    MCP_REFRESH_TOOLS = (
+        "mcp_refresh_tools",
+        None,
+        "mcp_refresh_tools",
+        Access.SESSION_MUTATION,
+    )
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access

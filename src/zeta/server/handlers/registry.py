@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ...mcp import MCPManagementError, MCPToolRefreshError
 from .. import abort_scope, accounts, model_selection, slash_commands
 from .. import control as session_grants
 from ..protocol import (
@@ -382,6 +383,34 @@ async def child_run_send(client, request_id, params):
     return await child_runs.send(client, params)
 
 
+async def mcp_refresh_tools(client, request_id, params):
+    runtime = client.server.runtime
+    validation.active(runtime, params)
+    if set(params) - {"session_id", "server"}:
+        raise ProtocolError(
+            ErrorDescriptor.INVALID_PARAMS,
+            "mcp_refresh_tools accepts only session_id and optional server",
+        )
+    server = validation.optional_string(params, "server")
+    try:
+        servers = await runtime.loop.refresh_mcp_tools(server)
+    except ValueError as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
+    except (MCPManagementError, MCPToolRefreshError) as exc:
+        data: dict[str, object] = {
+            "session_id": runtime.session_id,
+            "reason": str(exc),
+        }
+        if server is not None:
+            data["server"] = server
+        raise ProtocolError(
+            ErrorDescriptor.MCP_TOOL_REFRESH_FAILED,
+            "MCP tool refresh failed",
+            data,
+        ) from exc
+    return {"session_id": runtime.session_id, "servers": list(servers)}
+
+
 HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.LIST_SESSIONS: list_sessions,
     MethodDescriptor.NEW_SESSION: new_session,
@@ -433,6 +462,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.BACKGROUND_TASK_CANCEL: cancel_background_task,
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
+    MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")

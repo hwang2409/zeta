@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import time
 
+from ...protocol.types import Message
 from ...storage_format import (
     # the stored-format registry owns the reasons a resolution may carry
     APPROVAL_RESOLUTION_REASONS,
@@ -210,10 +211,14 @@ class IncrementalValidationMixin:
         # integrity state is deliberately rebuilt by the complete validator.
         if previous_ref is not None and entry.parent_id != previous_ref.id:
             return False
-        self._validate_entry_payload(entry)
+        validated_payload = self._validate_entry_payload(entry)
         if entry.type == "fork":
             self._validate_fork_entry(entry)
-        self._apply_to_working_fold(entry, approvals)
+        self._apply_to_working_fold(
+            entry,
+            approvals,
+            validated_payload if isinstance(validated_payload, Message) else None,
+        )
         self._resident_rows.append(entry)
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
@@ -246,6 +251,7 @@ class IncrementalValidationMixin:
         self,
         entry: ConversationEntry,
         approvals: _ApprovalValidationOverlay | None = None,
+        message: Message | None = None,
     ) -> None:
         """Apply one active-branch entry in place to the current working fold.
 
@@ -254,4 +260,7 @@ class IncrementalValidationMixin:
         incremental tail); this writes into that fold in place. It must never run
         against an installed fold, which is immutable.
         """
-        self._delivery_fold.apply(entry, approvals)
+        if message is None:
+            self._delivery_fold.apply(entry, approvals)
+        else:
+            self._delivery_fold.apply_validated(entry, approvals, message)
