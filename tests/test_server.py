@@ -2384,8 +2384,10 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
             for message in branch_messages(server.runtime.opened.store)
             for block in message.content
         )
-        child_store = ConversationStore(
-            server.runtime.opened.store.session_dir / "agents", session_id="1"
+        child_store = await asyncio.to_thread(
+            ConversationStore,
+            server.runtime.opened.store.session_dir / "agents",
+            session_id="1",
         )
         try:
             assert any(
@@ -2394,7 +2396,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
                 for block in message.content
             )
         finally:
-            child_store.close()
+            await asyncio.to_thread(child_store.close)
     finally:
         await close_serve(server, writer)
 
@@ -3616,7 +3618,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    child_store = ConversationStore(tmp_path / "delegated-child")
+    child_store = await asyncio.to_thread(ConversationStore, tmp_path / "delegated-child")
     child_task: asyncio.Task[None] | None = None
     try:
         await _request(
@@ -3636,7 +3638,8 @@ async def test_foreground_abort_only_ends_foreground_approval(
             delegated_call,
             child_instance_id="background-child",
         )
-        child_store.append_message_with_approval_requests(
+        await asyncio.to_thread(
+            child_store.append_message_with_approval_requests,
             Message(MessageRole.ASSISTANT, [ToolUseContent(delegated_call)]),
             [(delegated_call.id, delegated_call)],
         )
@@ -3663,7 +3666,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         assert not child_task.done()
     finally:
         await close_serve(server, writer)
-        child_store.close()
+        await asyncio.to_thread(child_store.close)
 
 
 @pytest.mark.asyncio
@@ -4559,6 +4562,7 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
     await _event(reader, "assistant_delta")
     writer.close()
     await writer.wait_closed()
+    # test-contract: latency < the detached turn must commit before reopening
     await asyncio.sleep(0.1)
     reopened = await asyncio.to_thread(server.runtime.manager.open, session_id)
     try:
@@ -8470,7 +8474,9 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-        assert SessionManager(tmp_path).read_metadata(sid).name == "Project notes"
+        assert (
+            await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+        ).name == "Project notes"
         for invalid in (None, 42, [], "x" * 61):
             result = (
                 await _request(
@@ -8558,7 +8564,9 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
         expected["system_prompt"] = expected["system_prompt"][:512]
         assert row == expected
         assert (
-            SessionManager(tmp_path).read_metadata(sid).name == "private display name"
+            (
+                await asyncio.to_thread(SessionManager(tmp_path).read_metadata, sid)
+            ).name == "private display name"
         )
     finally:
         await close_serve(server, writer)
@@ -9193,8 +9201,10 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert registry is not None
         project_record = await asyncio.to_thread(registry.create_project, "serve attention", "test")
         project_id = project_record.project_id
-        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
-        decision = store.request(
+        store = await asyncio.to_thread(
+            AttentionStore, opened.store.session_dir, writer_epoch=5
+        )
+        decision = await asyncio.to_thread(store.request,
             session_id=session_id,
             project_id=project_id,
             entry_id=None,
@@ -9202,7 +9212,7 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
             title="choose",
             why="choose one",
         )
-        answer = store.request(
+        answer = await asyncio.to_thread(store.request,
             session_id=session_id,
             project_id=project_id,
             entry_id=None,
@@ -9242,8 +9252,9 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
             )
         )[-1]["result"]
         assert dismissed["kind"] == "output"
-        assert store.get(answer.id).status == "resolved"
-        assert store.get(answer.id).decision is None
+        answer_record = await asyncio.to_thread(store.get, answer.id)
+        assert answer_record.status == "resolved"
+        assert answer_record.decision is None
         inbox = ProjectInbox(registry, sessions_root=tmp_path / "home" / "sessions")
         assert (
             await asyncio.to_thread(inbox.new_ids, project_id, session_id=session_id)
@@ -9265,7 +9276,7 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
         assert "error" in refused
         assert "require a reply" in refused["error"]["message"]
 
-        reply = store.request(
+        reply = await asyncio.to_thread(store.request,
             session_id=session_id,
             project_id=project_id,
             entry_id=None,
@@ -12165,14 +12176,16 @@ async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None
     reader, writer, session_id = await _ready_extensions(server)
     assert server.runtime.opened is not None
     root = server.runtime.opened.store
-    child = ConversationStore(root.session_dir / "agents", session_id="1")
-    child.append_message(
+    child = await asyncio.to_thread(
+        ConversationStore, root.session_dir / "agents", session_id="1"
+    )
+    await asyncio.to_thread(child.append_message,
         with_message_origin(
             Message(MessageRole.USER, [TextContent("retained")]),
             MessageOrigin.USER,
         )
     )
-    child.close()
+    await asyncio.to_thread(child.close)
     transcript = root.session_dir / "agents" / "1" / "conversation.jsonl"
     transcript.write_bytes(transcript.read_bytes() + b"{not json}\n")
     try:
@@ -12192,9 +12205,11 @@ async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None
         assert repaired["child_run_id"] == f"{session_id}:1"
         assert repaired["memory_review_required"] is False
 
-        reopened = ConversationStore(root.session_dir / "agents", session_id="1")
+        reopened = await asyncio.to_thread(
+            ConversationStore, root.session_dir / "agents", session_id="1"
+        )
         try:
-            reopened.append_message(
+            await asyncio.to_thread(reopened.append_message,
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent("usable")]),
                     MessageOrigin.USER,
@@ -12205,7 +12220,7 @@ async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None
                 "usable",
             ]
         finally:
-            reopened.close()
+            await asyncio.to_thread(reopened.close)
         assert len(root.agent_notifications()) == 1
     finally:
         await close_serve(server, writer)
