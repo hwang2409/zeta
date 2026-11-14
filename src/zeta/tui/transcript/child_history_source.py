@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,7 +18,9 @@ from ...protocol.types import (
     MessageOrigin,
     MessageRole,
     ToolUseContent,
+    is_passive_harness_message,
 )
+from ..cards.agent_sync import bounded_transcript_message
 from ..user import displayed_user_text
 from .paged_history import (
     HistoryCursor,
@@ -91,7 +94,9 @@ class ChildLogHistorySource:
             if ref.type != "message":
                 continue
             entry = self._store.entry(ref)
-            candidate = Message.from_dict(entry.data["message"])
+            candidate = Message.from_dict(
+                bounded_transcript_message(entry.data["message"])
+            )
             if any(
                 isinstance(block, ToolUseContent)
                 and block.tool_call.id == result.tool_call_id
@@ -107,7 +112,12 @@ class ChildLogHistorySource:
         entry = self._store.entry(ref)
         projected: list[tuple[str, Any]] = []
         if entry.type == "message":
-            message = Message.from_dict(entry.data["message"])
+            raw_message = entry.data["message"]
+            if is_passive_harness_message(raw_message):
+                return [], 0
+            bounded = bounded_transcript_message(raw_message)
+            entry = replace(entry, data={**entry.data, "message": bounded})
+            message = Message.from_dict(bounded)
             dependency = self._dependency(refs, position, message)
             if dependency is not None:
                 projected.append((f"{dependency.id}:dependency:{entry.id}", dependency))
@@ -219,7 +229,10 @@ class ChildLogHistorySource:
         size = scanned = 0
         scan = reversed(selected) if direction == "older" else iter(selected)
         for ref in scan:
-            message = Message.from_dict(self._store.entry(ref).data["message"])
+            raw_message = self._store.entry(ref).data["message"]
+            if is_passive_harness_message(raw_message):
+                continue
+            message = Message.from_dict(bounded_transcript_message(raw_message))
             scanned += 1
             if message.metadata.get(MESSAGE_ORIGIN_METADATA) != MessageOrigin.USER:
                 continue
@@ -310,6 +323,17 @@ class ChildLogHistorySource:
         for entry in self._store.stream_rows(reversed(refs), batch=256):
             if cancel.is_set():
                 break
+            raw_message = entry.data.get("message")
+            if isinstance(raw_message, dict):
+                if is_passive_harness_message(raw_message):
+                    continue
+                entry = replace(
+                    entry,
+                    data={
+                        **entry.data,
+                        "message": bounded_transcript_message(raw_message),
+                    },
+                )
             if needle in str(_project_entry(entry)).casefold():
                 matches.append(HistorySearchResult(entry.id))
                 if len(matches) == limit:

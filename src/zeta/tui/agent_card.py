@@ -571,7 +571,11 @@ class AgentTranscriptControl(UIControl):
         from .transcript.child_history_source import ChildLogHistorySource
         from .transcript.paged_history import PagedTranscriptHistory
 
-        source = await asyncio.to_thread(ChildLogHistorySource, path)
+        try:
+            source = await asyncio.to_thread(ChildLogHistorySource, path)
+        except (ConversationIntegrityError, OSError, SessionError, ValueError):
+            self._pending_path = None
+            return False
         previous = self._source
         if previous is not None:
             await previous.close()
@@ -581,7 +585,12 @@ class AgentTranscriptControl(UIControl):
             self._history_pager.source = source
         self.set_source(path, source)
         self._history_pager.reset()
-        page = await self._history_pager.load()
+        try:
+            page = await self._history_pager.load()
+        except (ConversationIntegrityError, OSError, SessionError, ValueError):
+            await source.close()
+            self._source = None
+            return False
         self.render_pages(self._history_pager.pages)
         return bool(page.units)
 

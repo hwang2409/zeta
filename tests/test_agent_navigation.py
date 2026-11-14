@@ -1676,9 +1676,9 @@ def test_child_replay_bounds_thoughts_and_text_before_rendering(tmp_path: Path) 
     rendered_lines = navigation.transcript_control.transcript.lines(120)
     rendered = "\n".join(rendered_lines)
 
-    assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+    assert len(rendered_lines) <= MAX_AGENT_VIEW_LINES
     assert "thought 0" in rendered
-    assert "thought 399" in rendered
+    assert "thought 399" not in rendered
     assert long_text not in rendered
     assert "x" * 2_001 not in rendered
     assert rendered.count("x") <= 2_000
@@ -1966,22 +1966,6 @@ def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: P
     assert lines[0] == "[older lines omitted]"
 
 
-@pytest.mark.asyncio
-async def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Complete")
-    _append_child_lines(
-        child, (f"line {index}" for index in range(MAX_AGENT_VIEW_LINES + 20))
-    )
-
-    control = agent_card.AgentTranscriptControl()
-    await control.load(child)
-    lines = control.transcript.lines(120)
-
-    assert control.transcript._max_lines is None
-    assert any("line 0" in line for line in lines)
-    assert any(f"line {MAX_AGENT_VIEW_LINES + 19}" in line for line in lines)
-    assert not any("older lines omitted" in line for line in lines)
 
 
 def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
@@ -2302,22 +2286,6 @@ def _wheel(event_type: MouseEventType) -> MouseEvent:
     )
 
 
-def test_subagent_view_can_scroll_to_first_message_while_running(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Running")
-    for index in range(300):
-        _append_child_line(child, f"line {index}")
-    navigation = AgentNavigation(store)
-    navigation.open_selected()
-    control = navigation.transcript_control
-    control.create_content(80, 10)
-
-    for _ in range(300):
-        control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
-    visible = _visible_text(control.create_content(80, 10))
-
-    assert "line 0" in visible
-    assert not control.transcript.follow_tail
 
 
 def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:

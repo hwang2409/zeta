@@ -279,6 +279,7 @@ class TUIApp(
         self._history_view_task: asyncio.Task[None] | None = None
         self._history_view_tasks: set[asyncio.Task[None]] = set()
         self._history_view_generation = 0
+        self._history_view_path = self.loop.store.session_dir
         self._history_search_results: tuple[Any, ...] = ()
         self._history_search_index = 0
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
@@ -361,9 +362,7 @@ class TUIApp(
         self._mcp_manager = MCPManager(self.loop._mcp_management)
         self._status_restore_text = ""
         self._status_restore_cursor = 0
-        self._agent_navigation = AgentNavigation(
-            self.loop.store, self._history_pager
-        )
+        self._agent_navigation = AgentNavigation(self.loop.store)
         self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_load = (
@@ -645,6 +644,10 @@ class TUIApp(
     def _viewed_transcript(self) -> TranscriptWidget:
         return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
+        path = self._viewed_session_path()
+        if path == self._history_view_path:
+            return
+        self._history_view_path = path
         self._prompt_history.reset_navigation()
         finder = self._active_finder
         if finder.finder_active:
@@ -652,16 +655,27 @@ class TUIApp(
         else:
             self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
-        self._request_history_view(self._viewed_session_path())
+        self._request_history_view(path)
 
     def _request_history_view(self, path: Path) -> None:
         if path != self._viewed_session_path():
+            return
+        if (
+            path == self.loop.store.session_dir
+            and self._history_pager.source is self._history_source
+        ):
             return
         self._history_view_generation += 1
         generation = self._history_view_generation
         if self._history_view_task is not None:
             self._history_view_task.cancel()
-        self._history_view_task = asyncio.create_task(
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._activate_history_view(path, generation))
+            self._history_view_task = None
+            return
+        self._history_view_task = loop.create_task(
             self._activate_history_view(path, generation)
         )
         self._history_view_tasks.add(self._history_view_task)
@@ -887,6 +901,23 @@ class TUIApp(
         tasks = tuple(self._history_marker_tasks)
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def _close_history_pager(self) -> None:
+        transcript = self._viewed_transcript()
+        self._closed_history_snapshot = (
+            (transcript, transcript.units)
+            if self._terminal_restored
+            else None
+        )
+        await self._history_pager.close()
+
+    def _restore_closed_history(self) -> None:
+        snapshot = getattr(self, "_closed_history_snapshot", None)
+        if snapshot is not None:
+            transcript, units = snapshot
+            transcript.clear()
+            transcript.adopt_units(units)
+        self._closed_history_snapshot = None
 
     def _publish_prompt_history_snapshot(
         self, snapshot: tuple[str, ...], buffer: Any | None = None

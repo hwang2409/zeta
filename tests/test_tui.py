@@ -12592,12 +12592,12 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
         navigation.selected_index = 1
         navigation.open_selected()
         assert app._history_view_task is not None
-        await app._history_view_task
+        await await_or_fail(app._history_view_task, what="focused child load")
         navigation.exit_navigation()
         assert app._history_view_task is not None
-        await app._history_view_task
+        await await_or_fail(app._history_view_task, what="root history restore")
 
-    await app.close()
+    await asyncio.wait_for(app.close(), 10)
 
     assert navigation.transcript_control._closed
     assert navigation.transcript_control._source is None
@@ -12810,9 +12810,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(lambda: session.default_buffer.text == "draftjjj")
 
         session.app.exit()
-        await task
+        await await_or_fail(task, what="recursive navigation prompt")
 
-    await navigation.close()
+    await asyncio.wait_for(navigation.close(), 10)
     assert navigation.transcript_control._source is None
     grandchild.close()
     child.close()
@@ -16092,14 +16092,10 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                 for index, expected in enumerate(reversed(prompts)):
                     before = processed_keys
                     pipe.send_text("\x1b[A")
-                    if index == 0:
-                        await wait_until(
-                            lambda expected=expected: session.default_buffer.text == expected
-                        )
-                    else:
-                        await wait_until(
-                            lambda before=before: processed_keys > before
-                        )
+                    await wait_until(
+                        lambda expected=expected: session.default_buffer.text == expected
+                    )
+                    assert processed_keys > before
                     assert session.default_buffer.text == expected, (
                         f"Up did not select prompt {expected!r}"
                     )
