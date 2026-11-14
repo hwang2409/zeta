@@ -95,7 +95,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
         await server.start()
         try:
             store = dropped_for_gc(
-                manager.open(session_id).store, "the collector must finalize it"
+                (await asyncio.to_thread(manager.open, session_id)).store, "the collector must finalize it"
             )
             store._cycle = store  # only the collector can free it now
             del store
@@ -124,7 +124,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
 
             # a drain that raises is logged and the next tick retries
             again = dropped_for_gc(
-                manager.open(session_id).store, "the collector must finalize it"
+                (await asyncio.to_thread(manager.open, session_id)).store, "the collector must finalize it"
             )
             again._cycle = again
             del again

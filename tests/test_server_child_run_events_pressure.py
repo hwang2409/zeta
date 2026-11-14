@@ -73,7 +73,7 @@ async def _serve(
         await server.close()
 
 
-def _start_child(
+async def _start_child(
     server: ZetaServer,
     stores: list[ConversationStore],
     run_id: str,
@@ -90,7 +90,8 @@ def _start_child(
         f"task {run_id}",
         "2026-01-01T00:00:00+00:00",
     )
-    child = ConversationStore(
+    child = await asyncio.to_thread(
+        ConversationStore,
         parent.session_dir / "agents",
         session_id=run_id.rpartition(":")[2],
         _storage_lease=root._storage_lease,
@@ -176,7 +177,7 @@ async def test_live_child_store_lookup_uses_only_the_loop_projection(
 ) -> None:
     # the serve-loop store lookup is transport-independent, so run it once
     async with _serve(tmp_path, "unix") as (server, _client, session_id, stores):
-        child = _start_child(server, stores, f"{session_id}:1")
+        child = await _start_child(server, stores, f"{session_id}:1")
         await _lifecycle_applied(server)
 
         class RejectLock:
@@ -205,7 +206,7 @@ async def test_progress_between_snapshot_and_response_write_is_next_live_seq(
 ) -> None:
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
         run_id = f"{session_id}:1"
-        child = _start_child(server, stores, run_id)
+        child = await _start_child(server, stores, run_id)
         captured = _capture_baseline(server, monkeypatch)
         write_started, release_write = asyncio.Event(), asyncio.Event()
         original_write = _Client._write_physical
@@ -257,7 +258,7 @@ async def test_pending_progress_from_63_busy_children_converges_to_one_baseline(
 ) -> None:
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
         children = [
-            _start_child(server, stores, f"{session_id}:{index}")
+            await _start_child(server, stores, f"{session_id}:{index}")
             for index in range(1, BUSY_CHILDREN + 1)
         ]
         await _lifecycle_applied(server)
@@ -306,8 +307,8 @@ async def test_64_small_frames_join_and_65th_is_stale_while_child_scope_stays_ga
 ) -> None:
     assert REPLAY_SCOPE_MAX_RECORDS == SCOPE_RECORDS
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
-        parent = _start_child(server, stores, f"{session_id}:1")
-        nested = _start_child(server, stores, f"{session_id}:1:1", parent)
+        parent = await _start_child(server, stores, f"{session_id}:1")
+        nested = await _start_child(server, stores, f"{session_id}:1:1", parent)
         observer = await connect_replay(server, transport)
         try:
             await negotiate(
@@ -446,7 +447,7 @@ async def test_64_maximal_lifecycle_frames_fit_the_scope_byte_cap(
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
         assert server.connections is not None
         replay = server.connections.replay
-        _start_child(server, stores, f"{session_id}:1")
+        await _start_child(server, stores, f"{session_id}:1")
         scope = ReplayScopeId.child(f"{session_id}:1")
         joined = await client.request(
             3, "child_run_events", {"session_id": session_id, "run_id": f"{session_id}:1"}
@@ -513,7 +514,7 @@ async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
         replay = server.connections.replay
         runs = [f"{session_id}:1", f"{session_id}:2"]
         for run_id in runs:
-            _start_child(server, stores, run_id)
+            await _start_child(server, stores, run_id)
         await _lifecycle_applied(server)
         joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})
         stream_id = joined["result"]["replay"]["stream_id"]
@@ -588,13 +589,15 @@ async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
         older = [f"{session_id}:{n}" for n in (1, 2, 3)]
         newer = [f"{session_id}:{n}" for n in (4, 5, 6)]
         for run_id in older:
-            _start_child(server, stores, run_id)
+            await _start_child(server, stores, run_id)
         _push_older(root)
-        children = {run_id: _start_child(server, stores, run_id) for run_id in newer}
+        children = {}
+        for run_id in newer:
+            children[run_id] = await _start_child(server, stores, run_id)
         parent = children[newer[0]]
-        nested_old = _start_child(server, stores, f"{newer[0]}:1", parent)
+        nested_old = await _start_child(server, stores, f"{newer[0]}:1", parent)
         _push_older(parent)
-        nested_new = _start_child(server, stores, f"{newer[0]}:2", parent)
+        nested_new = await _start_child(server, stores, f"{newer[0]}:2", parent)
         nested_old.update_agent_lifecycle(current_step="older start, still running")
         await _lifecycle_applied(server)
 
@@ -687,8 +690,8 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
         assert first.connections is not None
         first_sink = first.connections.child_runs.sink
         root = first.runtime.opened.store
-        ended = _start_child(first, stores, f"{session_id}:1")
-        running = _start_child(first, stores, f"{session_id}:2")
+        ended = await _start_child(first, stores, f"{session_id}:1")
+        running = await _start_child(first, stores, f"{session_id}:2")
         running.update_agent_lifecycle(current_step="before restart")
         ended.finish_agent_lifecycle("completed", final_result="done")
         root.append_message(
@@ -723,7 +726,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
             )
             resumed = await client.request(2, "resume", {"session_id": session_id})
             assert "error" not in resumed, resumed
-            fresh = _start_child(second, restarted, f"{session_id}:3")
+            fresh = await _start_child(second, restarted, f"{session_id}:3")
             fresh.update_agent_lifecycle(current_step="after restart")
             await _lifecycle_applied(second)
             joined = await client.request(3, "session_history_and_subscribe", {"session_id": session_id})

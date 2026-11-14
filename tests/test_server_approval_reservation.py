@@ -429,7 +429,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_first: bool
 ) -> None:
     server, _reader, writer, _foreground = await _approval_server(tmp_path)
-    store = ConversationStore(tmp_path / "child")
+    store = await asyncio.to_thread(ConversationStore, tmp_path / "child")
     call = ToolCall("child-call", "read", {"path": "input"})
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
@@ -1733,7 +1733,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             await server.control._event(_start_event(call))
             request_id = call.id
         else:
-            child = ConversationStore(tmp_path / "matrix-child")
+            child = await asyncio.to_thread(ConversationStore, tmp_path / "matrix-child")
             call = ToolCall("matrix-child-call", "read", {"path": "input"})
             child.append_message_with_approval_requests(
                 Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),

@@ -844,7 +844,7 @@ def _count_event(messages: list[dict], event: str, run_id: str) -> int:
     )
 
 
-def _seed_nested(root: ConversationStore, session_id: str, number: str, *, lease=None):
+async def _seed_nested(root: ConversationStore, session_id: str, number: str, *, lease=None):
     """Durable state a child and its grandchild write when the grandchild spawns.
 
     Returns ``(child, grandchild, child_run_id, grandchild_run_id)``. The child
@@ -852,13 +852,13 @@ def _seed_nested(root: ConversationStore, session_id: str, number: str, *, lease
     ``lease`` ties the stores to a live serve's storage lease.
     """
     shared = {"_storage_lease": lease} if lease is not None else {"cwd": root.cwd}
-    child = ConversationStore(root.session_dir / "agents", session_id=number, **shared)
+    child = await asyncio.to_thread(ConversationStore, root.session_dir / "agents", session_id=number, **shared)
     child.start_agent_lifecycle(
         handle=f"{session_id}:{number}", started_at=_NOW, depth=1,
         agent_type="worker", description="child",
     )
     gc_shared = {"_storage_lease": lease} if lease is not None else {"cwd": child.cwd}
-    grandchild = ConversationStore(child.session_dir / "agents", session_id="1", **gc_shared)
+    grandchild = await asyncio.to_thread(ConversationStore, child.session_dir / "agents", session_id="1", **gc_shared)
     grandchild.start_agent_lifecycle(
         handle=f"{session_id}:{number}:1", started_at=_NOW, depth=2,
         agent_type="worker", description="grandchild",
@@ -964,7 +964,7 @@ async def test_closed_child_history_ends_every_child_started(
     )
     root = opened.store
     session_id = root.session_id
-    child, grandchild, child_id, grandchild_id = _seed_nested(root, session_id, "1")
+    child, grandchild, child_id, grandchild_id = await _seed_nested(root, session_id, "1")
     try:
         await _ROUTES[route](root, child, grandchild, child_id, grandchild_id)
         # the route left the grandchild's receipt in root, not the closed child
@@ -1012,7 +1012,7 @@ async def test_closed_child_history_ends_every_child_started(
         # after resume so the live runtime's crash recovery does not finalize the
         # grandchild.
         lease = resumed.runtime.opened.store._storage_lease
-        pend_child, pend_gc, pend_child_id, pend_gc_id = _seed_nested(
+        pend_child, pend_gc, pend_child_id, pend_gc_id = await _seed_nested(
             resumed.runtime.opened.store, session_id, "2", lease=lease
         )
         req_id = 4

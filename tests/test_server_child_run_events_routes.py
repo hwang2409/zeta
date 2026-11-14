@@ -348,7 +348,8 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
         if route.nested:
             from zeta.core.store import ConversationStore
 
-            child_store = ConversationStore(
+            child_store = await asyncio.to_thread(
+                ConversationStore,
                 serve.store.session_dir / "agents", session_id="1",
                 _storage_lease=serve.store._storage_lease,
             )
@@ -585,7 +586,8 @@ async def test_recovered_terminal_route_presents_one_durable_child_ended(
             if route.nested:
                 from zeta.core.store import ConversationStore
 
-                child_store = ConversationStore(
+                child_store = await asyncio.to_thread(
+                ConversationStore,
                     serve.store.session_dir / "agents", session_id="1",
                     _storage_lease=serve.store._storage_lease,
                 )
