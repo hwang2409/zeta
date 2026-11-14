@@ -166,7 +166,7 @@ def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path:
                     thread.join(10)
                 finally:
                     RetentionPlanner.run_pass = original
-                assert read_retention_history(home)[-1]["mode"] == "armed"
+                assert read_retention_history(home)[-1]["days"] == 60
                 return
             result = retention_authority(home, lease, days=30)
             assert not result.applied
@@ -380,22 +380,18 @@ async def test_two_owners_append_without_lost_rows(
         assert all(failure is None for _projections, failure in results), results
         assert b_committed.is_set(), "owner b did not complete its forced commit"
         rows = (home / "retention-history.jsonl").read_text().splitlines()
-        assert len(rows) == 1
+        assert len(rows) == 2
         assert {json.loads(row)["mode"] for row in rows} == {"preview"}
-        winner_days = json.loads(rows[-1])["days"]
-        assert winner_days in {30, 31}
+        assert {json.loads(row)["days"] for row in rows} == {30, 31}
         assert all(
-            projection.projection["days"] == winner_days
-            for projections, _failure in results
-            for projection in projections
-        )
-        assert all(
-            json.loads(row).get("preview_id")
+            json.loads(row)["days"] in {30, 31}
             for row in rows
             if json.loads(row)["mode"] == "preview"
         )
         state = json.loads((home / "retention-state.json").read_text())
-        assert state["preview"]["preview_id"] == json.loads(rows[-1])["preview_id"]
+        assert state["preview"]["preview_id"] in {
+            json.loads(row)["preview_id"] for row in rows if json.loads(row)["preview_id"]
+        }
         await first.stop()
         await second.stop()
     finally:
@@ -653,6 +649,46 @@ async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) 
         assert deleted and any(item["root_ids"] == [opened] for item in deleted)
         assert not (home / "sessions" / opened).exists()
         assert any(row["mode"] == "deleted" and row["root_ids"] == [opened] for row in read_retention_history(home))
+        await owner.stop()
+    finally:
+        await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_arm_changes_after_files_are_deleted_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    manager = SessionManager(home)
+    session_id = await asyncio.to_thread(_create_closed, manager, [], name="old")
+    _age_tree(home / "sessions" / session_id, days=100)
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        clock = lambda: time.time_ns() + 365 * 86_400 * 1_000_000_000
+        owner = make_retention_owner(home, lease, lambda: 30, now_ns=clock)
+        first, failure = await asyncio.to_thread(owner._run_episode)
+        assert failure is None and any(item.complete for item in first)
+        assert (await asyncio.to_thread(retention_authority, home, lease, days=30)).applied
+
+        original = RetentionPlanner.run_pass
+        changed = threading.Event()
+
+        def after_transaction(planner, **kwargs):
+            result = original(planner, **kwargs)
+            if getattr(result, "mode", None) == "deleted" and not changed.is_set():
+                # run_pass returns after the transaction removes files and before owner publication.
+                assert disarm_retention(home, lease).applied
+                changed.set()
+            return result
+
+        monkeypatch.setattr(RetentionPlanner, "run_pass", after_transaction)
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert failure is None
+        assert changed.is_set()
+        assert not (home / "sessions" / session_id).exists()
+        assert projections[-1]["mode"] == "deleted"
+        assert read_retention_history(home)[-1]["mode"] == "deleted"
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)

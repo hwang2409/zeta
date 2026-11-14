@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..storage_format import StorageFeature, feature_enabled
+from ..storage_format import (
+    StorageFeature,
+    StorageFormatError,
+    feature_enabled,
+    validate_retention_arm,
+)
 from . import (
+    _ARM_FILENAME,
     RetentionPlanner,
     Yielded,
     _coordinator_authority,
+    _load_state,
+    _read_json,
     append_retention_history,
     project_retention_result,
     read_retention_history,
@@ -53,6 +62,59 @@ def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
     }
 
 
+def _stale_projection(
+    root: Path, days: Callable[[], int],
+    history: tuple[dict[str, object], ...],
+) -> Published:
+    """Re-decide stale no-side-effect work from bounded durable state."""
+    current_days = days()
+    if history and (
+        history[-1].get("days") == current_days
+        or history[-1].get("mode") in {"disarmed", "disabled"}
+    ):
+        return Published(dict(history[-1]), complete=True)
+
+    state: dict[str, object] | None = None
+    arm: dict[str, object] | None = None
+    home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        state = _load_state(home_fd)
+        value = _read_json(home_fd, _ARM_FILENAME)
+        if isinstance(value, dict):
+            try:
+                validate_retention_arm(value)
+            except StorageFormatError:
+                arm = None
+            else:
+                arm = value
+    finally:
+        os.close(home_fd)
+
+    preview = state.get("preview") if state is not None else None
+    if current_days == 0:
+        projection = retention_result(
+            timestamp=datetime.now(UTC).isoformat(), mode="disabled", days=0,
+        )
+        complete = True
+    elif isinstance(preview, dict) and preview.get("days") == current_days:
+        mode = "armed" if arm is not None and arm.get("preview_id") == preview.get("preview_id") else "preview"
+        projection = retention_result(
+            timestamp=datetime.now(UTC).isoformat(), mode=mode, days=current_days,
+            root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"),
+            bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"),
+            cutoff=preview.get("cutoff"),
+            armed_by_zeta_version=arm.get("armed_by_zeta_version") if mode == "armed" and arm else None,
+        )
+        complete = True
+    else:
+        projection = retention_result(
+            timestamp=datetime.now(UTC).isoformat(), mode="preview", days=current_days,
+            progress_counts={"roots": 0},
+        )
+        complete = False
+    return Published(projection, complete=complete)
+
+
 def make_retention_owner(
     home: str | Path, lease: Any, days: Callable[[], int] | None = None,
     *, bounds: Any | None = None, now_ns: Callable[[], int] | None = None,
@@ -86,16 +148,6 @@ def make_retention_owner(
         nonlocal last_projection
         with _coordinator_authority(root) as token:
             history = read_retention_history(root)
-            if (
-                history
-                and history[-1].get("mode") == "armed"
-                and history[-1].get("days") == current_days
-                and not getattr(result, "changed", False)
-            ):
-                planner.close()
-                projection = dict(history[-1])
-                last_projection = projection
-                return Published(projection, complete=True)
             effectful = bool(getattr(result, "changed", False))
             status = append_retention_history(
                 token, root, retained, projection,
@@ -104,23 +156,23 @@ def make_retention_owner(
                 before_append=None if effectful else lambda: planner.commit_state(token),
                 publish_if_stale=effectful,
             )
-            if status == "stale" or status == "not_committed":
+            if status == "stale":
                 planner.close()
-                history = read_retention_history(root)
-                if history:
-                    projection = dict(history[-1])
-                else:
-                    projection = retention_result(
-                        timestamp=datetime.now(UTC).isoformat(),
-                        mode="disabled" if days == 0 else "preview", days=days,
-                    )
-                    append_retention_history(token, root, retained, projection)
-                last_projection = projection
-                return Published(projection, complete=True)
+                current = _stale_projection(root, days, history)
+                if not current.complete:
+                    append_retention_history(token, root, retained, current.projection)
+                last_projection = current.projection
+                return current
+            if status == "not_committed":
+                planner.close()
+                current = _stale_projection(root, days, history)
+                last_projection = current.projection
+                return current
             if status == "fresh":
                 last_projection = projection
         return Published(
-            projection, complete=result.complete,
+            projection,
+            complete=result.complete or projection.get("mode") == "deleted",
             progressed=before != _progress_marker(planner, projection),
         )
 
