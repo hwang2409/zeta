@@ -603,10 +603,10 @@ class CheckpointTranscriptMixin:
         """Reset root paging after a branch or repair change."""
 
         branch_id = self.loop.store.active_branch_head_id()
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(), self._history_source, branch_id
         )
-        self._history_pager.reset(endpoint_id=branch_id)
+        self._agent_navigation.transcript_control.history_pager.reset(endpoint_id=branch_id)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -622,7 +622,7 @@ class CheckpointTranscriptMixin:
         await asyncio.sleep(0)
         if self._exit_requested:
             return False
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(),
             self._history_source,
             self.loop.store.active_branch_head_id(),
@@ -640,13 +640,13 @@ class CheckpointTranscriptMixin:
         """Read one page off-loop, then repaint the bounded resident window."""
 
         if reset:
-            self._history_pager.reset(
+            self._agent_navigation.transcript_control.history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
         transcript = self._viewed_transcript()
         anchor = transcript.durable_scroll_anchor
         scroll_generation = transcript.scroll_generation
-        page = await self._history_pager.load(direction)
+        page = await self._agent_navigation.transcript_control.history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
         restore_anchor = (
@@ -666,7 +666,7 @@ class CheckpointTranscriptMixin:
         self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
-        pages = self._history_pager.pages
+        pages = self._agent_navigation.transcript_control.history_pager.pages
         entries = tuple(
             unit.value
             for page in pages

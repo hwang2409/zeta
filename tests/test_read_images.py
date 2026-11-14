@@ -679,7 +679,9 @@ def test_tui_resume_renders_receipt_for_corrupt_stored_image(tmp_path: Path) -> 
     app._presenter = SimpleNamespace(clear=lambda: None)
     app._dismiss_model_picker = lambda: None
     app._failed_turn = None
-    app._prompt_history = SessionPromptHistory()
+    app._agent_navigation = SimpleNamespace(
+        transcript_control=SimpleNamespace(prompt_history=SessionPromptHistory())
+    )
     app._print_unit = printed.append
     app._print_system = printed.append
 

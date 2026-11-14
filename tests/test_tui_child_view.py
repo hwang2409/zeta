@@ -146,10 +146,10 @@ async def test_real_tui_child_view_journey(
             )
             await _send(pipe, "Henry")
             await _wait_until(
-                lambda: app._history_search_task is not None,
+                lambda: app._agent_navigation.transcript_control.search_task is not None,
                 what="focused child history scan",
             )
-            search_task = app._history_search_task
+            search_task = app._agent_navigation.transcript_control.search_task
             assert search_task is not None
             await await_or_fail(search_task, what="focused child history scan")
             try:
@@ -161,7 +161,13 @@ async def test_real_tui_child_view_journey(
                     ),
                     what="terminal focused child finder state",
                 )
-                selected = app._history_search_results[app._history_search_index]
+                selected = app._agent_navigation.transcript_control.search_results[
+                    app._agent_navigation.transcript_control.search_index
+                ]
+                await _wait_until(
+                    lambda: VISIBLE_PROMPT in _screen_text(app),
+                    what="selected child search result paint",
+                )
                 rendered = _screen_text(app)
                 assert selected.entry_id.endswith("1"), (
                     "child-search: seq 1 is not the selected visible Henry match"

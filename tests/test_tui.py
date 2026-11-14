@@ -12592,11 +12592,11 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
     for _ in range(8):
         navigation.selected_index = 1
         navigation.open_selected()
-        assert app._history_view_task is not None
-        await await_or_fail(app._history_view_task, what="focused child load")
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="focused child load")
         navigation.exit_navigation()
-        assert app._history_view_task is not None
-        await await_or_fail(app._history_view_task, what="root history restore")
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="root history restore")
 
     await asyncio.wait_for(app.close(), 10)
 
@@ -15991,7 +15991,7 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         )
         assert app._history_finder.finder_accept()
         assert buffer.text == "prompt-0"
-        assert len(app._prompt_history.pages) <= 2
+        assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio
@@ -16082,7 +16082,7 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                     child_path, app._invalidate_prompt
                 )
                 navigation._switch_transcript()
-                child_load = getattr(app, "_history_view_task", None) or getattr(
+                child_load = app._agent_navigation.transcript_control._load_task or getattr(
                     navigation.transcript_control, "_sync_task", None
                 )
                 assert child_load is not None
@@ -16129,7 +16129,7 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                             raise AssertionError(
                                 f"Down expected {expected!r}, got "
                                 f"{session.default_buffer.text!r}; "
-                                f"index={app._prompt_history._index}"
+                                f"index={app._agent_navigation.transcript_control.prompt_history._index}"
                             ) from exc
             elif journey == "edit":
                 pipe.send_text("\x1b[A")
@@ -16243,15 +16243,15 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
             monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
             buffer = Buffer()
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="initial empty ctrl+r prompt scan",
             )
             app._finder_input("nightly wipe")
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="typed ctrl+r prompt scan",
             )
             if app._finder_prepare_task is not None:
@@ -16519,27 +16519,27 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "history-49999" in rendered
         assert "history-0" not in rendered
         assert len(app._transcript.units) <= 4 * 128
-        assert len(app._history_pager.pages) <= 4
-        assert len(app._history_pager.descriptors) <= 4
-        assert len(app._history_pager.scalar_tokens) == 6
+        assert len(app._agent_navigation.transcript_control.history_pager.pages) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
 
         for page_number in range(5):
             app._transcript.scroll_to_top()
             anchor = app._transcript.durable_scroll_anchor
             app._scroll_history_up()
             await asyncio.sleep(0)
-            reads = tuple(app._history_pager._loads.values())
+            reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
             assert len(reads) == 1
             await await_or_fail(
                 asyncio.gather(*reads),
                 what=f"older transcript page {page_number + 1}",
             )
             assert app._transcript.durable_scroll_anchor == anchor
-            assert len(app._history_pager.descriptors) <= 4
+            assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
 
-        matches = await app._history_pager.search("history-0")
+        matches = await app._agent_navigation.transcript_control.history_pager.search("history-0")
         assert [(match.entry_id, match.unit_ordinal) for match in matches]
-        await app._history_pager.reveal(matches[0].entry_id)
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
         app._render_resident_history()
         assert app._transcript.restore_durable_scroll_anchor(
             (matches[0].entry_id, matches[0].unit_ordinal, 0)
@@ -16550,35 +16550,35 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         app._active_finder = app._transcript
         app._start_finder_preparation(request)
         app._finder_input("history-")
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="global transcript search",
         )
-        assert len(app._history_search_results) == 200
-        app._history_search_index = len(app._history_search_results) - 1
+        assert len(app._agent_navigation.transcript_control.search_results) == 200
+        app._agent_navigation.transcript_control.search_index = len(app._agent_navigation.transcript_control.search_results) - 1
         assert app._navigate_history_search(1)
-        assert app._history_search_task is not None
-        await await_or_fail(app._history_search_task, what="wrapped next search result")
-        assert app._history_search_index == 0
+        assert app._agent_navigation.transcript_control.search_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control.search_task, what="wrapped next search result")
+        assert app._agent_navigation.transcript_control.search_index == 0
         assert app._navigate_history_search(-1)
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="wrapped previous search result",
         )
-        assert app._history_search_index == len(app._history_search_results) - 1
+        assert app._agent_navigation.transcript_control.search_index == len(app._agent_navigation.transcript_control.search_results) - 1
 
         app._append_transcript(Text("live-tail"))
         page_number = 0
         async with asyncio.timeout(120):
-            while app._history_pager.can_load_newer:
+            while app._agent_navigation.transcript_control.history_pager.can_load_newer:
                 page_number += 1
                 assert page_number <= 500
                 app._transcript.scroll_to_bottom()
                 app._scroll_history_down()
                 await asyncio.sleep(0)
-                reads = tuple(app._history_pager._loads.values())
+                reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
                 assert len(reads) == 1
                 await await_or_fail(
                     asyncio.gather(*reads),
@@ -16611,14 +16611,8 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
             raising=False,
         )
         navigation = app._agent_navigation
-        navigation.current_path = child_path
-        navigation._path_stack.append(child_path)
-        navigation._breadcrumb_labels.append("long child")
-        navigation.transcript_control.request_sync(child_path, app._invalidate_prompt)
-        navigation._switch_transcript()
-        child_load = getattr(app, "_history_view_task", None) or getattr(
-            navigation.transcript_control, "_sync_task", None
-        )
+        navigation.transcript_control.capture_root_view()
+        child_load = navigation.transcript_control.activate(child_path)
         assert child_load is not None
         await await_or_fail(child_load, what="focused child newest page")
         child_transcript = navigation.transcript_control.transcript
@@ -16628,18 +16622,18 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert all(
             unit.entry_id in child_ids
             or ":dependency:" in unit.entry_id
-            for page in app._history_pager.pages
+            for page in app._agent_navigation.transcript_control.history_pager.pages
             for unit in page.units
         )
-        assert len(app._history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
         app._render_active_resident_history()
         app._render_active_resident_history()
         assert len(provider_reads) == 1
         assert provider_reads[0] != main_thread
 
-        matches = await app._history_pager.search("child-history-0")
+        matches = await app._agent_navigation.transcript_control.history_pager.search("child-history-0")
         assert matches
-        await app._history_pager.reveal(matches[0].entry_id)
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
         app._render_active_resident_history()
         assert child_transcript.restore_durable_scroll_anchor(
             (matches[0].entry_id, matches[0].unit_ordinal, 0)
@@ -16647,16 +16641,16 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "child-history-0" in Text.from_ansi(
             child_transcript.render(120)
         ).plain
-        assert len(app._history_pager.descriptors) <= 4
-        assert len(app._history_pager.scalar_tokens) == 6
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
 
         navigation.exit_navigation()
-        root_load = app._history_view_task
+        root_load = app._agent_navigation.transcript_control._load_task
         assert root_load is not None
         await await_or_fail(root_load, what="return to root history")
         assert all(
             unit.entry_id not in child_ids
-            for page in app._history_pager.pages
+            for page in app._agent_navigation.transcript_control.history_pager.pages
             for unit in page.units
         )
 
@@ -16824,9 +16818,9 @@ async def test_root_tui_paging_render_path_table(
                 child_path, app._invalidate_prompt
             )
             navigation._switch_transcript()
-            assert app._history_view_task is not None
+            assert app._agent_navigation.transcript_control._load_task is not None
             await await_or_fail(
-                app._history_view_task, what="focused child search activation"
+                app._agent_navigation.transcript_control._load_task, what="focused child search activation"
             )
             session = app._make_session()
             app._active_session = session
@@ -16850,9 +16844,9 @@ async def test_root_tui_paging_render_path_table(
                 press(Keys.ControlF)
                 await wait_until(lambda: app._active_finder.finder_active)
                 press("Henry's old child prompt")
-                await wait_until(lambda: app._history_search_task is not None)
+                await wait_until(lambda: app._agent_navigation.transcript_control.search_task is not None)
                 await await_or_fail(
-                    app._history_search_task, what="old focused child search"
+                    app._agent_navigation.transcript_control.search_task, what="old focused child search"
                 )
                 try:
                     await wait_until(
@@ -16867,7 +16861,7 @@ async def test_root_tui_paging_render_path_table(
                         "focused-child ctrl+f did not finish with the unloaded match"
                     ) from exc
                 assert old.id in {
-                    match.entry_id for match in app._history_search_results
+                    match.entry_id for match in app._agent_navigation.transcript_control.search_results
                 }, "focused-child ctrl+f did not select the unloaded old row"
                 rendered = Text.from_ansi(transcript.render(120)).plain
                 assert "Henry's old child prompt" in rendered, (
@@ -16878,13 +16872,13 @@ async def test_root_tui_paging_render_path_table(
                 await wait_until(lambda: transcript.finder_state() is None)
                 press(Keys.ControlF)
                 await wait_until(lambda: app._active_finder.finder_active)
-                previous_search = app._history_search_task
+                previous_search = app._agent_navigation.transcript_control.search_task
                 press("absent-focused-child-query")
                 await wait_until(
-                    lambda: app._history_search_task is not previous_search
+                    lambda: app._agent_navigation.transcript_control.search_task is not previous_search
                 )
                 await await_or_fail(
-                    app._history_search_task, what="focused child no-match search"
+                    app._agent_navigation.transcript_control.search_task, what="focused child no-match search"
                 )
                 await wait_until(
                     lambda: (
@@ -16903,7 +16897,7 @@ async def test_root_tui_paging_render_path_table(
                 )
                 session.layout.focus(session.default_buffer)
         elif journey == "root-anchor-child-visit":
-            await app._history_pager.load("older")
+            await app._agent_navigation.transcript_control.history_pager.load("older")
             app._render_resident_history()
             app._transcript.scroll_to_top()
             root_anchor = app._transcript.durable_scroll_anchor
@@ -16926,9 +16920,9 @@ async def test_root_tui_paging_render_path_table(
                 child_path, app._invalidate_prompt
             )
             navigation._switch_transcript()
-            assert app._history_view_task is not None
+            assert app._agent_navigation.transcript_control._load_task is not None
             await await_or_fail(
-                app._history_view_task, what="child visit activation"
+                app._agent_navigation.transcript_control._load_task, what="child visit activation"
             )
             assert "child visit" in Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
@@ -16943,9 +16937,9 @@ async def test_root_tui_paging_render_path_table(
                 session.app.key_processor.feed(KeyPress("h", data="h"))
                 session.app.key_processor.process_keys()
                 await wait_until(lambda: not navigation.child_view_active)
-                assert app._history_view_task is not None
+                assert app._agent_navigation.transcript_control._load_task is not None
                 await await_or_fail(
-                    app._history_view_task, what="root anchor restoration"
+                    app._agent_navigation.transcript_control._load_task, what="root anchor restoration"
                 )
                 assert app._transcript.durable_scroll_anchor == root_anchor, (
                     "returning from child moved the root viewport to the tail"
@@ -17052,11 +17046,11 @@ async def test_root_tui_paging_render_path_table(
                 child_path, app._invalidate_prompt
             )
             navigation._switch_transcript()
-            assert app._history_view_task is not None
+            assert app._agent_navigation.transcript_control._load_task is not None
             await await_or_fail(
-                app._history_view_task, what="running child activation"
+                app._agent_navigation.transcript_control._load_task, what="running child activation"
             )
-            await app._history_pager.reveal(entry_ids[0])
+            await app._agent_navigation.transcript_control.history_pager.reveal(entry_ids[0])
             app._render_active_resident_history()
             child_transcript = navigation.transcript_control.transcript
             assert child_transcript.restore_durable_scroll_anchor(
@@ -17075,14 +17069,14 @@ async def test_root_tui_paging_render_path_table(
                 )
                 child_store.close()
                 appended.append(text)
-                previous_task = app._history_view_task
+                previous_task = app._agent_navigation.transcript_control._load_task
                 navigation.refresh(force=True)
-                assert app._history_view_task is not None
+                assert app._agent_navigation.transcript_control._load_task is not None
                 await await_or_fail(
-                    app._history_view_task,
+                    app._agent_navigation.transcript_control._load_task,
                     what=f"running child live refresh {tick}",
                 )
-                assert app._history_view_task is not previous_task, (
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
                     f"running child refresh {tick} was suppressed"
                 )
                 assert child_transcript.durable_scroll_anchor == anchor, (
@@ -17091,9 +17085,9 @@ async def test_root_tui_paging_render_path_table(
 
             child_transcript.scroll_to_bottom()
             navigation.refresh(force=True)
-            assert app._history_view_task is not None
+            assert app._agent_navigation.transcript_control._load_task is not None
             await await_or_fail(
-                app._history_view_task, what="running child return to tail"
+                app._agent_navigation.transcript_control._load_task, what="running child return to tail"
             )
             navigation.transcript_control.create_content(120, 20)
             rendered = Text.from_ansi(child_transcript.render(120)).plain
@@ -17119,8 +17113,8 @@ async def test_root_tui_paging_render_path_table(
             navigation._breadcrumb_labels.append("first child")
             navigation.transcript_control.request_sync(first_path, app._invalidate_prompt)
             navigation._switch_transcript()
-            assert app._history_view_task is not None
-            await await_or_fail(app._history_view_task, what="first child activation")
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
 
             source = navigation.transcript_control._source
             original_page = source.page
@@ -17134,7 +17128,7 @@ async def test_root_tui_paging_render_path_table(
 
             source.page = held_page
             navigation.refresh(force=True)
-            first_refresh = app._history_view_task
+            first_refresh = app._agent_navigation.transcript_control._load_task
             assert first_refresh is not None
             await asyncio.wait_for(refresh_started.wait(), 10)
             navigation.current_path = second_path
@@ -17142,7 +17136,7 @@ async def test_root_tui_paging_render_path_table(
             navigation._breadcrumb_labels.append("second child")
             navigation.transcript_control.request_sync(second_path, app._invalidate_prompt)
             navigation._switch_transcript()
-            second_activation = app._history_view_task
+            second_activation = app._agent_navigation.transcript_control._load_task
             assert second_activation is not None and second_activation is not first_refresh
             refresh_release.set()
             await await_or_fail(second_activation, what="second child activation")
@@ -17162,14 +17156,14 @@ async def test_root_tui_paging_render_path_table(
                     )
                 )
                 second.close()
-                previous_task = app._history_view_task
+                previous_task = app._agent_navigation.transcript_control._load_task
                 navigation.refresh(force=True)
-                assert app._history_view_task is not None
+                assert app._agent_navigation.transcript_control._load_task is not None
                 await await_or_fail(
-                    app._history_view_task,
+                    app._agent_navigation.transcript_control._load_task,
                     what=f"second child refresh after switch {tick}",
                 )
-                assert app._history_view_task is not previous_task, (
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
                     f"second child refresh {tick} after switch was suppressed"
                 )
             rendered = Text.from_ansi(
@@ -17194,8 +17188,8 @@ async def test_root_tui_paging_render_path_table(
                 first_path, app._invalidate_prompt
             )
             navigation._switch_transcript()
-            assert app._history_view_task is not None
-            await await_or_fail(app._history_view_task, what="first child activation")
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
             assert "first child only" in Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
             ).plain
@@ -17243,14 +17237,14 @@ async def test_root_tui_paging_render_path_table(
                     )
                 )
                 retry.close()
-                previous_task = app._history_view_task
+                previous_task = app._agent_navigation.transcript_control._load_task
                 navigation.refresh(force=True)
-                assert app._history_view_task is not None
+                assert app._agent_navigation.transcript_control._load_task is not None
                 await await_or_fail(
-                    app._history_view_task,
+                    app._agent_navigation.transcript_control._load_task,
                     what=f"retry child refresh {tick}",
                 )
-                assert app._history_view_task is not previous_task, (
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
                     f"retry child refresh {tick} was suppressed"
                 )
             rendered = Text.from_ansi(
@@ -17277,12 +17271,12 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(load, what="stale-anchor page read")
             assert app._transcript.durable_scroll_anchor == moved_anchor
         elif journey == "mixed-live-durable":
-            app._history_pager.reset(endpoint_id=durable.id)
-            app._history_pager.append_live(durable.id, Text("live-A"))
-            app._history_pager.append_live("live-B", Text("live-B"))
-            app._history_pager.append_live("live-C", Text("live-C"))
+            app._agent_navigation.transcript_control.history_pager.reset(endpoint_id=durable.id)
+            app._agent_navigation.transcript_control.history_pager.append_live(durable.id, Text("live-A"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-B", Text("live-B"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-C", Text("live-C"))
             page = await app._history_source.reveal(durable.id)
-            app._history_pager.adopt(page, direction="newer")
+            app._agent_navigation.transcript_control.history_pager.adopt(page, direction="newer")
             app._render_resident_history()
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "durable-A" in rendered
@@ -17295,8 +17289,8 @@ async def test_root_tui_paging_render_path_table(
             assert app._failed_turn[0] == "retry-target-user"
         elif journey == "tool-result-bound":
             assert sum(
-                len(page.units) for page in app._history_pager.pages
-            ) <= app._history_pager.max_segment_rows
+                len(page.units) for page in app._agent_navigation.transcript_control.history_pager.pages
+            ) <= app._agent_navigation.transcript_control.history_pager.max_segment_rows
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "result-127" in rendered
         elif journey == "close-search":
@@ -17314,8 +17308,8 @@ async def test_root_tui_paging_render_path_table(
                     finished.set()
 
             store.tui_history_search = blocked_search
-            task = asyncio.create_task(app._history_pager.search("search-row"))
-            app._history_search_task = task
+            task = asyncio.create_task(app._agent_navigation.transcript_control.history_pager.search("search-row"))
+            app._agent_navigation.transcript_control.search_task = task
             assert await asyncio.to_thread(started.wait, 10)
             await await_or_fail(
                 app._close_history_search(), what="close during history search"
@@ -17325,10 +17319,10 @@ async def test_root_tui_paging_render_path_table(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)
         elif journey == "unloaded-failed-search":
-            matches = await app._history_pager.search(failure_text)
+            matches = await app._agent_navigation.transcript_control.history_pager.search(failure_text)
             target = next(match for match in matches if match.entry_id == failed.id)
             assert target.unit_ordinal == 1
-            checkpoint_matches = await app._history_pager.search(
+            checkpoint_matches = await app._agent_navigation.transcript_control.history_pager.search(
                 "searchable-checkpoint"
             )
             checkpoint_target = checkpoint_matches[0]
@@ -17340,7 +17334,7 @@ async def test_root_tui_paging_render_path_table(
                 (target, failure_text),
                 (checkpoint_target, "searchable-checkpoint"),
             ):
-                await app._history_pager.reveal(search_target.entry_id)
+                await app._agent_navigation.transcript_control.history_pager.reveal(search_target.entry_id)
                 app._render_resident_history()
                 assert app._transcript.restore_durable_scroll_anchor(
                     (search_target.entry_id, search_target.unit_ordinal, 0)
@@ -17367,11 +17361,11 @@ async def test_root_tui_paging_render_path_table(
             assert app._failed_turn is not None
             assert app._failed_turn[0] == "retry-target-user"
         elif journey == "branch-prompt-reset":
-            app._prompt_history.bind(
+            app._agent_navigation.transcript_control.prompt_history.bind(
                 app._viewed_session_path(), app._history_source
             )
-            await app._prompt_history.load_older()
-            assert "branch-a-prompt" in app._prompt_history.snapshot(
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
+            assert "branch-a-prompt" in app._agent_navigation.transcript_control.prompt_history.snapshot(
                 app._viewed_session_path()
             )
             assert await app.slash_fork("branch-base") == (
@@ -17385,15 +17379,15 @@ async def test_root_tui_paging_render_path_table(
             )
             assert await app._rebuild_transcript_async()
 
-            await app._prompt_history.load_older()
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
             buffer = Buffer()
             app._history_previous(buffer)
             assert buffer.text == "branch-b-prompt"
             finder_buffer = Buffer(document=Document("branch-a-prompt"))
             app._history_finder_open(finder_buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="branch prompt finder reset"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="branch prompt finder reset"
             )
             state = app._history_finder.finder_state()
             assert state is not None
@@ -17439,7 +17433,7 @@ async def test_root_tui_paging_render_path_table(
 
             monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
             app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
-            scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert scan is not None
@@ -17477,7 +17471,7 @@ async def test_root_tui_paging_render_path_table(
             published.clear()
             finder_buffer = Buffer(document=Document("branch-b-prompt"))
             app._history_finder_open(finder_buffer)
-            new_scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            new_scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert new_scan is not None
@@ -17487,9 +17481,9 @@ async def test_root_tui_paging_render_path_table(
         else:
             buffer = Buffer(document=Document("oldest-needle"))
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="bounded ctrl+r source scan"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="bounded ctrl+r source scan"
             )
             if app._finder_prepare_task is not None:
                 await await_or_fail(
@@ -17503,7 +17497,7 @@ async def test_root_tui_paging_render_path_table(
             assert state is not None
             assert state.total <= 200
             assert any("oldest-needle" in row.excerpt for row in state.rows)
-            assert len(app._prompt_history.pages) <= 2
+            assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio

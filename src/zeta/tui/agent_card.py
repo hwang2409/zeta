@@ -551,10 +551,13 @@ class AgentTranscriptControl(UIControl):
         self._closed = False
         self._pending_path: Path | None = None
         self._activation_generation = 0
+        self.search_task: asyncio.Task[None] | None = None
+        self.search_results: tuple[Any, ...] = ()
+        self.search_index = 0
+        self.view_path: Path | None = None
         self._root_path: Path | None = None
         self._root_source: Any = None
         self._root_transcript: Any = None
-        self._root_anchor: tuple[str, int, int] | None = None
         self._root_pager_state: Any = None
         self._prompt_history: Any = None
         self._current_path: Callable[[], Path] | None = None
@@ -564,6 +567,14 @@ class AgentTranscriptControl(UIControl):
         self._invalidate: Callable[[], None] | None = None
         self.on_load: Callable[[Path], None] | None = None
         self.on_history_edge: Callable[[str], None] | None = None
+
+    @property
+    def history_pager(self) -> Any:
+        return self._history_pager
+
+    @property
+    def prompt_history(self) -> Any:
+        return self._prompt_history
 
     @property
     def offset(self) -> int:
@@ -587,6 +598,7 @@ class AgentTranscriptControl(UIControl):
         invalidate: Callable[[], None],
     ) -> None:
         self._root_path = root_path
+        self.view_path = root_path
         self._root_source = root_source
         self._root_transcript = root_transcript
         self._prompt_history = prompt_history
@@ -607,6 +619,79 @@ class AgentTranscriptControl(UIControl):
         self.presenter.clear()
         self._tool_calls.clear()
         self.presenter.print(Text("transcript unavailable"))
+
+    def start_search(
+        self,
+        query: str,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
+    ) -> None:
+        self.search_results = ()
+        self.search_index = 0
+        if self.search_task is not None:
+            self.search_task.cancel()
+        if not query:
+            return
+
+        async def reveal_match() -> None:
+            matches = await self._history_pager.search(query)
+            if not matches or not transcript.finder_active:
+                return
+            self.search_results = matches
+            self.search_index = 0
+            target = matches[0]
+            resident = {
+                unit.entry_id
+                for page in self._history_pager.pages
+                for unit in page.units
+            }
+            if target.entry_id not in resident:
+                await self._history_pager.reveal(target.entry_id)
+            self.render_pages(self._history_pager.pages)
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
+
+        self.search_task = asyncio.create_task(reveal_match())
+
+    def navigate_search(
+        self,
+        delta: int,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
+    ) -> bool:
+        if not self.search_results:
+            return False
+        self.search_index = (self.search_index + delta) % len(self.search_results)
+        target = self.search_results[self.search_index]
+
+        async def reveal() -> None:
+            await self._history_pager.reveal(target.entry_id)
+            if not transcript.finder_active:
+                return
+            query = transcript.search_query
+            self.render_pages(self._history_pager.pages)
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
+
+        if self.search_task is not None:
+            self.search_task.cancel()
+        self.search_task = asyncio.create_task(reveal())
+        return True
+
+    def end_search(self) -> None:
+        self.search_results = ()
+        self.search_index = 0
+
+    async def close_search(self) -> None:
+        task, self.search_task = self.search_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.end_search()
 
     async def refresh(self) -> bool:
         anchor = self.transcript.durable_scroll_anchor
@@ -647,8 +732,6 @@ class AgentTranscriptControl(UIControl):
             return None
         if path == self._root_path and self._root_pager_state is not None:
             previous, self._source = self._source, None
-            if self._commit_path is not None:
-                self._commit_path(path)
             self.presenter.clear()
             self._tool_calls.clear()
             self._path = path
@@ -657,12 +740,16 @@ class AgentTranscriptControl(UIControl):
             endpoint = self._root_endpoint() if self._root_endpoint else None
             if self._prompt_history is not None:
                 self._prompt_history.bind(path, self._root_source, endpoint)
+            if self._commit_path is not None:
+                self._commit_path(path)
             if self._render_active:
                 self._render_active()
             else:
                 self.render_pages(self._history_pager.pages)
-            if self._root_anchor is not None and self._root_transcript is not None:
-                self._root_transcript.restore_durable_scroll_anchor(self._root_anchor)
+            if self._root_pager_state.anchor is not None and self._root_transcript is not None:
+                self._root_transcript.restore_durable_scroll_anchor(
+                    self._root_pager_state.anchor
+                )
             self._pending_path = None
 
             async def finish_root_activation() -> None:
@@ -724,8 +811,6 @@ class AgentTranscriptControl(UIControl):
                     await prepared_source.close()
                 return
 
-            if self._commit_path is not None:
-                self._commit_path(path)
             if path != self._path:
                 self.presenter.clear()
                 self._tool_calls.clear()
@@ -748,26 +833,25 @@ class AgentTranscriptControl(UIControl):
                     self._history_pager.adopt(prepared_page)
             if self._prompt_history is not None:
                 self._prompt_history.bind(path, prepared_source, endpoint)
+            if self._commit_path is not None:
+                self._commit_path(path)
             if self._render_active:
                 self._render_active()
             else:
                 self.render_pages(self._history_pager.pages)
-            if (
-                prepared_source is self._root_source
-                and self._root_anchor is not None
-                and self._root_transcript is not None
-            ):
-                self._root_transcript.restore_durable_scroll_anchor(self._root_anchor)
+            root_anchor = (
+                self._root_pager_state.anchor
+                if prepared_source is self._root_source
+                else None
+            )
+            if root_anchor is not None and self._root_transcript is not None:
+                self._root_transcript.restore_durable_scroll_anchor(root_anchor)
             if self._invalidate is not None:
                 self._invalidate()
-            if (
-                prepared_source is self._root_source
-                and self._root_anchor is not None
-                and self._root_transcript is not None
-            ):
+            if root_anchor is not None and self._root_transcript is not None:
                 asyncio.get_running_loop().call_soon(
                     self._root_transcript.restore_durable_scroll_anchor,
-                    self._root_anchor,
+                    root_anchor,
                 )
             if previous is not None and previous is not prepared_source:
                 await previous.close()
@@ -784,65 +868,24 @@ class AgentTranscriptControl(UIControl):
             if generation == self._activation_generation and path == self._pending_path:
                 self._pending_path = None
 
-    async def load(self, path: Path) -> bool:
-        """Load a child when the control is used without a TUI app owner."""
-
-        from .transcript.child_history_source import ChildLogHistorySource
-        from .transcript.paged_history import PagedTranscriptHistory
-
-        if self._closed:
-            return False
-        try:
-            source = await asyncio.to_thread(ChildLogHistorySource, path)
-        except (ConversationIntegrityError, OSError, SessionError, ValueError):
-            return False
-        previous = self._source
-        if previous is not None:
-            await previous.close()
-        if path != self._path:
-            self.presenter.clear()
-            self._tool_calls.clear()
-        self._source = source
-        self._path = path
-        if self._history_pager is None:
-            self._history_pager = PagedTranscriptHistory(source)
-        else:
-            self._history_pager.source = source
-        self._history_pager.reset()
-        try:
-            page = await self._history_pager.load()
-        except (ConversationIntegrityError, OSError, SessionError, ValueError):
-            await source.close()
-            self._source = None
-            return False
-        self.render_pages(self._history_pager.pages)
-        return bool(page.units)
-
-    async def sync(self, path: Path) -> bool:
-        if self._source is None or self._path != path:
-            return await self.load(path)
-        self._history_pager.reset()
-        page = await self._history_pager.load()
-        self.render_pages(self._history_pager.pages)
-        return bool(page.units)
-
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
-        if self._closed:
+        if self._closed or self._pending_path is not None:
             return False
-        if self.on_load is not None:
-            self.on_load(path)
-            return False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            changed = asyncio.run(self.load(path))
-            if changed and invalidate is not None:
-                invalidate()
-            return changed
-        task = loop.create_task(self.sync(path))
-        if invalidate is not None:
+        active_source = self._source is not None or (
+            path == self._root_path
+            and self._history_pager.source is self._root_source
+        )
+        if path != self._path or not active_source:
+            task = self.activate(path)
+        else:
+            if self._load_task is not None and not self._load_task.done():
+                self._load_task.cancel()
+            self._activation_generation += 1
+            task = asyncio.get_running_loop().create_task(self.refresh())
+            self._load_task = task
+        if task is not None and invalidate is not None:
             task.add_done_callback(lambda _task: invalidate())
         return False
 
@@ -893,10 +936,13 @@ class AgentTranscriptControl(UIControl):
             or self._history_pager.source is not self._root_source
         ):
             return
-        if self._root_transcript is not None:
-            self._root_anchor = self._root_transcript.durable_scroll_anchor
-        if self._root_anchor is not None:
-            self._history_pager.set_anchor(*self._root_anchor)
+        anchor = (
+            self._root_transcript.durable_scroll_anchor
+            if self._root_transcript is not None
+            else None
+        )
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
         self._root_pager_state = self._history_pager.capture()
 
     async def cancel_activation(self) -> None:
@@ -1358,6 +1404,7 @@ class AgentNavigation:
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
         self.selected_index = 0
+        self.transcript_control.activate(self.root_path)
         self.refresh(force=True)
         target = preselect_path
         if target is None and previous_path != self.root_path:
