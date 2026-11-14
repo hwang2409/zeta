@@ -1127,7 +1127,7 @@ def blocking_session_locks_leave_event_loop(
                         continue
                     if path.is_relative_to(_TEST_SITE_PACKAGES):
                         tests_caller = path.name != "conftest.py"
-                    break
+                        break
                 if tests_caller:
                     raise RuntimeError(
                         "retention lock requested on an asyncio event-loop thread; "
