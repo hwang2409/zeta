@@ -204,7 +204,7 @@ def append_retention_history(
                 rows.append(value)
     except FileNotFoundError:
         pass
-    except (OSError, ValueError, StorageFormatError):
+    except (OSError, ValueError, StorageFormatError, RetentionPlannerError):
         # A corrupt history row must not strand the activation owner.
         rows = []
     rows = (rows + [dict(result)])[-_MAX_HISTORY:]

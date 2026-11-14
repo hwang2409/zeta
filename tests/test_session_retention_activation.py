@@ -51,3 +51,43 @@ async def test_owner_lifecycle_table(
         assert (result.mode if hasattr(result, "mode") else result["mode"]) == expected
     finally:
         await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_owner_corrupt_history_survives_and_records_error(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    (home / "retention-history.jsonl").write_text("not json\n")
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        owner = make_retention_owner(home, lease, lambda: 30)
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert not projections
+        assert failure is not None
+        published = asyncio.Event()
+        owner.set_publish(lambda _projection: published.set())
+        owner.start()
+        await asyncio.wait_for(published.wait(), 10)
+        assert owner.task is not None and not owner.task.done()
+        await owner.stop()
+        assert '"mode":"none"' in (home / "retention-history.jsonl").read_text()
+    finally:
+        await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
+async def test_owner_publish_failure_does_not_stop_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        owner = make_retention_owner(home, lease, lambda: 30)
+        owner.set_publish(lambda _projection: (_ for _ in ()).throw(RuntimeError("publish")))
+        owner.start()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert owner.task is not None and not owner.task.done()
+        await owner.stop()
+    finally:
+        await asyncio.to_thread(lease.close)
