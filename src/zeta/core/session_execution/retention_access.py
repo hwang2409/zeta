@@ -10,8 +10,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from ..locking import RETENTION_HOME_ID, domain_lock_name
-from ..storage_format import StorageFeature, _read_manifest, feature_enabled
+from ...locking import RETENTION_HOME_ID, domain_lock_name
+from ...storage_format import StorageFeature, _read_manifest, feature_enabled
 
 
 class RetentionYieldError(RuntimeError):
@@ -65,7 +65,7 @@ def _off_loop() -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         return
-    from .session_files import require_off_loop_lock
+    from ..session_files import require_off_loop_lock
 
     require_off_loop_lock("retention yield")
 

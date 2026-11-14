@@ -12,8 +12,8 @@ import zeta.session_retention as retention_module
 import zeta.session_retention.activation as activation_module
 from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.storage_homes import initialize_storage_home
-from zeta.core import retention_access
 from zeta.core.session import SessionManager
+from zeta.core.session_execution import retention_access
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.session_retention import (
     RetentionBounds,

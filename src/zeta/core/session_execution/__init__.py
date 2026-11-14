@@ -17,8 +17,8 @@ from ...locking import execution_lock
 from ...storage_format import RegistryLock, WriterLease, drain_releases
 from ..checkpoints import ConversationIntegrityError
 from ..fsio import write_all
-from ..retention_access import acquire_after_retention_yield
 from ..session_files import SessionInUseError, open_session_file
+from .retention_access import acquire_after_retention_yield
 
 RUNTIME_LEASE_NAME = "runtime.lease"
 OwnerSurface = Literal["tui", "headless", "serve", "child", "recovery"]

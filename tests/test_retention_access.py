@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.retention_access import (
+from zeta.core.session_execution.retention_access import (
     RetentionYieldError,
     acquire_after_retention_yield,
 )
@@ -267,7 +267,7 @@ async def test_on_loop_contention_rejects_before_request_flock(
         os.O_RDWR | os.O_CREAT,
     )
     # test-contract: seam exercise the primitive's cheap active-lock probe
-    monkeypatch.setattr("zeta.core.retention_access._active", lambda _: active_fd)
+    monkeypatch.setattr("zeta.core.session_execution.retention_access._active", lambda _: active_fd)
     try:
         with pytest.raises(RuntimeError, match="event-loop"):
             acquire_after_retention_yield(

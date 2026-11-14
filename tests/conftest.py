@@ -1090,7 +1090,8 @@ def blocking_session_locks_leave_event_loop(
     request: pytest.FixtureRequest,
 ) -> Generator[None, None, None]:
     """Make every test catch direct blocking session access on an event loop."""
-    from zeta.core import retention_access, session_files
+    from zeta.core import session_files
+    from zeta.core.session_execution import retention_access
     from zeta.session_retention.activation import RetentionActivationOwner
 
     original = session_files.require_off_loop_lock

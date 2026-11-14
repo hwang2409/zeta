@@ -120,7 +120,9 @@ class SessionReferenceGate:
                 if exclusive:
                     enter()
                 else:
-                    from .retention_access import acquire_after_retention_yield
+                    from .session_execution.retention_access import (
+                        acquire_after_retention_yield,
+                    )
 
                     acquire_after_retention_yield(
                         self.home,
@@ -406,7 +408,9 @@ def session_directory(
             if exclusive:
                 drain_releases()  # a store this process dropped must not refuse deletion
             try:
-                from .retention_access import acquire_after_retention_yield
+                from .session_execution.retention_access import (
+                    acquire_after_retention_yield,
+                )
 
                 acquire_after_retention_yield(
                     root.parent,
