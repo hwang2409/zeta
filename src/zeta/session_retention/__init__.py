@@ -283,6 +283,16 @@ def retention_authority(
             ):
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
+                    has_authority = any(
+                        (root / name).is_file()
+                        for name in (_ARM_FILENAME, _STATE_FILENAME)
+                    )
+                    if not has_authority:
+                        return RetentionAuthorityResult(
+                            "retention already disabled",
+                            retention_result(timestamp=now(), mode="disabled", days=0),
+                            True,
+                        )
                     unlink_session_file(home_fd, _ARM_FILENAME)
                     unlink_session_file(home_fd, _STATE_FILENAME)
                 finally:
@@ -321,11 +331,6 @@ def retention_authority(
             timestamp=now(), mode="disabled" if days == 0 else "none", days=days,
             errors=(message,), disable_pending=days == 0,
         )
-        if days == 0:
-            try:
-                append_retention_history(root, lease, projection, authority_held=True)
-            except (OSError, RetentionPlannerError):
-                pass
         return RetentionAuthorityResult(message, projection, False)
 
 

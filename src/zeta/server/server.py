@@ -280,6 +280,7 @@ class ZetaServer:
                     if self.runtime.opened is None
                     else load_settings(home=self.home).settings.retention_days
                 ),
+                session_available=False,
             )
             if (
                 not self._borrowed

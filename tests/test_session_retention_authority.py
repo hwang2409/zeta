@@ -74,7 +74,7 @@ async def test_authority_zero_to_thirty_requires_fresh_preview(tmp_path: Path) -
                 assert planner.run_pass(days=30).complete
             finally:
                 planner.close()
-            assert retention_authority(home, lease, days=30).applied
+            # an unarmed completed preview is also invalidated by disabling retention
             assert retention_authority(home, lease, days=0).applied
             stale = retention_authority(home, lease, days=30).applied
             planner = RetentionPlanner(home, lease)

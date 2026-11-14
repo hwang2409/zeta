@@ -52,6 +52,7 @@ def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
 def make_retention_owner(
     home: str | Path, lease: Any, days: Callable[[], int] | None = None,
     *, bounds: Any | None = None, now_ns: Callable[[], int] | None = None,
+    session_available: bool = True,
 ) -> RetentionActivationOwner:
     """Build the process owner from an already-open home lease."""
     from ..config.settings import load_settings
@@ -129,6 +130,7 @@ def make_retention_owner(
         home=root,
         close_lease=retained.close,
         activation_enabled=activation_enabled,
+        session_available=session_available,
         disable=lambda: retention_authority(root, retained, days=0).projection,
     )
 
@@ -149,6 +151,7 @@ class RetentionActivationOwner:
         home: str | Path | None = None,
         close_lease: Callable[[], Any] | None = None,
         activation_enabled: bool = True,
+        session_available: bool = True,
         disable: Callable[[], Any] | None = None,
     ) -> None:
         self._planner_factory = planner_factory
@@ -157,24 +160,24 @@ class RetentionActivationOwner:
         self._wake_seconds = wake_seconds
         self._sleep = sleep or asyncio.sleep
         self._publish = publish
-        self._run_pass = run_pass or (lambda planner, current_days: getattr(planner, "run_" + "pass")(days=current_days))
+        self._run_pass = run_pass or (lambda planner, current_days: planner.run_pass(days=current_days))
         self._on_error = on_error or (lambda exc, current_days: {"mode": "none", "days": current_days, "errors": [str(exc)]})
         self._stop = asyncio.Event()
-        self._run_done = asyncio.Event()
-        self._run_done.set()
-        self._planner_closed = asyncio.Event()
-        self._planner_closed.set()
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._planner: Any = None
         self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
         self._close_lease = close_lease
         self._activation_enabled = activation_enabled
+        self._session_available = session_available
         self._disable = disable
         self._episode_user_yield = False
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
+
+    def set_session_available(self) -> None:
+        self._session_available = True
+        self.wake()
 
     def wake(self) -> None:
         self._wake.set()
@@ -208,16 +211,17 @@ class RetentionActivationOwner:
         failure: Exception | None = None
         planner = None
         try:
-            if not self._activation_enabled or (self._home is not None and planner_request_pending(self._home)):
+            if not self._activation_enabled or not self._session_available or (self._home is not None and planner_request_pending(self._home)):
                 return projections, None
             days = self._days()
             if days == 0:
-                if self._disable is not None and self._home is not None and (self._home / "retention-arm.json").is_file():
+                if self._disable is not None and self._home is not None and any(
+                    (self._home / name).is_file()
+                    for name in ("retention-arm.json", "retention-state.json")
+                ):
                     projections.append(self._disable())
                 return projections, None
             planner = self._planner_factory()
-            self._planner = planner
-            self._planner_closed.clear()
             if not getattr(planner, "enabled", True):
                 return projections, None
             context = planner_active(self._home) if self._home is not None else _null_context()
@@ -239,19 +243,13 @@ class RetentionActivationOwner:
                             break
                 planner.close()
                 planner = None
-                self._planner = None
-                self._planner_closed.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - keep the owner alive after pass errors
             failure = exc
         finally:
             if planner is not None:
-                try:
-                    planner.close()
-                finally:
-                    self._planner = None
-                    self._planner_closed.set()
+                planner.close()
         return projections, failure
 
     async def _run(self) -> None:
@@ -301,7 +299,6 @@ class RetentionActivationOwner:
             task = self._episode_task
             if task is not None:
                 await asyncio.shield(task)
-            self._planner = None
 
 
 class _null_context:

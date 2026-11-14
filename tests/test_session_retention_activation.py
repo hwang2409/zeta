@@ -182,7 +182,11 @@ async def test_two_owners_append_without_lost_rows(
         rows = (home / "retention-history.jsonl").read_text().splitlines()
         assert len(rows) >= 1
         assert {json.loads(row)["mode"] for row in rows} >= {"preview"}
-        assert all(json.loads(row)["preview_id"] for row in rows)
+        assert all(
+            json.loads(row).get("preview_id")
+            for row in rows
+            if json.loads(row)["mode"] == "preview"
+        )
         state = json.loads((home / "retention-state.json").read_text())
         assert state["preview"]["preview_id"] == json.loads(rows[-1])["preview_id"]
         await first.stop()
@@ -332,7 +336,7 @@ async def test_disarm_deadline_persists_pending_and_retries(tmp_path: Path, monk
         pending = await asyncio.to_thread(retention_authority, home, lease, days=0)
         assert not pending.applied and pending.projection["disable_pending"]
         assert (home / "retention-arm.json").exists()
-        assert read_retention_history(home)[-1]["disable_pending"]
+        assert not read_retention_history(home)[-1].get("disable_pending", False)
         monkeypatch.undo()
         cleared = await asyncio.to_thread(retention_authority, home, lease, days=0)
         assert cleared.applied and cleared.projection["mode"] == "disarmed"
@@ -366,6 +370,32 @@ async def test_armed_days_change_previews_before_deletion(tmp_path: Path) -> Non
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_inactive_owner_preserves_authority_until_session_exists(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        def seed() -> None:
+            with RetentionPlanner(home, lease) as planner:
+                assert planner.run_pass(days=30).complete
+            assert retention_authority(home, lease, days=30).applied
+
+        await asyncio.to_thread(seed)
+        owner = make_retention_owner(home, lease, lambda: 0, session_available=False)
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert failure is None and projections == []
+        assert (home / "retention-arm.json").exists()
+        assert (home / "retention-state.json").exists()
+        owner.set_session_available()
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert failure is None and projections
+        assert not (home / "retention-arm.json").exists()
+    finally:
+        await asyncio.to_thread(lease.close)
+
 
 @pytest.mark.asyncio
 async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) -> None:

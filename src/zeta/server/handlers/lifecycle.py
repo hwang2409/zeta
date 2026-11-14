@@ -105,7 +105,7 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
             )
             self.server.control.session_replaced()
             if self.server._retention_owner is not None:
-                self.server._retention_owner.wake()
+                self.server._retention_owner.set_session_available()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -195,7 +195,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             )
             self.server.control.session_replaced()
             if self.server._retention_owner is not None:
-                self.server._retention_owner.wake()
+                self.server._retention_owner.set_session_available()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
