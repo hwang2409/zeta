@@ -270,10 +270,15 @@ class FullScreenPromptSession(PromptSession[str]):
         import sys
 
         self.app.output.disable_mouse_support()
+        stdout = sys.__stdout__
+        if stdout.isatty():
+            try:
+                os.write(stdout.fileno(), MOUSE_OFF + b"\x1b[0 q")
+            except OSError:
+                pass
         self.app.output.quit_alternate_screen()
         self.app.output.show_cursor()
         self.app.output.flush()
-        stdout = sys.__stdout__
         if stdout.isatty():
             try:
                 os.write(
