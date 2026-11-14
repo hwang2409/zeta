@@ -14,7 +14,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -28,7 +28,6 @@ from ..core.session_files import (
     child_directory,
     read_reference_generation,
 )
-from ..locking import RETENTION_HOME_ID, domain_authority
 from ..project_errors import ProjectRegistryError
 from ..project_inbox import InboxError, ProjectInbox
 from ..project_registry import ProjectRegistry
@@ -43,6 +42,7 @@ from ..storage_format import (
     validate_retention_state,
 )
 from ..transcript_search.index import TranscriptIndexError, remove_indexed_sessions
+from . import CoordinatorToken
 
 _ARM_NAME = "retention-arm.json"
 _STATE_NAME = "retention-state.json"
@@ -51,7 +51,6 @@ _RESERVATIONS_NAME = "reservations"
 _TRANSACTIONS_NAME = "transactions"
 _MANIFEST_NAME = "manifest.json"
 _TREE_NAME = "tree"
-_COORDINATOR_DOMAIN = "coordinator"
 _MAX_JSON_BYTES = 1 << 20
 _MAX_DEPTH = 64
 
@@ -177,6 +176,7 @@ class _QuarantineTransaction:
         self.worker_ns = worker_ns
         self.clock = clock
         self.project_ids: tuple[str, ...] = ()
+        self._token: CoordinatorToken | None = None
 
     def advance(
         self,
@@ -184,7 +184,7 @@ class _QuarantineTransaction:
         days: int,
         preview: dict | None,
         verify: CandidateVerifier,
-        authority_held: bool = False,
+        token: CoordinatorToken,
         yield_check: Callable[[], bool] | None = None,
     ) -> TransactionOutcome:
         """Recover first, otherwise quarantine one arm-authorized candidate."""
@@ -196,6 +196,8 @@ class _QuarantineTransaction:
             pass
         else:
             raise SessionError("retention transaction requested on an asyncio event-loop thread")
+        token.require_active()
+        self._token = token
         budget = _Budget(
             entries=self.entries,
             deadline_ns=self.clock() + self.worker_ns,
@@ -203,20 +205,7 @@ class _QuarantineTransaction:
             yield_check=yield_check,
         )
         try:
-            self.project_ids = ()
-            if _entry_exists(self.home / _TRASH_NAME, _RESERVATIONS_NAME):
-                registry = self._project_registry()
-                self.project_ids = tuple(
-                    project.project_id for project in registry.list_projects()
-                )
-            authority = (
-                nullcontext()
-                if authority_held
-                else domain_authority(
-                    self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
-                )
-            )
-            with authority, SessionReferenceGate(self.home, self.lease).exclusive():
+            with SessionReferenceGate(self.home, self.lease).exclusive():
                 recovered = self._recover_one(budget)
                 if recovered is not None:
                     return recovered
@@ -228,6 +217,14 @@ class _QuarantineTransaction:
             OSError, ProjectRegistryError, StorageFormatError, TransactionError
         ) as exc:
             return TransactionOutcome(False, _bounded(str(exc)))
+
+    def prepare(self) -> None:
+        self.project_ids = ()
+        if _entry_exists(self.home / _TRASH_NAME, _RESERVATIONS_NAME):
+            registry = self._project_registry()
+            self.project_ids = tuple(
+                project.project_id for project in registry.list_projects()
+            )
 
     def _recover_one(self, budget: _Budget) -> TransactionOutcome | None:
         trash = self.home / _TRASH_NAME
@@ -261,7 +258,7 @@ class _QuarantineTransaction:
     ) -> TransactionOutcome:
         txid = _validated_reservation_name(name, reservation)
         if txns_fd is None:
-            self.lease.delete(reservations_fd, name)
+            self._delete(self._token, reservations_fd, name)
             return TransactionOutcome(
                 True, session_id=reservation["session_id"], completed=True
             )
@@ -270,7 +267,7 @@ class _QuarantineTransaction:
                 txid, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=txns_fd
             )
         except FileNotFoundError:
-            self.lease.delete(reservations_fd, name)
+            self._delete(self._token, reservations_fd, name)
             return TransactionOutcome(
                 True, session_id=reservation["session_id"], completed=True
             )
@@ -307,7 +304,7 @@ class _QuarantineTransaction:
             finally:
                 os.close(tree_fd)
             if manifest_missing:
-                self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
+                self._publish(self._token, txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
                 return TransactionOutcome(True, session_id=reservation["session_id"])
             _match_manifest(reservation, manifest)
             return self._advance_manifest(
@@ -328,7 +325,7 @@ class _QuarantineTransaction:
             )
         _match_manifest(reservation, manifest)
         if manifest["stage"] == "removing":
-            self._publish(
+            self._publish(self._token,
                 txn_fd,
                 _MANIFEST_NAME,
                 {**manifest, "stage": "removed"},
@@ -337,7 +334,7 @@ class _QuarantineTransaction:
             return TransactionOutcome(True, session_id=reservation["session_id"])
         if manifest["stage"] != "removed":
             raise TransactionError("retention tree disappeared before removal")
-        self.lease.delete(txn_fd, _MANIFEST_NAME)
+        self._delete(self._token, txn_fd, _MANIFEST_NAME)
         return self._finish_empty_transaction(
             reservations_fd, txns_fd, txn_fd, name, reservation
         )
@@ -349,7 +346,7 @@ class _QuarantineTransaction:
             txns_fd, txn_fd, reservation["transaction_id"]
         )
         if completed:
-            self.lease.delete(reservations_fd, name)
+            self._delete(self._token, reservations_fd, name)
         return TransactionOutcome(
             True, session_id=reservation["session_id"], completed=completed
         )
@@ -383,7 +380,7 @@ class _QuarantineTransaction:
                     dir_fd=txns_fd,
                 )
                 try:
-                    self._publish(
+                    self._publish(self._token,
                         reservations_fd, f"{session_id}.json", reservation,
                         validate_retention_reservation,
                     )
@@ -410,7 +407,7 @@ class _QuarantineTransaction:
                         "bytes": candidate.bytes,
                         "generation": candidate.generation,
                     }
-                    self._publish(
+                    self._publish(self._token,
                         txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest
                     )
                 finally:
@@ -426,7 +423,7 @@ class _QuarantineTransaction:
         if _entry_exists(self.home / "sessions", session_id):
             if manifest["stage"] != "id_republished":
                 manifest = {**manifest, "stage": "id_republished"}
-                self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
+                self._publish(self._token, txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
             return TransactionOutcome(False, "id_republished", session_id)
         stages = ("quarantined", "projects", "inbox", "attention", "indexes")
         if manifest["stage"] in stages:
@@ -437,27 +434,27 @@ class _QuarantineTransaction:
                 else "references-clean"
             )
             manifest = {**manifest, "stage": following}
-            self._publish(
+            self._publish(self._token,
                 txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest
             )
             return TransactionOutcome(True, session_id=session_id)
         if manifest["stage"] == "references-clean":
             manifest = {**manifest, "stage": "removing"}
-            self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
+            self._publish(self._token, txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
             return TransactionOutcome(True, session_id=session_id)
         if manifest["stage"] == "removing":
             if not self._remove_tree_step(txn_fd, manifest, budget):
                 return TransactionOutcome(True, session_id=session_id)
             manifest = {**manifest, "stage": "removed"}
-            self._publish(txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
+            self._publish(self._token, txn_fd, _MANIFEST_NAME, manifest, validate_retention_manifest)
             return TransactionOutcome(True, session_id=session_id)
         if manifest["stage"] == "removed":
-            self.lease.delete(txn_fd, _MANIFEST_NAME)
+            self._delete(self._token, txn_fd, _MANIFEST_NAME)
             if not _remove_empty_transaction(
                 txns_fd, txn_fd, manifest["transaction_id"]
             ):
                 raise TransactionError("retention transaction directory is not empty")
-            self.lease.delete(reservations_fd, reservation_name)
+            self._delete(self._token, reservations_fd, reservation_name)
             return TransactionOutcome(True, session_id=session_id, completed=True)
         return TransactionOutcome(False, "retention transaction is blocked", session_id)
 
@@ -530,7 +527,7 @@ class _QuarantineTransaction:
             directory_fd = _descend(txn_fd, (_TREE_NAME, *path))
         except FileNotFoundError:
             frontier.pop()
-            self._publish_state({**state, "frontier": [list(p) for p in frontier]})
+            self._publish_state(self._token, {**state, "frontier": [list(p) for p in frontier]})
             return not frontier
         try:
             first = _first_entry(directory_fd, budget)
@@ -541,7 +538,7 @@ class _QuarantineTransaction:
             os.close(directory_fd)
         _remove_empty_tree_directory(txn_fd, path)
         frontier.pop()
-        self._publish_state({**state, "frontier": [list(p) for p in frontier]})
+        self._publish_state(self._token, {**state, "frontier": [list(p) for p in frontier]})
         return not frontier
 
     def _remove_tree_entry(self, directory_fd, path, entry, state, frontier) -> None:
@@ -550,11 +547,11 @@ class _QuarantineTransaction:
             if len(path) >= _MAX_DEPTH:
                 raise TransactionError("retention trash is too deep")
             frontier.append((*path, entry.name))
-            self._publish_state({**state, "frontier": [list(p) for p in frontier]})
+            self._publish_state(self._token, {**state, "frontier": [list(p) for p in frontier]})
             return
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise TransactionError("unsafe retention trash entry")
-        self._publish_state(state)
+        self._publish_state(self._token, state)
         os.unlink(entry.name, dir_fd=directory_fd)
         os.fsync(directory_fd)
 
@@ -565,7 +562,12 @@ class _QuarantineTransaction:
         finally:
             os.close(home_fd)
 
-    def _publish(self, directory_fd, name, payload, validate) -> None:
+    def _delete(self, token: CoordinatorToken, directory_fd, name) -> None:
+        token.require_active()
+        self.lease.delete(directory_fd, name)
+
+    def _publish(self, token: CoordinatorToken, directory_fd, name, payload, validate) -> None:
+        token.require_active()
         validate(payload)
         self.lease.publish_json(
             directory_fd, name, mapping_mutations(payload),
@@ -573,11 +575,12 @@ class _QuarantineTransaction:
             initial={},
         )
 
-    def _publish_state(self, state: dict) -> None:
+    def _publish_state(self, token: CoordinatorToken, state: dict) -> None:
+        token.require_active()
         validate_retention_state(state)
         home_fd = _open_home(self.home)
         try:
-            self._publish(home_fd, _STATE_NAME, state, validate_retention_state)
+            self._publish(token, home_fd, _STATE_NAME, state, validate_retention_state)
         finally:
             os.close(home_fd)
 

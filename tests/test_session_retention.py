@@ -45,27 +45,85 @@ def _directory(path):
 
 def test_retention_durable_writers_have_one_owner():
     root = Path(__file__).parents[1] / "src"
-    forbidden = {"atomic_publish_file", "_store_state", "unlink_session_file"}
-    writers = []
-    retention_names = {"retention-history.jsonl", "retention-state.json", "retention-arm.json"}
+    retention_names = {
+        "retention-history.jsonl", "retention-state.json", "retention-arm.json",
+        "reservations", "transactions", "manifest.json",
+    }
+    low_level = {
+        "open", "write_text", "write_bytes", "write", "replace", "rename", "link",
+        "unlink", "atomic_publish_file", "publish_json", "os_write",
+    }
+    seams = {
+        "append_retention_history", "_store_state", "_publish_arm", "_remove_sidecars",
+        "_publish", "_publish_state",
+    }
+    allowed = {"append_retention_history", "_store_state", "_publish_arm", "_remove_sidecars", "_publish", "_publish_state", "_delete"}
+    violations = []
+
+    def call_name(call):
+        return call.func.id if isinstance(call.func, ast.Name) else (
+            call.func.attr if isinstance(call.func, ast.Attribute) else None
+        )
+
+    def has_retention_target(call):
+        return any(
+            (isinstance(value, ast.Constant) and value.value in retention_names)
+            or (isinstance(value, ast.Name) and value.id in {"_STATE_NAME", "_STATE_FILENAME", "_ARM_NAME", "_ARM_FILENAME", "_HISTORY_FILENAME", "_MANIFEST_NAME"})
+            for arg in call.args for value in ast.walk(arg)
+        )
+
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {}
+        functions = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions[parent] = parent.name
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            if not isinstance(node, ast.Call):
                 continue
-            if node.func.id in forbidden:
-                is_retention_path = path.as_posix().endswith("session_retention/__init__.py")
-                has_retention_name = any(
-                    isinstance(value, ast.Constant) and value.value in retention_names
-                    for value in ast.walk(node)
-                )
-                if is_retention_path or has_retention_name:
-                    writers.append((path.relative_to(root).as_posix(), node.func.id))
-    assert {path for path, _name in writers} == {"zeta/session_retention/__init__.py"}
-    assert sorted(name for _path, name in writers) == [
-        "_store_state", "_store_state", "atomic_publish_file", "atomic_publish_file", "atomic_publish_file",
-        "unlink_session_file", "unlink_session_file",
-    ]
+            name = call_name(node)
+            if name not in low_level | seams:
+                continue
+            owners = []
+            parent = node
+            while parent is not None:
+                parent = parents.get(parent)
+                if parent in functions:
+                    owners.append(functions[parent])
+            owner = next((value for value in owners if value in allowed), owners[0] if owners else None)
+            target = has_retention_target(node) or name in seams or (
+                name in {"atomic_publish_file", "unlink_session_file", "publish_json"}
+                and any(value in allowed for value in owners)
+            )
+            if not target:
+                continue
+            if name in seams:
+                if not node.args:
+                    violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} missing coordinator token")
+                continue
+            if owner not in allowed:
+                violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} can write retention durable data outside a token seam")
+            elif owner in {"_publish", "_publish_state"} and owner == "_publish" and not node.args:
+                violations.append(f"{path.relative_to(root)}:{node.lineno}: {name} missing coordinator token")
+    assert not violations, "\\n".join(violations)
+
+
+def test_retention_publication_rejects_token_after_authority_exit(tmp_path):
+    from zeta.session_retention import append_retention_history, retention_result
+
+    with _opened_lease(tmp_path) as lease:
+        with _coordinator_authority(tmp_path) as token:
+            pass
+        with pytest.raises(RuntimeError, match="no longer active"):
+            append_retention_history(
+                token,
+                tmp_path,
+                lease,
+                retention_result(timestamp="0", mode="preview", days=30),
+            )
 
 
 def test_retention_history_trims_oldest_row(tmp_path):
@@ -1727,9 +1785,9 @@ def _run_fault_transaction(home, details, monkeypatch, *, fail_at=None, cancel=F
         finally:
             active = False
 
-    def publish(owner, directory_fd, name, payload, validate):
+    def publish(owner, token, directory_fd, name, payload, validate):
         step(f"publish:{name}")
-        return real_publish(owner, directory_fd, name, payload, validate)
+        return real_publish(owner, token, directory_fd, name, payload, validate)
 
     class TransactionOs:
         def __getattr__(self, name):

@@ -45,12 +45,6 @@ from ..storage_format import (
 )
 from .handshake import planner_request_pending
 from .pin import is_retention_pinned
-from .transaction import (
-    Candidate,
-    CandidateRejected,
-    TransactionOutcome,
-    _QuarantineTransaction,
-)
 
 _STATE_FILENAME = "retention-state.json"
 _HISTORY_FILENAME = "retention-history.jsonl"
@@ -215,6 +209,14 @@ class CoordinatorToken:
         self._active = False
 
 
+from .transaction import (
+    Candidate,
+    CandidateRejected,
+    TransactionOutcome,
+    _QuarantineTransaction,
+)
+
+
 @contextmanager
 def _coordinator_authority(root: Path):
     with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
@@ -297,6 +299,21 @@ def _try_authority(root: Path, *, exclusive: bool, deadline: float):
             time.sleep(min(0.01, deadline - time.monotonic()))
 
 
+def _publish_arm(token: CoordinatorToken, home_fd: int, arm: dict) -> None:
+    token.require_active()
+    validate_retention_arm(arm)
+    atomic_publish_file(
+        home_fd, _ARM_FILENAME,
+        (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+    )
+
+
+def _remove_sidecars(token: CoordinatorToken, home_fd: int) -> None:
+    token.require_active()
+    unlink_session_file(home_fd, _ARM_FILENAME)
+    unlink_session_file(home_fd, _STATE_FILENAME)
+
+
 def retention_authority(
     home: str | Path, lease: WriterLease, *, days: int,
     zeta_version: str | None = None,
@@ -333,8 +350,7 @@ def retention_authority(
                             retention_result(timestamp=now(), mode="disabled", days=0),
                             True,
                         )
-                    unlink_session_file(home_fd, _ARM_FILENAME)
-                    unlink_session_file(home_fd, _STATE_FILENAME)
+                    _remove_sidecars(token, home_fd)
                 finally:
                     os.close(home_fd)
                 projection = retention_result(timestamp=now(), mode="disarmed", days=0)
@@ -358,8 +374,7 @@ def retention_authority(
                         "armed_by_zeta_version": zeta_version or package_version("zeta"),
                         "armed_at": now(), "preview_id": preview["preview_id"],
                     }
-                    validate_retention_arm(arm)
-                    atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode())
+                    _publish_arm(token, home_fd, arm)
                     projection = retention_result(timestamp=now(), mode="armed", days=days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
                     append_retention_history(token, root, lease, projection)
                     return RetentionAuthorityResult(_ARM_WARNING, projection, True)
@@ -686,13 +701,15 @@ class RetentionPlanner:
             worker_ns=self.bounds.worker_ns,
             clock=self._now_ns,
         )
-        outcome = transaction.advance(
-            days=days,
-            preview=self._latest if type(self._latest) is dict else None,
-            verify=self._verify_candidate,
-            authority_held=False,
-            yield_check=yield_check or (lambda: planner_request_pending(self.home)),
-        )
+        transaction.prepare()
+        with _coordinator_authority(self.home) as token:
+            outcome = transaction.advance(
+                days=days,
+                preview=self._latest if type(self._latest) is dict else None,
+                verify=self._verify_candidate,
+                token=token,
+                yield_check=yield_check or (lambda: planner_request_pending(self.home)),
+            )
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
             return transaction_result
