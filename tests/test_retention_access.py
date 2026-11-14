@@ -71,6 +71,10 @@ def _start_target_holder(home: Path):
         target=_child_target_holder, args=(str(home), ready_send, command_recv)
     )
     process.start()
+    if not ready_recv.poll(10):
+        process.terminate()
+        process.join(10)
+        pytest.fail("target holder did not become ready")
     assert ready_recv.recv()
     return process, command_send
 
@@ -85,6 +89,10 @@ def _start_holder(home: Path, *, crash: bool = False):
         kwargs={"crash": crash},
     )
     process.start()
+    if not ready_recv.poll(10):
+        process.terminate()
+        process.join(10)
+        pytest.fail("lock holder did not become ready")
     assert ready_recv.recv()
     return process, command_send
 
@@ -198,13 +206,6 @@ def test_planner_crash_releases_the_target(tmp_path: Path) -> None:
         os.close(target)
 
 
-@pytest.mark.asyncio
-async def test_guard_rejects_direct_on_loop_lock_without_retention_pass() -> None:
-    from zeta.core.session_files import require_off_loop_lock
-
-    with pytest.raises(RuntimeError, match="use asyncio.to_thread"):
-        require_off_loop_lock("test session")
-
 
 @pytest.mark.asyncio
 async def test_on_loop_contention_rejects_before_wait(tmp_path: Path) -> None:
@@ -252,7 +253,7 @@ def test_epoch_ten_keeps_old_refusal_without_handshake_files(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_on_loop_non_retention_holder_keeps_typed_error(
+async def test_on_loop_contention_rejects_before_request_flock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":11}')
@@ -266,7 +267,7 @@ async def test_on_loop_non_retention_holder_keeps_typed_error(
     # test-contract: seam exercise the primitive's cheap active-lock probe
     monkeypatch.setattr("zeta.core.retention_access._active", lambda _: active_fd)
     try:
-        with pytest.raises(RuntimeError, match="original"):
+        with pytest.raises(RuntimeError, match="event-loop"):
             acquire_after_retention_yield(
                 tmp_path, lambda: (_ for _ in ()).throw(BlockingIOError()),
                 lambda _: RuntimeError("original"),

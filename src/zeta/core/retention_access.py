@@ -96,6 +96,7 @@ def acquire_after_retention_yield(
         os.close(active_fd)
         raise blocked(first) from first
     try:
+        _off_loop()
         fcntl.flock(request_fd, fcntl.LOCK_SH)
         try:
             fcntl.flock(active_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

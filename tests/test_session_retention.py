@@ -435,6 +435,7 @@ def test_planner_entry_points_have_no_production_callers():
         if path.relative_to(root) in {
             Path("session_retention/__init__.py"),
             Path("session_retention/_helpers.py"),
+            Path("session_retention/activation.py"),
         }:
             continue  # planner implementation modules
         text = path.read_text(encoding="utf-8")

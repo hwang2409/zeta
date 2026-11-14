@@ -280,6 +280,10 @@ def _start_retention_holder(home: Path, session_id: str, *, crashed: bool = Fals
         args=(str(home), session_id, ready_send, command_recv, crashed),
     )
     process.start()
+    if not ready_recv.poll(10):
+        process.terminate()
+        process.join(10)
+        pytest.fail("retention holder did not become ready")
     assert ready_recv.recv()
     return process, command_send
 

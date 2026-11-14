@@ -6,9 +6,19 @@ import asyncio
 import inspect
 from collections.abc import Callable
 from datetime import UTC, datetime
-from importlib import import_module
 from pathlib import Path
 from typing import Any
+
+from ..storage_format import StorageFeature, feature_enabled
+from . import (
+    RetentionPlanner,
+    append_retention_history,
+    project_retention_result,
+    read_retention_history,
+    retention_authority,
+    retention_result,
+)
+from .handshake import planner_active, planner_request_pending
 
 
 class _PublishedPass(dict[str, object]):
@@ -23,27 +33,21 @@ def make_retention_owner(
     """Build the process owner from an already-open home lease."""
     from ..config.settings import load_settings
 
-    retention_module = import_module(".", __package__)
-    planner_type = getattr(retention_module, "Retention" + "Planner")
-    append_retention_history = retention_module.append_retention_history
-    read_retention_history = retention_module.read_retention_history
-    project_retention_result = retention_module.project_retention_result
     root = Path(home)
     retained = lease.retain()
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
-        result = getattr(planner, "run_" + "pass")(days=current_days)
+        result = planner.run_pass(days=current_days)
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
-        if (root / "retention-arm.json").is_file():
-            history = read_retention_history(root)
-            if history and history[-1].get("mode") == "armed":
-                return _PublishedPass(dict(history[-1]), complete=result.complete)
+        history = read_retention_history(root)
+        if history and history[-1].get("mode") == "armed":
+            projection = dict(history[-1])
         append_retention_history(root, retained, projection)
         return _PublishedPass(projection, complete=result.complete)
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:
-        projection = retention_module.retention_result(
+        projection = retention_result(
             timestamp=datetime.now(UTC).isoformat(),
             mode="none",
             days=current_days,
@@ -53,12 +57,14 @@ def make_retention_owner(
         return projection
 
     return RetentionActivationOwner(
-        lambda: planner_type(root, retained),
+        lambda: RetentionPlanner(root, retained),
         days or (lambda: load_settings(home=root).settings.retention_days),
         run_pass=run_pass,
         on_error=record_error,
         home=root,
         close_lease=retained.close,
+        activation_enabled=feature_enabled(retained.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION),
+        disable=lambda: retention_authority(root, retained, days=0).projection,
     )
 
 
@@ -77,6 +83,8 @@ class RetentionActivationOwner:
         on_error: Callable[[Exception, int], Any] | None = None,
         home: str | Path | None = None,
         close_lease: Callable[[], Any] | None = None,
+        activation_enabled: bool = True,
+        disable: Callable[[], Any] | None = None,
     ) -> None:
         self._planner_factory = planner_factory
         self._home = Path(home) if home is not None else None
@@ -96,6 +104,8 @@ class RetentionActivationOwner:
         self._planner: Any = None
         self._episode_task: asyncio.Task[tuple[list[Any], Exception | None]] | None = None
         self._close_lease = close_lease
+        self._activation_enabled = activation_enabled
+        self._disable = disable
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -132,9 +142,7 @@ class RetentionActivationOwner:
         failure: Exception | None = None
         planner = None
         try:
-            from .handshake import planner_active, planner_request_pending
-
-            if self._home is not None and planner_request_pending(self._home):
+            if not self._activation_enabled or (self._home is not None and planner_request_pending(self._home)):
                 return projections, None
             planner = self._planner_factory()
             self._planner = planner
@@ -143,17 +151,18 @@ class RetentionActivationOwner:
                 return projections, None
             context = planner_active(self._home) if self._home is not None else _null_context()
             with context:
-                while not self._stop.is_set():
-                    if self._home is not None and planner_request_pending(self._home):
-                        break
-                    days = self._days()
-                    if days == 0:
-                        break
-                    result = self._run_pass(planner, days)
-                    projections.append(result)
-                    # each bounded pass is its own episode; close its leases before
-                    # the event loop can publish or wait for the next pass.
-                    break
+                days = self._days()
+                if days == 0:
+                    if self._disable is not None:
+                        projections.append(self._disable())
+                elif self._home is None or not planner_request_pending(self._home):
+                    projections.append(self._run_pass(planner, days))
+                planner.close()
+                planner = None
+                self._planner = None
+                self._planner_closed.set()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001 - keep the owner alive after pass errors
             failure = exc
         finally:
@@ -169,31 +178,32 @@ class RetentionActivationOwner:
         try:
             await asyncio.sleep(0)
             while not self._stop.is_set():
-                if self._days() == 0:
-                    self._wake.clear()
-                    try:
-                        await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
-                    except TimeoutError:
-                        pass
-                    continue
                 self._episode_task = asyncio.create_task(
                     asyncio.to_thread(self._run_episode), name="retention-episode"
                 )
                 projections, failure = await asyncio.shield(self._episode_task)
                 self._episode_task = None
-                for projection in projections:
-                    if self._publish is not None:
-                        published = self._publish(projection)
-                        if inspect.isawaitable(published):
-                            await published
-                if failure is not None and not self._stop.is_set():
-                    error = await asyncio.to_thread(self._on_error, failure, self._days())
-                    if self._publish is not None:
-                        published = self._publish(error)
-                        if inspect.isawaitable(published):
-                            await published
+                try:
+                    for projection in projections:
+                        if self._publish is not None:
+                            published = self._publish(projection)
+                            if inspect.isawaitable(published):
+                                await published
+                    if failure is not None and not self._stop.is_set():
+                        error = await asyncio.to_thread(self._on_error, failure, self._days())
+                        if self._publish is not None:
+                            published = self._publish(error)
+                            if inspect.isawaitable(published):
+                                await published
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - publication must not kill the owner
+                    failure = exc
                 if self._stop.is_set():
                     return
+                if projections and any(getattr(p, "get", lambda *_: None)("mode") == "preview" and not getattr(p, "complete", True) for p in projections):
+                    await asyncio.sleep(0)
+                    continue
                 self._wake.clear()
                 try:
                     await asyncio.wait_for(self._wake.wait(), self._wake_seconds)

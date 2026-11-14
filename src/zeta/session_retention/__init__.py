@@ -118,6 +118,7 @@ class PassResult:
 
     enabled: bool
     complete: bool
+    mode: str | None = None
     reasons: tuple[RootOutcome, ...] = ()
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
@@ -164,6 +165,11 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
     preview = result.preview
     if not result.enabled:
         return retention_result(timestamp=timestamp, mode="disabled", days=0)
+    if result.mode is not None:
+        return retention_result(
+            timestamp=timestamp, mode=result.mode, days=days,
+            errors=tuple(reason.reason for reason in result.reasons if reason.reason),
+        )
     if preview is None:
         errors = tuple(reason.reason for reason in result.reasons if reason.reason)
         return retention_result(
@@ -177,9 +183,11 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
     )
 
 
-def append_retention_history(home: str | Path, lease: WriterLease, result: Mapping[str, object]) -> None:
+def append_retention_history(
+    home: str | Path, lease: WriterLease, result: Mapping[str, object], *, authority_held: bool = False
+) -> None:
     """Durably replace the bounded, validated retention history."""
-    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
         return
     validate_retention_history(result)
     path = Path(home) / _HISTORY_FILENAME
@@ -199,14 +207,20 @@ def append_retention_history(home: str | Path, lease: WriterLease, result: Mappi
     except (OSError, ValueError, StorageFormatError) as exc:
         raise RetentionPlannerError("malformed retention history") from exc
     rows = (rows + [dict(result)])[-_MAX_HISTORY:]
-    home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        atomic_publish_file(
-            home_fd, _HISTORY_FILENAME,
-            ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows)).encode(),
-        )
-    finally:
-        os.close(home_fd)
+    def publish() -> None:
+        home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            atomic_publish_file(
+                home_fd, _HISTORY_FILENAME,
+                ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows)).encode(),
+            )
+        finally:
+            os.close(home_fd)
+    if authority_held:
+        publish()
+    else:
+        with domain_authority(Path(home), RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
+            publish()
 
 
 def retention_arm_warning() -> str:
@@ -254,7 +268,7 @@ def retention_authority(
     if type(days) is not int or not 0 <= days <= 3650:
         raise RetentionPlannerError("retention days must be in 0..3650")
     empty = retention_result(timestamp=now(), mode="none", days=days)
-    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION):
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
         return RetentionAuthorityResult("retention unavailable: upgrade the home before arming", empty, False)
     root = Path(home)
     try:
@@ -263,7 +277,7 @@ def retention_authority(
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
                     unlink_session_file(home_fd, _ARM_FILENAME)
-                    projection = retention_result(timestamp=now(), mode="disabled", days=0)
+                    projection = retention_result(timestamp=now(), mode="disarmed", days=0)
                     append_retention_history(root, lease, projection)
                 finally:
                     os.close(home_fd)
@@ -279,7 +293,7 @@ def retention_authority(
                     if not isinstance(preview, dict) or preview.get("days") != days:
                         message = "retention arm requires a completed preview for the current days"
                         projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
-                        append_retention_history(root, lease, projection)
+                        append_retention_history(root, lease, projection, authority_held=True)
                         return RetentionAuthorityResult(message, projection, False)
                     arm = {
                         "schema_version": 1, "gate_version": 1,
@@ -289,13 +303,21 @@ def retention_authority(
                     validate_retention_arm(arm)
                     atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode())
                     projection = retention_result(timestamp=now(), mode="armed", days=days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
-                    append_retention_history(root, lease, projection)
+                    append_retention_history(root, lease, projection, authority_held=True)
                     return RetentionAuthorityResult(_ARM_WARNING, projection, True)
                 finally:
                     os.close(home_fd)
     except (TimeoutError, SessionReferenceUnavailable):
         message = "retention busy, try again" if days else "retention busy; disarm not applied, try again"
-        projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
+        projection = retention_result(
+            timestamp=now(), mode="disabled" if days == 0 else "none", days=days,
+            errors=(message,), disable_pending=days == 0,
+        )
+        if days == 0:
+            try:
+                append_retention_history(root, lease, projection)
+            except (OSError, RetentionPlannerError):
+                pass
         return RetentionAuthorityResult(message, projection, False)
 
 
@@ -571,6 +593,9 @@ class RetentionPlanner:
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
             self._latest = state["preview"] if state is not None else None
+        if type(self._latest) is dict and self._latest.get("days") != days:
+            self._latest = None
+            self.close()
         transaction = _QuarantineTransaction(
             self.home,
             self.lease,
@@ -582,6 +607,7 @@ class RetentionPlanner:
             days=days,
             preview=self._latest if type(self._latest) is dict else None,
             verify=self._verify_candidate,
+            authority_held=False,
         )
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
@@ -610,7 +636,10 @@ class RetentionPlanner:
             if sweep.root_scan is not None:
                 sweep.root_scan.close()
             self._sweep = None
-        _store_state(home_fd, self._state_payload())
+        with domain_authority(
+            self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
+        ):
+            _store_state(home_fd, self._state_payload())
         return PassResult(
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
@@ -630,6 +659,7 @@ class RetentionPlanner:
         return PassResult(
             enabled=True,
             complete=False,
+            mode="deleted" if outcome.completed else ("error" if outcome.blocked else None),
             reasons=reasons,
             preview=_preview_snapshot(self._latest),
         )

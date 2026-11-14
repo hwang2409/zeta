@@ -14,7 +14,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -173,6 +173,7 @@ class _QuarantineTransaction:
         days: int,
         preview: dict | None,
         verify: CandidateVerifier,
+        authority_held: bool = False,
     ) -> TransactionOutcome:
         """Recover first, otherwise quarantine one arm-authorized candidate."""
         try:
@@ -195,9 +196,14 @@ class _QuarantineTransaction:
                 self.project_ids = tuple(
                     project.project_id for project in registry.list_projects()
                 )
-            with domain_authority(
-                self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
-            ), SessionReferenceGate(self.home, self.lease).exclusive():
+            authority = (
+                nullcontext()
+                if authority_held
+                else domain_authority(
+                    self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
+                )
+            )
+            with authority, SessionReferenceGate(self.home, self.lease).exclusive():
                 recovered = self._recover_one(budget)
                 if recovered is not None:
                     return recovered
