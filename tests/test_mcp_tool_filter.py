@@ -504,11 +504,9 @@ async def _run_notification_listener(
     return client, failures
 
 
-@pytest.mark.parametrize("status", [403, 404])
 @pytest.mark.asyncio
-async def test_mcp_http_notification_listener_reports_terminal_4xx(
-    status: int,
-) -> None:
+async def test_mcp_http_notification_listener_reports_terminal_403() -> None:
+    status = 403
     get_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:

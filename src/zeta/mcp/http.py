@@ -122,7 +122,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._owns_spill_store = spill_store is None
         self._token_lock = asyncio.Lock()
         self._session_generation = 0
-        self._session_needs_initialize = True
+        self._session_needs_initialize = False
         self._session_recovery_task: asyncio.Task[None] | None = None
         self._credential_store = MCPCredentialStore(home=home)
 
