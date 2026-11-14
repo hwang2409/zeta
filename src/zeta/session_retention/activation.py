@@ -22,9 +22,18 @@ from .handshake import planner_active, planner_request_pending
 
 
 class _PublishedPass(dict[str, object]):
-    def __init__(self, projection: dict[str, object], *, complete: bool) -> None:
+    def __init__(
+        self, projection: dict[str, object], *, complete: bool, progressed: bool = False
+    ) -> None:
         super().__init__(projection)
         self.complete = complete
+        self.progressed = progressed
+
+
+def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
+    return {key: value for key, value in left.items() if key != "timestamp"} == {
+        key: value for key, value in right.items() if key != "timestamp"
+    }
 
 
 def make_retention_owner(
@@ -37,7 +46,9 @@ def make_retention_owner(
     root = Path(home)
     retained = lease.retain()
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
+        before = repr(getattr(planner, "_state_payload", lambda: None)())
         result = planner.run_pass(days=current_days)
+        after = repr(getattr(planner, "_state_payload", lambda: None)())
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
@@ -49,8 +60,11 @@ def make_retention_owner(
             and result.mode is None
         ):
             projection = dict(history[-1])
-        append_retention_history(root, retained, projection)
-        return _PublishedPass(projection, complete=result.complete)
+        if not history or not _same_projection(history[-1], projection):
+            append_retention_history(root, retained, projection)
+        return _PublishedPass(
+            projection, complete=result.complete, progressed=before != after
+        )
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:
         projection = retention_result(
@@ -168,11 +182,10 @@ class RetentionActivationOwner:
                     if self._disable is not None:
                         projections.append(self._disable())
                 else:
-                    while self._home is None or not planner_request_pending(self._home):
-                        projection = self._run_pass(planner, days)
-                        projections.append(projection)
-                        if getattr(projection, "complete", True):
-                            break
+                    if self._stop.is_set():
+                        return projections, None
+                    if self._home is None or not planner_request_pending(self._home):
+                        projections.append(self._run_pass(planner, days))
                 planner.close()
                 planner = None
                 self._planner = None
@@ -200,11 +213,18 @@ class RetentionActivationOwner:
                 projections, failure = await asyncio.shield(self._episode_task)
                 self._episode_task = None
                 try:
+                    published_projection: dict[str, object] | None = None
                     for projection in projections:
+                        if (
+                            published_projection is not None
+                            and _same_projection(published_projection, projection)
+                        ):
+                            continue
                         if self._publish is not None:
                             published = self._publish(projection)
                             if inspect.isawaitable(published):
                                 await published
+                        published_projection = projection
                     if failure is not None and not self._stop.is_set():
                         error = await asyncio.to_thread(self._on_error, failure, self._days())
                         if self._publish is not None:
@@ -217,7 +237,16 @@ class RetentionActivationOwner:
                     failure = exc
                 if self._stop.is_set():
                     return
-                if projections and any(getattr(p, "get", lambda *_: None)("mode") == "preview" and not getattr(p, "complete", True) for p in projections):
+                if (
+                    projections
+                    and any(
+                        getattr(p, "get", lambda *_: None)("mode") == "preview"
+                        and not getattr(p, "complete", True)
+                        and getattr(p, "progressed", False)
+                        for p in projections
+                    )
+                    and not (self._home is not None and planner_request_pending(self._home))
+                ):
                     await asyncio.sleep(0)
                     continue
                 self._wake.clear()

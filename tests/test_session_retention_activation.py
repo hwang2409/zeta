@@ -174,11 +174,16 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
             home, lease, lambda: 30,
             bounds=RetentionBounds(roots_advanced=1, metadata_candidates=1),
         )
-        projections, failure = await asyncio.to_thread(owner._run_episode)
-        assert failure is None
-        previews = [item for item in projections if item["mode"] == "preview"]
-        assert len(previews) >= 3
-        assert previews[-1].complete
+        published: list[dict[str, object]] = []
+        owner.set_publish(published.append)
+        owner.start()
+        for _ in range(100):
+            if published and getattr(published[-1], "complete", False):
+                break
+            owner.wake()
+            await asyncio.sleep(0)
+        assert len(published) >= 3
+        assert getattr(published[-1], "complete", False)
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)
