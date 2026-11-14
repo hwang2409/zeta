@@ -255,8 +255,10 @@ def test_fork_picker_and_persisted_message_check_use_compact_facts(
         monkeypatch.setattr("zeta.core.store._rows.os.pread", reject_payload_read)
         forkpoints = reopened.list_user_message_forkpoints()
         checkpoints = reopened.list_checkpoints()
+        branches = reopened.list_branches()
         assert forkpoints[0][2] == "first prompt"
         assert checkpoints[0][1] == "prompt 0"
+        assert branches[0].message_count == 71
         assert reopened.active_branch_contains_message(first_message)
         assert not reopened.active_branch_contains_message(
             with_message_origin(message(MessageRole.USER, "missing"), MessageOrigin.USER)

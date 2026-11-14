@@ -165,8 +165,8 @@ class ForkPoint:
 class BranchInfo:
     """One leaf of the parent-linked conversation tree."""
 
-    head: ConversationEntry
-    divergence: ConversationEntry | None
+    head: ForkPoint
+    divergence: ForkPoint | None
     preview: str
     message_count: int
     is_current: bool
@@ -185,7 +185,7 @@ def _message_preview(entry: ConversationEntry) -> str | None:
 
 
 def list_branches_from_entries(
-    entries: Iterable[ConversationEntry],
+    entries: Iterable[Any],
 ) -> list[BranchInfo]:
     """Enumerate every leaf from one conversation snapshot."""
 
@@ -216,26 +216,40 @@ def list_branches_from_entries(
                 break
             walker = by_id.get(walker.parent_id)
         chain.reverse()
-        preview = ""
-        for candidate in reversed(chain):
-            if candidate.type != "message":
-                continue
+        def user_preview(candidate: Any) -> str | None:
+            facts = getattr(candidate, "facts", None)
+            if facts is not None:
+                if not getattr(facts, "is_user", False):
+                    return None
+                return getattr(facts, "message_preview", None) or "[non-text message]"
             candidate_message = Message.from_dict(candidate.data["message"])
-            if candidate_message.role is MessageRole.USER:
-                preview = _message_preview(candidate) or ""
-                break
-        if not preview:
-            preview = f"seq {entry.seq}"
+            if candidate_message.role is not MessageRole.USER:
+                return None
+            return _message_preview(candidate) or ""
+
+        preview = next(
+            (
+                value
+                for candidate in reversed(chain)
+                if candidate.type == "message"
+                for value in [user_preview(candidate)]
+                if value is not None
+            ),
+            f"seq {entry.seq}",
+        )
         message_count = sum(
-            1
+            user_preview(candidate) is not None
             for candidate in chain
             if candidate.type == "message"
-            and Message.from_dict(candidate.data["message"]).role is MessageRole.USER
         )
         branches.append(
             BranchInfo(
-                head=entry,
-                divergence=divergence,
+                head=ForkPoint(entry.seq, entry.id),
+                divergence=(
+                    ForkPoint(divergence.seq, divergence.id)
+                    if divergence is not None
+                    else None
+                ),
                 preview=preview,
                 message_count=message_count,
                 is_current=(entry.id == active_head_id),
@@ -451,8 +465,7 @@ class CheckpointForkMixin:
     def list_branches(self) -> list[BranchInfo]:
         """Enumerate every leaf in the parent-linked tree."""
 
-        all_rows = tuple(self._resident_rows.entry(ref) for ref in self._resident_rows.rows)
-        return list_branches_from_entries(all_rows)
+        return list_branches_from_entries(self._resident_rows.rows)
 
     def switch_to_branch(self, head_entry_id: str) -> ConversationEntry:
         """Re-anchor the active branch on a leaf via a fork entry.
