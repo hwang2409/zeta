@@ -21,9 +21,9 @@ from zeta.session_retention import (
     RetentionBounds,
     RetentionPlanner,
     Yielded,
+    disarm_retention,
     read_retention_history,
     retention_authority,
-    disarm_retention,
 )
 from zeta.session_retention.activation import (
     Published,
