@@ -156,7 +156,7 @@ class EndProbe:
     lifecycle read from disk at the moment of publication."""
 
     session_dir: Path
-    ended: list[tuple[str, int, dict[str, Any]]] = field(default_factory=list)
+    ended: list[tuple[str, int, Path]] = field(default_factory=list)
 
     def sink(
         self,
@@ -168,11 +168,14 @@ class EndProbe:
     ) -> None:
         del store
         if kind == "ended":
-            durable = load_session_json(_lifecycle_path(self.session_dir, run_id))
-            self.ended.append((run_id, number, durable))
+            self.ended.append((run_id, number, _lifecycle_path(self.session_dir, run_id)))
 
-    def for_run(self, run_id: str) -> list[tuple[int, dict[str, Any]]]:
-        return [(number, durable) for run, number, durable in self.ended if run == run_id]
+    async def for_run(self, run_id: str) -> list[tuple[int, dict[str, Any]]]:
+        return [
+            (number, await asyncio.to_thread(load_session_json, path))
+            for run, number, path in self.ended
+            if run == run_id
+        ]
 
 
 async def _until(client: ReplayClient, name: str, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -319,7 +322,7 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
                 "nested child_started must precede its forwarded agent_start"
             )
         assert _lifecycle(before_end, "child_ended", target) == []
-        assert probe.for_run(target) == []
+        assert await probe.for_run(target) == []
         if route.outcome == "canceled":
             aborted = await serve.controller.request(serve.request_id(), "abort", {})
             assert aborted["result"]["aborted"] is True, aborted
@@ -363,7 +366,7 @@ async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
                 child_store.close()
         assert end["sequence"] == receipt.seq, (end, receipt)
         # the lifecycle was terminal on disk when the receipt published the end
-        published = probe.for_run(target)
+        published = await probe.for_run(target)
         assert [number for number, _durable in published] == [receipt.seq]
         assert published[0][1]["state"] in TERMINAL and published[0][1].get("finished_at")
         # 5. a nested run's root display mirror is not a second parent event
@@ -601,7 +604,7 @@ async def test_recovered_terminal_route_presents_one_durable_child_ended(
             receipt = receipts[0]
             # a run recovery finishes publishes once, and only after its lifecycle is
             # final on disk; an existing receipt and a later recovery publish nothing
-            published = probe.for_run(target)
+            published = await probe.for_run(target)
             expected = [] if route.state == "existing" or attempt else [receipt.seq]
             assert [number for number, _durable in published] == expected, published
             for _number, durable in published:
@@ -665,7 +668,7 @@ async def test_recovery_that_loses_the_receipt_race_publishes_nothing(
     try:
         serve = await _resumed(tmp_path, transport, session_id)
         assert raced == [False]
-        assert probe.for_run(target) == []
+        assert await probe.for_run(target) == []
         watcher = await serve.observer()
         history = (await serve.join(watcher, f"{session_id}:1" if nested else None))["messages"]
         ended = _lifecycle(history, "child_ended", target)
@@ -1110,7 +1113,7 @@ async def test_child_setup_failure_ends_once_after_its_failed_lifecycle(
             and (entry.data["message"].get("tool_result") or {}).get("tool_call_id") == "agent-1"
         ]
         assert ends[0]["sequence"] == receipt.seq
-        published = probe.for_run(run_id)
+        published = await probe.for_run(run_id)
         assert [number for number, _durable in published] == [receipt.seq]
         assert published[0][1]["state"] == "failed" and published[0][1].get("finished_at")
     finally:
@@ -1211,7 +1214,7 @@ async def test_cancel_at_each_background_transition_await_still_publishes_one_co
         assert ends[0]["child"]["status"] == "completed" and "finished_at" in ends[0]["child"]
         receipt = _receipt_entry(serve.store, route, target, "agent-1")
         assert ends[0]["sequence"] == receipt.seq
-        published = probe.for_run(target)
+        published = await probe.for_run(target)
         assert [number for number, _durable in published] == [receipt.seq]
         assert published[0][1]["state"] == "completed" and published[0][1].get("finished_at")
         durable = await asyncio.to_thread(

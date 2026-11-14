@@ -1121,15 +1121,14 @@ def blocking_session_locks_leave_event_loop(
                 pass
             else:
                 tests_caller = False
-                production_caller = False
-                for frame in traceback.extract_stack()[:-1]:
+                for frame in reversed(traceback.extract_stack()[:-1]):
                     path = Path(frame.filename).resolve()
-                    zeta_path = _REPOSITORY_ROOT / "src" / "zeta"
-                    if path.is_relative_to(zeta_path / "server") or path.is_relative_to(zeta_path / "agent"):
-                        production_caller = True
-                    if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name != "conftest.py":
-                        tests_caller = True
-                if tests_caller and not production_caller:
+                    if path.is_relative_to(_REPOSITORY_ROOT / "src" / "zeta"):
+                        continue
+                    if path.is_relative_to(_TEST_SITE_PACKAGES):
+                        tests_caller = path.name != "conftest.py"
+                    break
+                if tests_caller:
                     raise RuntimeError(
                         "retention lock requested on an asyncio event-loop thread; "
                         "use asyncio.to_thread"
