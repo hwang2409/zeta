@@ -61,7 +61,11 @@ def planner_active(home: Path) -> Iterator[None]:
 
 
 def planner_request_pending(home: Path) -> bool:
-    fd = _fd(home, "user-open-request")
+    path = Path(home) / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "user-open-request")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

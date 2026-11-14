@@ -186,6 +186,11 @@ class RetentionActivationOwner:
         try:
             if not self._activation_enabled or (self._home is not None and planner_request_pending(self._home)):
                 return projections, None
+            days = self._days()
+            if days == 0:
+                if self._disable is not None and self._home is not None and (self._home / "retention-arm.json").is_file():
+                    projections.append(self._disable())
+                return projections, None
             planner = self._planner_factory()
             self._planner = planner
             self._planner_closed.clear()
