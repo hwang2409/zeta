@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -16153,7 +16153,9 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("journey", ("up", "down", "edit", "in-flight"))
+@pytest.mark.parametrize(
+    "journey", ("up", "down", "edit", "in-flight", "in-flight-edit")
+)
 async def test_cold_prompt_history_keys_follow_owned_navigation(
     tmp_path: Path,
     journey: str,
@@ -16183,7 +16185,7 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
     )
     started = asyncio.Event()
     release = asyncio.Event()
-    if journey == "in-flight":
+    if journey in {"in-flight", "in-flight-edit"}:
         prompt_page = app._history_source.prompt_page
 
         async def gated_prompt_page(*args: object, **kwargs: object):
@@ -16248,7 +16250,7 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                 await wait_until(lambda: processed_keys > before)
                 assert session.default_buffer.document.cursor_position_row == 0
                 assert session.default_buffer.text == edited
-            else:
+            elif journey == "in-flight":
                 pipe.send_text("\x1b[A")
                 await await_or_fail(started.wait(), what="cold prompt history load")
                 pipe.send_text("\x1b[A")
@@ -16256,6 +16258,27 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                 release.set()
                 await wait_until(lambda: session.default_buffer.text == prompts[-2])
                 assert changes[-2:] == [prompts[-1], prompts[-2]]
+            else:
+                history_tasks: list[asyncio.Task[None]] = []
+                create_task = asyncio.create_task
+
+                def track_history_task(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+                    task = create_task(coro)
+                    if coro.cr_code.co_qualname.endswith(
+                        "TUIApp._history_previous.<locals>.load"
+                    ):
+                        history_tasks.append(task)
+                    return task
+
+                monkeypatch.setattr(asyncio, "create_task", track_history_task)
+                pipe.send_text("\x1b[A")
+                await await_or_fail(started.wait(), what="cold prompt history load")
+                pipe.send_text("typed draft")
+                await wait_until(lambda: session.default_buffer.text == "typed draft")
+                release.set()
+                await wait_until(lambda: bool(history_tasks))
+                await await_or_fail(history_tasks[0], what="cold prompt history navigation")
+                assert session.default_buffer.text == "typed draft"
 
             session.app.exit()
             await await_or_fail(prompt_task, what="prompt key journey")

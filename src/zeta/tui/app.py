@@ -832,9 +832,14 @@ class TUIApp(
             self._prompt_history.apply(buffer, document)
             return
 
+        navigation_revision = self._prompt_history.navigation_revision
+
         async def load() -> None:
             await self._prompt_history.load_older()
-            if path != self._viewed_session_path():
+            if (
+                path != self._viewed_session_path()
+                or not self._prompt_history.navigation_is_current(navigation_revision)
+            ):
                 return
             document = self._prompt_history.older(path, buffer.document)
             if document is not None:
@@ -850,9 +855,14 @@ class TUIApp(
             self._prompt_history.apply(buffer, document)
             return
 
+        navigation_revision = self._prompt_history.navigation_revision
+
         async def load() -> None:
             await self._prompt_history.load_newer()
-            if path != self._viewed_session_path():
+            if (
+                path != self._viewed_session_path()
+                or not self._prompt_history.navigation_is_current(navigation_revision)
+            ):
                 return
             document = self._prompt_history.newer(path)
             if document is not None:
