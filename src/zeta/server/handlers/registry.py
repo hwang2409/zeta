@@ -393,6 +393,8 @@ async def mcp_refresh_tools(client, request_id, params):
     server = validation.optional_string(params, "server")
     try:
         servers = await runtime.loop.refresh_mcp_tools(server)
+    except ValueError as exc:
+        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, str(exc)) from exc
     except (MCPManagementError, MCPToolRefreshError) as exc:
         data: dict[str, object] = {
             "session_id": runtime.session_id,

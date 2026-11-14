@@ -697,11 +697,23 @@ async def test_explicit_refresh_fences_send_before_unread_list_changed_notificat
         }
         assert mcp.tools_list_calls == 2
 
+        unknown = await _request(
+            reader,
+            writer,
+            5,
+            "mcp_refresh_tools",
+            {"session_id": session["session_id"], "server": "missing"},
+        )
+        assert unknown[-1]["error"] == {
+            "code": -32602,
+            "message": "unknown MCP server: missing",
+        }
+
         mcp.fail_tools_list = True
         failed = await _request(
             reader,
             writer,
-            5,
+            6,
             "mcp_refresh_tools",
             {"session_id": session["session_id"], "server": "page"},
         )
