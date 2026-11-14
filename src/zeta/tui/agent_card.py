@@ -755,7 +755,7 @@ class AgentTranscriptControl(UIControl):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            changed = asyncio.run(self.sync(path))
+            changed = asyncio.run(self.load(path))
             if changed and invalidate is not None:
                 invalidate()
             return changed
@@ -817,6 +817,12 @@ class AgentTranscriptControl(UIControl):
         del deadline
         self._closed = True
         await self.cancel_activation()
+        self._current_path = None
+        self._render_active = None
+        self._root_endpoint = None
+        self._invalidate = None
+        self.on_load = None
+        self.on_history_edge = None
         source, self._source = self._source, None
         if source is not None:
             if inspect.iscoroutinefunction(source.close):
