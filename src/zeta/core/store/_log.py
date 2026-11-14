@@ -752,6 +752,8 @@ class ConversationLogMixin:
         if not accepted:
             self._load_full()
             return
+        if self._history_index is not None:
+            self._history_index.invalidate_status_projection()
         if not self._read_only and not raw.endswith(b"\n"):
             # Preserve the loader's historical recovery for a complete JSON row
             # whose writer omitted only the line terminator.

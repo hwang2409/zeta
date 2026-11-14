@@ -354,6 +354,11 @@ class HistoryIndex:
     def status_projection(self) -> tuple[int, int, tuple[object, ...]] | None:
         return self._status_projection
 
+    def invalidate_status_projection(self) -> None:
+        """Discard a projection that predates a foreign transcript change."""
+        with self._lock:
+            self._status_projection = None
+
     def _set_meta(
         self,
         connection: sqlite3.Connection,

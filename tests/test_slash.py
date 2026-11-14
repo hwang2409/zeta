@@ -1398,6 +1398,39 @@ def test_status_uses_warm_index_without_transcript_payload_reads(
         asyncio.run(app.close())
 
 
+def test_status_projection_tracks_foreign_compaction(tmp_path: Path) -> None:
+    resident = ConversationStore(tmp_path / "sessions")
+    resident.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("source")]),
+            MessageOrigin.USER,
+        )
+    )
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    checkpoint = resident.append_checkpoint("before foreign compaction")
+    foreign = ConversationStore(
+        tmp_path / "sessions", session_id=resident.session_id
+    )
+    foreign.append_compaction_marker("summary", 1, 2)
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("after")]))
+    expected = compaction_history(branch_entries(resident), message_token_count)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), resident, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+
+    try:
+        assert app.slash_status().compaction_history == expected
+        resident.append_fork(str(checkpoint.seq))
+        assert app.slash_status().compaction_history == compaction_history(
+            branch_entries(resident), message_token_count
+        )
+    finally:
+        asyncio.run(app.close())
+        foreign.close()
+
+
 def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:
     def token_count(message: Message) -> int:
         if message.role is MessageRole.COMPACTION:
