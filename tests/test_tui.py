@@ -16152,6 +16152,97 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         assert len(app._prompt_history.pages) <= 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journey", ("up", "finder"))
+async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
+    tmp_path: Path,
+    journey: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    prompts = ("old nightly wipe request", "middle prompt", "newest prompt")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent(prompts[0])]),
+            MessageOrigin.USER,
+        )
+    )
+    for prompt in prompts[1:]:
+        for index in range(256):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"child notice {index}")]),
+                    MessageOrigin.AGENT_SEND,
+                )
+            )
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(prompt)]),
+                MessageOrigin.USER,
+            )
+        )
+    if journey == "finder":
+        for index in range(300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"recent prompt {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        if journey == "up":
+            buffer = Buffer()
+            for expected in reversed(prompts):
+                app._history_previous(buffer)
+                await wait_until(lambda expected=expected: buffer.text == expected)
+            assert buffer.text == prompts[0]
+        else:
+            branch_ref_reads = 0
+            original_branch_refs = store.branch_refs
+
+            def counted_branch_refs():
+                nonlocal branch_ref_reads
+                branch_ref_reads += 1
+                return original_branch_refs()
+
+            monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
+            buffer = Buffer()
+            app._history_finder_open(buffer)
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task,
+                what="initial empty ctrl+r prompt scan",
+            )
+            app._finder_input("nightly wipe")
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task,
+                what="typed ctrl+r prompt scan",
+            )
+            if app._finder_prepare_task is not None:
+                await await_or_fail(
+                    app._finder_prepare_task,
+                    what="ctrl+r candidate preparation",
+                )
+            await wait_until(
+                lambda: (
+                    (state := app._history_finder.finder_state()) is not None
+                    and state.complete
+                    and any("nightly wipe" in row.excerpt for row in state.rows)
+                )
+            )
+            assert branch_ref_reads == 2, "ctrl+r rebuilt a prompt list within a scan"
+
+
 def test_agent_transcript_source_keeps_snapshot_during_active_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16747,23 +16838,23 @@ async def test_root_tui_paging_render_path_table(
                     "switched to branch"
                 )
 
-            original_prompt_page = app._history_source.prompt_page
+            original_prompt_pages = app._history_source.prompt_pages
             started = asyncio.Event()
             release = asyncio.Event()
 
-            async def delayed_prompt_page(cursor=None, *, direction="older"):
-                page = await original_prompt_page(cursor, direction=direction)
-                started.set()
-                await asyncio.wait_for(release.wait(), 10)
-                return page
+            async def delayed_prompt_pages():
+                async for page in original_prompt_pages():
+                    started.set()
+                    await asyncio.wait_for(release.wait(), 10)
+                    yield page
 
-            monkeypatch.setattr(app._history_source, "prompt_page", delayed_prompt_page)
+            monkeypatch.setattr(app._history_source, "prompt_pages", delayed_prompt_pages)
             published: list[tuple[str, ...]] = []
             original_set_snapshot = app._history_finder.set_snapshot
 
-            def record_snapshot(snapshot: tuple[str, ...]) -> None:
+            def record_snapshot(snapshot: tuple[str, ...]) -> object | None:
                 published.append(snapshot)
-                original_set_snapshot(snapshot)
+                return original_set_snapshot(snapshot)
 
             monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
             app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
@@ -16801,7 +16892,7 @@ async def test_root_tui_paging_render_path_table(
                 pass
             assert all("branch-a-prompt" not in snapshot for snapshot in published)
 
-            monkeypatch.setattr(app._history_source, "prompt_page", original_prompt_page)
+            monkeypatch.setattr(app._history_source, "prompt_pages", original_prompt_pages)
             published.clear()
             finder_buffer = Buffer(document=Document("branch-b-prompt"))
             app._history_finder_open(finder_buffer)
