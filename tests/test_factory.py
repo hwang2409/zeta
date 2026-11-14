@@ -1,16 +1,82 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 
+import zeta.providers.factory as factory_module
+from tests.support.completion import completion_control
+from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountCredentials
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.providers.anthropic import (
     AnthropicApiKeyCredential,
     AnthropicAuthError,
+    OAuthTokens,
 )
 from zeta.providers.codex import DEFAULT_CODEX_MODEL
 from zeta.providers.factory import API_KEY_OPT_IN_VAR, build_backend
+
+_SSE = (
+    'event: message_start\n'
+    'data: {"type":"message_start","message":{"id":"m","model":"c",'
+    '"role":"assistant","usage":{"input_tokens":1}}}\n\n'
+    'event: message_delta\n'
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+    '"usage":{"output_tokens":1}}\n\n'
+    'event: message_stop\n'
+    'data: {"type":"message_stop"}\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_settings_file_enables_oauth_compat_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settings.toml opt-in makes a claude request carry the billing block,
+    even with no interactive-shell env var set. Fails on main (setting ignored).
+    """
+
+    monkeypatch.delenv("ZETA_ANTHROPIC_OAUTH_COMPAT", raising=False)
+    monkeypatch.delenv(API_KEY_OPT_IN_VAR, raising=False)
+    (tmp_path / "settings.toml").write_text("[anthropic]\noauth_compat = true\n")
+    store = named_account_credentials(tmp_path, "anthropic")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=_SSE
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    real_backend = factory_module.AnthropicBackend
+    monkeypatch.setattr(
+        factory_module,
+        "AnthropicBackend",
+        lambda **kwargs: real_backend(client=client, **kwargs),
+    )
+
+    backend, _ = await asyncio.to_thread(build_backend, "claude", None, home=tmp_path)
+    try:
+        await anext(
+            backend.complete(
+                [Message(MessageRole.USER, [TextContent("abcdefghijklmnop")])],
+                [],
+                control=completion_control(),
+            )
+        )
+    finally:
+        await client.aclose()
+
+    system = json.loads(requests[0].content)["system"]
+    assert system[0]["text"].startswith("x-anthropic-billing-header:")
+    assert requests[0].headers["user-agent"] == "claude-cli/2.1.280"
 
 
 def test_codex_default_matches_backend_default(tmp_path: Path) -> None:

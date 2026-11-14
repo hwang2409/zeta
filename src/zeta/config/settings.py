@@ -82,6 +82,7 @@ _TOP_KEYS = frozenset(
         "memory",
         "inbox",
         "commands",
+        "anthropic",
         "tools",
         "disallowed_tools",
         "allow_hooks",
@@ -107,6 +108,7 @@ _PROJECT_SAFE_KEYS = frozenset(
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
+_ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
@@ -131,6 +133,7 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
+    anthropic_oauth_compat: bool | None = None
     agents_explicit_finish: bool | None = None
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
@@ -556,6 +559,7 @@ def _validate(
     )
     auto_project = _validated_bool(data, "auto_project", notices)
     inbox_enabled = _validated_inbox(data, notices)
+    anthropic_oauth_compat = _validated_anthropic(data, notices)
     agents_table = data.get("agents", {})
     if not isinstance(agents_table, Mapping) or set(agents_table) - _AGENTS_KEYS:
         raise SettingsError("invalid agents settings")
@@ -626,6 +630,7 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
+        anthropic_oauth_compat=anthropic_oauth_compat,
         agents_explicit_finish=agents_explicit_finish,
         agents_max_depth=agents_max_depth,
         tool_allow=tool_allow,
@@ -657,6 +662,20 @@ def _validated_inbox(
     for key in table.keys() - _INBOX_KEYS:
         notices.append(f"settings · ignored unknown key 'inbox.{key}'")
     return _validated_bool(table, "enabled", notices)
+
+
+def _validated_anthropic(
+    data: Mapping[str, Any], notices: list[str]
+) -> bool | None:
+    if "anthropic" not in data:
+        return None
+    table = data["anthropic"]
+    if not isinstance(table, Mapping):
+        notices.append("settings · ignored key 'anthropic': expected table")
+        return None
+    for key in table.keys() - _ANTHROPIC_KEYS:
+        notices.append(f"settings · ignored unknown key 'anthropic.{key}'")
+    return _validated_bool(table, "oauth_compat", notices)
 
 
 def _validated_tool_patterns(

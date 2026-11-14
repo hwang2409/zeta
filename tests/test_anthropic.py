@@ -647,6 +647,122 @@ async def test_anthropic_oauth_compat_without_user_text_omits_billing_block(
     await client.aclose()
 
 
+async def _oauth_compat_system_block(
+    tmp_path: Path, **backend_kwargs: object
+) -> list[dict]:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    store = anthropic_credentials(tmp_path / "zeta.json")
+    store.save(OAuthTokens("access-test", "refresh-test", 4_000_000_000))
+    client = client_for(handler)
+    try:
+        await anext(
+            AnthropicBackend(client=client, token_store=store, **backend_kwargs).complete(
+                [Message(MessageRole.USER, [TextContent("abcdefghijklmnopqrstuv")])],
+                [],
+                control=completion_control(),
+            )
+        )
+    finally:
+        await client.aclose()
+    return json.loads(requests[0].content)["system"], requests[0]
+
+
+@pytest.mark.asyncio
+async def test_oauth_compat_setting_enables_billing_block_without_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_ANTHROPIC_OAUTH_COMPAT", raising=False)
+    system, request = await _oauth_compat_system_block(
+        tmp_path, oauth_compat_setting=True
+    )
+    assert system[0]["text"].startswith("x-anthropic-billing-header:")
+    assert request.headers["x-app"] == "cli"
+    assert request.headers["user-agent"] == "claude-cli/2.1.280"
+
+
+@pytest.mark.asyncio
+async def test_oauth_compat_setting_off_adds_no_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_ANTHROPIC_OAUTH_COMPAT", raising=False)
+    system, request = await _oauth_compat_system_block(
+        tmp_path, oauth_compat_setting=False
+    )
+    assert not any(
+        block["text"].startswith("x-anthropic-billing-header:") for block in system
+    )
+    assert "x-app" not in request.headers
+    assert request.headers["user-agent"] == "zeta/0.1"
+
+
+@pytest.mark.asyncio
+async def test_oauth_compat_env_one_overrides_setting_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "1")
+    system, _ = await _oauth_compat_system_block(tmp_path, oauth_compat_setting=False)
+    assert system[0]["text"].startswith("x-anthropic-billing-header:")
+
+
+@pytest.mark.asyncio
+async def test_oauth_compat_env_zero_overrides_setting_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_ANTHROPIC_OAUTH_COMPAT", "0")
+    system, request = await _oauth_compat_system_block(
+        tmp_path, oauth_compat_setting=True
+    )
+    assert not any(
+        block["text"].startswith("x-anthropic-billing-header:") for block in system
+    )
+    assert request.headers["user-agent"] == "zeta/0.1"
+
+
+@pytest.mark.asyncio
+async def test_oauth_compat_setting_never_applies_to_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ZETA_ANTHROPIC_OAUTH_COMPAT", raising=False)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=SSE,
+            request=request,
+        )
+
+    client = client_for(handler)
+    try:
+        _ = [
+            event
+            async for event in AnthropicBackend(
+                client=client,
+                token_store=AnthropicApiKeyCredential("sk-ant-test-key"),
+                oauth_compat_setting=True,
+            ).complete([], [], control=completion_control())
+        ]
+    finally:
+        await client.aclose()
+    system = json.loads(requests[0].content)["system"]
+    assert not any(
+        block["text"].startswith("x-anthropic-billing-header:") for block in system
+    )
+    assert requests[0].headers["user-agent"] == "zeta/0.1"
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_sends_one_zeta_identity_after_oauth_spoof(
     tmp_path: Path,
