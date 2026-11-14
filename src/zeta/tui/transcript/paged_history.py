@@ -212,6 +212,16 @@ class PagedTranscriptHistory:
         self._reveal_target = state.reveal_target
         self.endpoint_id = state.endpoint_id
 
+    def cancel_pending(self) -> tuple[asyncio.Task[TUIHistoryPage], ...]:
+        """Cancel reads without dropping the active resident pages."""
+
+        self.generation += 1
+        tasks = tuple(self._loads.values())
+        for task in tasks:
+            task.cancel()
+        self._loads.clear()
+        return tasks
+
     async def close(self) -> None:
         """Invalidate publication without waiting for executor-backed reads."""
 

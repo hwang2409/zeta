@@ -34,10 +34,46 @@ class SessionPromptHistory:
         self._generation = 0
         self._navigation_revision = 0
         self._applying_document = False
+        self._pending_cursor_id: str | None = None
 
     @property
     def navigating(self) -> bool:
         return self._index is not None
+
+    def cursor_id(self) -> str | None:
+        entries = tuple(item for page in self._entries for item in page)
+        if self._index is None or self._index >= len(entries):
+            return self._pending_cursor_id
+        return entries[self._index][0]
+
+    def restore_cursor(self, prompt_id: str | None) -> None:
+        self._pending_cursor_id = prompt_id
+        if prompt_id is None:
+            self._index = None
+            return
+        entries = tuple(item for page in self._entries for item in page)
+        self._index = next(
+            (index for index, item in enumerate(entries) if item[0] == prompt_id),
+            None,
+        )
+        if self._index is not None:
+            self._pending_cursor_id = None
+
+    def draft_document(self, displayed: Document) -> Document:
+        return self._draft or displayed
+
+    def restore_navigation(
+        self,
+        prompt_id: str | None,
+        prompt_text: str | None,
+        draft: Document,
+    ) -> None:
+        if prompt_id is None or prompt_text is None:
+            return
+        self._entries = [[(prompt_id, prompt_text)]]
+        self._index = 0
+        self._pending_cursor_id = None
+        self._draft = draft
 
     @property
     def navigation_revision(self) -> int:
@@ -101,6 +137,8 @@ class SessionPromptHistory:
                 self._newer = self._page_edges[-1][1]
                 if self._index is not None:
                     self._index += len(rows)
+                if self._pending_cursor_id is not None:
+                    self.restore_cursor(self._pending_cursor_id)
 
         self._load = asyncio.create_task(read())
         try:
@@ -133,6 +171,8 @@ class SessionPromptHistory:
                 if self._index is not None:
                     retained = sum(len(page) for page in self._entries)
                     self._index = max(0, retained - len(rows) - 1)
+                if self._pending_cursor_id is not None:
+                    self.restore_cursor(self._pending_cursor_id)
 
         self._load = asyncio.create_task(read())
         try:
@@ -216,6 +256,7 @@ class SessionPromptHistory:
         self._navigation_revision += 1
         self._index = None
         self._draft = None
+        self._pending_cursor_id = None
 
     def start_finder_scan(
         self,
@@ -302,6 +343,26 @@ class SessionPromptHistory:
             published = True
         if not published and generation == self._generation:
             publish(())
+
+    @property
+    def busy(self) -> bool:
+        return any(
+            task is not None and not task.done()
+            for task in (self._load, self._finder_scan)
+        )
+
+    def cancel_pending(self) -> tuple[asyncio.Task[None], ...]:
+        """Cancel active reads while preserving the resident prompt pages."""
+
+        self._generation += 1
+        tasks = tuple(
+            task for task in (self._load, self._finder_scan) if task is not None
+        )
+        for task in tasks:
+            task.cancel()
+        self._load = None
+        self._finder_scan = None
+        return tasks
 
     async def close(self) -> None:
         self.clear()

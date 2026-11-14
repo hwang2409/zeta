@@ -70,11 +70,34 @@ async def _enter_child(app: TUIApp, pipe) -> None:
         ),
         what="root history transition idle",
     )
-    while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
-        await _send(pipe, "\x1b[B")
     if not navigation.list_focused():
+        await _wait_until(
+            lambda: bool(navigation.entries), what="visible agent picker rows"
+        )
+        if not app._active_session.layout.has_focus(app._active_session.default_buffer):
+            await _send(pipe, "\x1b[<0;10;40M\x1b[<0;10;40m")
+            await _wait_until(
+                lambda: app._active_session.layout.has_focus(
+                    app._active_session.default_buffer
+                ),
+                what="visible composer before picker key",
+            )
         await _send(pipe, "\x1b[B")
         await _wait_until(navigation.list_focused, what="agent picker focus")
+    while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
+        before = navigation.selected_index
+        await _send(pipe, "\x1b[B")
+        await _wait_until(
+            lambda before=before: navigation.selected_index != before,
+            what="next visible child picker row",
+        )
+    await _wait_until(
+        lambda: (
+            navigation.list_focused()
+            and navigation.entries[navigation.selected_index].path.name == CHILD_ID
+        ),
+        what="selected child picker row",
+    )
     await _send(pipe, "\r")
     await _wait_until(
         lambda: navigation.child_view_active
@@ -87,9 +110,19 @@ async def _enter_child(app: TUIApp, pipe) -> None:
 async def _return_to_root(app: TUIApp, pipe) -> None:
     navigation = app._agent_navigation
     if not navigation.child_view_focused() and not navigation.list_focused():
-        await _send(pipe, "x\x7f")
-        await _send(pipe, "\x1b[B")
+        await _wait_until(
+            lambda: bool(navigation.transcript_control.transcript.units),
+            what="visible child transcript before picker key",
+        )
+        if navigation.transcript_control._prompt_history.navigating:
+            navigation.focus_list()
+        else:
+            await _send(pipe, "\x1b[B")
         await _wait_until(navigation.list_focused, what="child agent list focus")
+    await _wait_until(
+        lambda: navigation.child_view_focused() or navigation.list_focused(),
+        what="visible child navigation focus",
+    )
     await _send(pipe, "h")
     await _wait_until(
         lambda: not app._agent_navigation.child_view_active,
@@ -156,6 +189,10 @@ async def test_real_tui_child_view_journey(
             assert ROOT_MARKER in before, "root anchor fixture marker was not rendered"
 
             await _enter_child(app, pipe)
+            await _wait_until(
+                app._agent_navigation.child_view_focused,
+                what="visible focused child before finder key",
+            )
             await _send(pipe, "\x06")
             await _wait_until(
                 lambda: app._active_finder.finder_active,
@@ -195,10 +232,18 @@ async def test_real_tui_child_view_journey(
             except (AssertionError, IndexError) as exc:
                 failures.append(str(exc))
 
+            await _wait_until(
+                lambda: VISIBLE_PROMPT in _screen_text(app),
+                what="visible search result before finder close key",
+            )
             await _send(pipe, "\x03")
             await _wait_until(
                 lambda: not app._active_finder.finder_active,
                 what="finder close",
+            )
+            await _wait_until(
+                lambda: not app._active_finder.finder_active,
+                what="visible closed finder before escape key",
             )
             await _send(pipe, "\x1b")
             await _wait_until(
@@ -210,10 +255,19 @@ async def test_real_tui_child_view_journey(
                 lambda: session.layout.has_focus(session.default_buffer),
                 what="child composer focus from terminal click",
             )
+            await _wait_until(
+                lambda: session.layout.has_focus(session.default_buffer),
+                what="visible child composer before clear key",
+            )
             await _send(pipe, "\x15")
             await _wait_until(
                 lambda: not session.default_buffer.text,
                 what="empty child composer",
+            )
+            await _wait_until(
+                lambda: session.layout.has_focus(session.default_buffer)
+                and not session.default_buffer.text,
+                what="visible empty composer before paste",
             )
             await _send(pipe, "\x1b[200~draft-child-ux1309\x1b[201~")
             await _wait_until(
@@ -229,6 +283,10 @@ async def test_real_tui_child_view_journey(
                     lambda: session.app.vi_state.input_mode is InputMode.INSERT,
                     what="vi insert mode for prompt history",
                 )
+            await _wait_until(
+                lambda: session.default_buffer.text == "draft-child-ux1309",
+                what="visible child draft before history-up key",
+            )
             await _send(pipe, "\x1b[A")
             try:
                 await _wait_until(
@@ -238,23 +296,30 @@ async def test_real_tui_child_view_journey(
                 assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
                     "child-prompt-history: Up did not restore the exact old child prompt"
                 )
-                await _send(pipe, "\x1b[B")
-                await _wait_until(
-                    lambda: session.default_buffer.text == "draft-child-ux1309",
-                    what="child draft restoration",
-                )
-                assert session.default_buffer.text == "draft-child-ux1309", (
-                    "child-prompt-history: Down did not restore the child draft"
-                )
             except AssertionError as exc:
                 failures.append(
                     f"{exc}; composer={session.default_buffer.text[:80]!r} "
                     f"length={len(session.default_buffer.text)}"
                 )
 
-            child_anchor = (
-                app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
+            child_transcript = app._agent_navigation.transcript_control.transcript
+            prior_child_anchor = child_transcript.durable_scroll_anchor
+            await _wait_until(
+                lambda: (
+                    session.default_buffer.text == CHILD_PROMPT[:2_000]
+                    and bool(child_transcript.units)
+                ),
+                what="visible selected child prompt and transcript before PageUp",
             )
+            await _send(pipe, "\x1b[5~")
+            await _wait_until(
+                lambda: (
+                    child_transcript.durable_scroll_anchor is not None
+                    and child_transcript.durable_scroll_anchor != prior_child_anchor
+                ),
+                what="child anchor after PageUp",
+            )
+            child_anchor = child_transcript.durable_scroll_anchor
             assert child_anchor is not None
 
             await _return_to_root(app, pipe)
@@ -278,8 +343,28 @@ async def test_real_tui_child_view_journey(
                     ),
                     what="restored child durable anchor",
                 )
+                assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
+                    "child-return: selected prompt was not restored"
+                )
+                await _wait_until(
+                    lambda: session.default_buffer.text == CHILD_PROMPT[:2_000],
+                    what="visible restored prompt before history-down key",
+                )
+                assert (
+                    app._agent_navigation.transcript_control.prompt_history.navigating
+                ), "child-return: prompt cursor was not restored"
+                session.layout.focus(session.default_buffer)
+                await _wait_until(
+                    lambda: session.layout.has_focus(session.default_buffer),
+                    what="visible restored child composer before history-down key",
+                )
+                await _send(pipe, "\x1b[B")
+                await _wait_until(
+                    lambda: session.default_buffer.text == "draft-child-ux1309",
+                    what="child draft restoration after re-entry",
+                )
                 assert session.default_buffer.text == "draft-child-ux1309", (
-                    "child-return: parked draft was not restored"
+                    "child-return: parked draft was not restored after prompt navigation"
                 )
             except AssertionError as exc:
                 failures.append(str(exc))

@@ -16726,6 +16726,7 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "child-live-refresh",
         "child-switch-mid-refresh",
         "child-deleted-activation",
+        "child-commit-rollback",
         "child-old-search",
         "root-anchor-child-visit",
     ),
@@ -17065,6 +17066,28 @@ async def test_root_tui_paging_render_path_table(
                 assert owner.transcript.durable_scroll_anchor == child_anchor, (
                     "returning to a child lost its parked durable anchor"
                 )
+                assert owner.history_pager.source is owner._source
+                retained_pages = len(owner.history_pager.descriptors) + sum(
+                    len(value.segments)
+                    for value in vars(owner).values()
+                    if isinstance(value, PagedHistoryState)
+                )
+                assert retained_pages <= 4, (
+                    "active child retained root descriptors outside the global page budget"
+                )
+                assert not hasattr(owner._root_view_state, "segments"), (
+                    "active child retained root page descriptors in inactive state"
+                )
+
+                navigation.refresh(force=True)
+                assert owner._load_task is not None
+                await await_or_fail(
+                    owner._load_task, what="off-loop active child refresh"
+                )
+                assert discovery_threads
+                assert main_thread not in discovery_threads, (
+                    "open, return, or refresh discovery ran on the TUI loop thread"
+                )
         elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 
@@ -17370,6 +17393,39 @@ async def test_root_tui_paging_render_path_table(
                 navigation.transcript_control.transcript.render(120)
             ).plain
             assert "retry child refresh 1" in rendered
+        elif journey == "child-commit-rollback":
+            child = ConversationStore(store.session_dir / "agents", session_id="1")
+            child.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("rollback child row")])
+            )
+            child_path = child.session_dir
+            child.close()
+            navigation = app._agent_navigation
+            owner = navigation.transcript_control
+            root_entries = tuple(navigation.entries)
+            root_focus = app._active_session.layout.current_control
+            original_commit = owner._commit_path
+            assert original_commit is not None
+
+            def failing_commit(path, prepared, generation):
+                assert original_commit(path, prepared, generation)
+                raise RuntimeError("forced navigation commit failure")
+
+            owner._commit_path = failing_commit
+            activation = owner.activate(child_path)
+            assert activation is not None
+            with pytest.raises(RuntimeError, match="forced navigation commit failure"):
+                await await_or_fail(
+                    activation, what="forced child navigation commit failure"
+                )
+            owner._commit_path = original_commit
+
+            assert navigation.current_path == store.session_dir
+            assert navigation._path_stack == [store.session_dir]
+            assert tuple(navigation.entries) == root_entries
+            assert app._active_session.layout.current_control is root_focus
+            assert owner.history_pager.source is app._history_source
+            assert owner._source is None
         elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page
