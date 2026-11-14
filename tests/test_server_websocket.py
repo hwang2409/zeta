@@ -23,7 +23,7 @@ from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import TextContent, ToolCall
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, transport
 from zeta.server.protocol import MAX_FRAME_BYTES
 from zeta.server.transport import _parse_subprotocol_auth
 
@@ -709,6 +709,122 @@ async def test_websocket_discovery_file_has_one_owner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_websocket_custom_discovery_allows_a_second_server(tmp_path: Path) -> None:
+    default_path = tmp_path / "run" / "serve.ws.json"
+    custom_path = tmp_path / "dedicated" / "serve.json"
+    first = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    second = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    await first.start()
+    await second.start()
+    try:
+        assert json.loads(default_path.read_text())["port"] == first._websocket.port
+        assert json.loads(custom_path.read_text())["port"] == second._websocket.port
+        assert first._websocket.port != second._websocket.port
+        assert (custom_path.parent / "serve.json.lock").exists()
+        assert stat.S_IMODE(custom_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((custom_path.parent / "serve.json.lock").stat().st_mode) == 0o600
+
+        duplicate = ZetaServer(
+            home=tmp_path,
+            port=0,
+            ws_port=0,
+            ws_discovery=custom_path,
+            provider="codex",
+        )
+        with pytest.raises(ValueError, match="WebSocket server already running"):
+            await duplicate.start()
+        await close_serve(duplicate)
+        await close_serve(second)
+        assert default_path.exists()
+    finally:
+        await close_serve(second)
+        await close_serve(first)
+
+
+@pytest.mark.asyncio
+async def test_websocket_custom_discovery_rejects_insecure_parent(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "public"
+    parent.mkdir()
+    parent.chmod(0o775)
+    custom_path = parent / "serve.json"
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    with pytest.raises(ValueError, match="make a private subdirectory"):
+        await server.start()
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o775
+    await close_serve(server)
+
+
+@pytest.mark.asyncio
+async def test_websocket_custom_discovery_does_not_cleanup_unsafe_parent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "dedicated"
+    custom_path = parent / "serve.json"
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    await server.start()
+    try:
+        parent.chmod(0o702)
+        monkeypatch.setattr(transport._LOGGER, "disabled", False)
+        with caplog.at_level(logging.WARNING, logger="zeta.server.websocket"):
+            await close_serve(server)
+        assert custom_path.exists()
+        assert custom_path.with_name("serve.json.lock").exists()
+        assert "could not safely remove WebSocket discovery file" in caplog.text
+    finally:
+        await close_serve(server)
+
+
+@pytest.mark.asyncio
+async def test_websocket_custom_discovery_rejects_symlink_without_changing_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_text('{"unchanged":true}')
+    discovery = tmp_path / "serve.json"
+    discovery.symlink_to(target)
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=discovery,
+        provider="codex",
+    )
+    with pytest.raises(ValueError, match="unsafe WebSocket discovery file"):
+        await server.start()
+    assert discovery.is_symlink()
+    assert target.read_text() == '{"unchanged":true}'
+    await close_serve(server)
+
+
+@pytest.mark.asyncio
+async def test_websocket_rejects_relative_custom_discovery_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="absolute path"):
+        ZetaServer(home=tmp_path, port=0, ws_port=0, ws_discovery="serve.json")
+    with pytest.raises(ValueError, match="requires ws_port"):
+        ZetaServer(home=tmp_path, port=0, ws_discovery="/tmp/serve.json")
+
+
+@pytest.mark.asyncio
 async def test_websocket_replaces_stale_discovery_file(tmp_path: Path) -> None:
     token_path = tmp_path / "run" / "serve.ws.json"
     token_path.parent.mkdir(parents=True)
@@ -735,9 +851,12 @@ def test_serve_websocket_cli_flags() -> None:
             "http://127.0.0.1:5173",
             "--ws-origin",
             "https://app.example:443",
+            "--ws-discovery",
+            "/tmp/custom-serve.json",
         ]
     )
     assert args.ws_port == 8765
+    assert args.ws_discovery == "/tmp/custom-serve.json"
     assert args.ws_origins == ["http://127.0.0.1:5173", "https://app.example:443"]
 
 
