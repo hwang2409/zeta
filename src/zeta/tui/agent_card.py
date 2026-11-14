@@ -530,8 +530,11 @@ class AgentTranscriptControl(UIControl):
 
     def __init__(self, history_pager: Any = None) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
+        from .transcript.paged_history import PagedTranscriptHistory
 
-        self._history_pager = history_pager
+        self._history_pager = (
+            history_pager if history_pager is not None else PagedTranscriptHistory(None)
+        )
 
         self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
@@ -639,8 +642,36 @@ class AgentTranscriptControl(UIControl):
         except RuntimeError:
             asyncio.run(self._transition(path, generation))
             self._load_task = None
+            if self._current_path is None and self._path == path and self._commit_path:
+                self._commit_path(path)
             return None
-        task = loop.create_task(self._transition(path, generation))
+        if path == self._root_path and self._root_pager_state is not None:
+            previous, self._source = self._source, None
+            if self._commit_path is not None:
+                self._commit_path(path)
+            self.presenter.clear()
+            self._tool_calls.clear()
+            self._path = path
+            self._history_pager.source = self._root_source
+            self._history_pager.restore(self._root_pager_state)
+            endpoint = self._root_endpoint() if self._root_endpoint else None
+            if self._prompt_history is not None:
+                self._prompt_history.bind(path, self._root_source, endpoint)
+            if self._render_active:
+                self._render_active()
+            else:
+                self.render_pages(self._history_pager.pages)
+            if self._root_anchor is not None and self._root_transcript is not None:
+                self._root_transcript.restore_durable_scroll_anchor(self._root_anchor)
+            self._pending_path = None
+
+            async def finish_root_activation() -> None:
+                if previous is not None:
+                    await previous.close()
+
+            task = loop.create_task(finish_root_activation())
+        else:
+            task = loop.create_task(self._transition(path, generation))
         self._load_task = task
         self._load_tasks.add(task)
         task.add_done_callback(self._load_tasks.discard)
@@ -665,7 +696,7 @@ class AgentTranscriptControl(UIControl):
             prepared_page = None
             if path == self._root_path:
                 prepared_source = self._root_source
-                if self._root_pager_state is None:
+                if prepared_source is not None and self._root_pager_state is None:
                     endpoint = self._root_endpoint() if self._root_endpoint else None
                     prepared_page = await prepared_source.page(
                         None, direction="older"
@@ -686,11 +717,8 @@ class AgentTranscriptControl(UIControl):
 
             if (
                 generation != self._activation_generation
-                or prepared_source is None
-                or (
-                    path != self._root_path
-                    and (prepared_page is None or not prepared_page.units)
-                )
+                or (prepared_source is None and path != self._root_path)
+                or (path != self._root_path and prepared_page is None)
             ):
                 if prepared_source is not self._root_source:
                     await prepared_source.close()
@@ -718,9 +746,12 @@ class AgentTranscriptControl(UIControl):
                 self._history_pager.reset(endpoint_id=endpoint)
                 if prepared_page is not None:
                     self._history_pager.adopt(prepared_page)
-            self._prompt_history.bind(path, prepared_source, endpoint)
+            if self._prompt_history is not None:
+                self._prompt_history.bind(path, prepared_source, endpoint)
             if self._render_active:
                 self._render_active()
+            else:
+                self.render_pages(self._history_pager.pages)
             if (
                 prepared_source is self._root_source
                 and self._root_anchor is not None
@@ -857,7 +888,10 @@ class AgentTranscriptControl(UIControl):
     def capture_root_view(self) -> None:
         """Capture root paging and scroll before navigation changes layout focus."""
 
-        if self._history_pager.source is not self._root_source:
+        if (
+            self._history_pager is None
+            or self._history_pager.source is not self._root_source
+        ):
             return
         if self._root_transcript is not None:
             self._root_anchor = self._root_transcript.durable_scroll_anchor
@@ -941,6 +975,7 @@ class AgentNavigation:
         self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
         self.transcript_control = AgentTranscriptControl(history_pager)
+        self.transcript_control._commit_path = self._commit_view_path
         self.list_window = Window(
             content=self.list_control,
             height=Dimension(min=1, max=MAX_AGENT_LIST_ROWS),
@@ -1367,7 +1402,10 @@ class AgentNavigation:
             return
         if entry.path == self.current_path:
             return
-        self.transcript_control.activate(entry.path)
+        if self.transcript_control.on_load is not None:
+            self.transcript_control.request_sync(entry.path, self._invalidate)
+        else:
+            self.transcript_control.activate(entry.path)
 
     def back_to_parent(self) -> None:
         if not self.child_view_active:
@@ -1376,7 +1414,11 @@ class AgentNavigation:
         self._leave_current_view()
 
     def _leave_current_view(self) -> None:
-        self.transcript_control.activate(self._path_stack[-2])
+        path = self._path_stack[-2]
+        if self.transcript_control.on_load is not None:
+            self.transcript_control.request_sync(path, self._invalidate)
+        else:
+            self.transcript_control.activate(path)
 
     def _commit_view_path(self, path: Path) -> None:
         """Publish one prepared transcript path and its navigation state."""
@@ -1396,14 +1438,15 @@ class AgentNavigation:
             self._breadcrumb_labels.append(label)
         self.current_path = path
         self.refresh(force=True)
-        self.selected_index = next(
-            (
-                index
-                for index, entry in enumerate(self.entries)
-                if entry.path == previous
-            ),
-            0,
-        )
+        if path == self.root_path:
+            self.selected_index = next(
+                (
+                    index
+                    for index, entry in enumerate(self.entries)
+                    if entry.path == previous
+                ),
+                0,
+            )
         self._switch_transcript()
         if self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)

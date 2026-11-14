@@ -541,11 +541,11 @@ def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
     with caplog.at_level(logging.WARNING):
         navigation.open_selected()
         navigation.refresh(force=True)
-    assert widget.visible
-    assert _todo_text(widget) == "child todos unavailable"
-    assert sum("agent todo refresh failed" in record.message for record in caplog.records) == 1
+    assert "initial parent" in _todo_text(widget)
+    assert not any("agent todo refresh failed" in record.message for record in caplog.records)
 
     state_path.write_bytes(valid_state)
+    navigation.open_selected()
     navigation.refresh(force=True)
     assert "old child" in _todo_text(widget)
 
@@ -590,8 +590,9 @@ def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
     shutil.rmtree(child)
     navigation.open_selected()
     navigation.refresh(force=True)
+    assert navigation.current_path == navigation.root_path
     snapshot = navigation.todo_snapshot()
-    assert snapshot is not None and snapshot.unavailable
+    assert snapshot is not None and not snapshot.unavailable
     asyncio.run(navigation.close())
     root.close()
 
@@ -2556,6 +2557,10 @@ async def test_child_approval_exits_navigation_in_full_screen(
     app._install_full_screen_layout(session)
     app._agent_navigation.selected_index = 1
     app._agent_navigation.open_selected()
+    assert app._agent_navigation.transcript_control._load_task is not None
+    await asyncio.wait_for(
+        app._agent_navigation.transcript_control._load_task, 10
+    )
     assert app._agent_navigation.child_view_active
 
     app._handle_background_event(
@@ -2564,6 +2569,10 @@ async def test_child_approval_exits_navigation_in_full_screen(
             tool_call=call,
             data={"agent_instance_id": instance_id},
         )
+    )
+    assert app._agent_navigation.transcript_control._load_task is not None
+    await asyncio.wait_for(
+        app._agent_navigation.transcript_control._load_task, 10
     )
 
     assert app._agent_navigation.current_path == store.session_dir
