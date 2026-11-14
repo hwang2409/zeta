@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -16147,6 +16147,140 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         assert app._history_finder.finder_accept()
         assert buffer.text == "prompt-0"
         assert len(app._prompt_history.pages) <= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "journey", ("up", "down", "edit", "in-flight", "in-flight-edit")
+)
+async def test_cold_prompt_history_keys_follow_owned_navigation(
+    tmp_path: Path,
+    journey: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / journey / "sessions")
+    prompts = ("oldest prompt", "middle prompt", "newest\nprompt")
+    for prompt in prompts:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(prompt)]),
+                MessageOrigin.USER,
+            )
+        )
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("agent notice")]),
+                MessageOrigin.AGENT_SEND,
+            )
+        )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    if journey in {"in-flight", "in-flight-edit"}:
+        prompt_page = app._history_source.prompt_page
+
+        async def gated_prompt_page(*args: object, **kwargs: object):
+            started.set()
+            await await_or_fail(release.wait(), what="prompt history page release")
+            return await prompt_page(*args, **kwargs)
+
+        monkeypatch.setattr(app._history_source, "prompt_page", gated_prompt_page)
+
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        session.app.output = DummyOutput()
+        app._active_session = session
+        changes: list[str] = []
+        session.default_buffer.on_text_changed += lambda buffer: changes.append(buffer.text)
+        processed_keys = 0
+
+        def key_processed(_event: object) -> None:
+            nonlocal processed_keys
+            processed_keys += 1
+
+        session.app.key_processor.after_key_press += key_processed
+
+        async with owned_app(app) as owner:
+            prompt_task = owner.task(asyncio.create_task(session.prompt_async()))
+            await wait_until(lambda: session.app.is_running)
+
+            if journey in {"up", "down"}:
+                for index, expected in enumerate(reversed(prompts)):
+                    before = processed_keys
+                    pipe.send_text("\x1b[A")
+                    if index == 0:
+                        await wait_until(
+                            lambda expected=expected: session.default_buffer.text == expected
+                        )
+                    else:
+                        await wait_until(
+                            lambda before=before: processed_keys > before
+                        )
+                    assert session.default_buffer.text == expected, (
+                        f"Up did not select prompt {expected!r}"
+                    )
+                if journey == "down":
+                    for expected in (*prompts[1:], ""):
+                        before = processed_keys
+                        pipe.send_text("\x1b[B")
+                        await wait_until(
+                            lambda before=before: processed_keys > before
+                        )
+                        assert session.default_buffer.text == expected, (
+                            f"Down did not select prompt {expected!r}"
+                        )
+            elif journey == "edit":
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: session.default_buffer.text == prompts[-1])
+                pipe.send_text("x")
+                edited = f"{prompts[-1]}x"
+                await wait_until(lambda: session.default_buffer.text == edited)
+                before = processed_keys
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: processed_keys > before)
+                assert session.default_buffer.document.cursor_position_row == 0
+                assert session.default_buffer.text == edited
+            elif journey == "in-flight":
+                pipe.send_text("\x1b[A")
+                await await_or_fail(started.wait(), what="cold prompt history load")
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: processed_keys >= 2)
+                release.set()
+                await wait_until(lambda: session.default_buffer.text == prompts[-2])
+                assert changes[-2:] == [prompts[-1], prompts[-2]]
+            else:
+                history_tasks: list[asyncio.Task[None]] = []
+                create_task = asyncio.create_task
+
+                def track_history_task(
+                    coro: Coroutine[object, object, None],
+                ) -> asyncio.Task[None]:
+                    task = create_task(coro)
+                    if coro.cr_code.co_qualname.endswith(
+                        "TUIApp._history_previous.<locals>.load"
+                    ):
+                        history_tasks.append(task)
+                    return task
+
+                monkeypatch.setattr(asyncio, "create_task", track_history_task)
+                pipe.send_text("\x1b[A")
+                await await_or_fail(started.wait(), what="cold prompt history load")
+                pipe.send_text("typed draft")
+                await wait_until(lambda: session.default_buffer.text == "typed draft")
+                release.set()
+                await wait_until(lambda: bool(history_tasks))
+                await await_or_fail(history_tasks[0], what="cold prompt history navigation")
+                assert session.default_buffer.text == "typed draft"
+
+            session.app.exit()
+            await await_or_fail(prompt_task, what="prompt key journey")
 
 
 @pytest.mark.asyncio

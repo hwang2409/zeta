@@ -520,6 +520,8 @@ class TUIApp(
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
             on_history_previous=lambda buffer: app._history_previous(buffer),
             on_history_next=lambda buffer: app._history_next(buffer),
+            history_navigation_active=lambda: app._prompt_history.navigating,
+            on_history_detach=lambda: app._prompt_history.detach(),
             finder_active=lambda: app._active_finder.finder_active,
             history_finder_active=lambda: app._history_finder.finder_active,
             on_finder_move=lambda delta: app._finder_move(delta),
@@ -827,16 +829,21 @@ class TUIApp(
         path = self._viewed_session_path()
         document = self._prompt_history.older(path, buffer.document)
         if document is not None:
-            buffer.set_document(document, bypass_readonly=True)
+            self._prompt_history.apply(buffer, document)
             return
+
+        navigation_revision = self._prompt_history.navigation_revision
 
         async def load() -> None:
             await self._prompt_history.load_older()
-            if path != self._viewed_session_path():
+            if (
+                path != self._viewed_session_path()
+                or not self._prompt_history.navigation_is_current(navigation_revision)
+            ):
                 return
             document = self._prompt_history.older(path, buffer.document)
             if document is not None:
-                buffer.set_document(document, bypass_readonly=True)
+                self._prompt_history.apply(buffer, document)
                 self._invalidate_prompt()
 
         asyncio.create_task(load())
@@ -845,16 +852,21 @@ class TUIApp(
         path = self._viewed_session_path()
         document = self._prompt_history.newer(path)
         if document is not None:
-            buffer.set_document(document, bypass_readonly=True)
+            self._prompt_history.apply(buffer, document)
             return
+
+        navigation_revision = self._prompt_history.navigation_revision
 
         async def load() -> None:
             await self._prompt_history.load_newer()
-            if path != self._viewed_session_path():
+            if (
+                path != self._viewed_session_path()
+                or not self._prompt_history.navigation_is_current(navigation_revision)
+            ):
                 return
             document = self._prompt_history.newer(path)
             if document is not None:
-                buffer.set_document(document, bypass_readonly=True)
+                self._prompt_history.apply(buffer, document)
                 self._invalidate_prompt()
 
         asyncio.create_task(load())
