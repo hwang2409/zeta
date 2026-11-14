@@ -689,7 +689,7 @@ async def test_explicit_refresh_fences_send_before_unread_list_changed_notificat
         await _event(reader, "agent_end")
 
         names = {schema["name"] for schema in backend.calls[0][1]}
-        assert "page__x" in names, "send snapshotted the catalog from before refresh"
+        assert "page__x" in names, "send did not use the catalog published by refresh"
         assert "mcp_refresh_tools" in hello[-1]["result"]["capabilities"]["requests"]
         assert refreshed[-1]["result"] == {
             "session_id": session["session_id"],
