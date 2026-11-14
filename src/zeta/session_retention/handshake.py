@@ -24,12 +24,16 @@ def _lock_file(home: Path, name: str) -> int:
             ".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd
         )
         try:
-            fd = os.open(
-                name,
-                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                0o600,
-                dir_fd=locks_fd,
-            )
+            try:
+                fd = os.open(
+                    name,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    0o600,
+                    dir_fd=locks_fd,
+                )
+            except FileNotFoundError:
+                # Another owner can publish the lock directory concurrently.
+                return _lock_file(home, name)
         finally:
             os.close(locks_fd)
     finally:
