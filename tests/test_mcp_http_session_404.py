@@ -20,9 +20,20 @@ class _RestartingMCP:
         self.requests: list[tuple[str, str | None]] = []
         self.tool_calls = 0
         self.reject_retry = False
+        self.block_initialize = False
+        self.fail_initialize_once = False
+        self.initialize_started = asyncio.Event()
+        self.release_initialize = asyncio.Event()
+        self.initialize_cancelled = asyncio.Event()
 
     def restart(self) -> None:
         self.session = None
+
+    def block_next_initialize(self) -> None:
+        self.block_initialize = True
+        self.initialize_started.clear()
+        self.release_initialize.clear()
+        self.initialize_cancelled.clear()
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -32,6 +43,17 @@ class _RestartingMCP:
         if method == "notifications/initialized":
             return httpx.Response(202, request=request)
         if method == "initialize":
+            if self.block_initialize:
+                self.block_initialize = False
+                self.initialize_started.set()
+                try:
+                    await asyncio.wait_for(self.release_initialize.wait(), 10)
+                except asyncio.CancelledError:
+                    self.initialize_cancelled.set()
+                    raise
+            if self.fail_initialize_once:
+                self.fail_initialize_once = False
+                return httpx.Response(500, request=request, text="initialize failed")
             self.next_session += 1
             self.session = f"session-{self.next_session}"
             return httpx.Response(
@@ -153,3 +175,129 @@ async def test_http_404_without_session_is_plain_error(client, restarting_mcp):
         await client.list_tools()
 
     assert sum(method == "initialize" for method, _session in restarting_mcp.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_owner_does_not_cancel_recovery(
+    client, restarting_mcp
+):
+    restarting_mcp.restart()
+    restarting_mcp.block_next_initialize()
+    first = asyncio.create_task(client.list_tools())
+    await await_or_fail(
+        restarting_mcp.initialize_started.wait(), what="recovery initialize start"
+    )
+
+    first.cancel()
+    await asyncio.gather(first, return_exceptions=True)
+    assert not restarting_mcp.initialize_cancelled.is_set()
+
+    second = asyncio.create_task(client.list_tools())
+    restarting_mcp.release_initialize.set()
+    tools = await await_or_fail(second, what="list after cancelled recovery owner")
+
+    assert [tool.name for tool in tools] == ["echo"]
+    assert sum(method == "initialize" for method, _ in restarting_mcp.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_recovery_is_retried_by_next_request(client, restarting_mcp):
+    restarting_mcp.restart()
+    restarting_mcp.fail_initialize_once = True
+
+    with pytest.raises(MCPHTTPError, match="500"):
+        await client.list_tools()
+
+    tools = await client.list_tools()
+
+    assert [tool.name for tool in tools] == ["echo"]
+    assert sum(method == "initialize" for method, _ in restarting_mcp.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_request_started_during_recovery_waits_for_shared_initialize(
+    client, restarting_mcp, monkeypatch
+):
+    restarting_mcp.restart()
+    restarting_mcp.block_next_initialize()
+    first = asyncio.create_task(client.list_tools())
+    await await_or_fail(
+        restarting_mcp.initialize_started.wait(), what="recovery initialize start"
+    )
+    second_entered = asyncio.Event()
+    original = client._send_with_auth
+
+    async def observe_send(payload, request_id, state):
+        if payload["method"] == "tools/list":
+            second_entered.set()
+        return await original(payload, request_id, state)
+
+    monkeypatch.setattr(client, "_send_with_auth", observe_send)
+    second = asyncio.create_task(client.list_tools())
+    await await_or_fail(second_entered.wait(), what="second list request start")
+
+    assert not second.done()
+    assert restarting_mcp.requests[-1] == ("initialize", None)
+
+    restarting_mcp.release_initialize.set()
+    first_tools, second_tools = await await_or_fail(
+        asyncio.gather(first, second), what="requests sharing recovery"
+    )
+    assert [tool.name for tool in first_tools] == ["echo"]
+    assert [tool.name for tool in second_tools] == ["echo"]
+    assert sum(method == "initialize" for method, _ in restarting_mcp.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_notification_404_recovers_and_replaces_listener(
+    client, restarting_mcp, monkeypatch
+):
+    old_listener = client._notification_task
+    assert old_listener is not None
+    old_listener.cancel()
+    await asyncio.gather(old_listener, return_exceptions=True)
+    restarting_mcp.restart()
+    listener_calls: list[str | None] = []
+    new_listener_started = asyncio.Event()
+    release_listener = asyncio.Event()
+
+    async def listen_once(_token):
+        listener_calls.append(client._session_id)
+        if client._session_id == "session-1":
+            raise MCPHTTPError(404, "unknown session")
+        new_listener_started.set()
+        await asyncio.wait_for(release_listener.wait(), 10)
+        return False
+
+    monkeypatch.setattr(client, "_listen_notification_stream", listen_once)
+    replacement_owner = asyncio.create_task(client._listen_notifications())
+    client._notification_task = replacement_owner
+    try:
+        await await_or_fail(new_listener_started.wait(), what="new session listener")
+        assert listener_calls == ["session-1", "session-2"]
+        assert client._notification_task is not replacement_owner
+        assert sum(method == "initialize" for method, _ in restarting_mcp.requests) == 2
+    finally:
+        release_listener.set()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_recovery_after_caller_stops_waiting(
+    client, restarting_mcp
+):
+    restarting_mcp.restart()
+    restarting_mcp.block_next_initialize()
+    request = asyncio.create_task(client.list_tools())
+    await await_or_fail(
+        restarting_mcp.initialize_started.wait(), what="recovery initialize start"
+    )
+    request.cancel()
+    await asyncio.gather(request, return_exceptions=True)
+
+    assert not restarting_mcp.initialize_cancelled.is_set()
+
+    await client.close()
+    await await_or_fail(
+        restarting_mcp.initialize_cancelled.wait(), what="recovery cancellation on close"
+    )
+    assert client._notification_task is None
