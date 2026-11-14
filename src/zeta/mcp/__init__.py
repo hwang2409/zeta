@@ -8,6 +8,7 @@ from .client import (
     MCPResource,
     MCPTool,
     MCPTransportError,
+    MCPUnsupportedError,
 )
 from .config import (
     MCPConfig,
@@ -51,6 +52,7 @@ __all__ = [
     "MCPServerStatus",
     "MCPTool",
     "MCPTransportError",
+    "MCPUnsupportedError",
     "ManagedServer",
     "StdioMCPClient",
     "StreamableHTTPMCPClient",
