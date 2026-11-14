@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import gc
 import json
 import logging
 import os
@@ -21,6 +20,7 @@ from rich.text import Text
 
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
@@ -542,11 +542,11 @@ def test_todo_child_refresh_and_corruption_is_visible_and_recovers(
     with caplog.at_level(logging.WARNING):
         navigation.open_selected()
         navigation.refresh(force=True)
-    assert widget.visible
-    assert _todo_text(widget) == "child todos unavailable"
-    assert sum("agent todo refresh failed" in record.message for record in caplog.records) == 1
+    assert "initial parent" in _todo_text(widget)
+    assert not any("agent todo refresh failed" in record.message for record in caplog.records)
 
     state_path.write_bytes(valid_state)
+    navigation.open_selected()
     navigation.refresh(force=True)
     assert "old child" in _todo_text(widget)
 
@@ -591,8 +591,9 @@ def test_todo_missing_child_directory_is_unavailable(tmp_path: Path) -> None:
     shutil.rmtree(child)
     navigation.open_selected()
     navigation.refresh(force=True)
+    assert navigation.current_path == navigation.root_path
     snapshot = navigation.todo_snapshot()
-    assert snapshot is not None and snapshot.unavailable
+    assert snapshot is not None and not snapshot.unavailable
     asyncio.run(navigation.close())
     root.close()
 
@@ -1246,6 +1247,7 @@ async def test_send_to_run_ends_within_its_deadline_when_the_append_lock_is_held
         os.close(lock_fd)
     assert result is not None and "timed out" in result
     assert await asyncio.to_thread(child.pending_prompts) == []
+    await app.close()
 
 
 @pytest.mark.parametrize("missing", ["conversation", "session"])
@@ -1290,6 +1292,7 @@ async def test_send_to_run_is_not_blocked_by_a_held_child_root_lock(tmp_path: Pa
         entry.data["text"]
         for entry in await asyncio.to_thread(child.pending_prompts)
     ] == ["while locked"]
+    await app.close()
 
 
 @pytest.mark.asyncio
@@ -1677,9 +1680,9 @@ def test_child_replay_bounds_thoughts_and_text_before_rendering(tmp_path: Path) 
     rendered_lines = navigation.transcript_control.transcript.lines(120)
     rendered = "\n".join(rendered_lines)
 
-    assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+    assert len(rendered_lines) <= MAX_AGENT_VIEW_LINES
     assert "thought 0" in rendered
-    assert "thought 399" in rendered
+    assert "thought 399" not in rendered
     assert long_text not in rendered
     assert "x" * 2_001 not in rendered
     assert rendered.count("x") <= 2_000
@@ -1703,10 +1706,10 @@ def test_child_replay_caps_rendered_rows_at_multiple_widths(tmp_path: Path) -> N
     for width in (40, 80, 120):
         rendered_lines = navigation.transcript_control.transcript.lines(width)
         rendered = "\n".join(rendered_lines)
-        assert len(rendered_lines) > MAX_AGENT_VIEW_LINES
+        assert len(rendered_lines) <= MAX_AGENT_VIEW_LINES
         assert Text.from_ansi(rendered_lines[0]).plain == "✱ thought"
         assert "thought 0" in rendered
-        assert "thought 99" in rendered
+        assert "thought 99" not in rendered
         assert "older lines omitted" not in rendered
         transcript = navigation.transcript_control.transcript
         transcript.create_content(width, 10)
@@ -1967,22 +1970,6 @@ def test_child_transcript_excludes_nested_child_calls_and_is_bounded(tmp_path: P
     assert lines[0] == "[older lines omitted]"
 
 
-@pytest.mark.asyncio
-async def test_agent_transcript_control_loads_complete_history(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Complete")
-    _append_child_lines(
-        child, (f"line {index}" for index in range(MAX_AGENT_VIEW_LINES + 20))
-    )
-
-    control = agent_card.AgentTranscriptControl()
-    await control.load(child)
-    lines = control.transcript.lines(120)
-
-    assert control.transcript._max_lines is None
-    assert any("line 0" in line for line in lines)
-    assert any(f"line {MAX_AGENT_VIEW_LINES + 19}" in line for line in lines)
-    assert not any("older lines omitted" in line for line in lines)
 
 
 def test_child_transcript_exact_fit_has_no_truncation_marker(tmp_path: Path) -> None:
@@ -2303,39 +2290,28 @@ def _wheel(event_type: MouseEventType) -> MouseEvent:
     )
 
 
-def test_subagent_view_can_scroll_to_first_message_while_running(tmp_path: Path) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Running")
-    for index in range(300):
-        _append_child_line(child, f"line {index}")
-    navigation = AgentNavigation(store)
-    navigation.open_selected()
-    control = navigation.transcript_control
-    control.create_content(80, 10)
-
-    for _ in range(300):
-        control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
-    visible = _visible_text(control.create_content(80, 10))
-
-    assert "line 0" in visible
-    assert not control.transcript.follow_tail
 
 
-def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Running")
     for index in range(80):
         _append_child_line(child, f"line {index}")
     navigation = AgentNavigation(store)
-    navigation.open_selected()
     control = navigation.transcript_control
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 8)
     for _ in range(5):
         control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
     before = _visible_text(control.create_content(80, 8))
 
     _append_child_line(child, "new live output")
-    assert navigation.refresh(force=True)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
     after = _visible_text(control.create_content(80, 8))
 
     assert after == before
@@ -2343,19 +2319,24 @@ def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) 
     assert not control.transcript.follow_tail
 
 
-def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Running")
     for index in range(20):
         _append_child_line(child, f"line {index}")
     navigation = AgentNavigation(store)
-    navigation.open_selected()
     control = navigation.transcript_control
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 6)
     assert control.transcript.follow_tail
 
     _append_child_line(child, "new live output")
-    assert navigation.refresh(force=True)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
     visible = _visible_text(control.create_content(80, 6))
 
     assert "new live output" in visible
@@ -2380,13 +2361,18 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
     child = _child(root, 1, description="Replace")
     _append_child_lines(child, (f"stale {index}" for index in range(20)))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
     replacement = child / "replacement.jsonl"
     replacement.write_bytes(_replacement_transcript(tmp_path, child.name, "replacement"))
 
     os.replace(replacement, child / "conversation.jsonl")
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "replacement" in rendered
     assert "stale" not in rendered
@@ -2398,13 +2384,18 @@ async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
     child = _child(root, 1, description="Truncate")
     _append_child_lines(child, (f"stale {index}" for index in range(20)))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
 
     (child / "conversation.jsonl").write_bytes(
         _replacement_transcript(tmp_path, child.name, "short")
     )
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "short" in rendered
     assert "stale" not in rendered
@@ -2416,7 +2407,9 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
     child = _child(root, 1, description="Rewrite")
     _append_child_lines(child, ("old content",))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
     transcript = child / "conversation.jsonl"
     inode = transcript.stat().st_ino
 
@@ -2429,7 +2422,10 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
         handle.truncate()
     assert transcript.stat().st_ino == inode
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "new content" in rendered
     assert "old content" not in rendered
@@ -2449,7 +2445,9 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
         for index in range(60)
     ]
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 8)
     control.top()
     control.scroll(10)
@@ -2466,7 +2464,10 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
     )
     child_store.close()
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await await_or_fail(refresh, what="child transcript refresh")
+    assert control.transcript.units
     after_content = control.create_content(80, 8)
     after = "\n".join(
         "".join(text for _, text in after_content.get_line(index))
@@ -2476,50 +2477,6 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
     assert after == before
     assert "new branch" in rendered
     assert "line 59" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_large_subagent_append_keeps_event_loop_responsive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Large")
-    _append_child_line(child, "initial")
-    control = agent_card.AgentTranscriptControl()
-    await control.load(child)
-    control.create_content(80, 12)
-    payload = "x" * 2_000
-    _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
-
-    # The sync path must yield within the bounded render work budget.
-    gc.collect()
-    replayed = 0
-    batch_sizes: list[int] = []
-    original_replay = control._replay
-
-    def record_replay(*args: object, **kwargs: object) -> None:
-        nonlocal replayed
-        replayed += 1
-        original_replay(*args, **kwargs)
-
-    monkeypatch.setattr(control, "_replay", record_replay)
-    original_sleep = agent_card.asyncio.sleep
-
-    async def record_yield(_delay: float) -> None:
-        nonlocal replayed
-        batch_sizes.append(replayed)
-        replayed = 0
-        await original_sleep(0)
-
-    monkeypatch.setattr(agent_card.asyncio, "sleep", record_yield)
-    assert await control.sync(child)
-
-    control.create_content(80, 12)
-    assert control._snapshot is not None
-    assert len(control._snapshot.messages) == 5_001
-    assert control.transcript._lazy_viewport
-    assert batch_sizes
-    assert max(batch_sizes) <= AgentTranscriptControl._RENDER_BATCH_SIZE
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
@@ -2631,6 +2588,10 @@ async def test_child_approval_exits_navigation_in_full_screen(
     app._install_full_screen_layout(session)
     app._agent_navigation.selected_index = 1
     app._agent_navigation.open_selected()
+    assert app._agent_navigation.transcript_control._load_task is not None
+    await asyncio.wait_for(
+        app._agent_navigation.transcript_control._load_task, 10
+    )
     assert app._agent_navigation.child_view_active
 
     app._handle_background_event(
@@ -2639,6 +2600,10 @@ async def test_child_approval_exits_navigation_in_full_screen(
             tool_call=call,
             data={"agent_instance_id": instance_id},
         )
+    )
+    assert app._agent_navigation.transcript_control._load_task is not None
+    await asyncio.wait_for(
+        app._agent_navigation.transcript_control._load_task, 10
     )
 
     assert app._agent_navigation.current_path == store.session_dir

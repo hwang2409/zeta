@@ -947,7 +947,7 @@ class AgentRunCommandMixin:
             except BaseException as exc:  # noqa: BLE001 - surface send failures
                 error = str(exc) or exc.__class__.__name__
             if error is None:
-                self._prompt_history.append(history_path, value)
+                self._agent_navigation.transcript_control.prompt_history.append(history_path, value)
                 if buffer is not None and not edited:
                     buffer.reset()
                 self._print_system(f"queued message for {child_id}")
@@ -1020,7 +1020,7 @@ class AgentRunCommandMixin:
         if error is not None:
             return error
         if history_path is not None:
-            self._prompt_history.append(history_path, message)
+            self._agent_navigation.transcript_control.prompt_history.append(history_path, message)
         return (
             f"queued for {run_id}; a running child receives it after its current "
             "tool call, before its next model call; an idle child receives it at "

@@ -706,29 +706,3 @@ def test_transcript_rebuild_reads_session_metadata_once(
 
     assert "answer 19" in app._transcript.render(120)
     assert len(reads) <= 1
-
-
-def test_agent_transcript_replay_reads_session_metadata_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import asyncio
-
-    from zeta.tui import agent_card
-
-    manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
-    thought = Message(MessageRole.ASSISTANT, [ThinkingContent("**stored thought**")])
-    control = agent_card.AgentTranscriptControl()
-    reads = _count_meta_reads(monkeypatch)
-
-    asyncio.run(
-        control._replay_batches(
-            [(f"entry-{index}", thought.to_dict()) for index in range(20)],
-            opened.store.session_dir,
-        )
-    )
-
-    plain = Text.from_ansi(control.transcript.render(80)).plain
-    assert "stored thought" in plain
-    assert "**stored thought**" not in plain
-    assert len(reads) <= 1

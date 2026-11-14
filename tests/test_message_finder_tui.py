@@ -55,7 +55,13 @@ def _app_for_finder(
     app._transcript = transcript
     app._agent_navigation = SimpleNamespace(
         child_view_active=child is not None,
-        transcript_control=SimpleNamespace(transcript=child),
+        transcript_control=SimpleNamespace(
+            transcript=child,
+            prompt_history=None,
+            search_results=(),
+            end_search=lambda: None,
+            start_search=lambda *_args: None,
+        ),
         viewed_transcript=child or transcript,
     )
     app._active_finder = transcript

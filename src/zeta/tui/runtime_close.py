@@ -71,9 +71,16 @@ class RuntimeCloseMixin:
             close_history_markers = getattr(self, "_close_history_markers", None)
             if close_history_markers is not None:
                 await attempt_async(close_history_markers)
-            history_pager = getattr(self, "_history_pager", None)
-            if history_pager is not None:
-                await attempt_async(history_pager.close)
+            close_history_view = getattr(self, "_close_history_view", None)
+            if close_history_view is not None:
+                await attempt_async(close_history_view)
+            close_history_pager = getattr(self, "_close_history_pager", None)
+            if close_history_pager is not None:
+                await attempt_async(close_history_pager)
+            else:
+                history_pager = getattr(self, "_history_pager", None)
+                if history_pager is not None:
+                    await attempt_async(history_pager.close)
             prompt_history = getattr(self, "_prompt_history", None)
             if prompt_history is not None:
                 await attempt_async(prompt_history.close)
@@ -138,6 +145,9 @@ class RuntimeCloseMixin:
             self._draft_session = None
             self._session = None
             self._closed = True
+        restore_closed_history = getattr(self, "_restore_closed_history", None)
+        if restore_closed_history is not None:
+            attempt(restore_closed_history)
         if first_error is not None:
             raise first_error
 

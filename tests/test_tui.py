@@ -42,6 +42,7 @@ from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout
@@ -125,7 +126,7 @@ from zeta.tui.agent_card import (
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp, build_backend
 from zeta.tui.bootstrap import background_notice
-from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -2032,7 +2033,9 @@ async def test_agent_card_transcript_hides_passive_harness_message(
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
-    await control.load(store.session_dir)
+    activation = control.activate(store.session_dir)
+    assert activation is not None
+    await await_or_fail(activation, what="child transcript activation")
     rendered = Text.from_ansi(control.transcript.render(120)).plain
 
     assert any("visible prompt" in line for line in transcript)
@@ -12489,170 +12492,6 @@ def _fd_count() -> int:
 
 
 @pytest.mark.asyncio
-async def test_tui_close_rejects_inflight_transcript_source(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.agent_lifecycle_path.write_text(
-        json.dumps(
-            {"description": "Explore", "agent_type": "general", "state": "running"}
-        )
-    )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
-    child.close()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    baseline = _fd_count()
-    opened = threading.Event()
-    release = threading.Event()
-    sources: list[agent_sync.AgentTranscriptSource] = []
-    original_init = agent_sync.AgentTranscriptSource.__init__
-    original_refresh = agent_sync.AgentTranscriptSource.refresh
-
-    def record_init(source, *args, **kwargs) -> None:
-        original_init(source, *args, **kwargs)
-        sources.append(source)
-
-    def gated_refresh(source, *args, **kwargs):
-        tree = original_refresh(source, *args, **kwargs)
-        opened.set()
-        assert release.wait(5)
-        return tree
-
-    # test-contract: seam Hold the transcript source at its production refresh boundary.
-    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "__init__", record_init)
-    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "refresh", gated_refresh)
-    app._agent_navigation.selected_index = 1
-    app._agent_navigation.open_selected()
-    await wait_until(opened.is_set)
-
-    close_task = asyncio.create_task(app.close())
-    await asyncio.sleep(0)
-    assert not close_task.done()
-    release.set()
-    await close_task
-
-    assert sources and sources[0]._closed
-    assert sources[0]._stores == {}
-    assert app._agent_navigation.transcript_control._source is None
-    assert _fd_count() <= baseline
-
-
-@pytest.mark.asyncio
-async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.agent_lifecycle_path.write_text(
-        json.dumps(
-            {"description": "Explore", "agent_type": "general", "state": "running"}
-        )
-    )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
-    child.close()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    baseline = _fd_count()
-    navigation = app._agent_navigation
-    navigation.selected_index = 1
-    navigation.open_selected()
-    assert navigation.transcript_control._sync_task is not None
-    # test-contract: seam no public transcript-sync completion event exists
-    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
-    source = navigation.transcript_control._source
-    assert source is not None
-    previous = navigation.transcript_control._snapshot
-    entered = threading.Event()
-    published = threading.Event()
-    closed = threading.Event()
-    original_refresh = source.refresh
-    original_close = source.close
-
-    def blocked_refresh(*args, **kwargs):
-        entered.set()
-        return original_refresh(*args, **kwargs)
-
-    def close_and_signal() -> None:
-        try:
-            original_close()
-        finally:
-            closed.set()
-
-    # test-contract: seam no public transcript-refresh readiness event exists
-    monkeypatch.setattr(source, "refresh", blocked_refresh)
-    # test-contract: seam no public transcript-source closed event exists
-    monkeypatch.setattr(source, "close", close_and_signal)
-    transcript_handed_off = asyncio.Event()
-    todo_cleanup_release = asyncio.Event()
-    transcript_cleanup_tasks: set[asyncio.Task[None]] = set()
-    finish_transcript_cleanup = agent_lifetime.finish_cleanup_or_handoff
-    finish_todo_cleanup = agent_sync.finish_cleanup_or_handoff
-
-    async def record_transcript_cleanup(tasks, close, *, deadline, label) -> None:
-        before = set(agent_shutdown._LATE_CLEANUP_TASKS)
-        try:
-            await finish_transcript_cleanup(
-                tasks, close, deadline=deadline, label=label
-            )
-            transcript_cleanup_tasks.update(agent_shutdown._LATE_CLEANUP_TASKS - before)
-        finally:
-            transcript_handed_off.set()
-
-    async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
-        await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
-        # Keep the empty todo cleanup pending until both owners have handed off.
-        blocker = asyncio.create_task(
-            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
-        )
-        await finish_todo_cleanup(
-            (blocker, *tasks), close, deadline=deadline, label=label
-        )
-
-    monkeypatch.setattr(
-        agent_lifetime, "finish_cleanup_or_handoff", record_transcript_cleanup
-    )
-    monkeypatch.setattr(agent_sync, "finish_cleanup_or_handoff", block_todo_cleanup)
-    # test-contract: seam no public shutdown-budget injection exists
-    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
-    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
-    # test-contract: seam no public transcript-refresh lock seam exists
-    agent_sync._REFRESH_LOCK.acquire()
-    try:
-        navigation.transcript_control.request_sync(source.path, published.set)
-        assert await asyncio.to_thread(entered.wait, 10)
-        await asyncio.wait_for(app.close(), timeout=10)
-        assert not source._closed
-        # test-contract: durability shutdown retains one late transcript cleanup
-        assert len(transcript_cleanup_tasks) == 1 and transcript_cleanup_tasks <= (
-            agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
-        )
-    finally:
-        agent_sync._REFRESH_LOCK.release()
-        todo_cleanup_release.set()
-        late_cleanup_tasks = agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
-        if late_cleanup_tasks:
-            await asyncio.wait_for(
-                asyncio.gather(*late_cleanup_tasks, return_exceptions=True), timeout=10
-            )
-
-    assert await asyncio.to_thread(closed.wait, 10)
-    assert source._stores == {}
-    assert navigation.transcript_control._snapshot is previous
-    assert not published.is_set()
-    assert _fd_count() <= baseline
-
-
-@pytest.mark.asyncio
 async def test_tui_close_hands_off_blocked_todo_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12807,11 +12646,13 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
     for _ in range(8):
         navigation.selected_index = 1
         navigation.open_selected()
-        assert navigation.transcript_control._sync_task is not None
-        await navigation.transcript_control._sync_task
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="focused child load")
         navigation.exit_navigation()
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="root history restore")
 
-    await app.close()
+    await asyncio.wait_for(app.close(), 10)
 
     assert navigation.transcript_control._closed
     assert navigation.transcript_control._source is None
@@ -12929,7 +12770,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "child marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         assert session.layout.has_focus(navigation.transcript_window)
@@ -12968,7 +12811,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == grandchild.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "grandchild marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         assert navigation.list_visible
@@ -12987,7 +12832,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "child marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         child_text = Text.from_ansi(
@@ -13018,9 +12865,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(lambda: session.default_buffer.text == "draftjjj")
 
         session.app.exit()
-        await task
+        await await_or_fail(task, what="recursive navigation prompt")
 
-    await navigation.close()
+    await asyncio.wait_for(navigation.close(), 10)
     assert navigation.transcript_control._source is None
     grandchild.close()
     child.close()
@@ -16198,12 +16045,13 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         )
         assert app._history_finder.finder_accept()
         assert buffer.text == "prompt-0"
-        assert len(app._prompt_history.pages) <= 2
+        assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "journey", ("up", "down", "edit", "in-flight", "in-flight-edit")
+    "journey",
+    ("up", "down", "edit", "in-flight", "in-flight-edit", "child-up", "child-down"),
 )
 async def test_cold_prompt_history_keys_follow_owned_navigation(
     tmp_path: Path,
@@ -16211,20 +16059,37 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / journey / "sessions")
-    prompts = ("oldest prompt", "middle prompt", "newest\nprompt")
+    child_journey = journey.startswith("child-")
+    prompts = (
+        tuple(f"child prompt {index}" for index in range(260))
+        if child_journey
+        else ("oldest prompt", "middle prompt", "newest\nprompt")
+    )
+    prompt_store = (
+        ConversationStore(store.session_dir / "agents", session_id="1")
+        if child_journey
+        else store
+    )
     for prompt in prompts:
-        store.append_message(
+        prompt_store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent(prompt)]),
-                MessageOrigin.USER,
+                (
+                    MessageOrigin.AGENT_PROMPT
+                    if child_journey
+                    else MessageOrigin.USER
+                ),
             )
         )
-        store.append_message(
+        prompt_store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("agent notice")]),
                 MessageOrigin.AGENT_SEND,
             )
         )
+    child_path = prompt_store.session_dir if child_journey else None
+    if child_journey:
+        prompt_store.close()
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -16262,32 +16127,64 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
         async with owned_app(app) as owner:
             prompt_task = owner.task(asyncio.create_task(session.prompt_async()))
             await wait_until(lambda: session.app.is_running)
+            if child_path is not None:
+                navigation = app._agent_navigation
+                navigation.current_path = child_path
+                navigation._path_stack.append(child_path)
+                navigation._breadcrumb_labels.append("long child")
+                navigation.transcript_control.request_sync(
+                    child_path, app._invalidate_prompt
+                )
+                navigation._switch_transcript()
+                child_load = app._agent_navigation.transcript_control._load_task or getattr(
+                    navigation.transcript_control, "_sync_task", None
+                )
+                assert child_load is not None
+                await await_or_fail(
+                    child_load, what="focused child prompt source"
+                )
+                session.app.layout.focus(session.default_buffer)
+                if journey == "child-down":
+                    session.default_buffer.text = "exact child draft"
 
-            if journey in {"up", "down"}:
+            if journey in {"up", "down", "child-up", "child-down"}:
                 for index, expected in enumerate(reversed(prompts)):
                     before = processed_keys
                     pipe.send_text("\x1b[A")
-                    if index == 0:
+                    try:
                         await wait_until(
-                            lambda expected=expected: session.default_buffer.text == expected
+                            lambda expected=expected: (
+                                session.default_buffer.text == expected
+                            )
                         )
-                    else:
-                        await wait_until(
-                            lambda before=before: processed_keys > before
-                        )
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            f"Up did not select prompt {expected!r}"
+                        ) from exc
+                    assert processed_keys > before
                     assert session.default_buffer.text == expected, (
                         f"Up did not select prompt {expected!r}"
                     )
-                if journey == "down":
-                    for expected in (*prompts[1:], ""):
+                if journey in {"down", "child-down"}:
+                    restored_draft = (
+                        "exact child draft" if journey == "child-down" else ""
+                    )
+                    for expected in (*prompts[1:], restored_draft):
                         before = processed_keys
+                        assert session.app.layout.has_focus(session.default_buffer)
                         pipe.send_text("\x1b[B")
-                        await wait_until(
-                            lambda before=before: processed_keys > before
-                        )
-                        assert session.default_buffer.text == expected, (
-                            f"Down did not select prompt {expected!r}"
-                        )
+                        try:
+                            await wait_until(
+                                lambda expected=expected: (
+                                    session.default_buffer.text == expected
+                                )
+                            )
+                        except AssertionError as exc:
+                            raise AssertionError(
+                                f"Down expected {expected!r}, got "
+                                f"{session.default_buffer.text!r}; "
+                                f"index={app._agent_navigation.transcript_control.prompt_history._index}"
+                            ) from exc
             elif journey == "edit":
                 pipe.send_text("\x1b[A")
                 await wait_until(lambda: session.default_buffer.text == prompts[-1])
@@ -16400,15 +16297,15 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
             monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
             buffer = Buffer()
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="initial empty ctrl+r prompt scan",
             )
             app._finder_input("nightly wipe")
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="typed ctrl+r prompt scan",
             )
             if app._finder_prepare_task is not None:
@@ -16618,7 +16515,7 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
 
 @pytest.mark.asyncio
 async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
@@ -16650,6 +16547,18 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             parent_id = entry_id
     store = ConversationStore(store.root_dir, session_id=store.session_id)
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child_ids: list[str] = []
+    for index in range(700):
+        entry = child_store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"child-history-{index}")]),
+                MessageOrigin.USER,
+            )
+        )
+        child_ids.append(entry.id)
+    child_path = child_store.session_dir
+    child_store.close()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -16664,27 +16573,27 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "history-49999" in rendered
         assert "history-0" not in rendered
         assert len(app._transcript.units) <= 4 * 128
-        assert len(app._history_pager.pages) <= 4
-        assert len(app._history_pager.descriptors) <= 4
-        assert len(app._history_pager.scalar_tokens) == 6
+        assert len(app._agent_navigation.transcript_control.history_pager.pages) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
 
         for page_number in range(5):
             app._transcript.scroll_to_top()
             anchor = app._transcript.durable_scroll_anchor
             app._scroll_history_up()
             await asyncio.sleep(0)
-            reads = tuple(app._history_pager._loads.values())
+            reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
             assert len(reads) == 1
             await await_or_fail(
                 asyncio.gather(*reads),
                 what=f"older transcript page {page_number + 1}",
             )
             assert app._transcript.durable_scroll_anchor == anchor
-            assert len(app._history_pager.descriptors) <= 4
+            assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
 
-        matches = await app._history_pager.search("history-0")
+        matches = await app._agent_navigation.transcript_control.history_pager.search("history-0")
         assert [(match.entry_id, match.unit_ordinal) for match in matches]
-        await app._history_pager.reveal(matches[0].entry_id)
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
         app._render_resident_history()
         assert app._transcript.restore_durable_scroll_anchor(
             (matches[0].entry_id, matches[0].unit_ordinal, 0)
@@ -16695,35 +16604,35 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         app._active_finder = app._transcript
         app._start_finder_preparation(request)
         app._finder_input("history-")
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="global transcript search",
         )
-        assert len(app._history_search_results) == 200
-        app._history_search_index = len(app._history_search_results) - 1
+        assert len(app._agent_navigation.transcript_control.search_results) == 200
+        app._agent_navigation.transcript_control.search_index = len(app._agent_navigation.transcript_control.search_results) - 1
         assert app._navigate_history_search(1)
-        assert app._history_search_task is not None
-        await await_or_fail(app._history_search_task, what="wrapped next search result")
-        assert app._history_search_index == 0
+        assert app._agent_navigation.transcript_control.search_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control.search_task, what="wrapped next search result")
+        assert app._agent_navigation.transcript_control.search_index == 0
         assert app._navigate_history_search(-1)
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="wrapped previous search result",
         )
-        assert app._history_search_index == len(app._history_search_results) - 1
+        assert app._agent_navigation.transcript_control.search_index == len(app._agent_navigation.transcript_control.search_results) - 1
 
         app._append_transcript(Text("live-tail"))
         page_number = 0
         async with asyncio.timeout(120):
-            while app._history_pager.can_load_newer:
+            while app._agent_navigation.transcript_control.history_pager.can_load_newer:
                 page_number += 1
                 assert page_number <= 500
                 app._transcript.scroll_to_bottom()
                 app._scroll_history_down()
                 await asyncio.sleep(0)
-                reads = tuple(app._history_pager._loads.values())
+                reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
                 assert len(reads) == 1
                 await await_or_fail(
                     asyncio.gather(*reads),
@@ -16734,6 +16643,70 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "live-tail" in rendered
         assert "history-49999" in rendered
         assert app._transcript.follow_tail
+
+        from zeta.tui import agent_card as agent_card_module
+        from zeta.tui import checkpoints as checkpoints_module
+
+        provider_reads: list[int] = []
+        main_thread = threading.get_ident()
+        original_provider = checkpoints_module.session_replay_provider
+
+        def tracked_provider(path: Path) -> str | None:
+            provider_reads.append(threading.get_ident())
+            return original_provider(path)
+
+        monkeypatch.setattr(
+            checkpoints_module, "session_replay_provider", tracked_provider
+        )
+        monkeypatch.setattr(
+            agent_card_module,
+            "session_replay_provider",
+            tracked_provider,
+            raising=False,
+        )
+        navigation = app._agent_navigation
+        navigation.transcript_control.capture_root_view()
+        child_load = navigation.transcript_control.activate(child_path)
+        assert child_load is not None
+        await await_or_fail(child_load, what="focused child newest page")
+        child_transcript = navigation.transcript_control.transcript
+        rendered = Text.from_ansi(child_transcript.render(120)).plain
+        assert "child-history-699" in rendered
+        assert "child-history-0" not in rendered
+        assert all(
+            unit.entry_id in child_ids
+            or ":dependency:" in unit.entry_id
+            for page in app._agent_navigation.transcript_control.history_pager.pages
+            for unit in page.units
+        )
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        app._render_active_resident_history()
+        app._render_active_resident_history()
+        assert len(provider_reads) == 1
+        assert provider_reads[0] != main_thread
+
+        matches = await app._agent_navigation.transcript_control.history_pager.search("child-history-0")
+        assert matches
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
+        app._render_active_resident_history()
+        assert child_transcript.restore_durable_scroll_anchor(
+            (matches[0].entry_id, matches[0].unit_ordinal, 0)
+        )
+        assert "child-history-0" in Text.from_ansi(
+            child_transcript.render(120)
+        ).plain
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
+
+        navigation.exit_navigation()
+        root_load = app._agent_navigation.transcript_control._load_task
+        assert root_load is not None
+        await await_or_fail(root_load, what="return to root history")
+        assert all(
+            unit.entry_id not in child_ids
+            for page in app._agent_navigation.transcript_control.history_pager.pages
+            for unit in page.units
+        )
 
 @pytest.mark.parametrize(
     "journey",
@@ -16748,6 +16721,13 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "branch-prompt-reset",
         "branch-prompt-stale-fork",
         "branch-prompt-stale-tree",
+        "child-cancel-replace-close",
+        "child-stale-page",
+        "child-live-refresh",
+        "child-switch-mid-refresh",
+        "child-deleted-activation",
+        "child-old-search",
+        "root-anchor-child-visit",
     ),
 )
 @pytest.mark.asyncio
@@ -16758,7 +16738,7 @@ async def test_root_tui_paging_render_path_table(
     failure_text = "needle-provider-failure"
     checkpoint = None
 
-    if journey == "stale-anchor":
+    if journey in {"stale-anchor", "root-anchor-child-visit"}:
         for index in range(300):
             store.append_message(
                 with_message_origin(
@@ -16859,7 +16839,473 @@ async def test_root_tui_paging_render_path_table(
     async with owned_app(app):
         assert await app._rebuild_transcript_async()
 
-        if journey == "stale-anchor":
+        if journey == "child-old-search":
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            old = child_store.append_message(
+                with_message_origin(
+                    Message(
+                        MessageRole.USER,
+                        [TextContent("Henry's old child prompt")],
+                    ),
+                    MessageOrigin.AGENT_PROMPT,
+                )
+            )
+            for index in range(300):
+                child_store.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child search tail {index}")],
+                    )
+                )
+            child_path = child_store.session_dir
+            child_store.agent_lifecycle_path.write_text(
+                json.dumps({"description": "search child", "state": "running"})
+            )
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("search child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="focused child search activation"
+            )
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
+
+            def press(key: Keys | str) -> None:
+                keys = key if isinstance(key, Keys) else tuple(key)
+                if isinstance(keys, Keys):
+                    session.app.key_processor.feed(KeyPress(keys))
+                else:
+                    for character in keys:
+                        session.app.key_processor.feed(
+                            KeyPress(character, data=character)
+                        )
+                session.app.key_processor.process_keys()
+
+            transcript = navigation.transcript_control.transcript
+            with set_app(session.app):
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                press("Henry's old child prompt")
+                await wait_until(lambda: app._agent_navigation.transcript_control.search_task is not None)
+                await await_or_fail(
+                    app._agent_navigation.transcript_control.search_task, what="old focused child search"
+                )
+                try:
+                    await wait_until(
+                        lambda: (
+                            (state := transcript.finder_state()) is not None
+                            and state.complete
+                            and bool(state.rows)
+                        )
+                    )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "focused-child ctrl+f did not finish with the unloaded match"
+                    ) from exc
+                assert old.id in {
+                    match.entry_id for match in app._agent_navigation.transcript_control.search_results
+                }, "focused-child ctrl+f did not select the unloaded old row"
+                rendered = Text.from_ansi(transcript.render(120)).plain
+                assert "Henry's old child prompt" in rendered, (
+                    "selected old child row did not reach TranscriptWidget render"
+                )
+
+                app._finder_cancel()
+                await wait_until(lambda: transcript.finder_state() is None)
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                previous_search = app._agent_navigation.transcript_control.search_task
+                press("absent-focused-child-query")
+                await wait_until(
+                    lambda: app._agent_navigation.transcript_control.search_task is not previous_search
+                )
+                await await_or_fail(
+                    app._agent_navigation.transcript_control.search_task, what="focused child no-match search"
+                )
+                await wait_until(
+                    lambda: (
+                        (state := transcript.finder_state()) is not None
+                        and state.complete
+                        and not state.rows
+                    )
+                )
+                content = app._finder_control.create_content(80, None)
+                overlay = "\n".join(
+                    "".join(fragment[1] for fragment in content.get_line(row))
+                    for row in range(content.line_count)
+                )
+                assert "no matches" in overlay, (
+                    "focused-child no-match ctrl+f did not render no matches"
+                )
+                session.layout.focus(session.default_buffer)
+        elif journey == "root-anchor-child-visit":
+            await app._agent_navigation.transcript_control.history_pager.load("older")
+            app._render_resident_history()
+            app._transcript.scroll_to_top()
+            root_anchor = app._transcript.durable_scroll_anchor
+            assert root_anchor is not None
+            assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("child visit")])
+            )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("visited child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="child visit activation"
+            )
+            assert "child visit" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
+            with set_app(session.app):
+                session.app.key_processor.feed(KeyPress("h", data="h"))
+                session.app.key_processor.process_keys()
+                await wait_until(lambda: not navigation.child_view_active)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task, what="root anchor restoration"
+                )
+                assert app._transcript.durable_scroll_anchor == root_anchor, (
+                    "returning from child moved the root viewport to the tail"
+                )
+                assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+                session.layout.focus(session.default_buffer)
+        elif journey == "child-cancel-replace-close":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            first_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first search row")])
+            )
+            replacement_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("replacement search row")])
+            )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            started = threading.Event()
+            cancel_seen = threading.Event()
+            release = threading.Event()
+            original_search = source._search_sync
+
+            def blocked_search(*args: object):
+                query = args[-3]
+                cancel = args[-1]
+                assert isinstance(cancel, type(threading.Event()))
+                if query == "first":
+                    started.set()
+                    assert cancel.wait(10)
+                    cancel_seen.set()
+                    assert release.wait(10)
+                return original_search(*args)
+
+            # test-contract: seam force cancellation while the observer is open
+            monkeypatch.setattr(source, "_search_sync", blocked_search)
+            first = asyncio.create_task(source.search("first"))
+            assert await asyncio.to_thread(started.wait, 10)
+            first.cancel()
+            replacement = asyncio.create_task(source.search("replacement"))
+            closing = asyncio.create_task(source.close())
+            assert await asyncio.to_thread(cancel_seen.wait, 10)
+            await asyncio.sleep(0)
+            assert not first.done(), (
+                "cancelled search returned before its observer store closed"
+            )
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(first, what="cancelled child search drain")
+            matches = await await_or_fail(
+                replacement, what="replacement child search"
+            )
+            await await_or_fail(closing, what="child source close")
+            assert [match.entry_id for match in matches] == [replacement_entry.id]
+            assert first_entry.id not in {match.entry_id for match in matches}
+        elif journey == "child-stale-page":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+            from zeta.tui.transcript.paged_history import PagedTranscriptHistory
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            for index in range(300):
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"child row {index}")])
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            pager = PagedTranscriptHistory(source)
+            first_page = await pager.load()
+            anchor_id = first_page.units[0].entry_id
+            pager.set_anchor(anchor_id, 0, 0)
+            replacement = child_path / "conversation.replacement"
+            shutil.copy2(source.path / "conversation.jsonl", replacement)
+            os.replace(replacement, source.path / "conversation.jsonl")
+
+            page = await pager.load("older")
+
+            assert page.units
+            assert len(pager.descriptors) == 1, (
+                "stale child pages were mixed with the replacement log"
+            )
+            assert anchor_id in {unit.entry_id for unit in pager.pages[0].units}
+            await source.close()
+        elif journey == "child-live-refresh":
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            entry_ids = []
+            for index in range(300):
+                entry_ids.append(
+                    child_store.append_message(
+                        Message(
+                            MessageRole.ASSISTANT,
+                            [TextContent(f"running child row {index}")],
+                        )
+                    ).id
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("running child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="running child activation"
+            )
+            await app._agent_navigation.transcript_control.history_pager.reveal(entry_ids[0])
+            app._render_active_resident_history()
+            child_transcript = navigation.transcript_control.transcript
+            assert child_transcript.restore_durable_scroll_anchor(
+                (entry_ids[0], 0, 0)
+            )
+            anchor = child_transcript.durable_scroll_anchor
+
+            appended = []
+            for tick in range(3):
+                text = f"running child refresh {tick}"
+                child_store = ConversationStore(
+                    store.session_dir / "agents", session_id="1"
+                )
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(text)])
+                )
+                child_store.close()
+                appended.append(text)
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"running child live refresh {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"running child refresh {tick} was suppressed"
+                )
+                assert child_transcript.durable_scroll_anchor == anchor, (
+                    f"running child refresh {tick} moved the scrolled-up viewport"
+                )
+
+            child_transcript.scroll_to_bottom()
+            navigation.refresh(force=True)
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="running child return to tail"
+            )
+            navigation.transcript_control.create_content(120, 20)
+            rendered = Text.from_ansi(child_transcript.render(120)).plain
+            assert all(text in rendered for text in appended), (
+                "running child did not publish every refresh batch"
+            )
+        elif journey == "child-switch-mid-refresh":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child row")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("second child row")])
+            )
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            navigation.current_path = first_path
+            navigation._path_stack.append(first_path)
+            navigation._breadcrumb_labels.append("first child")
+            navigation.transcript_control.request_sync(first_path, app._invalidate_prompt)
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
+
+            source = navigation.transcript_control._source
+            original_page = source.page
+            refresh_started = asyncio.Event()
+            refresh_release = asyncio.Event()
+
+            async def held_page(*args, **kwargs):
+                refresh_started.set()
+                await asyncio.wait_for(refresh_release.wait(), 10)
+                return await original_page(*args, **kwargs)
+
+            source.page = held_page
+            navigation.refresh(force=True)
+            first_refresh = app._agent_navigation.transcript_control._load_task
+            assert first_refresh is not None
+            await asyncio.wait_for(refresh_started.wait(), 10)
+            navigation.current_path = second_path
+            navigation._path_stack.append(second_path)
+            navigation._breadcrumb_labels.append("second child")
+            navigation.transcript_control.request_sync(second_path, app._invalidate_prompt)
+            navigation._switch_transcript()
+            second_activation = app._agent_navigation.transcript_control._load_task
+            assert second_activation is not None and second_activation is not first_refresh
+            refresh_release.set()
+            await await_or_fail(second_activation, what="second child activation")
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "second child row" in rendered
+            assert "first child row" not in rendered
+            for tick in range(2):
+                second = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                second.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"second child refresh {tick}")],
+                    )
+                )
+                second.close()
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"second child refresh after switch {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"second child refresh {tick} after switch was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "second child refresh 1" in rendered
+        elif journey == "child-deleted-activation":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child only")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            navigation.current_path = first_path
+            navigation._path_stack.append(first_path)
+            navigation._breadcrumb_labels.append("first child")
+            navigation.transcript_control.request_sync(
+                first_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
+            assert "first child only" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            shutil.rmtree(second_path)
+            failed_activation = navigation.transcript_control.activate(second_path)
+            assert failed_activation is not None
+            await await_or_fail(
+                failed_activation, what="deleted child activation"
+            )
+            navigation.transcript_control.create_content(120, 20)
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            assert navigation.current_path == first_path
+            assert "first child only" in rendered, (
+                "failed target activation did not restore the leaving child"
+            )
+            assert "transcript unavailable" not in rendered
+
+            retry = ConversationStore(store.session_dir / "agents", session_id="2")
+            retry.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("retry child row")])
+            )
+            retry.close()
+            retry_activation = navigation.transcript_control.activate(second_path)
+            assert retry_activation is not None
+            await await_or_fail(
+                retry_activation, what="retry deleted child activation"
+            )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child row" in rendered
+            assert "transcript unavailable" not in rendered
+            for tick in range(2):
+                retry = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                retry.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"retry child refresh {tick}")],
+                    )
+                )
+                retry.close()
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"retry child refresh {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"retry child refresh {tick} was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child refresh 1" in rendered
+        elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page
             started = asyncio.Event()
@@ -16879,12 +17325,12 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(load, what="stale-anchor page read")
             assert app._transcript.durable_scroll_anchor == moved_anchor
         elif journey == "mixed-live-durable":
-            app._history_pager.reset(endpoint_id=durable.id)
-            app._history_pager.append_live(durable.id, Text("live-A"))
-            app._history_pager.append_live("live-B", Text("live-B"))
-            app._history_pager.append_live("live-C", Text("live-C"))
+            app._agent_navigation.transcript_control.history_pager.reset(endpoint_id=durable.id)
+            app._agent_navigation.transcript_control.history_pager.append_live(durable.id, Text("live-A"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-B", Text("live-B"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-C", Text("live-C"))
             page = await app._history_source.reveal(durable.id)
-            app._history_pager.adopt(page, direction="newer")
+            app._agent_navigation.transcript_control.history_pager.adopt(page, direction="newer")
             app._render_resident_history()
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "durable-A" in rendered
@@ -16897,8 +17343,8 @@ async def test_root_tui_paging_render_path_table(
             assert app._failed_turn[0] == "retry-target-user"
         elif journey == "tool-result-bound":
             assert sum(
-                len(page.units) for page in app._history_pager.pages
-            ) <= app._history_pager.max_segment_rows
+                len(page.units) for page in app._agent_navigation.transcript_control.history_pager.pages
+            ) <= app._agent_navigation.transcript_control.history_pager.max_segment_rows
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "result-127" in rendered
         elif journey == "close-search":
@@ -16916,8 +17362,8 @@ async def test_root_tui_paging_render_path_table(
                     finished.set()
 
             store.tui_history_search = blocked_search
-            task = asyncio.create_task(app._history_pager.search("search-row"))
-            app._history_search_task = task
+            task = asyncio.create_task(app._agent_navigation.transcript_control.history_pager.search("search-row"))
+            app._agent_navigation.transcript_control.search_task = task
             assert await asyncio.to_thread(started.wait, 10)
             await await_or_fail(
                 app._close_history_search(), what="close during history search"
@@ -16927,10 +17373,10 @@ async def test_root_tui_paging_render_path_table(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)
         elif journey == "unloaded-failed-search":
-            matches = await app._history_pager.search(failure_text)
+            matches = await app._agent_navigation.transcript_control.history_pager.search(failure_text)
             target = next(match for match in matches if match.entry_id == failed.id)
             assert target.unit_ordinal == 1
-            checkpoint_matches = await app._history_pager.search(
+            checkpoint_matches = await app._agent_navigation.transcript_control.history_pager.search(
                 "searchable-checkpoint"
             )
             checkpoint_target = checkpoint_matches[0]
@@ -16942,7 +17388,7 @@ async def test_root_tui_paging_render_path_table(
                 (target, failure_text),
                 (checkpoint_target, "searchable-checkpoint"),
             ):
-                await app._history_pager.reveal(search_target.entry_id)
+                await app._agent_navigation.transcript_control.history_pager.reveal(search_target.entry_id)
                 app._render_resident_history()
                 assert app._transcript.restore_durable_scroll_anchor(
                     (search_target.entry_id, search_target.unit_ordinal, 0)
@@ -16969,11 +17415,11 @@ async def test_root_tui_paging_render_path_table(
             assert app._failed_turn is not None
             assert app._failed_turn[0] == "retry-target-user"
         elif journey == "branch-prompt-reset":
-            app._prompt_history.bind(
+            app._agent_navigation.transcript_control.prompt_history.bind(
                 app._viewed_session_path(), app._history_source
             )
-            await app._prompt_history.load_older()
-            assert "branch-a-prompt" in app._prompt_history.snapshot(
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
+            assert "branch-a-prompt" in app._agent_navigation.transcript_control.prompt_history.snapshot(
                 app._viewed_session_path()
             )
             assert await app.slash_fork("branch-base") == (
@@ -16987,15 +17433,15 @@ async def test_root_tui_paging_render_path_table(
             )
             assert await app._rebuild_transcript_async()
 
-            await app._prompt_history.load_older()
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
             buffer = Buffer()
             app._history_previous(buffer)
             assert buffer.text == "branch-b-prompt"
             finder_buffer = Buffer(document=Document("branch-a-prompt"))
             app._history_finder_open(finder_buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="branch prompt finder reset"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="branch prompt finder reset"
             )
             state = app._history_finder.finder_state()
             assert state is not None
@@ -17041,7 +17487,7 @@ async def test_root_tui_paging_render_path_table(
 
             monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
             app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
-            scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert scan is not None
@@ -17079,7 +17525,7 @@ async def test_root_tui_paging_render_path_table(
             published.clear()
             finder_buffer = Buffer(document=Document("branch-b-prompt"))
             app._history_finder_open(finder_buffer)
-            new_scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            new_scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert new_scan is not None
@@ -17089,9 +17535,9 @@ async def test_root_tui_paging_render_path_table(
         else:
             buffer = Buffer(document=Document("oldest-needle"))
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="bounded ctrl+r source scan"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="bounded ctrl+r source scan"
             )
             if app._finder_prepare_task is not None:
                 await await_or_fail(
@@ -17105,7 +17551,7 @@ async def test_root_tui_paging_render_path_table(
             assert state is not None
             assert state.total <= 200
             assert any("oldest-needle" in row.excerpt for row in state.rows)
-            assert len(app._prompt_history.pages) <= 2
+            assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio
@@ -17151,3 +17597,68 @@ async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
         assert "old.txt" not in rendered
         assert rendered.count("new.txt") == 1
         assert rendered.count("nearest result") == 1
+
+
+@pytest.mark.asyncio
+async def test_child_activation_discards_stale_slow_target_and_returns_to_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("root owner row")]),
+            MessageOrigin.USER,
+        )
+    )
+    first = ConversationStore(store.session_dir / "agents", session_id="1")
+    first.append_message(Message(MessageRole.ASSISTANT, [TextContent("first row")]))
+    first_path = first.session_dir
+    first.close()
+    second = ConversationStore(store.session_dir / "agents", session_id="2")
+    second.append_message(Message(MessageRole.ASSISTANT, [TextContent("second row")]))
+    second_path = second.session_dir
+    second.close()
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+    original_page = ChildLogHistorySource.page
+
+    async def held_second_page(self, *args, **kwargs):
+        if self.path == second_path:
+            started.set()
+            await asyncio.wait_for(release.wait(), 10)
+        return await original_page(self, *args, **kwargs)
+
+    monkeypatch.setattr(ChildLogHistorySource, "page", held_second_page)
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        navigation = app._agent_navigation
+        first_activation = navigation.transcript_control.activate(first_path)
+        assert first_activation is not None
+        await await_or_fail(first_activation, what="first child activation")
+
+        second_activation = navigation.transcript_control.activate(second_path)
+        assert second_activation is not None
+        await asyncio.wait_for(started.wait(), 10)
+        root_activation = navigation.transcript_control.activate(navigation.root_path)
+        assert root_activation is not None
+        release.set()
+        await await_or_fail(root_activation, what="root activation over slow child")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(second_activation, 10)
+
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert navigation.current_path == navigation.root_path
+        assert navigation._path_stack == [navigation.root_path]
+        assert navigation.transcript_control._history_pager.source is app._history_source
+        assert "root owner row" in rendered
+        assert "first row" not in rendered and "second row" not in rendered

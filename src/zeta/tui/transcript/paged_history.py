@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from ...core.store._history_index import StaleHistorySnapshot
+
 
 @dataclass(frozen=True, slots=True)
 class HistoryCursor:
@@ -92,6 +94,20 @@ class PageDescriptor:
     page: TUIHistoryPage
 
 
+@dataclass(frozen=True, slots=True)
+class PagedHistoryState:
+    """One path's bounded resident history state."""
+
+    segments: tuple[PageDescriptor, ...]
+    older: HistoryCursor | None
+    newer: HistoryCursor | None
+    frozen_endpoint: str | None
+    newest_tail: HistoryCursor | None
+    anchor: tuple[str, int, int] | None
+    reveal_target: str | None
+    endpoint_id: str | None
+
+
 class PagedTranscriptHistory:
     """Own one contiguous, bounded deque of transcript paint segments."""
 
@@ -168,6 +184,33 @@ class PagedTranscriptHistory:
 
     def set_anchor(self, entry_id: str, unit_ordinal: int, text_offset: int) -> None:
         self._anchor = (entry_id, unit_ordinal, text_offset)
+
+    def capture(self) -> PagedHistoryState:
+        """Capture the bounded state needed to restore this exact viewport."""
+
+        return PagedHistoryState(
+            tuple(self._segments),
+            self._older,
+            self._newer,
+            self._frozen_endpoint,
+            self._newest_tail,
+            self._anchor,
+            self._reveal_target,
+            self.endpoint_id,
+        )
+
+    def restore(self, state: PagedHistoryState) -> None:
+        """Replace the resident state without reading history again."""
+
+        self.reset(endpoint_id=state.frozen_endpoint)
+        self._segments.extend(state.segments)
+        self._older = state.older
+        self._newer = state.newer
+        self._frozen_endpoint = state.frozen_endpoint
+        self._newest_tail = state.newest_tail
+        self._anchor = state.anchor
+        self._reveal_target = state.reveal_target
+        self.endpoint_id = state.endpoint_id
 
     async def close(self) -> None:
         """Invalidate publication without waiting for executor-backed reads."""
@@ -284,6 +327,75 @@ class PagedTranscriptHistory:
             self._segments.popleft()
         self._refresh_edges()
 
+    async def refresh_tail(self, *, follow_tail: bool) -> bool:
+        """Adopt child appends without replacing a scrolled-back resident window."""
+
+        source = self.source
+        generation = self.generation
+        if source is None:
+            return False
+        latest = await source.page()
+        if generation != self.generation or source is not self.source:
+            return False
+        current = next(
+            (
+                descriptor.page
+                for descriptor in reversed(self._segments)
+                if not descriptor.key.startswith("live:")
+            ),
+            None,
+        )
+        if current is None:
+            self.adopt(latest)
+            return bool(latest.units)
+        if latest.repair_generation != current.repair_generation:
+            anchor = self._anchor
+            self.reset()
+            self._anchor = anchor
+            page = (
+                await source.reveal(anchor[0])
+                if anchor is not None
+                else latest
+            )
+            self.adopt(page)
+            return bool(page.units)
+        if latest.endpoint_id == self.endpoint_id:
+            return False
+        if not follow_tail:
+            self._newest_tail = latest.older
+            return False
+        old_endpoint = self.endpoint_id
+        bridge = await source.reveal(old_endpoint) if old_endpoint is not None else latest
+        if generation != self.generation or source is not self.source:
+            return False
+        if not bridge.units or bridge.repair_generation != latest.repair_generation:
+            anchor = self._anchor
+            self.reset()
+            self._anchor = anchor
+            page = (
+                await source.reveal(anchor[0])
+                if anchor is not None
+                else latest
+            )
+            self.adopt(page)
+            return bool(page.units)
+        cursor = bridge.newer
+        changed = False
+        while cursor is not None:
+            page = await source.page(cursor, direction="newer")
+            if generation != self.generation or source is not self.source:
+                return False
+            for unit in page.units:
+                self.append_live(
+                    unit.entry_id, unit.value, unit_ordinal=unit.unit_ordinal
+                )
+                changed = True
+            cursor = page.newer
+        self.endpoint_id = latest.endpoint_id
+        self._frozen_endpoint = latest.endpoint_id
+        self._newest_tail = None
+        return changed
+
     async def load(self, direction: Literal["older", "newer"] = "older") -> TUIHistoryPage:
         cursor = self._older if direction == "older" else self._newer
         key = (self.generation, self.endpoint_id, direction, cursor.value if cursor else None)
@@ -296,9 +408,23 @@ class PagedTranscriptHistory:
             task = asyncio.create_task(source.page(cursor, direction=direction))
             self._loads[key] = task
             try:
-                page = await task
-            finally:
-                self._loads.pop(key, None)
+                try:
+                    page = await task
+                finally:
+                    self._loads.pop(key, None)
+            except StaleHistorySnapshot:
+                if generation != self.generation or source is not self.source:
+                    return TUIHistoryPage(())
+                anchor = self._anchor
+                self.reset()
+                self._anchor = anchor
+                page = (
+                    await source.reveal(anchor[0])
+                    if anchor is not None
+                    else await source.page()
+                )
+                self.adopt(page)
+                return page
             if generation != self.generation:
                 return TUIHistoryPage(())
             self.adopt(page, direction=direction)

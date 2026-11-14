@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit.buffer import Buffer
@@ -22,6 +22,7 @@ class SessionPromptHistory:
     def __init__(self, source: TUIHistorySource | None = None) -> None:
         self.source = source
         self._entries: list[tuple[tuple[str, str], ...]] = []
+        self._page_edges: list[tuple[HistoryCursor | None, HistoryCursor | None]] = []
         self._session: Path | None = None
         self._branch_id: str | None = None
         self._older: HistoryCursor | None = None
@@ -88,13 +89,16 @@ class SessionPromptHistory:
                 )
                 if generation != self._generation:
                     return
-                self._older, self._newer = older, newer
                 if rows or older is None:
                     break
                 cursor = older
             if rows:
                 self._entries.insert(0, rows)
+                self._page_edges.insert(0, (older, newer))
                 del self._entries[self.max_pages:]
+                del self._page_edges[self.max_pages:]
+                self._older = self._page_edges[0][0]
+                self._newer = self._page_edges[-1][1]
                 if self._index is not None:
                     self._index += len(rows)
 
@@ -119,10 +123,13 @@ class SessionPromptHistory:
             )
             if generation != self._generation:
                 return
-            self._older, self._newer = older, newer
             if rows:
                 self._entries.append(rows)
+                self._page_edges.append((older, newer))
                 self._entries = self._entries[-self.max_pages:]
+                self._page_edges = self._page_edges[-self.max_pages:]
+                self._older = self._page_edges[0][0]
+                self._newer = self._page_edges[-1][1]
                 if self._index is not None:
                     retained = sum(len(page) for page in self._entries)
                     self._index = max(0, retained - len(rows) - 1)
@@ -133,25 +140,21 @@ class SessionPromptHistory:
         finally:
             self._load = None
 
-    def replace(self, session_path: Path, prompts: Sequence[str]) -> None:
-        """Adopt a bounded child snapshot until child paging lands in 2b-2."""
-
-        self.bind(session_path)
-        rows = tuple((str(index), value) for index, value in enumerate(prompts[-256:]))
-        self._entries = [rows[index:index + 128] for index in range(0, len(rows), 128)]
-
     def append(self, session_path: Path, prompt: str) -> None:
         if not prompt:
             return
         self.bind(session_path)
         if not self._entries:
             self._entries.append(())
+            self._page_edges.append((None, None))
         self._entries[-1] = (*self._entries[-1], (f"live:{id(prompt)}", prompt))
         if len(self._entries[-1]) > 128:
             overflow = self._entries[-1][128:]
             self._entries[-1] = self._entries[-1][:128]
             self._entries.append(overflow)
+            self._page_edges.append((None, None))
         self._entries = self._entries[-self.max_pages:]
+        self._page_edges = self._page_edges[-self.max_pages:]
         self.reset_navigation()
 
     def snapshot(self, session_path: Path) -> tuple[str, ...]:
@@ -313,6 +316,7 @@ class SessionPromptHistory:
         self._load = None
         self._finder_scan = None
         self._entries.clear()
+        self._page_edges.clear()
         self._older = self._newer = None
         self.reset_navigation()
         self._session = None

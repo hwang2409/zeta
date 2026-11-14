@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any
@@ -34,7 +35,6 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
-from .cards.agent_lifetime import AgentTranscriptLifetime
 from .cards.agent_list import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
@@ -43,7 +43,6 @@ from .cards.agent_list import (
 from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
-    AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
     agent_tree_signature,
@@ -62,7 +61,7 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
-from .checkpoints import render_replayed_message, session_replay_provider
+from .checkpoints import render_replayed_message
 from .todo import TodoSnapshot
 from .user import displayed_user_text, user_message
 
@@ -526,14 +525,14 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 
-class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
-    """Scrollable child transcript synchronized through a read-only store."""
-
-    _RENDER_BATCH_SIZE = 4
-
-    def __init__(self) -> None:
+class AgentTranscriptControl(UIControl):
+    """Render the shared pager for the focused child view."""
+    def __init__(self, history_pager: Any = None) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
-
+        from .transcript.paged_history import PagedTranscriptHistory
+        self._history_pager = (
+            history_pager if history_pager is not None else PagedTranscriptHistory(None)
+        )
         self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
             self.transcript,
@@ -543,194 +542,378 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._initialize_transcript_lifetime()
-        self._snapshot: AgentTranscriptSnapshot | None = None
-        self._entry_units: dict[str, list[Any]] = {}
-        self._unit_entries: dict[Any, str] = {}
-        self._sync_task: asyncio.Task[bool] | None = None
+        self._source: Any = None
+        self._load_task: asyncio.Task[None] | None = None
+        self._load_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
         self._pending_path: Path | None = None
-        self.on_snapshot: Callable[[Path, AgentTranscriptSnapshot], None] | None = None
-
+        self._activation_generation = 0
+        self.search_task: asyncio.Task[None] | None = None
+        self.search_results: tuple[Any, ...] = ()
+        self.search_index = 0
+        self.view_path: Path | None = None
+        self._root_path: Path | None = None
+        self._root_source: Any = None
+        self._root_transcript: Any = None
+        self._root_pager_state: Any = None
+        self._prompt_history: Any = None
+        self._current_path: Callable[[], Path] | None = None
+        self._commit_path: Callable[[Path], None] | None = None
+        self._render_active: Callable[[], None] | None = None
+        self._root_endpoint: Callable[[], str | None] | None = None
+        self._invalidate: Callable[[], None] | None = None
+        self.on_load: Callable[[Path], None] | None = None
+        self.on_history_edge: Callable[[str], None] | None = None
+    @property
+    def history_pager(self) -> Any:
+        return self._history_pager
+    @property
+    def prompt_history(self) -> Any:
+        return self._prompt_history
     @property
     def offset(self) -> int:
         return self.transcript.scroll_offset
-
     @property
     def is_focusable(self) -> bool:
         return True
+    def configure_history(
+        self,
+        *,
+        root_path: Path,
+        root_source: Any,
+        root_transcript: Any,
+        prompt_history: Any,
+        current_path: Callable[[], Path],
+        commit_path: Callable[[Path], None],
+        render_active: Callable[[], None],
+        root_endpoint: Callable[[], str | None],
+        invalidate: Callable[[], None],
+    ) -> None:
+        self._root_path = root_path
+        self.view_path = root_path
+        self._root_source = root_source
+        self._root_transcript = root_transcript
+        self._prompt_history = prompt_history
+        self._current_path = current_path
+        self._commit_path = commit_path
+        self._render_active = render_active
+        self._root_endpoint = root_endpoint
+        self._invalidate = invalidate
+    async def _activation_failed(self, path: Path, generation: int) -> None:
+        if generation != self._activation_generation or path != self._path:
+            return
+        source, self._source = self._source, None
+        if source is not None:
+            await source.close()
+        self._history_pager.reset()
+        self._history_pager.source = None
+        self.presenter.clear()
+        self._tool_calls.clear()
+        self.presenter.print(Text("transcript unavailable"))
+    def start_search(
+        self,
+        query: str,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
+    ) -> None:
+        self.search_results = ()
+        self.search_index = 0
+        if self.search_task is not None:
+            self.search_task.cancel()
+        if not query:
+            return
+        async def reveal_match() -> None:
+            matches = await self._history_pager.search(query)
+            if not matches or not transcript.finder_active:
+                return
+            self.search_results = matches
+            self.search_index = 0
+            target = matches[0]
+            resident = {
+                unit.entry_id
+                for page in self._history_pager.pages
+                for unit in page.units
+            }
+            if target.entry_id not in resident:
+                await self._history_pager.reveal(target.entry_id)
+            self.render_pages(self._history_pager.pages)
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
+        self.search_task = asyncio.create_task(reveal_match())
 
-    async def load(self, path: Path) -> bool:
-        """Load a selected child without doing storage work on the event loop."""
-
-        if self._closed:
-            return False
-        if path != self._path:
-            self._reset_rendered(path)
-        if self._source is None or self._source.path != path:
-            try:
-                await self._replace_tracked(path)
-            except (ConversationIntegrityError, OSError, ValueError):
-                return False
-        return await self.sync(path)
-
-    async def sync(self, path: Path) -> bool:
-        """Apply one active-branch snapshot, yielding between render batches."""
-
-        if self._closed:
-            return False
-        if path != self._path or self._source is None:
-            return await self.load(path)
-        try:
-            tree = await asyncio.to_thread(self._source.refresh)
-        except (ConversationIntegrityError, OSError, ValueError):
-            return False
-        if self._closed:
-            return False
-        snapshot = tree.transcript(path)
-        return False if snapshot is None else await self._apply_snapshot(snapshot, path)
-
-    async def _apply_snapshot(self, snapshot: AgentTranscriptSnapshot, path: Path) -> bool:
-        previous = self._snapshot
-        if snapshot == previous:
-            return False
-        extends = (
-            previous is not None
-            and snapshot.entry_ids[: len(previous.entry_ids)] == previous.entry_ids
-            and snapshot.messages[: len(previous.messages)] == previous.messages
-        )
-        if extends:
-            await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
-        else:
-            await self._rebuild(snapshot, path)
-        if self._closed:
-            return False
-        self._snapshot = snapshot
-        if self.on_snapshot is not None:
-            self.on_snapshot(path, snapshot)
-        return True
-
-    def request_sync(
-        self, path: Path, invalidate: Callable[[], None] | None = None
+    def navigate_search(
+        self,
+        delta: int,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
     ) -> bool:
-        """Coalesce a UI refresh onto one asynchronous synchronization task."""
-
-        if self._closed:
+        if not self.search_results:
             return False
+        self.search_index = (self.search_index + delta) % len(self.search_results)
+        target = self.search_results[self.search_index]
+
+        async def reveal() -> None:
+            await self._history_pager.reveal(target.entry_id)
+            if not transcript.finder_active:
+                return
+            query = transcript.search_query
+            self.render_pages(self._history_pager.pages)
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
+
+        if self.search_task is not None:
+            self.search_task.cancel()
+        self.search_task = asyncio.create_task(reveal())
+        return True
+    def end_search(self) -> None:
+        self.search_results = ()
+        self.search_index = 0
+
+    async def close_search(self) -> None:
+        task, self.search_task = self.search_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.end_search()
+
+    async def refresh(self) -> bool:
+        anchor = self.transcript.durable_scroll_anchor
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
+        changed = await self._history_pager.refresh_tail(
+            follow_tail=self.transcript.follow_tail
+        )
+        if changed:
+            self.render_pages(self._history_pager.pages)
+        return changed
+    def activate(self, path: Path) -> asyncio.Task[None] | None:
+        """Start the single owned transition for a child activation or refresh."""
+
+        if (
+            self._closed
+            or path == self._pending_path
+            or (
+                path == self._root_path
+                and self._path == path
+                and self._history_pager.source is self._root_source
+            )
+        ):
+            return None
+        self._activation_generation += 1
+        generation = self._activation_generation
         self._pending_path = path
+        if self._load_task is not None and not self._load_task.done():
+            self._load_task.cancel()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            asyncio.run(self._transition(path, generation))
+            self._load_task = None
+            if self._current_path is None and self._path == path and self._commit_path:
+                self._commit_path(path)
+            return None
+        if path == self._root_path and self._root_pager_state is not None:
+            previous, self._source = self._source, None
+            self.presenter.clear()
+            self._tool_calls.clear()
+            self._path = path
+            self._history_pager.source = self._root_source
+            self._history_pager.restore(self._root_pager_state)
+            endpoint = self._root_endpoint() if self._root_endpoint else None
+            if self._prompt_history is not None:
+                self._prompt_history.bind(path, self._root_source, endpoint)
+            if self._commit_path is not None:
+                self._commit_path(path)
+            if self._render_active:
+                self._render_active()
+            else:
+                self.render_pages(self._history_pager.pages)
+            if self._root_pager_state.anchor is not None and self._root_transcript is not None:
+                self._root_transcript.restore_durable_scroll_anchor(
+                    self._root_pager_state.anchor
+                )
             self._pending_path = None
-            return asyncio.run(self.load(path))
-        if self._sync_task is not None and not self._sync_task.done():
-            return False
+            async def finish_root_activation() -> None:
+                if previous is not None:
+                    await previous.close()
 
-        async def run_pending() -> bool:
-            changed = False
-            while self._pending_path is not None:
-                requested = self._pending_path
-                self._pending_path = None
-                changed = await self.load(requested) or changed
-            if changed and invalidate is not None:
-                invalidate()
-            return changed
+            task = loop.create_task(finish_root_activation())
+        else:
+            task = loop.create_task(self._transition(path, generation))
+        self._load_task = task
+        self._load_tasks.add(task)
+        task.add_done_callback(self._load_tasks.discard)
+        return task
+    async def _transition(self, path: Path, generation: int) -> None:
+        from .transcript.child_history_source import ChildLogHistorySource
 
-        self._sync_task = loop.create_task(run_pending())
-        return False
-
-    def _reset_rendered(self, path: Path) -> None:
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        self._path = path
-        self._snapshot = None
-
-    async def _rebuild(self, snapshot: AgentTranscriptSnapshot, path: Path) -> None:
-        anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
-        old_entry_ids = (
-            self._snapshot.entry_ids if self._snapshot is not None else ()
-        )
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        await self._replay_batches(snapshot.messages, path)
-        if self._closed:
-            return
-        if not follow_tail:
-            target = self._nearest_entry(
-                anchor_id, old_entry_ids, snapshot.entry_ids
-            )
-            units = self._entry_units.get(target or "", ())
-            if units:
-                unit_index = min(anchor_unit_index, len(units) - 1)
-                self.transcript.restore_scroll_anchor(units[unit_index], anchor_offset)
-
-    async def _replay_batches(
-        self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
-    ) -> None:
-        provider = session_replay_provider(path)
-        for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
-            if self._closed:
+        prepared_source: Any = None
+        try:
+            previous = self._source
+            previous_source = self._history_pager.source
+            current = self._current_path() if self._current_path is not None else None
+            if path == self._root_path and self._root_source is None:
+                self.presenter.clear()
+                self._tool_calls.clear()
+                self._path = path
+                self._source = None
+                self._history_pager.source = None
+                if previous is not None:
+                    await previous.close()
+                if self._commit_path is not None:
+                    self._commit_path(path)
                 return
-            for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
-                self._replay(entry_id, raw_message, provider)
-            await asyncio.sleep(0.001)
+            if path == current and previous is not None and previous.path == path:
+                changed = await self.refresh()
+                if changed and self._invalidate is not None:
+                    self._invalidate()
+                return
+            if previous_source is self._root_source and self._root_pager_state is None:
+                self.capture_root_view()
 
-    def _replay(
-        self, entry_id: str, raw_message: dict[str, Any], provider: str | None
-    ) -> None:
+            prepared_page = None
+            if path == self._root_path:
+                prepared_source = self._root_source
+                if prepared_source is not None and self._root_pager_state is None:
+                    endpoint = self._root_endpoint() if self._root_endpoint else None
+                    prepared_page = await prepared_source.page(
+                        None, direction="older"
+                    )
+                    if endpoint is not None and not prepared_page.endpoint_id:
+                        prepared_page = replace(prepared_page, endpoint_id=endpoint)
+            else:
+                worker = asyncio.create_task(
+                    asyncio.to_thread(ChildLogHistorySource, path)
+                )
+                try:
+                    prepared_source = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    prepared_source = await worker
+                    await prepared_source.close()
+                    raise
+                prepared_page = await prepared_source.page(None, direction="older")
+
+            if (
+                generation != self._activation_generation
+                or (prepared_source is None and path != self._root_path)
+                or (path != self._root_path and prepared_page is None)
+            ):
+                if prepared_source is not self._root_source:
+                    await prepared_source.close()
+                return
+
+            if path != self._path:
+                self.presenter.clear()
+                self._tool_calls.clear()
+                self._path = path
+
+            self._source = (
+                None if prepared_source is self._root_source else prepared_source
+            )
+            self._history_pager.source = prepared_source
+            endpoint = (
+                self._root_endpoint()
+                if prepared_source is self._root_source and self._root_endpoint
+                else None
+            )
+            if path == self._root_path and self._root_pager_state is not None:
+                self._history_pager.restore(self._root_pager_state)
+            else:
+                self._history_pager.reset(endpoint_id=endpoint)
+                if prepared_page is not None:
+                    self._history_pager.adopt(prepared_page)
+            if self._prompt_history is not None:
+                self._prompt_history.bind(path, prepared_source, endpoint)
+            if self._commit_path is not None:
+                self._commit_path(path)
+            if self._render_active:
+                self._render_active()
+            else:
+                self.render_pages(self._history_pager.pages)
+            root_anchor = (
+                self._root_pager_state.anchor
+                if prepared_source is self._root_source
+                else None
+            )
+            if root_anchor is not None and self._root_transcript is not None:
+                self._root_transcript.restore_durable_scroll_anchor(root_anchor)
+            if self._invalidate is not None:
+                self._invalidate()
+            if root_anchor is not None and self._root_transcript is not None:
+                asyncio.get_running_loop().call_soon(
+                    self._root_transcript.restore_durable_scroll_anchor,
+                    root_anchor,
+                )
+            if previous is not None and previous is not prepared_source:
+                await previous.close()
+        except asyncio.CancelledError:
+            if prepared_source not in {None, self._root_source, self._source}:
+                await prepared_source.close()
+            raise
+        except (ConversationIntegrityError, OSError, SessionError, ValueError):
+            if prepared_source not in {None, self._root_source, self._source}:
+                await prepared_source.close()
+            if self._invalidate is not None:
+                self._invalidate()
+        finally:
+            if generation == self._activation_generation and path == self._pending_path:
+                self._pending_path = None
+    def request_sync(
+        self, path: Path, invalidate: Callable[[], None] | None = None
+    ) -> bool:
+        if self._closed or self._pending_path == path:
+            return False
         try:
-            message = Message.from_dict(_bounded_message(raw_message))
-        except (TypeError, ValueError):
-            return
-        unit_start = len(self.transcript._units)
-        render_replayed_message(
-            message,
-            presenter=self.presenter,
-            print_user=self._print_user,
-            print_unit=self.presenter.print_unit,
-            tool_calls=self._tool_calls,
-            include_thoughts=True,
-            replay_tool_results=True,
-            replay_tool_starts=True,
-            provider=provider,
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        active_source = self._source is not None or (
+            path == self._root_path
+            and self._history_pager.source is self._root_source
         )
-        units = self.transcript._units[unit_start:]
-        self._entry_units.setdefault(entry_id, []).extend(units)
-        self._unit_entries.update((unit, entry_id) for unit in units)
-
-    def _capture_anchor(self) -> tuple[str | None, int, int, bool]:
-        unit, offset = self.transcript.scroll_anchor
-        entry_id = self._unit_entries.get(unit)
-        units = self._entry_units.get(entry_id or "", ())
-        unit_index = units.index(unit) if unit in units else 0
-        return entry_id, unit_index, offset, self.transcript.follow_tail
-
-    @staticmethod
-    def _nearest_entry(
-        anchor_id: str | None,
-        old_version: tuple[str, ...],
-        new_version: tuple[str, ...],
-    ) -> str | None:
-        if anchor_id is None:
-            return None
-        if anchor_id in new_version:
-            return anchor_id
-        try:
-            anchor_index = old_version.index(anchor_id)
-        except ValueError:
-            return None
-        new_ids = set(new_version)
-        candidates = (
-            (abs(index - anchor_index), entry_id)
-            for index, entry_id in enumerate(old_version)
-            if entry_id in new_ids
-        )
-        return min(candidates, default=(0, None))[1]
+        if path != self._root_path or path != self._path or not active_source:
+            task = self.activate(path)
+        else:
+            if self._load_task is not None and not self._load_task.done():
+                self._load_task.cancel()
+            self._activation_generation += 1
+            task = loop.create_task(self.refresh())
+            self._load_task = task
+        if task is not None and invalidate is not None:
+            task.add_done_callback(lambda _task: invalidate())
+        return False
+    def render_pages(self, pages: tuple[Any, ...]) -> None:
+        anchor = self.transcript.durable_scroll_anchor
+        follow_tail = self.transcript.follow_tail
+        self.presenter.clear()
+        self._tool_calls.clear()
+        provider = self._source.replay_provider if self._source is not None else None
+        for page in pages:
+            for unit in page.units:
+                entry = unit.value
+                if getattr(entry, "type", None) != "message" or entry.message is None:
+                    continue
+                self.transcript.begin_history_entry(unit.entry_id)
+                try:
+                    render_replayed_message(
+                        entry.message,
+                        presenter=self.presenter,
+                        print_user=self._print_user,
+                        print_unit=self.presenter.print_unit,
+                        tool_calls=self._tool_calls,
+                        include_thoughts=True,
+                        replay_tool_results=True,
+                        replay_tool_starts=True,
+                        provider=provider,
+                    )
+                finally:
+                    self.transcript.end_history_entry()
+        if not follow_tail and anchor is not None:
+            self.transcript.restore_durable_scroll_anchor(anchor)
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -738,43 +921,84 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
 
     def pending_prompts(self, path: Path) -> tuple[str, ...]:
-        """Unconsumed follow-ups in the last applied snapshot of ``path``."""
-
-        if path != self._path or self._snapshot is None:
+        if path != self._path or self._source is None:
             return ()
-        return self._snapshot.pending_prompts
+        return self._source.pending_prompts
+    def capture_root_view(self) -> None:
+        """Capture root paging and scroll before navigation changes layout focus."""
+
+        if (
+            self._history_pager is None
+            or self._history_pager.source is not self._root_source
+        ):
+            return
+        anchor = (
+            self._root_transcript.durable_scroll_anchor
+            if self._root_transcript is not None
+            else None
+        )
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
+        self._root_pager_state = self._history_pager.capture()
+
+    async def cancel_activation(self) -> None:
+        task, self._load_task = self._load_task, None
+        if task is not None and not task.done():
+            task.cancel()
+        tasks = tuple(self._load_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._load_tasks.clear()
+        self._pending_path = None
+    async def close(self, deadline: float | None = None) -> None:
+        del deadline
+        self._closed = True
+        await self.cancel_activation()
+        self._current_path = None
+        self._render_active = None
+        self._root_endpoint = None
+        self._invalidate = None
+        self.on_load = None
+        self.on_history_edge = None
+        source, self._source = self._source, None
+        if source is not None:
+            if inspect.iscoroutinefunction(source.close):
+                await source.close()
+            else:
+                await asyncio.to_thread(source.close)
 
     def scroll(self, amount: int) -> None:
         self.transcript.scroll_lines(amount)
+        if amount < 0 and self.transcript.scroll_offset == 0 and self.on_history_edge:
+            self.on_history_edge("older")
+        elif amount > 0 and self.transcript.follow_tail and self.on_history_edge:
+            self.on_history_edge("newer")
 
     def half_page(self, amount: int) -> None:
-        self.transcript.scroll_lines(
-            amount * max(1, self.transcript._viewport_height // 2)
-        )
+        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
 
     def top(self) -> None:
         self.transcript.scroll_to_top()
+        if self.on_history_edge:
+            self.on_history_edge("older")
 
     def bottom(self) -> None:
         self.transcript.scroll_to_bottom()
+        if self.on_history_edge:
+            self.on_history_edge("newer")
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
-
     def create_content(self, width: int, height: int | None) -> UIContent:
         return self.transcript.create_content(width, height)
-
     def vertical_scroll(self, window: Window) -> int:
         return self.transcript.vertical_scroll(window)
-
     def mouse_handler(self, mouse_event: MouseEvent):
         return self.transcript.mouse_handler(mouse_event)
-
-
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
-    def __init__(self, store: ConversationStore) -> None:
+    def __init__(self, store: ConversationStore, history_pager: Any = None) -> None:
         self.store = store
         self.root_path = store.session_dir
         self.current_path = self.root_path
@@ -786,7 +1010,10 @@ class AgentNavigation:
         self._fork_main_path: Path | None = None
         self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
-        self.transcript_control = AgentTranscriptControl()
+        self.transcript_control = AgentTranscriptControl(history_pager)
+        self.transcript_control._root_path = self.root_path
+        self.transcript_control._path = self.root_path
+        self.transcript_control._commit_path = self._commit_view_path
         self.list_window = Window(
             content=self.list_control,
             height=Dimension(min=1, max=MAX_AGENT_LIST_ROWS),
@@ -1152,6 +1379,7 @@ class AgentNavigation:
         return self._layout is not None and self._layout.has_focus(self.list_window)
 
     def focus_list(self) -> None:
+        self.transcript_control.capture_root_view()
         self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
@@ -1168,6 +1396,7 @@ class AgentNavigation:
         self._path_stack[:] = [self.root_path]
         self._breadcrumb_labels[:] = ["main"]
         self.selected_index = 0
+        self.transcript_control.activate(self.root_path)
         self.refresh(force=True)
         target = preselect_path
         if target is None and previous_path != self.root_path:
@@ -1211,15 +1440,10 @@ class AgentNavigation:
             return
         if entry.path == self.current_path:
             return
-        self.current_path = entry.path
-        self._todo_control.clear(self._invalidate)
-        self._path_stack.append(entry.path)
-        self._breadcrumb_labels.append(entry.label)
-        self.transcript_control.request_sync(entry.path, self._invalidate)
-        self.refresh(force=True)
-        self._switch_transcript()
-        if self._layout is not None:
-            self._layout.focus(self.transcript_window)
+        if self.transcript_control.on_load is not None:
+            self.transcript_control.request_sync(entry.path, self._invalidate)
+        else:
+            self.transcript_control.activate(entry.path)
 
     def back_to_parent(self) -> None:
         if not self.child_view_active:
@@ -1228,24 +1452,44 @@ class AgentNavigation:
         self._leave_current_view()
 
     def _leave_current_view(self) -> None:
-        child_path = self.current_path
+        path = self._path_stack[-2]
+        if self.transcript_control.on_load is not None:
+            self.transcript_control.request_sync(path, self._invalidate)
+        else:
+            self.transcript_control.activate(path)
+
+    def _commit_view_path(self, path: Path) -> None:
+        """Publish one prepared transcript path and its navigation state."""
+
+        previous = self.current_path
+        preserve_list_focus = path == previous and self.list_focused()
         self._todo_control.clear(self._invalidate)
-        self._path_stack.pop()
-        self.current_path = self._path_stack[-1]
-        self._breadcrumb_labels.pop()
+        if path in self._path_stack:
+            index = self._path_stack.index(path)
+            self._path_stack = self._path_stack[: index + 1]
+            self._breadcrumb_labels = self._breadcrumb_labels[: index + 1]
+        else:
+            label = next(
+                (entry.label for entry in self.entries if entry.path == path),
+                path.name,
+            )
+            self._path_stack.append(path)
+            self._breadcrumb_labels.append(label)
+        self.current_path = path
         self.refresh(force=True)
-        self.selected_index = next(
-            (
-                index
-                for index, entry in enumerate(self.entries)
-                if entry.path == child_path
-            ),
-            0,
-        )
-        if self.child_view_active:
-            self.transcript_control.request_sync(self.current_path, self._invalidate)
+        if path == self.root_path:
+            self.selected_index = next(
+                (
+                    index
+                    for index, entry in enumerate(self.entries)
+                    if entry.path == previous
+                ),
+                0,
+            )
         self._switch_transcript()
-        if self.child_view_active and self._layout is not None:
+        if preserve_list_focus and self._layout is not None:
+            self._layout.focus(self.list_window)
+        elif self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
         else:
             self.focus_composer()
