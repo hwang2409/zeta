@@ -177,7 +177,9 @@ class IncrementalValidationMixin:
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
-        self._resident_rows.replace(staged._resident_rows.entries)
+        self._resident_rows.replace(
+            staged._resident_rows.stream_rows(staged._resident_rows.rows)
+        )
         self._record_client_delivery_entries(entries)
         return True
 
@@ -188,14 +190,15 @@ class IncrementalValidationMixin:
         self, entry: ConversationEntry, approvals: _ApprovalValidationOverlay
     ) -> bool:
         """Validate and install one linear tail entry, or request a full reload."""
-        expected_seq = self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1
+        previous_ref = self._resident_rows.rows[-1] if self._resident_rows.rows else None
+        expected_seq = previous_ref.seq + 1 if previous_ref is not None else 1
         if entry.seq != expected_seq:
             raise ConversationIntegrityError(
                 f"non-monotonic conversation sequence at {entry.id}"
             )
         if entry.id in self._entry_ids:
             raise ConversationIntegrityError(f"duplicate conversation id: {entry.id}")
-        if self._resident_rows.entries and entry.parent_id is None:
+        if previous_ref is not None and entry.parent_id is None:
             raise ConversationIntegrityError(
                 f"conversation entry {entry.id} is an orphaned root"
             )
@@ -205,7 +208,7 @@ class IncrementalValidationMixin:
             )
         # A non-tip parent changes the active branch. It is uncommon and its
         # integrity state is deliberately rebuilt by the complete validator.
-        if self._resident_rows.entries and entry.parent_id != self._resident_rows.entries[-1].id:
+        if previous_ref is not None and entry.parent_id != previous_ref.id:
             return False
         self._validate_entry_payload(entry)
         if entry.type == "fork":
@@ -225,7 +228,7 @@ class IncrementalValidationMixin:
         start_offset: int | None = None,
     ) -> None:
         """Install worker-validated tail rows and publish the entry list once."""
-        previous = self._resident_rows.entries[-1] if self._resident_rows.entries else None
+        previous = self._resident_rows.rows[-1] if self._resident_rows.rows else None
         fold = self._delivery_fold.staged()
         for entry in entries:
             expected_seq = previous.seq + 1 if previous is not None else 1

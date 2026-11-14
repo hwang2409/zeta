@@ -154,6 +154,14 @@ def active_branch(
 
 
 @dataclass(frozen=True, slots=True)
+class ForkPoint:
+    """Compact coordinates for one user-message fork target."""
+
+    seq: int
+    id: str
+
+
+@dataclass(frozen=True, slots=True)
 class BranchInfo:
     """One leaf of the parent-linked conversation tree."""
 
@@ -361,8 +369,27 @@ class CheckpointForkMixin:
                 None,
             )
             if next_message is not None:
-                preview = _message_preview(self.entry(next_message))
-            result.append((self._snapshot_entry(self.entry(ref)), preview))
+                preview = getattr(next_message.facts, "message_preview", None)
+                if preview is None:
+                    preview = "[non-text message]"
+            label, created_at, todo_dismissed = ref.facts
+            result.append(
+                (
+                    ConversationEntry(
+                        seq=ref.seq,
+                        id=ref.id,
+                        parent_id=ref.parent_id,
+                        lane=ref.lane,
+                        type=ref.type,
+                        data={
+                            "label": label,
+                            "created_at": created_at,
+                            "todo_dismissed": todo_dismissed,
+                        },
+                    ),
+                    preview,
+                )
+            )
         return result
 
     def checkpoint_count(self) -> int:
@@ -370,16 +397,15 @@ class CheckpointForkMixin:
 
     def list_user_message_forkpoints(
         self,
-    ) -> list[tuple[int, ConversationEntry, str]]:
-        """Return ``(index, entry, preview)`` for USER messages on the branch."""
+    ) -> list[tuple[int, ForkPoint, str]]:
+        """Return ``(index, target, preview)`` for USER messages on the branch."""
 
-        result: list[tuple[int, ConversationEntry, str]] = []
+        result: list[tuple[int, ForkPoint, str]] = []
         for ref in self.branch_refs():
             if not getattr(ref.facts, "is_user_forkpoint", False):
                 continue
-            entry = self.entry(ref)
-            preview = _message_preview(entry) or ""
-            result.append((len(result) + 1, self._snapshot_entry(entry), preview))
+            preview = getattr(ref.facts, "message_preview", None) or ""
+            result.append((len(result) + 1, ForkPoint(ref.seq, ref.id), preview))
         return result
 
     def append_message_fork(self, entry_id: str) -> ConversationEntry:

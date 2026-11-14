@@ -83,7 +83,9 @@ class ObserverSnapshotMixin:
                 setattr(self, attribute, getattr(validation.state, attribute))
             self._resident_rows = validation.state._resident_rows
             delta = (
-                self._installed_delta_from_baseline(self._resident_rows.entries, baseline)
+                self._installed_delta_from_baseline(
+                    self._resident_rows.stream_rows(self._resident_rows.rows), baseline
+                )
                 if self.on_entries_installed is not None
                 else ()
             )

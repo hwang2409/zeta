@@ -22,6 +22,7 @@ from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
 from zeta.core import agent_state, transcript_recovery
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
+from zeta.core.context import ContextAssembler
 from zeta.core.session_files import session_directory
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -176,63 +177,50 @@ def test_large_fork_load_trims_payloads_in_linear_work(
     assert CountedValuesOrderedDict.values_calls == 0
 
 
-def test_resident_payloads_stay_bounded_after_compaction() -> None:
-    rows = ResidentRows()
-    rows.payload_cache_bytes = 0
-    parent_id = None
-    for seq in range(1, 1101):
-        entry_id = f"message-{seq}"
-        stored_message = message(MessageRole.ASSISTANT, "x" * 4096).to_dict()
-        stored_message["metadata"] = {"turn_failed": True}
-        rows.append(
-            ConversationEntry(
-                seq=seq,
-                id=entry_id,
-                parent_id=parent_id,
-                lane="main",
-                type="message",
-                data={"message": stored_message},
-            )
-        )
-        parent_id = entry_id
-    rows.append(
-        ConversationEntry(
-            seq=1101,
-            id="compaction",
-            parent_id=parent_id,
-            lane="main",
-            type="compaction",
-            data={
-                "summary": "bounded",
-                "source_seq_start": 1,
-                "source_seq_end": 1100,
-                "replaces": [],
-            },
-        )
-    )
-    parent_id = "compaction"
-    for seq in range(1102, 1202):
-        entry_id = f"tail-{seq}"
-        stored_message = message(MessageRole.ASSISTANT, "x" * 4096).to_dict()
-        stored_message["metadata"] = {"turn_failed": True}
-        rows.append(
-            ConversationEntry(
-                seq=seq,
-                id=entry_id,
-                parent_id=parent_id,
-                lane="main",
-                type="message",
-                data={"message": stored_message},
-            )
-        )
-        parent_id = entry_id
-    rows._rebalance_resident()
+@pytest.mark.asyncio
+async def test_payload_cache_does_not_change_replay_or_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "payload-cache-equivalence"
+    with ConversationStore(tmp_path, session_id=session_id) as store:
+        for seq in range(80):
+            stored = message(MessageRole.ASSISTANT, f"{seq}:" + "x" * 4096).to_dict()
+            stored["metadata"] = {"turn_failed": True}
+            entry = store.append_message(Message.from_dict(stored))
+            if seq == 59:
+                store.commit_compaction_marker(
+                    "bounded", 1, entry.seq, expected_parent_id=entry.id
+                )
 
-    # test-contract: seam covered and uncovered turns stay in context without retaining their payloads
-    assert sum(ref.type == "message" for ref in rows.context_refs()) == 1200
-    assert len(rows.payloads) <= 65
-    assert rows.resident_payload_bytes < 5 * 1024 * 1024
-    assert 1 not in rows.payloads
+    async def open_and_read(cache_bytes: int):
+        monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", str(cache_bytes))
+        with ConversationStore(
+            tmp_path, session_id=session_id, _must_exist=True
+        ) as reopened:
+            replay = await asyncio.to_thread(
+                lambda: tuple(
+                    entry.to_dict()
+                    for entry in (
+                        reopened.entry(ref) for ref in reopened.resident_refs()
+                    )
+                )
+            )
+            context = tuple(
+                item.to_dict() for item in await ContextAssembler(reopened).assemble()
+            )
+            resident_count = len(reopened._resident_rows.payloads)
+            resident_bytes = reopened._resident_rows.resident_payload_bytes
+        return replay, context, resident_count, resident_bytes
+
+    uncached = await open_and_read(0)
+    cached = await open_and_read(10 * 1024 * 1024)
+
+    assert uncached[:2] == cached[:2]
+    assert len(uncached[0]) == 81
+    assert uncached[1]
+    assert uncached[2] <= 65
+    assert uncached[3] < 512 * 1024
+    assert cached[2] > uncached[2]
 
 
 def test_warm_message_transcript_opens_from_compact_index(

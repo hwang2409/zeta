@@ -633,7 +633,9 @@ class ConversationLogMixin:
             self._entry_prefix_digest = b""
             self._sent_message_receipts = []
             self._reset_incremental_validation_state()
-            self._rebuild_client_deliveries(self._resident_rows.entries)
+            self._rebuild_client_deliveries(
+                self._resident_rows.stream_rows(self._resident_rows.rows)
+            )
             if had_entries:
                 self._reset_generation += 1
             header = {
@@ -924,7 +926,7 @@ class ConversationLogMixin:
         self._publish_entries_installed(
             "reset"
             if self._reset_generation != generation
-            else tuple(self._resident_rows.entries[count:])
+            else tuple(self._resident_rows.stream_rows(self._resident_rows.rows[count:]))
         )
 
     def _load_full(

@@ -88,7 +88,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -1161,9 +1161,12 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
             with observer._append_lock(observer=True):
                 facts = observer._history_index_facts()
                 if not store._history_index.catch_up_validated(
-                    facts, observer._resident_rows.entries
+                    facts,
+                    observer._resident_rows.stream_rows(observer._resident_rows.rows),
                 ):
-                    observer._sync_history_index(observer._resident_rows.entries)
+                    observer._sync_history_index(
+                        observer._resident_rows.stream_rows(observer._resident_rows.rows)
+                    )
                 return facts
         finally:
             observer.close()
@@ -1171,8 +1174,12 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
-            if not store._history_index.catch_up_validated(facts, store._resident_rows.entries):
-                store._sync_history_index(store._resident_rows.entries)
+            if not store._history_index.catch_up_validated(
+                facts, store._resident_rows.stream_rows(store._resident_rows.rows)
+            ):
+                store._sync_history_index(
+                    store._resident_rows.stream_rows(store._resident_rows.rows)
+                )
             return facts
     finally:
         writer.close()
@@ -1287,7 +1294,8 @@ class HistoryPageStoreMixin:
         stat = os.stat(
             "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
         )
-        last = self._resident_rows.entries[-1] if self._resident_rows.entries else None
+        last_ref = self._resident_rows.rows[-1] if self._resident_rows.rows else None
+        last = self.entry(last_ref) if last_ref is not None else None
         return {
             "cwd": self.cwd,
             "st_dev": stat.st_dev,

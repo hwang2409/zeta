@@ -394,7 +394,9 @@ def _install_appended_entries(
     else:
         store._validate_entries()
         store._rebuild_incremental_validation_state()
-        store._sync_history_index(store._resident_rows.entries)
+        store._sync_history_index(
+            store._resident_rows.stream_rows(store._resident_rows.rows)
+        )
     store._record_client_delivery_entries(entries)
 
 

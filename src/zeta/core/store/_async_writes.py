@@ -796,7 +796,7 @@ class AsyncDurableWritesMixin:
             if prelude is not None and isinstance(command, _StoreMutationCommand):
                 durable_command = replace(
                     command,
-                    baseline_count=len(writer._resident_rows.entries),
+                    baseline_count=len(writer._resident_rows.rows),
                     baseline_digest=writer._entry_prefix_digest,
                     baseline_patch=prelude._resident_patch.values,
                 )

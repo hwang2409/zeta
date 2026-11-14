@@ -101,6 +101,7 @@ from ._rows import (
     RowRef,
     StartupFactsMixin,
     TranscriptRows,
+    _message_identity_digest,
     sent_message_receipts,
 )
 from ._session_state import SessionStatePersistenceMixin
@@ -801,7 +802,9 @@ class ConversationStore(
                 _ApprovalValidationOverlay(), {row.id for row in self._resident_rows.rows}
             )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self._resident_rows.entries)
+            self._sync_history_index(
+                self._resident_rows.stream_rows(self._resident_rows.rows)
+            )
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         self._record_physical_entry(entry)
@@ -1293,10 +1296,11 @@ class ConversationStore(
         path: the message was just appended, so a reverse scan finds it near
         the tail without copying the whole branch.
         """
-        for entry in reversed(self._resident_rows.branch):
-            if entry.type != "message":
+        digest = _message_identity_digest(message.to_dict())
+        for ref in reversed(self._resident_rows.branch_refs()):
+            if not isinstance(ref.facts, MessageFacts):
                 continue
-            if Message.from_dict(entry.data["message"]) == message:
+            if ref.facts.identity_digest == digest:
                 return True
         return False
 

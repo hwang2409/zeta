@@ -229,6 +229,40 @@ def test_tui_replay_hides_passive_harness_message(tmp_path: Path) -> None:
     assert "hidden inbox status" not in replay
 
 
+def test_fork_picker_and_persisted_message_check_use_compact_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "compact-fork-facts"
+    first_message = with_message_origin(
+        message(MessageRole.USER, "first prompt"), MessageOrigin.USER
+    )
+    with ConversationStore(tmp_path, session_id=session_id) as store:
+        store.append_message(first_message)
+        store.append_message(message(MessageRole.ASSISTANT, "first reply"))
+        store.append_checkpoint("first checkpoint")
+        for index in range(70):
+            store.append_message(
+                with_message_origin(
+                    message(MessageRole.USER, f"prompt {index}"), MessageOrigin.USER
+                )
+            )
+            store.append_message(message(MessageRole.ASSISTANT, f"reply {index}"))
+
+    with ConversationStore(tmp_path, session_id=session_id, _must_exist=True) as reopened:
+        def reject_payload_read(*args, **kwargs):
+            raise AssertionError("loop-side query read a transcript payload")
+
+        monkeypatch.setattr("zeta.core.store._rows.os.pread", reject_payload_read)
+        forkpoints = reopened.list_user_message_forkpoints()
+        checkpoints = reopened.list_checkpoints()
+        assert forkpoints[0][2] == "first prompt"
+        assert checkpoints[0][1] == "prompt 0"
+        assert reopened.active_branch_contains_message(first_message)
+        assert not reopened.active_branch_contains_message(
+            with_message_origin(message(MessageRole.USER, "missing"), MessageOrigin.USER)
+        )
+
+
 def test_checkpoint_and_fork_switch_the_active_branch(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="fork")
     first = store.append_message(with_message_origin(message(MessageRole.USER, "first"), MessageOrigin.USER))

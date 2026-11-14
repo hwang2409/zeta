@@ -45,6 +45,7 @@ class MessageFacts:
     is_user_forkpoint: bool
     message_preview: str | None
     projection_digest: str
+    identity_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +166,10 @@ class StartupFactsMixin:
         return tuple(records)
 
 
+def _message_identity_digest(message: Mapping[str, object]) -> str:
+    return hashlib.sha256(encode_json(message)).hexdigest()
+
+
 def _message_projection_digest(message: Mapping[str, object]) -> str:
     metadata = message.get("metadata", {})
     projection: Mapping[str, object] = message
@@ -182,12 +187,7 @@ def _message_projection_digest(message: Mapping[str, object]) -> str:
 
 def _message_facts(entry: ConversationEntry) -> MessageFacts:
     message = entry.data["message"]
-    metadata = message.get("metadata", {})
-    projection_digest = (
-        _message_projection_digest(message)
-        if isinstance(metadata, Mapping) and CLIENT_DELIVERY_METADATA in metadata
-        else ""
-    )
+    projection_digest = _message_projection_digest(message)
     is_user = message["role"] == "user"
     text = " ".join(
         block["text"].strip()
@@ -207,8 +207,9 @@ def _message_facts(entry: ConversationEntry) -> MessageFacts:
         context_exception,
         is_user,
         is_user and not is_passive_harness_message(message),
-        " ".join(text.split())[:48] if text else None,
+        " ".join(text.split())[:80] if text else None,
         projection_digest,
+        _message_identity_digest(message),
     )
 
 
@@ -224,29 +225,16 @@ def row_facts(entry: ConversationEntry) -> object | None:
             tuple(replaces) if isinstance(replaces, list) else replaces,
             data.get("kind"),
         )
+    if entry.type == "checkpoint":
+        return (
+            entry.data.get("label"),
+            entry.data.get("created_at"),
+            entry.data.get("todo_dismissed", False),
+        )
     if entry.type == "notification":
         data = entry.data
         return tuple(data.get(key) for key in ("kind", "task_id", "child_instance_id", "display_only"))
     return None
-
-
-class _EntryView(Sequence[ConversationEntry]):
-    """Compatibility view over row references without retaining payloads."""
-
-    def __init__(self, owner: ResidentRows, refs: Sequence[RowRef]) -> None:
-        self._owner = owner
-        self._refs = refs
-
-    def __len__(self) -> int:
-        return len(self._refs)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [self._owner.entry(ref) for ref in self._refs[index]]
-        return self._owner.entry(self._refs[index])
-
-    def __iter__(self) -> Iterator[ConversationEntry]:
-        return (self._owner.entry(ref) for ref in self._refs)
 
 
 def decode_row_facts(raw: str | bytes) -> object:
@@ -266,8 +254,11 @@ def decode_row_facts(raw: str | bytes) -> object:
     if kind == "MessageFacts" and isinstance(value, dict):
         calibration = value.get("calibration")
         projection_digest = value.get("projection_digest")
+        identity_digest = value.get("identity_digest")
         if not isinstance(projection_digest, str):
             raise ConversationIntegrityError("warm message facts lack projection digest")
+        if not isinstance(identity_digest, str):
+            raise ConversationIntegrityError("warm message facts lack identity digest")
         return MessageFacts(
             calibration=(
                 ContextCalibrationRecord(**calibration)
@@ -281,6 +272,7 @@ def decode_row_facts(raw: str | bytes) -> object:
             is_user_forkpoint=bool(value.get("is_user_forkpoint")),
             message_preview=value.get("message_preview"),
             projection_digest=projection_digest,
+            identity_digest=identity_digest,
         )
     raise ConversationIntegrityError(f"unsupported warm row facts: {kind}")
 
@@ -336,14 +328,6 @@ class ResidentRows:
             tuple(map(semantic, other.rows)),
             tuple(map(semantic, other._branch_refs)),
         )
-
-    @property
-    def entries(self) -> Sequence[ConversationEntry]:
-        return _EntryView(self, self.rows)
-
-    @property
-    def branch(self) -> Sequence[ConversationEntry]:
-        return _EntryView(self, self._branch_refs)
 
     def bind_source(
         self,
@@ -555,6 +539,44 @@ class ResidentRows:
     def _compaction_values(ref: RowRef) -> tuple[object, object, object, object]:
         return ref.facts if isinstance(ref.facts, tuple) and len(ref.facts) == 4 else (None,) * 4
 
+    def _resolve_legacy_pinned_sources(self, live_markers: Sequence[RowRef]) -> None:
+        live_marker_ids = {ref.id for ref in live_markers}
+        self._legacy_pinned_source_seqs = {
+            marker_id: seq
+            for marker_id, seq in self._legacy_pinned_source_seqs.items()
+            if marker_id in live_marker_ids
+        }
+        for marker in live_markers:
+            if marker.id in self._legacy_pinned_source_seqs:
+                continue
+            payload = self.payloads.get(marker.seq)
+            start, end, _, _ = self._compaction_values(marker)
+            pinned = None if payload is None else payload.data.get("pinned_message")
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not isinstance(pinned, dict)
+                or type(pinned.get("source_seq")) is int
+            ):
+                continue
+            try:
+                projection = without_client_delivery_marker(Message.from_dict(pinned))
+            except (KeyError, TypeError, ValueError):
+                continue
+            digest = _message_projection_digest(projection.to_dict())
+            match = next(
+                (
+                    ref.seq
+                    for ref in reversed(self._branch_refs)
+                    if start <= ref.seq <= end
+                    and isinstance(ref.facts, MessageFacts)
+                    and ref.facts.projection_digest == digest
+                ),
+                None,
+            )
+            if match is not None:
+                self._legacy_pinned_source_seqs[marker.id] = match
+
     def _required_payloads(self) -> set[int]:
         required: set[int] = set()
         context_required = {
@@ -578,57 +600,8 @@ class ResidentRows:
             )
         }
         live_markers = [ref for ref in markers if ref.id not in replaced]
-        live_marker_ids = {ref.id for ref in live_markers}
-        self._legacy_pinned_source_seqs = {
-            marker_id: seq
-            for marker_id, seq in self._legacy_pinned_source_seqs.items()
-            if marker_id in live_marker_ids
-        }
+        self._resolve_legacy_pinned_sources(live_markers)
         required.update(ref.seq for ref in live_markers)
-        for marker in live_markers:
-            if marker.id in self._legacy_pinned_source_seqs:
-                continue
-            payload = self.payloads.get(marker.seq)
-            start, end, _, _ = self._compaction_values(marker)
-            pinned = None if payload is None else payload.data.get("pinned_message")
-            if (
-                type(start) is not int
-                or type(end) is not int
-                or not isinstance(pinned, dict)
-                or type(pinned.get("source_seq")) is int
-            ):
-                continue
-            try:
-                projection = without_client_delivery_marker(Message.from_dict(pinned))
-            except (KeyError, TypeError, ValueError):
-                continue
-            digest = _message_projection_digest(projection.to_dict())
-            match = None
-            fd: int | None = None
-            try:
-                for ref in reversed(self._branch_refs):
-                    if not (
-                        start <= ref.seq <= end
-                        and isinstance(ref.facts, MessageFacts)
-                    ):
-                        continue
-                    if ref.facts.projection_digest == digest:
-                        match = ref.seq
-                        break
-                    if ref.facts.projection_digest:
-                        continue
-                    candidate = self.payloads.get(ref.seq)
-                    if candidate is None:
-                        fd = self._open_source() if fd is None else fd
-                        candidate = self._decode(fd, ref)
-                    if _message_projection_digest(candidate.data["message"]) == digest:
-                        match = ref.seq
-                        break
-            finally:
-                if fd is not None:
-                    os.close(fd)
-            if match is not None:
-                self._legacy_pinned_source_seqs[marker.id] = match
         coverage_end = max(
             (
                 value
