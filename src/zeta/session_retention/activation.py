@@ -147,7 +147,7 @@ def make_retention_owner(
         )
         nonlocal last_projection
         with _coordinator_authority(root) as token:
-            history = read_retention_history(root)
+            read_retention_history(root)
             effectful = bool(getattr(result, "changed", False))
             status = append_retention_history(
                 token, root, retained, projection,
@@ -158,14 +158,14 @@ def make_retention_owner(
             )
             if status == "stale":
                 planner.close()
-                current = _stale_projection(root, days, history)
+                current = _stale_projection(root, days, read_retention_history(root))
                 if not current.complete:
                     append_retention_history(token, root, retained, current.projection)
                 last_projection = current.projection
                 return current
             if status == "not_committed":
                 planner.close()
-                current = _stale_projection(root, days, history)
+                current = _stale_projection(root, days, read_retention_history(root))
                 last_projection = current.projection
                 return current
             if status == "fresh":
