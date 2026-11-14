@@ -756,6 +756,17 @@ class AgentTranscriptControl(UIControl):
             previous = self._source
             previous_source = self._history_pager.source
             current = self._current_path() if self._current_path is not None else None
+            if path == self._root_path and self._root_source is None:
+                self.presenter.clear()
+                self._tool_calls.clear()
+                self._path = path
+                self._source = None
+                self._history_pager.source = None
+                if previous is not None:
+                    await previous.close()
+                if self._commit_path is not None:
+                    self._commit_path(path)
+                return
             if path == current and previous is not None and previous.path == path:
                 changed = await self.refresh()
                 if changed and self._invalidate is not None:
@@ -1000,6 +1011,8 @@ class AgentNavigation:
         self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
         self.transcript_control = AgentTranscriptControl(history_pager)
+        self.transcript_control._root_path = self.root_path
+        self.transcript_control._path = self.root_path
         self.transcript_control._commit_path = self._commit_view_path
         self.list_window = Window(
             content=self.list_control,
