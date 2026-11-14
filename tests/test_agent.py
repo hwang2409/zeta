@@ -17634,16 +17634,36 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
     answer_notice_started = asyncio.Event()
     release_answer_notice = asyncio.Event()
     answer_notice_published = asyncio.Event()
+    answer_ack_started = asyncio.Event()
+    release_answer_ack = asyncio.Event()
+    answer_progress = asyncio.Event()
     force_extra_idle = False
     answer_consumed = False
+    gate_answer_ack = False
     prompts: list[str] = []
 
     channel = loop._background_owner.conversation_channel
     original_publish_idle = channel.publish_idle
+    original_produce_to_live_parent = channel.produce_to_live_parent
+
+    async def gated_produce_to_live_parent(child_instance_id, build):
+        nonlocal gate_answer_ack
+        if gate_answer_ack:
+            gate_answer_ack = False
+            answer_ack_started.set()
+            await await_or_fail(
+                release_answer_ack.wait(), what="release question answer ack"
+            )
+        return await original_produce_to_live_parent(child_instance_id, build)
+
+    monkeypatch.setattr(
+        channel, "produce_to_live_parent", gated_produce_to_live_parent
+    )
 
     async def gated_publish_idle(**kwargs):
         if kwargs.get("text") == "after Re q-reset: approved":
             answer_notice_started.set()
+            answer_progress.set()
             await await_or_fail(
                 release_answer_notice.wait(),
                 what="release answered child idle notice",
@@ -17685,6 +17705,8 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         idle_entries.put_nowait(None)
         if force_extra_idle and not answer_consumed:
             forced_extra_idle.set()
+        if answer_consumed:
+            answer_progress.set()
         await await_or_fail(wake(), what="idle notice wake")
         return True
 
@@ -17706,6 +17728,7 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
     loop._background_owner.register(
         "root:1", run.cancel, run, parent_store=parent, active_store=child
     )
+    answer_send: asyncio.Task[str | None] | None = None
     try:
         await await_or_fail(idle_entries.get(), what="first idle entry")
         assert (
@@ -17738,19 +17761,23 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
             await await_or_fail(
                 forced_extra_idle.wait(), what="forced extra idle entry"
             )
-        assert (
-            await send_to_run(
+        gate_answer_ack = True
+        answer_send = asyncio.create_task(
+            send_to_run(
                 parent,
                 "root:1",
                 "Re q-reset: approved",
                 owner=loop._background_owner,
                 channel=loop._background_owner.conversation_channel,
             )
-            is None
         )
-        await await_or_fail(
-            answer_notice_started.wait(), what="answered idle notice start"
+        await await_or_fail(answer_ack_started.wait(), what="question answer ack start")
+        await await_or_fail(answer_progress.wait(), what="answered child idle progress")
+        assert answer_notice_started.is_set(), (
+            "answered child must start its new idle notice while the answer ack is held"
         )
+        release_answer_ack.set()
+        assert await await_or_fail(answer_send, what="question answer send") is None
         release_answer_notice.set()
         await await_or_fail(
             answer_notice_published.wait(), what="answered idle notice publication"
@@ -17764,7 +17791,14 @@ async def test_question_answer_then_later_stall_starts_new_notice_episode(
         assert notices[0].id != notices[1].id
         assert notices[1].data["text"] == "after Re q-reset: approved"
     finally:
+        release_answer_ack.set()
         release_answer_notice.set()
+        if answer_send is not None:
+            answer_send.cancel()
+            await await_or_fail(
+                asyncio.gather(answer_send, return_exceptions=True),
+                what="question answer send cleanup",
+            )
         loop._background_owner.unregister("root:1")
         await _cancel_idle_fixture(run, registry, parent, child)
 
