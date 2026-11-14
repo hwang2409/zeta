@@ -10923,7 +10923,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         session.default_buffer.insert_text("draft")
         assert session.default_buffer.text == "draft"
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="pruned agent list TUI shutdown")
 
 
 @pytest.mark.parametrize(
@@ -17003,17 +17003,9 @@ async def test_root_tui_paging_render_path_table(
             child_path = child_store.session_dir
             child_store.close()
             navigation = app._agent_navigation
-            navigation.current_path = child_path
-            navigation._path_stack.append(child_path)
-            navigation._breadcrumb_labels.append("visited child")
-            navigation.transcript_control.request_sync(
-                child_path, app._invalidate_prompt
-            )
-            navigation._switch_transcript()
-            assert app._agent_navigation.transcript_control._load_task is not None
-            await await_or_fail(
-                app._agent_navigation.transcript_control._load_task, what="child visit activation"
-            )
+            activation = navigation.transcript_control.activate(child_path)
+            assert activation is not None
+            await await_or_fail(activation, what="child visit activation")
             assert "child visit 699" in Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
             ).plain
@@ -17038,10 +17030,7 @@ async def test_root_tui_paging_render_path_table(
                 session.app.key_processor.feed(KeyPress("h", data="h"))
                 session.app.key_processor.process_keys()
                 await wait_until(lambda: not navigation.child_view_active)
-                assert app._agent_navigation.transcript_control._load_task is not None
-                await await_or_fail(
-                    app._agent_navigation.transcript_control._load_task, what="root anchor restoration"
-                )
+                await navigation.wait_for_publication()
                 assert app._transcript.durable_scroll_anchor == root_anchor, (
                     "returning from child moved the root viewport to the tail"
                 )
@@ -17066,8 +17055,7 @@ async def test_root_tui_paging_render_path_table(
                 session.app.key_processor.feed(KeyPress(Keys.Enter))
                 session.app.key_processor.process_keys()
                 await wait_until(lambda: navigation.child_view_active)
-                assert owner._load_task is not None
-                await await_or_fail(owner._load_task, what="child anchor restoration")
+                await navigation.wait_for_publication()
                 assert owner.transcript.durable_scroll_anchor == child_anchor, (
                     "returning to a child lost its parked durable anchor"
                 )
@@ -17085,10 +17073,7 @@ async def test_root_tui_paging_render_path_table(
                 )
 
                 navigation.refresh(force=True)
-                assert owner._load_task is not None
-                await await_or_fail(
-                    owner._load_task, what="off-loop active child refresh"
-                )
+                await navigation.wait_for_publication()
                 assert discovery_threads
                 assert main_thread not in discovery_threads, (
                     "open, return, or refresh discovery ran on the TUI loop thread"
