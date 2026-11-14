@@ -913,6 +913,9 @@ def _run_tui_lifecycle_captured(
                 retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
             run_app._retention_owner = retention_owner
+            run_app._before_prompt_exit = (
+                retention_owner.stop if retention_owner is not None else None
+            )
             run_app._before_terminal_restore = (
                 retention_owner.stop if retention_owner is not None else None
             )
