@@ -16135,16 +16135,13 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
 
     async with owned_app(app):
         app._history_finder_open(buffer)
-        assert app._prompt_history.finder_task is not None
-        await await_or_fail(
-            app._prompt_history.finder_task,
-            what="ctrl+r prompt paging",
-        )
         await wait_until(
             lambda: (
                 (state := app._history_finder.finder_state()) is not None
-                and state.total > 0
                 and state.complete
+                and state.selected == 0
+                and state.rows
+                and state.rows[0].excerpt == "prompt-0"
             )
         )
         assert app._history_finder.finder_accept()
