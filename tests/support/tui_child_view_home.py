@@ -8,7 +8,7 @@ from typing import Any
 
 from zeta.storage_format import open_writer
 
-ROOT_BYTES = 183_032_858
+ROOT_BYTES = 64 * 1024 * 1024
 ROOT_ROWS = 17_527
 CHILD_BYTES = 23_086_500
 CHILD_ROWS = 1_154
