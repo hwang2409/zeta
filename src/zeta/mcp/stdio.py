@@ -145,7 +145,7 @@ class StdioMCPClient(MCPClient):
     ) -> None:
         self.config = config
         self.protocol_version: str | None = None
-        self.capabilities: dict[str, object] = {}
+        self.capabilities: dict[str, object] | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -224,8 +224,10 @@ class StdioMCPClient(MCPClient):
                     "MCP initialize response omitted protocolVersion"
                 )
             self.protocol_version = protocol_version
-            capabilities = result.get("capabilities", {})
-            self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
+            capabilities = result.get("capabilities")
+            self.capabilities = (
+                dict(capabilities) if type(capabilities) is dict else None
+            )
             await self._notify("notifications/initialized", {})
         except BaseException:
             await self.close()

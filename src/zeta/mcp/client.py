@@ -110,7 +110,7 @@ class MCPResourceContent:
 class MCPClient(Protocol):
     config: MCPServerConfig
     protocol_version: str | None
-    capabilities: dict[str, object]
+    capabilities: dict[str, object] | None
 
     async def connect(self) -> None:
         """Open the transport and complete initialize."""
@@ -193,9 +193,27 @@ def unavailable_result(name: str) -> StructuredToolResult:
     )
 
 
-def require_capability(capabilities: Mapping[str, object], name: str, server: str) -> None:
-    if name not in capabilities:
+def require_capability(
+    capabilities: Mapping[str, object] | None, name: str, server: str
+) -> None:
+    # An omitted capabilities object (None) is permissive legacy behavior: send
+    # the request. Reject only when the server explicitly advertises its
+    # capabilities and leaves this one out.
+    if capabilities is not None and name not in capabilities:
         raise MCPUnsupportedError(f"MCP server {server} does not provide {name}")
+
+
+def transport_degraded(error: BaseException) -> bool:
+    """Whether an MCP failure compromises the server, so its actor degrades.
+
+    One rule shared by the resource, prompt, tool-call, and refresh paths: a
+    JSON-RPC request error (`MCPRequestError`, including an unadvertised
+    capability) stays per-request and never degrades the server; a transport
+    failure, a malformed-protocol failure, or a timeout degrades it with a
+    typed reason.
+    """
+
+    return isinstance(error, (MCPTransportError, MCPProtocolError, TimeoutError))
 
 
 def initialize_params() -> dict[str, object]:

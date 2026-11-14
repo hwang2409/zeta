@@ -102,7 +102,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._session_id: str | None = None
         self._notification_event_id: bytes | None = None
         self.protocol_version: str | None = None
-        self.capabilities: dict[str, object] = {}
+        self.capabilities: dict[str, object] | None = None
         self._next_id = 0
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
@@ -132,8 +132,8 @@ class StreamableHTTPMCPClient(MCPClient):
         if type(protocol_version) is not str or not protocol_version:
             raise MCPProtocolError("MCP initialize response omitted protocolVersion")
         self.protocol_version = protocol_version
-        capabilities = result.get("capabilities", {})
-        self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
+        capabilities = result.get("capabilities")
+        self.capabilities = dict(capabilities) if type(capabilities) is dict else None
         await self._send_notification("notifications/initialized", {})
         self._notification_task = asyncio.create_task(self._listen_notifications())
 

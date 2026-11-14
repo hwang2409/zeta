@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ...core.abort import AbortSignal
-from ..client import MCPClient, MCPProtocolError, MCPTransportError
+from ..client import MCPClient, transport_degraded
 from .prompt import cancel_request, set_exception, set_result
 
 if TYPE_CHECKING:
@@ -165,9 +165,9 @@ def handle_resource_finished(actor: MCPServerActor, message: ResourceFinished) -
     if error is not None:
         # Degrade only on failures that compromise the transport (timeout,
         # transport failure, or malformed protocol state). Request-level errors
-        # such as "resource not found" are returned while staying mounted,
-        # mirroring how the prompt/tool paths distinguish them.
-        degrades = isinstance(error, (MCPTransportError, MCPProtocolError, TimeoutError))
+        # such as "resource not found" or an unadvertised capability are
+        # returned while staying mounted. One shared rule across all paths.
+        degrades = transport_degraded(error)
         if current and degrades:
             timed_out = isinstance(error, TimeoutError)
             actor._degrade_current(

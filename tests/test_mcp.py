@@ -1807,6 +1807,244 @@ async def test_discovery_resource_read_is_bounded_and_child_activation_is_local(
     await mount.close()
 
 
+def _resources_error_stdio_config(
+    name: str, *, advertise_resources: bool
+) -> MCPServerConfig:
+    """A real stdio server that returns a JSON-RPC error for resources/list.
+
+    When advertise_resources is False it mirrors a tools-only server (the
+    achilles incident): it does not list a resources capability. When True it
+    advertises resources but still answers resources/list with an error.
+    """
+
+    capabilities = (
+        '{"tools": {}, "resources": {}}' if advertise_resources else '{"tools": {}}'
+    )
+    source = _stdio_source().replace(
+        '"capabilities": {"tools": {}}', f'"capabilities": {capabilities}'
+    ).replace(
+        '    else:\n        result = {"content": [], "isError": False}\n',
+        '    elif method == "resources/list":\n'
+        '        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], '
+        '"error": {"code": -32601, "message": "resources not supported"}}), '
+        "flush=True)\n"
+        "        continue\n"
+        '    else:\n        result = {"content": [], "isError": False}\n',
+    )
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
+@pytest.mark.asyncio
+async def test_resources_action_on_tools_only_server_keeps_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RCA: mcp_discover action=resources must not degrade a tools-only server.
+
+    Runs the real stdio client and actor. On the base commit the resource call
+    sent resources/list, the error response was mistaken for malformed
+    protocol, and the whole server degraded so its tool stopped working.
+    """
+
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(
+            tmp_path / "mcp.json",
+            {"fake": _resources_error_stdio_config("fake", advertise_resources=False)},
+        ),
+    )
+    try:
+        first = await registry.execute(ToolCall("c1", "fake__echo", {"value": "alive"}))
+        assert first["content"][0]["text"] == "alive"
+        resources = await registry.execute(
+            ToolCall("r", "mcp_discover", {"action": "resources", "server": "fake"})
+        )
+        assert "MCP resources unavailable" in resources["content"][0]["text"]
+        # The failed resource request must not degrade the server: its status
+        # stays mounted and its tool stays published to the model.
+        assert mount.statuses["fake"].state == "mounted"
+        assert "fake__echo" in {schema["name"] for schema in registry.schemas}
+        again = await registry.execute(ToolCall("c2", "fake__echo", {"value": "alive"}))
+        assert again["content"][0]["text"] == "alive"
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_rpc_error_keeps_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that answers one request with a JSON-RPC error keeps its tools.
+
+    The server advertises resources, so the request is sent and the JSON-RPC
+    error comes back on the wire. That is a request-level error and must stay
+    local instead of degrading the server. Fails on the base commit.
+    """
+
+    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(tmp_path))
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    mount = await mount_mcp_servers(
+        registry,
+        MCPConfig(
+            tmp_path / "mcp.json",
+            {"fake": _resources_error_stdio_config("fake", advertise_resources=True)},
+        ),
+    )
+    try:
+        first = await registry.execute(ToolCall("c1", "fake__echo", {"value": "alive"}))
+        assert first["content"][0]["text"] == "alive"
+        resources = await registry.execute(
+            ToolCall("r", "mcp_discover", {"action": "resources", "server": "fake"})
+        )
+        assert "MCP resources unavailable" in resources["content"][0]["text"]
+        # The failed resource request must not degrade the server: its status
+        # stays mounted and its tool stays published to the model.
+        assert mount.statuses["fake"].state == "mounted"
+        assert "fake__echo" in {schema["name"] for schema in registry.schemas}
+        again = await registry.execute(ToolCall("c2", "fake__echo", {"value": "alive"}))
+        assert again["content"][0]["text"] == "alive"
+    finally:
+        await mount.close()
+        await registry.close()
+
+
+def _capability_probe_stdio_config(
+    name: str, capabilities: str | None
+) -> MCPServerConfig:
+    """A real stdio server that implements resources and prompts.
+
+    capabilities is the JSON advertised in initialize, or None to omit the
+    capabilities member entirely (the permissive legacy case).
+    """
+
+    init = '{"protocolVersion": "2025-06-18", "serverInfo": {"name": "p", "version": "1"}'
+    if capabilities is not None:
+        init += f', "capabilities": {capabilities}'
+    init += "}"
+    source = (
+        "import json\n"
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    method = request.get('method')\n"
+        "    if method in ('notifications/initialized', 'notifications/cancelled'):\n"
+        "        continue\n"
+        "    if method == 'initialize':\n"
+        f"        result = {init}\n"
+        "    elif method == 'tools/list':\n"
+        "        result = {'tools': [{'name': 'echo', 'description': 'echo', "
+        "'inputSchema': {'type': 'object'}}]}\n"
+        "    elif method == 'resources/list':\n"
+        "        result = {'resources': [{'uri': 'mem://one', 'name': 'one'}]}\n"
+        "    elif method == 'prompts/list':\n"
+        "        result = {'prompts': [{'name': 'greet', 'description': 'd'}]}\n"
+        "    else:\n"
+        "        result = {'content': [], 'isError': False}\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], "
+        "'result': result}), flush=True)\n"
+    )
+    return MCPServerConfig(name, "stdio", sys.executable, ("-u", "-c", source))
+
+
+@pytest.mark.asyncio
+async def test_stdio_omitted_capabilities_still_sends_resource_and_prompt_requests() -> None:
+    client = StdioMCPClient(_capability_probe_stdio_config("omitted", None))
+    try:
+        await client.connect()
+        assert client.capabilities is None
+        resources = await client.list_resources()
+        assert [r.uri for r in resources] == ["mem://one"]
+        prompts = await client.list_prompts()
+        assert [p.name for p in prompts] == ["greet"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_explicit_capabilities_reject_unadvertised_members() -> None:
+    client = StdioMCPClient(_capability_probe_stdio_config("explicit", '{"tools": {}}'))
+    try:
+        await client.connect()
+        assert client.capabilities == {"tools": {}}
+        with pytest.raises(MCPUnsupportedError, match="does not provide resources"):
+            await client.list_resources()
+        with pytest.raises(MCPUnsupportedError, match="does not provide prompts"):
+            await client.list_prompts()
+    finally:
+        await client.close()
+
+
+def _capability_probe_http_handler(
+    capabilities: dict[str, object] | None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        method = body["method"]
+        if method == "initialize":
+            result: dict[str, object] = {"protocolVersion": "2025-06-18"}
+            if capabilities is not None:
+                result["capabilities"] = capabilities
+        elif method == "resources/list":
+            result = {"resources": [{"uri": "mem://one", "name": "one"}]}
+        elif method == "prompts/list":
+            result = {"prompts": [{"name": "greet", "description": "d"}]}
+        else:
+            result = {"tools": []}
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": body["id"], "result": result},
+            request=request,
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_http_omitted_capabilities_still_sends_resource_and_prompt_requests() -> None:
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    client = StreamableHTTPMCPClient(
+        config,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_capability_probe_http_handler(None))
+        ),
+    )
+    try:
+        await client.connect()
+        assert client.capabilities is None
+        resources = await client.list_resources()
+        assert [r.uri for r in resources] == ["mem://one"]
+        prompts = await client.list_prompts()
+        assert [p.name for p in prompts] == ["greet"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_http_explicit_capabilities_reject_unadvertised_members() -> None:
+    config = MCPServerConfig("http", "streamable-http", url="https://mcp.test")
+    client = StreamableHTTPMCPClient(
+        config,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                _capability_probe_http_handler({"tools": {}})
+            )
+        ),
+    )
+    try:
+        await client.connect()
+        assert client.capabilities == {"tools": {}}
+        with pytest.raises(MCPUnsupportedError, match="does not provide resources"):
+            await client.list_resources()
+        with pytest.raises(MCPUnsupportedError, match="does not provide prompts"):
+            await client.list_prompts()
+    finally:
+        await client.close()
+
+
 @pytest.mark.asyncio
 async def test_mount_registers_prefixed_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
