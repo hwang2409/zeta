@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from ...core.store._history_index import StaleHistorySnapshot
+
 
 @dataclass(frozen=True, slots=True)
 class HistoryCursor:
@@ -296,9 +298,23 @@ class PagedTranscriptHistory:
             task = asyncio.create_task(source.page(cursor, direction=direction))
             self._loads[key] = task
             try:
-                page = await task
-            finally:
-                self._loads.pop(key, None)
+                try:
+                    page = await task
+                finally:
+                    self._loads.pop(key, None)
+            except StaleHistorySnapshot:
+                if generation != self.generation or source is not self.source:
+                    return TUIHistoryPage(())
+                anchor = self._anchor
+                self.reset()
+                self._anchor = anchor
+                page = (
+                    await source.reveal(anchor[0])
+                    if anchor is not None
+                    else await source.page()
+                )
+                self.adopt(page)
+                return page
             if generation != self.generation:
                 return TUIHistoryPage(())
             self.adopt(page, direction=direction)

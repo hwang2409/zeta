@@ -16449,7 +16449,7 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
 
 @pytest.mark.asyncio
 async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
@@ -16578,6 +16578,26 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "history-49999" in rendered
         assert app._transcript.follow_tail
 
+        from zeta.tui import agent_card as agent_card_module
+        from zeta.tui import checkpoints as checkpoints_module
+
+        provider_reads: list[int] = []
+        main_thread = threading.get_ident()
+        original_provider = checkpoints_module.session_replay_provider
+
+        def tracked_provider(path: Path) -> str | None:
+            provider_reads.append(threading.get_ident())
+            return original_provider(path)
+
+        monkeypatch.setattr(
+            checkpoints_module, "session_replay_provider", tracked_provider
+        )
+        monkeypatch.setattr(
+            agent_card_module,
+            "session_replay_provider",
+            tracked_provider,
+            raising=False,
+        )
         navigation = app._agent_navigation
         navigation.current_path = child_path
         navigation._path_stack.append(child_path)
@@ -16600,6 +16620,10 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
             for unit in page.units
         )
         assert len(app._history_pager.descriptors) <= 4
+        app._render_active_resident_history()
+        app._render_active_resident_history()
+        assert len(provider_reads) == 1
+        assert provider_reads[0] != main_thread
 
         matches = await app._history_pager.search("child-history-0")
         assert matches
@@ -16637,6 +16661,8 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "branch-prompt-reset",
         "branch-prompt-stale-fork",
         "branch-prompt-stale-tree",
+        "child-cancel-replace-close",
+        "child-stale-page",
     ),
 )
 @pytest.mark.asyncio
@@ -16748,7 +16774,84 @@ async def test_root_tui_paging_render_path_table(
     async with owned_app(app):
         assert await app._rebuild_transcript_async()
 
-        if journey == "stale-anchor":
+        if journey == "child-cancel-replace-close":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            first_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first search row")])
+            )
+            replacement_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("replacement search row")])
+            )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            started = threading.Event()
+            cancel_seen = threading.Event()
+            release = threading.Event()
+            original_search = source._search_sync
+
+            def blocked_search(*args: object):
+                query = args[-3]
+                cancel = args[-1]
+                assert isinstance(cancel, type(threading.Event()))
+                if query == "first":
+                    started.set()
+                    assert cancel.wait(10)
+                    cancel_seen.set()
+                    assert release.wait(10)
+                return original_search(*args)
+
+            monkeypatch.setattr(source, "_search_sync", blocked_search)
+            first = asyncio.create_task(source.search("first"))
+            assert await asyncio.to_thread(started.wait, 10)
+            first.cancel()
+            replacement = asyncio.create_task(source.search("replacement"))
+            closing = asyncio.create_task(source.close())
+            assert await asyncio.to_thread(cancel_seen.wait, 10)
+            await asyncio.sleep(0)
+            assert not first.done(), (
+                "cancelled search returned before its observer store closed"
+            )
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(first, what="cancelled child search drain")
+            matches = await await_or_fail(
+                replacement, what="replacement child search"
+            )
+            await await_or_fail(closing, what="child source close")
+            assert [match.entry_id for match in matches] == [replacement_entry.id]
+            assert first_entry.id not in {match.entry_id for match in matches}
+        elif journey == "child-stale-page":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+            from zeta.tui.transcript.paged_history import PagedTranscriptHistory
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            for index in range(300):
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"child row {index}")])
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            pager = PagedTranscriptHistory(source)
+            first_page = await pager.load()
+            anchor_id = first_page.units[0].entry_id
+            pager.set_anchor(anchor_id, 0, 0)
+            replacement = child_path / "conversation.replacement"
+            shutil.copy2(source.path / "conversation.jsonl", replacement)
+            os.replace(replacement, source.path / "conversation.jsonl")
+
+            page = await pager.load("older")
+
+            assert page.units
+            assert len(pager.descriptors) == 1, (
+                "stale child pages were mixed with the replacement log"
+            )
+            assert anchor_id in {unit.entry_id for unit in pager.pages[0].units}
+            await source.close()
+        elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page
             started = asyncio.Event()

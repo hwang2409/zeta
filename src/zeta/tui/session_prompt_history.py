@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 
 from prompt_toolkit.buffer import Buffer
@@ -139,14 +139,6 @@ class SessionPromptHistory:
             await self._load
         finally:
             self._load = None
-
-    def replace(self, session_path: Path, prompts: Sequence[str]) -> None:
-        """Adopt a bounded child snapshot until child paging lands in 2b-2."""
-
-        self.bind(session_path)
-        rows = tuple((str(index), value) for index, value in enumerate(prompts[-256:]))
-        self._entries = [rows[index:index + 128] for index in range(0, len(rows), 128)]
-        self._page_edges = [(None, None)] * len(self._entries)
 
     def append(self, session_path: Path, prompt: str) -> None:
         if not prompt:

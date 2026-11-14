@@ -61,7 +61,7 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
-from .checkpoints import render_replayed_message, session_replay_provider
+from .checkpoints import render_replayed_message
 from .todo import TodoSnapshot
 from .user import displayed_user_text, user_message
 
@@ -631,7 +631,7 @@ class AgentTranscriptControl(UIControl):
         follow_tail = self.transcript.follow_tail
         self.presenter.clear()
         self._tool_calls.clear()
-        provider = session_replay_provider(self._path) if self._path is not None else None
+        provider = self._source.replay_provider if self._source is not None else None
         for page in pages:
             for unit in page.units:
                 entry = unit.value
