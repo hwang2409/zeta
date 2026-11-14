@@ -87,16 +87,19 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     session_id = _created_session(home, tmp_path)
     lease_path = home / "sessions" / session_id / "runtime.lease"
     manager = SessionManager(home, owner_surface="serve")
+    opened = manager.open(session_id)
 
     async def exercise() -> None:
+        nonlocal opened
         probe = _DrainProbe(asyncio.get_running_loop())
         monkeypatch.setattr(server_module, "drain_releases", probe, raising=False)
         server = ZetaServer(home=home, port=0, provider="codex")
         await server.start()
         try:
             store = dropped_for_gc(
-                (await asyncio.to_thread(manager.open, session_id)).store, "the collector must finalize it"
+                opened.store, "the collector must finalize it"
             )
+            del opened
             store._cycle = store  # only the collector can free it now
             del store
             # a failed release ahead of the store's must not stop the drain
@@ -123,9 +126,12 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             assert result[0] == "opened", result
 
             # a drain that raises is logged and the next tick retries
+            opened = await asyncio.to_thread(manager.open, session_id)
             again = dropped_for_gc(
-                (await asyncio.to_thread(manager.open, session_id)).store, "the collector must finalize it"
+                opened.store, "the collector must finalize it"
             )
+            del opened
+            await asyncio.sleep(0)
             again._cycle = again
             del again
             probe.fail_next = True

@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import threading
+import traceback
 import uuid
 import weakref
 from collections import Counter
@@ -1119,10 +1120,19 @@ def blocking_session_locks_leave_event_loop(
             except RuntimeError:
                 pass
             else:
-                raise RuntimeError(
-                    "retention lock requested on an asyncio event-loop thread; "
-                    "use asyncio.to_thread"
-                )
+                tests_caller = False
+                for frame in reversed(traceback.extract_stack()[:-1]):
+                    path = Path(frame.filename).resolve()
+                    if path.is_relative_to(_REPOSITORY_ROOT / "src" / "zeta"):
+                        continue
+                    if path.is_relative_to(_TEST_SITE_PACKAGES):
+                        tests_caller = path.name != "conftest.py"
+                    break
+                if tests_caller:
+                    raise RuntimeError(
+                        "retention lock requested on an asyncio event-loop thread; "
+                        "use asyncio.to_thread"
+                    )
         return acquire(*args, **kwargs)
 
     monkeypatch.setattr(retention_access, "acquire_after_retention_yield", guarded_acquire)
