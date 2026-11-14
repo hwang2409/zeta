@@ -709,6 +709,51 @@ async def test_websocket_discovery_file_has_one_owner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_websocket_custom_discovery_allows_a_second_server(tmp_path: Path) -> None:
+    default_path = tmp_path / "run" / "serve.ws.json"
+    custom_path = tmp_path / "dedicated" / "serve.json"
+    first = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
+    second = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    await first.start()
+    await second.start()
+    try:
+        assert json.loads(default_path.read_text())["port"] == first._websocket.port
+        assert json.loads(custom_path.read_text())["port"] == second._websocket.port
+        assert first._websocket.port != second._websocket.port
+        assert (custom_path.parent / "serve.json.lock").exists()
+        assert stat.S_IMODE(custom_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((custom_path.parent / "serve.json.lock").stat().st_mode) == 0o600
+
+        duplicate = ZetaServer(
+            home=tmp_path,
+            port=0,
+            ws_port=0,
+            ws_discovery=custom_path,
+            provider="codex",
+        )
+        with pytest.raises(ValueError, match="WebSocket server already running"):
+            await duplicate.start()
+        await close_serve(duplicate)
+        await close_serve(second)
+        assert default_path.exists()
+    finally:
+        await close_serve(second)
+        await close_serve(first)
+
+
+@pytest.mark.asyncio
+async def test_websocket_rejects_relative_custom_discovery_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="absolute path"):
+        ZetaServer(home=tmp_path, port=0, ws_port=0, ws_discovery="serve.json")
+
+
+@pytest.mark.asyncio
 async def test_websocket_replaces_stale_discovery_file(tmp_path: Path) -> None:
     token_path = tmp_path / "run" / "serve.ws.json"
     token_path.parent.mkdir(parents=True)
@@ -735,9 +780,12 @@ def test_serve_websocket_cli_flags() -> None:
             "http://127.0.0.1:5173",
             "--ws-origin",
             "https://app.example:443",
+            "--ws-discovery",
+            "/tmp/custom-serve.json",
         ]
     )
     assert args.ws_port == 8765
+    assert args.ws_discovery == "/tmp/custom-serve.json"
     assert args.ws_origins == ["http://127.0.0.1:5173", "https://app.example:443"]
 
 

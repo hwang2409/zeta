@@ -83,6 +83,7 @@ class WebSocketServer:
         port: int,
         origins: Sequence[str],
         path: Path,
+        lock_path: Path,
         accept: Callable[[object, object], Awaitable[None]],
     ) -> None:
         if not 0 <= port <= 65535:
@@ -90,6 +91,7 @@ class WebSocketServer:
         self.port = port
         self.origins = validate_origins(origins)
         self.path = path
+        self.lock_path = lock_path
         self.accept = accept
         self.token: str | None = None
         self.controller_token: str | None = None
@@ -99,7 +101,7 @@ class WebSocketServer:
 
     async def start(self) -> None:
         self._lock_fd = await asyncio.to_thread(
-            acquire_connection_lock, self.path.with_name("serve.ws.lock")
+            acquire_connection_lock, self.lock_path
         )
         self.controller_token = secrets.token_urlsafe(32)
         self.observer_token = secrets.token_urlsafe(32)
