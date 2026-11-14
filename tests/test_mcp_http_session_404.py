@@ -277,9 +277,12 @@ async def test_notification_404_recovers_and_replaces_listener(
     replacement_owner = asyncio.create_task(client._listen_notifications())
     client._notification_task = replacement_owner
     try:
+        await asyncio.wait_for(
+            asyncio.gather(replacement_owner, return_exceptions=True), 10
+        )
+        assert client._notification_task is not replacement_owner
         await await_or_fail(new_listener_started.wait(), what="new session listener")
         assert listener_calls == ["session-1", "session-2"]
-        assert client._notification_task is not replacement_owner
         assert sum(method == "initialize" for method, _ in restarting_mcp.requests) == 2
     finally:
         release_listener.set()

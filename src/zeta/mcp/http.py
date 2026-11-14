@@ -627,6 +627,8 @@ class StreamableHTTPMCPClient(MCPClient):
                 raise
             except MCPHTTPError as exc:
                 if exc.status_code == 404 and session_id is not None:
+                    if asyncio.current_task() is self._notification_task:
+                        self._notification_task = None
                     recovery = self._start_session_recovery(generation, session_id)
                     if recovery is not None:
                         await asyncio.shield(recovery)
