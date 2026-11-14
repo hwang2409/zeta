@@ -1090,13 +1090,30 @@ def blocking_session_locks_leave_event_loop(
 ) -> Generator[None, None, None]:
     """Make every test catch direct blocking session access on an event loop."""
     from zeta.core import retention_access, session_files
+    from zeta.session_retention.activation import RetentionActivationOwner
 
     original = session_files.require_off_loop_lock
     acquire = retention_access.acquire_after_retention_yield
     allow_on_loop = request.node.get_closest_marker("retention_on_loop_allowed") is not None
+    active_owners: set[RetentionActivationOwner] = set()
+    original_start = RetentionActivationOwner.start
+    original_stop = RetentionActivationOwner.stop
+
+    def track_start(owner: RetentionActivationOwner):
+        active_owners.add(owner)
+        return original_start(owner)
+
+    async def track_stop(owner: RetentionActivationOwner):
+        try:
+            await original_stop(owner)
+        finally:
+            active_owners.discard(owner)
+
+    monkeypatch.setattr(RetentionActivationOwner, "start", track_start)
+    monkeypatch.setattr(RetentionActivationOwner, "stop", track_stop)
 
     def guarded_acquire(*args, **kwargs):
-        if not allow_on_loop:
+        if active_owners and not allow_on_loop:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -1115,6 +1132,8 @@ def blocking_session_locks_leave_event_loop(
             asyncio.get_running_loop()
         except RuntimeError:
             original(kind, error)
+            return
+        if not active_owners and not allow_on_loop:
             return
         raise error(
             f"{kind} lock requested on an asyncio event-loop thread; "

@@ -270,3 +270,23 @@ async def test_armed_days_change_previews_before_deletion(tmp_path: Path) -> Non
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    manager = await asyncio.to_thread(SessionManager, home)
+    session_id = await asyncio.to_thread(_create_closed, manager, [], name="idle")
+    lease = await asyncio.to_thread(open_writer, home)
+    owner = make_retention_owner(home, lease, lambda: 0)
+    owner.start()
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="retention lock requested on an asyncio event-loop thread; use asyncio.to_thread",
+        ):
+            manager.open(session_id)
+    finally:
+        await owner.stop()
+        await asyncio.to_thread(lease.close)
