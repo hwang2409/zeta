@@ -17068,8 +17068,8 @@ async def test_root_tui_paging_render_path_table(
                 assert retained_pages <= 4, (
                     "active child retained root descriptors outside the global page budget"
                 )
-                assert not hasattr(owner._root_view_state, "segments"), (
-                    "active child retained root page descriptors in inactive state"
+                assert not app._transcript.units, (
+                    "active child left rendered units in the inactive root widget"
                 )
 
                 navigation.refresh(force=True)

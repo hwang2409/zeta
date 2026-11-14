@@ -341,6 +341,12 @@ async def test_real_tui_child_view_journey(
                     "child-return: durable anchor changed; "
                     f"expected={child_anchor!r} actual={restored_anchor!r}"
                 )
+                assert not app._transcript.units, (
+                    "child-return: the inactive root widget still holds rendered units"
+                )
+                assert len(
+                    app._agent_navigation.transcript_control.history_pager.descriptors
+                ) <= 4, "child-return: retained pages exceed the global four-page budget"
                 assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
                     "child-return: selected prompt was not restored"
                 )
