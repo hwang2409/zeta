@@ -231,6 +231,7 @@ async def test_disarm_deadline_persists_pending_and_retries(tmp_path: Path, monk
         def deadline(*_args, **_kwargs):
             raise TimeoutError
 
+        # test-contract: seam forced coordinator deadline
         monkeypatch.setattr(retention_module, "_try_authority", deadline)
         pending = await asyncio.to_thread(retention_authority, home, lease, days=0)
         assert not pending.applied and pending.projection["disable_pending"]
