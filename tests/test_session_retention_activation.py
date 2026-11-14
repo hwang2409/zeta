@@ -10,6 +10,7 @@ import pytest
 import zeta.session_retention as retention_module
 from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.storage_homes import initialize_storage_home
+from zeta.core import retention_access
 from zeta.core.session import SessionManager
 from zeta.session_retention import (
     RetentionBounds,
@@ -324,7 +325,13 @@ async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) ->
             RuntimeError,
             match="retention lock requested on an asyncio event-loop thread; use asyncio.to_thread",
         ):
-            manager.open(session_id)
+            opened = manager.open(session_id)
+            retention_access.acquire_after_retention_yield(
+                home,
+                lambda: (_ for _ in ()).throw(BlockingIOError()),
+                lambda error: error,
+            )
     finally:
+        opened.store.close()
         await owner.stop()
         await asyncio.to_thread(lease.close)

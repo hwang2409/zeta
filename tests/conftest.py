@@ -1126,7 +1126,9 @@ def blocking_session_locks_leave_event_loop(
                     if path.is_relative_to(_REPOSITORY_ROOT / "src" / "zeta"):
                         continue
                     if path.is_relative_to(_TEST_SITE_PACKAGES):
-                        tests_caller = path.name != "conftest.py"
+                        if path.name == "conftest.py":
+                            continue
+                        tests_caller = True
                     break
                 if tests_caller:
                     raise RuntimeError(
