@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import json
 import os
@@ -171,35 +172,54 @@ async def test_two_owners_append_without_lost_rows(
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     lease = await asyncio.to_thread(open_writer, home)
     barrier = threading.Barrier(2)
+    planner_roles: dict[int, str] = {}
+    planner_lock = threading.Lock()
+    b_reached = threading.Event()
+    a_holds_coordinator = threading.Event()
     original_run_pass = RetentionPlanner.run_pass
+    original_publish = retention_module.atomic_publish_file
+    original_authority = activation_module.domain_authority
 
     def synchronized_run_pass(planner, *, days, commit_state=True, yield_check=None):
-        barrier.wait(10)
+        thread_id = threading.get_ident()
+        with planner_lock:
+            first_pass = thread_id not in planner_roles
+            if first_pass:
+                planner_roles[thread_id] = "a" if not planner_roles else "b"
+        if first_pass:
+            try:
+                barrier.wait(10)
+            except threading.BrokenBarrierError as exc:
+                raise AssertionError("owners did not reach the first-pass rendezvous") from exc
         if commit_state:
-            return original_run_pass(planner, days=days, yield_check=yield_check)
-        return original_run_pass(planner, days=days, commit_state=False, yield_check=yield_check)
+            result = original_run_pass(planner, days=days, yield_check=yield_check)
+        else:
+            result = original_run_pass(planner, days=days, commit_state=False, yield_check=yield_check)
+        if first_pass and planner_roles[thread_id] == "b":
+            b_reached.set()
+        return result
+
+    @contextlib.contextmanager
+    def observed_authority(*args, **kwargs):
+        if planner_roles.get(threading.get_ident()) == "a":
+            a_holds_coordinator.set()
+        elif planner_roles.get(threading.get_ident()) == "b":
+            b_reached.set()
+        with original_authority(*args, **kwargs):
+            yield
+
+    def ordered_publish(directory_fd, name, data, **kwargs):
+        role = planner_roles.get(threading.get_ident())
+        if role == "a" and name == "retention-history.jsonl":
+            assert b_reached.wait(10), "owner b did not reach its commit attempt"
+        original_publish(directory_fd, name, data, **kwargs)
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", synchronized_run_pass)
-    append_barrier = threading.Barrier(2)
-    append_timestamps: list[str] = []
-    append_lock = threading.Lock()
-    original_append = activation_module.append_retention_history
-
-    def synchronized_append(home, lease, result, **kwargs):
-        if kwargs.get("authority_held", False):
-            return original_append(home, lease, result, **kwargs)
-        with append_lock:
-            append_timestamps.append(str(result["timestamp"]))
-        append_barrier.wait(10)
-        if str(result["timestamp"]) == min(append_timestamps):
-            # test-contract: latency < force the older row to append last
-            time.sleep(0.05)
-        return original_append(home, lease, result, **kwargs)
-
-    monkeypatch.setattr(activation_module, "append_retention_history", synchronized_append)
+    monkeypatch.setattr(activation_module, "domain_authority", observed_authority)
+    monkeypatch.setattr(retention_module, "atomic_publish_file", ordered_publish)
     try:
         first = make_retention_owner(home, lease, lambda: 30)
-        second = make_retention_owner(home, lease, lambda: 30)
+        second = make_retention_owner(home, lease, lambda: 31)
         results = await asyncio.wait_for(
             asyncio.gather(
                 asyncio.to_thread(first._run_episode), asyncio.to_thread(second._run_episode)
@@ -208,8 +228,15 @@ async def test_two_owners_append_without_lost_rows(
         )
         assert all(failure is None for _projections, failure in results), results
         rows = (home / "retention-history.jsonl").read_text().splitlines()
-        assert len(rows) >= 1
-        assert {json.loads(row)["mode"] for row in rows} >= {"preview"}
+        assert len(rows) == 1
+        assert {json.loads(row)["mode"] for row in rows} == {"preview"}
+        winner_days = json.loads(rows[-1])["days"]
+        assert winner_days in {30, 31}
+        assert all(
+            projection.projection["days"] == winner_days
+            for projections, _failure in results
+            for projection in projections
+        )
         assert all(
             json.loads(row).get("preview_id")
             for row in rows
