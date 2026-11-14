@@ -871,7 +871,7 @@ class AgentTranscriptControl(UIControl):
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
-        if self._closed or self._pending_path is not None:
+        if self._closed or self._pending_path == path:
             return False
         try:
             loop = asyncio.get_running_loop()

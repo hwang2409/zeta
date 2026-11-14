@@ -20,6 +20,7 @@ from rich.text import Text
 
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
@@ -2301,7 +2302,7 @@ async def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: 
     control = navigation.transcript_control
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 8)
     for _ in range(5):
         control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
@@ -2310,7 +2311,7 @@ async def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: 
     _append_child_line(child, "new live output")
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     after = _visible_text(control.create_content(80, 8))
 
     assert after == before
@@ -2328,14 +2329,14 @@ async def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None
     control = navigation.transcript_control
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 6)
     assert control.transcript.follow_tail
 
     _append_child_line(child, "new live output")
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     visible = _visible_text(control.create_content(80, 6))
 
     assert "new live output" in visible
@@ -2362,7 +2363,7 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
     control = agent_card.AgentTranscriptControl()
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
     replacement = child / "replacement.jsonl"
     replacement.write_bytes(_replacement_transcript(tmp_path, child.name, "replacement"))
 
@@ -2370,7 +2371,7 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
 
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "replacement" in rendered
@@ -2385,7 +2386,7 @@ async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
     control = agent_card.AgentTranscriptControl()
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
 
     (child / "conversation.jsonl").write_bytes(
         _replacement_transcript(tmp_path, child.name, "short")
@@ -2393,7 +2394,7 @@ async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
 
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "short" in rendered
@@ -2408,7 +2409,7 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
     control = agent_card.AgentTranscriptControl()
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
     transcript = child / "conversation.jsonl"
     inode = transcript.stat().st_ino
 
@@ -2423,7 +2424,7 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
 
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "new content" in rendered
@@ -2446,7 +2447,7 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
     control = agent_card.AgentTranscriptControl()
     load = control.activate(child)
     assert load is not None
-    await load
+    await await_or_fail(load, what="child transcript activation")
     control.create_content(80, 8)
     control.top()
     control.scroll(10)
@@ -2465,7 +2466,7 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
 
     refresh = control.activate(child)
     assert refresh is not None
-    await refresh
+    await await_or_fail(refresh, what="child transcript refresh")
     assert control.transcript.units
     after_content = control.create_content(80, 8)
     after = "\n".join(
