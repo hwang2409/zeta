@@ -2291,21 +2291,26 @@ def _wheel(event_type: MouseEventType) -> MouseEvent:
 
 
 
-def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Running")
     for index in range(80):
         _append_child_line(child, f"line {index}")
     navigation = AgentNavigation(store)
-    navigation.open_selected()
     control = navigation.transcript_control
+    load = control.activate(child)
+    assert load is not None
+    await load
     control.create_content(80, 8)
     for _ in range(5):
         control.mouse_handler(_wheel(MouseEventType.SCROLL_UP))
     before = _visible_text(control.create_content(80, 8))
 
     _append_child_line(child, "new live output")
-    assert navigation.refresh(force=True)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
     after = _visible_text(control.create_content(80, 8))
 
     assert after == before
@@ -2313,19 +2318,24 @@ def test_subagent_view_does_not_jump_to_bottom_when_scrolled_up(tmp_path: Path) 
     assert not control.transcript.follow_tail
 
 
-def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_subagent_view_follows_tail_when_at_bottom(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(store, 1, description="Running")
     for index in range(20):
         _append_child_line(child, f"line {index}")
     navigation = AgentNavigation(store)
-    navigation.open_selected()
     control = navigation.transcript_control
+    load = control.activate(child)
+    assert load is not None
+    await load
     control.create_content(80, 6)
     assert control.transcript.follow_tail
 
     _append_child_line(child, "new live output")
-    assert navigation.refresh(force=True)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
     visible = _visible_text(control.create_content(80, 6))
 
     assert "new live output" in visible
@@ -2350,13 +2360,18 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
     child = _child(root, 1, description="Replace")
     _append_child_lines(child, (f"stale {index}" for index in range(20)))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await load
     replacement = child / "replacement.jsonl"
     replacement.write_bytes(_replacement_transcript(tmp_path, child.name, "replacement"))
 
     os.replace(replacement, child / "conversation.jsonl")
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "replacement" in rendered
     assert "stale" not in rendered
@@ -2368,13 +2383,18 @@ async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
     child = _child(root, 1, description="Truncate")
     _append_child_lines(child, (f"stale {index}" for index in range(20)))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await load
 
     (child / "conversation.jsonl").write_bytes(
         _replacement_transcript(tmp_path, child.name, "short")
     )
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "short" in rendered
     assert "stale" not in rendered
@@ -2386,7 +2406,9 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
     child = _child(root, 1, description="Rewrite")
     _append_child_lines(child, ("old content",))
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await load
     transcript = child / "conversation.jsonl"
     inode = transcript.stat().st_ino
 
@@ -2399,7 +2421,10 @@ async def test_subagent_sync_rebuilds_after_same_inode_rewrite(tmp_path: Path) -
         handle.truncate()
     assert transcript.stat().st_ino == inode
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
+    assert control.transcript.units
     rendered = "\n".join(control.transcript.lines(80))
     assert "new content" in rendered
     assert "old content" not in rendered
@@ -2419,7 +2444,9 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
         for index in range(60)
     ]
     control = agent_card.AgentTranscriptControl()
-    await control.load(child)
+    load = control.activate(child)
+    assert load is not None
+    await load
     control.create_content(80, 8)
     control.top()
     control.scroll(10)
@@ -2436,7 +2463,10 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
     )
     child_store.close()
 
-    assert await control.sync(child)
+    refresh = control.activate(child)
+    assert refresh is not None
+    await refresh
+    assert control.transcript.units
     after_content = control.create_content(80, 8)
     after = "\n".join(
         "".join(text for _, text in after_content.get_line(index))

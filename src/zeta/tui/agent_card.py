@@ -873,17 +873,21 @@ class AgentTranscriptControl(UIControl):
     ) -> bool:
         if self._closed or self._pending_path is not None:
             return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
         active_source = self._source is not None or (
             path == self._root_path
             and self._history_pager.source is self._root_source
         )
-        if path != self._path or not active_source:
+        if path != self._root_path or path != self._path or not active_source:
             task = self.activate(path)
         else:
             if self._load_task is not None and not self._load_task.done():
                 self._load_task.cancel()
             self._activation_generation += 1
-            task = asyncio.get_running_loop().create_task(self.refresh())
+            task = loop.create_task(self.refresh())
             self._load_task = task
         if task is not None and invalidate is not None:
             task.add_done_callback(lambda _task: invalidate())
