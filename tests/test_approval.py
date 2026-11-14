@@ -8,6 +8,7 @@ import pytest
 
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import (
     ApprovalDecision,
@@ -1507,6 +1508,100 @@ async def test_terminal_approval_claims_do_not_accumulate_across_turns(
 
 
 @pytest.mark.asyncio
+async def test_terminal_finalizer_wakes_duplicate_while_owner_unwinds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The duplicate claimant of an approved tool must wake with the single stored
+    # result when the turn finalizer releases the claim, even while the owning
+    # execution is still unwinding (its task is not done). Before the fix the
+    # finalizer only woke the waiter when the claim owner was done, so a still
+    # running owner left the waiter asleep forever.
+    store = ConversationStore(tmp_path)
+    call = ToolCall("call", "echo", {})
+    store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+        [(call.id, call, {"action": None}, {})],
+    )
+    store.resolve_approval(call.id, "allow")
+    policy = ApprovalPolicy(default="ask", store=store)
+    registry = ToolRegistry(
+        tmp_path,
+        approval_policy=policy,
+        approval_store=store,
+        session_store=store,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    executions = 0
+
+    async def echo(_arguments: dict[str, object]) -> str:
+        nonlocal executions
+        executions += 1
+        return "ran"
+
+    registry.register("echo", echo)
+    loop = AgentLoop(
+        FakeBackend([]),
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    pending = (call.id, registry.approval_definition_identity(call.name))
+    owner_claimed = asyncio.Event()
+    release_owner = asyncio.Event()
+
+    async def own_execution() -> None:
+        nonlocal executions
+        store.remember_pending_approval_execution(*pending)
+        assert store.claim_pending_approval_execution(*pending) == "claimed"
+        executions += 1
+        owner_claimed.set()
+        await await_or_fail(
+            release_owner.wait(), timeout=30, what="execution owner release"
+        )
+
+    owner = asyncio.create_task(own_execution())
+    waiter: asyncio.Task[object] | None = None
+    try:
+        await await_or_fail(owner_claimed.wait(), timeout=10, what="execution claim")
+
+        waiter_started = asyncio.Event()
+        real_wait = store.wait_pending_approval_execution
+
+        async def tracking_wait(request_id: str) -> None:
+            waiter_started.set()
+            await real_wait(request_id)
+
+        monkeypatch.setattr(store, "wait_pending_approval_execution", tracking_wait)
+        waiter = asyncio.create_task(registry.execute(call))
+        await await_or_fail(
+            waiter_started.wait(), timeout=10, what="duplicate approval waiter start"
+        )
+
+        # The real turn finalizer: store one terminal result, then release the
+        # claim through the same seam the turn uses, while the owner is not done.
+        finalized = loop._finalize_tool_results([call], [None])
+        assert len(finalized) == 1
+        assert finalized[0].is_canceled
+        waiter_result = await await_or_fail(
+            waiter, timeout=10, what="duplicate approved tool execution"
+        )
+
+        assert executions == 1
+        assert waiter_result["isError"] is True
+        assert store.tool_result(call.id) is not None
+    finally:
+        release_owner.set()
+        await await_or_fail(owner, timeout=10, what="execution owner cleanup")
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+            await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), 10)
+        await asyncio.wait_for(loop.close(), 10)
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_terminal_claim_blocks_a_delayed_loser_until_turn_end(
     tmp_path: Path,
 ) -> None:
@@ -1516,10 +1611,10 @@ async def test_terminal_claim_blocks_a_delayed_loser_until_turn_end(
     try:
         store.remember_pending_approval_execution(*first)
         assert store.claim_pending_approval_execution(*first) == "claimed"
-        store.release_pending_approval_execution(first[0])
+        store.complete_pending_approval_execution(first[0])
         store.remember_pending_approval_execution(*second)
         assert store.claim_pending_approval_execution(*second) == "claimed"
-        store.release_pending_approval_execution(second[0])
+        store.complete_pending_approval_execution(second[0])
 
         async def delayed_claim() -> str:
             await asyncio.sleep(0)
