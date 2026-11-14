@@ -22,7 +22,7 @@ class EntryValidationContext(Protocol):
     def _validate_checkpoint_or_fork_payload(self, entry: Any) -> None: ...
 
 
-EntryValidator = Callable[[EntryValidationContext, Any], None]
+EntryValidator = Callable[[EntryValidationContext, Any], object | None]
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
 
@@ -64,12 +64,13 @@ class ConversationEntrySpec:
     validator: EntryValidator
 
 
-def _message(_context: EntryValidationContext, entry: Any) -> None:
+def _message(_context: EntryValidationContext, entry: Any) -> Message:
     message = entry.data.get("message")
     if type(message) is not dict:
         raise ValueError("message entry payload must contain an object")
     parsed_message = Message.from_dict(message)
     _message_approval_requests(parsed_message, entry.data.get("approval_requests", []))
+    return parsed_message
 
 
 def _validated_approval_requests(
@@ -232,8 +233,10 @@ CONVERSATION_ENTRY_SPECS: dict[str, ConversationEntrySpec] = {
 }
 
 
-def validate_conversation_entry(context: EntryValidationContext, entry: Any) -> None:
+def validate_conversation_entry(
+    context: EntryValidationContext, entry: Any
+) -> object | None:
     spec = CONVERSATION_ENTRY_SPECS.get(entry.type)
     if spec is None:
         raise ValueError(f"unsupported conversation entry type: {entry.type}")
-    spec.validator(context, entry)
+    return spec.validator(context, entry)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+from ..context_accounting import message_token_count
 from ..core.slash import (
     MODEL_CONTEXT_WINDOWS,
     SlashStatus,
@@ -90,4 +91,9 @@ def capture_slash_status(
         ),
         transcript_entries=transcript_store.transcript_rows(transcript_refs),
         token_counter=context_assembler.token_counter,
+        status_projection=(
+            transcript_store.slash_status_projection()
+            if context_assembler.token_counter is message_token_count
+            else None
+        ),
     )

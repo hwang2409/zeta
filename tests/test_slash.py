@@ -19,6 +19,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from zeta.core.approval import ApprovalPolicy
+from zeta.context_accounting import message_token_count
 from zeta.core.context import ContextAssembler
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.model_input import ModelInputEnvelope
@@ -42,6 +43,7 @@ from zeta.core.slash import (
 from zeta.core.commands.slash_registry import SlashLock
 from zeta.context_eviction.token_estimates import estimated_tokens
 from zeta.core.store import ConversationStore
+from zeta.core.store._rows import TranscriptRows
 from zeta.runtime.loop import AgentLoop
 from zeta.providers import PROVIDER_MODELS
 from zeta.providers.usage import normalize_usage
@@ -1358,6 +1360,78 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
     history = app.slash_status().compaction_history
     assert len(history) == 1
     assert history[0].entries_folded == 4
+
+
+def test_status_uses_warm_index_without_transcript_payload_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("source")]),
+            MessageOrigin.USER,
+        )
+    )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    first_marker = store.append_compaction_marker("summary", 1, 2)
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("new reply")]))
+    store.append_compaction_marker(
+        "new summary", 3, 4, replaces=[first_marker.id]
+    )
+    expected = compaction_history(branch_entries(store), message_token_count)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+    payload_reads = 0
+    original_read = TranscriptRows.read
+
+    def counted_read(rows: TranscriptRows):
+        nonlocal payload_reads
+        payload_reads += 1
+        return original_read(rows)
+
+    monkeypatch.setattr(TranscriptRows, "read", counted_read)
+    try:
+        status = app.slash_status()
+        assert status.compaction_history == expected
+        assert payload_reads == 0, "warm /status read transcript payloads"
+    finally:
+        asyncio.run(app.close())
+
+
+def test_status_projection_tracks_foreign_compaction(tmp_path: Path) -> None:
+    resident = ConversationStore(tmp_path / "sessions")
+    resident.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("source")]),
+            MessageOrigin.USER,
+        )
+    )
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("reply")]))
+    checkpoint = resident.append_checkpoint("before foreign compaction")
+    foreign = ConversationStore(
+        tmp_path / "sessions", session_id=resident.session_id
+    )
+    foreign.append_compaction_marker("summary", 1, 2)
+    resident.append_message(Message(MessageRole.ASSISTANT, [TextContent("after")]))
+    expected = compaction_history(branch_entries(resident), message_token_count)
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), resident, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+    )
+
+    try:
+        assert app.slash_status().compaction_history == expected
+        resident.append_fork(str(checkpoint.seq))
+        assert app.slash_status().compaction_history == compaction_history(
+            branch_entries(resident), message_token_count
+        )
+    finally:
+        asyncio.run(app.close())
+        foreign.close()
 
 
 def test_compaction_history_subtracts_both_replacements(tmp_path: Path) -> None:

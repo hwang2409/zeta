@@ -32,6 +32,7 @@ class DeliveryFold:
     """Resident notification/prompt/receipt relations for one active branch."""
 
     __slots__ = (
+        "_validated_message",
         "active_notifications",
         "active_prompts",
         "agent_call_ids",
@@ -69,6 +70,7 @@ class DeliveryFold:
         self.last_message: Message | None = None
         self.last_turn_end: ConversationEntry | None = None
         self.last_terminal_transition: ConversationEntry | None = None
+        self._validated_message: Message | None = None
 
     # An installed fold is immutable, so a copy is the same object. This removes
     # the per-command deep copy of the whole fold.
@@ -114,6 +116,7 @@ class DeliveryFold:
         new.last_message = self.last_message
         new.last_turn_end = self.last_turn_end
         new.last_terminal_transition = self.last_terminal_transition
+        new._validated_message = None
         return new
 
     def apply(
@@ -180,8 +183,20 @@ class DeliveryFold:
         elif entry_type == "terminal_transition":
             self.last_terminal_transition = entry
 
+    def apply_validated(
+        self,
+        entry: ConversationEntry,
+        approvals: _ApprovalValidationOverlay | None,
+        message: Message,
+    ) -> None:
+        self._validated_message = message
+        try:
+            self.apply(entry, approvals)
+        finally:
+            self._validated_message = None
+
     def _apply_message(self, entry: ConversationEntry) -> None:
-        message = Message.from_dict(entry.data["message"])
+        message = self._validated_message or Message.from_dict(entry.data["message"])
         self.last_message = message
         prompt_id = message.metadata.get("zeta.pending_prompt_id")
         if type(prompt_id) is str:
