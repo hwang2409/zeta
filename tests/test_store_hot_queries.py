@@ -26,7 +26,7 @@ from zeta.protocol.types import (
 
 
 @pytest.mark.parametrize("old_version", [3, 999])
-def test_approval_index_rebuilds_non_v4_without_changing_authority(
+def test_approval_index_rebuilds_noncurrent_schema_without_changing_authority(
     tmp_path: Path, old_version: int
 ) -> None:
     store = ConversationStore(tmp_path, session_id=f"schema-{old_version}")
@@ -339,13 +339,15 @@ def test_index_parity_with_replay(tmp_path: Path) -> None:
         ), operation
 
         expected_results: dict[str, ToolResult] = {}
+        expected_result_seqs: dict[str, int] = {}
         for entry in reversed(branch):
             if entry.type != "message":
                 continue
             result = Message.from_dict(entry.data["message"]).tool_result
             if result is not None:
                 expected_results.setdefault(result.tool_call_id, result)
-        assert store.delivery_fold.tool_results == expected_results, operation
+                expected_result_seqs.setdefault(result.tool_call_id, entry.seq)
+        assert store.delivery_fold.tool_result_seqs == expected_result_seqs, operation
         assert all(
             store.tool_result(tool_call_id) == result
             for tool_call_id, result in expected_results.items()

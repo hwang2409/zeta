@@ -3,10 +3,12 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
 import warnings
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -20,6 +22,7 @@ from tests.support.notification_fixtures import notification_payloads
 from zeta import storage_format
 from zeta.core import agent_state, transcript_recovery
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
+from zeta.core.context import ContextAssembler
 from zeta.core.session_files import session_directory
 from zeta.core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
@@ -28,6 +31,8 @@ from zeta.core.store import (
     ConversationStore,
     TranscriptLoadError,
     _async_writes,
+    _log,
+    _rows,
 )
 from zeta.core.store._delivery_fold import DeliveryFold
 from zeta.core.store._history_index import (
@@ -95,6 +100,313 @@ def test_history_index_tracks_durable_rows_and_reopens(tmp_path: Path) -> None:
             for group in page.groups
             for entry in group
         ] == ["0", "1", "2"]
+    finally:
+        reopened.close()
+
+
+def test_large_fork_load_trims_payloads_in_linear_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row_count = 50_000
+    store = ConversationStore(tmp_path, session_id="large-fork")
+    path = store.path
+    store.close()
+    stored_message = message(MessageRole.ASSISTANT, "old").to_dict()
+    parent_id = None
+    with path.open("a", encoding="utf-8") as handle:
+        for seq in range(1, row_count + 1):
+            entry_id = f"entry-{seq}"
+            if seq == row_count:
+                parent_id = f"entry-{row_count - 100}"
+            entry = ConversationEntry(
+                seq=seq,
+                id=entry_id,
+                parent_id=parent_id,
+                lane="main",
+                type="message",
+                data={"message": stored_message},
+            )
+            handle.write(json.dumps(entry.to_dict(), separators=(",", ":")) + "\n")
+            parent_id = entry_id
+
+    class CountedValuesOrderedDict(OrderedDict):
+        values_calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.total = 0
+            super().__init__(*args, **kwargs)
+
+        def __setitem__(self, key, value) -> None:
+            self.total -= self.get(key, 0)
+            super().__setitem__(key, value)
+            self.total += value
+
+        def pop(self, key, default=None):
+            if key not in self:
+                return default
+            value = super().pop(key)
+            self.total -= value
+            return value
+
+        def popitem(self, last=True):
+            key, value = super().popitem(last=last)
+            self.total -= value
+            return key, value
+
+        def values(self):
+            type(self).values_calls += 1
+            return (self.total,)
+
+    drops = 0
+    original_drop = ResidentRows._drop_payload
+
+    def counted_drop(rows: ResidentRows, seq: int) -> None:
+        nonlocal drops
+        drops += 1
+        original_drop(rows, seq)
+
+    monkeypatch.setattr(_rows, "OrderedDict", CountedValuesOrderedDict)
+    # test-contract: seam count payload evictions during the real public constructor
+    monkeypatch.setattr(ResidentRows, "_drop_payload", counted_drop)
+    with ConversationStore(tmp_path, session_id="large-fork", _must_exist=True) as reopened:
+        assert len(reopened.branch_refs()) == row_count - 99
+
+    # test-contract: seam a full load performs at most one payload eviction per physical row
+    assert drops <= row_count
+    # test-contract: seam trimming never rescans the resident LRU while evicting rows
+    assert CountedValuesOrderedDict.values_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_payload_cache_does_not_change_replay_or_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = "payload-cache-equivalence"
+    with ConversationStore(tmp_path, session_id=session_id) as store:
+        for seq in range(80):
+            stored = message(MessageRole.ASSISTANT, f"{seq}:" + "x" * 4096).to_dict()
+            stored["metadata"] = {"turn_failed": True}
+            entry = store.append_message(Message.from_dict(stored))
+            if seq == 59:
+                store.commit_compaction_marker(
+                    "bounded", 1, entry.seq, expected_parent_id=entry.id
+                )
+
+    async def open_and_read(cache_bytes: int):
+        monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", str(cache_bytes))
+        with ConversationStore(
+            tmp_path, session_id=session_id, _must_exist=True
+        ) as reopened:
+            replay = await asyncio.to_thread(
+                lambda: tuple(
+                    entry.to_dict()
+                    for entry in (
+                        reopened.entry(ref) for ref in reopened.resident_refs()
+                    )
+                )
+            )
+            context = tuple(
+                item.to_dict() for item in await ContextAssembler(reopened).assemble()
+            )
+            resident_count = len(reopened._resident_rows.payloads)
+            resident_bytes = reopened._resident_rows.resident_payload_bytes
+        return replay, context, resident_count, resident_bytes
+
+    uncached = await open_and_read(0)
+    cached = await open_and_read(10 * 1024 * 1024)
+
+    assert uncached[:2] == cached[:2]
+    assert len(uncached[0]) == 81
+    assert uncached[1]
+    assert uncached[2] <= 65
+    assert uncached[3] < 512 * 1024
+    assert cached[2] > uncached[2]
+
+
+def test_warm_message_transcript_opens_from_compact_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ConversationStore(tmp_path, session_id="warm-index") as store:
+        stored = store.append_many(
+            [
+                ("message", {"message": message(MessageRole.ASSISTANT, value).to_dict()})
+                for value in ("first", "second")
+            ]
+        )
+        store.commit_compaction_marker(
+            "summary", 1, 2, expected_parent_id=stored[-1].id
+        )
+
+    physical_reads = 0
+    point_reads = 0
+    original = ConversationStore._iter_physical_rows
+    original_pread = _log.os.pread
+
+    def counted_rows(store, source, validated_prefix):
+        nonlocal physical_reads
+        physical_reads += 1
+        return original(store, source, validated_prefix)
+
+    def counted_pread(fd, length, offset):
+        nonlocal point_reads
+        point_reads += 1
+        return original_pread(fd, length, offset)
+
+    # test-contract: seam counts full scans and point reads from the authoritative transcript on warm startup
+    monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
+    monkeypatch.setattr(_log.os, "pread", counted_pread)
+    with ConversationStore(tmp_path, session_id="warm-index") as reopened:
+        assert physical_reads == 0
+        # test-contract: seam the warm-open path performs no point read from the transcript
+        assert point_reads == 0
+        assert [item.content[0].text for item in branch_messages(reopened)] == [
+            "first",
+            "second",
+        ]
+
+    index_path = store.session_dir / "history-index.sqlite3"
+    with sqlite3.connect(index_path) as connection:
+        connection.execute(
+            "UPDATE entries SET data=? WHERE seq=1",
+            (json.dumps({"message": message(MessageRole.ASSISTANT, "changed").to_dict()}),),
+        )
+    with ConversationStore(tmp_path, session_id="warm-index") as recovered:
+        assert [item.content[0].text for item in branch_messages(recovered)] == [
+            "first",
+            "second",
+        ]
+    assert physical_reads == 1
+
+    index_path.write_bytes(
+        b"broken disposable index"
+    )
+    with ConversationStore(tmp_path, session_id="warm-index") as recovered:
+        assert [item.content[0].text for item in branch_messages(recovered)] == [
+            "first",
+            "second",
+        ]
+    assert physical_reads == 2
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_messages",
+    [
+        ("foreign_append", ["first", "second", "appended"]),
+        ("crash_after_log_append", ["first", "second", "appended"]),
+        ("torn_tail", ["first", "second"]),
+        ("same_size_replacement", ["other", "second"]),
+        ("old_schema", ["first", "second"]),
+        ("corrupt_sidecar", ["first", "second"]),
+    ],
+)
+def test_warm_index_invalidations_read_authoritative_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_messages: list[str],
+) -> None:
+    with ConversationStore(tmp_path, session_id="warm-invalidations") as store:
+        stored = store.append_many(
+            [
+                ("message", {"message": message(MessageRole.ASSISTANT, value).to_dict()})
+                for value in ("first", "second")
+            ]
+        )
+        store.commit_compaction_marker(
+            "summary", 1, 2, expected_parent_id=stored[-1].id
+        )
+        marker_id = store.branch_refs()[-1].id
+        log_path = store.path
+        index_path = store.session_dir / "history-index.sqlite3"
+
+    if mutation in {"foreign_append", "crash_after_log_append"}:
+        appended = ConversationEntry(
+            seq=4,
+            id=("f" if mutation == "foreign_append" else "c") * 32,
+            parent_id=marker_id,
+            lane="main",
+            type="message",
+            data={"message": message(MessageRole.ASSISTANT, "appended").to_dict()},
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(appended.to_dict(), separators=(",", ":")) + "\n")
+    elif mutation == "torn_tail":
+        with log_path.open("ab") as handle:
+            handle.write(b'{"data":')
+    elif mutation == "same_size_replacement":
+        before = log_path.stat()
+        replacement = log_path.with_suffix(".replacement")
+        replacement.write_bytes(log_path.read_bytes().replace(b"first", b"other", 1))
+        assert replacement.stat().st_size == before.st_size
+        os.replace(replacement, log_path)
+        os.utime(log_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    elif mutation == "old_schema":
+        with sqlite3.connect(index_path) as connection:
+            raw = connection.execute(
+                "SELECT value FROM meta WHERE key='facts'"
+            ).fetchone()[0]
+            facts = json.loads(raw)
+            facts["schema_version"] -= 1
+            connection.execute(
+                "UPDATE meta SET value=? WHERE key='facts'", (json.dumps(facts),)
+            )
+    else:
+        index_path.write_bytes(b"broken disposable index")
+
+    physical_reads = 0
+    original = ConversationStore._iter_physical_rows
+
+    def counted_rows(store, source, validated_prefix):
+        nonlocal physical_reads
+        physical_reads += 1
+        return original(store, source, validated_prefix)
+
+    # test-contract: seam each invalid sidecar route must return to transcript authority
+    monkeypatch.setattr(ConversationStore, "_iter_physical_rows", counted_rows)
+    with ConversationStore(tmp_path, session_id="warm-invalidations") as reopened:
+        assert [item.content[0].text for item in branch_messages(reopened)] == expected_messages
+
+    # test-contract: seam every invalid sidecar route reads the authoritative transcript
+    assert physical_reads >= 1
+
+
+@pytest.mark.asyncio
+async def test_nonresident_rows_support_point_and_stream_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
+    store = ConversationStore(tmp_path, session_id="nonresident-reads")
+    try:
+        entries = [
+            (
+                "message",
+                {
+                    "message": message(
+                        MessageRole.ASSISTANT, f"payload-{seq}"
+                    ).to_dict()
+                },
+            )
+            for seq in range(1030)
+        ]
+        stored = store.append_many(entries)
+        store.commit_compaction_marker(
+            "bounded",
+            1,
+            1030,
+            expected_parent_id=stored[-1].id,
+        )
+    finally:
+        store.close()
+
+    reopened = ConversationStore(tmp_path, session_id="nonresident-reads")
+    try:
+        refs = reopened.resident_refs()[:2]
+        assert refs[0].seq not in reopened._resident_rows.payloads
+        assert reopened.entry(refs[0]).data["message"]["content"][0]["text"] == "payload-0"
+        streamed = await asyncio.wait_for(
+            asyncio.to_thread(lambda: list(reopened.stream_rows(refs))), 10
+        )
+        assert [entry.seq for entry in streamed] == [1, 2]
     finally:
         reopened.close()
 
@@ -294,7 +606,7 @@ def test_ordinary_append_reuses_entry_id_index(tmp_path: Path) -> None:
         )
 
         assert entries.iterations == 0
-        assert store._entry_ids == {entry.id for entry in list(entries)}
+        assert store._entry_ids == {ref.id for ref in store.resident_refs()}
 
 
 def test_entry_id_index_matches_entries_after_mixed_appends(tmp_path: Path) -> None:
@@ -2352,13 +2664,13 @@ async def test_async_append_does_not_mutate_resident_store_off_loop(
     original_append = store._resident_rows.append
     original_extend = store._resident_rows.extend
 
-    def observed_append(entry):
+    def observed_append(entry, **kwargs):
         mutation_threads.append(threading.get_ident())
-        return original_append(entry)
+        return original_append(entry, **kwargs)
 
-    def observed_extend(entries):
+    def observed_extend(entries, **kwargs):
         mutation_threads.append(threading.get_ident())
-        return original_extend(entries)
+        return original_extend(entries, **kwargs)
 
     store._resident_rows.append = observed_append
     store._resident_rows.extend = observed_extend

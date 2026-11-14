@@ -60,9 +60,9 @@ def overlay_resident_entries(
     store: ConversationStore, page: IndexedHistoryPage
 ) -> IndexedHistoryPage:
     def resident_entry(entry: ConversationEntry) -> ConversationEntry:
-        if entry.seq > len(store._resident_rows.entries):
+        if entry.seq > len(store._resident_rows.rows):
             return entry
-        resident = store._resident_rows.entries[entry.seq - 1]
+        resident = store.entry(store._resident_rows.rows[entry.seq - 1])
         if resident.id != entry.id:
             return entry
         accepted = entry.data.get("_accepted_message")
@@ -226,7 +226,7 @@ class RecentRowsMixin:
     def recent_row_floor(self: ConversationStore) -> int:
         """Return the lowest seq a lookup can see."""
         self._assert_owner_thread()
-        return max(1, len(self._resident_rows.entries) - RECENT_ROW_WINDOW + 1)
+        return max(1, len(self._resident_rows.rows) - RECENT_ROW_WINDOW + 1)
 
     def recent_row_seq(self: ConversationStore, key: RecentRowKey) -> int | None:
         """Return the seq of the row ``key`` names, or None when not visible.
@@ -236,7 +236,8 @@ class RecentRowsMixin:
         """
         floor = self.recent_row_floor()
         if type(key) is ApprovalRequest:
-            for entry in reversed(self._resident_rows.entries[floor - 1 :]):
+            for ref in reversed(self._resident_rows.rows[floor - 1 :]):
+                entry = self.entry(ref)
                 if entry.type != "message":
                     continue
                 if any(
@@ -245,17 +246,17 @@ class RecentRowsMixin:
                 ):
                     return entry.seq
             return None
-        entries = self._resident_rows.entries
+        refs = self._resident_rows.rows
         row_type, test = _predicate(key)
         if type(key) in (AssistantResponseAfter, UserTurnMessageAfter):
             if key.seq + 1 < floor:
                 return None
             # seq == index + 1, so index key.seq is the first row after key.seq.
-            indexes = range(max(key.seq, 0), len(entries))
+            indexes = range(max(key.seq, 0), len(refs))
         else:
-            indexes = range(len(entries) - 1, floor - 2, -1)
+            indexes = range(len(refs) - 1, floor - 2, -1)
         for index in indexes:
-            entry = entries[index]
+            entry = self.entry(refs[index])
             if entry.type == row_type and test(entry.data):
                 return entry.seq
         return None
@@ -263,9 +264,9 @@ class RecentRowsMixin:
     def row_id_at(self: ConversationStore, seq: int) -> str | None:
         """Return the stable entry id at ``seq`` while it is visible."""
         floor = self.recent_row_floor()
-        if not floor <= seq <= len(self._resident_rows.entries):
+        if not floor <= seq <= len(self._resident_rows.rows):
             return None
-        return self._resident_rows.entries[seq - 1].id
+        return self._resident_rows.rows[seq - 1].id
 
     def reset_generation(self: ConversationStore) -> int:
         """Count installs that replaced resident rows instead of extending them.

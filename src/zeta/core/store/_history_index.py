@@ -10,7 +10,7 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -88,7 +88,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 10
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -148,8 +148,9 @@ class HistoryIndex:
             if read_only:
                 connection.execute("PRAGMA busy_timeout=0")
             else:
-                connection.execute("PRAGMA journal_mode=DELETE")
-                connection.execute("PRAGMA synchronous=FULL")
+                # The transcript is authoritative and repairs interrupted cache writes.
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA foreign_keys=ON")
             return connection
         except BaseException:
@@ -175,8 +176,12 @@ class HistoryIndex:
                 value.get("lane", "main"), value["type"], HistoryIndex._value(value["data"]),
             )
         return (
-            entry.seq, entry.id, entry.parent_id, entry.lane, entry.type,
-            HistoryIndex._value(entry.data),
+            entry.seq,
+            entry.id,
+            entry.parent_id,
+            entry.lane,
+            entry.type,
+            HistoryIndex._value(getattr(entry, "data", None)),
         )
 
     @staticmethod
@@ -234,10 +239,115 @@ class HistoryIndex:
             "CREATE TABLE IF NOT EXISTS active_approval_resolutions ("
             "request_id TEXT PRIMARY KEY, decision TEXT NOT NULL, data BLOB NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS warm_rows ("
+            "seq INTEGER PRIMARY KEY, byte_offset INTEGER NOT NULL, "
+            "byte_length INTEGER NOT NULL, facts BLOB)"
+        )
 
     def _stored_facts(self, connection: sqlite3.Connection) -> dict[str, object] | None:
         row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
         return self._facts(json.loads(row[0])) if row is not None else None
+
+    def warm_snapshot(
+        self, stat: os.stat_result
+    ) -> tuple[list[tuple[object, ...]], list[dict[str, object]], dict[str, object]] | None:
+        """Return a compact unchanged message transcript, or require full validation."""
+        with self._lock:
+            try:
+                connection = self._connection(write=False)
+            except (HistoryIndexError, OSError, sqlite3.Error):
+                return None
+            try:
+                facts = self._stored_facts(connection)
+                expected = {
+                    "st_dev": stat.st_dev,
+                    "st_ino": stat.st_ino,
+                    "byte_boundary": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "schema_version": self.SCHEMA_VERSION,
+                }
+                if (
+                    facts is None
+                    or type(facts.get("cwd")) is not str
+                    or not facts["cwd"]
+                    or type(facts.get("prefix_fingerprint")) is not str
+                    or any(facts.get(key) != value for key, value in expected.items())
+                ):
+                    return None
+                if len(bytes.fromhex(facts["prefix_fingerprint"])) != 16:
+                    return None
+                try:
+                    expected_digest = bytes.fromhex(str(facts.get("prefix_digest")))
+                    if len(expected_digest) != 32:
+                        return None
+                except ValueError:
+                    return None
+                digest = b""
+                indexed_entries = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries ORDER BY seq"
+                )
+                for seq, entry_id, parent_id, lane, entry_type, data in indexed_entries:
+                    encoded_line = b"".join(
+                        (
+                            b'{"data":',
+                            data.encode(),
+                            b',"id":',
+                            encode_json(entry_id),
+                            b',"lane":',
+                            encode_json(lane),
+                            b',"parent_id":',
+                            encode_json(parent_id),
+                            b',"seq":',
+                            encode_json(seq),
+                            b',"type":',
+                            encode_json(entry_type),
+                            b"}\n",
+                        )
+                    )
+                    digest = hashlib.sha256(digest + encoded_line).digest()
+                if digest != expected_digest:
+                    return None
+                rows = connection.execute(
+                    "SELECT e.seq,e.id,e.parent_id,e.lane,e.type,w.byte_offset,"
+                    "w.byte_length,w.facts FROM entries e JOIN warm_rows w USING(seq) "
+                    "ORDER BY e.seq"
+                ).fetchall()
+                if len(rows) != facts.get("last_seq") or any(
+                    row[4] not in {"message", "compaction"} for row in rows
+                ):
+                    return None
+                unsupported_message = connection.execute(
+                    "SELECT 1 FROM entries WHERE type='message' AND ("
+                    "COALESCE(json_array_length(json_extract(data,'$.message.content')),0) != 1 "
+                    "OR json_extract(data,'$.message.content[0].type') != 'text' "
+                    "OR EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.message.metadata')) "
+                    "WHERE key != 'zeta.origin')) LIMIT 1"
+                ).fetchone()
+                if unsupported_message is not None:
+                    return None
+                payload_rows = connection.execute(
+                    "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                    "WHERE type='compaction' OR seq>? ORDER BY seq",
+                    (max(0, len(rows) - 1024),),
+                ).fetchall()
+                payloads = [
+                    {
+                        "seq": row[0],
+                        "id": row[1],
+                        "parent_id": row[2],
+                        "lane": row[3],
+                        "type": row[4],
+                        "data": json.loads(row[5]),
+                    }
+                    for row in payload_rows
+                ]
+                return rows, payloads, facts
+            except (HistoryIndexError, OSError, sqlite3.Error, ValueError, TypeError):
+                return None
+            finally:
+                connection.close()
 
     def _set_meta(
         self,
@@ -282,22 +392,47 @@ class HistoryIndex:
             current = by_id.get(row[2]) if row[2] else None
         return active
 
+    @staticmethod
+    def _warm_facts(value: object) -> object:
+        if value is None or isinstance(value, (str, int, float, bool, list, tuple, dict)):
+            return value
+        if is_dataclass(value):
+            return {"kind": type(value).__name__, "value": asdict(value)}
+        raise TypeError(f"unsupported warm row facts: {type(value).__name__}")
+
     def _rebuild(
-        self, source_facts: object, validated_rows: Iterable[object]
+        self,
+        source_facts: object,
+        row_refs: Sequence[object],
+        validated_rows: Iterable[object],
     ) -> None:
-        rows = tuple(validated_rows)
-        active_ids = self._active_ids(rows)
+        active_ids = self._active_ids(row_refs)
         connection: sqlite3.Connection | None = None
         try:
             self._remove_file()
             connection = self._connection(write=True)
             self._create_schema(connection)
+            for index in (
+                "entries_parent",
+                "entries_type",
+                "entries_history_group",
+                "entries_tui_group",
+            ):
+                connection.execute(f"DROP INDEX {index}")
             group = 0
             tui_group = 0
             with connection:
-                for entry in rows:
+                count = 0
+                entry_batch: list[tuple[object, ...]] = []
+                warm_batch: list[tuple[object, ...]] = []
+                for ref, entry in zip(row_refs, validated_rows, strict=True):
+                    count += 1
                     seq, entry_id, parent_id, lane, entry_type, encoded = self._row(entry)
-                    data = json.loads(encoded)
+                    data = (
+                        entry["data"]
+                        if isinstance(entry, Mapping)
+                        else json.loads(encoded)
+                    )
                     active = entry_id in active_ids
                     history_group = (
                         group if active and _row_history.belongs_in_history(entry_type, data) else None
@@ -307,15 +442,34 @@ class HistoryIndex:
                     tui_history_group = tui_group if active else None
                     if active:
                         tui_group += 1
-                    connection.execute(
-                        "INSERT INTO entries("
-                        "seq,id,parent_id,lane,type,data,history_group,tui_group) "
-                        "VALUES(?,?,?,?,?,?,?,?)",
+                    entry_batch.append(
                         (
                             seq, entry_id, parent_id, lane, entry_type, encoded,
                             history_group, tui_history_group,
-                        ),
+                        )
                     )
+                    warm_batch.append(
+                        (
+                            seq,
+                            int(getattr(ref, "offset", 0)),
+                            int(getattr(ref, "length", 0)),
+                            self._value(self._warm_facts(getattr(ref, "facts", None))),
+                        )
+                    )
+                    if len(entry_batch) == 2048:
+                        connection.executemany(
+                            "INSERT INTO entries("
+                            "seq,id,parent_id,lane,type,data,history_group,tui_group) "
+                            "VALUES(?,?,?,?,?,?,?,?)",
+                            entry_batch,
+                        )
+                        connection.executemany(
+                            "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) "
+                            "VALUES(?,?,?,?)",
+                            warm_batch,
+                        )
+                        entry_batch.clear()
+                        warm_batch.clear()
                     if active:
                         _row_history.write_text(
                             connection, seq, entry_id, entry_type, data
@@ -341,8 +495,40 @@ class HistoryIndex:
                             "INSERT OR REPLACE INTO accepted_messages(delivery_id,message) VALUES(?,?)",
                             (data["delivery_id"], self._value(data["accepted_message"])),
                         )
+                connection.executemany(
+                    "INSERT INTO entries("
+                    "seq,id,parent_id,lane,type,data,history_group,tui_group) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    entry_batch,
+                )
+                connection.executemany(
+                    "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) "
+                    "VALUES(?,?,?,?)",
+                    warm_batch,
+                )
+                connection.execute("CREATE INDEX entries_parent ON entries(parent_id)")
+                connection.execute("CREATE INDEX entries_type ON entries(type)")
+                connection.execute(
+                    "CREATE INDEX entries_history_group ON entries(history_group,seq)"
+                )
+                connection.execute(
+                    "CREATE INDEX entries_tui_group ON entries(tui_group,seq)"
+                )
                 self._set_meta(
                     connection, source_facts, total=group, tui_total=tui_group
+                )
+                connection.execute(
+                    "INSERT INTO meta(key,value) VALUES('startup_projection',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (
+                        self._value(
+                            {
+                                "active_head": self._row(row_refs[-1])[1] if row_refs else None,
+                                "row_count": count,
+                                "resident_tail_start": max(1, count - 1023) if count else 0,
+                            }
+                        ),
+                    ),
                 )
             self._available = True
         finally:
@@ -466,6 +652,25 @@ class HistoryIndex:
                     for entry, group, tui_group in projected
                 ),
             )
+            from ._rows import row_facts
+
+            lengths = [len(encode_json(entry.to_dict())) + 1 for entry in entries]
+            offset = int(self._facts(facts)["byte_boundary"]) - sum(lengths)
+            warm_rows = []
+            for entry, length in zip(entries, lengths, strict=True):
+                warm_rows.append(
+                    (
+                        entry.seq,
+                        offset,
+                        length,
+                        self._value(self._warm_facts(row_facts(entry))),
+                    )
+                )
+                offset += length
+            connection.executemany(
+                "INSERT INTO warm_rows(seq,byte_offset,byte_length,facts) VALUES(?,?,?,?)",
+                warm_rows,
+            )
             self._write_correlations(connection, entries)
             self._set_meta(
                 connection, facts, total=total, tui_total=tui_total
@@ -507,41 +712,64 @@ class HistoryIndex:
                 if connection is not None:
                     connection.close()
 
-    def sync_validated(self, source_facts: object, validated_rows: Iterable[object]) -> None:
-        """Make the disposable index match validated authority without failing it."""
+    def sync_validated(
+        self,
+        source_facts: object,
+        row_refs: Iterable[object],
+        validated_rows: Iterable[object] | Callable[[], Iterable[object]] | None = None,
+    ) -> None:
+        """Make the disposable index match validated authority without retaining it."""
         with self._lock:
             self._check_open()
             if self._observer:
                 self._available = self._exists()
                 return
-            rows = tuple(validated_rows)
+            refs = tuple(row_refs)
+            def rows() -> Iterable[object]:
+                if validated_rows is None:
+                    return refs
+                return validated_rows() if callable(validated_rows) else validated_rows
             expected = self._facts(source_facts)
             try:
                 connection = self._connection(write=True)
                 try:
                     self._create_schema(connection)
                     stored = self._stored_facts(connection)
-                    if stored is not None and all(
-                        stored.get(key) == value for key, value in expected.items()
-                    ) and stored.get("schema_version") == self.SCHEMA_VERSION:
-                        self._available = True
-                        return
-                    suffix_start = (
-                        self._suffix_start(stored, expected, rows)
-                        if stored is not None else None
-                    )
-                    if suffix_start is not None:
-                        self._append_entries(connection, source_facts, rows[suffix_start:])
+                    warm_count = connection.execute(
+                        "SELECT COUNT(*) FROM warm_rows"
+                    ).fetchone()[0]
+                    if (
+                        stored is not None
+                        and all(
+                            stored.get(key) == value for key, value in expected.items()
+                        )
+                        and stored.get("schema_version") == self.SCHEMA_VERSION
+                        and warm_count == len(refs)
+                    ):
                         self._available = True
                         return
                 finally:
                     connection.close()
-                self._rebuild(source_facts, rows)
-            except (HistoryIndexError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                self._rebuild(source_facts, refs, rows())
+            except (
+                HistoryIndexError,
+                OSError,
+                sqlite3.Error,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
                 self._available = False
                 try:
-                    self._rebuild(source_facts, rows)
-                except (HistoryIndexError, OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+                    self._rebuild(source_facts, refs, rows())
+                except (
+                    HistoryIndexError,
+                    OSError,
+                    sqlite3.Error,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
                     self._available = False
 
     def apply_committed(self, facts: object, rows: Iterable[object]) -> None:
@@ -932,10 +1160,10 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
         try:
             with observer._append_lock(observer=True):
                 facts = observer._history_index_facts()
+                rows = observer._resident_rows
                 if not store._history_index.catch_up_validated(
-                    facts, observer._resident_rows.entries
-                ):
-                    observer._sync_history_index(observer._resident_rows.entries)
+                    facts, rows.stream_rows(rows.rows)):
+                    observer._sync_history_index(rows.stream_rows(rows.rows))
                 return facts
         finally:
             observer.close()
@@ -943,8 +1171,10 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
-            if not store._history_index.catch_up_validated(facts, store._resident_rows.entries):
-                store._sync_history_index(store._resident_rows.entries)
+            rows = store._resident_rows
+            if not store._history_index.catch_up_validated(
+                facts, rows.stream_rows(rows.rows)):
+                store._sync_history_index(rows.stream_rows(rows.rows))
             return facts
     finally:
         writer.close()
@@ -1059,15 +1289,19 @@ class HistoryPageStoreMixin:
         stat = os.stat(
             "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
         )
-        last = self._resident_rows.entries[-1] if self._resident_rows.entries else None
+        last = self.entry(self._resident_rows.rows[-1]) if self._resident_rows.rows else None
         return {
+            "cwd": self.cwd,
             "st_dev": stat.st_dev,
             "st_ino": stat.st_ino,
             "byte_boundary": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
             "last_seq": last.seq if last else 0,
             "last_id": last.id if last else None,
             "last_parent": last.parent_id if last else None,
             "prefix_digest": self._entry_prefix_digest.hex(),
+            "prefix_fingerprint": self._log_prefix_fingerprint.hex(),
             "repair_generation": self._repair_generation,
         }
 
@@ -1079,15 +1313,18 @@ class HistoryPageStoreMixin:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            self._history_index.sync_validated(self._history_index_facts(), entries)
+            refs = self._resident_rows.resident_refs()
+            self._history_index.sync_validated(
+                self._history_index_facts(),
+                refs,
+                lambda: self._resident_rows.stream_validated_rows(refs),
+            )
         else:
             self._history_index._mark_unavailable()
 
     def _apply_history_index_entries(
-        self: ConversationStore,
-        entries: tuple[ConversationEntry, ...],
-        *,
-        leave_stale_on_loop: bool = False,
+        self: ConversationStore, entries: tuple[ConversationEntry, ...], *,
+        leave_stale_on_loop: bool = False, rebuild_unavailable: bool = True,
     ) -> None:
         if self._history_index is None or not entries:
             return
@@ -1099,7 +1336,7 @@ class HistoryPageStoreMixin:
             if not leave_stale_on_loop:
                 self._history_index._mark_unavailable()
             return
-        if not self._history_index.available:
+        if not self._history_index.available and rebuild_unavailable:
             self._sync_history_index(
                 self.entry(ref) for ref in self.branch_refs()
             )
