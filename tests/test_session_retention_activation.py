@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 import zeta.session_retention as retention_module
+import zeta.session_retention.activation as activation_module
 from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.storage_homes import initialize_storage_home
 from zeta.core import retention_access
@@ -133,11 +135,40 @@ async def test_owner_publish_failure_does_not_stop_owner(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_two_owners_append_without_lost_rows(tmp_path: Path) -> None:
+async def test_two_owners_append_without_lost_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     home = tmp_path / "home"
     initialize_storage_home(home)
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     lease = await asyncio.to_thread(open_writer, home)
+    barrier = threading.Barrier(2)
+    original_run_pass = RetentionPlanner.run_pass
+
+    def synchronized_run_pass(planner, *, days, commit_state=True):
+        barrier.wait(10)
+        if commit_state:
+            return original_run_pass(planner, days=days)
+        return original_run_pass(planner, days=days, commit_state=False)
+
+    monkeypatch.setattr(RetentionPlanner, "run_pass", synchronized_run_pass)
+    append_barrier = threading.Barrier(2)
+    append_timestamps: list[str] = []
+    append_lock = threading.Lock()
+    original_append = activation_module.append_retention_history
+
+    def synchronized_append(home, lease, result, **kwargs):
+        if kwargs.get("authority_held", False):
+            return original_append(home, lease, result, **kwargs)
+        with append_lock:
+            append_timestamps.append(str(result["timestamp"]))
+        append_barrier.wait(10)
+        if str(result["timestamp"]) == min(append_timestamps):
+            # test-contract: latency < force the older row to append last
+            time.sleep(0.05)
+        return original_append(home, lease, result, **kwargs)
+
+    monkeypatch.setattr(activation_module, "append_retention_history", synchronized_append)
     try:
         first = make_retention_owner(home, lease, lambda: 30)
         second = make_retention_owner(home, lease, lambda: 30)
@@ -171,10 +202,10 @@ async def test_owner_cancel_mid_episode_releases_lease(tmp_path: Path, monkeypat
     release = threading.Event()
     original = RetentionPlanner.run_pass
 
-    def blocked(planner, *, days):
+    def blocked(planner, *, days, commit_state=True):
         entered.set()
         assert release.wait(10)
-        return original(planner, days=days)
+        return original(planner, days=days, commit_state=commit_state)
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", blocked)
     owner = make_retention_owner(home, lease, lambda: 30)

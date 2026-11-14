@@ -9,8 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..locking import RETENTION_HOME_ID, domain_authority
 from ..storage_format import StorageFeature, feature_enabled
 from . import (
+    _COORDINATOR_DOMAIN,
     RetentionPlanner,
     append_retention_history,
     project_retention_result,
@@ -65,7 +67,7 @@ def make_retention_owner(
 
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
         before = _progress_marker(planner)
-        result = planner.run_pass(days=current_days)
+        result = planner.run_pass(days=current_days, commit_state=False)
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
@@ -78,9 +80,11 @@ def make_retention_owner(
         ):
             projection = dict(history[-1])
         nonlocal last_projection
-        if last_projection is None or not _same_projection(last_projection, projection):
-            append_retention_history(root, retained, projection)
-            last_projection = projection
+        with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
+            planner.commit_state()
+            if last_projection is None or not _same_projection(last_projection, projection):
+                append_retention_history(root, retained, projection, authority_held=True)
+                last_projection = projection
         return _PublishedPass(
             projection, complete=result.complete,
             progressed=before != _progress_marker(planner, projection),

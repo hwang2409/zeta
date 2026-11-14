@@ -595,7 +595,7 @@ class RetentionPlanner:
     def enabled(self) -> bool:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
 
-    def run_pass(self, *, days: int) -> PassResult:
+    def run_pass(self, *, days: int, commit_state: bool = True) -> PassResult:
         """Advance one bounded sweep step and return what it proved."""
         if type(days) is not int or days <= 0 or days > 3650:
             raise RetentionPlannerError("retention days must be in 1..3650")
@@ -606,13 +606,15 @@ class RetentionPlanner:
             return PassResult(enabled=True, complete=False)
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            return self._run_pass(home_fd, days)
+            return self._run_pass(home_fd, days, commit_state=commit_state)
         finally:
             os.close(home_fd)
             if planner_request_pending(self.home):
                 self.close()
 
-    def _run_pass(self, home_fd: int, days: int) -> PassResult:
+    def _run_pass(
+        self, home_fd: int, days: int, *, commit_state: bool = True
+    ) -> PassResult:
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
             self._latest = state["preview"] if state is not None else None
@@ -662,12 +664,20 @@ class RetentionPlanner:
         with domain_authority(
             self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
         ):
-            _store_state(home_fd, self._state_payload())
+            if commit_state:
+                _store_state(home_fd, self._state_payload())
         return PassResult(
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
         )
+
+    def commit_state(self) -> None:
+        home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _store_state(home_fd, self._state_payload())
+        finally:
+            os.close(home_fd)
 
     def _transaction_result(self, outcome: TransactionOutcome) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
