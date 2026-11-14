@@ -50,7 +50,7 @@ async def test_child_history_is_available_to_negotiated_observer(tmp_path: Path)
     server, _controller_reader, controller_writer, session_id = await _open(
         tmp_path, ["child_run_history"]
     )
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -114,7 +114,7 @@ async def test_history_validator_contract_is_shared_by_all_serve_history_methods
     server.runtime.opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("parent")])
     )
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -230,7 +230,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
     server, reader, writer, session_id = await _open(
         tmp_path, ["child_run_history", "session_history_fidelity"]
     )
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -246,7 +246,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         child.append_message(
             Message(MessageRole.ASSISTANT, [TextContent(f"message-{index}")])
         )
-    nested = ConversationStore(
+    nested = await asyncio.to_thread(ConversationStore, 
         child.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -331,7 +331,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
 @pytest.mark.asyncio
 async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Path) -> None:
     server, _reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -390,7 +390,7 @@ async def test_child_history_reports_cached_stable_torn_tail_with_repair_offer(
     tmp_path: Path,
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -436,7 +436,7 @@ async def test_child_history_preserves_corrupt_child_diagnosis_over_unix_socket(
     tmp_path: Path,
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -476,7 +476,7 @@ async def test_child_history_discards_obsolete_corruption_diagnosis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -530,7 +530,7 @@ async def test_child_history_bounds_persistent_source_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -578,7 +578,7 @@ async def test_child_history_warm_reader_serves_snapshot_when_every_refresh_chan
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -624,7 +624,7 @@ async def test_child_history_rejects_replacement_during_continuation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -681,7 +681,7 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -771,7 +771,7 @@ async def test_child_history_unix_ignores_production_partial_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
-    child = ConversationStore(
+    child = await asyncio.to_thread(ConversationStore, 
         server.runtime.opened.store.session_dir / "agents",
         session_id="1",
         _storage_lease=server.runtime.opened.store._storage_lease,
@@ -1042,7 +1042,7 @@ async def test_closed_child_history_ends_every_child_started(
         assert _count_event(pending, "child_ended", pend_gc_id) == 0, pending
         req_id += 1
 
-        finished = ConversationStore(
+        finished = await asyncio.to_thread(ConversationStore, 
             resumed.runtime.opened.store.session_dir / "agents" / "2" / "agents",
             session_id="1",
             _storage_lease=lease,
