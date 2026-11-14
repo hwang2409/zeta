@@ -320,6 +320,13 @@ class AgentTodoControl:
         self._task = loop.create_task(run_pending())
         return False
 
+    async def settle(self) -> None:
+        """Wait until the current published snapshot is ready."""
+
+        task = self._task
+        if task is not None:
+            await asyncio.shield(task)
+
     def clear(self, invalidate: Callable[[], None] | None = None) -> None:
         self._snapshot = None
         self._snapshot_path = None

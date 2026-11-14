@@ -669,6 +669,9 @@ class TUIApp(
             )
         else:
             self._render_resident_history()
+            if self._loop_state == "approval":
+                self._approval_units.clear()
+                self._present_pending_approvals()
 
     def _request_history_edge(self, direction: str) -> None:
         transcript = self._viewed_transcript()

@@ -370,25 +370,55 @@ class PagedTranscriptHistory:
             self.adopt(page)
             return bool(page.units)
         if latest.endpoint_id == self.endpoint_id:
-            return False
-        if not follow_tail:
-            self._newest_tail = latest.older
-            return False
+            if latest.units == current.units:
+                return False
+            anchor = self._anchor
+            self.reset()
+            self._anchor = anchor
+            latest_ids = {unit.entry_id for unit in latest.units}
+            page = (
+                await source.reveal(anchor[0])
+                if anchor is not None and anchor[0] in latest_ids
+                else latest
+            )
+            self.adopt(page)
+            return bool(page.units)
         old_endpoint = self.endpoint_id
         bridge = await source.reveal(old_endpoint) if old_endpoint is not None else latest
         if generation != self.generation or source is not self.source:
             return False
         if not bridge.units or bridge.repair_generation != latest.repair_generation:
             anchor = self._anchor
+            resident_start = next(
+                (
+                    descriptor.page.units[0].entry_id
+                    for descriptor in self._segments
+                    if descriptor.page.units
+                ),
+                None,
+            )
             self.reset()
             self._anchor = anchor
+            latest_ids = {unit.entry_id for unit in latest.units}
             page = (
-                await source.reveal(anchor[0])
-                if anchor is not None
+                latest
+                if anchor is not None and anchor[0] in latest_ids
+                else await source.reveal(resident_start)
+                if resident_start is not None
                 else latest
             )
+            if not page.units and anchor is not None:
+                page = await source.reveal(anchor[0])
             self.adopt(page)
             return bool(page.units)
+        if not follow_tail:
+            for unit in latest.units:
+                self.append_live(
+                    unit.entry_id, unit.value, unit_ordinal=unit.unit_ordinal
+                )
+            self._newest_tail = latest.older
+            self.endpoint_id = latest.endpoint_id
+            return bool(latest.units)
         cursor = bridge.newer
         changed = False
         while cursor is not None:

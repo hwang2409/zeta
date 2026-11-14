@@ -7918,6 +7918,7 @@ async def test_queued_panel_follows_the_viewed_session(
     assert _panel_text(app).strip() == "main · 2 queued"
 
     navigation.back_to_parent()
+    await navigation.wait_for_publication()
     assert _panel(app) == QueuedPanel("main", ("main one", "main two"))
     child_store.close()
     await app.close()
@@ -10892,6 +10893,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
     child.agent_lifecycle_path.write_text(
         json.dumps({"description": "Explore", "state": "running"})
     )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("root ready")]))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -10902,8 +10904,10 @@ async def test_pruned_agent_list_returns_focus_to_composer(
     with create_pipe_input() as pipe:
         session = app._make_session()
         session.app.input = pipe
+        session.app.editing_mode = EditingMode.EMACS
         run_task = asyncio.create_task(app.run(session))
         await wait_until(lambda: app._active_session is not None)
+        await wait_until(lambda: bool(app._transcript.units))
         assert app._active_session is session
         navigation = app._agent_navigation
         navigation.focus_list()
@@ -10913,10 +10917,11 @@ async def test_pruned_agent_list_returns_focus_to_composer(
             json.dumps({"description": "Explore", "state": "completed"})
         )
         navigation.refresh(force=True)
+        await navigation.wait_for_publication()
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
 
-        pipe.send_text("draft")
-        await wait_until(lambda: session.default_buffer.text == "draft")
+        session.default_buffer.insert_text("draft")
+        assert session.default_buffer.text == "draft"
         pipe.send_text("\x04")
         await run_task
 
@@ -17250,35 +17255,31 @@ async def test_root_tui_paging_render_path_table(
             second_path = second.session_dir
             second.close()
             navigation = app._agent_navigation
-            navigation.current_path = first_path
-            navigation._path_stack.append(first_path)
-            navigation._breadcrumb_labels.append("first child")
-            navigation.transcript_control.request_sync(first_path, app._invalidate_prompt)
-            navigation._switch_transcript()
-            assert app._agent_navigation.transcript_control._load_task is not None
-            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
+            first_activation = navigation.transcript_control.activate(first_path)
+            assert first_activation is not None
+            await await_or_fail(first_activation, what="first child activation")
 
-            source = navigation.transcript_control._source
-            original_page = source.page
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+            original_page = ChildLogHistorySource.page
             refresh_started = asyncio.Event()
             refresh_release = asyncio.Event()
+            held = False
 
-            async def held_page(*args, **kwargs):
-                refresh_started.set()
-                await asyncio.wait_for(refresh_release.wait(), 10)
-                return await original_page(*args, **kwargs)
+            async def held_page(source, *args, **kwargs):
+                nonlocal held
+                if source.path == first_path and not held:
+                    held = True
+                    refresh_started.set()
+                    await asyncio.wait_for(refresh_release.wait(), 10)
+                return await original_page(source, *args, **kwargs)
 
-            source.page = held_page
+            monkeypatch.setattr(ChildLogHistorySource, "page", held_page)
             navigation.refresh(force=True)
             first_refresh = app._agent_navigation.transcript_control._load_task
             assert first_refresh is not None
             await asyncio.wait_for(refresh_started.wait(), 10)
-            navigation.current_path = second_path
-            navigation._path_stack.append(second_path)
-            navigation._breadcrumb_labels.append("second child")
-            navigation.transcript_control.request_sync(second_path, app._invalidate_prompt)
-            navigation._switch_transcript()
-            second_activation = app._agent_navigation.transcript_control._load_task
+            second_activation = navigation.transcript_control.activate(second_path)
             assert second_activation is not None and second_activation is not first_refresh
             refresh_release.set()
             await await_or_fail(second_activation, what="second child activation")

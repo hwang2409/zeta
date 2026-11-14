@@ -13,6 +13,7 @@ from itertools import product
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
@@ -434,7 +435,8 @@ def test_selected_child_todo_render_performs_no_file_io(
     root.close()
 
 
-def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
+@pytest.mark.asyncio
+async def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
     tmp_path: Path,
 ) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
@@ -443,6 +445,7 @@ def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
     navigation = AgentNavigation(root)
     navigation.selected_index = 1
     navigation.open_selected()
+    await navigation.wait_for_publication()
     widget = TodoWidget(root, selected_snapshot=navigation.todo_snapshot)
     assert "old child" in _todo_text(widget)
 
@@ -456,6 +459,7 @@ def test_child_todo_refresh_detects_same_size_same_mtime_atomic_replacement(
     assert state_path.stat().st_mtime_ns == original_stat.st_mtime_ns
 
     navigation.refresh(force=True)
+    await navigation.wait_for_publication()
 
     assert "new child" in _todo_text(widget)
     assert "old child" not in _todo_text(widget)
@@ -963,7 +967,7 @@ def test_agent_list_selection_highlight_follows_focus(tmp_path: Path) -> None:
             return self.focused is control
 
     layout = Layout()
-    navigation.bind_layout(layout, object())
+    navigation.bind_layout(layout, Buffer())
     navigation.selected_index = 2
 
     navigation.focus_list()
@@ -1494,7 +1498,8 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
     await app.close()
 
 
-def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path / "sessions", session_id="root")
     _child(store, 1, description="Leaf")
     navigation = AgentNavigation(store)
@@ -1509,10 +1514,15 @@ def test_child_view_keeps_main_route_visible(tmp_path: Path) -> None:
         def has_focus(self, control: object) -> bool:
             return self.focused is control
 
+        @property
+        def current_window(self) -> object | None:
+            return self.focused
+
     layout = Layout()
-    navigation.bind_layout(layout, object())
+    navigation.bind_layout(layout, Buffer())
     navigation.selected_index = 1
     navigation.open_selected()
+    await navigation.wait_for_publication()
 
     assert navigation.list_visible
     assert [entry.label for entry in navigation.entries] == ["main"]

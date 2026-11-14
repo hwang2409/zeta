@@ -60,14 +60,7 @@ async def _enter_child(app: TUIApp, pipe) -> None:
         what="child 651 in the real agent picker",
     )
     await _wait_until(
-        lambda: (
-            (navigation.transcript_control._load_task is None
-             or navigation.transcript_control._load_task.done())
-            and (
-                navigation.transcript_control.search_task is None
-                or navigation.transcript_control.search_task.done()
-            )
-        ),
+        lambda: not navigation.transcript_control.transition_pending(),
         what="root history transition idle",
     )
     if not navigation.list_focused():
@@ -84,19 +77,13 @@ async def _enter_child(app: TUIApp, pipe) -> None:
             )
         await _send(pipe, "\x1b[B")
         await _wait_until(navigation.list_focused, what="agent picker focus")
-    navigation.selected_index = next(
-        index
-        for index, entry in enumerate(navigation.entries)
-        if entry.path.name == CHILD_ID
-    )
-    app._active_session.app.invalidate()
-    await _wait_until(
-        lambda: (
-            navigation.list_focused()
-            and navigation.entries[navigation.selected_index].path.name == CHILD_ID
-        ),
-        what="selected child picker row",
-    )
+    while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
+        before = navigation.selected_index
+        await _send(pipe, "\x1b[B")
+        await _wait_until(
+            lambda before=before: navigation.selected_index != before,
+            what="next visible child picker row",
+        )
     await _send(pipe, "\r")
     await _wait_until(
         lambda: navigation.child_view_active
@@ -111,13 +98,12 @@ async def _return_to_root(app: TUIApp, pipe) -> None:
     if not navigation.child_view_focused() and not navigation.list_focused():
         await _wait_until(
             lambda: bool(navigation.transcript_control.transcript.units),
-            what="visible child transcript before picker key",
+            what="visible child transcript before transcript click",
         )
-        if navigation.transcript_control._prompt_history.navigating:
-            navigation.focus_list()
-        else:
-            await _send(pipe, "\x1b[B")
-        await _wait_until(navigation.list_focused, what="child agent list focus")
+        await _send(pipe, "\x1b[<0;10;10M\x1b[<0;10;10m")
+        await _wait_until(
+            navigation.child_view_focused, what="visible child transcript focus"
+        )
     await _wait_until(
         lambda: navigation.child_view_focused() or navigation.list_focused(),
         what="visible child navigation focus",
@@ -336,11 +322,15 @@ async def test_real_tui_child_view_journey(
                 )
                 await _enter_child(app, pipe)
                 await _wait_until(
-                    lambda: (
-                        app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
-                        == child_anchor
-                    ),
-                    what="restored child durable anchor",
+                    lambda: not app._agent_navigation.transcript_control.transition_pending(),
+                    what="published child re-entry",
+                )
+                restored_anchor = (
+                    app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
+                )
+                assert restored_anchor == child_anchor, (
+                    "child-return: durable anchor changed; "
+                    f"expected={child_anchor!r} actual={restored_anchor!r}"
                 )
                 assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
                     "child-return: selected prompt was not restored"
