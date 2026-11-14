@@ -11,7 +11,7 @@ from zeta.session_retention import (
     RetentionPlanner,
     retention_authority,
 )
-from zeta.session_retention.activation import RetentionActivationOwner
+from zeta.session_retention.activation import make_retention_owner
 from zeta.storage_format import open_writer
 
 
@@ -41,24 +41,7 @@ async def test_owner_lifecycle_table(
                 return retention_authority(home, lease, days=30).applied
             assert await asyncio.to_thread(seed_arm)
 
-        owner = RetentionActivationOwner(
-            lambda: RetentionPlanner(
-                home,
-                lease,
-                bounds=RetentionBounds(
-                    metadata_candidates=2,
-                    roots_advanced=1,
-                    entries_per_root=8,
-                    entries_total=16,
-                ),
-            ),
-            lambda: days,
-            wake_seconds=60,
-            publish=None,
-            home=home,
-            activation_enabled=True,
-            disable=lambda: retention_authority(home, lease, days=0).projection,
-        )
+        owner = make_retention_owner(home, lease, lambda: days)
         projections, failure = await asyncio.to_thread(owner._run_episode)
         assert failure is None, failure
         published.extend(projections)
@@ -66,6 +49,6 @@ async def test_owner_lifecycle_table(
 
         assert published
         result = published[-1]
-        assert (result.mode if hasattr(result, "mode") else result["mode"]) == (None if expected == "preview" else expected)
+        assert (result.mode if hasattr(result, "mode") else result["mode"]) == expected
     finally:
         await asyncio.to_thread(lease.close)
