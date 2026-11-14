@@ -279,6 +279,11 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                 return ApprovalDecision.DENY
             if state[1] == "abort":
                 self._pending_bindings.pop(tool_call.id, None)
+                # An aborted delegated approval means this turn is being torn
+                # down (subtree cleanup or turn cancel). Abort the turn signal
+                # so the loop stops instead of dispatching another turn while
+                # the durable cancellation confirmation is still in flight.
+                abort_signal.abort()
                 return None
         else:
             decision, binding = self._decide_with_binding(
@@ -341,6 +346,9 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                 )
             self._pending_bindings.pop(tool_call.id, None)
             if state[1] == "abort":
+                # See authorize(): stop this turn once the delegated approval is
+                # aborted, before a settled approval can resume a new turn.
+                abort_signal.abort()
                 return True, None
             return True, ApprovalDecision.DENY
 

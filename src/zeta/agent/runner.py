@@ -1062,6 +1062,7 @@ async def run_agent_tool(
                 terminal_fence, child_store, tool_call.id
             )
             if confirmed:
+                child_loop.admit_abort()
                 child_loop.tool_registry.abort()
             return confirmed
         except BaseException:
@@ -1086,10 +1087,6 @@ async def run_agent_tool(
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""
-        # Admit the abort before any await. A descendant whose pending approval
-        # is settled by the concurrent cleanup would otherwise dispatch one more
-        # provider turn while the durable confirmation task is still in flight.
-        child_loop.admit_abort()
         confirmation = loop._background_owner.create_cancellation_task(
             confirm_child_cancel()
         )
