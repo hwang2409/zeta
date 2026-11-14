@@ -643,19 +643,20 @@ class CheckpointTranscriptMixin:
             self._history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
-        anchor = self._transcript.durable_scroll_anchor
-        scroll_generation = self._transcript.scroll_generation
+        transcript = self._viewed_transcript()
+        anchor = transcript.durable_scroll_anchor
+        scroll_generation = transcript.scroll_generation
         page = await self._history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
         restore_anchor = (
             anchor
-            if scroll_generation == self._transcript.scroll_generation
-            else self._transcript.durable_scroll_anchor
+            if scroll_generation == transcript.scroll_generation
+            else transcript.durable_scroll_anchor
         )
-        self._render_resident_history()
+        self._render_active_resident_history()
         if restore_anchor is not None:
-            self._transcript.restore_durable_scroll_anchor(restore_anchor)
+            transcript.restore_durable_scroll_anchor(restore_anchor)
         if self._history_marker_tasks:
             await asyncio.gather(*tuple(self._history_marker_tasks))
         self._invalidate_prompt()

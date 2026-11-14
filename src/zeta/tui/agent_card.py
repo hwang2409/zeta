@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from collections import deque
@@ -34,7 +35,6 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
-from .cards.agent_lifetime import AgentTranscriptLifetime
 from .cards.agent_list import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
@@ -43,7 +43,6 @@ from .cards.agent_list import (
 from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
-    AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
     agent_tree_signature,
@@ -526,13 +525,13 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
     return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
 
 
-class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
-    """Scrollable child transcript synchronized through a read-only store."""
+class AgentTranscriptControl(UIControl):
+    """Render the shared pager for the focused child view."""
 
-    _RENDER_BATCH_SIZE = 4
-
-    def __init__(self) -> None:
+    def __init__(self, history_pager: Any = None) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
+
+        self._history_pager = history_pager
 
         self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
@@ -543,13 +542,12 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._initialize_transcript_lifetime()
-        self._snapshot: AgentTranscriptSnapshot | None = None
-        self._entry_units: dict[str, list[Any]] = {}
-        self._unit_entries: dict[Any, str] = {}
-        self._sync_task: asyncio.Task[bool] | None = None
+        self._source: Any = None
+        self._load_task: asyncio.Task[bool] | None = None
+        self._closed = False
         self._pending_path: Path | None = None
-        self.on_snapshot: Callable[[Path, AgentTranscriptSnapshot], None] | None = None
+        self.on_load: Callable[[Path], None] | None = None
+        self.on_history_edge: Callable[[str], None] | None = None
 
     @property
     def offset(self) -> int:
@@ -559,178 +557,94 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
     def is_focusable(self) -> bool:
         return True
 
-    async def load(self, path: Path) -> bool:
-        """Load a selected child without doing storage work on the event loop."""
+    def set_source(self, path: Path, source: Any) -> None:
+        if path != self._path:
+            self.presenter.clear()
+            self._tool_calls.clear()
+        self._path = path
+        self._pending_path = None
+        self._source = source
 
+    async def load(self, path: Path) -> bool:
         if self._closed:
             return False
-        if path != self._path:
-            self._reset_rendered(path)
-        if self._source is None or self._source.path != path:
-            try:
-                await self._replace_tracked(path)
-            except (ConversationIntegrityError, OSError, ValueError):
-                return False
-        return await self.sync(path)
+        from .transcript.child_history_source import ChildLogHistorySource
+        from .transcript.paged_history import PagedTranscriptHistory
+
+        source = await asyncio.to_thread(ChildLogHistorySource, path)
+        previous = self._source
+        if previous is not None:
+            await previous.close()
+        if self._history_pager is None:
+            self._history_pager = PagedTranscriptHistory(source)
+        else:
+            self._history_pager.source = source
+        self.set_source(path, source)
+        self._history_pager.reset()
+        page = await self._history_pager.load()
+        self.render_pages(self._history_pager.pages)
+        return bool(page.units)
 
     async def sync(self, path: Path) -> bool:
-        """Apply one active-branch snapshot, yielding between render batches."""
-
-        if self._closed:
-            return False
-        if path != self._path or self._source is None:
+        if self._source is None or self._path != path:
             return await self.load(path)
-        try:
-            tree = await asyncio.to_thread(self._source.refresh)
-        except (ConversationIntegrityError, OSError, ValueError):
-            return False
-        if self._closed:
-            return False
-        snapshot = tree.transcript(path)
-        return False if snapshot is None else await self._apply_snapshot(snapshot, path)
-
-    async def _apply_snapshot(self, snapshot: AgentTranscriptSnapshot, path: Path) -> bool:
-        previous = self._snapshot
-        if snapshot == previous:
-            return False
-        extends = (
-            previous is not None
-            and snapshot.entry_ids[: len(previous.entry_ids)] == previous.entry_ids
-            and snapshot.messages[: len(previous.messages)] == previous.messages
-        )
-        if extends:
-            await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
-        else:
-            await self._rebuild(snapshot, path)
-        if self._closed:
-            return False
-        self._snapshot = snapshot
-        if self.on_snapshot is not None:
-            self.on_snapshot(path, snapshot)
-        return True
+        self._history_pager.reset()
+        page = await self._history_pager.load()
+        self.render_pages(self._history_pager.pages)
+        return bool(page.units)
 
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
-        """Coalesce a UI refresh onto one asynchronous synchronization task."""
-
         if self._closed:
             return False
+        if path == self._pending_path:
+            return False
         self._pending_path = path
+        if self.on_load is not None:
+            self.on_load(path)
+            return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._pending_path = None
-            return asyncio.run(self.load(path))
-        if self._sync_task is not None and not self._sync_task.done():
-            return False
-
-        async def run_pending() -> bool:
-            changed = False
-            while self._pending_path is not None:
-                requested = self._pending_path
-                self._pending_path = None
-                changed = await self.load(requested) or changed
+            changed = asyncio.run(self.load(path))
             if changed and invalidate is not None:
                 invalidate()
             return changed
-
-        self._sync_task = loop.create_task(run_pending())
+        task = loop.create_task(self.sync(path))
+        self._load_task = task
+        if invalidate is not None:
+            task.add_done_callback(lambda _task: invalidate())
         return False
 
-    def _reset_rendered(self, path: Path) -> None:
+    def render_pages(self, pages: tuple[Any, ...]) -> None:
+        anchor = self.transcript.durable_scroll_anchor
+        follow_tail = self.transcript.follow_tail
         self.presenter.clear()
         self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        self._path = path
-        self._snapshot = None
-
-    async def _rebuild(self, snapshot: AgentTranscriptSnapshot, path: Path) -> None:
-        anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
-        old_entry_ids = (
-            self._snapshot.entry_ids if self._snapshot is not None else ()
-        )
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        await self._replay_batches(snapshot.messages, path)
-        if self._closed:
-            return
-        if not follow_tail:
-            target = self._nearest_entry(
-                anchor_id, old_entry_ids, snapshot.entry_ids
-            )
-            units = self._entry_units.get(target or "", ())
-            if units:
-                unit_index = min(anchor_unit_index, len(units) - 1)
-                self.transcript.restore_scroll_anchor(units[unit_index], anchor_offset)
-
-    async def _replay_batches(
-        self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
-    ) -> None:
-        provider = session_replay_provider(path)
-        for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
-            if self._closed:
-                return
-            for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
-                self._replay(entry_id, raw_message, provider)
-            await asyncio.sleep(0.001)
-
-    def _replay(
-        self, entry_id: str, raw_message: dict[str, Any], provider: str | None
-    ) -> None:
-        try:
-            message = Message.from_dict(_bounded_message(raw_message))
-        except (TypeError, ValueError):
-            return
-        unit_start = len(self.transcript._units)
-        render_replayed_message(
-            message,
-            presenter=self.presenter,
-            print_user=self._print_user,
-            print_unit=self.presenter.print_unit,
-            tool_calls=self._tool_calls,
-            include_thoughts=True,
-            replay_tool_results=True,
-            replay_tool_starts=True,
-            provider=provider,
-        )
-        units = self.transcript._units[unit_start:]
-        self._entry_units.setdefault(entry_id, []).extend(units)
-        self._unit_entries.update((unit, entry_id) for unit in units)
-
-    def _capture_anchor(self) -> tuple[str | None, int, int, bool]:
-        unit, offset = self.transcript.scroll_anchor
-        entry_id = self._unit_entries.get(unit)
-        units = self._entry_units.get(entry_id or "", ())
-        unit_index = units.index(unit) if unit in units else 0
-        return entry_id, unit_index, offset, self.transcript.follow_tail
-
-    @staticmethod
-    def _nearest_entry(
-        anchor_id: str | None,
-        old_version: tuple[str, ...],
-        new_version: tuple[str, ...],
-    ) -> str | None:
-        if anchor_id is None:
-            return None
-        if anchor_id in new_version:
-            return anchor_id
-        try:
-            anchor_index = old_version.index(anchor_id)
-        except ValueError:
-            return None
-        new_ids = set(new_version)
-        candidates = (
-            (abs(index - anchor_index), entry_id)
-            for index, entry_id in enumerate(old_version)
-            if entry_id in new_ids
-        )
-        return min(candidates, default=(0, None))[1]
+        provider = session_replay_provider(self._path) if self._path is not None else None
+        for page in pages:
+            for unit in page.units:
+                entry = unit.value
+                if getattr(entry, "type", None) != "message" or entry.message is None:
+                    continue
+                self.transcript.begin_history_entry(unit.entry_id)
+                try:
+                    render_replayed_message(
+                        entry.message,
+                        presenter=self.presenter,
+                        print_user=self._print_user,
+                        print_unit=self.presenter.print_unit,
+                        tool_calls=self._tool_calls,
+                        include_thoughts=True,
+                        replay_tool_results=True,
+                        replay_tool_starts=True,
+                        provider=provider,
+                    )
+                finally:
+                    self.transcript.end_history_entry()
+        if not follow_tail and anchor is not None:
+            self.transcript.restore_durable_scroll_anchor(anchor)
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -738,25 +652,43 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
 
     def pending_prompts(self, path: Path) -> tuple[str, ...]:
-        """Unconsumed follow-ups in the last applied snapshot of ``path``."""
-
-        if path != self._path or self._snapshot is None:
+        if path != self._path or self._source is None:
             return ()
-        return self._snapshot.pending_prompts
+        return self._source.pending_prompts
+
+    async def close(self, deadline: float | None = None) -> None:
+        del deadline
+        self._closed = True
+        task, self._load_task = self._load_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        source, self._source = self._source, None
+        if source is not None:
+            if inspect.iscoroutinefunction(source.close):
+                await source.close()
+            else:
+                await asyncio.to_thread(source.close)
 
     def scroll(self, amount: int) -> None:
         self.transcript.scroll_lines(amount)
+        if amount < 0 and self.transcript.scroll_offset == 0 and self.on_history_edge:
+            self.on_history_edge("older")
+        elif amount > 0 and self.transcript.follow_tail and self.on_history_edge:
+            self.on_history_edge("newer")
 
     def half_page(self, amount: int) -> None:
-        self.transcript.scroll_lines(
-            amount * max(1, self.transcript._viewport_height // 2)
-        )
+        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
 
     def top(self) -> None:
         self.transcript.scroll_to_top()
+        if self.on_history_edge:
+            self.on_history_edge("older")
 
     def bottom(self) -> None:
         self.transcript.scroll_to_bottom()
+        if self.on_history_edge:
+            self.on_history_edge("newer")
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
@@ -774,7 +706,7 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
-    def __init__(self, store: ConversationStore) -> None:
+    def __init__(self, store: ConversationStore, history_pager: Any = None) -> None:
         self.store = store
         self.root_path = store.session_dir
         self.current_path = self.root_path
@@ -786,7 +718,7 @@ class AgentNavigation:
         self._fork_main_path: Path | None = None
         self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
-        self.transcript_control = AgentTranscriptControl()
+        self.transcript_control = AgentTranscriptControl(history_pager)
         self.list_window = Window(
             content=self.list_control,
             height=Dimension(min=1, max=MAX_AGENT_LIST_ROWS),

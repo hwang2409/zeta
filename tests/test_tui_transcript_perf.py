@@ -355,7 +355,7 @@ def test_bounded_agent_source_reads_only_active_branch_tail(tmp_path: Path) -> N
         "first",
         "new branch",
     ]
-    assert source._stores == {}
+    assert not hasattr(source, "_stores")
     source.close()
     with pytest.raises(RuntimeError, match="closed"):
         source.refresh()

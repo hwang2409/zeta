@@ -109,46 +109,6 @@ def agent_tree_signature(
     return path, selected_index, registration, lifecycles
 
 
-def _message_display_text(message: dict[str, Any]) -> str:
-    metadata = message.get("metadata")
-    if isinstance(metadata, dict) and isinstance(metadata.get("zeta.user_display_text"), str):
-        return metadata["zeta.user_display_text"]
-    content = message.get("content")
-    if not isinstance(content, list):
-        return ""
-    return next(
-        (block.get("text", "") for block in content
-         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)),
-        "",
-    )
-
-
-def _project_typed_prompts(
-    messages: Sequence[dict[str, Any]], pending_entries: Sequence[ConversationEntry]
-) -> tuple[str, ...]:
-    represented_prompt_ids = {
-        prompt_id
-        for message in messages
-        if message.get("role") == "user"
-        and isinstance(metadata := message.get("metadata"), dict)
-        and isinstance(prompt_id := metadata.get("zeta.pending_prompt_id"), str)
-    }
-    consumed = tuple(
-        text
-        for message in messages
-        if message.get("role") == "user"
-        and isinstance(metadata := message.get("metadata"), dict)
-        and metadata.get("zeta.origin") == "user"
-        and (text := _message_display_text(message))
-    )
-    pending = tuple(
-        str(entry.data.get("text", ""))
-        for entry in pending_entries
-        if entry.data.get("origin") == "user" and entry.id not in represented_prompt_ids
-    )
-    return consumed + pending
-
-
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
     lifecycle_path = path / "agent_lifecycle.json"
     try:
@@ -359,7 +319,7 @@ class AgentTodoControl:
 
 
 @dataclass(frozen=True, slots=True)
-class AgentTranscriptSnapshot:
+class AgentTailSnapshot:
     """One immutable active-branch projection from a child transcript."""
 
     entry_ids: tuple[str, ...]
@@ -367,7 +327,6 @@ class AgentTranscriptSnapshot:
     unavailable_reason: str | None = None
     # Follow-ups sent to this child that its loop has not consumed yet.
     pending_prompts: tuple[str, ...] = ()
-    typed_prompts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,10 +334,10 @@ class AgentTranscriptTreeSnapshot:
     """A child transcript and every nested child referenced by its branch."""
 
     root: Path
-    transcripts: tuple[tuple[Path, AgentTranscriptSnapshot], ...]
+    transcripts: tuple[tuple[Path, AgentTailSnapshot], ...]
     lifecycles: tuple[dict[str, object], ...] = ()
 
-    def transcript(self, path: Path) -> AgentTranscriptSnapshot | None:
+    def transcript(self, path: Path) -> AgentTailSnapshot | None:
         return next(
             (snapshot for candidate, snapshot in self.transcripts if candidate == path),
             None,
@@ -396,18 +355,16 @@ class _BoundedTailUnavailable(Exception):
 class AgentTranscriptSource:
     """Own child transcript storage and publish detached immutable snapshots.
 
-    A source without a message limit owns incremental read-only stores for the
-    selected full child view. A limited source reverse-scans only the active
-    branch tail and never retains a store or file descriptor between refreshes.
+    The source reverse-scans only the active branch tail and never retains a
+    store or file descriptor between refreshes.
     Sources have an explicit lifetime: callers must close them and cannot
     refresh them after close.
     """
 
-    def __init__(self, path: Path, *, message_limit: int | None = None) -> None:
+    def __init__(self, path: Path, *, message_limit: int = 64) -> None:
         self.path = path
         self._message_limit = message_limit
-        self._stores: dict[Path, ConversationStore] = {}
-        self._snapshots: dict[Path, AgentTranscriptSnapshot] = {}
+        self._snapshots: dict[Path, AgentTailSnapshot] = {}
         self._closed = False
         self._refresh_error_logged = False
 
@@ -436,14 +393,11 @@ class AgentTranscriptSource:
             if self._closed:
                 return
             self._closed = True
-            for store in self._stores.values():
-                store.close()
-            self._stores.clear()
             self._snapshots.clear()
 
     def _refresh_locked(self, *, recursive: bool) -> AgentTranscriptTreeSnapshot:
         pending = [self.path]
-        projected: list[tuple[Path, AgentTranscriptSnapshot]] = []
+        projected: list[tuple[Path, AgentTailSnapshot]] = []
         seen: set[Path] = set()
         while pending:
             path = pending.pop(0)
@@ -470,53 +424,27 @@ class AgentTranscriptSource:
         )
         return AgentTranscriptTreeSnapshot(self.path, tuple(projected), lifecycles)
 
-    def _refresh_path(self, path: Path) -> AgentTranscriptSnapshot:
-        if self._message_limit is not None:
-            try:
-                entries = _read_active_message_tail(path, self._message_limit)
-            except _BoundedTailUnavailable:
-                snapshot = AgentTranscriptSnapshot((), (), _BOUNDED_UNAVAILABLE)
-                self._snapshots[path] = snapshot
-                return snapshot
-        else:
-            store = self._stores.get(path)
-            if store is None:
-                store = ConversationStore(
-                    path.parent,
-                    session_id=path.name,
-                    _read_only=True,
-                    _observer_snapshot=True,
-                    _must_exist=True,
-                )
-                self._stores[path] = store
-            else:
-                store.refresh()
-            entries = tuple(store.entry(ref) for ref in store.branch_refs())
-            lifecycle = _read_agent_lifecycle(path)
-            if lifecycle is not None and lifecycle.get("finished_at") is not None:
-                store.close()
-                self._stores.pop(path, None)
+    def _refresh_path(self, path: Path) -> AgentTailSnapshot:
+        try:
+            entries = _read_active_message_tail(path, self._message_limit)
+        except _BoundedTailUnavailable:
+            snapshot = AgentTailSnapshot((), (), _BOUNDED_UNAVAILABLE)
+            self._snapshots[path] = snapshot
+            return snapshot
         snapshot = self._project(path, entries)
         self._snapshots[path] = snapshot
         return snapshot
 
     def _project(
         self, path: Path, entries: Sequence[ConversationEntry]
-    ) -> AgentTranscriptSnapshot:
+    ) -> AgentTailSnapshot:
         message_entries = [entry for entry in entries if entry.type == "message"]
-        if self._message_limit is not None:
-            message_entries = message_entries[-self._message_limit :]
-            entry_ids = tuple(entry.id for entry in message_entries)
-        else:
-            entry_ids = tuple(entry.id for entry in entries)
+        message_entries = message_entries[-self._message_limit :]
+        entry_ids = tuple(entry.id for entry in message_entries)
         previous = self._snapshots.get(path)
         previous_by_id = dict(previous.messages) if previous is not None else {}
         messages: list[tuple[str, dict[str, Any]]] = []
-        for index, entry in enumerate(message_entries):
-            if index and index % 64 == 0:
-                # Full-view parsing is incremental. Cooperate while its first
-                # snapshot detaches a large resident branch.
-                time.sleep(0.001)
+        for entry in message_entries:
             message = entry.data.get("message")
             if not isinstance(message, dict):
                 continue
@@ -539,14 +467,10 @@ class AgentTranscriptSource:
         pending_prompts = tuple(
             str(entry.data.get("text", "")) for entry in pending_entries
         )
-        typed_prompts = _project_typed_prompts(
-            [message for _entry_id, message in messages], pending_entries
-        )
-        return AgentTranscriptSnapshot(
+        return AgentTailSnapshot(
             entry_ids,
             tuple(messages),
             pending_prompts=pending_prompts,
-            typed_prompts=typed_prompts,
         )
 
     def _tree_snapshot(self) -> AgentTranscriptTreeSnapshot:
@@ -574,7 +498,7 @@ class AgentTranscriptSource:
 
     def _failed_path_snapshot(
         self, path: Path, error: Exception
-    ) -> AgentTranscriptSnapshot:
+    ) -> AgentTailSnapshot:
         if not isinstance(error, TranscriptLoadError):
             try:
                 ConversationStore(
@@ -599,7 +523,7 @@ class AgentTranscriptSource:
             if isinstance(error, TranscriptLoadError)
             else _REFRESH_UNAVAILABLE
         )
-        snapshot = AgentTranscriptSnapshot((), (), reason)
+        snapshot = AgentTailSnapshot((), (), reason)
         self._snapshots[path] = snapshot
         return snapshot
 
@@ -720,7 +644,7 @@ def refresh_agent_transcripts(
     return snapshots
 
 
-def _nested_child_paths(snapshot: AgentTranscriptSnapshot) -> list[Path]:
+def _nested_child_paths(snapshot: AgentTailSnapshot) -> list[Path]:
     paths: list[Path] = []
     for _entry_id, message in snapshot.messages:
         result = message.get("tool_result")

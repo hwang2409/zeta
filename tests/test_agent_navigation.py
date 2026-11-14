@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import gc
 import json
 import logging
 import os
@@ -2476,50 +2475,6 @@ async def test_subagent_sync_rebuilds_active_branch_and_preserves_anchor(
     assert after == before
     assert "new branch" in rendered
     assert "line 59" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_large_subagent_append_keeps_event_loop_responsive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = _child(store, 1, description="Large")
-    _append_child_line(child, "initial")
-    control = agent_card.AgentTranscriptControl()
-    await control.load(child)
-    control.create_content(80, 12)
-    payload = "x" * 2_000
-    _append_child_lines(child, (f"line {index} {payload}" for index in range(5_000)))
-
-    # The sync path must yield within the bounded render work budget.
-    gc.collect()
-    replayed = 0
-    batch_sizes: list[int] = []
-    original_replay = control._replay
-
-    def record_replay(*args: object, **kwargs: object) -> None:
-        nonlocal replayed
-        replayed += 1
-        original_replay(*args, **kwargs)
-
-    monkeypatch.setattr(control, "_replay", record_replay)
-    original_sleep = agent_card.asyncio.sleep
-
-    async def record_yield(_delay: float) -> None:
-        nonlocal replayed
-        batch_sizes.append(replayed)
-        replayed = 0
-        await original_sleep(0)
-
-    monkeypatch.setattr(agent_card.asyncio, "sleep", record_yield)
-    assert await control.sync(child)
-
-    control.create_content(80, 12)
-    assert control._snapshot is not None
-    assert len(control._snapshot.messages) == 5_001
-    assert control.transcript._lazy_viewport
-    assert batch_sizes
-    assert max(batch_sizes) <= AgentTranscriptControl._RENDER_BATCH_SIZE
 
 
 def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) -> None:
