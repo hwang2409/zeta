@@ -20,6 +20,7 @@ class PrepareAssembly(Protocol):
         self,
         branch: Sequence[ConversationEntry],
         *,
+        active_source_seqs: set[int],
         force: bool,
         assembly_budget: int,
         system_append: str,
@@ -107,13 +108,22 @@ class ContextPreparation:
         try:
             while True:
                 assembly_budget = self.budget(reserved_estimator_tokens)
-                branch = tuple(self._store.entry(ref) for ref in self._store.branch_refs())
-                branch_id = branch[-1].id if branch else None
+                refs = (
+                    self._store.branch_refs()
+                    if force
+                    else self._store.context_refs()
+                )
+                branch = await asyncio.to_thread(
+                    lambda refs=refs: tuple(self._store.stream_rows(refs))
+                )
+                active_source_seqs = self._store.context_source_seqs()
+                branch_id = self._store.active_branch_head_id()
                 prompt_generation, system_prompt = self._prompt_state()
                 preparation = await asyncio.to_thread(
                     cooperative_call,
                     self._prepare,
                     branch,
+                    active_source_seqs=active_source_seqs,
                     force=force,
                     assembly_budget=assembly_budget,
                     system_append=system_append,

@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
+from ...agent.receipt import encode_json
 from ...protocol.types import Message, is_passive_harness_message
-from ..checkpoints import ConversationEntry, ConversationIntegrityError
+from ..checkpoints import (
+    ConversationEntry,
+    ConversationIntegrityError,
+    load_session_json,
+)
+from ._client_delivery import (
+    CLIENT_DELIVERY_METADATA,
+    CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA,
+    without_client_delivery_marker,
+)
 
 _SENT_STATUS_EVENT = "project_inbox_sent_status"
 _MESSAGE_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -25,9 +40,53 @@ class MessageFacts:
     calibration: ContextCalibrationRecord | None
     receipts: tuple[tuple[str, str], ...]
     approval_request_ids: tuple[str, ...]
+    context_exception: bool
     is_user: bool
     is_user_forkpoint: bool
     message_preview: str | None
+    projection_digest: str
+    identity_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptRows:
+    path: Path
+    refs: tuple[RowRef, ...]
+    source_identity: tuple[int, int]
+    relative_offsets: bool
+
+    def read(self) -> tuple[ConversationEntry, ...]:
+        fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            stat = os.fstat(fd)
+            if (stat.st_dev, stat.st_ino) != self.source_identity:
+                from ._history_index import StaleHistorySnapshot
+
+                raise StaleHistorySnapshot("conversation row source changed")
+            header_size = 0
+            if self.relative_offsets:
+                header = os.pread(fd, 4096, 0)
+                header_size = header.find(b"\n") + 1
+                if header_size <= 0:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation header is incomplete")
+            entries = []
+            for ref in self.refs:
+                raw = os.pread(fd, ref.length, ref.offset + header_size)
+                if len(raw) != ref.length:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation row offset is stale")
+                entry = ConversationEntry.from_dict(load_session_json(raw))
+                if entry.seq != ref.seq or entry.id != ref.id:
+                    from ._history_index import StaleHistorySnapshot
+
+                    raise StaleHistorySnapshot("conversation row identity is stale")
+                entries.append(entry)
+            return tuple(entries)
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +96,8 @@ class RowRef:
     parent_id: str | None
     lane: str
     type: str
+    offset: int = 0
+    length: int = 0
     facts: object | None = None
 
 
@@ -105,21 +166,50 @@ class StartupFactsMixin:
         return tuple(records)
 
 
+def _message_identity_digest(message: Mapping[str, object]) -> str:
+    return hashlib.sha256(encode_json(message)).hexdigest()
+
+
+def _message_projection_digest(message: Mapping[str, object]) -> str:
+    metadata = message.get("metadata", {})
+    projection: Mapping[str, object] = message
+    if isinstance(metadata, Mapping) and CLIENT_DELIVERY_METADATA in metadata:
+        projection = dict(message)
+        projection_metadata = dict(metadata)
+        del projection_metadata[CLIENT_DELIVERY_METADATA]
+        projection_metadata.pop(CLIENT_DELIVERY_PAYLOAD_DIGEST_METADATA, None)
+        if projection_metadata:
+            projection["metadata"] = projection_metadata
+        else:
+            projection.pop("metadata", None)
+    return hashlib.sha256(encode_json(projection)).hexdigest()
+
+
 def _message_facts(entry: ConversationEntry) -> MessageFacts:
     message = entry.data["message"]
+    projection_digest = _message_projection_digest(message)
     is_user = message["role"] == "user"
     text = " ".join(
         block["text"].strip()
         for block in message["content"]
         if block["type"] == "text" and block["text"].strip()
     )
+    metadata = message.get("metadata", {})
+    context_exception = isinstance(metadata, Mapping) and bool(
+        metadata.get("turn_failed")
+        or metadata.get("zeta.pending_prompt_id")
+        or metadata.get("zeta.step_delivery")
+    )
     return MessageFacts(
         context_calibration_record(entry),
         sent_message_receipts(entry),
         tuple(request["request_id"] for request in entry.data.get("approval_requests", ())),
+        context_exception,
         is_user,
         is_user and not is_passive_harness_message(message),
-        " ".join(text.split())[:48] if text else None,
+        " ".join(text.split())[:80] if text else None,
+        projection_digest,
+        _message_identity_digest(message),
     )
 
 
@@ -128,122 +218,586 @@ def row_facts(entry: ConversationEntry) -> object | None:
         return _message_facts(entry)
     if entry.type == "compaction":
         data = entry.data
-        return tuple(data.get(key) for key in ("source_seq_start", "source_seq_end", "replaces", "kind"))
+        replaces = data.get("replaces")
+        return (
+            data.get("source_seq_start"),
+            data.get("source_seq_end"),
+            tuple(replaces) if isinstance(replaces, list) else replaces,
+            data.get("kind"),
+        )
+    if entry.type == "checkpoint":
+        return (
+            entry.data.get("label"),
+            entry.data.get("created_at"),
+            entry.data.get("todo_dismissed", False),
+        )
     if entry.type == "notification":
         data = entry.data
         return tuple(data.get(key) for key in ("kind", "task_id", "child_instance_id", "display_only"))
     return None
 
 
+def decode_row_facts(raw: str | bytes) -> object:
+    stored = load_session_json(raw.encode() if isinstance(raw, str) else raw)
+    if isinstance(stored, list):
+        return tuple(
+            tuple(value) if isinstance(value, list) else value for value in stored
+        )
+    if not isinstance(stored, dict):
+        raise ConversationIntegrityError("warm row facts are malformed")
+    kind = stored.get("kind")
+    value = stored.get("value")
+    if kind == "NoneType":
+        return None
+    if kind == "tuple" and isinstance(value, list):
+        return tuple(value)
+    if kind == "MessageFacts" and isinstance(value, dict):
+        calibration = value.get("calibration")
+        projection_digest = value.get("projection_digest")
+        identity_digest = value.get("identity_digest")
+        if not isinstance(projection_digest, str):
+            raise ConversationIntegrityError("warm message facts lack projection digest")
+        if not isinstance(identity_digest, str):
+            raise ConversationIntegrityError("warm message facts lack identity digest")
+        return MessageFacts(
+            calibration=(
+                ContextCalibrationRecord(**calibration)
+                if isinstance(calibration, dict)
+                else None
+            ),
+            receipts=tuple(tuple(item) for item in value.get("receipts", ())),
+            approval_request_ids=tuple(value.get("approval_request_ids", ())),
+            context_exception=bool(value.get("context_exception")),
+            is_user=bool(value.get("is_user")),
+            is_user_forkpoint=bool(value.get("is_user_forkpoint")),
+            message_preview=value.get("message_preview"),
+            projection_digest=projection_digest,
+            identity_digest=identity_digest,
+        )
+    raise ConversationIntegrityError(f"unsupported warm row facts: {kind}")
+
+
 class ResidentRows:
-    """One owner for the row skeleton and its currently resident payloads."""
+    """One owner for the row skeleton and its bounded resident payload set."""
+
+    _BULK_TYPES = frozenset({"message", "compaction", "notification"})
+    _RECENT_WINDOW = 64
 
     def __init__(self, entries: Iterable[ConversationEntry] = ()) -> None:
-        self.entries: list[ConversationEntry] = []
         self.rows: list[RowRef] = []
-        self._by_id: dict[str, ConversationEntry] = {}
         self._rows_by_id: dict[str, RowRef] = {}
-        self.branch: list[ConversationEntry] = []
-        self.replace(entries)
+        self._branch_refs: list[RowRef] = []
+        self._context_refs: list[RowRef] = []
+        self._context_required: set[int] = set()
+        self._context_source_seqs: set[int] = set()
+        self._legacy_pinned_source_seqs: dict[str, int] = {}
+        self.payloads: dict[int, ConversationEntry] = {}
+        self._payload_sizes: dict[int, int] = {}
+        self._pinned: set[int] = set()
+        self._payload_lru: OrderedDict[int, int] = OrderedDict()
+        self._payload_lru_bytes = 0
+        self.payload_cache_bytes = int(
+            os.environ.get("ZETA_STORE_PAYLOAD_CACHE_BYTES", "0")
+        )
+        self.resident_payload_bytes = 0
+        self._source_dir_fd: int | None = None
+        self._source_identity: tuple[int, int] | None = None
+        self._source_generation = 0
+        self._generation_reader: Callable[[], int] | None = None
+        self._relative_offsets = False
+        self.extend(entries)
+        self._rebuild_branch()
+        self._rebalance_resident()
 
-    def append(self, entry: ConversationEntry) -> None:
-        previous = self.entries[-1] if self.entries else None
-        self.entries.append(entry)
-        self._by_id[entry.id] = entry
-        row = RowRef(entry.seq, entry.id, entry.parent_id, entry.lane, entry.type, row_facts(entry))
-        self.rows.append(row)
-        self._rows_by_id[entry.id] = row
-        if (previous is None and entry.parent_id is None) or (
-            previous is not None and entry.parent_id == previous.id
-        ):
-            self.branch.append(entry)
-        else:
-            self._rebuild_branch()
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ResidentRows):
+            return False
+        semantic = lambda ref: (
+            ref.seq,
+            ref.id,
+            ref.parent_id,
+            ref.lane,
+            ref.type,
+            ref.length,
+            ref.facts,
+        )
+        return (
+            tuple(map(semantic, self.rows)),
+            tuple(map(semantic, self._branch_refs)),
+        ) == (
+            tuple(map(semantic, other.rows)),
+            tuple(map(semantic, other._branch_refs)),
+        )
 
-    def extend(self, entries: Iterable[ConversationEntry]) -> None:
-        additions = list(entries)
-        if not additions:
-            return
-        previous = self.entries[-1] if self.entries else None
-        self.entries.extend(additions)
-        self._by_id.update((entry.id, entry) for entry in additions)
-        new_rows = [
-            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
-            for e in additions
-        ]
-        self.rows.extend(new_rows)
-        self._rows_by_id.update((row.id, row) for row in new_rows)
-        parent = previous.id if previous is not None else None
-        linear = True
-        for entry in additions:
-            if entry.parent_id != parent:
-                linear = False
-                break
-            parent = entry.id
+    def bind_source(
+        self,
+        directory_fd: int,
+        identity: tuple[int, int, int] | None = None,
+        generation: int = 0,
+        generation_reader: Callable[[], int] | None = None,
+    ) -> None:
+        self._source_dir_fd = directory_fd
+        self._source_identity = None if identity is None else identity[:2]
+        self._source_generation = generation
+        self._generation_reader = generation_reader
+        self._rebalance_resident()
+
+    def append(
+        self,
+        entry: ConversationEntry,
+        *,
+        offset: int = 0,
+        length: int = 0,
+    ) -> None:
+        previous, row = self._append_row(entry, offset=offset, length=length)
+        linear = (previous is None and row.parent_id is None) or (
+            previous is not None and row.parent_id == previous.id
+        )
         if linear:
-            self.branch.extend(additions)
+            self._branch_refs.append(row)
         else:
             self._rebuild_branch()
+        if row.type in {"message", "compaction"}:
+            self._context_source_seqs.add(row.seq)
+        if row.type == "compaction" or not linear:
+            self._rebalance_resident()
+        else:
+            self._context_refs.append(row)
+            self._pinned.add(row.seq)
+            self._remove_lru(row.seq)
+            self._trim_payload_cache()
+
+    def append_loaded(
+        self, entry: ConversationEntry, *, offset: int, length: int
+    ) -> None:
+        self._append_row(entry, offset=offset, length=length)
+        self._trim_payload_cache()
+
+    def _append_row(
+        self, entry: ConversationEntry, *, offset: int, length: int
+    ) -> tuple[RowRef | None, RowRef]:
+        previous = self.rows[-1] if self.rows else None
+        size = length or len(encode_json(entry.to_dict())) + 1
+        if not self.rows and offset == 0:
+            self._relative_offsets = True
+        elif self._relative_offsets and previous is not None:
+            offset = previous.offset + previous.length
+        row = RowRef(
+            entry.seq,
+            entry.id,
+            entry.parent_id,
+            entry.lane,
+            entry.type,
+            offset,
+            size,
+            row_facts(entry),
+        )
+        self.rows.append(row)
+        self._rows_by_id[row.id] = row
+        self._store_payload(row, entry)
+        return previous, row
+
+    def extend(
+        self,
+        entries: Iterable[ConversationEntry],
+        *,
+        start_offset: int | None = None,
+    ) -> None:
+        offset = start_offset
+        for entry in entries:
+            length = len(encode_json(entry.to_dict())) + 1
+            self.append(
+                entry,
+                offset=0 if offset is None else offset,
+                length=length,
+            )
+            if offset is not None:
+                offset += length
 
     def truncate_to(self, length: int) -> None:
-        del self.entries[length:]
+        removed = self.rows[length:]
         del self.rows[length:]
-        self._by_id = {entry.id: entry for entry in self.entries}
+        for row in removed:
+            self._drop_payload(row.seq)
         self._rows_by_id = {row.id: row for row in self.rows}
         self._rebuild_branch()
+        self._rebalance_resident()
 
     @classmethod
     def prepared(cls, entries: Iterable[ConversationEntry]) -> ResidentRows:
-        rows = cls.__new__(cls)
-        rows.entries = entries if isinstance(entries, list) else list(entries)
-        rows.rows = [
-            RowRef(e.seq, e.id, e.parent_id, e.lane, e.type, row_facts(e))
-            for e in rows.entries
-        ]
-        rows._by_id = {entry.id: entry for entry in rows.entries}
+        return cls(entries)
+
+    @classmethod
+    def warm(
+        cls,
+        raw_rows: Sequence[tuple[object, ...]],
+        payload_entries: Iterable[ConversationEntry],
+    ) -> ResidentRows:
+        rows = cls()
+        for raw in raw_rows:
+            seq, entry_id, parent_id, lane, entry_type, offset, length, facts = raw
+            rows.rows.append(
+                RowRef(
+                    seq=int(seq),
+                    id=str(entry_id),
+                    parent_id=None if parent_id is None else str(parent_id),
+                    lane=str(lane),
+                    type=str(entry_type),
+                    offset=int(offset),
+                    length=int(length),
+                    facts=decode_row_facts(facts),
+                )
+            )
         rows._rows_by_id = {row.id: row for row in rows.rows}
         rows._rebuild_branch()
+        for entry in payload_entries:
+            ref = rows._rows_by_id[entry.id]
+            rows._store_payload(ref, entry)
+        rows._rebalance_resident()
+        return rows
+
+    def clone(self) -> ResidentRows:
+        rows = type(self).__new__(type(self))
+        rows.rows = list(self.rows)
+        rows._rows_by_id = dict(self._rows_by_id)
+        rows._branch_refs = list(self._branch_refs)
+        rows._context_refs = list(self._context_refs)
+        rows._context_source_seqs = set(self._context_source_seqs)
+        rows._legacy_pinned_source_seqs = dict(self._legacy_pinned_source_seqs)
+        rows.payloads = dict(self.payloads)
+        rows._payload_sizes = dict(self._payload_sizes)
+        rows._pinned = set(self._pinned)
+        rows._payload_lru = OrderedDict(self._payload_lru)
+        rows._payload_lru_bytes = self._payload_lru_bytes
+        rows.payload_cache_bytes = self.payload_cache_bytes
+        rows.resident_payload_bytes = self.resident_payload_bytes
+        rows._source_dir_fd = self._source_dir_fd
+        rows._source_identity = self._source_identity
+        rows._source_generation = self._source_generation
+        rows._generation_reader = self._generation_reader
+        rows._relative_offsets = self._relative_offsets
         return rows
 
     def replace(self, entries: Iterable[ConversationEntry]) -> None:
         prepared = type(self).prepared(entries)
-        self.entries = prepared.entries
-        self.rows = prepared.rows
-        self._by_id = prepared._by_id
-        self._rows_by_id = prepared._rows_by_id
-        self.branch = prepared.branch
+        prepared.bind_source(
+            self._source_dir_fd,
+            None if self._source_identity is None else (*self._source_identity, 0),
+            self._source_generation,
+            self._generation_reader,
+        ) if self._source_dir_fd is not None else None
+        self.__dict__.update(prepared.__dict__)
 
     def _rebuild_branch(self) -> None:
-        current = self.entries[-1] if self.entries else None
-        branch: list[ConversationEntry] = []
+        current = self.rows[-1] if self.rows else None
+        branch: list[RowRef] = []
         seen: set[str] = set()
         while current is not None:
             if current.id in seen:
-                raise ConversationIntegrityError(f"conversation parent cycle at {current.id}")
+                raise ConversationIntegrityError(
+                    f"conversation parent cycle at {current.id}"
+                )
             seen.add(current.id)
             branch.append(current)
-            current = self._by_id.get(current.parent_id) if current.parent_id else None
-        self.branch = list(reversed(branch))
+            current = self._rows_by_id.get(current.parent_id) if current.parent_id else None
+        self._branch_refs = list(reversed(branch))
+        self._context_source_seqs = {
+            ref.seq
+            for ref in self._branch_refs
+            if ref.type in {"message", "compaction"}
+        }
 
     def branch_refs(self) -> tuple[RowRef, ...]:
-        return tuple(self._rows_by_id[entry.id] for entry in self.branch)
+        return tuple(self._branch_refs)
 
     def resident_refs(self) -> tuple[RowRef, ...]:
         return tuple(self.rows)
 
     def last_message_ref(self) -> RowRef | None:
         return next(
-            (ref for ref in reversed(self.branch_refs()) if ref.type == "message"),
+            (ref for ref in reversed(self._branch_refs) if ref.type == "message"),
             None,
         )
 
-    def entry(self, ref: RowRef) -> ConversationEntry:
-        entry = self._by_id.get(ref.id)
-        if entry is None or entry.seq != ref.seq:
-            raise KeyError(ref.seq)
+    def row_by_id(self, entry_id: str) -> RowRef | None:
+        return self._rows_by_id.get(entry_id)
+
+    @property
+    def relative_offsets(self) -> bool:
+        return self._relative_offsets
+
+    def context_refs(self) -> tuple[RowRef, ...]:
+        return tuple(self._context_refs)
+
+    def context_source_seqs(self) -> set[int]:
+        return self._context_source_seqs
+
+    def legacy_pinned_source_seq(self, marker_id: str) -> int | None:
+        return self._legacy_pinned_source_seqs.get(marker_id)
+
+    @staticmethod
+    def _compaction_values(ref: RowRef) -> tuple[object, object, object, object]:
+        return ref.facts if isinstance(ref.facts, tuple) and len(ref.facts) == 4 else (None,) * 4
+
+    def _resolve_legacy_pinned_sources(self, live_markers: Sequence[RowRef]) -> None:
+        live_marker_ids = {ref.id for ref in live_markers}
+        self._legacy_pinned_source_seqs = {
+            marker_id: seq
+            for marker_id, seq in self._legacy_pinned_source_seqs.items()
+            if marker_id in live_marker_ids
+        }
+        for marker in live_markers:
+            if marker.id in self._legacy_pinned_source_seqs:
+                continue
+            payload = self.payloads.get(marker.seq)
+            start, end, _, _ = self._compaction_values(marker)
+            pinned = None if payload is None else payload.data.get("pinned_message")
+            if (
+                type(start) is not int
+                or type(end) is not int
+                or not isinstance(pinned, dict)
+                or type(pinned.get("source_seq")) is int
+            ):
+                continue
+            try:
+                projection = without_client_delivery_marker(Message.from_dict(pinned))
+            except (KeyError, TypeError, ValueError):
+                continue
+            digest = _message_projection_digest(projection.to_dict())
+            match = next(
+                (
+                    ref.seq
+                    for ref in reversed(self._branch_refs)
+                    if start <= ref.seq <= end
+                    and isinstance(ref.facts, MessageFacts)
+                    and ref.facts.projection_digest == digest
+                ),
+                None,
+            )
+            if match is not None:
+                self._legacy_pinned_source_seqs[marker.id] = match
+
+    def _required_payloads(self) -> set[int]:
+        required: set[int] = set()
+        context_required = {
+            ref.seq for ref in self.rows if ref.type not in self._BULK_TYPES
+        }
+        context_required.update(
+            ref.seq
+            for ref in self.rows
+            if isinstance(ref.facts, MessageFacts)
+            and (ref.facts.approval_request_ids or ref.facts.context_exception)
+        )
+
+        markers = [ref for ref in self._branch_refs if ref.type == "compaction"]
+        replaced = {
+            marker_id
+            for ref in markers
+            for marker_id in (
+                self._compaction_values(ref)[2]
+                if isinstance(self._compaction_values(ref)[2], tuple)
+                else ()
+            )
+        }
+        live_markers = [ref for ref in markers if ref.id not in replaced]
+        self._resolve_legacy_pinned_sources(live_markers)
+        required.update(ref.seq for ref in live_markers)
+        coverage_end = max(
+            (
+                value
+                for ref in live_markers
+                for value in [self._compaction_values(ref)[1]]
+                if type(value) is int
+            ),
+            default=0,
+        )
+        context_required.update(ref.seq for ref in self._branch_refs if ref.seq > coverage_end)
+        recent = self.rows[-self._RECENT_WINDOW :]
+        required.update(
+            ref.seq
+            for ref in recent
+            if ref.type != "compaction" or ref in live_markers
+        )
+        self._context_required = context_required | required
+        return required
+
+    def _rebalance_resident(self) -> None:
+        required = self._required_payloads()
+        self._context_refs = [
+            ref for ref in self._branch_refs if ref.seq in self._context_required
+        ]
+        self._pinned = required
+        for seq in tuple(self._payload_lru):
+            if seq in required:
+                self._remove_lru(seq)
+        for seq in tuple(self.payloads):
+            if seq not in required and seq not in self._payload_lru:
+                size = self._payload_sizes[seq]
+                self._payload_lru[seq] = size
+                self._payload_lru_bytes += size
+        self._trim_payload_cache()
+
+    def _remove_lru(self, seq: int) -> None:
+        size = self._payload_lru.pop(seq, None)
+        if size is not None:
+            self._payload_lru_bytes -= size
+
+    def _store_payload(self, ref: RowRef, entry: ConversationEntry) -> None:
+        old_size = self._payload_sizes.get(ref.seq, 0)
+        self.payloads[ref.seq] = entry
+        self._payload_sizes[ref.seq] = ref.length
+        self.resident_payload_bytes += ref.length - old_size
+        self._remove_lru(ref.seq)
+        if ref.seq not in self._pinned:
+            self._payload_lru[ref.seq] = ref.length
+            self._payload_lru_bytes += ref.length
+
+    def _drop_payload(self, seq: int) -> None:
+        if self.payloads.pop(seq, None) is not None:
+            self.resident_payload_bytes -= self._payload_sizes.get(seq, 0)
+        self._payload_sizes.pop(seq, None)
+        self._remove_lru(seq)
+        self._pinned.discard(seq)
+
+    def _trim_payload_cache(self) -> None:
+        limit = max(0, self.payload_cache_bytes)
+        while self._payload_lru_bytes > limit and self._payload_lru:
+            seq, size = self._payload_lru.popitem(last=False)
+            self._payload_lru_bytes -= size
+            if seq not in self._pinned:
+                self._drop_payload(seq)
+
+    def _open_source(self) -> int:
+        if self._source_dir_fd is None:
+            raise KeyError("row source is not bound")
+        fd = os.open("conversation.jsonl", os.O_RDONLY, dir_fd=self._source_dir_fd)
+        info = os.fstat(fd)
+        if self._source_identity is not None and (info.st_dev, info.st_ino) != self._source_identity:
+            os.close(fd)
+            from ._history_index import StaleHistorySnapshot
+            raise StaleHistorySnapshot("conversation row source changed")
+        if (
+            self._generation_reader is not None
+            and self._generation_reader() != self._source_generation
+        ):
+            os.close(fd)
+            from ._history_index import StaleHistorySnapshot
+            raise StaleHistorySnapshot("conversation row generation changed")
+        return fd
+
+    def _raw(self, fd: int, ref: RowRef) -> bytes:
+        offset = ref.offset
+        if self._relative_offsets:
+            header = os.pread(fd, 4096, 0)
+            header_end = header.find(b"\n") + 1
+            if header_end <= 0:
+                from ._history_index import StaleHistorySnapshot
+                raise StaleHistorySnapshot("conversation header is incomplete")
+            offset += header_end
+        raw = os.pread(fd, ref.length, offset)
+        if len(raw) != ref.length:
+            from ._history_index import StaleHistorySnapshot
+            raise StaleHistorySnapshot("conversation row offset is stale")
+        return raw
+
+    def _decode(self, fd: int, ref: RowRef) -> ConversationEntry:
+        value = load_session_json(self._raw(fd, ref))
+        entry = ConversationEntry.from_dict(value)
+        if entry.seq != ref.seq or entry.id != ref.id:
+            from ._history_index import StaleHistorySnapshot
+            raise StaleHistorySnapshot("conversation row identity is stale")
         return entry
 
-    def stream_rows(self, refs: Iterable[RowRef], *, batch: int = 256) -> Iterator[ConversationEntry]:
-        del batch
+    def entry(self, ref: RowRef) -> ConversationEntry:
+        entry = self.payloads.get(ref.seq)
+        if entry is None:
+            fd = self._open_source()
+            try:
+                entry = self._decode(fd, ref)
+            finally:
+                os.close(fd)
+            self._store_payload(ref, entry)
+            self._trim_payload_cache()
+        elif ref.seq in self._payload_lru:
+            self._payload_lru.move_to_end(ref.seq)
+        return entry
+
+    def stream_rows(
+        self, refs: Iterable[RowRef], *, batch: int = 256
+    ) -> Iterator[ConversationEntry]:
+        if batch <= 0:
+            raise ValueError("batch must be positive")
+        generation = self._source_generation
+        fd: int | None = None
+        try:
+            for ref in refs:
+                entry = self.payloads.get(ref.seq)
+                if entry is None:
+                    fd = self._open_source() if fd is None else fd
+                    entry = self._decode(fd, ref)
+                yield entry
+            if (
+                self._generation_reader is not None
+                and self._generation_reader() != generation
+            ):
+                from ._history_index import StaleHistorySnapshot
+                raise StaleHistorySnapshot("conversation row generation changed")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def stream_validated_rows(
+        self, refs: Iterable[RowRef]
+    ) -> Iterator[object]:
+        """Read rows whose payloads were already validated against these refs."""
+        generation = self._source_generation
+        fd: int | None = None
+        try:
+            for ref in refs:
+                entry = self.payloads.get(ref.seq)
+                if entry is None:
+                    fd = self._open_source() if fd is None else fd
+                    entry = json.loads(self._raw(fd, ref))
+                    if (
+                        entry.get("seq") != ref.seq
+                        or entry.get("id") != ref.id
+                        or entry.get("parent_id") != ref.parent_id
+                        or entry.get("lane", "main") != ref.lane
+                        or entry.get("type") != ref.type
+                    ):
+                        from ._history_index import StaleHistorySnapshot
+                        raise StaleHistorySnapshot("conversation row offset is stale")
+                yield entry
+            if (
+                self._generation_reader is not None
+                and self._generation_reader() != generation
+            ):
+                from ._history_index import StaleHistorySnapshot
+                raise StaleHistorySnapshot("conversation row generation changed")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def stream_loaded_entries(
+        self, refs: Iterable[RowRef], fd: int
+    ) -> Iterator[ConversationEntry]:
+        """Read loaded rows from the descriptor that supplied their references."""
         for ref in refs:
-            yield self.entry(ref)
+            yield self.payloads.get(ref.seq) or self._decode(fd, ref)
+
+    def stream_validated_entries(
+        self, refs: Iterable[RowRef]
+    ) -> Iterator[ConversationEntry]:
+        """Read validated rows as entries without repeating payload validation."""
+        for value in self.stream_validated_rows(refs):
+            if isinstance(value, ConversationEntry):
+                yield value
+            else:
+                yield ConversationEntry(
+                    seq=value["seq"],
+                    id=value["id"],
+                    parent_id=value.get("parent_id"),
+                    lane=value.get("lane", "main"),
+                    type=value["type"],
+                    data=value["data"],
+                )

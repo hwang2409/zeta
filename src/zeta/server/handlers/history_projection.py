@@ -77,6 +77,7 @@ class _CachedProjection:
 
 
 _cache_creation_lock = threading.Lock()
+_MAX_CACHED_TRANSCRIPT_BYTES = 32 * 1024 * 1024
 _HISTORY_ROW_FEATURES = (
     "include_delivery_id",
     "fidelity",
@@ -295,7 +296,8 @@ def history_projection(
 
     # The store is loop-owned; the serve worker reads its validated snapshot.
     generation = _generation(store)
-    branch = tuple(store.entry(ref) for ref in store.branch_refs())
+    branch_refs = tuple(store.branch_refs())
+    branch = tuple(store.entry(ref) for ref in branch_refs)
     stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}
@@ -356,7 +358,10 @@ def history_projection(
         } or (entry.type == "turn_end" and served_turn_end):
             entries[-1].append(entry)
 
-    skip_cache = False
+    skip_cache = (
+        sum(getattr(ref, "length", 0) for ref in branch_refs)
+        > _MAX_CACHED_TRANSCRIPT_BYTES
+    )
     if child_runs and started_entries:
         orphan_ended, has_unended = child_run_lifecycle.orphan_ended_entries(
             store, started_entries, ended_run_ids, branch[-1].seq if branch else 0

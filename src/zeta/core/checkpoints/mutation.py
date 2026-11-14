@@ -290,9 +290,17 @@ def _resolve_append_dedupe[ResultT](
     key = command.dedupe_key
     if key is None:
         return None
-    by_id = {entry.id: entry for entry in store._resident_rows.entries}
-    existing = tuple(by_id.get(entry_id) for entry_id in deterministic_ids)
-    next_exists = _dedupe_id(store, key, len(command.rows)) in by_id
+    existing_refs = tuple(
+        store._resident_rows.row_by_id(entry_id) for entry_id in deterministic_ids
+    )
+    existing = tuple(
+        store._resident_rows.entry(ref) if ref is not None else None
+        for ref in existing_refs
+    )
+    next_exists = (
+        store._resident_rows.row_by_id(_dedupe_id(store, key, len(command.rows)))
+        is not None
+    )
     if not any(entry is not None for entry in existing) and not next_exists:
         return None
     if any(entry is None for entry in existing) or next_exists:
@@ -321,8 +329,8 @@ def _build_append_entries(
     deterministic_ids: tuple[str, ...],
 ) -> list[ConversationEntry]:
     prior_ids = set(store._entry_ids)
-    parent_id = store._resident_rows.entries[-1].id if store._resident_rows.entries else None
-    next_seq = store._resident_rows.entries[-1].seq + 1 if store._resident_rows.entries else 1
+    parent_id = store._resident_rows.rows[-1].id if store._resident_rows.rows else None
+    next_seq = store._resident_rows.rows[-1].seq + 1 if store._resident_rows.rows else 1
     entries: list[ConversationEntry] = []
     for index, row in enumerate(rows):
         if index == 0 and row.parent_id is not None:
@@ -357,16 +365,23 @@ def _build_append_entries(
     try:
         store._validate_entries()
     finally:
-        store._resident_rows.truncate_to(len(store._resident_rows.entries) - len(entries))
+        store._resident_rows.truncate_to(len(store._resident_rows.rows) - len(entries))
     return entries
 
 
 def _install_appended_entries(
-    store: ConversationStore, entries: list[ConversationEntry]
+    store: ConversationStore,
+    entries: list[ConversationEntry],
+    start_offset: int,
 ) -> None:
-    linear = not store._resident_rows.entries or entries[0].parent_id == store._resident_rows.entries[-1].id
+    linear = not store._resident_rows.rows or entries[0].parent_id == store._resident_rows.rows[-1].id
+    offset = start_offset
     for entry in entries:
-        store._resident_rows.append(entry)
+        store._resident_rows.append(
+            entry,
+            offset=0 if store._resident_rows.relative_offsets else offset,
+        )
+        offset += store._resident_rows.rows[-1].length
         store._record_entry_prefix(entry)
         store._entry_ids.add(entry.id)
         store._sent_message_receipts.extend(sent_message_receipts(entry))
@@ -379,7 +394,9 @@ def _install_appended_entries(
     else:
         store._validate_entries()
         store._rebuild_incremental_validation_state()
-        store._sync_history_index(store._resident_rows.entries)
+        store._sync_history_index(
+            store._resident_rows.stream_rows(store._resident_rows.rows)
+        )
     store._record_client_delivery_entries(entries)
 
 
@@ -406,13 +423,12 @@ def _execute_append[ResultT](
         if expected_generation != generation_before:
             raise ConversationGenerationConflict(expected_generation, generation_before)
         entries = _build_append_entries(store, command.rows, deterministic_ids)
-        store._write_bytes(
-            b"".join(store._encoded_entry_line(entry) for entry in entries)
-        )
-        if not store._resident_rows.entries or entries[0].parent_id == store._resident_rows.entries[-1].id:
+        encoded = b"".join(store._encoded_entry_line(entry) for entry in entries)
+        store._write_bytes(encoded)
+        if not store._resident_rows.rows or entries[0].parent_id == store._resident_rows.rows[-1].id:
             store._apply_history_index_entries(tuple(entries))
         # A fork is rebuilt by _install_appended_entries below.
-        _install_appended_entries(store, entries)
+        _install_appended_entries(store, entries, store._log_offset - len(encoded))
         generation_after = store.conversation_generation
         committed = tuple(store._snapshot_entry(entry) for entry in entries)
         if store.on_persisted_activity is not None:
@@ -443,7 +459,7 @@ def _execute_store_command[ResultT](
             expected_generation, store.conversation_generation
         )
     baseline_count = (
-        len(store._resident_rows.entries)
+        len(store._resident_rows.rows)
         if command.baseline_count is None
         else command.baseline_count
     )
@@ -459,15 +475,18 @@ def _execute_store_command[ResultT](
     )
     baseline_patch = _snapshot_patch(store, command.patch_fields)
     writer_baseline_matches = (
-        len(store._resident_rows.entries) == baseline_count
+        len(store._resident_rows.rows) == baseline_count
         and store._entry_prefix_digest == baseline_digest
     )
     full_reload_count = store._full_reload_count
     result = command.apply(store)
-    entries = store._owned_installed_delta(tuple(store._resident_rows.entries[baseline_count:]))
+    new_refs = store._resident_rows.rows[baseline_count:]
+    entries = store._owned_installed_delta(
+        tuple(store._resident_rows.stream_rows(new_refs))
+    )
     baseline_parent_id = (
-        store._resident_rows.entries[baseline_count - 1].id
-        if 0 < baseline_count <= len(store._resident_rows.entries)
+        store._resident_rows.rows[baseline_count - 1].id
+        if 0 < baseline_count <= len(store._resident_rows.rows)
         else None
     )
     replace_entries = (
@@ -477,7 +496,9 @@ def _execute_store_command[ResultT](
         or bool(entries and entries[0].parent_id != baseline_parent_id)
     )
     if replace_entries:
-        entries = store._owned_installed_delta(tuple(store._resident_rows.entries))
+        entries = store._owned_installed_delta(
+            tuple(store._resident_rows.stream_rows(store._resident_rows.rows))
+        )
     changed_patch = {
         field: copy.deepcopy(getattr(store, field))
         for field, old in baseline_patch.items()

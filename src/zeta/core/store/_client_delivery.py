@@ -7,7 +7,7 @@ import binascii
 import hashlib
 import re
 from collections import OrderedDict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard
@@ -147,27 +147,27 @@ class ClientDeliveryMixin:
         self._client_steering: deque[_QueuedSteering] = deque()
 
     def _rebuild_client_deliveries(
-        self: ConversationStore, entries: list[ConversationEntry]
+        self: ConversationStore, entries: Iterable[ConversationEntry]
     ) -> None:
         self._client_deliveries = OrderedDict()
         self._client_delivery_outcomes = {}
         self._record_client_delivery_entries(entries)
 
     def _record_client_delivery_entries(
-        self: ConversationStore, entries: list[ConversationEntry]
+        self: ConversationStore, entries: Iterable[ConversationEntry]
     ) -> None:
         payload_digests: dict[str, str] = {}
+        delivery_entries: list[ConversationEntry] = []
         for entry in entries:
-            if entry.type != "message":
-                continue
-            message = Message.from_dict(entry.data["message"])
-            marker = message.metadata.get(CLIENT_DELIVERY_METADATA)
-            digest = _message_image_payload_digest(message)
-            if valid_client_delivery_id(marker) and digest is not None:
-                payload_digests[marker] = digest
-        for entry in entries:
-            if entry.type != "client_delivery":
-                continue
+            if entry.type == "message":
+                message = Message.from_dict(entry.data["message"])
+                marker = message.metadata.get(CLIENT_DELIVERY_METADATA)
+                digest = _message_image_payload_digest(message)
+                if valid_client_delivery_id(marker) and digest is not None:
+                    payload_digests[marker] = digest
+            elif entry.type == "client_delivery":
+                delivery_entries.append(entry)
+        for entry in delivery_entries:
             data = entry.data
             delivery_id = data["delivery_id"]
             if "outcome" in data:
@@ -205,9 +205,10 @@ class ClientDeliveryMixin:
 
         ids = [
             entry.data["delivery_id"]
-            for entry in self._resident_rows.entries
-            if entry.type == "client_delivery"
-            and "outcome" in entry.data
+            for entry in self._resident_rows.stream_rows(
+                ref for ref in self._resident_rows.rows if ref.type == "client_delivery"
+            )
+            if "outcome" in entry.data
             and entry.data["method"] == "steer"
             and self.client_delivery_outcome(entry.data["delivery_id"]) == "queued"
         ]
