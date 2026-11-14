@@ -527,15 +527,12 @@ def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list
 
 class AgentTranscriptControl(UIControl):
     """Render the shared pager for the focused child view."""
-
     def __init__(self, history_pager: Any = None) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
         from .transcript.paged_history import PagedTranscriptHistory
-
         self._history_pager = (
             history_pager if history_pager is not None else PagedTranscriptHistory(None)
         )
-
         self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
             self.transcript,
@@ -567,23 +564,18 @@ class AgentTranscriptControl(UIControl):
         self._invalidate: Callable[[], None] | None = None
         self.on_load: Callable[[Path], None] | None = None
         self.on_history_edge: Callable[[str], None] | None = None
-
     @property
     def history_pager(self) -> Any:
         return self._history_pager
-
     @property
     def prompt_history(self) -> Any:
         return self._prompt_history
-
     @property
     def offset(self) -> int:
         return self.transcript.scroll_offset
-
     @property
     def is_focusable(self) -> bool:
         return True
-
     def configure_history(
         self,
         *,
@@ -607,7 +599,6 @@ class AgentTranscriptControl(UIControl):
         self._render_active = render_active
         self._root_endpoint = root_endpoint
         self._invalidate = invalidate
-
     async def _activation_failed(self, path: Path, generation: int) -> None:
         if generation != self._activation_generation or path != self._path:
             return
@@ -619,7 +610,6 @@ class AgentTranscriptControl(UIControl):
         self.presenter.clear()
         self._tool_calls.clear()
         self.presenter.print(Text("transcript unavailable"))
-
     def start_search(
         self,
         query: str,
@@ -632,7 +622,6 @@ class AgentTranscriptControl(UIControl):
             self.search_task.cancel()
         if not query:
             return
-
         async def reveal_match() -> None:
             matches = await self._history_pager.search(query)
             if not matches or not transcript.finder_active:
@@ -652,7 +641,6 @@ class AgentTranscriptControl(UIControl):
                 (target.entry_id, target.unit_ordinal, 0)
             )
             publish(target, query)
-
         self.search_task = asyncio.create_task(reveal_match())
 
     def navigate_search(
@@ -681,7 +669,6 @@ class AgentTranscriptControl(UIControl):
             self.search_task.cancel()
         self.search_task = asyncio.create_task(reveal())
         return True
-
     def end_search(self) -> None:
         self.search_results = ()
         self.search_index = 0
@@ -703,7 +690,6 @@ class AgentTranscriptControl(UIControl):
         if changed:
             self.render_pages(self._history_pager.pages)
         return changed
-
     def activate(self, path: Path) -> asyncio.Task[None] | None:
         """Start the single owned transition for a child activation or refresh."""
 
@@ -751,7 +737,6 @@ class AgentTranscriptControl(UIControl):
                     self._root_pager_state.anchor
                 )
             self._pending_path = None
-
             async def finish_root_activation() -> None:
                 if previous is not None:
                     await previous.close()
@@ -763,7 +748,6 @@ class AgentTranscriptControl(UIControl):
         self._load_tasks.add(task)
         task.add_done_callback(self._load_tasks.discard)
         return task
-
     async def _transition(self, path: Path, generation: int) -> None:
         from .transcript.child_history_source import ChildLogHistorySource
 
@@ -867,7 +851,6 @@ class AgentTranscriptControl(UIControl):
         finally:
             if generation == self._activation_generation and path == self._pending_path:
                 self._pending_path = None
-
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
@@ -892,7 +875,6 @@ class AgentTranscriptControl(UIControl):
         if task is not None and invalidate is not None:
             task.add_done_callback(lambda _task: invalidate())
         return False
-
     def render_pages(self, pages: tuple[Any, ...]) -> None:
         anchor = self.transcript.durable_scroll_anchor
         follow_tail = self.transcript.follow_tail
@@ -931,7 +913,6 @@ class AgentTranscriptControl(UIControl):
         if path != self._path or self._source is None:
             return ()
         return self._source.pending_prompts
-
     def capture_root_view(self) -> None:
         """Capture root paging and scroll before navigation changes layout focus."""
 
@@ -958,7 +939,6 @@ class AgentTranscriptControl(UIControl):
             await asyncio.gather(*tasks, return_exceptions=True)
         self._load_tasks.clear()
         self._pending_path = None
-
     async def close(self, deadline: float | None = None) -> None:
         del deadline
         self._closed = True
@@ -998,17 +978,12 @@ class AgentTranscriptControl(UIControl):
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
-
     def create_content(self, width: int, height: int | None) -> UIContent:
         return self.transcript.create_content(width, height)
-
     def vertical_scroll(self, window: Window) -> int:
         return self.transcript.vertical_scroll(window)
-
     def mouse_handler(self, mouse_event: MouseEvent):
         return self.transcript.mouse_handler(mouse_event)
-
-
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 

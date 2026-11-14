@@ -10349,8 +10349,11 @@ class _RunCommands(AgentRunCommandMixin):
 
     def __init__(self, loop: AgentLoop) -> None:
         self.loop = loop
-        self._agent_navigation = SimpleNamespace(current_path=loop.store.session_dir)
         self._prompt_history = SessionPromptHistory()
+        self._agent_navigation = SimpleNamespace(
+            current_path=loop.store.session_dir,
+            transcript_control=SimpleNamespace(prompt_history=self._prompt_history),
+        )
 
 
 def test_run_preset_is_registered_without_a_turn_cap(tmp_path: Path) -> None:
@@ -21502,6 +21505,7 @@ async def test_tui_child_send_keeps_target_history_across_view_switch(
         child_view_active=True,
         child_instance_id=lambda: handle,
         current_path=child_a.session_dir,
+        transcript_control=SimpleNamespace(prompt_history=commands._prompt_history),
     )
     commands._active_session = None
     commands._ui_generation = 0

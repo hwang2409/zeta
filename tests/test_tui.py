@@ -2031,7 +2031,9 @@ async def test_agent_card_transcript_hides_passive_harness_message(
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
-    await control.load(store.session_dir)
+    activation = control.activate(store.session_dir)
+    assert activation is not None
+    await await_or_fail(activation, what="child transcript activation")
     rendered = Text.from_ansi(control.transcript.render(120)).plain
 
     assert any("visible prompt" in line for line in transcript)
