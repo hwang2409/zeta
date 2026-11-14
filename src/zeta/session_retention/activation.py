@@ -71,6 +71,9 @@ def make_retention_owner(
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
+        if result.mode == "yielded":
+            planner.close()
+            return _PublishedPass(projection, complete=True)
         history = read_retention_history(root)
         if (
             history
@@ -83,10 +86,18 @@ def make_retention_owner(
         with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
             committed = planner.commit_state()
             if not committed:
+                planner.close()
                 history = read_retention_history(root)
-                if history:
+                if result.mode is None and history:
                     projection = dict(history[-1])
-            elif last_projection is None or not _same_projection(last_projection, projection):
+                elif result.mode is not None and (
+                    not history or not _same_projection(history[-1], projection)
+                ):
+                    append_retention_history(
+                        root, retained, projection, authority_held=True
+                    )
+                return _PublishedPass(projection, complete=True)
+            if last_projection is None or not _same_projection(last_projection, projection):
                 append_retention_history(root, retained, projection, authority_held=True)
                 last_projection = projection
         return _PublishedPass(

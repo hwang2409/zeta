@@ -92,7 +92,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             release_later(_failing_release)
             gc.collect()
 
-            def process_open() -> tuple[str, str | None]:
+            def process_open() -> tuple[str, str | None, str | None]:
                 result_recv, result_send = multiprocessing.Pipe(duplex=False)
                 contender = _spawn(_try_open, str(home), session_id, result_send)
                 try:
@@ -105,7 +105,8 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
                     result_send.close()
 
             await probe.drains(1)
-            assert process_open()[0] == "opened"
+            result = process_open()
+            assert result[0] == "opened", result
 
             # a drain that raises is logged and the next tick retries
             opened = await asyncio.to_thread(manager.open, session_id)
@@ -119,7 +120,8 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             probe.fail_next = True
             gc.collect()
             await probe.drains(2)
-            assert process_open()[0] == "opened"
+            result = process_open()
+            assert result[0] == "opened", result
             assert "draining released leases failed" in caplog.text
         finally:
             drain = getattr(server, "_idle_drain", None)

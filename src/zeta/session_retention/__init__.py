@@ -8,6 +8,7 @@ planner entry points.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import secrets
@@ -555,6 +556,7 @@ class RetentionPlanner:
         self._flight: _InFlight | None = None
         self._latest: object = _UNLOADED
         self._commit_baseline: dict | None = None
+        self._prepared_commit: tuple[dict | None, dict] | None = None
 
     def __enter__(self) -> Self:
         return self
@@ -616,6 +618,7 @@ class RetentionPlanner:
     def _run_pass(
         self, home_fd: int, days: int, *, commit_state: bool = True
     ) -> PassResult:
+        self._prepared_commit = None
         self._commit_baseline = _load_state(home_fd)
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
@@ -635,10 +638,14 @@ class RetentionPlanner:
             preview=self._latest if type(self._latest) is dict else None,
             verify=self._verify_candidate,
             authority_held=False,
+            yield_check=lambda: planner_request_pending(self.home),
         )
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
             return transaction_result
+        if outcome.yielded:
+            self.close()
+            return PassResult(enabled=True, complete=False, mode="yielded")
         budget = _Budget(
             self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
             yield_check=lambda: planner_request_pending(self.home),
@@ -663,11 +670,13 @@ class RetentionPlanner:
             if sweep.root_scan is not None:
                 sweep.root_scan.close()
             self._sweep = None
+        prepared = copy.deepcopy(self._state_payload())
+        self._prepared_commit = (copy.deepcopy(self._commit_baseline), prepared)
         with domain_authority(
             self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
         ):
             if commit_state:
-                _store_state(home_fd, self._state_payload())
+                _store_state(home_fd, prepared)
         return PassResult(
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
@@ -675,11 +684,17 @@ class RetentionPlanner:
         )
 
     def commit_state(self) -> bool:
+        prepared = self._prepared_commit
+        self._prepared_commit = None
+        if prepared is None:
+            return False
+        baseline, payload = prepared
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            if _load_state(home_fd) != self._commit_baseline:
+            if _load_state(home_fd) != baseline:
+                self.close()
                 return False
-            _store_state(home_fd, self._state_payload())
+            _store_state(home_fd, payload)
             return True
         finally:
             os.close(home_fd)
@@ -697,7 +712,7 @@ class RetentionPlanner:
         return PassResult(
             enabled=True,
             complete=False,
-            mode="deleted" if outcome.completed else ("error" if outcome.blocked else None),
+            mode="deleted" if outcome.completed else ("none" if outcome.blocked else None),
             reasons=reasons,
             preview=_preview_snapshot(self._latest),
         )
