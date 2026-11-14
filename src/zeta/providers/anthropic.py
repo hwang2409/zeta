@@ -186,14 +186,9 @@ def _oauth_compat_enabled(
 ) -> bool:
     if isinstance(credential, AnthropicApiKeyCredential):
         return False
-    # Precedence: ZETA_ANTHROPIC_OAUTH_COMPAT=1/0 wins over the settings value;
-    # any other env value (including unset) falls back to the setting.
+    # env 1/0 overrides the setting; any other value (incl. unset) falls back.
     env = os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT")
-    if env == "1":
-        return True
-    if env == "0":
-        return False
-    return setting_enabled
+    return env == "1" or (env != "0" and setting_enabled)
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
