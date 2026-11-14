@@ -1426,7 +1426,6 @@ class AgentNavigation:
         self.focus_composer()
 
     def focus_child_list(self) -> None:
-        self.transcript_control.capture_root_view()
         self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
@@ -1475,6 +1474,7 @@ class AgentNavigation:
         """Publish one prepared transcript path and its navigation state."""
 
         previous = self.current_path
+        preserve_list_focus = path == previous and self.list_focused()
         self._todo_control.clear(self._invalidate)
         if path in self._path_stack:
             index = self._path_stack.index(path)
@@ -1499,7 +1499,9 @@ class AgentNavigation:
                 0,
             )
         self._switch_transcript()
-        if self.child_view_active and self._layout is not None:
+        if preserve_list_focus and self._layout is not None:
+            self._layout.focus(self.list_window)
+        elif self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
         else:
             self.focus_composer()
