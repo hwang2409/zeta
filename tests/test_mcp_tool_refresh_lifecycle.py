@@ -101,6 +101,7 @@ async def _explicit_refresh(
         fail_refresh=fail_refresh,
     )
     clients = iter((client,))
+    # test-contract: seam the mount client factory forces explicit refresh ordering
     monkeypatch.setattr(mount_module, "_build_client", lambda _config: next(clients))
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
@@ -194,7 +195,7 @@ async def test_cancelled_explicit_tool_refresh_does_not_block_mount(
         await await_or_fail(client.refresh_started.wait(), what="cancelled refresh start")
         refresh.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await refresh
+            await asyncio.wait_for(refresh, 10)
         client.refresh_release.set()
         await await_or_fail(
             mount.wait_for_tool_refreshes(), what="cancelled caller refresh settlement"
