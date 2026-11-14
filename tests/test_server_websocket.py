@@ -23,7 +23,7 @@ from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.cli.main import build_parser
 from zeta.protocol.types import TextContent, ToolCall
-from zeta.server import ZetaServer
+from zeta.server import ZetaServer, transport
 from zeta.server.protocol import MAX_FRAME_BYTES
 from zeta.server.transport import _parse_subprotocol_auth
 
@@ -766,6 +766,32 @@ async def test_websocket_custom_discovery_rejects_insecure_parent(
         await server.start()
     assert stat.S_IMODE(parent.stat().st_mode) == 0o775
     await close_serve(server)
+
+
+@pytest.mark.asyncio
+async def test_websocket_custom_discovery_does_not_cleanup_unsafe_parent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "dedicated"
+    custom_path = parent / "serve.json"
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    await server.start()
+    try:
+        parent.chmod(0o702)
+        monkeypatch.setattr(transport._LOGGER, "disabled", False)
+        with caplog.at_level(logging.WARNING, logger="zeta.server.websocket"):
+            await close_serve(server)
+        assert custom_path.exists()
+        assert custom_path.with_name("serve.json.lock").exists()
+        assert "could not safely remove WebSocket discovery file" in caplog.text
+    finally:
+        await close_serve(server)
 
 
 @pytest.mark.asyncio

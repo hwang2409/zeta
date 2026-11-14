@@ -191,6 +191,7 @@ class WebSocketServer:
             await asyncio.to_thread(
                 release_connection_lock,
                 self.path,
+                secure_parent=self.secure_parent,
                 token=self.token,
                 lock_fd=self._lock_fd,
             )
@@ -272,11 +273,13 @@ async def run_server(server: ZetaServer) -> None:
             loop.remove_signal_handler(signum)
 
 
-def _prepare_parent(path: Path, *, secure_parent: bool) -> int:
+def _prepare_parent(
+    path: Path, *, secure_parent: bool, repair_parent: bool = True
+) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     info = os.fstat(parent_fd)
-    if secure_parent:
+    if secure_parent and repair_parent:
         os.fchmod(parent_fd, 0o700)
     elif info.st_uid != os.getuid() or info.st_mode & 0o022:
         os.close(parent_fd)
@@ -325,10 +328,12 @@ def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
         os.close(parent_fd)
 
 
-def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> None:
+def release_connection_lock(
+    path: Path, *, secure_parent: bool, token: str | None, lock_fd: int
+) -> None:
     try:
         if token is not None:
-            remove_connection_file(path, token=token)
+            remove_connection_file(path, secure_parent=secure_parent, token=token)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
@@ -390,24 +395,36 @@ def write_connection_file(
         os.close(parent_fd)
 
 
-def remove_connection_file(path: Path, *, token: str) -> None:
+def remove_connection_file(
+    path: Path, *, secure_parent: bool, token: str
+) -> None:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+        parent_fd = _prepare_parent(
+            path, secure_parent=secure_parent, repair_parent=False
+        )
+    except (OSError, ValueError) as exc:
+        _LOGGER.warning("could not safely remove WebSocket discovery file: %s", exc)
         return
+    fd = -1
     try:
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return
         with os.fdopen(fd) as handle:
             fd = -1
             value = json.load(handle)
         if value.get("token") == token:
-            path.unlink()
+            os.unlink(path.name, dir_fd=parent_fd)
     except (OSError, ValueError, AttributeError):
         return
     finally:
         if fd >= 0:
             os.close(fd)
+        os.close(parent_fd)
 
 
 __all__ = ["WebSocketServer", "run_server"]
