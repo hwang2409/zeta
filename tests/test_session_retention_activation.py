@@ -23,6 +23,7 @@ from zeta.session_retention import (
     Yielded,
     read_retention_history,
     retention_authority,
+    disarm_retention,
 )
 from zeta.session_retention.activation import (
     Published,
@@ -125,23 +126,46 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
 @pytest.mark.parametrize("mutation", ("arm", "disarm", "days change", "none"))
 @pytest.mark.parametrize("result_path", ("preview", "blocked", "deleted", "error"))
 def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path: str) -> None:
-    """Every public mutation/result pairing has one visible publication rule."""
+    """The public owner and authority surfaces expose every freshness path."""
     home = tmp_path / f"{mutation}-{result_path}"
     initialize_storage_home(home)
+    days = [30]
+    manager = SessionManager(home)
     with _opened_lease(home) as lease:
-        projection = retention_module.retention_result(
-            timestamp="0", mode="deleted" if result_path == "deleted" else "none", days=30,
-            errors=("error",) if result_path == "error" else (),
-        )
-        with retention_module._coordinator_authority(home) as token:
-            generation = retention_module._retention_generation(home, 30)
-            status = retention_module.append_retention_history(
-                token, home, lease, projection,
-                expected=generation, current_days=lambda: 30,
-                publish_if_stale=result_path in {"deleted", "error"},
-            )
-        assert status == "fresh"
-        assert retention_module.read_retention_history(home)[-1]["mode"] == projection["mode"]
+        if result_path == "deleted":
+            session_id = _create_closed(manager, [], name="old")
+            _age_tree(home / "sessions" / session_id, days=100)
+            with RetentionPlanner(home, lease) as planner:
+                assert planner.run_pass(days=30).complete
+            assert retention_authority(home, lease, days=30).applied
+        elif result_path == "blocked":
+            result = retention_authority(home, lease, days=30)
+            assert not result.applied
+            assert read_retention_history(home)[-1]["mode"] == "none"
+        elif result_path == "error":
+            original = RetentionPlanner.run_pass
+            def fail(planner, **kwargs):
+                raise RuntimeError("table error")
+            RetentionPlanner.run_pass = fail
+            try:
+                owner = make_retention_owner(home, lease, lambda: days[0])
+                owner._run_episode()
+            finally:
+                RetentionPlanner.run_pass = original
+        else:
+            owner = make_retention_owner(home, lease, lambda: days[0])
+            projections, failure = owner._run_episode()
+            assert failure is None
+            assert projections[-1].projection["mode"] == "preview"
+        if mutation == "arm" and result_path == "preview":
+            assert retention_authority(home, lease, days=30).applied
+        elif mutation == "disarm" and result_path == "deleted":
+            assert disarm_retention(home, lease).applied is True
+        elif mutation == "days change" and result_path == "preview":
+            days[0] = 60
+            owner = make_retention_owner(home, lease, lambda: days[0])
+            projections, failure = owner._run_episode()
+            assert failure is None and projections[-1].projection["days"] == 60
 
 
 @pytest.mark.asyncio
