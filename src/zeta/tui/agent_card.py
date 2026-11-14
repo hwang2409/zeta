@@ -543,9 +543,18 @@ class AgentTranscriptControl(UIControl):
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
         self._source: Any = None
-        self._load_task: asyncio.Task[bool] | None = None
+        self._load_task: asyncio.Task[None] | None = None
+        self._load_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self._pending_path: Path | None = None
+        self._activation_generation = 0
+        self._root_path: Path | None = None
+        self._root_source: Any = None
+        self._prompt_history: Any = None
+        self._current_path: Callable[[], Path] | None = None
+        self._render_active: Callable[[], None] | None = None
+        self._root_endpoint: Callable[[], str | None] | None = None
+        self._invalidate: Callable[[], None] | None = None
         self.on_load: Callable[[Path], None] | None = None
         self.on_history_edge: Callable[[str], None] | None = None
 
@@ -557,21 +566,27 @@ class AgentTranscriptControl(UIControl):
     def is_focusable(self) -> bool:
         return True
 
-    def begin_activation(self, path: Path) -> None:
-        if path == self._path:
-            return
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self._path = path
-        self._pending_path = path
+    def configure_history(
+        self,
+        *,
+        root_path: Path,
+        root_source: Any,
+        prompt_history: Any,
+        current_path: Callable[[], Path],
+        render_active: Callable[[], None],
+        root_endpoint: Callable[[], str | None],
+        invalidate: Callable[[], None],
+    ) -> None:
+        self._root_path = root_path
+        self._root_source = root_source
+        self._prompt_history = prompt_history
+        self._current_path = current_path
+        self._render_active = render_active
+        self._root_endpoint = root_endpoint
+        self._invalidate = invalidate
 
-    def set_source(self, path: Path, source: Any) -> None:
-        self.begin_activation(path)
-        self._pending_path = None
-        self._source = source
-
-    async def activation_failed(self, path: Path) -> None:
-        if path != self._path:
+    async def _activation_failed(self, path: Path, generation: int) -> None:
+        if generation != self._activation_generation or path != self._path:
             return
         source, self._source = self._source, None
         if source is not None:
@@ -581,7 +596,6 @@ class AgentTranscriptControl(UIControl):
         self.presenter.clear()
         self._tool_calls.clear()
         self.presenter.print(Text("transcript unavailable"))
-        self._pending_path = None
 
     async def refresh(self) -> bool:
         anchor = self.transcript.durable_scroll_anchor
@@ -594,25 +608,124 @@ class AgentTranscriptControl(UIControl):
             self.render_pages(self._history_pager.pages)
         return changed
 
+    def activate(self, path: Path) -> asyncio.Task[None] | None:
+        """Start the single owned transition for a child activation or refresh."""
+
+        if (
+            self._closed
+            or path == self._pending_path
+            or (self._current_path is not None and path != self._current_path())
+            or (
+                path == self._root_path
+                and self._path == path
+                and self._history_pager.source is self._root_source
+            )
+        ):
+            return None
+        self._activation_generation += 1
+        generation = self._activation_generation
+        self._pending_path = path
+        if path != self._path:
+            self.presenter.clear()
+            self._tool_calls.clear()
+            self._path = path
+        if self._load_task is not None and not self._load_task.done():
+            self._load_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._transition(path, generation))
+            self._load_task = None
+            return None
+        task = loop.create_task(self._transition(path, generation))
+        self._load_task = task
+        self._load_tasks.add(task)
+        task.add_done_callback(self._load_tasks.discard)
+        return task
+
+    async def _transition(self, path: Path, generation: int) -> None:
+        from .transcript.child_history_source import ChildLogHistorySource
+
+        try:
+            previous = self._source
+            if previous is not None and previous.path == path:
+                changed = await self.refresh()
+                if changed and self._invalidate is not None:
+                    self._invalidate()
+                return
+
+            if path == self._root_path:
+                source = self._root_source
+            else:
+                worker = asyncio.create_task(
+                    asyncio.to_thread(ChildLogHistorySource, path)
+                )
+                try:
+                    source = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    source = await worker
+                    await source.close()
+                    raise
+
+            if generation != self._activation_generation:
+                if source is not self._root_source and source is not previous:
+                    await source.close()
+                return
+            if previous is not None and previous is not source:
+                await previous.close()
+            self._source = None if source is self._root_source else source
+            self._history_pager.source = source
+            endpoint = (
+                self._root_endpoint()
+                if source is self._root_source and self._root_endpoint is not None
+                else None
+            )
+            self._history_pager.reset(endpoint_id=endpoint)
+            self._prompt_history.bind(path, source, endpoint)
+            page = await self._history_pager.load()
+            if (
+                generation != self._activation_generation
+                or self._current_path is None
+                or path != self._current_path()
+                or not page.units
+            ):
+                return
+            if self._render_active is not None:
+                self._render_active()
+            if self._invalidate is not None:
+                self._invalidate()
+        except (ConversationIntegrityError, OSError, SessionError, ValueError):
+            await self._activation_failed(path, generation)
+            if self._invalidate is not None:
+                self._invalidate()
+        finally:
+            if (
+                generation == self._activation_generation
+                and path == self._pending_path
+            ):
+                self._pending_path = None
+
     async def load(self, path: Path) -> bool:
-        if self._closed:
-            return False
+        """Load a child when the control is used without a TUI app owner."""
+
         from .transcript.child_history_source import ChildLogHistorySource
         from .transcript.paged_history import PagedTranscriptHistory
 
+        if self._closed:
+            return False
         try:
             source = await asyncio.to_thread(ChildLogHistorySource, path)
         except (ConversationIntegrityError, OSError, SessionError, ValueError):
-            self._pending_path = None
             return False
         previous = self._source
         if previous is not None:
             await previous.close()
+        self._source = source
+        self._path = path
         if self._history_pager is None:
             self._history_pager = PagedTranscriptHistory(source)
         else:
             self._history_pager.source = source
-        self.set_source(path, source)
         self._history_pager.reset()
         try:
             page = await self._history_pager.load()
@@ -636,21 +749,17 @@ class AgentTranscriptControl(UIControl):
     ) -> bool:
         if self._closed:
             return False
-        if path == self._pending_path:
-            return False
-        self._pending_path = path
         if self.on_load is not None:
             self.on_load(path)
             return False
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            changed = asyncio.run(self.load(path))
+            changed = asyncio.run(self.sync(path))
             if changed and invalidate is not None:
                 invalidate()
             return changed
         task = loop.create_task(self.sync(path))
-        self._load_task = task
         if invalidate is not None:
             task.add_done_callback(lambda _task: invalidate())
         return False
@@ -694,13 +803,20 @@ class AgentTranscriptControl(UIControl):
             return ()
         return self._source.pending_prompts
 
-    async def close(self, deadline: float | None = None) -> None:
-        del deadline
-        self._closed = True
+    async def cancel_activation(self) -> None:
         task, self._load_task = self._load_task, None
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        tasks = tuple(self._load_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._load_tasks.clear()
+        self._pending_path = None
+
+    async def close(self, deadline: float | None = None) -> None:
+        del deadline
+        self._closed = True
+        await self.cancel_activation()
         source, self._source = self._source, None
         if source is not None:
             if inspect.iscoroutinefunction(source.close):

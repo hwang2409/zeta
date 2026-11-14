@@ -16664,6 +16664,7 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "child-cancel-replace-close",
         "child-stale-page",
         "child-live-refresh",
+        "child-switch-mid-refresh",
         "child-deleted-activation",
     ),
 )
@@ -16888,26 +16889,93 @@ async def test_root_tui_paging_render_path_table(
             )
             anchor = child_transcript.durable_scroll_anchor
 
-            child_store = ConversationStore(
-                store.session_dir / "agents", session_id="1"
-            )
-            child_store.append_message(
-                Message(MessageRole.ASSISTANT, [TextContent("new running child row")])
-            )
-            child_store.close()
+            appended = []
+            for tick in range(3):
+                text = f"running child refresh {tick}"
+                child_store = ConversationStore(
+                    store.session_dir / "agents", session_id="1"
+                )
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(text)])
+                )
+                child_store.close()
+                appended.append(text)
+                previous_task = app._history_view_task
+                navigation.refresh(force=True)
+                assert app._history_view_task is not None
+                await await_or_fail(
+                    app._history_view_task,
+                    what=f"running child live refresh {tick}",
+                )
+                assert app._history_view_task is not previous_task, (
+                    f"running child refresh {tick} was suppressed"
+                )
+                assert child_transcript.durable_scroll_anchor == anchor, (
+                    f"running child refresh {tick} moved the scrolled-up viewport"
+                )
+
+            child_transcript.scroll_to_bottom()
             navigation.refresh(force=True)
             assert app._history_view_task is not None
             await await_or_fail(
-                app._history_view_task, what="running child live refresh"
+                app._history_view_task, what="running child return to tail"
             )
             navigation.transcript_control.create_content(120, 20)
-
-            assert child_transcript.durable_scroll_anchor == anchor, (
-                "running child refresh moved the scrolled-up viewport"
+            rendered = Text.from_ansi(child_transcript.render(120)).plain
+            assert all(text in rendered for text in appended), (
+                "running child did not publish every refresh batch"
             )
-            assert "running child row 0" in Text.from_ansi(
-                child_transcript.render(120)
+        elif journey == "child-switch-mid-refresh":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child row")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("second child row")])
+            )
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            navigation.current_path = first_path
+            navigation._path_stack.append(first_path)
+            navigation._breadcrumb_labels.append("first child")
+            navigation.transcript_control.request_sync(first_path, app._invalidate_prompt)
+            navigation._switch_transcript()
+            assert app._history_view_task is not None
+            await await_or_fail(app._history_view_task, what="first child activation")
+
+            source = navigation.transcript_control._source
+            original_page = source.page
+            refresh_started = asyncio.Event()
+            refresh_release = asyncio.Event()
+
+            async def held_page(*args, **kwargs):
+                refresh_started.set()
+                await asyncio.wait_for(refresh_release.wait(), 10)
+                return await original_page(*args, **kwargs)
+
+            source.page = held_page
+            navigation.refresh(force=True)
+            first_refresh = app._history_view_task
+            assert first_refresh is not None
+            await asyncio.wait_for(refresh_started.wait(), 10)
+            navigation.current_path = second_path
+            navigation._path_stack.append(second_path)
+            navigation._breadcrumb_labels.append("second child")
+            navigation.transcript_control.request_sync(second_path, app._invalidate_prompt)
+            navigation._switch_transcript()
+            second_activation = app._history_view_task
+            assert second_activation is not None and second_activation is not first_refresh
+            refresh_release.set()
+            await await_or_fail(second_activation, what="second child activation")
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
             ).plain
+            assert "second child row" in rendered
+            assert "first child row" not in rendered
         elif journey == "child-deleted-activation":
             first = ConversationStore(store.session_dir / "agents", session_id="1")
             first.append_message(
@@ -16952,6 +17020,22 @@ async def test_root_tui_paging_render_path_table(
                 "deleted child activation retained the previous child's rows"
             )
             assert "transcript unavailable" in rendered
+
+            retry = ConversationStore(store.session_dir / "agents", session_id="2")
+            retry.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("retry child row")])
+            )
+            retry.close()
+            navigation.refresh(force=True)
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="retry deleted child activation"
+            )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child row" in rendered
+            assert "transcript unavailable" not in rendered
         elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page

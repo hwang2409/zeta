@@ -27,14 +27,12 @@ from ..config.settings import (
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
 from ..core.approval import ApprovalPolicy
-from ..core.checkpoints import ConversationIntegrityError
 from ..core.project_context import (
     discover_project,
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
 from ..core.session import SessionMetadata
-from ..core.session_files import SessionNotFoundError
 from ..core.slash import (
     SlashStatus,
     UsageTracker,
@@ -98,7 +96,6 @@ from .transcript import (
     TranscriptPresenter,
     TranscriptWidget,
 )
-from .transcript.child_history_source import ChildLogHistorySource
 from .transcript.finder_runtime import FinderRuntimeMixin
 from .transcript.history_finder import HistoryFinder
 from .transcript.paged_history import PagedTranscriptHistory
@@ -278,8 +275,6 @@ class TUIApp(
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
         self._history_view_task: asyncio.Task[None] | None = None
-        self._history_view_tasks: set[asyncio.Task[None]] = set()
-        self._history_view_generation = 0
         self._history_view_path = self.loop.store.session_dir
         self._history_search_results: tuple[Any, ...] = ()
         self._history_search_index = 0
@@ -366,6 +361,15 @@ class TUIApp(
         self._agent_navigation = AgentNavigation(self.loop.store, self._history_pager)
         self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
+        self._agent_navigation.transcript_control.configure_history(
+            root_path=self.loop.store.session_dir,
+            root_source=self._history_source,
+            prompt_history=self._prompt_history,
+            current_path=lambda: app._viewed_session_path(),
+            render_active=lambda: app._render_active_resident_history(),
+            root_endpoint=lambda: self.loop.store.active_branch_head_id(),
+            invalidate=lambda: app._invalidate_prompt(),
+        )
         self._agent_navigation.transcript_control.on_load = (
             lambda path: app._request_history_view(path)
         )
@@ -659,107 +663,9 @@ class TUIApp(
         self._request_history_view(path)
 
     def _request_history_view(self, path: Path) -> None:
-        if path != self._viewed_session_path():
-            return
-        if (
-            path == self.loop.store.session_dir
-            and self._history_pager.source is self._history_source
-        ):
-            return
-        self._history_view_generation += 1
-        generation = self._history_view_generation
-        self._agent_navigation.transcript_control.begin_activation(path)
-        if self._history_view_task is not None:
-            self._history_view_task.cancel()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(self._activate_history_view(path, generation))
-            self._history_view_task = None
-            return
-        self._history_view_task = loop.create_task(
-            self._activate_history_view(path, generation)
-        )
-        self._history_view_tasks.add(self._history_view_task)
-        self._history_view_task.add_done_callback(self._history_view_tasks.discard)
-
-    async def _activate_history_view(self, path: Path, generation: int) -> None:
-        control = self._agent_navigation.transcript_control
-        previous = control._source
-        if previous is not None and previous.path == path:
-            try:
-                changed = await control.refresh()
-            except (
-                ConversationIntegrityError,
-                OSError,
-                SessionNotFoundError,
-                ValueError,
-            ):
-                await control.activation_failed(path)
-                self._invalidate_prompt()
-                return
-            if changed:
-                self._invalidate_prompt()
-            return
-        if path == self.loop.store.session_dir:
-            source = self._history_source
-        else:
-            worker = asyncio.create_task(
-                asyncio.to_thread(ChildLogHistorySource, path)
-            )
-            try:
-                source = await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                source = await worker
-                await source.close()
-                raise
-            except (
-                ConversationIntegrityError,
-                OSError,
-                SessionNotFoundError,
-                ValueError,
-            ):
-                await control.activation_failed(path)
-                self._invalidate_prompt()
-                return
-        if generation != self._history_view_generation:
-            if source is not self._history_source and source is not previous:
-                await source.close()
-            return
-        if previous is not None and previous is not source:
-            await previous.close()
-        if path != self.loop.store.session_dir:
-            control.set_source(path, source)
-        else:
-            control._source = None
-        self._history_pager.source = source
-        endpoint = (
-            self.loop.store.active_branch_head_id()
-            if path == self.loop.store.session_dir
-            else None
-        )
-        self._history_pager.reset(endpoint_id=endpoint)
-        self._prompt_history.bind(path, source, endpoint)
-        try:
-            page = await self._history_pager.load()
-        except (
-            ConversationIntegrityError,
-            OSError,
-            SessionNotFoundError,
-            ValueError,
-        ):
-            await control.activation_failed(path)
-            self._invalidate_prompt()
-            return
-        if (
-            generation != self._history_view_generation
-            or path != self._viewed_session_path()
-            or not page.units
-        ):
-            return
-        self._render_active_resident_history()
-        self._active_finder = self._viewed_transcript()
-        self._invalidate_prompt()
+        task = self._agent_navigation.transcript_control.activate(path)
+        if task is not None:
+            self._history_view_task = task
 
     def _render_active_resident_history(self) -> None:
         if self._agent_navigation.child_view_active:
@@ -922,12 +828,7 @@ class TUIApp(
 
     async def _close_history_view(self) -> None:
         self._history_view_task = None
-        tasks = tuple(self._history_view_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._history_view_tasks.clear()
+        await self._agent_navigation.transcript_control.cancel_activation()
 
     async def _close_history_markers(self) -> None:
         tasks = tuple(self._history_marker_tasks)
