@@ -16262,7 +16262,9 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                 history_tasks: list[asyncio.Task[None]] = []
                 create_task = asyncio.create_task
 
-                def track_history_task(coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+                def track_history_task(
+                    coro: Coroutine[object, object, None],
+                ) -> asyncio.Task[None]:
                     task = create_task(coro)
                     if coro.cr_code.co_qualname.endswith(
                         "TUIApp._history_previous.<locals>.load"
