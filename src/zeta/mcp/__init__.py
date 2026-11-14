@@ -7,6 +7,7 @@ from .client import (
     MCPRequestError,
     MCPResource,
     MCPTool,
+    MCPToolRefreshError,
     MCPTransportError,
     MCPUnsupportedError,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "MCPServerState",
     "MCPServerStatus",
     "MCPTool",
+    "MCPToolRefreshError",
     "MCPTransportError",
     "MCPUnsupportedError",
     "ManagedServer",
