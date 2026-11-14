@@ -550,6 +550,8 @@ class AgentTranscriptControl(UIControl):
         self._activation_generation = 0
         self._root_path: Path | None = None
         self._root_source: Any = None
+        self._root_transcript: Any = None
+        self._root_anchor: tuple[str, int, int] | None = None
         self._prompt_history: Any = None
         self._current_path: Callable[[], Path] | None = None
         self._render_active: Callable[[], None] | None = None
@@ -571,6 +573,7 @@ class AgentTranscriptControl(UIControl):
         *,
         root_path: Path,
         root_source: Any,
+        root_transcript: Any,
         prompt_history: Any,
         current_path: Callable[[], Path],
         render_active: Callable[[], None],
@@ -579,6 +582,7 @@ class AgentTranscriptControl(UIControl):
     ) -> None:
         self._root_path = root_path
         self._root_source = root_source
+        self._root_transcript = root_transcript
         self._prompt_history = prompt_history
         self._current_path = current_path
         self._render_active = render_active
@@ -648,6 +652,7 @@ class AgentTranscriptControl(UIControl):
 
         try:
             previous = self._source
+            previous_source = self._history_pager.source
             if previous is not None and previous.path == path:
                 changed = await self.refresh()
                 if changed and self._invalidate is not None:
@@ -657,6 +662,11 @@ class AgentTranscriptControl(UIControl):
             if path == self._root_path:
                 source = self._root_source
             else:
+                if (
+                    previous_source is self._root_source
+                    and self._root_transcript is not None
+                ):
+                    self._root_anchor = self._root_transcript.durable_scroll_anchor
                 worker = asyncio.create_task(
                     asyncio.to_thread(ChildLogHistorySource, path)
                 )
@@ -682,7 +692,10 @@ class AgentTranscriptControl(UIControl):
             )
             self._history_pager.reset(endpoint_id=endpoint)
             self._prompt_history.bind(path, source, endpoint)
-            page = await self._history_pager.load()
+            if source is self._root_source and self._root_anchor is not None:
+                page = await self._history_pager.reveal(self._root_anchor[0])
+            else:
+                page = await self._history_pager.load()
             if (
                 generation != self._activation_generation
                 or self._current_path is None
@@ -692,6 +705,14 @@ class AgentTranscriptControl(UIControl):
                 return
             if self._render_active is not None:
                 self._render_active()
+            if (
+                source is self._root_source
+                and self._root_anchor is not None
+                and self._root_transcript is not None
+            ):
+                self._root_transcript.restore_durable_scroll_anchor(
+                    self._root_anchor
+                )
             if self._invalidate is not None:
                 self._invalidate()
         except (ConversationIntegrityError, OSError, SessionError, ValueError):

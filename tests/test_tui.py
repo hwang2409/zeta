@@ -16019,7 +16019,11 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
         prompt_store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent(prompt)]),
-                MessageOrigin.USER,
+                (
+                    MessageOrigin.AGENT_PROMPT
+                    if child_journey
+                    else MessageOrigin.USER
+                ),
             )
         )
         prompt_store.append_message(
@@ -16092,9 +16096,16 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
                 for index, expected in enumerate(reversed(prompts)):
                     before = processed_keys
                     pipe.send_text("\x1b[A")
-                    await wait_until(
-                        lambda expected=expected: session.default_buffer.text == expected
-                    )
+                    try:
+                        await wait_until(
+                            lambda expected=expected: (
+                                session.default_buffer.text == expected
+                            )
+                        )
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            f"Up did not select prompt {expected!r}"
+                        ) from exc
                     assert processed_keys > before
                     assert session.default_buffer.text == expected, (
                         f"Up did not select prompt {expected!r}"
@@ -16666,6 +16677,8 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "child-live-refresh",
         "child-switch-mid-refresh",
         "child-deleted-activation",
+        "child-old-search",
+        "root-anchor-child-visit",
     ),
 )
 @pytest.mark.asyncio
@@ -16676,7 +16689,7 @@ async def test_root_tui_paging_render_path_table(
     failure_text = "needle-provider-failure"
     checkpoint = None
 
-    if journey == "stale-anchor":
+    if journey in {"stale-anchor", "root-anchor-child-visit"}:
         for index in range(300):
             store.append_message(
                 with_message_origin(
@@ -16777,7 +16790,136 @@ async def test_root_tui_paging_render_path_table(
     async with owned_app(app):
         assert await app._rebuild_transcript_async()
 
-        if journey == "child-cancel-replace-close":
+        if journey == "child-old-search":
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            old = child_store.append_message(
+                with_message_origin(
+                    Message(
+                        MessageRole.USER,
+                        [TextContent("Henry's old child prompt")],
+                    ),
+                    MessageOrigin.AGENT_PROMPT,
+                )
+            )
+            for index in range(300):
+                child_store.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child search tail {index}")],
+                    )
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("search child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="focused child search activation"
+            )
+            transcript = navigation.transcript_control.transcript
+            request = transcript.open_finder()
+            assert request is not None
+            app._active_finder = transcript
+            app._start_finder_preparation(request)
+
+            app._finder_input("Henry's old child prompt")
+            assert app._history_search_task is not None
+            await await_or_fail(
+                app._history_search_task, what="old focused child search"
+            )
+            try:
+                await wait_until(
+                    lambda: (
+                        (state := transcript.finder_state()) is not None
+                        and state.complete
+                        and bool(state.rows)
+                    )
+                )
+            except AssertionError as exc:
+                raise AssertionError(
+                    "focused-child search did not finish with the unloaded match"
+                ) from exc
+            assert old.id in {
+                match.entry_id for match in app._history_search_results
+            }, "focused-child search did not find the unloaded old row"
+            assert transcript.durable_scroll_anchor is not None
+            assert transcript.durable_scroll_anchor[0] == old.id
+
+            app._finder_input("absent-focused-child-query")
+            assert app._history_search_task is not None
+            await await_or_fail(
+                app._history_search_task, what="focused child no-match search"
+            )
+            await wait_until(
+                lambda: (
+                    (state := transcript.finder_state()) is not None
+                    and state.complete
+                    and not state.rows
+                )
+            )
+            state = transcript.finder_state()
+            assert state is not None and state.complete and not state.rows, (
+                "focused-child no-match search stayed searching"
+            )
+        elif journey == "root-anchor-child-visit":
+            root_ids = [
+                unit.entry_id
+                for page in app._history_pager.pages
+                for unit in page.units
+            ]
+            oldest_page = await app._history_source.page()
+            while oldest_page.older is not None:
+                oldest_page = await app._history_source.page(
+                    oldest_page.older, direction="older"
+                )
+            old_root_id = oldest_page.units[0].entry_id
+            await app._history_pager.reveal(old_root_id)
+            app._render_resident_history()
+            assert app._transcript.restore_durable_scroll_anchor(
+                (old_root_id, 0, 0)
+            )
+            root_anchor = app._transcript.durable_scroll_anchor
+            assert root_anchor is not None
+
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("child visit")])
+            )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("visited child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="child visit activation"
+            )
+
+            navigation.exit_navigation()
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="root anchor restoration"
+            )
+            assert app._transcript.durable_scroll_anchor == root_anchor, (
+                "returning from child moved the root viewport to the tail"
+            )
+            assert old_root_id not in root_ids
+        elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 
             child_store = ConversationStore(store.session_dir / "agents", session_id="1")

@@ -319,7 +319,10 @@ class ChildLogHistorySource:
                 continue
             message = Message.from_dict(bounded_transcript_message(raw_message))
             scanned += 1
-            if message.metadata.get(MESSAGE_ORIGIN_METADATA) != MessageOrigin.USER:
+            if message.metadata.get(MESSAGE_ORIGIN_METADATA) not in {
+                MessageOrigin.USER,
+                MessageOrigin.AGENT_PROMPT,
+            }:
                 continue
             text = displayed_user_text(message)
             encoded = len(text.encode())
@@ -412,14 +415,12 @@ class ChildLogHistorySource:
             if isinstance(raw_message, dict):
                 if is_passive_harness_message(raw_message):
                     continue
-                entry = replace(
-                    entry,
-                    data={
-                        **entry.data,
-                        "message": bounded_transcript_message(raw_message),
-                    },
+                searchable = json.dumps(
+                    bounded_transcript_message(raw_message), ensure_ascii=False
                 )
-            if needle in str(_project_entry(entry)).casefold():
+            else:
+                searchable = json.dumps(entry.data, ensure_ascii=False)
+            if needle in searchable.casefold():
                 matches.append(HistorySearchResult(entry.id))
                 if len(matches) == limit:
                     break

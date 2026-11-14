@@ -160,6 +160,15 @@ class TranscriptFinderMixin:
         self._finder.extend_candidates(candidates, complete=complete)
         return True
 
+    def restart_finder(self) -> FinderCandidateRequest | None:
+        """Rebuild candidates after paging while keeping the open finder."""
+
+        if self._finder is None:
+            return None
+        self._finder = MessageFinder((), complete=False)
+        self._finder_generation += 1
+        return FinderCandidateRequest(generation=self._finder_generation)
+
     def finder_set_query(self, query: str) -> int | None:
         if self._finder is None:
             return None

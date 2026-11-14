@@ -364,6 +364,7 @@ class TUIApp(
         self._agent_navigation.transcript_control.configure_history(
             root_path=self.loop.store.session_dir,
             root_source=self._history_source,
+            root_transcript=self._transcript,
             prompt_history=self._prompt_history,
             current_path=lambda: app._viewed_session_path(),
             render_active=lambda: app._render_active_resident_history(),
@@ -773,7 +774,7 @@ class TUIApp(
             transcript.restore_durable_scroll_anchor(
                 (target.entry_id, target.unit_ordinal, 0)
             )
-            request = transcript.open_finder()
+            request = transcript.restart_finder()
             self._active_finder = transcript
             self._start_finder_preparation(request)
             transcript.finder_set_query(query)
@@ -805,7 +806,7 @@ class TUIApp(
             transcript.restore_durable_scroll_anchor(
                 (target.entry_id, target.unit_ordinal, 0)
             )
-            request = transcript.open_finder()
+            request = transcript.restart_finder()
             self._active_finder = transcript
             self._start_finder_preparation(request)
             transcript.finder_set_query(query)
