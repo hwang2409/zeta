@@ -374,10 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ws", dest="ws_port", type=int, help="also listen for WebSocket clients"
     )
     serve_parser.add_argument(
-        "--ws-discovery",
-        dest="ws_discovery",
-        metavar="PATH",
-        help="write WebSocket discovery data to PATH instead of the default",
+        "--ws-discovery", help="write WebSocket discovery data to PATH instead of the default"
     )
     serve_parser.add_argument(
         "--ws-origin",
