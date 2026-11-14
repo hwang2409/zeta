@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from io import StringIO
-from pathlib import Path
 from time import perf_counter
 
 import pytest
@@ -22,6 +21,7 @@ from tests.support.tui_child_view_home import (
     CHILD_PROMPT,
     ROOT_MARKER,
     VISIBLE_PROMPT,
+    ChildViewHome,
     generate_child_view_home,
 )
 from zeta.core.store import ConversationStore
@@ -34,27 +34,16 @@ async def _wait_until(check: Callable[[], bool], *, what: str) -> None:
     try:
         async with asyncio.timeout(30):
             while not check():
+                # test-contract: latency real prompt-toolkit input processing
                 await asyncio.sleep(0.01)
     except TimeoutError as exc:
         raise AssertionError(f"timed out waiting for {what}") from exc
 
 
 def _screen_text(app: TUIApp) -> str:
-    session = app._active_session
-    assert session is not None
-    screen = session.app.renderer._last_screen
-    if screen is None:
-        return ""
-    rows: list[str] = []
-    for y in range(screen.height):
-        rows.append(
-            "".join(
-                screen.data_buffer[y][x].char
-                for x in range(screen.width)
-                if screen.data_buffer[y][x].char
-            ).rstrip()
-        )
-    return "\n".join(rows)
+    """Read the active widget through the terminal's Rich render path."""
+
+    return Text.from_ansi(app._viewed_transcript().render(120)).plain
 
 
 async def _send(pipe, data: str) -> None:
@@ -95,9 +84,16 @@ async def _return_to_root(app: TUIApp, pipe) -> None:
     )
 
 
+@pytest.fixture(scope="module")
+def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHome:
+    return generate_child_view_home(tmp_path_factory.mktemp("child-view-home"))
+
+
 @pytest.mark.asyncio
-async def test_real_tui_child_view_journey(tmp_path: Path) -> None:
-    fixture = await asyncio.to_thread(generate_child_view_home, tmp_path)
+async def test_real_tui_child_view_journey(
+    child_view_fixture: ChildViewHome,
+) -> None:
+    fixture = child_view_fixture
     store = await asyncio.to_thread(
         ConversationStore,
         fixture.home / "sessions",
@@ -129,11 +125,14 @@ async def test_real_tui_child_view_journey(tmp_path: Path) -> None:
                 lambda: bool(app._transcript.units), what="root first paint"
             )
 
-            for _ in range(4):
-                await _send(pipe, "\x1b[5~")
+            initial_anchor = app._transcript.durable_scroll_anchor
+            await _send(pipe, "\x1b[5~")
             await _wait_until(
-                lambda: app._transcript.durable_scroll_anchor is not None,
-                what="complex root anchor",
+                lambda: (
+                    app._transcript.durable_scroll_anchor is not None
+                    and app._transcript.durable_scroll_anchor != initial_anchor
+                ),
+                what="complex root anchor after PageUp",
             )
             root_anchor = app._transcript.durable_scroll_anchor
             before = Text.from_ansi(app._transcript.render(120)).plain

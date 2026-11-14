@@ -20,6 +20,7 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    TextContent,
     ToolUseContent,
     is_passive_harness_message,
 )
@@ -398,6 +399,21 @@ class ChildLogHistorySource:
     ) -> str | None:
         return await self._run(self._adjacent_user_sync, entry_id, direction)
 
+    @staticmethod
+    def _visible_message_text(raw_message: dict[str, Any]) -> str:
+        """Project only text that the child transcript renderer exposes."""
+
+        message = Message.from_dict(bounded_transcript_message(raw_message))
+        visible = [message.role.value]
+        for block in message.content:
+            if isinstance(block, TextContent):
+                visible.append(block.text)
+            elif isinstance(block, ToolUseContent):
+                visible.append(block.tool_call.name)
+        if message.tool_result is not None:
+            visible.append(message.tool_result.content)
+        return "\n".join(visible)
+
     def _search_sync(
         self,
         store: ConversationStore,
@@ -415,9 +431,7 @@ class ChildLogHistorySource:
             if isinstance(raw_message, dict):
                 if is_passive_harness_message(raw_message):
                     continue
-                searchable = json.dumps(
-                    bounded_transcript_message(raw_message), ensure_ascii=False
-                )
+                searchable = self._visible_message_text(raw_message)
             elif entry.type == "checkpoint":
                 searchable = json.dumps(entry.data, ensure_ascii=False)
             else:

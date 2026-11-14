@@ -17201,35 +17201,31 @@ async def test_root_tui_paging_render_path_table(
             ).plain
 
             shutil.rmtree(second_path)
-            navigation.current_path = second_path
-            navigation._path_stack.append(second_path)
-            navigation._breadcrumb_labels.append("deleted child")
-            navigation.transcript_control.request_sync(
-                second_path, app._invalidate_prompt
-            )
-            assert app._history_view_task is not None
+            failed_activation = navigation.transcript_control.activate(second_path)
+            assert failed_activation is not None
             await await_or_fail(
-                app._history_view_task, what="deleted child activation"
+                failed_activation, what="deleted child activation"
             )
             navigation.transcript_control.create_content(120, 20)
             rendered = Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
             ).plain
 
-            assert "first child only" not in rendered, (
-                "deleted child activation retained the previous child's rows"
+            assert navigation.current_path == first_path
+            assert "first child only" in rendered, (
+                "failed target activation did not restore the leaving child"
             )
-            assert "transcript unavailable" in rendered
+            assert "transcript unavailable" not in rendered
 
             retry = ConversationStore(store.session_dir / "agents", session_id="2")
             retry.append_message(
                 Message(MessageRole.ASSISTANT, [TextContent("retry child row")])
             )
             retry.close()
-            navigation.refresh(force=True)
-            assert app._history_view_task is not None
+            retry_activation = navigation.transcript_control.activate(second_path)
+            assert retry_activation is not None
             await await_or_fail(
-                app._history_view_task, what="retry deleted child activation"
+                retry_activation, what="retry deleted child activation"
             )
             rendered = Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
@@ -17553,3 +17549,68 @@ async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
         assert "old.txt" not in rendered
         assert rendered.count("new.txt") == 1
         assert rendered.count("nearest result") == 1
+
+
+@pytest.mark.asyncio
+async def test_child_activation_discards_stale_slow_target_and_returns_to_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("root owner row")]),
+            MessageOrigin.USER,
+        )
+    )
+    first = ConversationStore(store.session_dir / "agents", session_id="1")
+    first.append_message(Message(MessageRole.ASSISTANT, [TextContent("first row")]))
+    first_path = first.session_dir
+    first.close()
+    second = ConversationStore(store.session_dir / "agents", session_id="2")
+    second.append_message(Message(MessageRole.ASSISTANT, [TextContent("second row")]))
+    second_path = second.session_dir
+    second.close()
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+    original_page = ChildLogHistorySource.page
+
+    async def held_second_page(self, *args, **kwargs):
+        if self.path == second_path:
+            started.set()
+            await asyncio.wait_for(release.wait(), 10)
+        return await original_page(self, *args, **kwargs)
+
+    monkeypatch.setattr(ChildLogHistorySource, "page", held_second_page)
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        navigation = app._agent_navigation
+        first_activation = navigation.transcript_control.activate(first_path)
+        assert first_activation is not None
+        await await_or_fail(first_activation, what="first child activation")
+
+        second_activation = navigation.transcript_control.activate(second_path)
+        assert second_activation is not None
+        await asyncio.wait_for(started.wait(), 10)
+        root_activation = navigation.transcript_control.activate(navigation.root_path)
+        assert root_activation is not None
+        release.set()
+        await await_or_fail(root_activation, what="root activation over slow child")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(second_activation, 10)
+
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert navigation.current_path == navigation.root_path
+        assert navigation._path_stack == [navigation.root_path]
+        assert navigation.transcript_control._history_pager.source is app._history_source
+        assert "root owner row" in rendered
+        assert "first row" not in rendered and "second row" not in rendered

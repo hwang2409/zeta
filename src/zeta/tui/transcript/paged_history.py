@@ -94,6 +94,20 @@ class PageDescriptor:
     page: TUIHistoryPage
 
 
+@dataclass(frozen=True, slots=True)
+class PagedHistoryState:
+    """One path's bounded resident history state."""
+
+    segments: tuple[PageDescriptor, ...]
+    older: HistoryCursor | None
+    newer: HistoryCursor | None
+    frozen_endpoint: str | None
+    newest_tail: HistoryCursor | None
+    anchor: tuple[str, int, int] | None
+    reveal_target: str | None
+    endpoint_id: str | None
+
+
 class PagedTranscriptHistory:
     """Own one contiguous, bounded deque of transcript paint segments."""
 
@@ -170,6 +184,33 @@ class PagedTranscriptHistory:
 
     def set_anchor(self, entry_id: str, unit_ordinal: int, text_offset: int) -> None:
         self._anchor = (entry_id, unit_ordinal, text_offset)
+
+    def capture(self) -> PagedHistoryState:
+        """Capture the bounded state needed to restore this exact viewport."""
+
+        return PagedHistoryState(
+            tuple(self._segments),
+            self._older,
+            self._newer,
+            self._frozen_endpoint,
+            self._newest_tail,
+            self._anchor,
+            self._reveal_target,
+            self.endpoint_id,
+        )
+
+    def restore(self, state: PagedHistoryState) -> None:
+        """Replace the resident state without reading history again."""
+
+        self.reset(endpoint_id=state.frozen_endpoint)
+        self._segments.extend(state.segments)
+        self._older = state.older
+        self._newer = state.newer
+        self._frozen_endpoint = state.frozen_endpoint
+        self._newest_tail = state.newest_tail
+        self._anchor = state.anchor
+        self._reveal_target = state.reveal_target
+        self.endpoint_id = state.endpoint_id
 
     async def close(self) -> None:
         """Invalidate publication without waiting for executor-backed reads."""
