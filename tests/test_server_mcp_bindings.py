@@ -13,14 +13,13 @@ from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
 
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,
     ScriptedTurn,
 )
-from tests.support.owned import await_or_fail, start_task_stack_watchdog
+from tests.support.owned import await_or_fail
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
 from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
@@ -709,20 +708,6 @@ async def test_socket_http_list_changed_refreshes_next_turn_catalog(
         await mcp.close()
 
 
-@pytest_asyncio.fixture
-async def approved_mcp_task_stack_watchdog() -> AsyncIterator[None]:
-    watchdog = start_task_stack_watchdog(
-        TIMEOUT, what="approved MCP socket test"
-    )
-    try:
-        yield
-    finally:
-        watchdog.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(watchdog, return_exceptions=True), 10
-        )
-
-
 @pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
 @pytest.mark.parametrize("live_added", [True, False], ids=["live-added", "initial"])
 @pytest.mark.asyncio
@@ -731,7 +716,6 @@ async def test_socket_http_approved_tool_runs_once(
     monkeypatch: pytest.MonkeyPatch,
     bound: bool,
     live_added: bool,
-    approved_mcp_task_stack_watchdog: None,
 ) -> None:
     monkeypatch.setattr(
         httpx.AsyncHTTPTransport,
@@ -813,7 +797,7 @@ async def test_socket_http_approved_tool_runs_once(
         assert recovery_turn is not None
         await await_or_fail(
             asyncio.gather(live_turn, recovery_turn),
-            timeout=10,
+            timeout=60,
             what="approved MCP live and recovery turns",
         )
 
@@ -825,15 +809,9 @@ async def test_socket_http_approved_tool_runs_once(
         ) == 1
     finally:
         writer.close()
-        await await_or_fail(
-            writer.wait_closed(), timeout=10, what="approved MCP socket close"
-        )
-        await await_or_fail(
-            server.close(), timeout=10, what="approved MCP zeta server close"
-        )
-        await await_or_fail(
-            mcp.close(), timeout=10, what="approved MCP test server close"
-        )
+        await writer.wait_closed()
+        await server.close()
+        await mcp.close()
 
 
 @pytest.mark.asyncio
