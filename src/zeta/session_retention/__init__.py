@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from ..core.session_files import (
     SessionError,
@@ -112,6 +112,13 @@ class PreviewSnapshot:
     count: int
     bytes: int
     created_at: str
+
+
+@dataclass(frozen=True)
+class Yielded:
+    """Internal planner control outcome; never a client-visible result."""
+
+    reason: Literal["user", "stop"]
 
 
 @dataclass(frozen=True)
@@ -427,7 +434,7 @@ class _Budget:
     entries: int = 0
     records: int = 0
     record_bytes: int = 0
-    yield_check: Callable[[], bool] | None = None
+    yield_check: Callable[[], bool | str] | None = None
 
     def charge_entry(self, size: int = 0) -> None:
         self.entries += 1
@@ -605,8 +612,8 @@ class RetentionPlanner:
 
     def run_pass(
         self, *, days: int, commit_state: bool = True,
-        yield_check: Callable[[], bool] | None = None,
-    ) -> PassResult:
+        yield_check: Callable[[], bool | str] | None = None,
+    ) -> PassResult | Yielded:
         """Advance one bounded sweep step and return what it proved."""
         if type(days) is not int or days <= 0 or days > 3650:
             raise RetentionPlannerError("retention days must be in 1..3650")
@@ -614,7 +621,7 @@ class RetentionPlanner:
             return PassResult(enabled=False, complete=False)
         if planner_request_pending(self.home):
             self.close()
-            return PassResult(enabled=True, complete=False)
+            return Yielded("user")
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             return self._run_pass(
@@ -627,8 +634,8 @@ class RetentionPlanner:
 
     def _run_pass(
         self, home_fd: int, days: int, *, commit_state: bool = True,
-        yield_check: Callable[[], bool] | None = None,
-    ) -> PassResult:
+        yield_check: Callable[[], bool | str] | None = None,
+    ) -> PassResult | Yielded:
         self._yield_check = yield_check
         self._prepared_commit = None
         self._commit_baseline = _load_state(home_fd)
@@ -657,7 +664,8 @@ class RetentionPlanner:
             return transaction_result
         if outcome.yielded:
             self.close()
-            return PassResult(enabled=True, complete=False, mode="yielded")
+            reason = yield_check() if yield_check is not None else "user"
+            return Yielded("stop" if reason == "stop" else "user")
         budget = _Budget(
             self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
             yield_check=yield_check or (lambda: planner_request_pending(self.home)),

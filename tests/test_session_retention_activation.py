@@ -22,8 +22,8 @@ from zeta.session_retention import (
     retention_authority,
 )
 from zeta.session_retention.activation import (
+    Published,
     RetentionActivationOwner,
-    _PublishedPass,
     make_retention_owner,
 )
 from zeta.session_retention.handshake import planner_active
@@ -323,7 +323,7 @@ async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
     def run_pass(_planner, _days, _yield_check=None):
         nonlocal passes
         passes += 1
-        return _PublishedPass({"mode": "preview", "days": 30}, complete=False)
+        return Published({"mode": "preview", "days": 30}, complete=False)
 
     owner = RetentionActivationOwner(
         lambda: Planner(), lambda: 30, run_pass=run_pass, wake_seconds=60

@@ -14,6 +14,7 @@ from ..storage_format import StorageFeature, feature_enabled
 from . import (
     _COORDINATOR_DOMAIN,
     RetentionPlanner,
+    Yielded,
     append_retention_history,
     project_retention_result,
     read_retention_history,
@@ -23,13 +24,17 @@ from . import (
 from .handshake import ensure_handshake_files, planner_active, planner_request_pending
 
 
-class _PublishedPass(dict[str, object]):
-    def __init__(
-        self, projection: dict[str, object], *, complete: bool, progressed: bool = False
-    ) -> None:
-        super().__init__(projection)
+class Published:
+    def __init__(self, projection: dict[str, object], *, complete: bool, progressed: bool = False) -> None:
+        self.projection = projection
         self.complete = complete
         self.progressed = progressed
+
+    def __getitem__(self, key: str) -> object:
+        return self.projection[key]
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.projection.get(key, default)
 
 
 def _progress_marker(planner: Any, projection: dict[str, object] | None = None) -> str:
@@ -68,17 +73,17 @@ def make_retention_owner(
 
     def run_pass(
         planner: Any, current_days: int, yield_check: Callable[[], bool] | None = None
-    ) -> dict[str, object]:
+    ) -> Published | Yielded:
         before = _progress_marker(planner)
         result = planner.run_pass(
             days=current_days, commit_state=False, yield_check=yield_check
         )
+        if isinstance(result, Yielded):
+            planner.close()
+            return result
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
-        if result.mode == "yielded":
-            planner.close()
-            return _PublishedPass(projection, complete=True)
         history = read_retention_history(root)
         if (
             history
@@ -101,11 +106,11 @@ def make_retention_owner(
                     append_retention_history(
                         root, retained, projection, authority_held=True
                     )
-                return _PublishedPass(projection, complete=True)
+                return Published(projection, complete=True)
             if last_projection is None or not _same_projection(last_projection, projection):
                 append_retention_history(root, retained, projection, authority_held=True)
                 last_projection = projection
-        return _PublishedPass(
+        return Published(
             projection, complete=result.complete,
             progressed=before != _progress_marker(planner, projection),
         )
@@ -148,9 +153,8 @@ class RetentionActivationOwner:
         days: Callable[[], int],
         *,
         wake_seconds: float = 86_400,
-        sleep: Callable[[float], Any] | None = None,
         publish: Callable[[Any], Any] | None = None,
-        run_pass: Callable[[Any, int], Any] | None = None,
+        run_pass: Callable[[Any, int], Published | Yielded] | None = None,
         on_error: Callable[[Exception, int], Any] | None = None,
         home: str | Path | None = None,
         close_lease: Callable[[], Any] | None = None,
@@ -162,7 +166,6 @@ class RetentionActivationOwner:
         self._home = Path(home) if home is not None else None
         self._days = days
         self._wake_seconds = wake_seconds
-        self._sleep = sleep or asyncio.sleep
         self._publish = publish
         self._run_pass = run_pass or (
             lambda planner, current_days, yield_check=None: planner.run_pass(
@@ -178,7 +181,6 @@ class RetentionActivationOwner:
         self._activation_enabled = activation_enabled
         self._session_available = session_available
         self._disable = disable
-        self._episode_user_yield = False
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -214,8 +216,8 @@ class RetentionActivationOwner:
             await asyncio.to_thread(self._close_lease)
             self._close_lease = None
 
-    def _run_episode(self) -> tuple[list[Any], Exception | None]:
-        projections: list[Any] = []
+    def _run_episode(self) -> tuple[list[Published], Yielded | Exception | None]:
+        projections: list[Published] = []
         failure: Exception | None = None
         planner = None
         try:
@@ -227,7 +229,7 @@ class RetentionActivationOwner:
                     (self._home / name).is_file()
                     for name in ("retention-arm.json", "retention-state.json")
                 ):
-                    projections.append(self._disable())
+                    projections.append(Published(self._disable(), complete=True))
                 return projections, None
             planner = self._planner_factory()
             if not getattr(planner, "enabled", True):
@@ -237,24 +239,21 @@ class RetentionActivationOwner:
                 days = self._days()
                 if days == 0:
                     if self._disable is not None:
-                        projections.append(self._disable())
+                        projections.append(Published(self._disable(), complete=True))
                 else:
                     while not self._stop.is_set():
                         if self._home is not None and planner_request_pending(self._home):
-                            self._episode_user_yield = True
-                            break
+                            return projections, Yielded("user")
                         projection = self._run_pass(
                             planner, days,
-                            lambda: self._stop.is_set()
-                            or (
-                                self._home is not None
-                                and planner_request_pending(self._home)
+                            lambda: "stop" if self._stop.is_set() else (
+                                "user" if self._home is not None and planner_request_pending(self._home) else None
                             ),
                         )
+                        if isinstance(projection, Yielded):
+                            return projections, projection
                         projections.append(projection)
-                        if getattr(projection, "complete", True) or not getattr(
-                            projection, "progressed", False
-                        ):
+                        if projection.complete or not projection.progressed:
                             break
                 planner.close()
                 planner = None
@@ -274,35 +273,36 @@ class RetentionActivationOwner:
                 self._episode_task = asyncio.create_task(
                     asyncio.to_thread(self._run_episode), name="retention-episode"
                 )
-                projections, failure = await asyncio.shield(self._episode_task)
+                projections, outcome = await asyncio.shield(self._episode_task)
                 self._episode_task = None
                 try:
                     published_projection: dict[str, object] | None = None
                     for projection in projections:
                         if (
                             published_projection is not None
-                            and _same_projection(published_projection, projection)
+                            and _same_projection(published_projection, projection.projection)
                         ):
                             continue
                         if self._publish is not None:
-                            published = self._publish(projection)
+                            published = self._publish(projection.projection)
                             if inspect.isawaitable(published):
                                 await published
-                        published_projection = projection
-                    if failure is not None and not self._stop.is_set():
-                        error = await asyncio.to_thread(self._on_error, failure, self._days())
+                        published_projection = projection.projection
+                    if isinstance(outcome, Exception) and not self._stop.is_set():
+                        error = await asyncio.to_thread(self._on_error, outcome, self._days())
                         if self._publish is not None:
                             published = self._publish(error)
                             if inspect.isawaitable(published):
                                 await published
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - publication must not kill the owner
-                    failure = exc
+                except Exception:  # noqa: BLE001,S110 - publication must not kill the owner
+                    pass
                 if self._stop.is_set():
                     return
-                if self._episode_user_yield and not self._stop.is_set():
-                    self._episode_user_yield = False
+                if isinstance(outcome, Yielded):
+                    if outcome.reason == "stop":
+                        return
                     await asyncio.sleep(0)
                     continue
                 self._wake.clear()
