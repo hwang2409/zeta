@@ -720,6 +720,9 @@ class AgentTranscriptControl(UIControl):
         previous = self._source
         if previous is not None:
             await previous.close()
+        if path != self._path:
+            self.presenter.clear()
+            self._tool_calls.clear()
         self._source = source
         self._path = path
         if self._history_pager is None:
