@@ -38,16 +38,17 @@ class NotificationStateMixin:
 
         if task_id not in self._task_notification_ids:
             return None
-        return next(
+        ref = next(
             (
-                self._snapshot_entry(entry)
-                for entry in reversed(self._resident_rows.entries)
-                if entry.type == "notification"
-                and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-                and entry.data.get("task_id") == task_id
+                ref
+                for ref in reversed(self._resident_rows.rows)
+                if ref.type == "notification"
+                and isinstance(ref.facts, tuple)
+                and ref.facts[:2] == (TASK_EXITED_NOTIFICATION_KIND, task_id)
             ),
             None,
         )
+        return self._snapshot_entry(self.entry(ref)) if ref is not None else None
 
     def has_task_exit_notification(self: ConversationStore, task_id: str) -> bool:
         return task_id in self._task_notification_ids

@@ -11,7 +11,8 @@ ROOT = Path(__file__).parents[1] / "src" / "zeta"
 # Bumped on 2026-11-12 to 1288 for the one-publication-owner seam in
 # server/approval_lifecycle.py (_publish_end extracted from _finish_record and
 # the _settlement_for_end helper that gives the runtime routes one owner).
-MAX_FILE_LINES = 1288
+# Bumped to 1508 for the bounded-payload row index and derived history sidecar.
+MAX_FILE_LINES = 1508
 # Built-in todo state and tool modules keep their layer-specific boundaries.
 # Bumped on 2026-08-27 for the dedicated TUI agent-card seam and again on
 # 2026-09-06 for the ZETA-77 external tool discovery seam.

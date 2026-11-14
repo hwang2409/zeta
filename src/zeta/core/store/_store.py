@@ -95,7 +95,15 @@ from ._pending_prompts import (
     PendingPromptStoreMixin,
 )
 from ._row_history import RecentRowsMixin, TurnHistoryMixin
-from ._rows import MessageFacts, ResidentRows, StartupFactsMixin, sent_message_receipts
+from ._rows import (
+    MessageFacts,
+    ResidentRows,
+    RowRef,
+    StartupFactsMixin,
+    TranscriptRows,
+    _message_identity_digest,
+    sent_message_receipts,
+)
 from ._session_state import SessionStatePersistenceMixin
 from ._step_delivery import StepDeliveryStoreMixin
 from ._validation import (
@@ -251,6 +259,12 @@ class ConversationStore(
                 _, self.directory_fd = lease.enter_context(
                     session_directory(self.root_dir, self.session_id, lifetime=True)
                 )
+                self._resident_rows.bind_source(
+                    self.directory_fd,
+                    None,
+                    self._reset_generation,
+                    lambda: self._reset_generation,
+                )
                 if _read_only:
                     if _observer_snapshot:
                         self._sync_observer_snapshot()
@@ -268,6 +282,10 @@ class ConversationStore(
                         _recovery_owner,
                     )
                     lease.callback(self._runtime_lease.close)
+                    if self._history_index is None:
+                        self._history_index = HistoryIndex(
+                            self.session_dir, self.directory_fd, observer=False
+                        )
                     if _validated_log_state is not None:
                         self._install_log_state(_validated_log_state)
                         self._strict_snapshot_sync = True
@@ -435,15 +453,17 @@ class ConversationStore(
         notification_tui_presentations: set[str] = set()
         pending_prompts: set[str] = set()
         pending_prompt_acks: set[str] = set()
-        by_id = {entry.id: entry for entry in self._resident_rows.entries}
+        by_id = {ref.id: ref for ref in self._resident_rows.rows}
         active_ids: set[str] = set()
-        current = self._resident_rows.entries[-1] if self._resident_rows.entries else None
+        current = self._resident_rows.rows[-1] if self._resident_rows.rows else None
         while current is not None:
             if current.id in active_ids:
                 break
             active_ids.add(current.id)
             current = by_id.get(current.parent_id) if current.parent_id else None
-        for expected_seq, entry in enumerate(self._resident_rows.entries, start=1):
+        for expected_seq, entry in enumerate(
+            self._resident_rows.stream_rows(self._resident_rows.rows), start=1
+        ):
             if entry.seq != expected_seq:
                 raise ConversationIntegrityError(
                     f"non-monotonic conversation sequence at {entry.id}"
@@ -627,8 +647,8 @@ class ConversationStore(
         self, rows: list[tuple[str, dict[str, Any]]]
     ) -> list[ConversationEntry]:
         prior_ids = set(self._entry_ids)
-        parent_id = self._resident_rows.entries[-1].id if self._resident_rows.entries else None
-        next_seq = self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1
+        parent_id = self._resident_rows.rows[-1].id if self._resident_rows.rows else None
+        next_seq = self._resident_rows.rows[-1].seq + 1 if self._resident_rows.rows else 1
         entries: list[ConversationEntry] = []
         for index, (entry_type, data) in enumerate(rows):
             self._validate_notification_write(entry_type, data)
@@ -659,18 +679,31 @@ class ConversationStore(
             if touched
             else _ApprovalValidationOverlay()
         )
-        resident_length = len(self._resident_rows.entries)
+        resident_length = len(self._resident_rows.rows)
         self._resident_rows.extend(entries)
         try:
             self._validate_entries(approvals, {entry.id for entry in entries})
         finally:
             self._resident_rows.truncate_to(resident_length)
-        encoded = b"".join(encode_json(entry.to_dict()) + b"\n" for entry in entries)
+        encoded_rows = [encode_json(entry.to_dict()) + b"\n" for entry in entries]
+        encoded = b"".join(encoded_rows)
         self._write_bytes(encoded)
+        start_offset = (
+            os.stat(
+                "conversation.jsonl",
+                dir_fd=self.directory_fd,
+                follow_symlinks=False,
+            ).st_size
+            - len(encoded)
+        )
         self._apply_history_index_entries(tuple(entries))
         fold = self._delivery_fold.staged()
-        for entry in entries:
-            self._resident_rows.append(entry)
+        offset = start_offset
+        for entry, encoded_row in zip(entries, encoded_rows, strict=True):
+            self._resident_rows.append(
+                entry, offset=offset, length=len(encoded_row)
+            )
+            offset += len(encoded_row)
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
             fold.apply(entry)
@@ -701,12 +734,12 @@ class ConversationStore(
         if entry_id in prior_ids:
             raise ConversationIntegrityError(f"duplicate conversation id: {entry_id}")
         entry = ConversationEntry(
-            seq=(self._resident_rows.entries[-1].seq + 1 if self._resident_rows.entries else 1),
+            seq=(self._resident_rows.rows[-1].seq + 1 if self._resident_rows.rows else 1),
             id=entry_id,
             parent_id=(
                 parent_id
                 if parent_id is not None
-                else (self._resident_rows.entries[-1].id if self._resident_rows.entries else None)
+                else (self._resident_rows.rows[-1].id if self._resident_rows.rows else None)
             ),
             lane="main",
             type=entry_type,
@@ -715,7 +748,7 @@ class ConversationStore(
         # Reject with the same payload and relation validators used while loading
         # before any authoritative bytes reach disk.
         self._validate_entry_payload(entry)
-        linear = not self._resident_rows.entries or entry.parent_id == self._resident_rows.entries[-1].id
+        linear = not self._resident_rows.rows or entry.parent_id == self._resident_rows.rows[-1].id
         touched = _ApprovalValidationOverlay.touched([entry])
         if touched or entry.type == "approval_request":
             if linear:
@@ -724,12 +757,13 @@ class ConversationStore(
                 # A fork re-selects the active branch, so the active-branch
                 # index cannot seed a sibling branch. Validate the whole
                 # candidate branch before any bytes reach disk.
-                resident_length = len(self._resident_rows.entries)
+                resident_length = len(self._resident_rows.rows)
                 self._resident_rows.append(entry)
                 try:
                     self._validate_entries()
                 finally:
                     self._resident_rows.truncate_to(resident_length)
+        encoded_length = len(encode_json(entry.to_dict())) + 1
         previous_deadline = self._write_deadline
         self._write_deadline = deadline
         try:
@@ -737,11 +771,24 @@ class ConversationStore(
         finally:
             self._write_deadline = previous_deadline
         if linear:
-            self._apply_history_index_entries((entry,))
+            self._apply_history_index_entries(
+                (entry,), rebuild_unavailable=deadline is None
+            )
         # A fork is rebuilt by _sync_history_index below: skipping the
         # incremental apply leaves the stored boundary behind, so the sync
         # detects the non-contiguous tail and fully rebuilds the active branch.
-        self._resident_rows.append(entry)
+        self._resident_rows.append(
+            entry,
+            offset=(
+                os.stat(
+                    "conversation.jsonl",
+                    dir_fd=self.directory_fd,
+                    follow_symlinks=False,
+                ).st_size
+                - encoded_length
+            ),
+            length=encoded_length,
+        )
         self._record_entry_prefix(entry)
         self._entry_ids.add(entry.id)
         self._sent_message_receipts.extend(sent_message_receipts(entry))
@@ -752,10 +799,12 @@ class ConversationStore(
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.
             self._validate_entries(
-                _ApprovalValidationOverlay(), {row.id for row in self._resident_rows.entries}
+                _ApprovalValidationOverlay(), {row.id for row in self._resident_rows.rows}
             )
             self._rebuild_incremental_validation_state()
-            self._sync_history_index(self._resident_rows.entries)
+            self._sync_history_index(
+                self._resident_rows.stream_rows(self._resident_rows.rows)
+            )
         if self.on_persisted_activity is not None:
             self.on_persisted_activity(entry.seq)
         self._record_physical_entry(entry)
@@ -991,9 +1040,8 @@ class ConversationStore(
     def _branch_to_parent(self, parent_id: str | None) -> list[ConversationEntry]:
         if parent_id is None:
             return []
-        by_id = {entry.id: entry for entry in self._resident_rows.entries}
-        current = by_id.get(parent_id)
-        branch: list[ConversationEntry] = []
+        current = self._resident_rows.row_by_id(parent_id)
+        branch: list[RowRef] = []
         seen: set[str] = set()
         while current is not None:
             if current.id in seen:
@@ -1002,8 +1050,12 @@ class ConversationStore(
                 )
             seen.add(current.id)
             branch.append(current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return list(reversed(branch))
+            current = (
+                self._resident_rows.row_by_id(current.parent_id)
+                if current.parent_id
+                else None
+            )
+        return list(self._resident_rows.stream_rows(reversed(branch)))
 
     def append_approval_request(
         self,
@@ -1117,20 +1169,33 @@ class ConversationStore(
         return None
 
     @property
+    def resident_payload_bytes(self) -> int:
+        return self._resident_rows.resident_payload_bytes
+
+    @property
     def closed(self) -> bool:
         """Whether this store instance has been closed (its fd released)."""
         return self._closed
 
     def active_branch_head_id(self) -> str | None:
         """Return the active leaf identity without materializing the branch."""
-        return self._resident_rows.entries[-1].id if self._resident_rows.entries else None
+        return self._resident_rows.rows[-1].id if self._resident_rows.rows else None
 
     def active_branch_head_sequence(self) -> int:
         """Return the active leaf sequence without materializing the branch."""
-        return self._resident_rows.entries[-1].seq if self._resident_rows.entries else 0
+        return self._resident_rows.rows[-1].seq if self._resident_rows.rows else 0
 
     def branch_refs(self):
         return self._resident_rows.branch_refs()
+
+    def context_refs(self):
+        return self._resident_rows.context_refs()
+
+    def context_source_seqs(self):
+        return self._resident_rows.context_source_seqs()
+
+    def legacy_pinned_source_seq(self, marker_id: str) -> int | None:
+        return self._resident_rows.legacy_pinned_source_seq(marker_id)
 
     def last_message_ref(self):
         return self._resident_rows.last_message_ref()
@@ -1178,6 +1243,15 @@ class ConversationStore(
     def entry(self, ref):
         return self._resident_rows.entry(ref)
 
+    def transcript_rows(self, refs) -> TranscriptRows:
+        stat = os.stat("conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False)
+        return TranscriptRows(
+            path=self.path,
+            refs=tuple(refs),
+            source_identity=(stat.st_dev, stat.st_ino),
+            relative_offsets=self._resident_rows.relative_offsets,
+        )
+
     def stream_rows(self, refs, *, batch=256):
         if self._owner_thread_id == threading.get_ident():
             raise RuntimeError("stream_rows must run off the owner thread")
@@ -1222,14 +1296,19 @@ class ConversationStore(
         path: the message was just appended, so a reverse scan finds it near
         the tail without copying the whole branch.
         """
-        for entry in reversed(self._resident_rows.branch):
-            if entry.type != "message":
+        digest = _message_identity_digest(message.to_dict())
+        for ref in reversed(self._resident_rows.branch_refs()):
+            if not isinstance(ref.facts, MessageFacts):
                 continue
-            if Message.from_dict(entry.data["message"]) == message:
+            if ref.facts.identity_digest == digest:
                 return True
         return False
 
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():
-            return self._delivery_fold.tool_results.get(tool_call_id)
+            seq = self._delivery_fold.tool_result_seqs.get(tool_call_id)
+            if seq is None:
+                return None
+            ref = self._resident_rows.rows[seq - 1]
+            return Message.from_dict(self.entry(ref).data["message"]).tool_result

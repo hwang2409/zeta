@@ -33,6 +33,8 @@ def capture_slash_status(
     child_usage = context_assembler.descendant_usage
     items = loop.store.todo_items()
     hooks = loop.hooks
+    transcript_store = loop.store
+    transcript_refs = transcript_store.branch_refs()
     return SlashStatusSnapshot(
         base=SlashStatus(
             session_id=session_id,
@@ -86,6 +88,6 @@ def capture_slash_status(
             ),
             project_context_health=project_context_health,
         ),
-        transcript_entries=tuple(loop.store.entry(ref) for ref in loop.store.branch_refs()),
+        transcript_entries=transcript_store.transcript_rows(transcript_refs),
         token_counter=context_assembler.token_counter,
     )

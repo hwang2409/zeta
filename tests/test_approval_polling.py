@@ -381,3 +381,38 @@ async def test_nested_authorize_polling_preserves_innermost_abort_context(
     finally:
         for store in reversed(stores):
             store.close()
+
+
+@pytest.mark.asyncio
+async def test_delegated_abort_resolution_aborts_the_turn_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: when subtree cleanup settles a delegated approval to abort
+    # (reason child_cleanup) on its own path, the waiting authorize call must
+    # abort the turn's own signal. Otherwise the agent loop resumes from the
+    # settled approval and dispatches another provider turn before the durable
+    # cancellation confirmation sets that signal (the grandchild-cancel race).
+    harness = _harness(tmp_path, "nested")
+    signal = _ControlledSignal()
+    tick = _ControlledTick()
+    monkeypatch.setattr(approval_module.asyncio, "sleep", tick)
+    task: asyncio.Task[ApprovalDecision | None] | None = None
+    try:
+        task = asyncio.create_task(harness.authorize(signal))
+        await await_or_fail(signal.wait_entered.wait(), what="approval abort waiter")
+        await await_or_fail(tick.entered.wait(), what="approval poll tick")
+        # Settle externally, as subtree cleanup does, without touching the signal.
+        assert harness.store.resolve_approval(
+            harness.call.id, "abort", reason="child_cleanup"
+        )
+        tick.released.set()
+        assert await await_or_fail(task, what="externally aborted approval") is None
+        assert signal.is_set()
+    finally:
+        tick.released.set()
+        signal.abort()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        harness.close()

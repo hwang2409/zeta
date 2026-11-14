@@ -290,9 +290,7 @@ class PendingPromptQueue:
         )
 
     def _queue_closed_unlocked(self) -> bool:
-        return any(
-            entry.type == "pending_queue_closed" for entry in self._store._resident_rows.entries
-        )
+        return self._store._delivery_fold.queue_closed
 
     def _pending_unlocked(self) -> list[ConversationEntry]:
         return [
