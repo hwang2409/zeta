@@ -752,12 +752,15 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         """List valid sessions from metadata without opening conversation stores."""
         try:
             with session_root(self.sessions_dir) as root_fd:
-                names = os.listdir(os.dup(root_fd))
+                names = os.listdir(root_fd)
         except FileNotFoundError:
             return []
         sessions: list[SessionMetadata] = []
         for name in names:
             try:
+                sessions.append(self.read_metadata(name))
+            except SessionInUseError:
+                # listing must not drop a root held by a retention pass
                 directory_fd = os.open(
                     self.sessions_dir / name, os.O_RDONLY | os.O_DIRECTORY
                 )
