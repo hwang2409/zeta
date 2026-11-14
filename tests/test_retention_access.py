@@ -208,6 +208,7 @@ def test_planner_crash_releases_the_target(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.retention_on_loop_allowed
 async def test_on_loop_contention_rejects_before_wait(tmp_path: Path) -> None:
     _prepare(tmp_path)
     process, _ = _start_holder(tmp_path)
@@ -253,6 +254,7 @@ def test_epoch_ten_keeps_old_refusal_without_handshake_files(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.retention_on_loop_allowed
 async def test_on_loop_contention_rejects_before_request_flock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -81,7 +81,6 @@ def acquire_after_retention_yield(
     timeout: float = _WAIT_DEADLINE,
 ) -> object:
     """Retry one refused primitive while giving an active planner one chance."""
-    _off_loop()
     try:
         return acquire()
     except BlockingIOError as exc:

@@ -1086,11 +1086,29 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture(autouse=True)
 def blocking_session_locks_leave_event_loop(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> Generator[None, None, None]:
     """Make every test catch direct blocking session access on an event loop."""
-    from zeta.core import session_files
+    from zeta.core import retention_access, session_files
 
     original = session_files.require_off_loop_lock
+    acquire = retention_access.acquire_after_retention_yield
+    allow_on_loop = request.node.get_closest_marker("retention_on_loop_allowed") is not None
+
+    def guarded_acquire(*args, **kwargs):
+        if not allow_on_loop:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError(
+                    "retention lock requested on an asyncio event-loop thread; "
+                    "use asyncio.to_thread"
+                )
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(retention_access, "acquire_after_retention_yield", guarded_acquire)
 
     def guard(kind: str, error=RuntimeError) -> None:
         try:
