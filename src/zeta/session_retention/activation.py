@@ -9,12 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..locking import RETENTION_HOME_ID, domain_authority
 from ..storage_format import StorageFeature, feature_enabled
 from . import (
-    _COORDINATOR_DOMAIN,
     RetentionPlanner,
     Yielded,
+    _coordinator_authority,
     append_retention_history,
     project_retention_result,
     read_retention_history,
@@ -84,17 +83,20 @@ def make_retention_owner(
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
-        history = read_retention_history(root)
-        if (
-            history
-            and history[-1].get("mode") == "armed"
-            and history[-1].get("days") == current_days
-            and result.mode is None
-        ):
-            projection = dict(history[-1])
         nonlocal last_projection
-        with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
-            committed = planner.commit_state()
+        with _coordinator_authority(root) as token:
+            history = read_retention_history(root)
+            if (
+                history
+                and history[-1].get("mode") == "armed"
+                and history[-1].get("days") == current_days
+                and result.mode is None
+            ):
+                planner.close()
+                projection = dict(history[-1])
+                last_projection = projection
+                return Published(projection, complete=True)
+            committed = planner.commit_state(token)
             if not committed:
                 planner.close()
                 history = read_retention_history(root)
@@ -103,12 +105,10 @@ def make_retention_owner(
                 elif result.mode is not None and (
                     not history or not _same_projection(history[-1], projection)
                 ):
-                    append_retention_history(
-                        root, retained, projection, authority_held=True
-                    )
+                    append_retention_history(token, root, retained, projection)
                 return Published(projection, complete=True)
             if last_projection is None or not _same_projection(last_projection, projection):
-                append_retention_history(root, retained, projection, authority_held=True)
+                append_retention_history(token, root, retained, projection)
                 last_projection = projection
         return Published(
             projection, complete=result.complete,
@@ -122,7 +122,8 @@ def make_retention_owner(
             days=current_days,
             errors=(f"{type(exc).__name__}: {exc}",),
         )
-        append_retention_history(root, retained, projection)
+        with _coordinator_authority(root) as token:
+            append_retention_history(token, root, retained, projection)
         return projection
 
     return RetentionActivationOwner(

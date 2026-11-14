@@ -194,16 +194,45 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
     )
 
 
+_COORDINATOR_TOKEN_MARKER = object()
+
+
+class CoordinatorToken:
+    """Capability for retention durable writes during one coordinator section."""
+
+    __slots__ = ("_active",)
+
+    def __init__(self, marker: object) -> None:
+        if marker is not _COORDINATOR_TOKEN_MARKER:
+            raise TypeError("retention coordinator tokens are authority-owned")
+        self._active = True
+
+    def require_active(self) -> None:
+        if not self._active:
+            raise RuntimeError("retention coordinator token is no longer active")
+
+    def close(self) -> None:
+        self._active = False
+
+
+@contextmanager
+def _coordinator_authority(root: Path):
+    with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
+        token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+        try:
+            yield token
+        finally:
+            token.close()
+
+
 def append_retention_history(
-    home: str | Path, lease: WriterLease, result: Mapping[str, object], *, authority_held: bool = False
+    token: CoordinatorToken, home: str | Path, lease: WriterLease, result: Mapping[str, object]
 ) -> None:
-    """Durably replace the bounded, validated retention history."""
+    """Durably replace history; the token proves coordinator ownership."""
+    token.require_active()
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
         return
     validate_retention_history(result)
-    if not authority_held:
-        with domain_authority(Path(home), RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
-            return append_retention_history(home, lease, result, authority_held=True)
     path = Path(home) / _HISTORY_FILENAME
     rows: list[dict[str, object]] = []
     try:
@@ -256,7 +285,11 @@ def _try_authority(root: Path, *, exclusive: bool, deadline: float):
                 root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN,
                 exclusive=exclusive, nonblocking=True,
             ):
-                yield
+                token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+                try:
+                    yield token
+                finally:
+                    token.close()
                 return
         except BlockingIOError:
             if time.monotonic() >= deadline:
@@ -285,7 +318,7 @@ def retention_authority(
     try:
         if days == 0:
             with (
-                _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
+                _try_authority(root, exclusive=True, deadline=time.monotonic() + 35) as token,
                 SessionReferenceGate(root, lease).exclusive(timeout=10),
             ):
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -305,10 +338,10 @@ def retention_authority(
                 finally:
                     os.close(home_fd)
                 projection = retention_result(timestamp=now(), mode="disarmed", days=0)
-                append_retention_history(root, lease, projection, authority_held=True)
+                append_retention_history(token, root, lease, projection)
                 return RetentionAuthorityResult("retention disabled", projection, True)
         with (
-            _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
+            _try_authority(root, exclusive=True, deadline=time.monotonic() + 35) as token,
             SessionReferenceGate(root, lease).exclusive(timeout=10),
         ):
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -318,7 +351,7 @@ def retention_authority(
                     if not isinstance(preview, dict) or preview.get("days") != days:
                         message = "retention arm requires a completed preview for the current days"
                         projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
-                        append_retention_history(root, lease, projection, authority_held=True)
+                        append_retention_history(token, root, lease, projection)
                         return RetentionAuthorityResult(message, projection, False)
                     arm = {
                         "schema_version": 1, "gate_version": 1,
@@ -328,7 +361,7 @@ def retention_authority(
                     validate_retention_arm(arm)
                     atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode())
                     projection = retention_result(timestamp=now(), mode="armed", days=days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
-                    append_retention_history(root, lease, projection, authority_held=True)
+                    append_retention_history(token, root, lease, projection)
                     return RetentionAuthorityResult(_ARM_WARNING, projection, True)
                 finally:
                     os.close(home_fd)
@@ -408,7 +441,8 @@ def _load_state(home_fd: int) -> dict | None:
     return value
 
 
-def _store_state(home_fd: int, state: dict) -> None:
+def _store_state(token: CoordinatorToken, home_fd: int, state: dict) -> None:
+    token.require_active()
     validate_retention_state(state)
     atomic_publish_file(
         home_fd,
@@ -692,18 +726,17 @@ class RetentionPlanner:
             self._sweep = None
         prepared = copy.deepcopy(self._state_payload())
         self._prepared_commit = (copy.deepcopy(self._commit_baseline), prepared)
-        with domain_authority(
-            self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
-        ):
+        with _coordinator_authority(self.home) as token:
             if commit_state:
-                _store_state(home_fd, prepared)
+                _store_state(token, home_fd, prepared)
         return PassResult(
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
         )
 
-    def commit_state(self) -> bool:
+    def commit_state(self, token: CoordinatorToken) -> bool:
+        token.require_active()
         prepared = self._prepared_commit
         self._prepared_commit = None
         if prepared is None:
@@ -714,7 +747,7 @@ class RetentionPlanner:
             if _load_state(home_fd) != baseline:
                 self.close()
                 return False
-            _store_state(home_fd, payload)
+            _store_state(token, home_fd, payload)
             return True
         finally:
             os.close(home_fd)

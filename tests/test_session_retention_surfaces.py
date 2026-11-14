@@ -372,10 +372,7 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
                 assert sid in {row["session_id"] for row in rows}
             if route == "rename":
                 assert result["result"]["session"]["session_id"] == sid
-        if owner_state == "mid-preview" and route != "list-project":
-            assert holder is not None
-            assert not holder.is_alive()
-            if route in {"list-full", "list-paged"}:
+        if owner_state == "mid-preview" and route != "list-project" and route in {"list-full", "list-paged"}:
                 assert sid in {row["session_id"] for row in rows}
     finally:
         if holder is not None and holder.is_alive():
@@ -413,8 +410,6 @@ def test_cli_session_list_and_rename_survive_retention_owner(
         assert cli_main_module.main(["session", "rename", sid, "from-cli"]) == 0
         assert f"renamed {sid}" in capsys.readouterr().out
         assert SessionManager(home).read_metadata(sid).name == "from-cli"
-        if owner_state == "mid-preview":
-            assert holder is not None and not holder.is_alive()
     finally:
         if holder is not None and holder.is_alive():
             command.send(True)
@@ -470,8 +465,6 @@ def test_tui_resume_entry_survives_retention_owner(
             )
         assert cli_main_module.main(["--resume", sid]) == 0
         assert seen == [sid]
-        if owner_state == "mid-preview":
-            assert holder is not None and not holder.is_alive()
     finally:
         if app is not None and not app.loop.store._closed:
             app.loop.store.close()

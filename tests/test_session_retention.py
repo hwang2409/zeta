@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
@@ -22,7 +23,11 @@ from zeta.project_inbox import ProjectInbox
 from zeta.project_inbox_sent import SentMessageTracker
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent
-from zeta.session_retention import RetentionBounds, RetentionPlanner
+from zeta.session_retention import (
+    RetentionBounds,
+    RetentionPlanner,
+    _coordinator_authority,
+)
 from zeta.session_retention.pin import (
     RETENTION_PIN_FILENAME,
     is_retention_pinned,
@@ -38,16 +43,43 @@ def _directory(path):
     return session_root(path)
 
 
+def test_retention_durable_writers_have_one_owner():
+    root = Path(__file__).parents[1] / "src"
+    forbidden = {"atomic_publish_file", "_store_state", "unlink_session_file"}
+    writers = []
+    retention_names = {"retention-history.jsonl", "retention-state.json", "retention-arm.json"}
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id in forbidden:
+                is_retention_path = path.as_posix().endswith("session_retention/__init__.py")
+                has_retention_name = any(
+                    isinstance(value, ast.Constant) and value.value in retention_names
+                    for value in ast.walk(node)
+                )
+                if is_retention_path or has_retention_name:
+                    writers.append((path.relative_to(root).as_posix(), node.func.id))
+    assert {path for path, _name in writers} == {"zeta/session_retention/__init__.py"}
+    assert sorted(name for _path, name in writers) == [
+        "_store_state", "_store_state", "atomic_publish_file", "atomic_publish_file", "atomic_publish_file",
+        "unlink_session_file", "unlink_session_file",
+    ]
+
+
 def test_retention_history_trims_oldest_row(tmp_path):
     from zeta.session_retention import append_retention_history, retention_result
 
     with _opened_lease(tmp_path) as lease:
         for index in range(129):
-            append_retention_history(
-                tmp_path,
-                lease,
-                retention_result(timestamp=str(index), mode="preview", days=30),
-            )
+            with _coordinator_authority(tmp_path) as token:
+                append_retention_history(
+                    token,
+                    tmp_path,
+                    lease,
+                    retention_result(timestamp=str(index), mode="preview", days=30),
+                )
     rows = session_retention.read_retention_history(tmp_path)
     assert len(rows) == 128
     assert rows[0]["timestamp"] == "1"

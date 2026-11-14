@@ -123,6 +123,50 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_owner_drops_prepared_preview_after_concurrent_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        def seed_preview():
+            with RetentionPlanner(home, lease) as planner:
+                result = planner.run_pass(days=30)
+            assert result.complete
+        await asyncio.to_thread(seed_preview)
+        before = (home / "retention-state.json").read_bytes()
+        owner = make_retention_owner(home, lease, lambda: 30)
+        original_authority = activation_module._coordinator_authority
+        entered = threading.Event()
+        release = threading.Event()
+
+        @contextlib.contextmanager
+        def delayed_authority(root):
+            entered.set()
+            assert release.wait(10), "owner did not receive authority release"
+            with original_authority(root) as token:
+                yield token
+
+        # test-contract: seam force the coordinator order at the owner interface.
+        monkeypatch.setattr(activation_module, "_coordinator_authority", delayed_authority)
+        task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
+        armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
+        assert armed.applied and armed.projection["mode"] == "armed"
+        release.set()
+        projections, failure = await asyncio.wait_for(task, 10)
+        assert failure is None
+        # test-contract: seam the activation owner projection is its public interface.
+        assert projections[-1].projection["mode"] == "armed", (projections, failure, read_retention_history(home))
+        assert (home / "retention-state.json").read_bytes() == before
+        assert read_retention_history(home)[-1]["mode"] == "armed"
+    finally:
+        await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
 async def test_owner_corrupt_history_survives_and_records_error(tmp_path: Path) -> None:
     home = tmp_path / "home"
     initialize_storage_home(home)
@@ -153,10 +197,13 @@ async def test_owner_publish_failure_does_not_stop_owner(tmp_path: Path) -> None
     lease = await asyncio.to_thread(open_writer, home)
     try:
         owner = make_retention_owner(home, lease, lambda: 30)
-        owner.set_publish(lambda _projection: (_ for _ in ()).throw(RuntimeError("publish")))
+        published = asyncio.Event()
+        def fail_publish(_projection):
+            published.set()
+            raise RuntimeError("publish")
+        owner.set_publish(fail_publish)
         owner.start()
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(published.wait(), 10)
         assert owner.task is not None and not owner.task.done()
         await owner.stop()
     finally:
@@ -176,7 +223,7 @@ async def test_two_owners_append_without_lost_rows(
     prepared = {"a": threading.Event(), "b": threading.Event()}
     b_committed = threading.Event()
     original_run_pass = RetentionPlanner.run_pass
-    original_authority = activation_module.domain_authority
+    original_authority = retention_module.domain_authority
 
     def record_prepared(planner, *, days, commit_state=True, yield_check=None):
         result = original_run_pass(
@@ -199,7 +246,7 @@ async def test_two_owners_append_without_lost_rows(
             b_committed.set()
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", record_prepared)
-    monkeypatch.setattr(activation_module, "domain_authority", forced_commit_order)
+    monkeypatch.setattr(retention_module, "domain_authority", forced_commit_order)
     try:
         first = make_retention_owner(home, lease, lambda: 30)
         second = make_retention_owner(home, lease, lambda: 31)
@@ -335,8 +382,14 @@ async def test_owner_cancel_mid_episode_releases_lease(tmp_path: Path, monkeypat
     try:
         owner.start()
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
+        stop_entered = asyncio.Event()
+        original_stop = owner.stop
+        async def stop_with_signal():
+            stop_entered.set()
+            await original_stop()
+        owner.stop = stop_with_signal
         stopping = asyncio.create_task(owner.stop())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(stop_entered.wait(), 10)
         release.set()
         await asyncio.wait_for(stopping, 10)
         replacement = await asyncio.to_thread(open_writer, home)
