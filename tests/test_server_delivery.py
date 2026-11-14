@@ -16,6 +16,7 @@ import pytest
 
 from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.server_backend import StopThenFailBackend
 from tests.support.server_client import event as _event
@@ -76,6 +77,28 @@ class BlockingBackend:
         )
 
 
+class SteerTurnEndBackend:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.first_started = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.release_first = asyncio.Event()
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.calls.append(list(messages))
+        if len(self.calls) == 1:
+            self.first_started.set()
+            await await_or_fail(self.release_first.wait(), what="first backend release")
+        else:
+            self.second_started.set()
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
+        )
+
+
 @pytest.mark.asyncio
 async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
     target = tmp_path / "target.txt"
@@ -127,7 +150,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
 
     async def append(*args: Any, **kwargs: Any):
         append_started.set()
-        await release_append.wait()
+        await await_or_fail(release_append.wait(), what="append release")
         result = await original_append(*args, **kwargs)
         assert request_task is not None
         request_task.cancel()
@@ -135,7 +158,12 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
         return result
 
     store.append_client_delivery_async = append
-    loop = type("Loop", (), {"steer": lambda self, message: effects.append("steer")})()
+
+    def steer(message: Message) -> None:
+        effects.append("steer")
+        store.queue_client_steering(message)
+
+    loop = type("Loop", (), {"steer": lambda self, message: steer(message)})()
     control = type("Control", (), {})()
     control.server = type("Server", (), {"runtime": type("Runtime", (), {
         "loop": loop, "opened": type("Opened", (), {"store": store})(),
@@ -161,10 +189,10 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     request_task = asyncio.create_task(
         getattr(requests, method)({"text": "hello", "delivery_id": "cancel-1"}, features)
     )
-    await append_started.wait()
+    await await_or_fail(append_started.wait(), what="append start")
     release_append.set()
     with pytest.raises(asyncio.CancelledError):
-        await request_task
+        await await_or_fail(request_task, what="canceled delivery request")
 
     assert store.client_delivery("cancel-1") is not None
     # canceled at commit: no echo, the work still runs once
@@ -174,6 +202,11 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     )({"text": "hello", "delivery_id": "cancel-1"}, features)
     assert duplicate["duplicate"] is True
     assert effects == (["start"] if method == "send" else ["steer"])
+    if method == "steer":
+        dropped = await store.drop_client_steering_async("turn_end")
+        assert len(dropped) == 1
+        assert store.client_delivery("cancel-1").status == "dropped"
+        assert not store.has_pending_client_steering
     store.close()
 
 
@@ -425,6 +458,109 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         ]
         assert texts.count("also this") == 1
     finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_steer_commit_and_publish_finish_before_turn_finalization(
+    tmp_path: Path,
+) -> None:
+    backend = SteerTurnEndBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path, "-steer-finalize"),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    resume_publish = asyncio.Event()
+    backend.release_first.clear()
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.first_started.wait(), what="first provider request")
+
+        store = server.runtime.opened.store
+        committed = asyncio.Event()
+        drop_finished = asyncio.Event()
+        finalize_started = asyncio.Event()
+        finalize_finished = asyncio.Event()
+        original_append = store.append_client_delivery_async
+        original_drop = store.drop_client_steering_async
+        original_finalize = server.control.deliveries.finalize_turn
+
+        async def pause_after_commit(*args: Any, **kwargs: Any) -> None:
+            await original_append(*args, **kwargs)
+            if args[0] == "late-steer":
+                committed.set()
+                await await_or_fail(resume_publish.wait(), what="resume steer publication")
+
+        async def track_drop(*args: Any, **kwargs: Any):
+            result = await original_drop(*args, **kwargs)
+            drop_finished.set()
+            return result
+
+        async def track_finalize(*args: Any, **kwargs: Any) -> None:
+            finalize_started.set()
+            try:
+                await original_finalize(*args, **kwargs)
+            finally:
+                finalize_finished.set()
+
+        store.append_client_delivery_async = pause_after_commit
+        store.drop_client_steering_async = track_drop
+        server.control.deliveries.finalize_turn = track_finalize
+        steer = asyncio.create_task(
+            _request(
+                reader,
+                writer,
+                4,
+                "steer",
+                {"text": "must not leak", "delivery_id": "late-steer"},
+            )
+        )
+        await await_or_fail(committed.wait(), what="durable steer commit")
+        backend.release_first.set()
+        await await_or_fail(finalize_started.wait(), what="turn finalization start")
+        guard = getattr(server.control.deliveries, "_steer_turn_guard", None)
+        if guard is None:
+            await await_or_fail(drop_finished.wait(), what="old finalization drop")
+        resume_publish.set()
+
+        accepted = await await_or_fail(steer, what="steer response")
+        assert accepted[-1]["result"] == {"accepted": True}
+        await await_or_fail(finalize_finished.wait(), what="turn finalization")
+        status = await _request(
+            reader,
+            writer,
+            5,
+            "delivery_status",
+            {"delivery_id": "late-steer"},
+        )
+        assert status[-1]["result"]["status"] == "dropped"
+        assert len(backend.calls) == 1
+
+        await _request(reader, writer, 6, "send", {"text": "second"})
+        await await_or_fail(backend.second_started.wait(), what="second provider request")
+        second_texts = [
+            block.text
+            for message in backend.calls[1]
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        assert "must not leak" not in second_texts
+        assert len(backend.calls) == 2
+        assert not server.runtime.loop.has_pending_steering
+    finally:
+        resume_publish.set()
+        backend.release_first.set()
         await close_serve(server, writer)
 
 
