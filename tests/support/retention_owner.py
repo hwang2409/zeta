@@ -50,7 +50,7 @@ def _age_tree(session_dir, *, days=100, keep_metadata=False):
     if not keep_metadata:
         meta = session_dir / "meta.json"
         value = json.loads(meta.read_text())
-        value["updated_at"] = _OLD
+        value["created_at"] = value["updated_at"] = _OLD
         meta.write_text(json.dumps(value))
     old = time.time_ns() - days * _DAY_NS
     for dirpath, _dirs, files in os.walk(session_dir, topdown=False):

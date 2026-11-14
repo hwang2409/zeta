@@ -1133,7 +1133,8 @@ def blocking_session_locks_leave_event_loop(
         except RuntimeError:
             original(kind, error)
             return
-        if not active_owners and not allow_on_loop:
+        if not active_owners or allow_on_loop:
+            original(kind, error)
             return
         raise error(
             f"{kind} lock requested on an asyncio event-loop thread; "
