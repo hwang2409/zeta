@@ -849,6 +849,7 @@ async def send_to_run(
     match = QUESTION_ANSWER_PATTERN.match(message)
     if match is not None:
         question_id = match.group(1)
+        channel.question_answered(child_instance_id, question_id)
         await channel.produce_to_live_parent(
             child_instance_id,
             lambda _store: NotificationInput(
@@ -859,5 +860,4 @@ async def send_to_run(
                 },
             ),
         )
-        channel.question_answered(child_instance_id, question_id)
     return None
