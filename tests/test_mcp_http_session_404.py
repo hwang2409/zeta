@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.core.abort import AbortSignal
 from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import MCPServerConfig
@@ -124,7 +125,10 @@ async def test_http_404_concurrent_requests_share_reinitialize(client, restartin
     await client.list_tools()
     restarting_mcp.restart()
 
-    await asyncio.gather(client.list_tools(), client.list_tools())
+    await await_or_fail(
+        asyncio.gather(client.list_tools(), client.list_tools()),
+        what="concurrent list requests",
+    )
 
     assert sum(method == "initialize" for method, _session in restarting_mcp.requests) == 2
 
