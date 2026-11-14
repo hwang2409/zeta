@@ -198,6 +198,7 @@ feature. Observer connections receive only methods with `read` access.
 | `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
+| `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
 
 ## common JSON-RPC shapes
 
@@ -472,6 +473,37 @@ Real sessions can resume across real providers.
 
 ```json
 {"jsonrpc":"2.0","id":4,"result":{"session":{"session_id":"abc123","provider":"claude","model":"claude-sonnet-4-6"}}}
+```
+
+### `mcp_refresh_tools` (`mcp_refresh_tools` feature)
+
+Params require `session_id`, which must be the active session. Optional `server`
+is a non-empty mounted MCP server name. With no `server`, the request refreshes
+all mounted MCP servers. The result contains the active `session_id` and the
+`servers` whose refreshed definitions were published into the session tool
+registry.
+
+The request coalesces with a tools refresh already in progress for each server.
+It returns only after `tools/list` completes and the new definitions are visible
+to the next provider request. Controller requests are admitted in wire order, so
+a later `send` on the controller connection cannot snapshot tools before this
+request publishes them. Each MCP request uses the existing bounded MCP setup
+timeout. Cancellation or failure releases the request ordering point.
+
+A failed refresh returns `-32005` with message `MCP tool refresh failed` and data
+`{"code":"mcp_tool_refresh_failed","session_id":"abc123","server":"page","reason":"..."}`.
+The `server` field is omitted when all mounted servers were requested. The last
+published catalog stays active. An unknown `server` returns `-32602`; a missing
+or different active session returns the normal session error. Observers receive
+`-32008` `observer_read_only`. This is controller-only and serve-only: no TUI
+surface.
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"mcp_refresh_tools","params":{"session_id":"abc123","server":"page"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":5,"result":{"session_id":"abc123","servers":["page"]}}
 ```
 
 ### `send`
@@ -1205,6 +1237,7 @@ Error descriptors are:
 | `session_not_found` | `-32602` | `session_not_found` | the requested session does not exist |
 | `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
+| `mcp_tool_refresh_failed` | `-32005` | `mcp_tool_refresh_failed` | an MCP tools/list refresh failed |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. A new `send` or `send_images` turn on a detached session that
@@ -1918,6 +1951,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `zeta_updated` | emits one `zeta_updated` event when the running source revision changes; revision values are opaque strings and clients must not parse them |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
+| `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

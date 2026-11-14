@@ -226,6 +226,15 @@ class MCPSession:
 
         await self._ensure_mcp_servers()
 
+    async def refresh_mcp_tools(self, server: str | None = None) -> tuple[str, ...]:
+        await self._ensure_mcp_servers()
+        if self._mcp_config_error is not None:
+            raise MCPManagementError(self._mcp_config_error)
+        mount = self._mcp_mount
+        if mount is None:
+            return ()
+        return await mount.refresh_tools(server)
+
     async def close_mcp_management(self) -> None:
         """Join the management transaction owned by this MCP session."""
 

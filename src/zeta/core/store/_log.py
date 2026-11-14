@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ...agent.receipt import encode_json
+from ...protocol.types import Message
 from ...storage_format import StorageFeature, feature_enabled
 from ..checkpoints import (
     CONVERSATION_ENTRY_TYPES,
@@ -122,7 +123,13 @@ class _FullLoadValidator:
         "_client_delivery_outcomes",
     )
 
-    def __init__(self, store: ConversationStore, source: TranscriptStream) -> None:
+    def __init__(
+        self,
+        store: ConversationStore,
+        source: TranscriptStream,
+        *,
+        active_branch_ids: tuple[str, ...] | None = None,
+    ) -> None:
         self.store = store
         self.source = source
         # The resident rows stay a prefix only if the digest at their count matches.
@@ -144,6 +151,12 @@ class _FullLoadValidator:
         self.by_id: dict[str, RowRef] = {}
         self.rows_by_id: dict[str, _PhysicalRow] = {}
         self.header_seen = False
+        self._warm_branch_ids = active_branch_ids
+        self._warm_branch_set = (
+            frozenset(active_branch_ids) if active_branch_ids is not None else None
+        )
+        self._warm_approvals = _ApprovalValidationOverlay()
+        self._warm_semantic_error: tuple[_PhysicalRow, ConversationIntegrityError] | None = None
 
     def _error(
         self,
@@ -223,7 +236,7 @@ class _FullLoadValidator:
                 row, kind="invalid_row", reason_code="invalid_common_fields"
             ) from exc
         try:
-            self.state._validate_entry_payload(entry)
+            validated_payload = self.state._validate_entry_payload(entry)
             if entry.type == "fork":
                 self.state._validate_fork_entry(entry)
         except ConversationIntegrityError as exc:
@@ -243,6 +256,19 @@ class _FullLoadValidator:
         if reason_code is not None:
             raise self._error(row, kind="broken_links", reason_code=reason_code)
 
+        if (
+            self._warm_branch_set is not None
+            and entry.id in self._warm_branch_set
+            and self._warm_semantic_error is None
+        ):
+            try:
+                self.state._apply_to_working_fold(
+                    entry,
+                    self._warm_approvals,
+                    validated_payload if isinstance(validated_payload, Message) else None,
+                )
+            except ConversationIntegrityError as exc:
+                self._warm_semantic_error = (row, exc)
         self.state._resident_rows.append_loaded(
             entry, offset=row.byte_offset, length=row.length
         )
@@ -282,27 +308,46 @@ class _FullLoadValidator:
             last_lane=last.lane if last is not None else "main",
         )
 
+    def _apply_semantic_entry(
+        self,
+        entry: ConversationEntry,
+        row: _PhysicalRow,
+        approvals: _ApprovalValidationOverlay,
+    ) -> None:
+        try:
+            self.state._apply_to_working_fold(entry, approvals)
+        except ConversationIntegrityError as exc:
+            raise self._error(
+                row,
+                kind="broken_links",
+                reason_code=self._semantic_reason(exc),
+            ) from exc
+
     def _select_branch(self, head: RowRef) -> None:
         entry_ids = set(self.by_id)
-        self.state._reset_incremental_validation_state()
-        self.state._entry_ids = entry_ids
         branch: list[RowRef] = []
         current: RowRef | None = head
         while current is not None:
             branch.append(current)
             current = self.by_id.get(current.parent_id) if current.parent_id else None
+        selected_ids = tuple(ref.id for ref in reversed(branch))
+        if self._warm_branch_ids == selected_ids:
+            if self._warm_semantic_error is not None:
+                row, error = self._warm_semantic_error
+                raise self._error(
+                    row,
+                    kind="broken_links",
+                    reason_code=self._semantic_reason(error),
+                ) from error
+            self.state._entry_ids = entry_ids
+            return
+        self.state._reset_incremental_validation_state()
+        self.state._entry_ids = entry_ids
         approvals = _ApprovalValidationOverlay()
         for entry in self.state._resident_rows.stream_loaded_entries(
             reversed(branch), self.source.fd
         ):
-            try:
-                self.state._apply_to_working_fold(entry, approvals)
-            except ConversationIntegrityError as exc:
-                raise self._error(
-                    self.rows_by_id[entry.id],
-                    kind="broken_links",
-                    reason_code=self._semantic_reason(exc),
-                ) from exc
+            self._apply_semantic_entry(entry, self.rows_by_id[entry.id], approvals)
 
     @staticmethod
     def _semantic_reason(error: ConversationIntegrityError) -> str:
@@ -427,7 +472,9 @@ class ConversationLogMixin:
 
     @staticmethod
     def _next_entry_prefix_digest(previous: bytes, encoded_line: bytes) -> bytes:
-        return hashlib.sha256(previous + encoded_line).digest()
+        digest = hashlib.sha256(previous)
+        digest.update(encoded_line)
+        return digest.digest()
 
     def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
         self._entry_prefix_digest = self._next_entry_prefix_digest(
@@ -705,6 +752,8 @@ class ConversationLogMixin:
         if not accepted:
             self._load_full()
             return
+        if self._history_index is not None:
+            self._history_index.invalidate_status_projection()
         if not self._read_only and not raw.endswith(b"\n"):
             # Preserve the loader's historical recovery for a complete JSON row
             # whose writer omitted only the line terminator.
@@ -987,7 +1036,15 @@ class ConversationLogMixin:
                         self._publish_reload(since)
                         return
             source = TranscriptStream(fd, stat)
-            validator = _FullLoadValidator(self, source)
+            validator = _FullLoadValidator(
+                self,
+                source,
+                active_branch_ids=(
+                    self._history_index.warm_active_ids
+                    if self._history_index is not None
+                    else None
+                ),
+            )
             torn_row: _PhysicalRow | None = None
             last_row: _PhysicalRow | None = None
             try:

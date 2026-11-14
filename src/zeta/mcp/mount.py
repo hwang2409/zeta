@@ -14,7 +14,14 @@ from ..core.abort import AbortSignal
 from ..protocol.types import StructuredToolResult
 from ..tools.registry import ToolRegistry
 from . import connection as mcp_connection
-from .client import MCPClient, MCPPrompt, MCPResource, MCPResourceContent, MCPTool
+from .client import (
+    MCPClient,
+    MCPPrompt,
+    MCPResource,
+    MCPResourceContent,
+    MCPTool,
+    MCPToolRefreshError,
+)
 from .config import (
     MCPConfig,
     MCPServerConfig,
@@ -369,6 +376,26 @@ class MCPMount:
         ]
         if waits:
             await asyncio.gather(*waits)
+
+    async def refresh_tools(self, name: str | None = None) -> tuple[str, ...]:
+        if name is not None:
+            actor = self._actors.get(name)
+            if actor is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            actors = (actor,)
+        else:
+            actors = tuple(
+                actor
+                for actor in self._actors.values()
+                if actor.status.state == "mounted"
+            )
+        outcomes = await asyncio.gather(
+            *(actor.refresh_tools() for actor in actors), return_exceptions=True
+        )
+        for actor, outcome in zip(actors, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                raise MCPToolRefreshError(f"{actor.name}: {outcome}") from outcome
+        return tuple(actor.name for actor in actors)
 
     def set_primary_registry_only(self, name: str, enabled: bool) -> None:
         actor = self._actors.get(name)

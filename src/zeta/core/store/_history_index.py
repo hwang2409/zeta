@@ -10,12 +10,13 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...agent.receipt import encode_json
 from ...protocol.types import ToolCall
+from .. import history_status
 from ..checkpoints import ConversationEntry
 from ..transcript_recovery import recovery_status
 from . import _row_history
@@ -88,7 +89,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -105,6 +106,8 @@ class HistoryIndex:
         self._lock = threading.Lock()
         self._closed = False
         self._available = False
+        self._status_projection: tuple[int, int, tuple[object, ...]] | None = None
+        self._warm_active_ids: tuple[str, ...] | None = None
 
     @property
     def available(self) -> bool:
@@ -184,19 +187,6 @@ class HistoryIndex:
             HistoryIndex._value(getattr(entry, "data", None)),
         )
 
-    @staticmethod
-    def _facts(value: object) -> dict[str, object]:
-        if isinstance(value, Mapping):
-            return dict(value)
-        return {
-            key: getattr(value, key)
-            for key in (
-                "st_dev", "st_ino", "byte_boundary", "last_seq", "last_id",
-                "last_parent", "prefix_digest", "reset_generation", "repair_generation",
-            )
-            if hasattr(value, key)
-        }
-
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)"
@@ -245,21 +235,22 @@ class HistoryIndex:
             "byte_length INTEGER NOT NULL, facts BLOB)"
         )
 
-    def _stored_facts(self, connection: sqlite3.Connection) -> dict[str, object] | None:
-        row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
-        return self._facts(json.loads(row[0])) if row is not None else None
+    @property
+    def warm_active_ids(self) -> tuple[str, ...] | None:
+        return self._warm_active_ids
 
     def warm_snapshot(
         self, stat: os.stat_result
     ) -> tuple[list[tuple[object, ...]], list[dict[str, object]], dict[str, object]] | None:
         """Return a compact unchanged message transcript, or require full validation."""
         with self._lock:
+            self._warm_active_ids = None
             try:
                 connection = self._connection(write=False)
             except (HistoryIndexError, OSError, sqlite3.Error):
                 return None
             try:
-                facts = self._stored_facts(connection)
+                facts = history_status.stored_facts(connection)
                 expected = {
                     "st_dev": stat.st_dev,
                     "st_ino": stat.st_ino,
@@ -283,6 +274,16 @@ class HistoryIndex:
                     if len(expected_digest) != 32:
                         return None
                 except ValueError:
+                    return None
+                self._warm_active_ids = tuple(
+                    row[0] for row in connection.execute(
+                        "SELECT id FROM entries WHERE tui_group IS NOT NULL ORDER BY seq"
+                    )
+                )
+                if connection.execute(
+                    "SELECT 1 FROM entries "
+                    "WHERE type NOT IN ('message','compaction') LIMIT 1"
+                ).fetchone() is not None:
                     return None
                 digest = b""
                 indexed_entries = connection.execute(
@@ -349,6 +350,13 @@ class HistoryIndex:
             finally:
                 connection.close()
 
+    @property
+    def status_projection(self) -> tuple[int, int, tuple[object, ...]] | None:
+        return self._status_projection
+
+    def invalidate_status_projection(self) -> None:
+        self._status_projection = None
+
     def _set_meta(
         self,
         connection: sqlite3.Connection,
@@ -357,7 +365,7 @@ class HistoryIndex:
         total: int,
         tui_total: int,
     ) -> None:
-        payload = self._facts(facts)
+        payload = history_status.facts(facts)
         payload.update(
             schema_version=self.SCHEMA_VERSION,
             history_groups=total,
@@ -379,34 +387,13 @@ class HistoryIndex:
         except FileNotFoundError:
             pass
 
-    @staticmethod
-    def _active_ids(rows: Sequence[object]) -> set[str]:
-        by_id = {HistoryIndex._row(entry)[1]: entry for entry in rows}
-        active: set[str] = set()
-        current = rows[-1] if rows else None
-        while current is not None:
-            row = HistoryIndex._row(current)
-            if row[1] in active:
-                break
-            active.add(row[1])
-            current = by_id.get(row[2]) if row[2] else None
-        return active
-
-    @staticmethod
-    def _warm_facts(value: object) -> object:
-        if value is None or isinstance(value, (str, int, float, bool, list, tuple, dict)):
-            return value
-        if is_dataclass(value):
-            return {"kind": type(value).__name__, "value": asdict(value)}
-        raise TypeError(f"unsupported warm row facts: {type(value).__name__}")
-
     def _rebuild(
         self,
         source_facts: object,
         row_refs: Sequence[object],
         validated_rows: Iterable[object],
     ) -> None:
-        active_ids = self._active_ids(row_refs)
+        active_ids = history_status.active_ids(row_refs)
         connection: sqlite3.Connection | None = None
         try:
             self._remove_file()
@@ -453,7 +440,7 @@ class HistoryIndex:
                             seq,
                             int(getattr(ref, "offset", 0)),
                             int(getattr(ref, "length", 0)),
-                            self._value(self._warm_facts(getattr(ref, "facts", None))),
+                            self._value(history_status.warm_facts(getattr(ref, "facts", None))),
                         )
                     )
                     if len(entry_batch) == 2048:
@@ -517,6 +504,7 @@ class HistoryIndex:
                 self._set_meta(
                     connection, source_facts, total=group, tui_total=tui_group
                 )
+                self._status_projection = history_status.write(connection)
                 connection.execute(
                     "INSERT INTO meta(key,value) VALUES('startup_projection',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -636,7 +624,7 @@ class HistoryIndex:
         )
         if expected_seq != self._row(entries[0])[0]:
             raise HistoryIndexUnavailableError("history index delta is not contiguous")
-        stored = self._stored_facts(connection) or {}
+        stored = history_status.stored_facts(connection) or {}
         projected, total, tui_total = self._project_entries(
             entries,
             int(stored.get("history_groups", 0)),
@@ -655,7 +643,7 @@ class HistoryIndex:
             from ._rows import row_facts
 
             lengths = [len(encode_json(entry.to_dict())) + 1 for entry in entries]
-            offset = int(self._facts(facts)["byte_boundary"]) - sum(lengths)
+            offset = int(history_status.facts(facts)["byte_boundary"]) - sum(lengths)
             warm_rows = []
             for entry, length in zip(entries, lengths, strict=True):
                 warm_rows.append(
@@ -663,7 +651,7 @@ class HistoryIndex:
                         entry.seq,
                         offset,
                         length,
-                        self._value(self._warm_facts(row_facts(entry))),
+                        self._value(history_status.warm_facts(row_facts(entry))),
                     )
                 )
                 offset += length
@@ -675,6 +663,9 @@ class HistoryIndex:
             self._set_meta(
                 connection, facts, total=total, tui_total=tui_total
             )
+            self._status_projection = history_status.update(
+                connection, self._status_projection, entries
+            )
 
     def catch_up_validated(
         self, source_facts: object, validated_rows: Sequence[object]
@@ -684,17 +675,18 @@ class HistoryIndex:
             self._check_open()
             if self._observer:
                 return False
-            expected = self._facts(source_facts)
+            expected = history_status.facts(source_facts)
             connection: sqlite3.Connection | None = None
             try:
                 connection = self._connection(write=True)
                 self._create_schema(connection)
-                stored = self._stored_facts(connection)
+                stored = history_status.stored_facts(connection)
                 if stored is None:
                     return False
                 if all(
                     stored.get(key) == value for key, value in expected.items()
                 ) and stored.get("schema_version") == self.SCHEMA_VERSION:
+                    self._status_projection = history_status.load(connection)
                     self._available = True
                     return True
                 suffix_start = self._suffix_start(stored, expected, validated_rows)
@@ -729,12 +721,12 @@ class HistoryIndex:
                 if validated_rows is None:
                     return refs
                 return validated_rows() if callable(validated_rows) else validated_rows
-            expected = self._facts(source_facts)
+            expected = history_status.facts(source_facts)
             try:
                 connection = self._connection(write=True)
                 try:
                     self._create_schema(connection)
-                    stored = self._stored_facts(connection)
+                    stored = history_status.stored_facts(connection)
                     warm_count = connection.execute(
                         "SELECT COUNT(*) FROM warm_rows"
                     ).fetchone()[0]
@@ -746,6 +738,7 @@ class HistoryIndex:
                         and stored.get("schema_version") == self.SCHEMA_VERSION
                         and warm_count == len(refs)
                     ):
+                        self._status_projection = history_status.load(connection)
                         self._available = True
                         return
                 finally:
@@ -886,8 +879,8 @@ class HistoryIndex:
             try:
                 page_request = request if isinstance(request, Mapping) else vars(request)
                 connection = self._connection(write=False)
-                stored = self._stored_facts(connection)
-                requested = self._facts(g0)
+                stored = history_status.stored_facts(connection)
+                requested = history_status.facts(g0)
                 if stored is None or any(
                     stored.get(key) != value for key, value in requested.items()
                 ):
@@ -914,8 +907,8 @@ class HistoryIndex:
             connection = self._connection(write=False)
             try:
                 page_request = request if isinstance(request, Mapping) else vars(request)
-                stored = self._stored_facts(connection)
-                requested = self._facts(g0)
+                stored = history_status.stored_facts(connection)
+                requested = history_status.facts(g0)
                 if stored is None or any(
                     stored.get(key) != value for key, value in requested.items()
                 ):
@@ -965,8 +958,8 @@ class HistoryIndex:
             self._check_open()
             connection = self._connection(write=False)
             try:
-                stored = self._stored_facts(connection)
-                requested = self._facts(g0)
+                stored = history_status.stored_facts(connection)
+                requested = history_status.facts(g0)
                 if stored is None or any(
                     stored.get(key) != value for key, value in requested.items()
                 ):
@@ -982,10 +975,10 @@ class HistoryIndex:
             self._check_open()
             connection = self._connection(write=False)
             try:
-                stored = self._stored_facts(connection)
+                stored = history_status.stored_facts(connection)
                 if stored is None or any(
                     stored.get(key) != value
-                    for key, value in self._facts(g0).items()
+                    for key, value in history_status.facts(g0).items()
                 ):
                     raise StaleHistorySnapshot
                 row = connection.execute(
@@ -1013,10 +1006,10 @@ class HistoryIndex:
             self._check_open()
             connection = self._connection(write=False)
             try:
-                stored = self._stored_facts(connection)
+                stored = history_status.stored_facts(connection)
                 if stored is None or any(
                     stored.get(key) != value
-                    for key, value in self._facts(g0).items()
+                    for key, value in history_status.facts(g0).items()
                 ):
                     raise StaleHistorySnapshot
                 row = connection.execute(
@@ -1060,8 +1053,8 @@ class HistoryIndex:
             connection: sqlite3.Connection | None = None
             try:
                 connection = self._connection(write=False)
-                stored = self._stored_facts(connection)
-                expected = self._facts(facts)
+                stored = history_status.stored_facts(connection)
+                expected = history_status.facts(facts)
                 if stored is None or any(
                     stored.get(key) != value for key, value in expected.items()
                 ):
@@ -1258,6 +1251,12 @@ def _decide_approval(
 
 
 class HistoryPageStoreMixin:
+    def slash_status_projection(
+        self: ConversationStore,
+    ) -> tuple[int, int, tuple[object, ...]] | None:
+        index = self._history_index
+        return index.status_projection if index is not None and index.available else None
+
     def _refresh_repair_generation(self: ConversationStore) -> None:
         record = recovery_status(self.directory_fd, self._repair_target).latest_committed
         self._repair_generation = record.quarantine_id if record is not None else None

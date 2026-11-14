@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 
 from tests.support.owned import await_or_fail
-from zeta.mcp import MCPConfig, MCPMount, MCPServerConfig, MCPTool, mount_mcp_servers
+from zeta.mcp import (
+    MCPConfig,
+    MCPMount,
+    MCPServerConfig,
+    MCPTool,
+    MCPToolRefreshError,
+    mount_mcp_servers,
+)
 from zeta.mcp import mount as mount_module
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -83,6 +90,29 @@ async def _mounted_refresh(
     return registry, mount
 
 
+async def _explicit_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_refresh: bool = False,
+) -> tuple[_HeldRefreshClient, ToolRegistry, MCPMount]:
+    client = _HeldRefreshClient(
+        MCPServerConfig("server", "stdio", "unused"),
+        fail_refresh=fail_refresh,
+    )
+    clients = iter((client,))
+    # test-contract: seam the mount client factory forces explicit refresh ordering
+    monkeypatch.setattr(mount_module, "_build_client", lambda _config: next(clients))
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    config = MCPServerConfig("server", "stdio", "unused")
+    mount = await mount_mcp_servers(
+        registry, MCPConfig(tmp_path / "mcp.json", {"server": config})
+    )
+    return client, registry, mount
+
+
 async def _wait_catalog(
     mount: MCPMount, registry: ToolRegistry
 ) -> tuple[str, set[str]]:
@@ -99,6 +129,83 @@ async def _assert_following_turn_does_not_wait(mount: MCPMount) -> None:
     await await_or_fail(
         mount.wait_for_tool_refreshes(), what="following tool refresh wait"
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_tool_refresh_coalesces_concurrent_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _HeldRefreshClient(MCPServerConfig("server", "stdio", "unused"))
+    registry, mount = await _mounted_refresh(tmp_path, monkeypatch, client)
+    refresh = mount._actors["server"]._tool_refresh
+    requests_coalesced = asyncio.Event()
+    original_request = type(refresh).request
+
+    def observe_request(self, message) -> None:
+        original_request(self, message)
+        if len(self._request_waiters) == 2:
+            requests_coalesced.set()
+
+    monkeypatch.setattr(type(refresh), "request", observe_request)
+    first = asyncio.create_task(mount.refresh_tools("server"))
+    second = asyncio.create_task(mount.refresh_tools("server"))
+    try:
+        await await_or_fail(requests_coalesced.wait(), what="coalesced refresh requests")
+        assert client._list_calls == 2
+        client.refresh_release.set()
+        assert await await_or_fail(first, what="first explicit refresh") == ("server",)
+        assert await await_or_fail(second, what="coalesced explicit refresh") == (
+            "server",
+        )
+        assert client._list_calls == 2, "concurrent requests started parallel tools/list"
+    finally:
+        client.refresh_release.set()
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_explicit_tool_refresh_keeps_published_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, registry, mount = await _explicit_refresh(
+        tmp_path, monkeypatch, fail_refresh=True
+    )
+    refresh = asyncio.create_task(mount.refresh_tools("server"))
+    try:
+        await await_or_fail(client.refresh_started.wait(), what="failing refresh start")
+        client.refresh_release.set()
+        with pytest.raises(MCPToolRefreshError, match="refresh failed"):
+            await await_or_fail(refresh, what="failing explicit refresh")
+        assert {schema["name"] for schema in registry.schemas} == {"server__echo"}
+        assert mount.statuses["server"].state == "mounted"
+    finally:
+        client.refresh_release.set()
+        await mount.close()
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_explicit_tool_refresh_does_not_block_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, registry, mount = await _explicit_refresh(tmp_path, monkeypatch)
+    refresh = asyncio.create_task(mount.refresh_tools("server"))
+    try:
+        await await_or_fail(client.refresh_started.wait(), what="cancelled refresh start")
+        refresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(refresh, 10)
+        client.refresh_release.set()
+        await await_or_fail(
+            mount.wait_for_tool_refreshes(), what="cancelled caller refresh settlement"
+        )
+        assert {schema["name"] for schema in registry.schemas} == {"server__changed"}
+        assert await mount.refresh_tools("server") == ("server",)
+    finally:
+        client.refresh_release.set()
+        await mount.close()
+        await registry.close()
 
 
 @pytest.mark.asyncio
