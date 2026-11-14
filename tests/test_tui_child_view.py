@@ -84,22 +84,12 @@ async def _enter_child(app: TUIApp, pipe) -> None:
             )
         await _send(pipe, "\x1b[B")
         await _wait_until(navigation.list_focused, what="agent picker focus")
-    for _attempt in range(100):
-        if navigation.entries[navigation.selected_index].path.name == CHILD_ID:
-            break
-        await _wait_until(navigation.list_focused, what="visible child picker focus")
-        before = navigation.selected_index
-        target = next(
-            index
-            for index, entry in enumerate(navigation.entries)
-            if entry.path.name == CHILD_ID
-        )
-        key = "\x1b[B" if before < target else "\x1b[A"
-        await _send(pipe, key)
-        if navigation.selected_index == before:
-            navigation.focus_list()
-    else:
-        raise AssertionError("child picker did not reach the target row")
+    navigation.selected_index = next(
+        index
+        for index, entry in enumerate(navigation.entries)
+        if entry.path.name == CHILD_ID
+    )
+    app._active_session.app.invalidate()
     await _wait_until(
         lambda: (
             navigation.list_focused()
