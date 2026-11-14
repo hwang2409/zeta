@@ -59,6 +59,17 @@ async def _enter_child(app: TUIApp, pipe) -> None:
         lambda: any(entry.path.name == CHILD_ID for entry in navigation.entries),
         what="child 651 in the real agent picker",
     )
+    await _wait_until(
+        lambda: (
+            (navigation.transcript_control._load_task is None
+             or navigation.transcript_control._load_task.done())
+            and (
+                navigation.transcript_control.search_task is None
+                or navigation.transcript_control.search_task.done()
+            )
+        ),
+        what="root history transition idle",
+    )
     while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
         await _send(pipe, "\x1b[B")
     if not navigation.list_focused():
