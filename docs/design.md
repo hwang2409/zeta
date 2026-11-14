@@ -22,9 +22,16 @@ the harness-native distillation.
   fallback: the key must be paired with `ZETA_ALLOW_API_KEY=1` or it is
   ignored, so a developer who merely has the variable exported for unrelated
   tools does not silently start spending API credits instead of plan quota.
-  An explicitly opt-in compatibility mode, `ZETA_ANTHROPIC_OAUTH_COMPAT=1`,
-  adds the pinned Claude Code billing system block and CLI request headers to
-  OAuth requests only. It is off by default, is unsupported routing rather than
+  An explicitly opt-in compatibility mode adds the pinned Claude Code billing
+  system block and CLI request headers to OAuth requests only. Turn it on with
+  either `ZETA_ANTHROPIC_OAUTH_COMPAT=1` in the environment or `oauth_compat =
+  true` under `[anthropic]` in `~/.zeta/settings.toml` (so a `zeta serve`,
+  ssh, or launchd start that does not inherit an interactive shell still gets
+  it). Precedence: `ZETA_ANTHROPIC_OAUTH_COMPAT=1` or `=0` overrides the
+  setting either way; any other env value (including unset) falls back to the
+  setting. The project `.zeta/settings.toml` cannot set it (it is not a
+  project-safe key), so a hostile checkout cannot flip request routing. It is
+  off by default, is unsupported routing rather than
   a permission or billing guarantee, and does not alter API-key requests. The
   block is derived from the first eligible original user turn (harness/meta
   turns excluded). When eviction has removed every typed turn, it is derived

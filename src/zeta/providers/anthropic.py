@@ -181,11 +181,19 @@ def build_billing_header_value(message_text: str) -> str | None:
     )
 
 
-def _oauth_compat_enabled(credential: AnthropicCredential) -> bool:
-    return (
-        not isinstance(credential, AnthropicApiKeyCredential)
-        and os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT") == "1"
-    )
+def _oauth_compat_enabled(
+    credential: AnthropicCredential, *, setting_enabled: bool
+) -> bool:
+    if isinstance(credential, AnthropicApiKeyCredential):
+        return False
+    # Precedence: ZETA_ANTHROPIC_OAUTH_COMPAT=1/0 wins over the settings value;
+    # any other env value (including unset) falls back to the setting.
+    env = os.environ.get("ZETA_ANTHROPIC_OAUTH_COMPAT")
+    if env == "1":
+        return True
+    if env == "0":
+        return False
+    return setting_enabled
 
 
 def _first_string(value: Mapping[str, Any], *keys: str) -> str | None:
@@ -484,6 +492,7 @@ class AnthropicBackend(CompletionBackend):
         diagnostics_path: str | Path | None = None,
         stall_seconds: float = TRANSPORT_IDLE_SECONDS,
         stall_retries: int = MAX_STALL_RETRIES,
+        oauth_compat_setting: bool = False,
     ) -> None:
         default_max_tokens, default_thinking_budget = model_output_limits(model)
         if max_tokens is None:
@@ -511,6 +520,7 @@ class AnthropicBackend(CompletionBackend):
             else _default_diagnostics_path(self.token_store)
         )
         self.stall_seconds, self.stall_retries = stall_seconds, stall_retries
+        self.oauth_compat_setting = oauth_compat_setting
 
     def complete(
         self,
@@ -606,7 +616,9 @@ class AnthropicBackend(CompletionBackend):
                 max_tokens=self.max_tokens,
                 thinking_budget=self.thinking_budget,
             )
-            oauth_compat = _oauth_compat_enabled(self.token_store)
+            oauth_compat = _oauth_compat_enabled(
+                self.token_store, setting_enabled=self.oauth_compat_setting
+            )
             if oauth_compat:
                 billing_header = build_billing_header_value(_first_user_text(messages))
                 if billing_header is not None:
