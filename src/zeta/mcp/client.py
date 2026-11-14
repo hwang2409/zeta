@@ -41,6 +41,10 @@ class MCPRequestError(MCPError):
     """Raised when an MCP request returns a JSON-RPC error response."""
 
 
+class MCPUnsupportedError(MCPRequestError):
+    """Raised when a server does not advertise an optional capability."""
+
+
 class MCPHTTPError(MCPTransportError):
     """Raised for an unsuccessful streamable-http response."""
 
@@ -106,7 +110,7 @@ class MCPResourceContent:
 class MCPClient(Protocol):
     config: MCPServerConfig
     protocol_version: str | None
-    capabilities: dict[str, object]
+    capabilities: dict[str, object] | None
 
     async def connect(self) -> None:
         """Open the transport and complete initialize."""
@@ -187,6 +191,30 @@ def unavailable_result(name: str) -> StructuredToolResult:
     return make_error_result(
         f"MCP server '{name}' is unavailable. Use /mcp reconnect {name}."
     )
+
+
+def require_capability(
+    capabilities: Mapping[str, object] | None, name: str, server: str
+) -> None:
+    # An omitted capabilities object (None) is permissive legacy behavior: send
+    # the request. Reject only when the server explicitly advertises its
+    # capabilities and leaves this one out.
+    if capabilities is not None and name not in capabilities:
+        raise MCPUnsupportedError(f"MCP server {server} does not provide {name}")
+
+
+def degrades_server(error: BaseException) -> bool:
+    """Whether an MCP failure compromises the server, so its actor degrades.
+
+    One rule shared by the resource, prompt, and tool-refresh paths. A JSON-RPC
+    request error (`MCPRequestError`, including an unadvertised capability via
+    `MCPUnsupportedError`) and a cancellation (`MCPCanceled`) keep the server
+    mounted: the server is healthy, only this request did not complete.
+    Anything else -- a transport failure, a malformed-protocol reply, a
+    timeout, or an unexpected error -- degrades the server with a typed reason.
+    """
+
+    return not isinstance(error, (MCPRequestError, MCPCanceled))
 
 
 def initialize_params() -> dict[str, object]:
@@ -280,7 +308,7 @@ def parse_rpc_response(value: object, request_id: int) -> dict[str, object]:
         message = error.get("message")
         if type(code) is not int or type(message) is not str:
             raise MCPProtocolError("MCP JSON-RPC error has an invalid shape")
-        return make_error_result(message)
+        raise MCPRequestError(f"MCP JSON-RPC error {code}: {message}")
     result = value.get("result")
     if type(result) is not dict:
         raise MCPProtocolError("MCP JSON-RPC response result must be an object")
