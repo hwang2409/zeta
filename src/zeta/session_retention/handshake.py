@@ -49,9 +49,26 @@ def _fd(home: Path, domain: str) -> int:
     return _lock_file(home, domain_lock_name(RETENTION_HOME_ID, domain))
 
 
+def ensure_handshake_files(home: Path) -> None:
+    """Create the owner handshake files before retention serves requests."""
+    for domain in ("planner-active", "user-open-request"):
+        fd = _fd(home, domain)
+        os.close(fd)
+
+
+def _existing_handshake_file(home: Path, domain: str) -> int:
+    path = Path(home) / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, domain)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise OSError("retention lock must be a regular, unshared file")
+    return fd
+
+
 @contextmanager
 def planner_active(home: Path) -> Iterator[None]:
-    fd = _fd(home, "planner-active")
+    fd = _existing_handshake_file(home, "planner-active")
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
         yield

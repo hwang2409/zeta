@@ -12,6 +12,7 @@ from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.storage_homes import initialize_storage_home
 from zeta.core import retention_access
 from zeta.core.session import SessionManager
+from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.session_retention import (
     RetentionBounds,
     RetentionPlanner,
@@ -23,7 +24,32 @@ from zeta.session_retention.activation import (
     _PublishedPass,
     make_retention_owner,
 )
+from zeta.session_retention.handshake import planner_active
 from zeta.storage_format import open_writer
+
+
+@pytest.mark.asyncio
+async def test_epoch_11_owner_creates_handshake_files_once(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        make_retention_owner(home, lease, lambda: 30)
+        lock_dir = home / ".domain-locks"
+        assert (lock_dir / domain_lock_name(RETENTION_HOME_ID, "planner-active")).is_file()
+        assert (lock_dir / domain_lock_name(RETENTION_HOME_ID, "user-open-request")).is_file()
+    finally:
+        await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
+async def test_planner_active_does_not_create_missing_handshake_file(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    with pytest.raises(FileNotFoundError), planner_active(home):
+        pass
+    assert not (home / ".domain-locks").exists()
 
 
 @pytest.mark.asyncio

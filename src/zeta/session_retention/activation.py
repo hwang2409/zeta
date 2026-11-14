@@ -18,7 +18,7 @@ from . import (
     retention_authority,
     retention_result,
 )
-from .handshake import planner_active, planner_request_pending
+from .handshake import ensure_handshake_files, planner_active, planner_request_pending
 
 
 class _PublishedPass(dict[str, object]):
@@ -56,6 +56,11 @@ def make_retention_owner(
 
     root = Path(home)
     retained = lease.retain()
+    activation_enabled = feature_enabled(
+        retained.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION
+    )
+    if activation_enabled:
+        ensure_handshake_files(root)
     last_projection: dict[str, object] | None = None
 
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
@@ -104,7 +109,7 @@ def make_retention_owner(
         on_error=record_error,
         home=root,
         close_lease=retained.close,
-        activation_enabled=feature_enabled(retained.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION),
+        activation_enabled=activation_enabled,
         disable=lambda: retention_authority(root, retained, days=0).projection,
     )
 
