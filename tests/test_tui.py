@@ -16803,6 +16803,7 @@ async def test_root_tui_paging_render_path_table(
                     assert release.wait(10)
                 return original_search(*args)
 
+            # test-contract: seam force cancellation while the observer is open
             monkeypatch.setattr(source, "_search_sync", blocked_search)
             first = asyncio.create_task(source.search("first"))
             assert await asyncio.to_thread(started.wait, 10)
