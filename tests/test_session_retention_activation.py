@@ -145,11 +145,11 @@ async def test_two_owners_append_without_lost_rows(
     barrier = threading.Barrier(2)
     original_run_pass = RetentionPlanner.run_pass
 
-    def synchronized_run_pass(planner, *, days, commit_state=True):
+    def synchronized_run_pass(planner, *, days, commit_state=True, yield_check=None):
         barrier.wait(10)
         if commit_state:
-            return original_run_pass(planner, days=days)
-        return original_run_pass(planner, days=days, commit_state=False)
+            return original_run_pass(planner, days=days, yield_check=yield_check)
+        return original_run_pass(planner, days=days, commit_state=False, yield_check=yield_check)
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", synchronized_run_pass)
     append_barrier = threading.Barrier(2)
@@ -195,6 +195,64 @@ async def test_two_owners_append_without_lost_rows(
         await asyncio.to_thread(lease.close)
 
 @pytest.mark.asyncio
+async def test_owner_stop_yields_at_bounded_checkpoint_before_pass_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    manager = SessionManager(home)
+    await asyncio.to_thread(_create_closed, manager, [], name="old")
+    lease = await asyncio.to_thread(open_writer, home)
+    checkpoint = threading.Event()
+    stop_seen = threading.Event()
+    pass_released = threading.Event()
+    original_charge = retention_module._Budget.charge_entry
+    original_run_pass = RetentionPlanner.run_pass
+    owner_ref: dict[str, RetentionActivationOwner] = {}
+
+    def charge_entry(budget, size=0):
+        checkpoint.set()
+        assert stop_seen.wait(10)
+        return original_charge(budget, size)
+
+    def run_pass(planner, *, days, commit_state=True, yield_check=None):
+        result = original_run_pass(
+            planner, days=days, commit_state=commit_state, yield_check=yield_check
+        )
+        if result.complete:
+            pass_released.set()
+        return result
+
+    monkeypatch.setattr(retention_module._Budget, "charge_entry", charge_entry)
+    monkeypatch.setattr(RetentionPlanner, "run_pass", run_pass)
+    owner = make_retention_owner(
+        home, lease, lambda: 30,
+        bounds=retention_module.RetentionBounds(entries_total=32, entries_per_root=32),
+    )
+    owner_ref["owner"] = owner
+    real_stop = owner.stop
+
+    async def stop() -> None:
+        owner._stop.set()
+        stop_seen.set()
+        await real_stop()
+
+    owner.stop = stop
+    try:
+        owner.start()
+        # test-contract: latency stop checkpoint gate
+        await asyncio.wait_for(asyncio.to_thread(checkpoint.wait, 10), 10)
+        stopping = asyncio.create_task(owner.stop())
+        await asyncio.wait_for(stopping, 10)
+        assert not pass_released.is_set()
+    finally:
+        await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
 async def test_owner_cancel_mid_episode_releases_lease(tmp_path: Path, monkeypatch) -> None:
     import threading
 
@@ -206,10 +264,12 @@ async def test_owner_cancel_mid_episode_releases_lease(tmp_path: Path, monkeypat
     release = threading.Event()
     original = RetentionPlanner.run_pass
 
-    def blocked(planner, *, days, commit_state=True):
+    def blocked(planner, *, days, commit_state=True, yield_check=None):
         entered.set()
         assert release.wait(10)
-        return original(planner, days=days, commit_state=commit_state)
+        return original(
+            planner, days=days, commit_state=commit_state, yield_check=yield_check
+        )
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", blocked)
     owner = make_retention_owner(home, lease, lambda: 30)
@@ -260,7 +320,7 @@ async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
         def close(self):
             return None
 
-    def run_pass(_planner, _days):
+    def run_pass(_planner, _days, _yield_check=None):
         nonlocal passes
         passes += 1
         return _PublishedPass({"mode": "preview", "days": 30}, complete=False)

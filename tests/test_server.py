@@ -139,9 +139,11 @@ from zeta.server.protocol import (
 )
 from zeta.server.server import _Client
 from zeta.server.slash_commands import _SERVE_MCP_VERBS, ServerSlashSession
+from zeta.session_retention import RetentionPlanner, retention_authority
 from zeta.session_retention.pin import RETENTION_PIN_FILENAME
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
+from zeta.storage_format import open_writer
 from zeta.tui.render import render_event
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -937,6 +939,42 @@ async def test_child_message_delivered_event_maps_from_background_run(
         }
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_serve_retention_stays_dormant_until_requested_session(
+    tmp_path: Path,
+) -> None:
+    initialize_storage_home(tmp_path)
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, tmp_path)
+    try:
+        def seed_retention() -> None:
+            with RetentionPlanner(tmp_path, lease) as planner:
+                assert planner.run_pass(days=30).complete
+            assert retention_authority(tmp_path, lease, days=30).applied
+
+        await asyncio.to_thread(seed_retention)
+    finally:
+        await asyncio.to_thread(lease.close)
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader = writer = None
+    try:
+        reader, writer = await _connect(server)
+        assert server._retention_owner is not None
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
+        assert (tmp_path / "retention-arm.json").is_file()
+        assert (tmp_path / "retention-state.json").is_file()
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server._retention_owner.task is not None
+    finally:
+        if writer is not None:
+            await close_serve(server, writer)
+        else:
+            await server.close()
 
 
 def test_removed_fake_provider_has_clear_serve_error(tmp_path: Path) -> None:

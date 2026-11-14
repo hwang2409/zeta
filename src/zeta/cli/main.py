@@ -891,6 +891,12 @@ def _retain_active_draft(
         retained_drafts.append(draft)
 
 
+def _attach_retention_owner(app: object, owner: object | None) -> None:
+    app._retention_owner = owner
+    app._before_prompt_exit = owner.stop if owner is not None else None
+    app._before_terminal_restore = owner.stop if owner is not None else None
+
+
 def _run_tui_lifecycle_captured(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -912,13 +918,7 @@ def _run_tui_lifecycle_captured(
                 from ..session_retention.activation import make_retention_owner
                 retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
-            run_app._retention_owner = retention_owner
-            run_app._before_prompt_exit = (
-                retention_owner.stop if retention_owner is not None else None
-            )
-            run_app._before_terminal_restore = (
-                retention_owner.stop if retention_owner is not None else None
-            )
+            _attach_retention_owner(run_app, retention_owner)
             if retention_owner is not None:
                 from ..tui.cards.retention import render_retention_card
                 retention_owner.set_publish(lambda projection, app=app: app._print_unit(render_retention_card(projection)) if projection.get("mode") != "none" else None)

@@ -66,9 +66,13 @@ def make_retention_owner(
         ensure_handshake_files(root)
     last_projection: dict[str, object] | None = None
 
-    def run_pass(planner: Any, current_days: int) -> dict[str, object]:
+    def run_pass(
+        planner: Any, current_days: int, yield_check: Callable[[], bool] | None = None
+    ) -> dict[str, object]:
         before = _progress_marker(planner)
-        result = planner.run_pass(days=current_days, commit_state=False)
+        result = planner.run_pass(
+            days=current_days, commit_state=False, yield_check=yield_check
+        )
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
@@ -160,7 +164,11 @@ class RetentionActivationOwner:
         self._wake_seconds = wake_seconds
         self._sleep = sleep or asyncio.sleep
         self._publish = publish
-        self._run_pass = run_pass or (lambda planner, current_days: planner.run_pass(days=current_days))
+        self._run_pass = run_pass or (
+            lambda planner, current_days, yield_check=None: planner.run_pass(
+                days=current_days, yield_check=yield_check
+            )
+        )
         self._on_error = on_error or (lambda exc, current_days: {"mode": "none", "days": current_days, "errors": [str(exc)]})
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
@@ -235,7 +243,14 @@ class RetentionActivationOwner:
                         if self._home is not None and planner_request_pending(self._home):
                             self._episode_user_yield = True
                             break
-                        projection = self._run_pass(planner, days)
+                        projection = self._run_pass(
+                            planner, days,
+                            lambda: self._stop.is_set()
+                            or (
+                                self._home is not None
+                                and planner_request_pending(self._home)
+                            ),
+                        )
                         projections.append(projection)
                         if getattr(projection, "complete", True) or not getattr(
                             projection, "progressed", False

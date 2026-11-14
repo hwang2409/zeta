@@ -603,7 +603,10 @@ class RetentionPlanner:
     def enabled(self) -> bool:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
 
-    def run_pass(self, *, days: int, commit_state: bool = True) -> PassResult:
+    def run_pass(
+        self, *, days: int, commit_state: bool = True,
+        yield_check: Callable[[], bool] | None = None,
+    ) -> PassResult:
         """Advance one bounded sweep step and return what it proved."""
         if type(days) is not int or days <= 0 or days > 3650:
             raise RetentionPlannerError("retention days must be in 1..3650")
@@ -614,15 +617,19 @@ class RetentionPlanner:
             return PassResult(enabled=True, complete=False)
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            return self._run_pass(home_fd, days, commit_state=commit_state)
+            return self._run_pass(
+                home_fd, days, commit_state=commit_state, yield_check=yield_check
+            )
         finally:
             os.close(home_fd)
             if planner_request_pending(self.home):
                 self.close()
 
     def _run_pass(
-        self, home_fd: int, days: int, *, commit_state: bool = True
+        self, home_fd: int, days: int, *, commit_state: bool = True,
+        yield_check: Callable[[], bool] | None = None,
     ) -> PassResult:
+        self._yield_check = yield_check
         self._prepared_commit = None
         self._commit_baseline = _load_state(home_fd)
         if self._latest is _UNLOADED:
@@ -643,7 +650,7 @@ class RetentionPlanner:
             preview=self._latest if type(self._latest) is dict else None,
             verify=self._verify_candidate,
             authority_held=False,
-            yield_check=lambda: planner_request_pending(self.home),
+            yield_check=yield_check or (lambda: planner_request_pending(self.home)),
         )
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
@@ -653,7 +660,7 @@ class RetentionPlanner:
             return PassResult(enabled=True, complete=False, mode="yielded")
         budget = _Budget(
             self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
-            yield_check=lambda: planner_request_pending(self.home),
+            yield_check=yield_check or (lambda: planner_request_pending(self.home)),
         )
         sweep = self._sweep
         if sweep is None or sweep.days != days:
@@ -727,7 +734,7 @@ class RetentionPlanner:
         """Repeat the full closure proof while the transaction owns authority."""
         budget = _Budget(
             self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
-            yield_check=lambda: planner_request_pending(self.home),
+            yield_check=self._yield_check or (lambda: planner_request_pending(self.home)),
         )
         sweep = _Sweep(days, self._now_ns(), current_root=root_id)
         scan = _ClosureBudget(budget)
