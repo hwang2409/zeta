@@ -188,6 +188,7 @@ class ZetaServer:
         socket_path: str | Path | None = None,
         port: int | None = None,
         ws_port: int | None = None,
+        ws_discovery: str | Path | None = None,
         ws_origins: tuple[str, ...] = (),
         provider: str | None = None,
         model: str | None = None,
@@ -211,6 +212,12 @@ class ZetaServer:
             raise ValueError("port must be between 0 and 65535")
         if ws_port is None and ws_origins:
             raise ValueError("ws_origins requires ws_port")
+        if ws_port is None and ws_discovery is not None:
+            raise ValueError("ws_discovery requires ws_port")
+        if ws_discovery is not None:
+            ws_discovery = Path(ws_discovery).expanduser()
+            if not ws_discovery.is_absolute():
+                raise ValueError("ws_discovery must be an absolute path")
         self.home = Path(home).expanduser().resolve() if home is not None else _home()
         self.socket_path = (
             Path(socket_path).expanduser().resolve()
@@ -239,11 +246,23 @@ class ZetaServer:
         self._foreground_subscription = None
         self._foreground_task: asyncio.Task[None] | None = None
         self._server: asyncio.AbstractServer | None = None
+        discovery_path = (
+            Path(ws_discovery)
+            if ws_discovery is not None
+            else self.home / "run" / "serve.ws.json"
+        )
+        discovery_lock_path = (
+            discovery_path.with_name(discovery_path.name + ".lock")
+            if ws_discovery is not None
+            else self.home / "run" / "serve.ws.lock"
+        )
         self._websocket = (
             WebSocketServer(
                 port=ws_port,
                 origins=ws_origins,
-                path=self.home / "run" / "serve.ws.json",
+                path=discovery_path,
+                lock_path=discovery_lock_path,
+                secure_parent=ws_discovery is None,
                 accept=self._accept,
             )
             if ws_port is not None

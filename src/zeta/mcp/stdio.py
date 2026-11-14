@@ -21,6 +21,7 @@ from .client import (
     MCPError,
     MCPPrompt,
     MCPProtocolError,
+    MCPRequestError,
     MCPResource,
     MCPTool,
     MCPTransportError,
@@ -30,6 +31,7 @@ from .client import (
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
+    require_capability,
     resource_content_from_result,
     resources_from_result,
     tools_from_result,
@@ -143,7 +145,7 @@ class StdioMCPClient(MCPClient):
     ) -> None:
         self.config = config
         self.protocol_version: str | None = None
-        self.capabilities: dict[str, object] = {}
+        self.capabilities: dict[str, object] | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -222,8 +224,10 @@ class StdioMCPClient(MCPClient):
                     "MCP initialize response omitted protocolVersion"
                 )
             self.protocol_version = protocol_version
-            capabilities = result.get("capabilities", {})
-            self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
+            capabilities = result.get("capabilities")
+            self.capabilities = (
+                dict(capabilities) if type(capabilities) is dict else None
+            )
             await self._notify("notifications/initialized", {})
         except BaseException:
             await self.close()
@@ -253,6 +257,7 @@ class StdioMCPClient(MCPClient):
         return await self._list_pages("tools/list", tools_from_result, "tools/list")
 
     async def list_prompts(self) -> list[MCPPrompt]:
+        require_capability(self.capabilities, "prompts", self.config.name)
         return await self._list_pages(
             "prompts/list", prompts_from_result, "prompts/list"
         )
@@ -260,6 +265,7 @@ class StdioMCPClient(MCPClient):
     async def list_resources(
         self, abort_signal: AbortSignal | None = None
     ) -> list[MCPResource]:
+        require_capability(self.capabilities, "resources", self.config.name)
         return await self._list_pages(
             "resources/list",
             resources_from_result,
@@ -268,10 +274,12 @@ class StdioMCPClient(MCPClient):
         )
 
     async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None):
+        require_capability(self.capabilities, "resources", self.config.name)
         result = await self._request("resources/read", {"uri": uri}, abort_signal)
         return resource_content_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
+        require_capability(self.capabilities, "prompts", self.config.name)
         result = await self._request(
             "prompts/get", {"name": name, "arguments": dict(arguments)}
         )
@@ -295,6 +303,8 @@ class StdioMCPClient(MCPClient):
             )
         except _StdioRestart:
             return self._restart_result()
+        except MCPRequestError as exc:
+            return make_error_result(str(exc))
         except MCPError as exc:
             self._report_failure(exc)
             return make_error_result(str(exc))

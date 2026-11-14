@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ...agent.receipt import encode_json
 from ..checkpoints import ConversationIntegrityError
 from ..checkpoints.mutation import (
     CommittedDelta,
@@ -20,7 +21,6 @@ from ..checkpoints.mutation import (
     execute_mutation,
 )
 from ._pending_prompts import PendingPromptWriterReloadedError
-from ._rows import ResidentRows
 
 if TYPE_CHECKING:
     from ..checkpoints import ConversationEntry
@@ -594,7 +594,7 @@ class AsyncDurableWritesMixin:
             or delta._resident_patch.replace_entries
         ):
             return entries
-        existing_ids = {entry.id for entry in self._resident_rows.entries}
+        existing_ids = {ref.id for ref in self._resident_rows.rows}
         missing = next(
             (
                 index
@@ -621,23 +621,55 @@ class AsyncDurableWritesMixin:
             if delta._resident_patch.replace_entries
             else list(copy.deepcopy(entries_to_install))
         )
+        original = delta.entries_to_install
+        first = (
+            next(
+                (
+                    index
+                    for index, entry in enumerate(original)
+                    if entry.id == entries[0].id
+                ),
+                len(original),
+            )
+            if entries
+            else 0
+        )
+        encoded_lengths = [
+            len(encode_json(entry.to_dict())) + 1 for entry in original
+        ]
+        start_offset = (
+            delta.log_cursor.offset
+            - sum(encoded_lengths)
+            + sum(encoded_lengths[:first])
+        )
+        if entries and delta.resident_rows is not None:
+            installed_ref = delta.resident_rows.row_by_id(entries[0].id)
+            if installed_ref is not None:
+                start_offset = installed_ref.offset
         if delta._resident_patch.replace_entries:
             self._before_incremental_state_install()
             self._reset_generation += 1
-            prepared = delta.resident_rows
-            if prepared is None:
+            if delta.resident_rows is None:
                 raise ConversationIntegrityError(
                     "replace delta missing prepared resident rows"
                 )
-            self._resident_rows = prepared
-            self._entry_ids = {entry.id for entry in entries}
+            self._resident_rows = delta.resident_rows.clone()
+            self._resident_rows.bind_source(
+                self.directory_fd,
+                delta.log_cursor.identity,
+                self._reset_generation,
+                lambda: self._reset_generation,
+            )
+            self._entry_ids = {ref.id for ref in self._resident_rows.rows}
         elif entries:
             self._before_incremental_state_install()
             if delta._resident_patch.raw_entries:
-                self._resident_rows.extend(entries)
+                self._resident_rows.extend(entries, start_offset=start_offset)
                 self._entry_ids.update(entry.id for entry in entries)
             else:
-                self._install_validated_linear_entries(entries)
+                self._install_validated_linear_entries(
+                    entries, start_offset=start_offset
+                )
                 self._record_client_delivery_entries(entries)
         return entries
 
@@ -660,7 +692,7 @@ class AsyncDurableWritesMixin:
         self._log_offset = cursor.offset
         self._log_mtime_ns = cursor.mtime_ns
         self._log_prefix_fingerprint = cursor.prefix_fingerprint
-        if entries:
+        if entries or delta._resident_patch.replace_entries:
             self._transcript_generation += 1
         return (
             "reset"
@@ -708,12 +740,11 @@ class AsyncDurableWritesMixin:
         )
         if current == baseline.cursor:
             return None
-        entries_to_install = writer._owned_installed_delta(tuple(writer._resident_rows.entries))
         return CommittedDelta(
             generation_before=baseline.generation,
             generation_after=writer.conversation_generation,
             committed_entries=(),
-            entries_to_install=entries_to_install,
+            entries_to_install=(),
             _resident_patch=_ResidentPatch(
                 {field: copy.deepcopy(getattr(writer, field)) for field in _PATCH_FIELDS},
                 baseline.patch,
@@ -723,7 +754,7 @@ class AsyncDurableWritesMixin:
             log_cursor=cursor,
             dedupe_key=None,
             duplicate=False,
-            resident_rows=ResidentRows.prepared(entries_to_install),
+            resident_rows=writer._resident_rows.clone(),
         )
 
     def _run_committed_mutation(
@@ -765,7 +796,7 @@ class AsyncDurableWritesMixin:
             if prelude is not None and isinstance(command, _StoreMutationCommand):
                 durable_command = replace(
                     command,
-                    baseline_count=len(writer._resident_rows.entries),
+                    baseline_count=len(writer._resident_rows.rows),
                     baseline_digest=writer._entry_prefix_digest,
                     baseline_patch=prelude._resident_patch.values,
                 )
@@ -774,7 +805,7 @@ class AsyncDurableWritesMixin:
                 if delta._resident_patch.replace_entries:
                     delta = replace(
                         delta,
-                        resident_rows=ResidentRows.prepared(delta.entries_to_install),
+                        resident_rows=writer._resident_rows.clone(),
                     )
             except BaseException as error:
                 if prelude is None:
@@ -923,7 +954,7 @@ class AsyncDurableWritesMixin:
         async with self._async_write_lock:
             command = replace(
                 command,
-                baseline_count=len(self._resident_rows.entries),
+                baseline_count=len(self._resident_rows.rows),
                 baseline_digest=self._entry_prefix_digest,
                 baseline_patch=_snapshot_patch_fields(self, command.patch_fields),
             )
@@ -936,7 +967,7 @@ class AsyncDurableWritesMixin:
                 if self.conversation_generation != resident_generation:
                     command = replace(
                         command,
-                        baseline_count=len(self._resident_rows.entries),
+                        baseline_count=len(self._resident_rows.rows),
                         baseline_digest=self._entry_prefix_digest,
                         baseline_patch=_snapshot_patch_fields(
                             self, command.patch_fields

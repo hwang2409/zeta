@@ -44,6 +44,7 @@ from .project_context import (
     project_instructions_command,
 )
 from .store import ConversationEntry
+from .store._rows import TranscriptRows
 
 
 class UsageCounterSource(Protocol):
@@ -557,14 +558,16 @@ class SlashStatusSnapshot:
     """Loop-owned status values plus append-only transcript references."""
 
     base: SlashStatus
-    transcript_entries: tuple[ConversationEntry, ...]
+    transcript_entries: tuple[ConversationEntry, ...] | TranscriptRows
     token_counter: Callable[[Message], int]
 
 
 def build_slash_status(snapshot: SlashStatusSnapshot) -> SlashStatus:
     """Finish the shared projection, including transcript-sized work."""
 
-    entries = copy.deepcopy(active_branch(snapshot.transcript_entries))
+    source = snapshot.transcript_entries
+    rows = source.read() if isinstance(source, TranscriptRows) else source
+    entries = copy.deepcopy(active_branch(rows))
     return replace(
         snapshot.base,
         compaction_marker_count=sum(entry.type == "compaction" for entry in entries),

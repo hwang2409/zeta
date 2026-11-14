@@ -1945,7 +1945,7 @@ async def test_mcp_http_large_response_spills_not_errors() -> None:
                 json={
                     "jsonrpc": "2.0",
                     "id": body["id"],
-                    "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {"resources": {}}},
                 },
                 request=request,
             )

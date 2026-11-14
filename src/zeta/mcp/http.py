@@ -24,6 +24,7 @@ from .client import (
     MCPHTTPError,
     MCPPrompt,
     MCPProtocolError,
+    MCPRequestError,
     MCPResource,
     MCPTool,
     MCPTransportError,
@@ -33,6 +34,7 @@ from .client import (
     parse_rpc_response,
     prompt_text_from_result,
     prompts_from_result,
+    require_capability,
     resource_content_from_result,
     resources_from_result,
     tools_from_result,
@@ -100,7 +102,7 @@ class StreamableHTTPMCPClient(MCPClient):
         self._session_id: str | None = None
         self._notification_event_id: bytes | None = None
         self.protocol_version: str | None = None
-        self.capabilities: dict[str, object] = {}
+        self.capabilities: dict[str, object] | None = None
         self._next_id = 0
         self._closed = False
         self._failure_sink: Callable[[str], None] | None = None
@@ -130,8 +132,8 @@ class StreamableHTTPMCPClient(MCPClient):
         if type(protocol_version) is not str or not protocol_version:
             raise MCPProtocolError("MCP initialize response omitted protocolVersion")
         self.protocol_version = protocol_version
-        capabilities = result.get("capabilities", {})
-        self.capabilities = dict(capabilities) if type(capabilities) is dict else {}
+        capabilities = result.get("capabilities")
+        self.capabilities = dict(capabilities) if type(capabilities) is dict else None
         await self._send_notification("notifications/initialized", {})
         self._notification_task = asyncio.create_task(self._listen_notifications())
 
@@ -141,6 +143,7 @@ class StreamableHTTPMCPClient(MCPClient):
         )
 
     async def list_prompts(self) -> list[MCPPrompt]:
+        require_capability(self.capabilities, "prompts", self.config.name)
         return await _drain_pages(
             self._request, "prompts/list", prompts_from_result, "prompts/list"
         )
@@ -148,6 +151,7 @@ class StreamableHTTPMCPClient(MCPClient):
     async def list_resources(
         self, abort_signal: AbortSignal | None = None
     ) -> list[MCPResource]:
+        require_capability(self.capabilities, "resources", self.config.name)
         return await _drain_pages(
             self._request,
             "resources/list",
@@ -157,10 +161,12 @@ class StreamableHTTPMCPClient(MCPClient):
         )
 
     async def read_resource(self, uri: str, abort_signal: AbortSignal | None = None):
+        require_capability(self.capabilities, "resources", self.config.name)
         result = await self._request("resources/read", {"uri": uri}, abort_signal)
         return resource_content_from_result(result)
 
     async def get_prompt(self, name: str, arguments: Mapping[str, str]) -> str:
+        require_capability(self.capabilities, "prompts", self.config.name)
         try:
             result = await self._request(
                 "prompts/get", {"name": name, "arguments": dict(arguments)}
@@ -197,6 +203,8 @@ class StreamableHTTPMCPClient(MCPClient):
             result = make_error_result(error["text"])
             result["structuredContent"] = {"credential_store_error": error}
             return result
+        except MCPRequestError as exc:
+            return make_error_result(str(exc))
         except MCPError as exc:
             if self._failure_sink is not None:
                 self._failure_sink(str(exc))

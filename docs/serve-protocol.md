@@ -26,9 +26,12 @@ remains under `ZETA_HOME`.
 ### WebSocket transport
 
 `zeta serve --ws PORT` adds an RFC 6455 WebSocket listener on
-`127.0.0.1:PORT`; it does not replace the Unix socket or TCP listener. Only one
-`--ws` server can run per `ZETA_HOME`. The bind address is fixed and cannot be
-configured. The transport supports text
+`127.0.0.1:PORT`; it does not replace the Unix socket or TCP listener. The bind
+address is fixed and cannot be configured. By default, only one `--ws` server
+can run per `ZETA_HOME`. Use `--ws-discovery PATH` with an absolute path to run
+another WebSocket server in the same home; its discovery file is written at
+`PATH` and its lock at `PATH.lock`. The parent directory is created with mode
+`0700` when needed. The transport supports text
 messages, fragmentation, ping, pong, and the close handshake. It does not
 negotiate extensions. Binary messages close with code `1003`, and messages over
 1 MiB close with code `1009`.
@@ -46,6 +49,10 @@ this discovery file with mode `0600` and removes it on clean shutdown:
 ```text
 $ZETA_HOME/run/serve.ws.json
 ```
+
+With `--ws-discovery PATH`, this file is written at the supplied path instead.
+The custom discovery file and lock use the same owner-only permissions,
+atomic writes, and clean-shutdown ownership check as the default files.
 
 ```json
 {"port":8765,"token":"<controller credential>","controller_token":"<controller credential>","observer_token":"<observer credential>","pid":12345,"origins":["http://127.0.0.1:5173"],"ws_auth":["subprotocol","query"]}

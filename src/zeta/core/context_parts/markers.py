@@ -26,6 +26,7 @@ class ContextMarkerMixin:
         entry: ConversationEntry,
         active_source_seqs: set[int],
         source_entries: Sequence[ConversationEntry] = (),
+        legacy_pinned_seq: int | None = None,
     ) -> list[_ContextItem]:
         sources: dict[int, Mapping[str, Any]] = {}
         if entry.data.get("kind") == EVICTION_KIND:
@@ -38,9 +39,11 @@ class ContextMarkerMixin:
                     pinned_message is not None
                     and "source_seq" not in pinned_message.metadata
                 ):
-                    pinned_seq = ContextMarkerMixin._legacy_pinned_seq(
-                        entry, pinned_message, source_entries
-                    )
+                    pinned_seq = legacy_pinned_seq
+                    if pinned_seq is None:
+                        pinned_seq = ContextMarkerMixin._legacy_pinned_seq(
+                            entry, pinned_message, source_entries
+                        )
                     if pinned_seq is not None:
                         pinned_message = Message(
                             pinned_message.role,
