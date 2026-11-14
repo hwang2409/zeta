@@ -189,7 +189,7 @@ async def test_cancelled_recovery_owner_does_not_cancel_recovery(
     )
 
     first.cancel()
-    await asyncio.gather(first, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(first, return_exceptions=True), 10)
     assert not restarting_mcp.initialize_cancelled.is_set()
 
     second = asyncio.create_task(client.list_tools())
@@ -227,11 +227,14 @@ async def test_request_started_during_recovery_waits_for_shared_initialize(
     second_entered = asyncio.Event()
     original = client._send_with_auth
 
-    async def observe_send(payload, request_id, state):
+    async def observe_send(payload, request_id, state, *, recover_session=True):
         if payload["method"] == "tools/list":
             second_entered.set()
-        return await original(payload, request_id, state)
+        return await original(
+            payload, request_id, state, recover_session=recover_session
+        )
 
+    # test-contract: seam observe entry before the transport waits on recovery
     monkeypatch.setattr(client, "_send_with_auth", observe_send)
     second = asyncio.create_task(client.list_tools())
     await await_or_fail(second_entered.wait(), what="second list request start")
@@ -255,7 +258,9 @@ async def test_notification_404_recovers_and_replaces_listener(
     old_listener = client._notification_task
     assert old_listener is not None
     old_listener.cancel()
-    await asyncio.gather(old_listener, return_exceptions=True)
+    await asyncio.wait_for(
+        asyncio.gather(old_listener, return_exceptions=True), 10
+    )
     restarting_mcp.restart()
     listener_calls: list[str | None] = []
     new_listener_started = asyncio.Event()
@@ -269,6 +274,7 @@ async def test_notification_404_recovers_and_replaces_listener(
         await asyncio.wait_for(release_listener.wait(), 10)
         return False
 
+    # test-contract: seam force the GET stream's 404 and hold its replacement
     monkeypatch.setattr(client, "_listen_notification_stream", listen_once)
     replacement_owner = asyncio.create_task(client._listen_notifications())
     client._notification_task = replacement_owner
@@ -292,7 +298,7 @@ async def test_close_cancels_recovery_after_caller_stops_waiting(
         restarting_mcp.initialize_started.wait(), what="recovery initialize start"
     )
     request.cancel()
-    await asyncio.gather(request, return_exceptions=True)
+    await asyncio.wait_for(asyncio.gather(request, return_exceptions=True), 10)
 
     assert not restarting_mcp.initialize_cancelled.is_set()
 
@@ -301,3 +307,5 @@ async def test_close_cancels_recovery_after_caller_stops_waiting(
         restarting_mcp.initialize_cancelled.wait(), what="recovery cancellation on close"
     )
     assert client._notification_task is None
+    # test-contract: seam close must release both owned background task slots
+    assert client._session_recovery_task is None
