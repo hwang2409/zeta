@@ -277,10 +277,10 @@ def retention_authority(
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
                     unlink_session_file(home_fd, _ARM_FILENAME)
-                    projection = retention_result(timestamp=now(), mode="disarmed", days=0)
-                    append_retention_history(root, lease, projection)
                 finally:
                     os.close(home_fd)
+            projection = retention_result(timestamp=now(), mode="disarmed", days=0)
+            append_retention_history(root, lease, projection)
             return RetentionAuthorityResult("retention disabled", projection, True)
         with (
             _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
