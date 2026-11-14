@@ -845,7 +845,9 @@ async def test_socket_http_approved_tool_runs_once(
     )
     mcp = LocalMCP(chunked_notifications=True)
     mcp.include_x = not live_added
-    port = await mcp.start()
+    port = await await_or_fail(
+        mcp.start(), timeout=30, what="approved MCP test server start"
+    )
     project = tmp_path / "project"
     project.mkdir()
     (tmp_path / "mcp.json").write_text(
@@ -875,16 +877,22 @@ async def test_socket_http_approved_tool_runs_once(
         provider="codex",
         backend_factory=lambda *_: (backend, "offline"),
     )
-    reader, writer = await _connect(server)
+    reader, writer = await await_or_fail(
+        _connect(server), timeout=30, what="approved MCP serve connection"
+    )
     try:
-        await _request(reader, writer, 1, "hello", {
-            "protocol_version": "1.2",
-            "features": [
-                "approval_reconnect",
-                "new_session_settings",
-                "session_mcp_bindings",
-            ],
-        })
+        await await_or_fail(
+            _request(reader, writer, 1, "hello", {
+                "protocol_version": "1.2",
+                "features": [
+                    "approval_reconnect",
+                    "new_session_settings",
+                    "session_mcp_bindings",
+                ],
+            }),
+            timeout=30,
+            what="approved MCP hello",
+        )
         new_session: dict[str, Any] = {
             "provider": "codex",
             "model": "gpt-5.6-sol",
@@ -895,24 +903,54 @@ async def test_socket_http_approved_tool_runs_once(
                 "server": "page",
                 "headers": {"Authorization": f"Bearer {SECRET}"},
             }]
-        created = await _request(reader, writer, 2, "new_session", new_session)
+        created = await await_or_fail(
+            _request(reader, writer, 2, "new_session", new_session),
+            timeout=30,
+            what="approved MCP new session",
+        )
         assert "error" not in created[-1]
-        sent = await _request(reader, writer, 3, "send", {"text": "first"})
+        sent = await await_or_fail(
+            _request(reader, writer, 3, "send", {"text": "first"}),
+            timeout=30,
+            what="approved MCP first send",
+        )
         assert "error" not in sent[-1]
-        await _event(reader, "agent_end")
+        await await_or_fail(
+            _event(reader, "agent_end"),
+            timeout=30,
+            what="approved MCP first turn end",
+        )
 
         if live_added:
-            await mcp.add_tool()
-            await asyncio.wait_for(mcp.tools_refetched.wait(), TIMEOUT)
+            await await_or_fail(
+                mcp.add_tool(), timeout=30, what="approved MCP live tool notification"
+            )
+            await await_or_fail(
+                mcp.tools_refetched.wait(),
+                timeout=30,
+                what="approved MCP live binding refresh",
+            )
 
-        await _request(reader, writer, 4, "send", {"text": "use x"})
-        approval = await _event(reader, "approval_request")
+        await await_or_fail(
+            _request(reader, writer, 4, "send", {"text": "use x"}),
+            timeout=30,
+            what="approved MCP tool send",
+        )
+        approval = await await_or_fail(
+            _event(reader, "approval_request"),
+            timeout=30,
+            what="approved MCP approval request",
+        )
         live_turn = server.control._turn_task
         assert live_turn is not None
         server.control._turn_task = None
-        approved = await _request(reader, writer, 5, "approve", {
-            "request_id": approval["request_id"],
-        })
+        approved = await await_or_fail(
+            _request(reader, writer, 5, "approve", {
+                "request_id": approval["request_id"],
+            }),
+            timeout=30,
+            what="approved MCP approval response",
+        )
         assert "error" not in approved[-1]
         recovery_turn = server.control._turn_task
         assert recovery_turn is not None
@@ -930,9 +968,15 @@ async def test_socket_http_approved_tool_runs_once(
         ) == 1
     finally:
         writer.close()
-        await writer.wait_closed()
-        await server.close()
-        await mcp.close()
+        await await_or_fail(
+            writer.wait_closed(), timeout=30, what="approved MCP socket close"
+        )
+        await await_or_fail(
+            server.close(), timeout=30, what="approved MCP zeta server close"
+        )
+        await await_or_fail(
+            mcp.close(), timeout=30, what="approved MCP test server close"
+        )
 
 
 @pytest.mark.asyncio
