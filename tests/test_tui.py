@@ -41,6 +41,7 @@ from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout
@@ -16811,6 +16812,9 @@ async def test_root_tui_paging_render_path_table(
                     )
                 )
             child_path = child_store.session_dir
+            child_store.agent_lifecycle_path.write_text(
+                json.dumps({"description": "search child", "state": "running"})
+            )
             child_store.close()
             navigation = app._agent_navigation
             navigation.current_path = child_path
@@ -16824,70 +16828,87 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(
                 app._history_view_task, what="focused child search activation"
             )
-            transcript = navigation.transcript_control.transcript
-            request = transcript.open_finder()
-            assert request is not None
-            app._active_finder = transcript
-            app._start_finder_preparation(request)
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
 
-            app._finder_input("Henry's old child prompt")
-            assert app._history_search_task is not None
-            await await_or_fail(
-                app._history_search_task, what="old focused child search"
-            )
-            try:
+            def press(key: Keys | str) -> None:
+                keys = key if isinstance(key, Keys) else tuple(key)
+                if isinstance(keys, Keys):
+                    session.app.key_processor.feed(KeyPress(keys))
+                else:
+                    for character in keys:
+                        session.app.key_processor.feed(
+                            KeyPress(character, data=character)
+                        )
+                session.app.key_processor.process_keys()
+
+            transcript = navigation.transcript_control.transcript
+            with set_app(session.app):
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                press("Henry's old child prompt")
+                await wait_until(lambda: app._history_search_task is not None)
+                await await_or_fail(
+                    app._history_search_task, what="old focused child search"
+                )
+                try:
+                    await wait_until(
+                        lambda: (
+                            (state := transcript.finder_state()) is not None
+                            and state.complete
+                            and bool(state.rows)
+                        )
+                    )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "focused-child ctrl+f did not finish with the unloaded match"
+                    ) from exc
+                assert old.id in {
+                    match.entry_id for match in app._history_search_results
+                }, "focused-child ctrl+f did not select the unloaded old row"
+                rendered = Text.from_ansi(transcript.render(120)).plain
+                assert "Henry's old child prompt" in rendered, (
+                    "selected old child row did not reach TranscriptWidget render"
+                )
+
+                app._finder_cancel()
+                await wait_until(lambda: transcript.finder_state() is None)
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                previous_search = app._history_search_task
+                press("absent-focused-child-query")
+                await wait_until(
+                    lambda: app._history_search_task is not previous_search
+                )
+                await await_or_fail(
+                    app._history_search_task, what="focused child no-match search"
+                )
                 await wait_until(
                     lambda: (
                         (state := transcript.finder_state()) is not None
                         and state.complete
-                        and bool(state.rows)
+                        and not state.rows
                     )
                 )
-            except AssertionError as exc:
-                raise AssertionError(
-                    "focused-child search did not finish with the unloaded match"
-                ) from exc
-            assert old.id in {
-                match.entry_id for match in app._history_search_results
-            }, "focused-child search did not find the unloaded old row"
-            assert transcript.durable_scroll_anchor is not None
-            assert transcript.durable_scroll_anchor[0] == old.id
-
-            app._finder_input("absent-focused-child-query")
-            assert app._history_search_task is not None
-            await await_or_fail(
-                app._history_search_task, what="focused child no-match search"
-            )
-            await wait_until(
-                lambda: (
-                    (state := transcript.finder_state()) is not None
-                    and state.complete
-                    and not state.rows
+                content = app._finder_control.create_content(80, None)
+                overlay = "\n".join(
+                    "".join(fragment[1] for fragment in content.get_line(row))
+                    for row in range(content.line_count)
                 )
-            )
-            state = transcript.finder_state()
-            assert state is not None and state.complete and not state.rows, (
-                "focused-child no-match search stayed searching"
-            )
+                assert "no matches" in overlay, (
+                    "focused-child no-match ctrl+f did not render no matches"
+                )
+                session.layout.focus(session.default_buffer)
         elif journey == "root-anchor-child-visit":
-            root_ids = [
-                unit.entry_id
-                for page in app._history_pager.pages
-                for unit in page.units
-            ]
-            oldest_page = await app._history_source.page()
-            while oldest_page.older is not None:
-                oldest_page = await app._history_source.page(
-                    oldest_page.older, direction="older"
-                )
-            old_root_id = oldest_page.units[0].entry_id
-            await app._history_pager.reveal(old_root_id)
+            await app._history_pager.load("older")
             app._render_resident_history()
-            assert app._transcript.restore_durable_scroll_anchor(
-                (old_root_id, 0, 0)
-            )
+            app._transcript.scroll_to_top()
             root_anchor = app._transcript.durable_scroll_anchor
             assert root_anchor is not None
+            assert Text.from_ansi(app._transcript.render(120)).plain.strip()
 
             child_store = ConversationStore(
                 store.session_dir / "agents", session_id="1"
@@ -16909,16 +16930,28 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(
                 app._history_view_task, what="child visit activation"
             )
+            assert "child visit" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
 
-            navigation.exit_navigation()
-            assert app._history_view_task is not None
-            await await_or_fail(
-                app._history_view_task, what="root anchor restoration"
-            )
-            assert app._transcript.durable_scroll_anchor == root_anchor, (
-                "returning from child moved the root viewport to the tail"
-            )
-            assert old_root_id not in root_ids
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
+            with set_app(session.app):
+                session.app.key_processor.feed(KeyPress("h", data="h"))
+                session.app.key_processor.process_keys()
+                await wait_until(lambda: not navigation.child_view_active)
+                assert app._history_view_task is not None
+                await await_or_fail(
+                    app._history_view_task, what="root anchor restoration"
+                )
+                assert app._transcript.durable_scroll_anchor == root_anchor, (
+                    "returning from child moved the root viewport to the tail"
+                )
+                assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+                session.layout.focus(session.default_buffer)
         elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 

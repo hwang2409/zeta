@@ -418,8 +418,10 @@ class ChildLogHistorySource:
                 searchable = json.dumps(
                     bounded_transcript_message(raw_message), ensure_ascii=False
                 )
-            else:
+            elif entry.type == "checkpoint":
                 searchable = json.dumps(entry.data, ensure_ascii=False)
+            else:
+                continue
             if needle in searchable.casefold():
                 matches.append(HistorySearchResult(entry.id))
                 if len(matches) == limit:
