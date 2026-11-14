@@ -1214,7 +1214,9 @@ async def test_cancel_at_each_background_transition_await_still_publishes_one_co
         published = probe.for_run(target)
         assert [number for number, _durable in published] == [receipt.seq]
         assert published[0][1]["state"] == "completed" and published[0][1].get("finished_at")
-        durable = load_session_json(_lifecycle_path(serve.store.session_dir, target))
+        durable = await asyncio.to_thread(
+            load_session_json, _lifecycle_path(serve.store.session_dir, target)
+        )
         assert durable["state"] == "completed"
     finally:
         unregister()
