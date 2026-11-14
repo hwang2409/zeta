@@ -2731,6 +2731,7 @@ async def test_cancel_child_admits_grandchild_abort_before_any_await(
             grandchild_loops.append(self)
         return original_run_turn_impl(self, *args, **kwargs)
 
+    # test-contract: seam no public hook exposes the grandchild's loop object
     monkeypatch.setattr(AgentLoop, "_run_turn_impl", capture_grandchild_loop)
 
     child_watcher: asyncio.Task[object] | None = None
