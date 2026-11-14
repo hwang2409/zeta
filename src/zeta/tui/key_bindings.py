@@ -963,6 +963,8 @@ def build_key_bindings(
 
     @bindings.add(*resolved_keys["exit"], filter=~panel_mode)
     def exit_prompt(event: KeyPressEvent) -> None:
+        event.app.output.reset_cursor_shape()
+        event.app.output.flush()
         on_exit()
         if event.app.future is not None and not event.app.future.done():
             event.app.exit(exception=EOFError())

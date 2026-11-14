@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import pty
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -50,6 +51,7 @@ from prompt_toolkit.layout.mouse_handlers import MouseHandlers
 from prompt_toolkit.layout.screen import Screen, WritePosition
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.cells import cell_len
 from rich.console import Console
@@ -7957,6 +7959,39 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
     assert rendered.index("name") < rendered.index("second")
 
 
+@pytest.mark.asyncio
+async def test_ctrl_d_resets_cursor_before_prompt_toolkit_exit() -> None:
+    stream = StringIO()
+    output = Vt100_Output(stream, lambda: Size(rows=24, columns=80))
+    original_quit = output.quit_alternate_screen
+
+    def quit_alternate_screen_with_forced_flush() -> None:
+        original_quit()
+        output.flush()
+        rendered = stream.getvalue().encode()
+        assert b"\x1b[0 q" in rendered
+        assert rendered.index(b"\x1b[0 q") < rendered.index(b"\x1b[?1049l")
+
+    output.quit_alternate_screen = quit_alternate_screen_with_forced_flush  # type: ignore[method-assign]
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(
+            input=pipe,
+            output=output,
+            key_bindings=build_key_bindings(
+                on_interrupt=lambda: None,
+                on_exit=lambda: session.app.exit(exception=EOFError()),
+                on_history_previous=lambda _buffer: None,
+                on_history_next=lambda _buffer: None,
+            ),
+            multiline=True,
+            editing_mode=EditingMode.VI,
+        )
+        prompt = asyncio.create_task(session.prompt_async())
+        pipe.send_text("\x04")
+        with pytest.raises(EOFError):
+            await asyncio.wait_for(prompt, 10)
+
+
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
     master_fd, slave_fd = pty.openpty()
     env = _fixed_terminal_env(tmp_path / "zeta-home")
@@ -7982,10 +8017,27 @@ def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
         os.write(master_fd, b"\x04")
         read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
         reap_process(process, timeout=10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(
+                [master_fd], [], [], max(0, deadline - time.monotonic())
+            )
+            if not ready:
+                break
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError as error:
+                if error.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            output.extend(chunk)
         assert process.returncode == 0
         assert b"\x1b[?1049h" in output
         assert b"\x1b[?1049l" in output
         assert b"\x1b[0 q" in output
+        assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
         assert output.count(b"\x1b[?1049h") == 1
     finally:
         if process.poll() is None:
