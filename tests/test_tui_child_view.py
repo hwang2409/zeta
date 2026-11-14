@@ -252,6 +252,11 @@ async def test_real_tui_child_view_journey(
                     f"length={len(session.default_buffer.text)}"
                 )
 
+            child_anchor = (
+                app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
+            )
+            assert child_anchor is not None
+
             await _return_to_root(app, pipe)
             try:
                 await _wait_until(
@@ -264,6 +269,17 @@ async def test_real_tui_child_view_journey(
                 )
                 assert ROOT_MARKER in after, (
                     "root-anchor-return: complex root marker is not in the restored rendered widget"
+                )
+                await _enter_child(app, pipe)
+                await _wait_until(
+                    lambda: (
+                        app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
+                        == child_anchor
+                    ),
+                    what="restored child durable anchor",
+                )
+                assert session.default_buffer.text == "draft-child-ux1309", (
+                    "child-return: parked draft was not restored"
                 )
             except AssertionError as exc:
                 failures.append(str(exc))

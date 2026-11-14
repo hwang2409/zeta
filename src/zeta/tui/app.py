@@ -364,6 +364,7 @@ class TUIApp(
             root_transcript=self._transcript,
             prompt_history=prompt_history,
             current_path=lambda: app._viewed_session_path(),
+            prepare_path=self._agent_navigation._prepare_view_path,
             commit_path=self._agent_navigation._commit_view_path,
             render_active=lambda: app._render_active_resident_history(),
             root_endpoint=lambda: self.loop.store.active_branch_head_id(),

@@ -16951,6 +16951,32 @@ async def test_root_tui_paging_render_path_table(
                 )
                 session.layout.focus(session.default_buffer)
         elif journey == "root-anchor-child-visit":
+            from zeta.tui import agent_card as agent_card_module
+            from zeta.tui.transcript.paged_history import PagedHistoryState
+
+            discovery_threads: list[int] = []
+            main_thread = threading.get_ident()
+            original_markers = agent_card_module.registered_child_markers
+            original_paths = agent_card_module.agent_child_paths
+            original_metadata = agent_card_module._agent_metadata
+
+            def tracked_markers(path: Path):
+                discovery_threads.append(threading.get_ident())
+                return original_markers(path)
+
+            def tracked_paths(path: Path, candidates):
+                discovery_threads.append(threading.get_ident())
+                return original_paths(path, candidates)
+
+            def tracked_metadata(path: Path, fallback=None):
+                discovery_threads.append(threading.get_ident())
+                return original_metadata(path, fallback)
+
+            monkeypatch.setattr(agent_card_module, "registered_child_markers", tracked_markers)
+            monkeypatch.setattr(agent_card_module, "agent_child_paths", tracked_paths)
+            # test-contract: seam prove navigation filesystem preparation stays off-loop
+            monkeypatch.setattr(agent_card_module, "_agent_metadata", tracked_metadata)
+
             await app._agent_navigation.transcript_control.history_pager.load("older")
             app._render_resident_history()
             app._transcript.scroll_to_top()
@@ -16961,9 +16987,13 @@ async def test_root_tui_paging_render_path_table(
             child_store = ConversationStore(
                 store.session_dir / "agents", session_id="1"
             )
-            child_store.append_message(
-                Message(MessageRole.ASSISTANT, [TextContent("child visit")])
-            )
+            for index in range(700):
+                child_store.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child visit {index}")],
+                    )
+                )
             child_path = child_store.session_dir
             child_store.close()
             navigation = app._agent_navigation
@@ -16978,9 +17008,20 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(
                 app._agent_navigation.transcript_control._load_task, what="child visit activation"
             )
-            assert "child visit" in Text.from_ansi(
+            assert "child visit 699" in Text.from_ansi(
                 navigation.transcript_control.transcript.render(120)
             ).plain
+            assert discovery_threads
+            assert main_thread not in discovery_threads, (
+                "child navigation discovery or metadata read ran on the TUI loop"
+            )
+            await navigation.transcript_control.history_pager.load("older")
+            navigation.transcript_control.render_pages(
+                navigation.transcript_control.history_pager.pages
+            )
+            navigation.transcript_control.transcript.scroll_to_top()
+            child_anchor = navigation.transcript_control.transcript.durable_scroll_anchor
+            assert child_anchor is not None
 
             session = app._make_session()
             app._active_session = session
@@ -16999,7 +17040,31 @@ async def test_root_tui_paging_render_path_table(
                     "returning from child moved the root viewport to the tail"
                 )
                 assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+                owner = navigation.transcript_control
+                retained_pages = len(owner.history_pager.descriptors) + sum(
+                    len(value.segments)
+                    for value in vars(owner).values()
+                    if isinstance(value, PagedHistoryState)
+                )
+                assert retained_pages <= 4, (
+                    "root and child retained more than the one global page budget"
+                )
+
                 session.layout.focus(session.default_buffer)
+                session.app.key_processor.feed(KeyPress(Keys.Down))
+                session.app.key_processor.process_keys()
+                await wait_until(navigation.list_focused)
+                while navigation.entries[navigation.selected_index].path != child_path:
+                    session.app.key_processor.feed(KeyPress(Keys.Down))
+                    session.app.key_processor.process_keys()
+                session.app.key_processor.feed(KeyPress(Keys.Enter))
+                session.app.key_processor.process_keys()
+                await wait_until(lambda: navigation.child_view_active)
+                assert owner._load_task is not None
+                await await_or_fail(owner._load_task, what="child anchor restoration")
+                assert owner.transcript.durable_scroll_anchor == child_anchor, (
+                    "returning to a child lost its parked durable anchor"
+                )
         elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 
