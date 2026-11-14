@@ -114,6 +114,7 @@ def test_retention_durable_writers_have_one_owner():
         )
 
     for path in source.rglob("*.py"):
+        path_in_package = path.is_relative_to(package)
         tree = ast.parse(path.read_text(encoding="utf-8"))
         relative = path.relative_to(source).as_posix()
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
@@ -139,7 +140,6 @@ def test_retention_durable_writers_have_one_owner():
             ):
                 continue
             owners = owner(node, parents)
-            path_in_package = path.is_relative_to(package)
             if not path_in_package:
                 continue
             if not mentions_target(node, assigned):

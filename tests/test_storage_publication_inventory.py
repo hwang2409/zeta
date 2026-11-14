@@ -48,7 +48,7 @@ _DURABILITY_CALLBACKS = {
 _RAW_PUBLICATION = {
     ("storage_format.py", "_publish_manifest", "os.replace"),
     ("project_registry.py", "_rename_without_replacement", "os.rename"),
-    ("session_retention/transaction.py", "_start_one", "os.rename"),
+    ("session_retention/transaction.py", "_move_to_trash", "os.rename"),
     ("project_inbox.py", "claim", "os.rename"),
     ("project_inbox.py", "done_with_outcome", "os.rename"),
     ("project_inbox.py", "_recover_stale", "os.rename"),
@@ -140,7 +140,7 @@ _RAW_DELETION = {
     ("server/transport.py", "write_connection_file", "unlink"),
     ("storage_format.py", "_publish_manifest", "unlink"),
     ("storage_format.py", "delete", "unlink"),
-    ("session_retention/transaction.py", "_remove_tree_entry", "unlink"),
+    ("session_retention/transaction.py", "_unlink_tree_entry", "unlink"),
     ("tools/_atomic_replace.py", "atomic_create", "unlink"),
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
