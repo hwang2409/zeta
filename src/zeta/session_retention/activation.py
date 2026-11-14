@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,23 @@ class _PublishedPass(dict[str, object]):
         self.progressed = progressed
 
 
+def _progress_marker(planner: Any) -> str:
+    marker = [repr(getattr(planner, "_state_payload", lambda: None)())]
+    home = getattr(planner, "home", None)
+    if home is None:
+        return marker[0]
+    trash = Path(home) / "session-trash"
+    if trash.exists():
+        for root, _dirs, files in os.walk(trash):
+            for name in sorted(files):
+                path = Path(root) / name
+                try:
+                    marker.append(str(path.relative_to(trash)) + ":" + path.read_bytes().hex())
+                except OSError:
+                    continue
+    return "|".join(marker)
+
+
 def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
     return {key: value for key, value in left.items() if key != "timestamp"} == {
         key: value for key, value in right.items() if key != "timestamp"
@@ -46,9 +64,9 @@ def make_retention_owner(
     root = Path(home)
     retained = lease.retain()
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
-        before = repr(getattr(planner, "_state_payload", lambda: None)())
+        before = _progress_marker(planner)
         result = planner.run_pass(days=current_days)
-        after = repr(getattr(planner, "_state_payload", lambda: None)())
+        after = _progress_marker(planner)
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
@@ -240,8 +258,7 @@ class RetentionActivationOwner:
                 if (
                     projections
                     and any(
-                        getattr(p, "get", lambda *_: None)("mode") == "preview"
-                        and not getattr(p, "complete", True)
+                        not getattr(p, "complete", True)
                         and getattr(p, "progressed", False)
                         for p in projections
                     )

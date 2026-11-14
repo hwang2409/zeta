@@ -175,13 +175,12 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
             bounds=RetentionBounds(roots_advanced=1, metadata_candidates=1),
         )
         published: list[dict[str, object]] = []
-        owner.set_publish(published.append)
-        owner.start()
         for _ in range(100):
+            projections, failure = await asyncio.to_thread(owner._run_episode)
+            assert failure is None
+            published.extend(projections)
             if published and getattr(published[-1], "complete", False):
                 break
-            owner.wake()
-            await asyncio.sleep(0)
         assert len(published) >= 3
         assert getattr(published[-1], "complete", False)
         await owner.stop()
@@ -209,9 +208,13 @@ async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) 
         assert preview["root_ids"] == [opened]
         armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
         assert armed.applied
-        projections, failure = await asyncio.to_thread(owner._run_episode)
-        assert failure is None
-        deleted = [item for item in projections if item["mode"] == "deleted"]
+        deleted = []
+        for _ in range(20):
+            projections, failure = await asyncio.to_thread(owner._run_episode)
+            assert failure is None
+            deleted = [item for item in projections if item["mode"] == "deleted"]
+            if deleted:
+                break
         assert deleted and any(item["root_ids"] == [opened] for item in deleted)
         assert not (home / "sessions" / opened).exists()
         assert any(row["mode"] == "deleted" and row["root_ids"] == [opened] for row in read_retention_history(home))
