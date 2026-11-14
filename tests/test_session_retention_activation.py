@@ -31,7 +31,7 @@ from zeta.session_retention.activation import (
     make_retention_owner,
 )
 from zeta.session_retention.handshake import ensure_handshake_files, planner_active
-from zeta.storage_format import open_writer
+from zeta.storage_format import StorageFormatError, open_writer
 
 
 @pytest.mark.asyncio
@@ -221,6 +221,59 @@ def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path:
             owner = make_retention_owner(home, lease, lambda: days[0])
             projections, failure = owner._run_episode()
             assert failure is None and projections[-1].projection["days"] == 60
+
+
+@pytest.mark.parametrize("existing_preview", (True, False))
+def test_stale_days_change_redecides_current_projection(
+    tmp_path: Path, existing_preview: bool,
+) -> None:
+    home = tmp_path / ("existing" if existing_preview else "empty")
+    initialize_storage_home(home)
+    days = [30]
+    with _opened_lease(home) as lease:
+        if existing_preview:
+            with RetentionPlanner(home, lease) as planner:
+                preview = planner.run_pass(days=30)
+            assert preview.complete and preview.preview is not None
+        decided = threading.Event()
+        release = threading.Event()
+        original = RetentionPlanner.run_pass
+
+        def gated(planner, **kwargs):
+            result = original(planner, **kwargs)
+            decided.set()
+            assert release.wait(10)
+            return result
+
+        RetentionPlanner.run_pass = gated
+        try:
+            owner = make_retention_owner(home, lease, lambda: days[0])
+            outcome: dict[str, object] = {}
+
+            def run_owner() -> None:
+                try:
+                    outcome["result"] = owner._run_episode()
+                except StorageFormatError as exc:
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=run_owner)
+            thread.start()
+            assert decided.wait(10)
+            days[0] = 60
+            release.set()
+            thread.join(10)
+            assert not thread.is_alive()
+        finally:
+            release.set()
+            RetentionPlanner.run_pass = original
+
+        assert "error" not in outcome
+        projections, failure = outcome["result"]
+        assert failure is None
+        assert projections[-1].projection["days"] == 60
+        last = read_retention_history(home)[-1]
+        assert last["days"] == 60
+        assert last["mode"] == "preview"
 
 
 @pytest.mark.asyncio
@@ -654,8 +707,9 @@ async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) 
         await asyncio.to_thread(lease.close)
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("arm", "disarm"))
 async def test_arm_changes_after_files_are_deleted_before_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
     home = tmp_path / "home"
     initialize_storage_home(home)
@@ -678,7 +732,13 @@ async def test_arm_changes_after_files_are_deleted_before_publication(
             result = original(planner, **kwargs)
             if getattr(result, "mode", None) == "deleted" and not changed.is_set():
                 # run_pass returns after the transaction removes files and before owner publication.
-                assert disarm_retention(home, lease).applied
+                if mutation == "arm":
+                    with RetentionPlanner(home, lease) as followup:
+                        assert original(followup, days=30).complete
+                    changed_result = retention_authority(home, lease, days=30)
+                else:
+                    changed_result = disarm_retention(home, lease)
+                assert changed_result.applied
                 changed.set()
             return result
 
