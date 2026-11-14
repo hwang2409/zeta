@@ -2178,7 +2178,7 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
         store = server.runtime.opened.store
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
-        reopened = await _open_session(tmp_path, session_id).store
+        reopened = (await asyncio.wait_for(_open_session(tmp_path, session_id), 10)).store
         assert "reason" not in resident_entries(reopened)[-1].data
 
         history = (
@@ -5773,7 +5773,7 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         assert sum(branch["current"] for branch in branches) == 1
         restored = (await rpc("session_history"))["result"]["messages"]
         assert restored == history["messages"]
-        reopened = await _open_session(tmp_path, sid)
+        reopened = await asyncio.wait_for(_open_session(tmp_path, sid), 10)
         assert [m.to_dict() for m in branch_messages(reopened.store)] == [
             m.to_dict() for m in branch_messages(server.runtime.loop.store)
         ]
@@ -6735,7 +6735,7 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
             "size": len(png),
         }
         assert "data" not in history[0]["content"][1]
-        assert branch_messages(await _open_session(tmp_path, sid).store)[0] == message
+        assert branch_messages((await asyncio.wait_for(_open_session(tmp_path, sid), 10)).store)[0] == message
     finally:
         await close_serve(server, writer)
 
@@ -6871,7 +6871,7 @@ async def test_settings_retune_budget_atomically(
             assert runtime.loop.context_assembler.token_budget == old_budget
             assert runtime.policy.default.value == "ask"
             assert (
-                await _open_session(tmp_path, sid).metadata.to_dict() == metadata_before
+                (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.to_dict() == metadata_before
             )
         else:
             assert response["result"] == {
@@ -6883,7 +6883,7 @@ async def test_settings_retune_budget_atomically(
             assert runtime.metadata.compaction_budget == expected_budget
             assert runtime.metadata.budget_pinned == pinned
             assert (
-                await _open_session(tmp_path, sid).metadata.compaction_budget
+                (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.compaction_budget
                 == expected_budget
             )
             await _request(reader, writer, "resume", "resume", {"session_id": sid})
@@ -7171,7 +7171,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
             assert response["error"]["code"] == -32000
             assert runtime.metadata.to_dict() == metadata_before
             assert (
-                await _open_session(tmp_path, sid).metadata.to_dict() == metadata_before
+                (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.to_dict() == metadata_before
             )
             assert loop.backend is backend
             assert loop.context_assembler.backend is backend
@@ -7809,7 +7809,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
         )
         assert detail in failure["error"]["message"]
         await _event(reader, "agent_end")
-        metadata = await _open_session(tmp_path, sid).metadata
+        metadata = (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata
         assert (metadata.provider, metadata.model) == (start_provider, start_model)
         assert metadata.model_fallback is None
         assert metadata.compaction_budget == old_budget
@@ -7911,7 +7911,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _request(reader, writer, 4, "send", {"text": "confirm selection"})
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
-        assert await _open_session(tmp_path, sid).metadata.model_fallback is None
+        assert (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.model_fallback is None
         await server.control._event(
             StreamEvent(
                 StreamEventType.ERROR,
@@ -8095,7 +8095,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
                 },
             )
         assert server.runtime.metadata.model_fallback is None
-        assert await _open_session(tmp_path, sid).metadata.model_fallback is None
+        assert (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.model_fallback is None
         await _request(reader, writer, 4, "send", {"text": "try returned selection"})
         failure = (await _event(reader, "error"))["error"]
         assert failure == {"code": "model_access_error", "message": "Access denied"}
@@ -8264,7 +8264,7 @@ async def test_stream_access_error_restores_model_over_wire(
         assert failure["code"] == "model_reverted"
         await _event(reader, "agent_end")
         assert server.runtime.model == original
-        metadata = await _open_session(tmp_path, sid).metadata
+        metadata = (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata
         assert (metadata.provider, metadata.model) == (provider, original)
         assert metadata.model_fallback is None
         await _request(reader, writer, 5, "send", {"text": "try fallback"})
@@ -8495,7 +8495,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
         assert row["name"] == ""
         assert row["first_message_preview"] == "original preview"
         # An external open store blocks RPC deletion even with no active server session.
-        with await _open_session(tmp_path, sid).store:
+        with (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).store:
             error = (
                 await _request(reader, writer, 5, "delete_session", {"session_id": sid})
             )[-1]["error"]
