@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -18,6 +20,7 @@ from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.session_retention import (
     RetentionBounds,
     RetentionPlanner,
+    Yielded,
     read_retention_history,
     retention_authority,
 )
@@ -26,7 +29,7 @@ from zeta.session_retention.activation import (
     RetentionActivationOwner,
     make_retention_owner,
 )
-from zeta.session_retention.handshake import planner_active
+from zeta.session_retention.handshake import ensure_handshake_files, planner_active
 from zeta.storage_format import open_writer
 
 
@@ -92,6 +95,33 @@ async def test_owner_lifecycle_table(
         assert (result.mode if hasattr(result, "mode") else result["mode"]) == expected
     finally:
         await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    ensure_handshake_files(home)
+    request = os.open(
+        home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "user-open-request"),
+        os.O_RDWR,
+    )
+    try:
+        fcntl.flock(request, fcntl.LOCK_EX)
+        planner = RetentionPlanner(home, lease)
+        try:
+            result = planner.run_pass(days=30)
+        finally:
+            planner.close()
+        assert isinstance(result, Yielded)
+        assert result.reason == "user"
+        assert not (home / "retention-history.jsonl").exists()
+    finally:
+        fcntl.flock(request, fcntl.LOCK_UN)
+        os.close(request)
+        await asyncio.to_thread(lease.close)
+
 
 @pytest.mark.asyncio
 async def test_owner_corrupt_history_survives_and_records_error(tmp_path: Path) -> None:
@@ -307,6 +337,78 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "outcomes"),
+    [
+        ("complete", [Published({"mode": "preview"}, complete=True)]),
+        ("progressed-incomplete", [Published({"mode": "preview"}, complete=False, progressed=True), Published({"mode": "preview"}, complete=True)]),
+        ("no-progress", [Published({"mode": "preview"}, complete=False)]),
+        ("user-scan-checkpoint", [Yielded("user"), Published({"mode": "preview"}, complete=True)]),
+        ("user-transaction-checkpoint", [Yielded("user"), Published({"mode": "preview"}, complete=True)]),
+        ("stop-scan-checkpoint", [Yielded("stop")]),
+        ("stop-transaction-checkpoint", [Yielded("stop")]),
+        ("publish-failure", [Published({"mode": "preview"}, complete=True)]),
+        ("history-failure", [RuntimeError("history")]),
+        ("stale-commit", [RuntimeError("stale")]),
+        ("restart", [Published({"mode": "preview"}, complete=True)]),
+    ],
+)
+async def test_owner_outcome_table_real_epoch_home(
+    tmp_path: Path, case: str, outcomes: list[object]
+) -> None:
+    home = tmp_path / case
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    ensure_handshake_files(home)
+    calls = 0
+    published: list[object] = []
+    published_event = asyncio.Event()
+
+    class Planner:
+        enabled = True
+
+        def close(self) -> None:
+            return None
+
+    def run_pass(_planner, _days, _yield_check=None):
+        nonlocal calls
+        outcome = outcomes[min(calls, len(outcomes) - 1)]
+        calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    owner = RetentionActivationOwner(
+        lambda: Planner(), lambda: 30, run_pass=run_pass, home=home, wake_seconds=60
+    )
+    if case == "publish-failure":
+        def fail_publish(_value):
+            published_event.set()
+            raise RuntimeError("publish")
+        owner.set_publish(fail_publish)
+    else:
+        def publish(value):
+            published.append(value)
+            published_event.set()
+        owner.set_publish(publish)
+    owner.start()
+    if case.startswith("user-"):
+        await asyncio.wait_for(published_event.wait(), 10)
+        await owner.stop()
+        assert calls >= 2
+    elif case.startswith("stop-"):
+        await asyncio.wait_for(owner.task, 10)
+        assert calls == 1
+    else:
+        await asyncio.wait_for(published_event.wait(), 10)
+        await owner.stop()
+    if case.startswith(("user-", "stop-")):
+        assert not (home / "retention-history.jsonl").exists()
+    if case.startswith("stop-"):
+        assert calls == 1
 
 
 @pytest.mark.asyncio
