@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,21 +30,15 @@ class _PublishedPass(dict[str, object]):
         self.progressed = progressed
 
 
-def _progress_marker(planner: Any) -> str:
-    marker = [repr(getattr(planner, "_state_payload", lambda: None)())]
-    home = getattr(planner, "home", None)
-    if home is None:
-        return marker[0]
-    trash = Path(home) / "session-trash"
-    if trash.exists():
-        for root, _dirs, files in os.walk(trash):
-            for name in sorted(files):
-                path = Path(root) / name
-                try:
-                    marker.append(str(path.relative_to(trash)) + ":" + path.read_bytes().hex())
-                except OSError:
-                    continue
-    return "|".join(marker)
+def _progress_marker(planner: Any, projection: dict[str, object] | None = None) -> str:
+    progress = projection or {}
+    return repr(
+        (
+            getattr(planner, "progress_marker", lambda: ())(),
+            progress.get("progress_counts"), progress.get("skip_counts"),
+            progress.get("mode"), progress.get("root_ids"),
+        )
+    )
 
 
 def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
@@ -63,10 +56,11 @@ def make_retention_owner(
 
     root = Path(home)
     retained = lease.retain()
+    last_projection: dict[str, object] | None = None
+
     def run_pass(planner: Any, current_days: int) -> dict[str, object]:
         before = _progress_marker(planner)
         result = planner.run_pass(days=current_days)
-        after = _progress_marker(planner)
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
@@ -78,10 +72,13 @@ def make_retention_owner(
             and result.mode is None
         ):
             projection = dict(history[-1])
-        if not history or not _same_projection(history[-1], projection):
+        nonlocal last_projection
+        if last_projection is None or not _same_projection(last_projection, projection):
             append_retention_history(root, retained, projection)
+            last_projection = projection
         return _PublishedPass(
-            projection, complete=result.complete, progressed=before != after
+            projection, complete=result.complete,
+            progressed=before != _progress_marker(planner, projection),
         )
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:

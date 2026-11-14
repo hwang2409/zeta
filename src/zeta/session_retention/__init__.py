@@ -574,6 +574,22 @@ class RetentionPlanner:
                 flight.walk.listing[1].close()
             flight.stack.close()
 
+    def progress_marker(self) -> tuple[object, ...]:
+        """Return the in-memory cursor state used to detect forward progress."""
+        sweep = self._sweep
+        flight = self._flight
+        if sweep is None:
+            return ()
+        walk = flight.walk if flight is not None else None
+        return (
+            sweep.days, sweep.current_root, sweep.discovery_done,
+            sweep.discovery_blocked, tuple(sweep.selected), sweep.bytes,
+            tuple(walk.frontier) if walk is not None else (),
+            tuple(walk.fingerprints) if walk is not None else (),
+            walk.entries if walk is not None else 0,
+            walk.bytes if walk is not None else 0,
+        )
+
     @property
     def enabled(self) -> bool:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)

@@ -17,7 +17,11 @@ from zeta.session_retention import (
     read_retention_history,
     retention_authority,
 )
-from zeta.session_retention.activation import make_retention_owner
+from zeta.session_retention.activation import (
+    RetentionActivationOwner,
+    _PublishedPass,
+    make_retention_owner,
+)
 from zeta.storage_format import open_writer
 
 
@@ -174,18 +178,44 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
             home, lease, lambda: 30,
             bounds=RetentionBounds(roots_advanced=1, metadata_candidates=1),
         )
-        published: list[dict[str, object]] = []
-        for _ in range(100):
-            projections, failure = await asyncio.to_thread(owner._run_episode)
-            assert failure is None
-            published.extend(projections)
-            if published and getattr(published[-1], "complete", False):
-                break
+        published, failure = await asyncio.to_thread(owner._run_episode)
+        assert failure is None
         assert len(published) >= 3
         assert getattr(published[-1], "complete", False)
         await owner.stop()
     finally:
         await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.asyncio
+async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
+    del tmp_path
+    passes = 0
+
+    class Planner:
+        enabled = True
+
+        def close(self):
+            return None
+
+    def run_pass(_planner, _days):
+        nonlocal passes
+        passes += 1
+        return _PublishedPass({"mode": "preview", "days": 30}, complete=False)
+
+    owner = RetentionActivationOwner(
+        lambda: Planner(), lambda: 30, run_pass=run_pass, wake_seconds=60
+    )
+    published = asyncio.Event()
+    owner.set_publish(lambda _projection: published.set())
+    owner.start()
+    await asyncio.wait_for(published.wait(), 10)
+    assert passes == 1
+    published.clear()
+    owner.wake()
+    await asyncio.wait_for(published.wait(), 10)
+    assert passes == 2
+    await owner.stop()
 
 
 @pytest.mark.asyncio
