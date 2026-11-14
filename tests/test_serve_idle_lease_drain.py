@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import gc
 import multiprocessing
-import threading
+import os
 from pathlib import Path
 
 import pytest
 
-from tests.support.owned import await_or_fail
 from tests.support.owner_counts import dropped_for_gc
 from tests.test_session_execution_owner import (
     _cleanup_process,
@@ -20,12 +20,22 @@ from tests.test_session_execution_owner import (
     _try_open,
 )
 from zeta.core.session import SessionManager
-from zeta.core.store import _store as store_module
 from zeta.server import server as server_module
 from zeta.server.server import ZetaServer
 from zeta.storage_format import drain_releases, release_later
 
 _DEADLINE_SECONDS = 10
+
+
+def _exclusive_flock_free(path: Path) -> bool:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
 
 
 class _DrainProbe:
@@ -75,80 +85,55 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     monkeypatch.setattr(server_module, "IDLE_DRAIN_INTERVAL", 0.01, raising=False)
     home = tmp_path / "home"
     session_id = _created_session(home, tmp_path)
+    lease_path = home / "sessions" / session_id / "runtime.lease"
     manager = SessionManager(home, owner_surface="serve")
-    release_done = threading.Event()
-
-    def queue_release(close, *args):
-        def wrapped_close(*wrapped_args):
-            try:
-                close(*wrapped_args)
-            finally:
-                release_done.set()
-
-        from zeta.storage_format import release_later as real_release_later
-
-        real_release_later(wrapped_close, *args)
-
-    monkeypatch.setattr(store_module, "release_later", queue_release)
-    opened = manager.open(session_id)
-
-    async def wait_for_release() -> None:
-        await await_or_fail(
-            asyncio.to_thread(release_done.wait),
-            timeout=_DEADLINE_SECONDS,
-            what="session lease release",
-        )
-        release_done.clear()
 
     async def exercise() -> None:
-        nonlocal opened
         probe = _DrainProbe(asyncio.get_running_loop())
         monkeypatch.setattr(server_module, "drain_releases", probe, raising=False)
         server = ZetaServer(home=home, port=0, provider="codex")
         await server.start()
         try:
             store = dropped_for_gc(
-                opened.store, "the collector must finalize it"
+                manager.open(session_id).store, "the collector must finalize it"
             )
-            del opened
             store._cycle = store  # only the collector can free it now
             del store
             # a failed release ahead of the store's must not stop the drain
             release_later(_failing_release)
             gc.collect()
-
-            def process_open() -> tuple[str, str | None, str | None]:
-                result_recv, result_send = multiprocessing.Pipe(duplex=False)
-                contender = _spawn(_try_open, str(home), session_id, result_send)
-                try:
-                    result = _recv(result_recv)
-                    _join(contender)
-                    return result
-                finally:
-                    _cleanup_process(contender)
-                    result_recv.close()
-                    result_send.close()
+            assert not _exclusive_flock_free(lease_path), (
+                "the finalizer must defer the release, not run it"
+            )
 
             await probe.drains(1)
-            await wait_for_release()
-            result = process_open()
+            assert _exclusive_flock_free(lease_path), (
+                "an idle serve kept a GC-released session lease"
+            )
+
+            result_recv, result_send = multiprocessing.Pipe(duplex=False)
+            contender = _spawn(_try_open, str(home), session_id, result_send)
+            try:
+                result = _recv(result_recv)
+                _join(contender)
+            finally:
+                _cleanup_process(contender)
+                result_recv.close()
+                result_send.close()
             assert result[0] == "opened", result
 
             # a drain that raises is logged and the next tick retries
-            opened = await asyncio.to_thread(manager.open, session_id)
             again = dropped_for_gc(
-                opened.store, "the collector must finalize it"
+                manager.open(session_id).store, "the collector must finalize it"
             )
-            del opened
-            await asyncio.sleep(0)
             again._cycle = again
             del again
             probe.fail_next = True
             gc.collect()
             await probe.drains(2)
-            await wait_for_release()
-            result = process_open()
-            assert result[0] == "opened", result
+            assert _exclusive_flock_free(lease_path), (
+                "the idle drain stopped after a failed drain"
+            )
             assert "draining released leases failed" in caplog.text
         finally:
             drain = getattr(server, "_idle_drain", None)
