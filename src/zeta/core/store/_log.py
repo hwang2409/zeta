@@ -472,7 +472,9 @@ class ConversationLogMixin:
 
     @staticmethod
     def _next_entry_prefix_digest(previous: bytes, encoded_line: bytes) -> bytes:
-        return hashlib.sha256(previous + encoded_line).digest()
+        digest = hashlib.sha256(previous)
+        digest.update(encoded_line)
+        return digest.digest()
 
     def _record_entry_prefix(self: ConversationStore, entry: ConversationEntry) -> None:
         self._entry_prefix_digest = self._next_entry_prefix_digest(

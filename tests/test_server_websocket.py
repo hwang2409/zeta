@@ -914,23 +914,21 @@ async def test_websocket_status_names_the_running_slash_command(
     import threading
 
     import zeta.core.slash as core_slash
-    import zeta.runtime.status as runtime_status
-    from zeta.core.checkpoints import active_branch
 
     event_loop = asyncio.get_running_loop()
     started = event_loop.create_future()
     release = threading.Event()
+    original_build = core_slash.build_slash_status
 
-    def gated(entries):
+    def gated(snapshot):
         event_loop.call_soon_threadsafe(
             lambda: started.done() or started.set_result(None)
         )
         release.wait(30)
-        return active_branch(entries)
+        return original_build(snapshot)
 
-    # The transcript-sized /status work calls active_branch on both bases.
-    monkeypatch.setattr(core_slash, "active_branch", gated, raising=False)
-    monkeypatch.setattr(runtime_status, "active_branch", gated, raising=False)
+    # test-contract: seam holds /status assembly off the event loop
+    monkeypatch.setattr(core_slash, "build_slash_status", gated)
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
     await server.start()
     assert server._websocket is not None
