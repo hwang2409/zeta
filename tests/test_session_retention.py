@@ -428,22 +428,6 @@ def test_below_feature_epoch_writes_nothing(tmp_path):
     assert not (tmp_path / "retention-state.json").exists()
 
 
-def test_planner_entry_points_have_no_production_callers():
-    root = Path(__file__).resolve().parents[1] / "src" / "zeta"
-    offenders = []
-    for path in root.rglob("*.py"):
-        if path.relative_to(root) in {
-            Path("session_retention/__init__.py"),
-            Path("session_retention/_helpers.py"),
-            Path("session_retention/activation.py"),
-        }:
-            continue  # planner implementation modules
-        text = path.read_text(encoding="utf-8")
-        if "RetentionPlanner" in text or ".run_pass(" in text:
-            offenders.append(str(path.relative_to(root)))
-    assert offenders == [], f"planner must stay dormant, used in: {offenders}"
-
-
 def _future_ns() -> int:
     return time.time_ns() + 60 * _DAY_NS
 

@@ -63,10 +63,6 @@ async def _publish_project_registry_notice(self) -> None:
 
 
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
-    return await _new_session(self, params)
-
-
-async def _new_session(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
         initial_model = validation.optional_string(params, "model")
@@ -123,10 +119,6 @@ async def _new_session(self, params: dict[str, Any]) -> dict[str, object]:
 
 
 async def resume(self, params: dict[str, Any]) -> dict[str, object]:
-    return await _resume(self, params)
-
-
-async def _resume(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
         state = self.server.runtime.state
