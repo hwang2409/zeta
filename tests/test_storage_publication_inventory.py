@@ -16,6 +16,8 @@ _DURABILITY_CALLBACKS = {
     ),
     ("core/transcript_recovery/__init__.py", "resume_memory_review", "write_json_file"),
     ("session_retention/pin.py", "write_retention_pin", "atomic_publish_file"),
+    ("session_retention/__init__.py", "publish", "atomic_publish_file"),
+    ("session_retention/__init__.py", "retention_authority", "atomic_publish_file"),
     ("session_retention/__init__.py", "_store_state", "atomic_publish_file"),
     ("session_retention/transaction.py", "_publish", "atomic_publish_file"),
     ("project_registry.py", "_publish", "atomic_publish_file"),

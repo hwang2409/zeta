@@ -105,6 +105,7 @@ EVENT_FEATURES = {
     EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
     EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
     EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
+    EventDescriptor.SESSION_RETENTION: frozenset({"session_retention"}),
     EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
     EventDescriptor.ZETA_UPDATED: frozenset({"zeta_updated"}),
 }

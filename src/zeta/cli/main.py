@@ -18,7 +18,14 @@ from ..core.commands.completion import completion_script
 from ..core.session import SessionError, account_home, env_home
 from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR
 from ..remote.update import add_remote_parser, run_remote_update
-from ..storage_format import StorageFormatError, advance, writer_epoch
+from ..storage_format import (
+    StorageFeature,
+    StorageFormatError,
+    advance,
+    feature_enabled,
+    writer_epoch,
+)
+from .retention import create_tui_app
 
 if TYPE_CHECKING:
     import httpx
@@ -834,6 +841,12 @@ def _tui_print(message: str) -> None:
     write_terminal(message)
 
 
+def _create_tui_app(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> object | None:
+    return create_tui_app(args, parser, _tui_print, _has_console_message)
+
+
 def _print_exit_hint(app: object) -> None:
     if app.ephemeral_root is not None:
         return
@@ -878,31 +891,10 @@ def _retain_active_draft(
         retained_drafts.append(draft)
 
 
-def _create_tui_app(
-    args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-) -> object | None:
-    from ..tui.bootstrap import create_app
-
-    try:
-        if args.continue_session or args.resume is not None:
-            _tui_print("Loading session…")
-            return asyncio.run(asyncio.to_thread(create_app, args))
-        return create_app(args)
-    except SessionError as exc:
-        parser.error(str(exc))
-    except StorageFormatError:
-        raise
-    except ValueError as exc:
-        _tui_print(f"zeta: {exc}")
-        return None
-    except Exception as exc:
-        if _has_console_message(exc):
-            raise
-        from ..tui.loop_errors import log_tui_crash
-
-        _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
-        return None
+def _attach_retention_owner(app: object, owner: object | None) -> None:
+    app._retention_owner = owner
+    app._before_prompt_exit = owner.stop if owner is not None else None
+    app._before_terminal_restore = owner.stop if owner is not None else None
 
 
 def _run_tui_lifecycle_captured(
@@ -914,6 +906,7 @@ def _run_tui_lifecycle_captured(
     restart_session_id: str | None = None
     exit_status = 0
     app: object | None = None
+    retention_owner: object | None = None
     try:
         while True:
             app = _create_tui_app(args, parser)
@@ -921,7 +914,14 @@ def _run_tui_lifecycle_captured(
                 exit_status = 1
                 break
             current_session_id = app.loop.store.session_id
+            if retention_owner is None and not args.no_session and feature_enabled(app.loop.store._storage_lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
+                from ..session_retention.activation import make_retention_owner
+                retention_owner = make_retention_owner(env_home(), app.loop.store._storage_lease)
             run_app = app
+            _attach_retention_owner(run_app, retention_owner)
+            if retention_owner is not None:
+                from ..tui.cards.retention import render_retention_card
+                retention_owner.set_publish(lambda projection, app=app: app._print_unit(render_retention_card(projection)) if projection.get("mode") != "none" else None)
             restart_requested = False
             restart_cancels_work = False
             new_session_requested = False
@@ -929,14 +929,12 @@ def _run_tui_lifecycle_captured(
                 from ..tui.errors import (
                     TerminalRenderError as default_terminal_render_error,
                 )
-
                 terminal_render_error = (
                     globals().get("TerminalRenderError") or default_terminal_render_error
                 )
                 from ..tui.stderr_capture import run_tui_session
-
                 restart_requested, restart_cancels_work = run_tui_session(
-                    run_app, args, _run_tui
+                    run_app, args, _run_tui, retention_owner
                 )
                 new_session_requested = run_app.new_session_requested
                 if new_session_requested:
@@ -953,7 +951,6 @@ def _run_tui_lifecycle_captured(
                 if _has_console_message(exc):
                     raise
                 from ..tui.loop_errors import log_tui_crash
-
                 _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
                 _print_exit_hint(app)
                 exit_status = 1
@@ -961,6 +958,7 @@ def _run_tui_lifecycle_captured(
             finally:
                 _cleanup_ephemeral(run_app)
             if new_session_requested:
+                retention_owner = None
                 continue
             if restart_requested:
                 if restart_cancels_work:
@@ -970,6 +968,8 @@ def _run_tui_lifecycle_captured(
             _print_exit_hint(app)
             break
     finally:
+        if retention_owner is not None:
+            asyncio.run(retention_owner.stop())
         _retain_active_draft(app, retained_drafts)
         for retained_draft in retained_drafts:
             _print_unsaved_draft(
@@ -977,11 +977,8 @@ def _run_tui_lifecycle_captured(
                 current_session_id=current_session_id,
             )
     return exit_status, restart_session_id
-
-
 def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str]:
     """Replace the original session selector while preserving all other flags."""
-
     rewritten: list[str] = []
     index = 0
     while index < len(argv):
@@ -1000,11 +997,8 @@ def _restart_argv(entrypoint: str, argv: list[str], session_id: str) -> list[str
         rewritten.append(token)
         index += 1
     return [entrypoint, *rewritten, "--resume", session_id]
-
-
 def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     from ..tui.stderr_capture import restore_stderr_for_cli
-
     restore_stderr_for_cli()
     command = _restart_argv(entrypoint, argv, session_id)
     try:
@@ -1014,14 +1008,9 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
         print(f"resume manually: zeta --resume {session_id}", file=sys.stderr)
         return 1
     return 0
-
-
 def _has_console_message(exc: Exception) -> bool:
     from ..accounts import AccountError
-
     return isinstance(exc, StorageFormatError | AccountError)
-
-
 def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
@@ -1029,10 +1018,8 @@ def _run_console(run: Callable[[], int]) -> int:
         if not _has_console_message(exc):
             raise
         from ..tui.stderr_capture import write_terminal
-
         write_terminal(f"zeta: {exc}")
         return 2
-
 
 def _run_tui_command(
     args: argparse.Namespace,

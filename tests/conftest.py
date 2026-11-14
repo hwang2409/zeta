@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import threading
+import traceback
 import uuid
 import weakref
 from collections import Counter
@@ -1081,6 +1082,79 @@ async def close_direct_test_agent_loops(monkeypatch: pytest.MonkeyPatch):
             await registry_close(loop.tool_registry)
         if not loop.store._closed:
             loop.store.close()
+
+
+@pytest.fixture(autouse=True)
+def blocking_session_locks_leave_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> Generator[None, None, None]:
+    """Make every test catch direct blocking session access on an event loop."""
+    from zeta.core import session_files
+    from zeta.core.session_execution import retention_access
+    from zeta.session_retention.activation import RetentionActivationOwner
+
+    original = session_files.require_off_loop_lock
+    acquire = retention_access.acquire_after_retention_yield
+    allow_on_loop = request.node.get_closest_marker("retention_on_loop_allowed") is not None
+    active_owners: set[RetentionActivationOwner] = set()
+    original_start = RetentionActivationOwner.start
+    original_stop = RetentionActivationOwner.stop
+
+    def track_start(owner: RetentionActivationOwner):
+        active_owners.add(owner)
+        return original_start(owner)
+
+    async def track_stop(owner: RetentionActivationOwner):
+        try:
+            await original_stop(owner)
+        finally:
+            active_owners.discard(owner)
+
+    monkeypatch.setattr(RetentionActivationOwner, "start", track_start)
+    monkeypatch.setattr(RetentionActivationOwner, "stop", track_stop)
+
+    def guarded_acquire(*args, **kwargs):
+        if active_owners and not allow_on_loop:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                tests_caller = False
+                production_caller = False
+                for frame in traceback.extract_stack()[:-1]:
+                    path = Path(frame.filename).resolve()
+                    zeta_path = _REPOSITORY_ROOT / "src" / "zeta"
+                    if path.is_relative_to(zeta_path / "server") or path.is_relative_to(zeta_path / "agent"):
+                        production_caller = True
+                    if path.is_relative_to(_TEST_SITE_PACKAGES) and path.name != "conftest.py":
+                        tests_caller = True
+                if tests_caller and not production_caller:
+                    raise RuntimeError(
+                        "retention lock requested on an asyncio event-loop thread; "
+                        "use asyncio.to_thread"
+                    )
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(retention_access, "acquire_after_retention_yield", guarded_acquire)
+
+    def guard(kind: str, error=RuntimeError) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            original(kind, error)
+            return
+        if not active_owners or allow_on_loop:
+            original(kind, error)
+            return
+        raise error(
+            f"{kind} lock requested on an asyncio event-loop thread; "
+            "use asyncio.to_thread"
+        )
+
+    monkeypatch.setattr(session_files, "require_off_loop_lock", guard)
+    yield
 
 
 @pytest.fixture(autouse=True)

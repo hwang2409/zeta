@@ -8,48 +8,42 @@ planner entry points.
 
 from __future__ import annotations
 
-import fcntl
+import copy
 import json
 import os
-import stat
+import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
-from ..attention_forks import read_attention_fork
-from ..attention_records import AttentionRecord
-from ..core.agent_state import _parse_agent_state
-from ..core.child_lifecycle import ChildRunPhase, parse_legacy_child_lifecycle
-from ..core.session import SessionMetadata
 from ..core.session_files import (
     SessionError,
-    SessionInUseError,
     SessionNotFoundError,
+    SessionReferenceGate,
+    SessionReferenceUnavailable,
     atomic_publish_file,
     child_directory,
-    descend_directory,
     open_session_file,
     read_reference_generation,
+    unlink_session_file,
 )
-from ..core.session_links import valid_child_pending_link, valid_pending_link
-from ..core.todo import parse_todo_items
-from ..core.transcript_recovery import RepairTarget, classify_recovery_records
-from ..memory.reconciliation_state import classify_reconciliation_records
-from ..project_inbox import InboxError, validate_inbox_record
-from ..project_inbox_sent import SentMessageTracker, _Broken, _Loaded
+from ..locking import RETENTION_HOME_ID, domain_authority
 from ..storage_format import (
     StorageFeature,
     StorageFormatError,
     WriterLease,
     feature_enabled,
-    validate_retention_reservation,
+    validate_retention_arm,
+    validate_retention_history,
     validate_retention_state,
 )
+from .handshake import planner_request_pending
 from .pin import is_retention_pinned
 from .transaction import (
     Candidate,
@@ -59,6 +53,11 @@ from .transaction import (
 )
 
 _STATE_FILENAME = "retention-state.json"
+_HISTORY_FILENAME = "retention-history.jsonl"
+_MAX_HISTORY = 128
+_ARM_FILENAME = "retention-arm.json"
+_COORDINATOR_DOMAIN = "coordinator"
+_ARM_WARNING = "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
 _METADATA_NAME = "meta.json"
 _SESSION_STATE_NAME = "session_state.json"
 _PENDING_LINK_NAME = "project_link_pending.json"
@@ -116,11 +115,19 @@ class PreviewSnapshot:
 
 
 @dataclass(frozen=True)
+class Yielded:
+    """Internal planner control outcome; never a client-visible result."""
+
+    reason: Literal["user", "stop"]
+
+
+@dataclass(frozen=True)
 class PassResult:
     """The outcome of one bounded planner pass."""
 
     enabled: bool
     complete: bool
+    mode: str | None = None
     reasons: tuple[RootOutcome, ...] = ()
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
@@ -128,6 +135,264 @@ class PassResult:
 
 class RetentionPlannerError(Exception):
     """Raised when the planner cannot proceed safely."""
+
+
+def retention_result(
+    *,
+    timestamp: str,
+    mode: str,
+    days: int,
+    root_ids: tuple[str, ...] = (),
+    count: int | None = None,
+    preview_id: str | None = None,
+    cutoff: str | None = None,
+    armed_by_zeta_version: str | None = None,
+    descendant_count: int = 0,
+    bytes: int = 0,
+    skip_counts: dict[str, int] | None = None,
+    progress_counts: dict[str, int] | None = None,
+    errors: tuple[str, ...] = (),
+    disable_pending: bool = False,
+) -> dict[str, object]:
+    """Build the single strict result projection used by all surfaces."""
+    result = {
+        "timestamp": timestamp, "mode": mode, "days": days,
+        "armed_by_zeta_version": armed_by_zeta_version, "preview_id": preview_id,
+        "cutoff": cutoff, "root_ids": list(root_ids),
+        "count": len(root_ids) if count is None else count,
+        "descendant_count": descendant_count, "bytes": bytes,
+        "skip_counts": dict(skip_counts or {}),
+        "progress_counts": dict(progress_counts or {}),
+        "errors": list(errors), "disable_pending": disable_pending,
+    }
+    validate_retention_history(result)
+    return result
+
+
+def project_retention_result(result: PassResult, *, days: int, timestamp: str) -> dict[str, object]:
+    """Project one planner result into the shared client-visible mapping."""
+    preview = result.preview
+    if not result.enabled:
+        return retention_result(timestamp=timestamp, mode="disabled", days=0)
+    if result.mode is not None:
+        root_ids = tuple(reason.root_id for reason in result.reasons if reason.root_id != "recovery")
+        return retention_result(
+            timestamp=timestamp, mode=result.mode, days=days,
+            root_ids=root_ids,
+            errors=tuple(reason.reason for reason in result.reasons if reason.reason),
+        )
+    if preview is None:
+        errors = tuple(reason.reason for reason in result.reasons if reason.reason)
+        return retention_result(
+            timestamp=timestamp, mode="preview", days=days,
+            errors=errors, progress_counts={"roots": len(result.reasons)},
+        )
+    return retention_result(
+        timestamp=timestamp, mode="preview", days=days,
+        root_ids=preview.root_ids, count=preview.count, bytes=preview.bytes,
+        preview_id=preview.preview_id, cutoff=preview.cutoff,
+    )
+
+
+_COORDINATOR_TOKEN_MARKER = object()
+
+
+class CoordinatorToken:
+    """Capability for retention durable writes during one coordinator section."""
+
+    __slots__ = ("_active",)
+
+    def __init__(self, marker: object) -> None:
+        if marker is not _COORDINATOR_TOKEN_MARKER:
+            raise TypeError("retention coordinator tokens are authority-owned")
+        self._active = True
+
+    def require_active(self) -> None:
+        if not self._active:
+            raise RuntimeError("retention coordinator token is no longer active")
+
+    def close(self) -> None:
+        self._active = False
+
+
+@contextmanager
+def _coordinator_authority(root: Path):
+    with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
+        token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+        try:
+            yield token
+        finally:
+            token.close()
+
+
+def append_retention_history(
+    token: CoordinatorToken, home: str | Path, lease: WriterLease, result: Mapping[str, object]
+) -> None:
+    """Durably replace history; the token proves coordinator ownership."""
+    token.require_active()
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
+        return
+    validate_retention_history(result)
+    path = Path(home) / _HISTORY_FILENAME
+    rows: list[dict[str, object]] = []
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if type(value) is not dict:
+                    raise RetentionPlannerError("malformed retention history")
+                validate_retention_history(value)
+                rows.append(value)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, StorageFormatError, RetentionPlannerError):
+        # A corrupt history row must not strand the activation owner.
+        rows = []
+    rows = (rows + [dict(result)])[-_MAX_HISTORY:]
+    def publish() -> None:
+        home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            atomic_publish_file(
+                home_fd, _HISTORY_FILENAME,
+                ("".join(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n" for row in rows)).encode(),
+            )
+        finally:
+            os.close(home_fd)
+    publish()
+
+
+def retention_arm_warning() -> str:
+    return _ARM_WARNING
+
+
+@dataclass(frozen=True)
+class RetentionAuthorityResult:
+    message: str
+    projection: dict[str, object]
+    applied: bool
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@contextmanager
+def _try_authority(root: Path, *, exclusive: bool, deadline: float):
+    while True:
+        try:
+            with domain_authority(
+                root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN,
+                exclusive=exclusive, nonblocking=True,
+            ):
+                token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+                try:
+                    yield token
+                finally:
+                    token.close()
+                return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            time.sleep(min(0.01, deadline - time.monotonic()))
+
+
+def retention_authority(
+    home: str | Path, lease: WriterLease, *, days: int,
+    zeta_version: str | None = None,
+    now: Callable[[], str] = lambda: datetime.now(UTC).isoformat(),
+) -> RetentionAuthorityResult:
+    try:
+        import asyncio
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise SessionError("retention authority requested on an asyncio event-loop thread")
+    if type(days) is not int or not 0 <= days <= 3650:
+        raise RetentionPlannerError("retention days must be in 0..3650")
+    empty = retention_result(timestamp=now(), mode="none", days=days)
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
+        return RetentionAuthorityResult("retention unavailable: upgrade the home before arming", empty, False)
+    root = Path(home)
+    try:
+        if days == 0:
+            with (
+                _try_authority(root, exclusive=True, deadline=time.monotonic() + 35) as token,
+                SessionReferenceGate(root, lease).exclusive(timeout=10),
+            ):
+                home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    has_authority = any(
+                        (root / name).is_file()
+                        for name in (_ARM_FILENAME, _STATE_FILENAME)
+                    )
+                    if not has_authority:
+                        return RetentionAuthorityResult(
+                            "retention already disabled",
+                            retention_result(timestamp=now(), mode="disabled", days=0),
+                            True,
+                        )
+                    unlink_session_file(home_fd, _ARM_FILENAME)
+                    unlink_session_file(home_fd, _STATE_FILENAME)
+                finally:
+                    os.close(home_fd)
+                projection = retention_result(timestamp=now(), mode="disarmed", days=0)
+                append_retention_history(token, root, lease, projection)
+                return RetentionAuthorityResult("retention disabled", projection, True)
+        with (
+            _try_authority(root, exclusive=True, deadline=time.monotonic() + 35) as token,
+            SessionReferenceGate(root, lease).exclusive(timeout=10),
+        ):
+                home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    state = _load_state(home_fd)
+                    preview = state.get("preview") if state else None
+                    if not isinstance(preview, dict) or preview.get("days") != days:
+                        message = "retention arm requires a completed preview for the current days"
+                        projection = retention_result(timestamp=now(), mode="none", days=days, errors=(message,))
+                        append_retention_history(token, root, lease, projection)
+                        return RetentionAuthorityResult(message, projection, False)
+                    arm = {
+                        "schema_version": 1, "gate_version": 1,
+                        "armed_by_zeta_version": zeta_version or package_version("zeta"),
+                        "armed_at": now(), "preview_id": preview["preview_id"],
+                    }
+                    validate_retention_arm(arm)
+                    atomic_publish_file(home_fd, _ARM_FILENAME, (json.dumps(arm, separators=(",", ":"), sort_keys=True) + "\n").encode())
+                    projection = retention_result(timestamp=now(), mode="armed", days=days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
+                    append_retention_history(token, root, lease, projection)
+                    return RetentionAuthorityResult(_ARM_WARNING, projection, True)
+                finally:
+                    os.close(home_fd)
+    except (TimeoutError, SessionReferenceUnavailable):
+        message = "retention busy, try again" if days else "retention busy; disarm not applied, try again"
+        projection = retention_result(
+            timestamp=now(), mode="disabled" if days == 0 else "none", days=days,
+            errors=(message,), disable_pending=days == 0,
+        )
+        return RetentionAuthorityResult(message, projection, False)
+
+
+def disarm_retention(home: str | Path, lease: WriterLease) -> RetentionAuthorityResult:
+    return retention_authority(home, lease, days=0)
+
+def read_retention_history(home: str | Path) -> tuple[dict[str, object], ...]:
+    """Read and validate the bounded history projection."""
+    try:
+        lines = (Path(home) / _HISTORY_FILENAME).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ()
+    if len(lines) > _MAX_HISTORY:
+        raise RetentionPlannerError("retention history exceeds bound")
+    output = []
+    for line in lines:
+        value = json.loads(line)
+        if type(value) is not dict:
+            raise RetentionPlannerError("malformed retention history")
+        validate_retention_history(value)
+        output.append(value)
+    return tuple(output)
 
 
 def _read_json(directory_fd: int, name: str, scan=None) -> object | None:
@@ -176,7 +441,8 @@ def _load_state(home_fd: int) -> dict | None:
     return value
 
 
-def _store_state(home_fd: int, state: dict) -> None:
+def _store_state(token: CoordinatorToken, home_fd: int, state: dict) -> None:
+    token.require_active()
     validate_retention_state(state)
     atomic_publish_file(
         home_fd,
@@ -202,9 +468,12 @@ class _Budget:
     entries: int = 0
     records: int = 0
     record_bytes: int = 0
+    yield_check: Callable[[], bool | str] | None = None
 
     def charge_entry(self, size: int = 0) -> None:
         self.entries += 1
+        if self.yield_check is not None and self.yield_check():
+            raise _Deferred
         if self.entries > self.bounds.entries_total or self.clock() >= self.deadline:
             raise _Deferred
 
@@ -328,10 +597,12 @@ class RetentionPlanner:
         self.lease = lease
         self.bounds = bounds or RetentionBounds()
         self._now_ns = now_ns
-        self._lease_epoch = uuid.uuid4().hex
+        self._lease_epoch = secrets.token_hex(16)
         self._sweep: _Sweep | None = None
         self._flight: _InFlight | None = None
         self._latest: object = _UNLOADED
+        self._commit_baseline: dict | None = None
+        self._prepared_commit: tuple[dict | None, dict] | None = None
 
     def __enter__(self) -> Self:
         return self
@@ -353,26 +624,61 @@ class RetentionPlanner:
                 flight.walk.listing[1].close()
             flight.stack.close()
 
+    def progress_marker(self) -> tuple[object, ...]:
+        """Return the in-memory cursor state used to detect forward progress."""
+        sweep = self._sweep
+        flight = self._flight
+        if sweep is None:
+            return ()
+        walk = flight.walk if flight is not None else None
+        return (
+            sweep.days, sweep.current_root, sweep.discovery_done,
+            sweep.discovery_blocked, tuple(sweep.selected), sweep.bytes,
+            tuple(walk.frontier) if walk is not None else (),
+            tuple(walk.fingerprints) if walk is not None else (),
+            walk.entries if walk is not None else 0,
+            walk.bytes if walk is not None else 0,
+        )
+
     @property
     def enabled(self) -> bool:
         return feature_enabled(self.lease.observed_epoch, StorageFeature.SESSION_RETENTION)
 
-    def run_pass(self, *, days: int) -> PassResult:
+    def run_pass(
+        self, *, days: int, commit_state: bool = True,
+        yield_check: Callable[[], bool | str] | None = None,
+    ) -> PassResult | Yielded:
         """Advance one bounded sweep step and return what it proved."""
         if type(days) is not int or days <= 0 or days > 3650:
             raise RetentionPlannerError("retention days must be in 1..3650")
         if not self.enabled:
             return PassResult(enabled=False, complete=False)
+        if planner_request_pending(self.home):
+            self.close()
+            return Yielded("user")
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            return self._run_pass(home_fd, days)
+            return self._run_pass(
+                home_fd, days, commit_state=commit_state, yield_check=yield_check
+            )
         finally:
             os.close(home_fd)
+            if planner_request_pending(self.home):
+                self.close()
 
-    def _run_pass(self, home_fd: int, days: int) -> PassResult:
+    def _run_pass(
+        self, home_fd: int, days: int, *, commit_state: bool = True,
+        yield_check: Callable[[], bool | str] | None = None,
+    ) -> PassResult | Yielded:
+        self._yield_check = yield_check
+        self._prepared_commit = None
+        self._commit_baseline = _load_state(home_fd)
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
             self._latest = state["preview"] if state is not None else None
+        if type(self._latest) is dict and self._latest.get("days") != days:
+            self._latest = None
+            self.close()
         transaction = _QuarantineTransaction(
             self.home,
             self.lease,
@@ -384,11 +690,20 @@ class RetentionPlanner:
             days=days,
             preview=self._latest if type(self._latest) is dict else None,
             verify=self._verify_candidate,
+            authority_held=False,
+            yield_check=yield_check or (lambda: planner_request_pending(self.home)),
         )
         transaction_result = self._transaction_result(outcome)
         if transaction_result is not None:
             return transaction_result
-        budget = _Budget(self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns)
+        if outcome.yielded:
+            self.close()
+            reason = yield_check() if yield_check is not None else "user"
+            return Yielded("stop" if reason == "stop" else "user")
+        budget = _Budget(
+            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
+            yield_check=yield_check or (lambda: planner_request_pending(self.home)),
+        )
         sweep = self._sweep
         if sweep is None or sweep.days != days:
             self.close()
@@ -409,12 +724,33 @@ class RetentionPlanner:
             if sweep.root_scan is not None:
                 sweep.root_scan.close()
             self._sweep = None
-        _store_state(home_fd, self._state_payload())
+        prepared = copy.deepcopy(self._state_payload())
+        self._prepared_commit = (copy.deepcopy(self._commit_baseline), prepared)
+        with _coordinator_authority(self.home) as token:
+            if commit_state:
+                _store_state(token, home_fd, prepared)
         return PassResult(
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
         )
+
+    def commit_state(self, token: CoordinatorToken) -> bool:
+        token.require_active()
+        prepared = self._prepared_commit
+        self._prepared_commit = None
+        if prepared is None:
+            return False
+        baseline, payload = prepared
+        home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if _load_state(home_fd) != baseline:
+                self.close()
+                return False
+            _store_state(token, home_fd, payload)
+            return True
+        finally:
+            os.close(home_fd)
 
     def _transaction_result(self, outcome: TransactionOutcome) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
@@ -423,12 +759,13 @@ class RetentionPlanner:
             self._latest = None
         reasons = (
             (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
-            if outcome.blocked is not None
+            if outcome.session_id is not None or outcome.blocked is not None
             else ()
         )
         return PassResult(
             enabled=True,
             complete=False,
+            mode="deleted" if outcome.completed else ("none" if outcome.blocked else None),
             reasons=reasons,
             preview=_preview_snapshot(self._latest),
         )
@@ -437,7 +774,8 @@ class RetentionPlanner:
     def _verify_candidate(self, root_id: str, days: int):
         """Repeat the full closure proof while the transaction owns authority."""
         budget = _Budget(
-            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns
+            self.bounds, self._now_ns, self._now_ns() + self.bounds.worker_ns,
+            yield_check=self._yield_check or (lambda: planner_request_pending(self.home)),
         )
         sweep = _Sweep(days, self._now_ns(), current_root=root_id)
         scan = _ClosureBudget(budget)
@@ -706,513 +1044,27 @@ class _ClosureAuthority:
         return self._store_names
 
 
-_descend = descend_directory
-_TIMESTAMP_FIELDS = ("created_at", "updated_at", "started_at", "finished_at")
-
-
-class _EntryScan:
-    """The only directory enumerator: resumable, no-follow, and charged per entry."""
-
-    def __init__(self, directory_fd: int, charge: Callable[[int], None]):
-        try:
-            self._fd = os.open(
-                ".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
-            )
-            self._entries = os.scandir(self._fd)
-        except OSError as exc:
-            raise RetentionPlannerError("unsafe retention directory") from exc
-        self.charge = charge
-        self._pending = None
-        self._closed = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._pending is None:
-            try:
-                entry = next(self._entries)
-                info = entry.stat(follow_symlinks=False)
-            except StopIteration:
-                raise
-            except OSError as exc:
-                raise RetentionPlannerError("unsafe retention entry") from exc
-            self._pending = (entry, info.st_size if stat.S_ISREG(info.st_mode) else 0)
-        entry, size = self._pending
-        self.charge(size)
-        self._pending = None
-        return entry
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._entries.close()
-        os.close(self._fd)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info) -> None:
-        self.close()
-
-
-def _next_root(sweep: _Sweep) -> str | None:
-    assert sweep.root_scan is not None
-    for entry in sweep.root_scan:
-        if entry.name.startswith("."):
-            continue
-        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-            raise RetentionPlannerError("unsafe session root entry")
-        return entry.name
-    sweep.discovery_done = True
-    return None
-
-
-def _flock_nb(fd) -> None:
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        raise SessionInUseError("session is open or in use") from exc
-
-
-def _lease_file(stack, directory_fd, name) -> None:
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise RetentionPlannerError(f"unsafe store lock: {name}") from exc
-    stack.callback(os.close, fd)
-    _flock_nb(fd)
-
-
-def _walk_directory(flight: _InFlight, walk: _Walk, budget: _Budget):
-    comps = walk.frontier.pop()
-    if len(comps) > _MAX_TREE_DEPTH:
-        raise RetentionPlannerError("tree is too deep")
-    if comps[-2:-1] == (_AGENTS_DIRNAME,) and comps not in flight.store_dirs:
-        raise RetentionPlannerError("child store appeared during walk")
-    with _descend(flight.root_fd, comps) as dfd:
-        info = os.fstat(dfd)
-        entries = _EntryScan(dfd, budget.charge_entry)
-    walk.fingerprints.append(["/".join(comps), info.st_dev, info.st_ino, info.st_mtime_ns])
-    walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
-    return comps, entries
-
-
-def _visit(walk: _Walk, dfd, comps, entry) -> None:
-    name = entry.name
-    info = entry.stat(follow_symlinks=False)
-    walk.entries += 1
-    if stat.S_ISDIR(info.st_mode):
-        walk.frontier.append((*comps, name))
-        return
-    if not stat.S_ISREG(info.st_mode):
-        raise RetentionPlannerError("unsafe entry in tree")
-    if info.st_nlink != 1:
-        raise RetentionPlannerError("hard-linked file in tree")
-    walk.bytes += info.st_size
-    walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
-
-
-def _fingerprints_intact(flight: _InFlight) -> bool:
-    for relpath, dev, ino, mtime in flight.walk.fingerprints:
-        comps = tuple(p for p in relpath.split("/") if p)
-        try:
-            with _descend(flight.root_fd, comps) as dfd:
-                cur = os.fstat(dfd)
-        except (OSError, SessionError):
-            return False
-        if (cur.st_dev, cur.st_ino, cur.st_mtime_ns) != (dev, ino, mtime):
-            return False
-    return True
-
-
-def _failure_reason(exc: BaseException) -> str:
-    """Map one root's filesystem or safety failure to a conservative reason."""
-    if isinstance(exc, SessionInUseError):
-        return "session is open or in use"
-    if isinstance(exc, (SessionNotFoundError, FileNotFoundError)):
-        return "session or entry disappeared"
-    if isinstance(exc, OSError):
-        return _bounded_reason(f"unreadable entry: {exc.strerror or exc}")
-    return _bounded_reason(str(exc))
-
-
-def _sent_file_reason(directory_fd, scan) -> str | None:
-    value = _read_json(directory_fd, "project-inbox-sent.json", scan)
-    if value is None:
-        return None
-    tracker = object.__new__(SentMessageTracker)
-    tracker.path = Path("project-inbox-sent.json")
-    state = tracker._classify_value(value, charge_record=lambda: scan.charge(0))
-    if isinstance(state, _Broken):
-        return "broken sent tracker"
-    assert isinstance(state, _Loaded)
-    for record in state.records:
-        if "done" not in record["reported"]:
-            return "unacknowledged sent message"
-    return None
-
-
-def _authority_transcript_recovery_reason(
-    flight: _InFlight, stores
-) -> str | None:
-    for comps, names in stores:
-        with _descend(flight.root_fd, comps) as dfd:
-            child = ":".join(part for part in comps if part != _AGENTS_DIRNAME)
-            target = RepairTarget(
-                flight.root_id, f"{flight.root_id}:{child}" if child else None
-            )
-            try:
-                if classify_recovery_records(dfd, target, names):
-                    return "unresolved transcript recovery"
-            except (OSError, SessionError, ValueError) as exc:
-                raise RetentionPlannerError("broken transcript recovery") from exc
-    return None
-
-
-def _read_authority_bytes(directory_fd: int, name: str) -> bytes | None:
-    try:
-        fd = open_session_file(directory_fd, name, os.O_RDONLY)
-    except FileNotFoundError:
-        return None
-    except (OSError, SessionError) as exc:
-        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
-    try:
-        with os.fdopen(fd, "rb") as stream:
-            fd = -1
-            return stream.read()
-    except OSError as exc:
-        raise RetentionPlannerError(f"unsafe retention read: {name}") from exc
-    finally:
-        if fd != -1:
-            os.close(fd)
-
-
-def _authority_memory_reconciliation_reason(
-    flight: _InFlight, stores
-) -> str | None:
-    for comps, store_names in stores:
-        names = set(store_names)
-        with _descend(flight.root_fd, comps) as dfd:
-            cursor = (
-                _read_authority_bytes(dfd, "memory-reconcile.json")
-                if "memory-reconcile.json" in names else None
-            )
-            receipts = (
-                _read_authority_bytes(dfd, "memory-reconcile-receipts.jsonl")
-                if "memory-reconcile-receipts.jsonl" in names else None
-            )
-            if classify_reconciliation_records(cursor, receipts):
-                return "unresolved memory reconciliation"
-    return None
-
-
-def _authority_store_reason(flight: _InFlight, scan: _ClosureBudget) -> str | None:
-    """Store-local blockers; also folds metadata timestamps into activity."""
-    for comps in flight.store_dirs:
-        with _descend(flight.root_fd, comps) as dfd:
-            pending = _read_json(dfd, _PENDING_LINK_NAME, scan)
-            if pending is not None:
-                if not valid_pending_link(pending):
-                    raise RetentionPlannerError("malformed pending project link")
-                return "pending project link"
-            if _pending_child_link(dfd, scan):
-                return "pending child link"
-            if _has_child_marker(dfd, scan):
-                return "live or recoverable child"
-            lifecycle = _read_json(dfd, _LIFECYCLE_NAME, scan)
-            if comps and not _lifecycle_terminal(lifecycle):
-                return "live or recoverable child"
-            metadata = _read_json(dfd, _METADATA_NAME, scan)
-            if not comps:
-                _canonical_metadata(metadata, flight.root_id)
-            for value in (metadata, lifecycle):
-                flight.walk.max_activity = max(flight.walk.max_activity, _metadata_activity(value))
-    return None
-
-
-def _has_child_marker(directory_fd, scan) -> bool:
-    value = _read_json(directory_fd, _SESSION_STATE_NAME, scan)
-    if value is None:
-        return False
-    if type(value) is not dict:
-        raise RetentionPlannerError("malformed session state")
-    try:
-        bash_cwd = value.get("bash_cwd")
-        if type(bash_cwd) is not str or not bash_cwd:
-            raise ValueError
-        parse_todo_items(value.get("todo_items", []))
-        if type(value.get("todo_dismissed", False)) is not bool:
-            raise ValueError
-        parsed = _parse_agent_state(value, Path(_SESSION_STATE_NAME))
-    except (TypeError, ValueError, SessionError) as exc:
-        raise RetentionPlannerError("malformed session state") from exc
-    return bool(parsed["agent_children"] or parsed["agent_parent"])
-
-
-def _lifecycle_terminal(value) -> bool:
-    if type(value) is not dict:
-        raise RetentionPlannerError("malformed child lifecycle")
-    try:
-        record = parse_legacy_child_lifecycle(value)
-    except (TypeError, ValueError) as exc:
-        raise RetentionPlannerError("malformed child lifecycle") from exc
-    return record.phase in {
-        ChildRunPhase.COMPLETED, ChildRunPhase.CANCELED, ChildRunPhase.FAILED
-    }
-
-
-def _canonical_metadata(value, session_id: str) -> SessionMetadata:
-    if type(value) is not dict:
-        raise RetentionPlannerError("malformed metadata")
-    try:
-        metadata = SessionMetadata.from_dict(
-            value, path=Path("sessions") / session_id / _METADATA_NAME
-        )
-    except (TypeError, ValueError, SessionError) as exc:
-        raise RetentionPlannerError("malformed metadata") from exc
-    if metadata.session_id != session_id:
-        raise RetentionPlannerError("metadata id does not match directory")
-    return metadata
-
-
-def _metadata_activity(value) -> int:
-    """Latest metadata timestamp in ns; a malformed one makes the root ineligible."""
-    if value is None:
-        return 0
-    if type(value) is not dict:
-        raise RetentionPlannerError("malformed metadata")
-    latest = 0
-    for name in _TIMESTAMP_FIELDS:
-        text = value.get(name)
-        if text is None:
-            continue
-        try:
-            moment = datetime.fromisoformat(text)
-        except (TypeError, ValueError) as exc:
-            raise RetentionPlannerError("malformed metadata timestamp") from exc
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=UTC)
-        latest = max(latest, int(moment.timestamp() * 1_000_000_000))
-    return latest
-
-
-def _authority_parent_id(sessions_fd, session_id, scan) -> str | None:
-    """Return the canonical parent id; a missing chain member is unsafe."""
-    try:
-        with child_directory(sessions_fd, session_id) as session_fd:
-            meta = _read_json(session_fd, _METADATA_NAME, scan)
-    except FileNotFoundError as exc:
-        raise RetentionPlannerError("missing metadata ancestor") from exc
-    if meta is None:
-        raise RetentionPlannerError("malformed metadata")
-    return _canonical_metadata(meta, session_id).parent_session_id
-
-
-def _authority_inbox_reason(home_fd, ids, scan: _ClosureBudget) -> str | None:
-    for status_fd, bodies_fd in _authority_inbox_dirs(home_fd, scan):
-        with scan.iter_entries(status_fd) as entries:
-            for entry in entries:
-                name = entry.name
-                if not name.endswith(".json"):
-                    raise RetentionPlannerError("unexpected inbox file")
-                if _classify_inbox_record(
-                    _read_json(status_fd, name, scan), name, ids, bodies_fd
-                ):
-                    return "pending inbox reference"
-    return None
-
-
-def _authority_inbox_dirs(home_fd, scan):
-    """Yield each project's inbox ``new`` and ``claimed`` fds, never following links."""
-    with ExitStack() as stack:
-        projects_fd = _open_dir(stack, home_fd, "projects")
-        if projects_fd is None:
-            return
-        with scan.iter_entries(projects_fd) as projects:
-            for entry in projects:
-                project = entry.name
-                if entry.is_symlink():
-                    raise RetentionPlannerError("unsafe project directory")
-                if not entry.is_dir(follow_symlinks=False):
-                    continue  # e.g. projects/.lock
-                with ExitStack() as inner:
-                    project_fd = _open_dir(inner, projects_fd, project)
-                    inbox_fd = _open_dir(inner, project_fd, "inbox") if project_fd is not None else None
-                    bodies_fd = _open_dir(inner, inbox_fd, "bodies") if inbox_fd is not None else None
-                    for status in ("new", "claimed") if inbox_fd is not None else ():
-                        status_fd = _open_dir(inner, inbox_fd, status)
-                        if status_fd is not None:
-                            yield status_fd, bodies_fd
-
-
-def _open_dir(stack, directory_fd, name) -> int | None:
-    """Open one directory without following links; absent is None."""
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise RetentionPlannerError(f"unsafe directory: {name}") from exc
-    stack.callback(os.close, fd)
-    return fd
-
-
-def _authority_dependents(sessions_fd, root_id, scan: _ClosureBudget) -> str | None:
-    """Scan every other root through the canonical metadata authorities."""
-    with scan.iter_entries(sessions_fd) as roots:
-        for entry in roots:
-            other = entry.name
-            if other == root_id or other.startswith("."):
-                continue
-            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-                raise RetentionPlannerError("unsafe possible dependent")
-            if _dependent_reason(sessions_fd, other, root_id, scan):
-                return "published top-level dependent"
-    return None
-
-
-def _dependent_reason(sessions_fd, other, root_id, scan) -> bool:
-    try:
-        with child_directory(sessions_fd, other) as other_fd:
-            meta = _canonical_metadata(_read_json(other_fd, _METADATA_NAME, scan), other)
-            fork_value = _read_json(other_fd, _ATTENTION_FORK_NAME, scan)
-            try:
-                fork = (
-                    read_attention_fork(Path(other), directory_fd=other_fd)
-                    if fork_value is not None else None
-                )
-            except (TypeError, ValueError, SessionError) as exc:
-                raise RetentionPlannerError("malformed attention fork") from exc
-            attention = _attention_reference(other_fd, root_id, scan)
-    except FileNotFoundError:
-        return False
-    return bool(
-        attention
-        or meta.parent_session_id == root_id
-        or (fork is not None and fork.forked_from_session == root_id)
-    )
-
-
-def _attention_reference(other_fd, root_id, scan) -> bool:
-    with ExitStack() as stack:
-        attention_fd = _open_dir(stack, other_fd, "attention")
-        if attention_fd is None:
-            return False
-        with scan.iter_entries(attention_fd) as records:
-            for entry in records:
-                if not entry.name.endswith(".json"):
-                    raise RetentionPlannerError("malformed attention record")
-                value = _read_json(attention_fd, entry.name, scan)
-                try:
-                    record = AttentionRecord.from_dict(value)
-                except (TypeError, ValueError, KeyError) as exc:
-                    raise RetentionPlannerError("malformed attention record") from exc
-                if entry.name != f"{record.id}.json":
-                    raise RetentionPlannerError("attention id does not match filename")
-                if record.fork_session_id == root_id:
-                    return True
-    return False
-
-
-def _authority_store_dirs(root_fd, scan, prefix=()):
-    """Yield component paths for every child store directory under a root."""
-    if len(prefix) > _MAX_TREE_DEPTH:
-        raise RetentionPlannerError("tree is too deep")
-    try:
-        with (
-            _descend(root_fd, (*prefix, _AGENTS_DIRNAME)) as agents_fd,
-            scan.iter_entries(agents_fd) as entries,
-        ):
-            for entry in entries:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                comps = (*prefix, _AGENTS_DIRNAME, entry.name)
-                yield comps
-                yield from _authority_store_dirs(root_fd, scan, comps)
-    except (FileNotFoundError, NotADirectoryError):
-        return
-
-
-def _generation_value(home, scan) -> int:
-    value = read_reference_generation(home)
-    scan.charge(0)
-    return value
-
-
-def _reservation_present(home_fd, root_id, scan) -> bool:
-    with ExitStack() as stack:
-        trash_fd = _open_dir(stack, home_fd, "session-trash")
-        if trash_fd is None:
-            return False
-        reservations_fd = _open_dir(stack, trash_fd, "reservations")
-        if reservations_fd is not None:
-            value = _read_json(reservations_fd, f"{root_id}.json", scan)
-            if value is not None:
-                if type(value) is not dict:
-                    raise RetentionPlannerError("malformed retention reservation")
-                try:
-                    validate_retention_reservation(value)
-                except StorageFormatError as exc:
-                    raise RetentionPlannerError("malformed retention reservation") from exc
-                if value["session_id"] != root_id:
-                    raise RetentionPlannerError("reservation id does not match filename")
-                return True
-        try:
-            info = os.stat(root_id, dir_fd=trash_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        if not stat.S_ISDIR(info.st_mode):
-            raise RetentionPlannerError("unsafe retention trash evidence")
-        scan.charge_entry(0)
-        return True
-
-
-def _pending_child_link(directory_fd, scan) -> bool:
-    with ExitStack() as stack:
-        fd = _open_dir(stack, directory_fd, _PENDING_CHILD_LINKS_DIRNAME)
-        if fd is None:
-            return False
-        with scan.iter_entries(fd) as entries:
-            for entry in entries:
-                if not entry.name.endswith(".json"):
-                    raise RetentionPlannerError("malformed pending child link")
-                value = _read_json(fd, entry.name, scan)
-                if not valid_child_pending_link(value):
-                    raise RetentionPlannerError("malformed pending child link")
-                return True
-    return False
-
-
-def _classify_inbox_record(record, name, ids, bodies_fd) -> bool:
-    try:
-        record = validate_inbox_record(record, name, bodies_fd=bodies_fd)
-    except (InboxError, TypeError, ValueError) as exc:
-        raise RetentionPlannerError("malformed inbox record") from exc
-    sender = record["from"]
-    return (
-        sender["session"] in ids
-        or record.get("to_session") in ids
-        or record.get("claimer_session") in ids
-    )
-
-
-def _preview_snapshot(preview) -> PreviewSnapshot | None:
-    if not preview:
-        return None
-    return PreviewSnapshot(
-        preview_id=preview["preview_id"],
-        days=preview["days"],
-        cutoff=preview["cutoff"],
-        root_ids=tuple(preview["root_ids"]),
-        count=preview["count"],
-        bytes=preview["bytes"],
-        created_at=preview["created_at"],
-    )
-
-
-def _bounded_reason(message: str) -> str:
-    return message[:120]
+PlannerError = RetentionPlannerError
+
+from ._helpers import (
+    _authority_dependents,
+    _authority_inbox_reason,
+    _authority_memory_reconciliation_reason,
+    _authority_parent_id,
+    _authority_store_dirs,
+    _authority_store_reason,
+    _authority_transcript_recovery_reason,
+    _descend,
+    _EntryScan,
+    _failure_reason,
+    _fingerprints_intact,
+    _flock_nb,
+    _generation_value,
+    _lease_file,
+    _next_root,
+    _preview_snapshot,
+    _reservation_present,
+    _sent_file_reason,
+    _visit,
+    _walk_directory,
+)

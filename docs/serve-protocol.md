@@ -1381,6 +1381,7 @@ Event fields are:
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
+| `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
@@ -1862,6 +1863,7 @@ The shared slash registry has this order and surface availability:
 | `tasks` | no | inspect background processes |
 | `pin` | yes | pin the attached root session |
 | `unpin` | yes | unpin the attached root session |
+| `retention` | yes | show or change session retention: /retention [arm|disarm] |
 | `decisions` | yes | read, reply, dismiss, or batch-reply to attention items |
 | `send` | no | send a follow-up to a run: `/send <id> <message>` |
 | `help` | yes | list commands |
@@ -1951,6 +1953,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `zeta_updated` | emits one `zeta_updated` event when the running source revision changes; revision values are opaque strings and clients must not parse them |
 | `child_runs` | adds observer-allowed `child_run_list` and controller-only `child_run_send` for inspecting the active session's child runs and sending one safe-point follow-up to a running child (see "child runs") |
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
+| `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends

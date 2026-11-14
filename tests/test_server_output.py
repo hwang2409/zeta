@@ -1384,7 +1384,9 @@ async def test_status_projects_foreign_turn_end_after_resident_append(
         session_id = created["result"]["session"]["session_id"]
         assert server.runtime.opened is not None
         resident = server.runtime.opened.store
-        foreign = ConversationStore(resident.root_dir, session_id=session_id)
+        foreign = await asyncio.to_thread(
+            ConversationStore, resident.root_dir, session_id=session_id
+        )
         await foreign.append_turn_end_async("1" * 32, "error")
 
         resident.append_message(
@@ -1398,7 +1400,7 @@ async def test_status_projects_foreign_turn_end_after_resident_append(
         }
     finally:
         if foreign is not None:
-            foreign.close()
+            await asyncio.to_thread(foreign.close)
         writer.close()
         await server.close()
 

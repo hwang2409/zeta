@@ -112,11 +112,12 @@ async def rename_session(client, request_id, params):
 
 
 async def delete_session(client, request_id, params):
-    return await session.delete_session(
+    operation = lambda: session.delete_session(
         client.server.runtime,
         validation.required_string(params, "session_id"),
         client.server.control.require_idle,
     )
+    return await operation()
 
 
 async def repair_transcript(client, request_id, params):

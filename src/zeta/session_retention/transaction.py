@@ -14,7 +14,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -60,6 +60,10 @@ class TransactionError(Exception):
     """The transaction blocked without changing later durable stages."""
 
 
+class TransactionYield(TransactionError):
+    """A user open is pending; the transaction can resume from its durable stage."""
+
+
 class CandidateRejected(TransactionError):
     """Final candidate evidence no longer authorizes quarantine."""
 
@@ -90,6 +94,7 @@ class TransactionOutcome:
     blocked: str | None = None
     session_id: str | None = None
     completed: bool = False
+    yielded: bool = False
 
 
 class _ChargedScan:
@@ -137,12 +142,18 @@ class _ChargedScan:
 
 
 class _Budget:
-    def __init__(self, *, entries: int, deadline_ns: int, clock: Callable[[], int]):
+    def __init__(
+        self, *, entries: int, deadline_ns: int, clock: Callable[[], int],
+        yield_check: Callable[[], bool] | None = None,
+    ):
         self.remaining = entries
         self.deadline_ns = deadline_ns
         self.clock = clock
+        self.yield_check = yield_check
 
     def charge(self, _size: int = 0) -> None:
+        if self.yield_check is not None and self.yield_check():
+            raise TransactionYield
         if self.remaining <= 0 or self.clock() >= self.deadline_ns:
             raise TransactionError("retention transaction bound reached")
         self.remaining -= 1
@@ -173,6 +184,8 @@ class _QuarantineTransaction:
         days: int,
         preview: dict | None,
         verify: CandidateVerifier,
+        authority_held: bool = False,
+        yield_check: Callable[[], bool] | None = None,
     ) -> TransactionOutcome:
         """Recover first, otherwise quarantine one arm-authorized candidate."""
         try:
@@ -187,6 +200,7 @@ class _QuarantineTransaction:
             entries=self.entries,
             deadline_ns=self.clock() + self.worker_ns,
             clock=self.clock,
+            yield_check=yield_check,
         )
         try:
             self.project_ids = ()
@@ -195,13 +209,21 @@ class _QuarantineTransaction:
                 self.project_ids = tuple(
                     project.project_id for project in registry.list_projects()
                 )
-            with domain_authority(
-                self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
-            ), SessionReferenceGate(self.home, self.lease).exclusive():
+            authority = (
+                nullcontext()
+                if authority_held
+                else domain_authority(
+                    self.home, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True
+                )
+            )
+            with authority, SessionReferenceGate(self.home, self.lease).exclusive():
                 recovered = self._recover_one(budget)
                 if recovered is not None:
                     return recovered
+                budget.charge()
                 return self._start_one(days, preview, verify)
+        except TransactionYield:
+            return TransactionOutcome(False, yielded=True)
         except (
             OSError, ProjectRegistryError, StorageFormatError, TransactionError
         ) as exc:
