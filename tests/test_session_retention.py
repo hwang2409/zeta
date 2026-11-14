@@ -179,6 +179,11 @@ def test_retention_durable_writers_have_one_owner():
             if first_write is None or not any(check.lineno < first_write.lineno for check in checks):
                 violations.append(f"{seam[0]}:{function.lineno}: seam does not require token before its first write")
     assert not violations, "\\n".join(violations)
+    transaction_source = (package / "transaction.py").read_text(encoding="utf-8")
+    for seam in ("_publish", "_publish_state", "_delete", "_move_to_trash", "_unlink_tree_entry", "_start_one"):
+        tree = ast.parse(transaction_source)
+        function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == seam)
+        assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_mark_changed" for node in ast.walk(function)), seam
 
 
 def test_transaction_deadline_includes_prepare(tmp_path, monkeypatch):

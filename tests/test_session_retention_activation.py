@@ -13,7 +13,7 @@ import pytest
 
 import zeta.session_retention as retention_module
 import zeta.session_retention.activation as activation_module
-from tests.support.retention_owner import _age_tree, _create_closed
+from tests.support.retention_owner import _age_tree, _create_closed, _opened_lease
 from tests.support.storage_homes import initialize_storage_home
 from zeta.core.session import SessionManager
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
@@ -120,6 +120,28 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
         fcntl.flock(request, fcntl.LOCK_UN)
         os.close(request)
         await asyncio.to_thread(lease.close)
+
+
+@pytest.mark.parametrize("mutation", ("arm", "disarm", "days change", "none"))
+@pytest.mark.parametrize("result_path", ("preview", "blocked", "deleted", "error"))
+def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path: str) -> None:
+    """Every public mutation/result pairing has one visible publication rule."""
+    home = tmp_path / f"{mutation}-{result_path}"
+    initialize_storage_home(home)
+    with _opened_lease(home) as lease:
+        projection = retention_module.retention_result(
+            timestamp="0", mode="deleted" if result_path == "deleted" else "none", days=30,
+            errors=("error",) if result_path == "error" else (),
+        )
+        with retention_module._coordinator_authority(home) as token:
+            generation = retention_module._retention_generation(home, 30)
+            status = retention_module.append_retention_history(
+                token, home, lease, projection,
+                expected=generation, current_days=lambda: 30,
+                publish_if_stale=result_path in {"deleted", "error"},
+            )
+        assert status == "fresh"
+        assert retention_module.read_retention_history(home)[-1]["mode"] == projection["mode"]
 
 
 @pytest.mark.asyncio
