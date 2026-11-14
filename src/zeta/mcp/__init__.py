@@ -6,6 +6,7 @@ from .client import (
     MCPPromptArgument,
     MCPRequestError,
     MCPResource,
+    MCPUnsupportedError,
     MCPTool,
     MCPTransportError,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "MCPServerStatus",
     "MCPTool",
     "MCPTransportError",
+    "MCPUnsupportedError",
     "ManagedServer",
     "StdioMCPClient",
     "StreamableHTTPMCPClient",

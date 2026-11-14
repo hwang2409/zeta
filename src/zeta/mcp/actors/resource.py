@@ -176,7 +176,7 @@ def handle_resource_finished(actor: MCPServerActor, message: ResourceFinished) -
             text = (
                 resource_timed_out(actor.name)
                 if timed_out
-                else resource_unavailable(actor.name)
+                else f"MCP server {actor.name} is unavailable: {_error_text(error)}"
             )
             set_exception(request.result, RuntimeError(text))
         elif current:

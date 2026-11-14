@@ -42,6 +42,7 @@ from zeta.mcp.client import (
     MCPProtocolError,
     MCPRequestError,
     MCPTransportError,
+    MCPUnsupportedError,
     parse_rpc_response,
     translate_call_result,
 )
@@ -216,8 +217,8 @@ def test_mcp_non_text_blocks_keep_the_standard_content_shape() -> None:
     ]
 
 
-def test_mcp_json_rpc_error_is_a_tool_error() -> None:
-    result = translate_call_result(
+def test_mcp_json_rpc_error_is_a_request_error() -> None:
+    with pytest.raises(MCPRequestError, match=r"MCP JSON-RPC error -1: tool failed"):
         parse_rpc_response(
             {
                 "jsonrpc": "2.0",
@@ -226,10 +227,13 @@ def test_mcp_json_rpc_error_is_a_tool_error() -> None:
             },
             1,
         )
-    )
 
-    assert result["isError"] is True
-    assert result["content"][0]["text"] == "tool failed"
+
+def test_mcp_optional_capability_error_is_clear() -> None:
+    from zeta.mcp.client import require_capability
+
+    with pytest.raises(MCPUnsupportedError, match="server achilles does not provide resources"):
+        require_capability({"tools": {}}, "resources", "achilles")
 
 
 def test_mcp_malformed_tool_result_is_a_protocol_error() -> None:
@@ -1692,6 +1696,7 @@ async def test_http_generic_request_failure_notifies_sink() -> None:
 @pytest.mark.asyncio
 async def test_json_rpc_prompt_error_does_not_notify_transport_sink() -> None:
     client = StdioMCPClient(MCPServerConfig("stdio", "stdio", "unused"))
+    client.capabilities = {"prompts": {}}
     failures: list[str] = []
     client.set_failure_sink(failures.append)
 
