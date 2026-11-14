@@ -509,6 +509,41 @@ async def test_context_overflow_forces_emergency_eviction_and_retries_once(
 
 
 @pytest.mark.asyncio
+async def test_provider_output_usage_is_persisted_on_assistant_message(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                [TextContent("done")],
+                usage={
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "reasoning_output_tokens": 3,
+                },
+            )
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        backend,
+        store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+    try:
+        await _collect(loop.run_turn("current request", origin=MessageOrigin.USER))
+
+        completed = branch_messages(store)[-1]
+        assert completed.metadata["provider_usage"]["output_tokens"] == 7
+        assert completed.metadata["provider_usage"]["reasoning_output_tokens"] == 3
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_retry_failure_persists_turn_once(
     tmp_path: Path,
 ) -> None:
