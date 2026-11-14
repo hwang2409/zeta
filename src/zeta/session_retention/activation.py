@@ -81,8 +81,12 @@ def make_retention_owner(
             projection = dict(history[-1])
         nonlocal last_projection
         with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
-            planner.commit_state()
-            if last_projection is None or not _same_projection(last_projection, projection):
+            committed = planner.commit_state()
+            if not committed:
+                history = read_retention_history(root)
+                if history:
+                    projection = dict(history[-1])
+            elif last_projection is None or not _same_projection(last_projection, projection):
                 append_retention_history(root, retained, projection, authority_held=True)
                 last_projection = projection
         return _PublishedPass(

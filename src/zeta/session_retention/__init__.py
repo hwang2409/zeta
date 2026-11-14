@@ -554,6 +554,7 @@ class RetentionPlanner:
         self._sweep: _Sweep | None = None
         self._flight: _InFlight | None = None
         self._latest: object = _UNLOADED
+        self._commit_baseline: dict | None = None
 
     def __enter__(self) -> Self:
         return self
@@ -615,6 +616,7 @@ class RetentionPlanner:
     def _run_pass(
         self, home_fd: int, days: int, *, commit_state: bool = True
     ) -> PassResult:
+        self._commit_baseline = _load_state(home_fd)
         if self._latest is _UNLOADED:
             state = _load_state(home_fd)
             self._latest = state["preview"] if state is not None else None
@@ -672,10 +674,13 @@ class RetentionPlanner:
             in_progress_root=None if complete else sweep.current_root,
         )
 
-    def commit_state(self) -> None:
+    def commit_state(self) -> bool:
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
+            if _load_state(home_fd) != self._commit_baseline:
+                return False
             _store_state(home_fd, self._state_payload())
+            return True
         finally:
             os.close(home_fd)
 
