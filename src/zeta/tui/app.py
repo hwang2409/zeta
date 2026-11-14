@@ -363,7 +363,7 @@ class TUIApp(
         self._mcp_manager = MCPManager(self.loop._mcp_management)
         self._status_restore_text = ""
         self._status_restore_cursor = 0
-        self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation = AgentNavigation(self.loop.store, self._history_pager)
         self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
         self._agent_navigation.transcript_control.on_load = (
@@ -668,6 +668,7 @@ class TUIApp(
             return
         self._history_view_generation += 1
         generation = self._history_view_generation
+        self._agent_navigation.transcript_control.begin_activation(path)
         if self._history_view_task is not None:
             self._history_view_task.cancel()
         try:
@@ -685,10 +686,23 @@ class TUIApp(
     async def _activate_history_view(self, path: Path, generation: int) -> None:
         control = self._agent_navigation.transcript_control
         previous = control._source
+        if previous is not None and previous.path == path:
+            try:
+                changed = await control.refresh()
+            except (
+                ConversationIntegrityError,
+                OSError,
+                SessionNotFoundError,
+                ValueError,
+            ):
+                await control.activation_failed(path)
+                self._invalidate_prompt()
+                return
+            if changed:
+                self._invalidate_prompt()
+            return
         if path == self.loop.store.session_dir:
             source = self._history_source
-        elif previous is not None and previous.path == path:
-            source = previous
         else:
             worker = asyncio.create_task(
                 asyncio.to_thread(ChildLogHistorySource, path)
@@ -705,6 +719,8 @@ class TUIApp(
                 SessionNotFoundError,
                 ValueError,
             ):
+                await control.activation_failed(path)
+                self._invalidate_prompt()
                 return
         if generation != self._history_view_generation:
             if source is not self._history_source and source is not previous:
@@ -732,6 +748,8 @@ class TUIApp(
             SessionNotFoundError,
             ValueError,
         ):
+            await control.activation_failed(path)
+            self._invalidate_prompt()
             return
         if (
             generation != self._history_view_generation

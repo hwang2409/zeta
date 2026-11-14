@@ -16663,6 +16663,8 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "branch-prompt-stale-tree",
         "child-cancel-replace-close",
         "child-stale-page",
+        "child-live-refresh",
+        "child-deleted-activation",
     ),
 )
 @pytest.mark.asyncio
@@ -16852,6 +16854,104 @@ async def test_root_tui_paging_render_path_table(
             )
             assert anchor_id in {unit.entry_id for unit in pager.pages[0].units}
             await source.close()
+        elif journey == "child-live-refresh":
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            entry_ids = []
+            for index in range(300):
+                entry_ids.append(
+                    child_store.append_message(
+                        Message(
+                            MessageRole.ASSISTANT,
+                            [TextContent(f"running child row {index}")],
+                        )
+                    ).id
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("running child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="running child activation"
+            )
+            await app._history_pager.reveal(entry_ids[0])
+            app._render_active_resident_history()
+            child_transcript = navigation.transcript_control.transcript
+            assert child_transcript.restore_durable_scroll_anchor(
+                (entry_ids[0], 0, 0)
+            )
+            anchor = child_transcript.durable_scroll_anchor
+
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("new running child row")])
+            )
+            child_store.close()
+            navigation.refresh(force=True)
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="running child live refresh"
+            )
+            navigation.transcript_control.create_content(120, 20)
+
+            assert child_transcript.durable_scroll_anchor == anchor, (
+                "running child refresh moved the scrolled-up viewport"
+            )
+            assert "running child row 0" in Text.from_ansi(
+                child_transcript.render(120)
+            ).plain
+        elif journey == "child-deleted-activation":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child only")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            navigation.current_path = first_path
+            navigation._path_stack.append(first_path)
+            navigation._breadcrumb_labels.append("first child")
+            navigation.transcript_control.request_sync(
+                first_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._history_view_task is not None
+            await await_or_fail(app._history_view_task, what="first child activation")
+            assert "first child only" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            shutil.rmtree(second_path)
+            navigation.current_path = second_path
+            navigation._path_stack.append(second_path)
+            navigation._breadcrumb_labels.append("deleted child")
+            navigation.transcript_control.request_sync(
+                second_path, app._invalidate_prompt
+            )
+            assert app._history_view_task is not None
+            await await_or_fail(
+                app._history_view_task, what="deleted child activation"
+            )
+            navigation.transcript_control.create_content(120, 20)
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            assert "first child only" not in rendered, (
+                "deleted child activation retained the previous child's rows"
+            )
+            assert "transcript unavailable" in rendered
         elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page

@@ -557,13 +557,42 @@ class AgentTranscriptControl(UIControl):
     def is_focusable(self) -> bool:
         return True
 
-    def set_source(self, path: Path, source: Any) -> None:
-        if path != self._path:
-            self.presenter.clear()
-            self._tool_calls.clear()
+    def begin_activation(self, path: Path) -> None:
+        if path == self._path:
+            return
+        self.presenter.clear()
+        self._tool_calls.clear()
         self._path = path
+        self._pending_path = path
+
+    def set_source(self, path: Path, source: Any) -> None:
+        self.begin_activation(path)
         self._pending_path = None
         self._source = source
+
+    async def activation_failed(self, path: Path) -> None:
+        if path != self._path:
+            return
+        source, self._source = self._source, None
+        if source is not None:
+            await source.close()
+        self._history_pager.reset()
+        self._history_pager.source = None
+        self.presenter.clear()
+        self._tool_calls.clear()
+        self.presenter.print(Text("transcript unavailable"))
+        self._pending_path = None
+
+    async def refresh(self) -> bool:
+        anchor = self.transcript.durable_scroll_anchor
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
+        changed = await self._history_pager.refresh_tail(
+            follow_tail=self.transcript.follow_tail
+        )
+        if changed:
+            self.render_pages(self._history_pager.pages)
+        return changed
 
     async def load(self, path: Path) -> bool:
         if self._closed:

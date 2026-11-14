@@ -248,6 +248,7 @@ class ChildLogHistorySource:
             older=self._cursor(refs, start, revision) if start > 0 else None,
             newer=self._cursor(refs, stop, revision) if stop < len(refs) else None,
             endpoint_id=endpoint,
+            repair_generation=json.dumps(revision[:2], separators=(",", ":")),
         )
 
     def _page_sync(
