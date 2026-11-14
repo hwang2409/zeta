@@ -748,9 +748,34 @@ async def test_websocket_custom_discovery_allows_a_second_server(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_websocket_custom_discovery_preserves_existing_parent_mode(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "public"
+    parent.mkdir()
+    parent.chmod(0o755)
+    custom_path = parent / "serve.json"
+    server = ZetaServer(
+        home=tmp_path,
+        port=0,
+        ws_port=0,
+        ws_discovery=custom_path,
+        provider="codex",
+    )
+    await server.start()
+    try:
+        assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    finally:
+        await close_serve(server)
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+
+
+@pytest.mark.asyncio
 async def test_websocket_rejects_relative_custom_discovery_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="absolute path"):
         ZetaServer(home=tmp_path, port=0, ws_port=0, ws_discovery="serve.json")
+    with pytest.raises(ValueError, match="requires ws_port"):
+        ZetaServer(home=tmp_path, port=0, ws_discovery="/tmp/serve.json")
 
 
 @pytest.mark.asyncio

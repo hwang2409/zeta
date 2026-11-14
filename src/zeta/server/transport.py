@@ -84,6 +84,7 @@ class WebSocketServer:
         origins: Sequence[str],
         path: Path,
         lock_path: Path,
+        secure_parent: bool,
         accept: Callable[[object, object], Awaitable[None]],
     ) -> None:
         if not 0 <= port <= 65535:
@@ -92,6 +93,7 @@ class WebSocketServer:
         self.origins = validate_origins(origins)
         self.path = path
         self.lock_path = lock_path
+        self.secure_parent = secure_parent
         self.accept = accept
         self.token: str | None = None
         self.controller_token: str | None = None
@@ -101,7 +103,7 @@ class WebSocketServer:
 
     async def start(self) -> None:
         self._lock_fd = await asyncio.to_thread(
-            acquire_connection_lock, self.lock_path
+            acquire_connection_lock, self.lock_path, self.secure_parent
         )
         self.controller_token = secrets.token_urlsafe(32)
         self.observer_token = secrets.token_urlsafe(32)
@@ -126,6 +128,7 @@ class WebSocketServer:
         await asyncio.to_thread(
             write_connection_file,
             self.path,
+            secure_parent=self.secure_parent,
             port=self.port,
             controller_token=self.controller_token,
             observer_token=self.observer_token,
@@ -269,12 +272,13 @@ async def run_server(server: ZetaServer) -> None:
             loop.remove_signal_handler(signum)
 
 
-def acquire_connection_lock(path: Path) -> int:
+def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     fd = -1
     try:
-        os.fchmod(parent_fd, 0o700)
+        if secure_parent:
+            os.fchmod(parent_fd, 0o700)
         fd = os.open(
             path.name,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -321,6 +325,7 @@ def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> N
 def write_connection_file(
     path: Path,
     *,
+    secure_parent: bool = True,
     port: int,
     controller_token: str,
     observer_token: str,
@@ -344,7 +349,8 @@ def write_connection_file(
     ).encode()
     fd = -1
     try:
-        os.fchmod(parent_fd, 0o700)
+        if secure_parent:
+            os.fchmod(parent_fd, 0o700)
         fd = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
