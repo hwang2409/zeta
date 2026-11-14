@@ -813,7 +813,7 @@ async def test_socket_http_approved_tool_runs_once(
         assert recovery_turn is not None
         await await_or_fail(
             asyncio.gather(live_turn, recovery_turn),
-            timeout=TIMEOUT,
+            timeout=10,
             what="approved MCP live and recovery turns",
         )
 
@@ -825,9 +825,15 @@ async def test_socket_http_approved_tool_runs_once(
         ) == 1
     finally:
         writer.close()
-        await writer.wait_closed()
-        await server.close()
-        await mcp.close()
+        await await_or_fail(
+            writer.wait_closed(), timeout=10, what="approved MCP socket close"
+        )
+        await await_or_fail(
+            server.close(), timeout=10, what="approved MCP zeta server close"
+        )
+        await await_or_fail(
+            mcp.close(), timeout=10, what="approved MCP test server close"
+        )
 
 
 @pytest.mark.asyncio
