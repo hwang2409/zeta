@@ -97,6 +97,7 @@ async def _enter_child(app: TUIApp, pipe) -> None:
         and bool(navigation.transcript_control.transcript.units),
         what="focused child transcript",
     )
+    await navigation.wait_for_publication()
 
 
 async def _return_to_root(app: TUIApp, pipe) -> None:
@@ -114,11 +115,13 @@ async def _return_to_root(app: TUIApp, pipe) -> None:
         lambda: navigation.child_view_focused() or navigation.list_focused(),
         what="visible child navigation focus",
     )
+    await navigation.wait_for_publication()
     await _send(pipe, "h")
     await _wait_until(
         lambda: not app._agent_navigation.child_view_active,
         what="root transcript after h",
     )
+    await navigation.wait_for_publication()
 
 
 @pytest.fixture(scope="module")
@@ -158,7 +161,6 @@ async def test_real_tui_child_view_journey(
 
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
         session = app._make_session()
-        session.app.ttimeoutlen = 0.02
         run_task = asyncio.create_task(app.run(session))
         try:
             await _wait_until(lambda: session.app.is_running, what="running TUIApp")

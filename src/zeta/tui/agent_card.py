@@ -1097,6 +1097,7 @@ class AgentNavigation:
         self._breadcrumb_labels = ["main"]
         self.entries: list[AgentEntry] = []
         self.selected_index = 0
+        self._list_focus_requested = False
         self._fork_title: str | None = None
         self._fork_main_path: Path | None = None
         self._on_return_to_main: Callable[[], None] | None = None
@@ -1482,6 +1483,7 @@ class AgentNavigation:
         self.refresh(force=True)
 
     def focus_composer(self) -> None:
+        self._list_focus_requested = False
         if self._layout is not None and self._composer_buffer is not None:
             self._layout.focus(self._composer_buffer)
 
@@ -1490,6 +1492,7 @@ class AgentNavigation:
 
     def focus_list(self) -> None:
         self.transcript_control.capture_root_view()
+        self._list_focus_requested = True
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         else:
@@ -1507,6 +1510,7 @@ class AgentNavigation:
         self.transcript_control.activate(self.root_path)
 
     def focus_child_list(self) -> None:
+        self._list_focus_requested = True
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         self.refresh(force=True)
@@ -1631,8 +1635,8 @@ class AgentNavigation:
         if self._navigation_generation != generation:
             return False
         previous = self.current_path
-        preserve_list_focus = (
-            path == previous and bool(prepared.entries) and self.list_focused()
+        preserve_list_focus = path == previous and bool(prepared.entries) and (
+            self.list_focused() or self._list_focus_requested
         )
         previous_index = self.selected_index
         if path in self._path_stack:
@@ -1666,6 +1670,7 @@ class AgentNavigation:
         self._switch_transcript()
         if preserve_list_focus and self._layout is not None:
             self._layout.focus(self.list_window)
+            self._list_focus_requested = False
         elif self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
         else:
