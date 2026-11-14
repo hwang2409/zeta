@@ -227,10 +227,10 @@ async def test_request_started_during_recovery_waits_for_shared_initialize(
     second_entered = asyncio.Event()
     original = client._send_with_auth
 
-    async def observe_send(payload, request_id, state):
+    async def observe_send(payload, request_id, state, **kwargs):
         if payload["method"] == "tools/list":
             second_entered.set()
-        return await original(payload, request_id, state)
+        return await original(payload, request_id, state, **kwargs)
 
     # test-contract: seam observe entry before the transport waits on recovery
     monkeypatch.setattr(client, "_send_with_auth", observe_send)
