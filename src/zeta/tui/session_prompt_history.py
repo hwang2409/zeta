@@ -7,6 +7,7 @@ import heapq
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
 from .transcript.fuzzy import match_query, parse_query
@@ -30,6 +31,19 @@ class SessionPromptHistory:
         self._load: asyncio.Task[None] | None = None
         self._finder_scan: asyncio.Task[None] | None = None
         self._generation = 0
+        self._navigation_revision = 0
+        self._applying_document = False
+
+    @property
+    def navigating(self) -> bool:
+        return self._index is not None
+
+    @property
+    def navigation_revision(self) -> int:
+        return self._navigation_revision
+
+    def navigation_is_current(self, revision: int) -> bool:
+        return revision == self._navigation_revision
 
     @property
     def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
@@ -184,7 +198,19 @@ class SessionPromptHistory:
         self.reset_navigation()
         return draft
 
+    def apply(self, buffer: Buffer, document: Document) -> None:
+        self._applying_document = True
+        try:
+            buffer.set_document(document, bypass_readonly=True)
+        finally:
+            self._applying_document = False
+
+    def detach(self) -> None:
+        if not self._applying_document:
+            self.reset_navigation()
+
     def reset_navigation(self) -> None:
+        self._navigation_revision += 1
         self._index = None
         self._draft = None
 
@@ -288,7 +314,6 @@ class SessionPromptHistory:
         self._finder_scan = None
         self._entries.clear()
         self._older = self._newer = None
-        self._index = None
-        self._draft = None
+        self.reset_navigation()
         self._session = None
         self._branch_id = None
