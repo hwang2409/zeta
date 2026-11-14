@@ -150,38 +150,18 @@ def test_metadata_writes_do_not_change_pin(tmp_path):
         assert (session / RETENTION_PIN_FILENAME).read_bytes()
 
 
-_DAY_NS = 86_400 * 1_000_000_000
-_OLD = "2020-01-01T00:00:00+00:00"
-
-
-def _manager(home):
-    return SessionManager(home)
-
-
-def _create_closed(manager, stack, **kwargs):
-    opened = manager.create(
-        provider="codex", model="gpt-5.6-sol", cwd=str(manager.home),
-        auto_project=False, **kwargs,
-    )
-    opened.store.close()
-    return opened.metadata.session_id
-
-
-def _true_tree_bytes(session_dir) -> int:
-    total = 0
-    for dirpath, _dirs, files in os.walk(session_dir):
-        for name in files:
-            path = os.path.join(dirpath, name)
-            if os.path.islink(path):
-                continue
-            total += os.path.getsize(path)
-    return total
-
-
-def _planner(stack, *args, **kwargs):
-    planner = RetentionPlanner(*args, **kwargs)
-    stack.callback(getattr(planner, "close", lambda: None))
-    return planner
+from tests.support.retention_owner import (
+    _DAY_NS,
+    _OLD,
+    _age_tree,
+    _create_closed,
+    _manager,
+    _opened_lease,
+    _planner,
+    _run_sweep,
+    _run_sweep_without_error,
+    _true_tree_bytes,
+)
 
 
 def test_not_old_blocks_under_real_clock(tmp_path):
@@ -447,20 +427,6 @@ def _create_with_message(manager, text):
     return opened.metadata.session_id
 
 
-def _age_tree(session_dir, *, days=100, keep_metadata=False):
-    """Make a session look ``days`` old: metadata timestamps and every mtime."""
-    if not keep_metadata:
-        meta = session_dir / "meta.json"
-        value = json.loads(meta.read_text())
-        value["created_at"] = value["updated_at"] = _OLD
-        meta.write_text(json.dumps(value))
-    old = time.time_ns() - days * _DAY_NS
-    for dirpath, _dirs, files in os.walk(session_dir, topdown=False):
-        for name in files:
-            os.utime(os.path.join(dirpath, name), ns=(old, old), follow_symlinks=False)
-        os.utime(dirpath, ns=(old, old))
-
-
 def _write_sent_ledger(home, session_id, reported):
     """A v1 sent ledger, the shape ``SentMessageTracker`` itself loads."""
     record = {
@@ -470,33 +436,6 @@ def _write_sent_ledger(home, session_id, reported):
     path = home / "sessions" / session_id / "project-inbox-sent.json"
     path.write_text(json.dumps({"schema_version": 1, "records": [record]}))
     path.chmod(0o600)
-
-
-def _run_sweep(planner, days=30):
-    """Run passes to the end of one sweep; return the result and every reason."""
-    reasons = {}
-    for _ in range(500):
-        result = planner.run_pass(days=days)
-        reasons.update({row.root_id: (row.closed, row.reason) for row in result.reasons})
-        if result.complete:
-            return result, reasons
-    raise AssertionError("sweep did not complete in 500 passes")
-
-
-def _run_sweep_without_error(planner, days=30):
-    try:
-        return _run_sweep(planner, days)
-    except OSError:
-        return None, {}
-
-
-@contextmanager
-def _opened_lease(home):
-    lease = open_writer(home)
-    try:
-        yield lease
-    finally:
-        lease.close()
 
 
 def test_isolated_all_roots_behavior(tmp_path):

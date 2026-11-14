@@ -204,8 +204,9 @@ def append_retention_history(
                 rows.append(value)
     except FileNotFoundError:
         pass
-    except (OSError, ValueError, StorageFormatError) as exc:
-        raise RetentionPlannerError("malformed retention history") from exc
+    except (OSError, ValueError, StorageFormatError):
+        # A corrupt history row must not strand the activation owner.
+        rows = []
     rows = (rows + [dict(result)])[-_MAX_HISTORY:]
     def publish() -> None:
         home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
