@@ -50,6 +50,28 @@ def test_missing_files_are_silent(tmp_path: Path) -> None:
     assert loaded.notices == ()
 
 
+def test_anthropic_oauth_compat_reads_from_global(tmp_path: Path) -> None:
+    _write(tmp_path / "home", "[anthropic]\noauth_compat = true\n")
+    loaded = load_settings(home=tmp_path / "home")
+    assert loaded.settings.anthropic_oauth_compat is True
+    assert loaded.notices == ()
+
+
+def test_anthropic_oauth_compat_defaults_to_none(tmp_path: Path) -> None:
+    loaded = load_settings(home=tmp_path / "empty")
+    assert loaded.settings.anthropic_oauth_compat is None
+
+
+def test_project_cannot_enable_oauth_compat(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write(home, 'provider = "claude"\n')
+    _write(project, "[anthropic]\noauth_compat = true\n")
+    loaded = load_settings(home=home, project_dir=project)
+    assert loaded.settings.anthropic_oauth_compat is None
+    assert any("anthropic" in warning for warning in loaded.warnings)
+
+
 @pytest.mark.parametrize("days", [0, 1, 3650])
 def test_retention_days_accepts_global_values(tmp_path: Path, days: int) -> None:
     _write(tmp_path / "home", f"[retention]\ndays = {days}\n")

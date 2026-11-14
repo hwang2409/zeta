@@ -139,10 +139,14 @@ def build_backend(
         selected_model = model or DEFAULT_CLAUDE_MODEL
         if require_credentials:
             _require_credentials(credential)
+        oauth_compat_setting = (
+            load_settings(home=runtime_home).settings.anthropic_oauth_compat is True
+        )
         return AnthropicBackend(
             model=selected_model,
             token_store=credential,
             diagnostics_path=runtime_home / "logs" / "stream-diagnostics.jsonl",
+            oauth_compat_setting=oauth_compat_setting,
             **stall_kwargs,
         ), selected_model
     if provider == "codex":
