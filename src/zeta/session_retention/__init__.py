@@ -115,22 +115,28 @@ class Yielded:
     reason: Literal["user", "stop"]
 
 
-@dataclass(frozen=True)
+_GENERATION_MARKER = object()
+
+
+@dataclass(frozen=True, init=False)
 class RetentionGeneration:
     days: int
     arm: tuple[int, int, int, int, int] | None
     history: tuple[int, int, int, int, int] | None
     state: tuple[int, int, int, int, int] | None
 
-
-def _retention_generation(root: Path, days: int) -> RetentionGeneration:
-    def identity(name: str) -> tuple[int, int, int, int, int] | None:
-        try:
-            info = os.stat(root / name, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-    return RetentionGeneration(days, identity(_ARM_FILENAME), identity(_HISTORY_FILENAME), identity(_STATE_FILENAME))
+    def __init__(
+        self, marker: object, days: int,
+        arm: tuple[int, int, int, int, int] | None,
+        history: tuple[int, int, int, int, int] | None,
+        state: tuple[int, int, int, int, int] | None,
+    ) -> None:
+        if marker is not _GENERATION_MARKER:
+            raise TypeError("retention generations are coordinator-owned")
+        object.__setattr__(self, "days", days)
+        object.__setattr__(self, "arm", arm)
+        object.__setattr__(self, "history", history)
+        object.__setattr__(self, "state", state)
 
 
 @dataclass(frozen=True)
@@ -139,11 +145,11 @@ class PassResult:
 
     enabled: bool
     complete: bool
+    expected_generation: RetentionGeneration
     mode: str | None = None
     reasons: tuple[RootOutcome, ...] = ()
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
-    expected_generation: RetentionGeneration | None = None
     changed: bool = False
 
 
@@ -214,12 +220,28 @@ _COORDINATOR_TOKEN_MARKER = object()
 class CoordinatorToken:
     """Capability for retention durable writes during one coordinator section."""
 
-    __slots__ = ("_active",)
+    __slots__ = ("_active", "_root")
 
-    def __init__(self, marker: object) -> None:
+    def __init__(self, marker: object, root: Path) -> None:
         if marker is not _COORDINATOR_TOKEN_MARKER:
             raise TypeError("retention coordinator tokens are authority-owned")
         self._active = True
+        self._root = root
+
+    def generation(self, days: int) -> RetentionGeneration:
+        """Capture the freshness generation; only a live token can make one."""
+        self.require_active()
+
+        def identity(name: str) -> tuple[int, int, int, int, int] | None:
+            try:
+                info = os.stat(self._root / name, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        return RetentionGeneration(
+            _GENERATION_MARKER, days, identity(_ARM_FILENAME),
+            identity(_HISTORY_FILENAME), identity(_STATE_FILENAME),
+        )
 
     def require_active(self) -> None:
         if not self._active:
@@ -240,7 +262,7 @@ from .transaction import (
 @contextmanager
 def _coordinator_authority(root: Path):
     with domain_authority(root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN, exclusive=True):
-        token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+        token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER, root)
         try:
             yield token
         finally:
@@ -261,7 +283,7 @@ def append_retention_history(
     if expected is not None:
         if current_days is None:
             raise TypeError("current_days is required with expected")
-        if _retention_generation(Path(home), current_days()) != expected and not publish_if_stale:
+        if token.generation(current_days()) != expected and not publish_if_stale:
             return "stale"
     if before_append is not None and not before_append():
         return "not_committed"
@@ -319,7 +341,7 @@ def _try_authority(root: Path, *, exclusive: bool, deadline: float):
                 root, RETENTION_HOME_ID, _COORDINATOR_DOMAIN,
                 exclusive=exclusive, nonblocking=True,
             ):
-                token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER)
+                token = CoordinatorToken(_COORDINATOR_TOKEN_MARKER, root)
                 try:
                     yield token
                 finally:
@@ -699,7 +721,9 @@ class RetentionPlanner:
         if type(days) is not int or days <= 0 or days > 3650:
             raise RetentionPlannerError("retention days must be in 1..3650")
         if not self.enabled:
-            return PassResult(enabled=False, complete=False)
+            with _coordinator_authority(self.home) as token:
+                generation = token.generation(days)
+            return PassResult(enabled=False, complete=False, expected_generation=generation)
         if planner_request_pending(self.home):
             self.close()
             return Yielded("user")
@@ -744,7 +768,7 @@ class RetentionPlanner:
                 deadline_ns=deadline_ns,
                 yield_check=yield_check or (lambda: planner_request_pending(self.home)),
             )
-            expected_generation = _retention_generation(self.home, days)
+            expected_generation = token.generation(days)
         transaction_result = self._transaction_result(outcome, expected_generation)
         if transaction_result is not None:
             return transaction_result
@@ -785,7 +809,7 @@ class RetentionPlanner:
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
-            expected_generation=_retention_generation(self.home, days),
+            expected_generation=expected_generation,
         )
 
     def commit_state(self, token: CoordinatorToken) -> bool:
@@ -805,7 +829,7 @@ class RetentionPlanner:
         finally:
             os.close(home_fd)
 
-    def _transaction_result(self, outcome: TransactionOutcome, expected_generation: RetentionGeneration | None = None) -> PassResult | None:
+    def _transaction_result(self, outcome: TransactionOutcome, expected_generation: RetentionGeneration) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
             return None
         if outcome.completed:

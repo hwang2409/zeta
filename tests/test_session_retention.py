@@ -228,6 +228,21 @@ def test_transaction_deadline_includes_prepare(tmp_path, monkeypatch):
         assert seen
 
 
+def test_retention_generation_exists_only_from_live_token(tmp_path):
+    # A publication's freshness generation must come from the pre-scan token
+    # section; nothing else may build, edit, or recompute one.
+    with _coordinator_authority(tmp_path) as token:
+        generation = token.generation(30)
+    with pytest.raises(TypeError, match="coordinator-owned"):
+        session_retention.RetentionGeneration(object(), 30, None, None, None)
+    with pytest.raises(TypeError):
+        replace(generation, days=31)
+    with pytest.raises(AttributeError):
+        generation.days = 31
+    with pytest.raises(RuntimeError, match="no longer active"):
+        token.generation(30)
+
+
 def test_retention_publication_rejects_token_after_authority_exit(tmp_path):
     from zeta.session_retention import append_retention_history, retention_result
 
