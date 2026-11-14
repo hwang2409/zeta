@@ -79,6 +79,7 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
     home, manager, session_id, lease = await _armed_home(tmp_path)
     checkpoint = threading.Event()
     second_checkpoint = threading.Event()
+    second_continue = threading.Event()
     request_seen = threading.Event()
     stop_seen = threading.Event()
     charge_calls = 0
@@ -96,6 +97,7 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
             raise transaction_module.TransactionYield
         elif charge_calls == 2:
             second_checkpoint.set()
+            assert second_continue.wait(10), "second transaction charge did not receive stop"
         return original_charge(budget, size)
 
     monkeypatch.setattr(transaction_module._Budget, "charge", charge)
@@ -166,7 +168,11 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
             request_released = True
             await asyncio.to_thread(request_process.join, 10)
             owner.wake()
-            await asyncio.wait_for(asyncio.to_thread(second_checkpoint.wait, 10), 10)
+            assert await asyncio.wait_for(asyncio.to_thread(second_checkpoint.wait, 10), 10), (
+                "second transaction charge did not reach its checkpoint"
+            )
+            owner._stop.set()
+            second_continue.set()
             await owner.stop()
         else:
             stop_task = asyncio.create_task(owner.stop())
@@ -178,8 +184,12 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
         assert all(probes)
         rows = read_retention_history(home)
         new_rows = rows[len(baseline_rows) :]
-        assert all(row.get("mode") not in {"yielded", "none"} for row in new_rows)
-        assert all(not row.get("errors") for row in new_rows)
+        assert all(
+            row.get("mode") not in {"yielded", "none"} for row in new_rows
+        ), [(row.get("mode"), row.get("errors")) for row in new_rows]
+        assert all(not row.get("errors") for row in new_rows), [
+            (row.get("mode"), row.get("errors")) for row in new_rows
+        ]
         assert all(
             (item.get("mode") if isinstance(item, dict) else getattr(item, "mode", None))
             not in {"yielded", "none"}

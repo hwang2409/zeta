@@ -173,38 +173,31 @@ async def test_two_owners_append_without_lost_rows(
     lease = await asyncio.to_thread(open_writer, home)
     barrier = threading.Barrier(2)
     thread_roles: dict[int, str] = {}
-    b_reached = threading.Event()
-    a_holds_coordinator = threading.Event()
+    prepared = {"a": threading.Event(), "b": threading.Event()}
+    b_committed = threading.Event()
     original_run_pass = RetentionPlanner.run_pass
-    original_publish = retention_module.atomic_publish_file
     original_authority = activation_module.domain_authority
 
-    def signal_second_commit(planner, *, days, commit_state=True, yield_check=None):
+    def record_prepared(planner, *, days, commit_state=True, yield_check=None):
         result = original_run_pass(
             planner, days=days, commit_state=commit_state, yield_check=yield_check
         )
-        if thread_roles.get(threading.get_ident()) == "b":
-            b_reached.set()
+        role = thread_roles[threading.get_ident()]
+        prepared[role].set()
         return result
 
     @contextlib.contextmanager
-    def observed_authority(*args, **kwargs):
-        if thread_roles.get(threading.get_ident()) == "a":
-            a_holds_coordinator.set()
-        elif thread_roles.get(threading.get_ident()) == "b":
-            b_reached.set()
+    def forced_commit_order(*args, **kwargs):
+        role = thread_roles[threading.get_ident()]
+        if role == "a" and prepared[role].is_set():
+            assert b_committed.wait(10), "owner b did not commit its prepared state"
         with original_authority(*args, **kwargs):
             yield
+        if role == "b" and prepared[role].is_set():
+            b_committed.set()
 
-    def ordered_publish(directory_fd, name, data, **kwargs):
-        role = thread_roles.get(threading.get_ident())
-        if role == "a" and name == "retention-history.jsonl":
-            assert b_reached.wait(10), "owner b did not reach its commit attempt"
-        original_publish(directory_fd, name, data, **kwargs)
-
-    monkeypatch.setattr(RetentionPlanner, "run_pass", signal_second_commit)
-    monkeypatch.setattr(activation_module, "domain_authority", observed_authority)
-    monkeypatch.setattr(retention_module, "atomic_publish_file", ordered_publish)
+    monkeypatch.setattr(RetentionPlanner, "run_pass", record_prepared)
+    monkeypatch.setattr(activation_module, "domain_authority", forced_commit_order)
     try:
         first = make_retention_owner(home, lease, lambda: 30)
         second = make_retention_owner(home, lease, lambda: 31)
@@ -235,6 +228,7 @@ async def test_two_owners_append_without_lost_rows(
             10,
         )
         assert all(failure is None for _projections, failure in results), results
+        assert b_committed.is_set(), "owner b did not complete its forced commit"
         rows = (home / "retention-history.jsonl").read_text().splitlines()
         assert len(rows) == 1
         assert {json.loads(row)["mode"] for row in rows} == {"preview"}
