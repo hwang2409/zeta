@@ -16976,6 +16976,31 @@ async def test_root_tui_paging_render_path_table(
             ).plain
             assert "second child row" in rendered
             assert "first child row" not in rendered
+            for tick in range(2):
+                second = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                second.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"second child refresh {tick}")],
+                    )
+                )
+                second.close()
+                previous_task = app._history_view_task
+                navigation.refresh(force=True)
+                assert app._history_view_task is not None
+                await await_or_fail(
+                    app._history_view_task,
+                    what=f"second child refresh after switch {tick}",
+                )
+                assert app._history_view_task is not previous_task, (
+                    f"second child refresh {tick} after switch was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "second child refresh 1" in rendered
         elif journey == "child-deleted-activation":
             first = ConversationStore(store.session_dir / "agents", session_id="1")
             first.append_message(
@@ -17036,6 +17061,31 @@ async def test_root_tui_paging_render_path_table(
             ).plain
             assert "retry child row" in rendered
             assert "transcript unavailable" not in rendered
+            for tick in range(2):
+                retry = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                retry.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"retry child refresh {tick}")],
+                    )
+                )
+                retry.close()
+                previous_task = app._history_view_task
+                navigation.refresh(force=True)
+                assert app._history_view_task is not None
+                await await_or_fail(
+                    app._history_view_task,
+                    what=f"retry child refresh {tick}",
+                )
+                assert app._history_view_task is not previous_task, (
+                    f"retry child refresh {tick} was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child refresh 1" in rendered
         elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page
