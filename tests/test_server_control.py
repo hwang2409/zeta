@@ -50,7 +50,7 @@ from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
-from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.server.protocol import ErrorDescriptor, EventDescriptor, FrameCodec
 from zeta.server.server import _Client
 from zeta.skills import SkillCatalog
 
@@ -664,6 +664,7 @@ async def _assert_steer_is_read_while_response_write_waits(
     async def write_request(
         sent_id: int, sent_method: str, sent_params: dict[str, object]
     ) -> None:
+        # test-contract: transport hold a prior response without pending-response cleanup
         writer.write(
             (
                 json.dumps(
@@ -679,6 +680,7 @@ async def _assert_steer_is_read_while_response_write_waits(
         )
         await asyncio.wait_for(writer.drain(), 10)
 
+    # test-contract: seam force a response write to remain pending
     monkeypatch.setattr(_Client, "_write", hold_response)
     monkeypatch.setattr(server.runtime.loop, "steer", observe_steer)
     try:
@@ -693,8 +695,12 @@ async def _assert_steer_is_read_while_response_write_waits(
         )
     finally:
         release_response.set()
-        while (await read_frame(reader)).get("id") != request_id:
-            pass
+        response_ids: list[int] = []
+        while len(response_ids) < 2:
+            frame_id = (await read_frame(reader)).get("id")
+            if frame_id in {request_id, request_id + 1}:
+                response_ids.append(frame_id)
+        assert response_ids == [request_id, request_id + 1]
 
 
 @pytest.mark.asyncio
@@ -765,6 +771,74 @@ async def test_deny_response_write_does_not_block_steer_on_resumed_turn(
         )
     finally:
         backend.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_is_busy_while_notification_turn_finalizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    finalizing = asyncio.Event()
+    release_finalization = asyncio.Event()
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.runtime.session_id
+        assert session_id is not None
+
+        async def stream_notification(
+            _session_id: str,
+            _loop: AgentLoop,
+            publish: Any,
+            **_kwargs: object,
+        ) -> tuple[bool, None]:
+            await publish(StreamEvent(StreamEventType.TURN_START))
+            await publish(StreamEvent(StreamEventType.MESSAGE_START))
+            await publish(
+                StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE,
+                    content=TextContent("still visible"),
+                )
+            )
+            return True, None
+
+        finalize_turn = server.control.deliveries.finalize_turn
+
+        async def hold_finalization(*args: object, **kwargs: object) -> None:
+            finalizing.set()
+            await await_or_fail(
+                release_finalization.wait(), what="release notification finalization"
+            )
+            await finalize_turn(*args, **kwargs)
+
+        monkeypatch.setattr(
+            server.turn_contexts, "run_notification_turn", stream_notification
+        )
+        monkeypatch.setattr(
+            server.control.deliveries, "finalize_turn", hold_finalization
+        )
+        turn = asyncio.create_task(
+            server.control._run_notification_turn(
+                session_id, turn_id=uuid.uuid4().hex
+            )
+        )
+        # test-contract: seam install the notification task as serve's active turn
+        server.control._turn_task = turn
+        await await_or_fail(finalizing.wait(), what="notification turn finalizing")
+
+        response = (
+            await _request(reader, writer, 3, "send", {"text": "do not replace"})
+        )[-1]
+        assert response["error"]["code"] == ErrorDescriptor.OPERATION_BUSY.code
+    finally:
+        release_finalization.set()
         await close_serve(server, writer)
 
 

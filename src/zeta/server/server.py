@@ -445,6 +445,7 @@ class _Client:
         self._local_close = False
         self._controller_release: asyncio.Task[None] | None = None
         self._response_writes: set[asyncio.Task[bool]] = set()
+        self._response_tail: asyncio.Task[bool] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -465,7 +466,7 @@ class _Client:
                 try:
                     request = self.codec.parse_request(line)
                 except ProtocolError as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             exc.request_id, exc.descriptor, exc.message, exc.data
                         )
@@ -479,7 +480,7 @@ class _Client:
                         request_id, request["method"], request["params"]
                     )
                 except ProtocolError as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             exc.request_id
                             if exc.request_id is not None
@@ -493,11 +494,11 @@ class _Client:
                         self.connections.release(self)
                 except PROJECT_REQUEST_EXCEPTIONS as exc:
                     descriptor, message, data = project_request_error(exc)
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(request_id, descriptor, message, data)
                     )
                 except ProjectRegistryBusyError as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id,
                             ErrorDescriptor.PROJECT_REGISTRY_BUSY,
@@ -506,7 +507,7 @@ class _Client:
                         )
                     )
                 except TranscriptRepairRequiresUpgrade as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id,
                             ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
@@ -518,7 +519,7 @@ class _Client:
                         )
                     )
                 except TranscriptLoadError as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id,
                             ErrorDescriptor.CORRUPT_TRANSCRIPT,
@@ -527,25 +528,26 @@ class _Client:
                         )
                     )
                 except ConversationIntegrityError as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
                         )
                     )
                 except (SessionError, ValueError) as exc:
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
-                    await self._write(
+                    await self._write_response(
                         self.codec.error_response(
                             request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
                         )
                     )
                 else:
                     if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
+                        await self._wait_for_prior_responses()
                         baseline_builder = (
                             self.connections.child_runs.with_baseline
                             if request["method"] in {"session_history_and_subscribe", "child_run_events"}
@@ -556,11 +558,10 @@ class _Client:
                         )
                     else:
                         response = self.codec.response(request_id, result)
-                        if request["method"] in _TURN_ACCEPTING_METHODS:
-                            self._defer_response_write(response)
-                            written = False
-                        else:
-                            written = await self._write(response)
+                        written = await self._write_response(
+                            response,
+                            defer=request["method"] in _TURN_ACCEPTING_METHODS,
+                        )
                     if (
                         written
                         and request["method"] == "hello"
@@ -573,13 +574,35 @@ class _Client:
         finally:
             await self.close(graceful=graceful and not self._transport_failed)
 
+    async def _write_response(
+        self, response: _Frame, *, defer: bool = False
+    ) -> bool:
+        if defer or self._response_tail is not None:
+            self._defer_response_write(response)
+            return True
+        return await self._write(response)
+
     def _defer_response_write(self, response: _Frame) -> None:
-        task = asyncio.create_task(self._write(response))
+        previous = self._response_tail
+
+        async def write_in_order() -> bool:
+            if previous is not None:
+                await asyncio.gather(previous, return_exceptions=True)
+            return await self._write(response)
+
+        task = asyncio.create_task(write_in_order())
+        self._response_tail = task
         self._response_writes.add(task)
         task.add_done_callback(self._response_write_finished)
 
+    async def _wait_for_prior_responses(self) -> None:
+        if self._response_tail is not None:
+            await asyncio.gather(self._response_tail, return_exceptions=True)
+
     def _response_write_finished(self, task: asyncio.Task[bool]) -> None:
         self._response_writes.discard(task)
+        if self._response_tail is task:
+            self._response_tail = None
         if not task.cancelled() and (error := task.exception()) is not None:
             logger.error(
                 "serve response write failed",
