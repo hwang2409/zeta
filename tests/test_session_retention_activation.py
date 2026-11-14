@@ -191,6 +191,8 @@ async def test_two_owners_append_without_lost_rows(
         role = thread_roles[threading.get_ident()]
         if role == "a" and prepared[role].is_set():
             assert b_committed.wait(10), "owner b did not commit its prepared state"
+        if role == "b":
+            assert prepared["a"].wait(10), "owner a did not prepare its baseline state"
         with original_authority(*args, **kwargs):
             yield
         if role == "b" and prepared[role].is_set():
