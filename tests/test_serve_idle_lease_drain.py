@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import gc
 import multiprocessing
+import threading
 from pathlib import Path
 
 import pytest
@@ -75,16 +76,14 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     home = tmp_path / "home"
     session_id = _created_session(home, tmp_path)
     manager = SessionManager(home, owner_surface="serve")
-    release_done: asyncio.Event | None = None
-    loop: asyncio.AbstractEventLoop | None = None
+    release_done = threading.Event()
 
     def queue_release(close, *args):
         def wrapped_close(*wrapped_args):
             try:
                 close(*wrapped_args)
             finally:
-                if release_done is not None and loop is not None:
-                    loop.call_soon_threadsafe(release_done.set)
+                release_done.set()
 
         from zeta.storage_format import release_later as real_release_later
 
@@ -94,17 +93,16 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     opened = manager.open(session_id)
 
     async def wait_for_release() -> None:
-        assert release_done is not None
         await await_or_fail(
-            release_done.wait(), timeout=_DEADLINE_SECONDS, what="session lease release"
+            asyncio.to_thread(release_done.wait),
+            timeout=_DEADLINE_SECONDS,
+            what="session lease release",
         )
         release_done.clear()
 
     async def exercise() -> None:
-        nonlocal loop, opened, release_done
-        loop = asyncio.get_running_loop()
-        release_done = asyncio.Event()
-        probe = _DrainProbe(loop)
+        nonlocal opened
+        probe = _DrainProbe(asyncio.get_running_loop())
         monkeypatch.setattr(server_module, "drain_releases", probe, raising=False)
         server = ZetaServer(home=home, port=0, provider="codex")
         await server.start()
