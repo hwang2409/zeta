@@ -272,13 +272,25 @@ async def run_server(server: ZetaServer) -> None:
             loop.remove_signal_handler(signum)
 
 
-def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
+def _prepare_parent(path: Path, *, secure_parent: bool) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    info = os.fstat(parent_fd)
+    if secure_parent:
+        os.fchmod(parent_fd, 0o700)
+    elif info.st_uid != os.getuid() or info.st_mode & 0o022:
+        os.close(parent_fd)
+        raise ValueError(
+            "refusing unsafe WebSocket discovery parent; make a private "
+            "subdirectory instead of using /tmp"
+        )
+    return parent_fd
+
+
+def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
+    parent_fd = _prepare_parent(path, secure_parent=secure_parent)
     fd = -1
     try:
-        if secure_parent:
-            os.fchmod(parent_fd, 0o700)
         fd = os.open(
             path.name,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -331,8 +343,7 @@ def write_connection_file(
     observer_token: str,
     origins: tuple[str, ...],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_fd = _prepare_parent(path, secure_parent=secure_parent)
     temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
     payload = json.dumps(
         {
@@ -349,8 +360,6 @@ def write_connection_file(
     ).encode()
     fd = -1
     try:
-        if secure_parent:
-            os.fchmod(parent_fd, 0o700)
         fd = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -363,6 +372,14 @@ def write_connection_file(
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            existing = os.lstat(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+        ):
+            raise ValueError(f"refusing unsafe WebSocket discovery file: {path}")
         os.replace(temporary, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
