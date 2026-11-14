@@ -116,6 +116,24 @@ class Yielded:
 
 
 @dataclass(frozen=True)
+class RetentionGeneration:
+    days: int
+    arm: tuple[int, int, int, int, int] | None
+    history: tuple[int, int, int, int, int] | None
+    state: tuple[int, int, int, int, int] | None
+
+
+def _retention_generation(root: Path, days: int) -> RetentionGeneration:
+    def identity(name: str) -> tuple[int, int, int, int, int] | None:
+        try:
+            info = os.stat(root / name, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return RetentionGeneration(days, identity(_ARM_FILENAME), identity(_HISTORY_FILENAME), identity(_STATE_FILENAME))
+
+
+@dataclass(frozen=True)
 class PassResult:
     """The outcome of one bounded planner pass."""
 
@@ -125,6 +143,8 @@ class PassResult:
     reasons: tuple[RootOutcome, ...] = ()
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
+    expected_generation: RetentionGeneration | None = None
+    changed: bool = False
 
 
 class RetentionPlannerError(Exception):
@@ -228,12 +248,23 @@ def _coordinator_authority(root: Path):
 
 
 def append_retention_history(
-    token: CoordinatorToken, home: str | Path, lease: WriterLease, result: Mapping[str, object]
-) -> None:
+    token: CoordinatorToken, home: str | Path, lease: WriterLease, result: Mapping[str, object],
+    *, expected: RetentionGeneration | None = None,
+    current_days: Callable[[], int] | None = None,
+    before_append: Callable[[], bool] | None = None,
+    publish_if_stale: bool = False,
+) -> str:
     """Durably replace history; the token proves coordinator ownership."""
     token.require_active()
     if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
-        return
+        return "fresh"
+    if expected is not None:
+        if current_days is None:
+            raise TypeError("current_days is required with expected")
+        if _retention_generation(Path(home), current_days()) != expected and not publish_if_stale:
+            return "stale"
+    if before_append is not None and not before_append():
+        return "not_committed"
     validate_retention_history(result)
     path = Path(home) / _HISTORY_FILENAME
     rows: list[dict[str, object]] = []
@@ -263,6 +294,7 @@ def append_retention_history(
         finally:
             os.close(home_fd)
     publish()
+    return "fresh"
 
 
 def retention_arm_warning() -> str:
@@ -712,7 +744,8 @@ class RetentionPlanner:
                 deadline_ns=deadline_ns,
                 yield_check=yield_check or (lambda: planner_request_pending(self.home)),
             )
-        transaction_result = self._transaction_result(outcome)
+            expected_generation = _retention_generation(self.home, days)
+        transaction_result = self._transaction_result(outcome, expected_generation)
         if transaction_result is not None:
             return transaction_result
         if outcome.yielded:
@@ -752,6 +785,7 @@ class RetentionPlanner:
             enabled=True, complete=complete, reasons=tuple(reasons),
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
+            expected_generation=_retention_generation(self.home, days),
         )
 
     def commit_state(self, token: CoordinatorToken) -> bool:
@@ -771,7 +805,7 @@ class RetentionPlanner:
         finally:
             os.close(home_fd)
 
-    def _transaction_result(self, outcome: TransactionOutcome) -> PassResult | None:
+    def _transaction_result(self, outcome: TransactionOutcome, expected_generation: RetentionGeneration | None = None) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
             return None
         if outcome.completed:
@@ -787,6 +821,8 @@ class RetentionPlanner:
             mode="deleted" if outcome.completed else ("none" if outcome.blocked else None),
             reasons=reasons,
             preview=_preview_snapshot(self._latest),
+            expected_generation=expected_generation,
+            changed=outcome.changed,
         )
 
     @contextmanager

@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -94,6 +94,7 @@ class TransactionOutcome:
     session_id: str | None = None
     completed: bool = False
     yielded: bool = False
+    changed: bool = False
 
 
 class _ChargedScan:
@@ -176,6 +177,10 @@ class _QuarantineTransaction:
         self.worker_ns = worker_ns
         self.clock = clock
         self.project_ids: tuple[str, ...] = ()
+        self.changed = False
+
+    def _mark_changed(self) -> None:
+        self.changed = True
 
     def advance(
         self,
@@ -197,6 +202,7 @@ class _QuarantineTransaction:
         else:
             raise SessionError("retention transaction requested on an asyncio event-loop thread")
         token.require_active()
+        self.changed = False
         budget = _Budget(
             entries=self.entries,
             deadline_ns=deadline_ns,
@@ -207,15 +213,15 @@ class _QuarantineTransaction:
             with SessionReferenceGate(self.home, self.lease).exclusive():
                 recovered = self._recover_one(token, budget)
                 if recovered is not None:
-                    return recovered
+                    return replace(recovered, changed=recovered.changed or self.changed)
                 budget.charge()
-                return self._start_one(token, days, preview, verify)
+                return replace(self._start_one(token, days, preview, verify), changed=self.changed)
         except TransactionYield:
-            return TransactionOutcome(False, yielded=True)
+            return TransactionOutcome(False, yielded=True, changed=self.changed)
         except (
             OSError, ProjectRegistryError, StorageFormatError, TransactionError
         ) as exc:
-            return TransactionOutcome(False, _bounded(str(exc)))
+            return TransactionOutcome(False, _bounded(str(exc)), changed=self.changed)
 
     def prepare(self) -> None:
         self.project_ids = ()
@@ -341,6 +347,7 @@ class _QuarantineTransaction:
     def _finish_empty_transaction(
         self, token, reservations_fd, txns_fd, txn_fd, name, reservation
     ) -> TransactionOutcome:
+        self._mark_changed()
         completed = _remove_empty_transaction(
             token, txns_fd, txn_fd, reservation["transaction_id"]
         )
@@ -357,8 +364,10 @@ class _QuarantineTransaction:
         arm = self._read_arm()
         if arm is None or preview is None:
             return TransactionOutcome(False)
-        if preview.get("days") != days or not preview.get("root_ids"):
+        if preview.get("days") != days:
             return TransactionOutcome(False, "retention arm does not match current preview")
+        if not preview.get("root_ids"):
+            return TransactionOutcome(False)
         session_id = preview["root_ids"][0]
         with verify(session_id, days) as candidate:
             txid = uuid.uuid4().hex
@@ -374,6 +383,7 @@ class _QuarantineTransaction:
             validate_retention_reservation(reservation)
             with self._trash_directories(token, create=True) as (trash_fd, reservations_fd, txns_fd):
                 token.require_active()
+                self._mark_changed()
                 os.mkdir(txid, mode=0o700, dir_fd=txns_fd)
                 os.fsync(txns_fd)
                 txn_fd = os.open(
@@ -465,6 +475,7 @@ class _QuarantineTransaction:
         return state.registry
 
     def _cleanup_stage(self, stage: str, manifest: dict, budget: _Budget) -> None:
+        self._mark_changed()
         candidate_ids = (manifest["session_id"], *manifest["descendants"])
         budget.charge()
         registry = self._project_registry()
@@ -555,10 +566,12 @@ class _QuarantineTransaction:
 
     def _unlink_tree_entry(self, token: CoordinatorToken, directory_fd: int, name: str) -> None:
         token.require_active()
+        self._mark_changed()
         os.unlink(name, dir_fd=directory_fd)
 
     def _move_to_trash(self, token: CoordinatorToken, session_id: str, txn_fd: int, sessions_fd: int) -> None:
         token.require_active()
+        self._mark_changed()
         os.rename(session_id, _TREE_NAME, src_dir_fd=sessions_fd, dst_dir_fd=txn_fd)
 
     def _read_arm(self) -> dict | None:
@@ -570,10 +583,12 @@ class _QuarantineTransaction:
 
     def _delete(self, token: CoordinatorToken, directory_fd, name) -> None:
         token.require_active()
+        self._mark_changed()
         self.lease.delete(directory_fd, name)
 
     def _publish(self, token: CoordinatorToken, directory_fd, name, payload, validate) -> None:
         token.require_active()
+        self._mark_changed()
         validate(payload)
         self.lease.publish_json(
             directory_fd, name, mapping_mutations(payload),
@@ -583,6 +598,7 @@ class _QuarantineTransaction:
 
     def _publish_state(self, token: CoordinatorToken, state: dict) -> None:
         token.require_active()
+        self._mark_changed()
         validate_retention_state(state)
         home_fd = _open_home(self.home)
         try:

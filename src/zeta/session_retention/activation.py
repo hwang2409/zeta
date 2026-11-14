@@ -86,29 +86,28 @@ def make_retention_owner(
         nonlocal last_projection
         with _coordinator_authority(root) as token:
             history = read_retention_history(root)
-            if (
-                history
-                and history[-1].get("mode") == "armed"
-                and history[-1].get("days") == current_days
-                and result.mode is None
-            ):
-                planner.close()
-                projection = dict(history[-1])
-                last_projection = projection
-                return Published(projection, complete=True)
-            committed = planner.commit_state(token)
-            if not committed:
+            effectful = bool(getattr(result, "changed", False))
+            status = append_retention_history(
+                token, root, retained, projection,
+                expected=result.expected_generation,
+                current_days=days,
+                before_append=None if effectful else lambda: planner.commit_state(token),
+                publish_if_stale=effectful,
+            )
+            if status == "stale" or status == "not_committed":
                 planner.close()
                 history = read_retention_history(root)
-                if result.mode is None and history:
+                if history:
                     projection = dict(history[-1])
-                elif result.mode is not None and (
-                    not history or not _same_projection(history[-1], projection)
-                ):
+                else:
+                    projection = retention_result(
+                        timestamp=datetime.now(UTC).isoformat(),
+                        mode="disabled" if days == 0 else "preview", days=days,
+                    )
                     append_retention_history(token, root, retained, projection)
+                last_projection = projection
                 return Published(projection, complete=True)
-            if last_projection is None or not _same_projection(last_projection, projection):
-                append_retention_history(token, root, retained, projection)
+            if status == "fresh":
                 last_projection = projection
         return Published(
             projection, complete=result.complete,
