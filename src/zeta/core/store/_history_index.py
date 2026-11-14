@@ -1160,13 +1160,10 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
         try:
             with observer._append_lock(observer=True):
                 facts = observer._history_index_facts()
+                rows = observer._resident_rows
                 if not store._history_index.catch_up_validated(
-                    facts,
-                    observer._resident_rows.stream_rows(observer._resident_rows.rows),
-                ):
-                    observer._sync_history_index(
-                        observer._resident_rows.stream_rows(observer._resident_rows.rows)
-                    )
+                    facts, rows.stream_rows(rows.rows)):
+                    observer._sync_history_index(rows.stream_rows(rows.rows))
                 return facts
         finally:
             observer.close()
@@ -1174,12 +1171,10 @@ def _rebuild_history_index(store: ConversationStore) -> dict[str, object]:
     try:
         with writer._append_lock():
             facts = store._history_index_facts()
+            rows = store._resident_rows
             if not store._history_index.catch_up_validated(
-                facts, store._resident_rows.stream_rows(store._resident_rows.rows)
-            ):
-                store._sync_history_index(
-                    store._resident_rows.stream_rows(store._resident_rows.rows)
-                )
+                facts, rows.stream_rows(rows.rows)):
+                store._sync_history_index(rows.stream_rows(rows.rows))
             return facts
     finally:
         writer.close()
@@ -1294,8 +1289,7 @@ class HistoryPageStoreMixin:
         stat = os.stat(
             "conversation.jsonl", dir_fd=self.directory_fd, follow_symlinks=False
         )
-        last_ref = self._resident_rows.rows[-1] if self._resident_rows.rows else None
-        last = self.entry(last_ref) if last_ref is not None else None
+        last = self.entry(self._resident_rows.rows[-1]) if self._resident_rows.rows else None
         return {
             "cwd": self.cwd,
             "st_dev": stat.st_dev,
