@@ -41,7 +41,7 @@ def make_retention_owner(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
         history = read_retention_history(root)
-        if history and history[-1].get("mode") == "armed":
+        if history and history[-1].get("mode") == "armed" and result.mode is None:
             projection = dict(history[-1])
         append_retention_history(root, retained, projection)
         return _PublishedPass(projection, complete=result.complete)
