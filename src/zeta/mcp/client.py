@@ -203,17 +203,18 @@ def require_capability(
         raise MCPUnsupportedError(f"MCP server {server} does not provide {name}")
 
 
-def transport_degraded(error: BaseException) -> bool:
+def degrades_server(error: BaseException) -> bool:
     """Whether an MCP failure compromises the server, so its actor degrades.
 
-    One rule shared by the resource, prompt, tool-call, and refresh paths: a
-    JSON-RPC request error (`MCPRequestError`, including an unadvertised
-    capability) stays per-request and never degrades the server; a transport
-    failure, a malformed-protocol failure, or a timeout degrades it with a
-    typed reason.
+    One rule shared by the resource, prompt, and tool-refresh paths. A JSON-RPC
+    request error (`MCPRequestError`, including an unadvertised capability via
+    `MCPUnsupportedError`) and a cancellation (`MCPCanceled`) keep the server
+    mounted: the server is healthy, only this request did not complete.
+    Anything else -- a transport failure, a malformed-protocol reply, a
+    timeout, or an unexpected error -- degrades the server with a typed reason.
     """
 
-    return isinstance(error, (MCPTransportError, MCPProtocolError, TimeoutError))
+    return not isinstance(error, (MCPRequestError, MCPCanceled))
 
 
 def initialize_params() -> dict[str, object]:

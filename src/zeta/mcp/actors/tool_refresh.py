@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..client import MCPClient, MCPTool, error_text, notice, transport_degraded
+from ..client import MCPClient, MCPTool, degrades_server, error_text, notice
 from ..config import mcp_log_path
 
 if TYPE_CHECKING:
@@ -111,9 +111,9 @@ class ToolRefreshActor:
             tools = owner._filter_tools(message.task.result(), owner._notice_sink)
         except Exception as exc:  # noqa: BLE001 - classify refresh failure
             self._pending = False
-            # A transport or malformed-protocol failure degrades the server; a
-            # JSON-RPC request error stays local and keeps the published tools.
-            if transport_degraded(exc):
+            # A request error stays local and keeps the published tools; any
+            # other failure degrades the server with a typed reason.
+            if degrades_server(exc):
                 owner._degrade_current(error_text(exc))
             else:
                 notice(

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ...core.abort import AbortSignal
-from ..client import MCPClient, transport_degraded
+from ..client import MCPClient, degrades_server
 from .prompt import cancel_request, set_exception, set_result
 
 if TYPE_CHECKING:
@@ -163,11 +163,12 @@ def handle_resource_finished(actor: MCPServerActor, message: ResourceFinished) -
         and actor._status.state == "mounted"
     )
     if error is not None:
-        # Degrade only on failures that compromise the transport (timeout,
-        # transport failure, or malformed protocol state). Request-level errors
-        # such as "resource not found" or an unadvertised capability are
-        # returned while staying mounted. One shared rule across all paths.
-        degrades = transport_degraded(error)
+        # Degrade on any failure that compromises the server (timeout,
+        # transport failure, malformed protocol, or an unexpected error).
+        # A JSON-RPC request error such as "resource not found" or an
+        # unadvertised capability is returned while staying mounted. One shared
+        # rule across all paths.
+        degrades = degrades_server(error)
         if current and degrades:
             timed_out = isinstance(error, TimeoutError)
             actor._degrade_current(

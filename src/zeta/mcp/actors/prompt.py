@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
-from ..client import MCPClient, MCPPrompt, transport_degraded
+from ..client import MCPClient, MCPPrompt, degrades_server
 
 if TYPE_CHECKING:
     from ..server_actor import MCPServerActor
@@ -162,7 +162,7 @@ def handle_prompt_finished(
         and actor._status.state == "mounted"
     )
     if message.error is not None:
-        if current and transport_degraded(message.error):
+        if current and degrades_server(message.error):
             actor._degrade_current(_error_text(message.error))
         set_exception(request.result, message.error)
         return
