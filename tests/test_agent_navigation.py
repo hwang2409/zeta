@@ -143,6 +143,7 @@ def test_agent_metadata_cache_reads_only_changed_lifecycle(
             reads.append(path)
         return original(path)
 
+    # test-contract: seam counts lifecycle reads at the metadata json reader
     monkeypatch.setattr(agent_view_state, "_read_json", record)
     navigation.refresh(force=True)
     assert reads == []
@@ -276,6 +277,7 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
         return original_read(path)
 
     monkeypatch.setattr(agent_card.asyncio, "get_running_loop", Loop)
+    # test-contract: seam counts lifecycle reads at the metadata json reader
     monkeypatch.setattr(agent_view_state, "_read_json", record_read)
     navigation.bind_layout(None, None, lambda: invalidations.append(None))
     assert len(callbacks) == 1
@@ -2238,6 +2240,7 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
         raw_tail_sizes.append(len(raw_tail))
         return recover_oversized_message(raw_tail)
 
+    # test-contract: seam measures the raw tail handed to the oversized-row parser
     monkeypatch.setattr(agent_view_state, "_oversized_message", record_raw_tail)
     lines = read_agent_transcript(child.session_dir)
 

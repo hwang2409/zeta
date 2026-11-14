@@ -349,7 +349,7 @@ class AgentTranscriptControl(UIControl):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(self._transition(path, generation, refresh, cancelled))
+            asyncio.run(self._transition_without_loop(path, generation, refresh, cancelled))
             self._load_task = None
             return None
         task = loop.create_task(
@@ -370,6 +370,14 @@ class AgentTranscriptControl(UIControl):
         if not self._park_active_view():
             return None
         return self._start_transition(path, refresh=False)
+
+    async def _transition_without_loop(self, *args: Any) -> None:
+        # The commit starts follow-up work (the todo refresh) on this private
+        # loop; finish it here, or asyncio.run cancels it with its store open.
+        await self._transition(*args)
+        current = asyncio.current_task()
+        while pending := asyncio.all_tasks() - {current}:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     @staticmethod
     def _restore_anchor(transcript: Any, anchor: tuple[str, int, int]) -> None:
