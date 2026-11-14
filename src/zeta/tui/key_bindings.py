@@ -278,7 +278,7 @@ class FullScreenPromptSession(PromptSession[str]):
             try:
                 os.write(
                     stdout.fileno(),
-                    MOUSE_OFF + b"\x1b[?1049l\x1b[0 q\x1b[?25h",
+                    MOUSE_OFF + b"\x1b[0 q\x1b[?1049l\x1b[?25h",
                 )
             except OSError:
                 pass

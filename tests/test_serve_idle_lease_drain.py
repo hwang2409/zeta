@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import gc
 import multiprocessing
+import threading
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from tests.test_session_execution_owner import (
     _try_open,
 )
 from zeta.core.session import SessionManager
+from zeta.core.store import _store as store_module
 from zeta.server import server as server_module
 from zeta.server.server import ZetaServer
 from zeta.storage_format import drain_releases, release_later
@@ -73,7 +75,25 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
     home = tmp_path / "home"
     session_id = _created_session(home, tmp_path)
     manager = SessionManager(home, owner_surface="serve")
+    release_done = threading.Event()
+
+    def queue_release(close, *args):
+        def wrapped_close(*wrapped_args):
+            try:
+                close(*wrapped_args)
+            finally:
+                release_done.set()
+
+        from zeta.storage_format import release_later as real_release_later
+
+        real_release_later(wrapped_close, *args)
+
+    monkeypatch.setattr(store_module, "release_later", queue_release)
     opened = manager.open(session_id)
+
+    async def wait_for_release() -> None:
+        await asyncio.wait_for(asyncio.to_thread(release_done.wait), _DEADLINE_SECONDS)
+        release_done.clear()
 
     async def exercise() -> None:
         nonlocal opened
@@ -105,6 +125,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
                     result_send.close()
 
             await probe.drains(1)
+            await wait_for_release()
             result = process_open()
             assert result[0] == "opened", result
 
@@ -120,6 +141,7 @@ def test_idle_serve_releases_gc_dropped_session_to_another_process(
             probe.fail_next = True
             gc.collect()
             await probe.drains(2)
+            await wait_for_release()
             result = process_open()
             assert result[0] == "opened", result
             assert "draining released leases failed" in caplog.text
