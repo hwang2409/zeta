@@ -46,6 +46,7 @@ class DeliveryRequests:
 
     def __init__(self, control: ServeControl) -> None:
         self._control = control
+        self._steer_turn_guard = asyncio.Lock()
 
     async def send(
         self, params: dict[str, Any], features: frozenset[str]
@@ -234,8 +235,6 @@ class DeliveryRequests:
         if duplicate is not None:
             return duplicate
         control._reject_if_unhealthy()
-        if not control.turn_busy():
-            raise ProtocolError(ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running")
         text = validation.required_string(params, "text")
         message = with_message_origin(
             Message(MessageRole.USER, [TextContent(text)]), MessageOrigin.USER
@@ -244,24 +243,30 @@ class DeliveryRequests:
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
         canceled_after_commit = False
-        try:
-            await runtime.opened.store.append_client_delivery_async(
-                delivery_id,
-                "steer",
-                "queued",
-                outcome,
-                accepted_message=message,
-            )
-        except asyncio.CancelledError:
-            if runtime.opened.store.client_delivery(delivery_id) is None:
-                raise
-            canceled_after_commit = True
+        async with self._steer_turn_guard:
+            if not control.turn_busy():
+                raise ProtocolError(
+                    ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running"
+                )
+            try:
+                await runtime.opened.store.append_client_delivery_async(
+                    delivery_id,
+                    "steer",
+                    "queued",
+                    outcome,
+                    accepted_message=message,
+                )
+            except asyncio.CancelledError:
+                if runtime.opened.store.client_delivery(delivery_id) is None:
+                    raise
+                canceled_after_commit = True
+            loop.steer(tagged)
 
         await _deliver_after_commit(
             lambda: control.user_message(
                 text, "steer", features, delivery_id=requested_delivery_id
             ),
-            lambda: loop.steer(tagged),
+            lambda: None,
             canceled=canceled_after_commit,
         )
         return outcome
@@ -313,7 +318,8 @@ class DeliveryRequests:
             TurnOutcome.DISCONNECTED: "disconnect",
         }.get(outcome)
         if reason is not None:
-            dropped = await state.opened.store.drop_client_steering_async(reason)
+            async with self._steer_turn_guard:
+                dropped = await state.opened.store.drop_client_steering_async(reason)
             connections = control.server.connections
             if connections is not None:
                 for entry, accepted_message in dropped:
