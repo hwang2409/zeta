@@ -125,6 +125,8 @@ class ContextCalibration:
                 "prompt_tokens",
                 "cache_read_input_tokens",
                 "cache_creation_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
             )
             if type(value := usage.get(key)) is int and value >= 0
         }

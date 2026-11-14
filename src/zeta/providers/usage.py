@@ -19,6 +19,14 @@ def normalize_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
         if type(completion_tokens) is int:
             normalized["output_tokens"] = completion_tokens
 
+    for details_key in ("output_tokens_details", "completion_tokens_details"):
+        details = normalized.get(details_key)
+        if not isinstance(details, Mapping):
+            continue
+        reasoning_tokens = details.get("reasoning_tokens")
+        if type(reasoning_tokens) is int and reasoning_tokens >= 0:
+            normalized.setdefault("reasoning_output_tokens", reasoning_tokens)
+
     details = normalized.get("input_tokens_details")
     if not isinstance(details, Mapping):
         details = normalized.get("prompt_tokens_details")
