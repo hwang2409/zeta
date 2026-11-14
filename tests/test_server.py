@@ -2535,12 +2535,39 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
     register_attempted = asyncio.Event()
     original_register = owner.register
     deferred_registration: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    grandchild_watchers: list[asyncio.Task[object]] = []
+    closed_grandchild_loops: list[AgentLoop] = []
+    grandchild_close_started = [asyncio.Event(), asyncio.Event()]
+    release_grandchild_close = [asyncio.Event(), asyncio.Event()]
+    grandchild_close_calls = 0
+    original_loop_close = AgentLoop.close
+
+    async def record_grandchild_close(
+        agent_loop: AgentLoop, **kwargs: object
+    ) -> tuple[str, ...]:
+        nonlocal grandchild_close_calls
+        if agent_loop.agent_depth == 2 and grandchild_close_calls < 2:
+            if agent_loop not in closed_grandchild_loops:
+                closed_grandchild_loops.append(agent_loop)
+            call_index = grandchild_close_calls
+            grandchild_close_calls += 1
+            grandchild_close_started[call_index].set()
+            await await_or_fail(
+                release_grandchild_close[call_index].wait(),
+                timeout=TIMEOUT,
+                what=f"release grandchild close {call_index + 1}",
+            )
+        return await original_loop_close(agent_loop, **kwargs)
+
+    monkeypatch.setattr(AgentLoop, "close", record_grandchild_close)
 
     def defer_grandchild_registration(
         *args: object, **kwargs: object
     ) -> None:
         if kwargs.get("parent_instance_id") is not None:
             deferred_registration.append((args, kwargs))
+            assert isinstance(args[2], asyncio.Task)
+            grandchild_watchers.append(args[2])
             register_attempted.set()
             return
         original_register(*args, **kwargs)
@@ -2634,7 +2661,30 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
             for item in status["pending_approvals"]
         )
         assert len(backend.grandchild.calls) == 1
+        assert len(grandchild_watchers) == 1
+        grandchild_watcher = grandchild_watchers[0]
+        for call_index in range(2):
+            await await_or_fail(
+                grandchild_close_started[call_index].wait(),
+                timeout=TIMEOUT,
+                what=f"grandchild close {call_index + 1} start",
+            )
+            grandchild_watcher.cancel()
+            release_grandchild_close[call_index].set()
+        await await_or_fail(
+            asyncio.gather(grandchild_watcher, return_exceptions=True),
+            timeout=TIMEOUT,
+            what="grandchild watcher cleanup",
+        )
+        assert grandchild_watcher.done()
+        assert len(closed_grandchild_loops) == 1
+        grandchild_loop = closed_grandchild_loops[0]
+        assert grandchild_loop._closed
+        assert grandchild_loop.tool_registry._closed
+        assert grandchild_loop.tool_registry.background_tasks._closed
     finally:
+        for release_close in release_grandchild_close:
+            release_close.set()
         if child_watcher is not None and not child_watcher.done():
             child_watcher.cancel()
             await await_or_fail(

@@ -8699,7 +8699,81 @@ async def test_grandchild_approval_composes_with_parent_policy(
         if message.tool_result is not None
     )
     assert expected in bash_result.content
+    grandchild_store.close()
     await loop.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_depth", "abort_descendant", "expected_backend_calls"),
+    [(1, True, 1), (1, False, 2), (0, True, 2)],
+)
+async def test_aborted_descendant_stops_after_cancelled_tool_result(
+    tmp_path: Path,
+    agent_depth: int,
+    abort_descendant: bool,
+    expected_backend_calls: int,
+) -> None:
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("cancelled", "cancelled", {})]),
+            ScriptedTurn([TextContent("recovered")]),
+        ]
+    )
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    result_ready = asyncio.Event()
+    release_result = asyncio.Event()
+
+    async def cancelled_tool(*_args, **_kwargs) -> ToolResult:
+        if abort_descendant:
+            registry.abort()
+        result_ready.set()
+        await await_or_fail(release_result.wait(), what="cancelled tool result release")
+        return ToolResult(
+            "cancelled", "tool execution canceled", True, is_canceled=True
+        )
+
+    registry.register(
+        "cancelled",
+        cancelled_tool,
+        description="return a tool-local cancelled result",
+        requires_approval=False,
+    )
+    loop = AgentLoop(
+        backend,
+        store,
+        registry=registry,
+        max_turns=2,
+        agent_depth=agent_depth,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    task = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await await_or_fail(result_ready.wait(), what="cancelled tool result ready")
+        assert registry.abort_signal.aborted is abort_descendant
+        release_result.set()
+        await await_or_fail(task, what="cancelled tool turn")
+        assert len(backend.calls) == expected_backend_calls
+        if abort_descendant and agent_depth > 0:
+            assert [message.role for message in branch_messages(store)] == [
+                MessageRole.USER,
+                MessageRole.ASSISTANT,
+                MessageRole.TOOL_RESULT,
+            ]
+    finally:
+        release_result.set()
+        if not task.done():
+            task.cancel()
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True),
+            what="cancelled tool task cleanup",
+        )
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

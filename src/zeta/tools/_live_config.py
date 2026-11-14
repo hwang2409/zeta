@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -56,7 +57,11 @@ class _LiveConfigRegistryMixin:
             )
 
     def approval_execution_error(
-        self, tool_call: Any, *, prepared: bool
+        self,
+        tool_call: Any,
+        *,
+        prepared: bool,
+        owner: asyncio.Task[object] | None = None,
     ) -> tuple[str, str] | None:
         if self._session_store is None:
             return None
@@ -65,6 +70,7 @@ class _LiveConfigRegistryMixin:
             tool_call.id,
             self.approval_definition_identity(tool_call.name),
             prepared=prepared,
+            owner=owner,
         )
         if claim == "changed":
             return (

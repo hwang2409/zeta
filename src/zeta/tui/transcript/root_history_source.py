@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -207,18 +207,20 @@ class RootTUIHistorySource:
             lambda: self._entry_page_sync(entry_id)
         )
 
-    def _prompt_page_sync(
-        self,
-        cursor: HistoryCursor | None,
-        direction: Literal["older", "newer"],
-    ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]:
-        refs = self._store.branch_refs()
-        users = [
-            ref for ref in refs
+    def _prompt_refs_sync(self) -> list[Any]:
+        return [
+            ref for ref in self._store.branch_refs()
             if ref.type == "message"
             and isinstance(ref.facts, MessageFacts)
             and ref.facts.is_user
         ]
+
+    def _prompt_page_from_refs(
+        self,
+        users: list[Any],
+        cursor: HistoryCursor | None,
+        direction: Literal["older", "newer"],
+    ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]:
         boundary = len(users) if cursor is None else int(cursor.value)
         if direction == "older":
             start = max(0, boundary - self.prompt_limit)
@@ -254,6 +256,15 @@ class RootTUIHistorySource:
             HistoryCursor(str(consumed)) if consumed < len(users) else None,
         )
 
+    def _prompt_page_sync(
+        self,
+        cursor: HistoryCursor | None,
+        direction: Literal["older", "newer"],
+    ) -> tuple[tuple[tuple[str, str], ...], HistoryCursor | None, HistoryCursor | None]:
+        return self._prompt_page_from_refs(
+            self._prompt_refs_sync(), cursor, direction
+        )
+
     async def prompt_page(
         self,
         cursor: HistoryCursor | None = None,
@@ -263,6 +274,23 @@ class RootTUIHistorySource:
         return await self._store._to_thread_store(
             lambda: self._prompt_page_sync(cursor, direction)
         )
+
+    async def prompt_pages(
+        self,
+    ) -> AsyncIterator[tuple[tuple[str, str], ...]]:
+        users = await self._store._to_thread_store(self._prompt_refs_sync)
+        cursor: HistoryCursor | None = None
+        while True:
+            rows, older, _newer = await self._store._to_thread_store(
+                lambda cursor=cursor: self._prompt_page_from_refs(
+                    users, cursor, "older"
+                )
+            )
+            if rows:
+                yield rows
+            if older is None:
+                return
+            cursor = older
 
     def _visible_users(self) -> list[Any]:
         return [

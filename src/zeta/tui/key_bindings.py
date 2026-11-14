@@ -330,6 +330,8 @@ def build_key_bindings(
     on_finder_open: Callable[[], None] | None = None,
     on_history_previous: Callable[[Buffer], None],
     on_history_next: Callable[[Buffer], None],
+    history_navigation_active: Callable[[], bool] | None = None,
+    on_history_detach: Callable[[], None] | None = None,
     on_history_finder_open: Callable[[Buffer], None] | None = None,
     finder_active: Callable[[], bool] | None = None,
     history_finder_active: Callable[[], bool] | None = None,
@@ -388,20 +390,17 @@ def build_key_bindings(
     bindings = KeyBindings()
     escape_chord_pending = False
     escape_chord_cursor_position: int | None = None
-    history_navigation_active = False
     history_navigation_buffer: Buffer | None = None
-    suppress_history_detach = False
 
     def track_history_buffer(buffer: Buffer) -> None:
-        nonlocal history_navigation_active, history_navigation_buffer
+        nonlocal history_navigation_buffer
         if history_navigation_buffer is buffer:
             return
         history_navigation_buffer = buffer
 
         def detach_history_navigation(_buffer: Buffer) -> None:
-            nonlocal history_navigation_active
-            if not suppress_history_detach:
-                history_navigation_active = False
+            if on_history_detach is not None:
+                on_history_detach()
 
         buffer.on_text_changed += detach_history_navigation
 
@@ -934,33 +933,27 @@ def build_key_bindings(
 
     @bindings.add("up", filter=history_navigation_filter & ~panel_mode)
     def history_up(event: KeyPressEvent) -> None:
-        nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
-        if not history_navigation_active and buffer.text:
+        navigating = (
+            history_navigation_active is not None and history_navigation_active()
+        )
+        if not navigating and buffer.text:
             if buffer.document.cursor_position_row > 0:
                 buffer.auto_up()
             return
-        suppress_history_detach = True
-        try:
-            on_history_previous(buffer)
-        finally:
-            suppress_history_detach = False
-        history_navigation_active = buffer.text != ""
+        on_history_previous(buffer)
 
     @bindings.add("down", filter=history_navigation_filter & ~panel_mode)
     def history_down(event: KeyPressEvent) -> None:
-        nonlocal history_navigation_active, suppress_history_detach
         buffer = event.current_buffer
-        if not history_navigation_active:
+        navigating = (
+            history_navigation_active is not None and history_navigation_active()
+        )
+        if not navigating:
             if buffer.document.cursor_position_row < buffer.document.line_count - 1:
                 buffer.auto_down()
             return
-        suppress_history_detach = True
-        try:
-            on_history_next(buffer)
-        finally:
-            suppress_history_detach = False
-        history_navigation_active = buffer.text != ""
+        on_history_next(buffer)
 
     @bindings.add(Keys.SIGINT, filter=~panel_mode)
     @bindings.add(*resolved_keys["interrupt"], filter=~panel_mode)

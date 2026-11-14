@@ -7,6 +7,7 @@ import heapq
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
 from .transcript.fuzzy import match_query, parse_query
@@ -30,6 +31,19 @@ class SessionPromptHistory:
         self._load: asyncio.Task[None] | None = None
         self._finder_scan: asyncio.Task[None] | None = None
         self._generation = 0
+        self._navigation_revision = 0
+        self._applying_document = False
+
+    @property
+    def navigating(self) -> bool:
+        return self._index is not None
+
+    @property
+    def navigation_revision(self) -> int:
+        return self._navigation_revision
+
+    def navigation_is_current(self, revision: int) -> bool:
+        return revision == self._navigation_revision
 
     @property
     def pages(self) -> tuple[tuple[tuple[str, str], ...], ...]:
@@ -67,12 +81,17 @@ class SessionPromptHistory:
         generation = self._generation
 
         async def read() -> None:
-            rows, older, newer = await self.source.prompt_page(
-                self._older, direction="older"
-            )
-            if generation != self._generation:
-                return
-            self._older, self._newer = older, newer
+            cursor = self._older
+            while True:
+                rows, older, newer = await self.source.prompt_page(
+                    cursor, direction="older"
+                )
+                if generation != self._generation:
+                    return
+                self._older, self._newer = older, newer
+                if rows or older is None:
+                    break
+                cursor = older
             if rows:
                 self._entries.insert(0, rows)
                 del self._entries[self.max_pages:]
@@ -179,7 +198,19 @@ class SessionPromptHistory:
         self.reset_navigation()
         return draft
 
+    def apply(self, buffer: Buffer, document: Document) -> None:
+        self._applying_document = True
+        try:
+            buffer.set_document(document, bypass_readonly=True)
+        finally:
+            self._applying_document = False
+
+    def detach(self) -> None:
+        if not self._applying_document:
+            self.reset_navigation()
+
     def reset_navigation(self) -> None:
+        self._navigation_revision += 1
         self._index = None
         self._draft = None
 
@@ -214,12 +245,11 @@ class SessionPromptHistory:
                 publish(values[-limit:])
             return
         parsed = parse_query(query)
-        cursor: HistoryCursor | None = None
         ranked: list[tuple[int, int, str]] = []
         retained_values: set[str] = set()
         newest_ordinal = 0
-        while True:
-            rows, older, _newer = await source.prompt_page(cursor, direction="older")
+        published = False
+        async for rows in source.prompt_pages():
             if generation != self._generation:
                 return
 
@@ -258,19 +288,17 @@ class SessionPromptHistory:
                     removed = heapq.heapreplace(ranked, candidate)
                     retained_values.remove(removed[2])
                     retained_values.add(candidate[2])
-            if older is None:
-                break
-            cursor = older
-        if generation != self._generation:
-            return
-        publish(
-            tuple(
-                value
-                for _score, _recency, value in sorted(
-                    ranked, key=lambda item: item[1]
+            publish(
+                tuple(
+                    value
+                    for _score, _recency, value in sorted(
+                        ranked, key=lambda item: item[1]
+                    )
                 )
             )
-        )
+            published = True
+        if not published and generation == self._generation:
+            publish(())
 
     async def close(self) -> None:
         self.clear()
@@ -286,7 +314,6 @@ class SessionPromptHistory:
         self._finder_scan = None
         self._entries.clear()
         self._older = self._newer = None
-        self._index = None
-        self._draft = None
+        self.reset_navigation()
         self._session = None
         self._branch_id = None

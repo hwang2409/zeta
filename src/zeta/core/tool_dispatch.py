@@ -37,6 +37,7 @@ class _ToolRegistry(Protocol):
         _stream_sink: Callable[[StreamEvent], None],
         _lifecycle_sink: Callable[..., None],
         _host_environment: Mapping[str, str] | None = None,
+        _pending_execution_owner: asyncio.Task[object] | None = None,
     ) -> Coroutine[Any, Any, StructuredToolResult]: ...
 
 
@@ -88,6 +89,7 @@ async def dispatch_tool_calls(
     """Execute one tool batch and yield its lifecycle and result events."""
 
     completed_tool_indexes: set[int] = set()
+    execution_owner = asyncio.current_task()
     # Advisory output is capped below; lifecycle events must never be dropped.
     stream_updates: asyncio.Queue[StreamEvent] = asyncio.Queue()
 
@@ -178,6 +180,7 @@ async def dispatch_tool_calls(
                             abort_signal=abort_signal,
                             _scope_signal=abort_signal,
                             _host_environment=host_environment,
+                            _pending_execution_owner=execution_owner,
                             _stream_sink=enqueue_tool_update,
                             _lifecycle_sink=(
                                 lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
@@ -245,6 +248,7 @@ async def dispatch_tool_calls(
                     abort_signal=abort_signal,
                     _scope_signal=abort_signal,
                     _host_environment=host_environment,
+                    _pending_execution_owner=execution_owner,
                     _stream_sink=enqueue_tool_update,
                     _lifecycle_sink=(
                         lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(

@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -8227,6 +8227,59 @@ def test_completed_message_replaces_streaming_unit_once(
     assert "completed" in "\n".join(app._transcript.lines(80))
 
 
+@pytest.mark.parametrize(
+    ("source", "sentinel"),
+    [
+        ("- item\n\n  > blockquote-sentinel", "blockquote-sentinel"),
+        ("- item\n\n  ```text\n  fenced-sentinel\n  ```", "fenced-sentinel"),
+        (
+            "- item\n\n  | name |\n  | --- |\n  | table-sentinel |",
+            "table-sentinel",
+        ),
+        ("- item\n\n  # heading-sentinel", "heading-sentinel"),
+        ("- item\n  - nested-list-sentinel", "nested-list-sentinel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_assistant_preserves_blocks_nested_in_list_items(
+    tmp_path: Path, source: str, sentinel: str
+) -> None:
+    app = TUIApp(
+        AgentLoop(
+            GateBackend(),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        app._consume_text(
+            StreamEvent(
+                StreamEventType.MESSAGE_UPDATE,
+                content=TextContent(source),
+            )
+        )
+        streaming = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert sentinel in streaming
+
+        app._finish_message(
+            StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(source)]),
+            )
+        )
+
+        completed = "\n".join(
+            Text.from_ansi(line).plain for line in app._transcript.lines(80)
+        )
+        assert sentinel in completed
+
+
 def test_mixed_assistant_tool_transcript_commits_each_text_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16099,6 +16152,231 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         assert len(app._prompt_history.pages) <= 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "journey", ("up", "down", "edit", "in-flight", "in-flight-edit")
+)
+async def test_cold_prompt_history_keys_follow_owned_navigation(
+    tmp_path: Path,
+    journey: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / journey / "sessions")
+    prompts = ("oldest prompt", "middle prompt", "newest\nprompt")
+    for prompt in prompts:
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(prompt)]),
+                MessageOrigin.USER,
+            )
+        )
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent("agent notice")]),
+                MessageOrigin.AGENT_SEND,
+            )
+        )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    if journey in {"in-flight", "in-flight-edit"}:
+        prompt_page = app._history_source.prompt_page
+
+        async def gated_prompt_page(*args: object, **kwargs: object):
+            started.set()
+            await await_or_fail(release.wait(), what="prompt history page release")
+            return await prompt_page(*args, **kwargs)
+
+        monkeypatch.setattr(app._history_source, "prompt_page", gated_prompt_page)
+
+    with create_pipe_input() as pipe:
+        session = app._make_session()
+        session.app.input = pipe
+        session.app.output = DummyOutput()
+        app._active_session = session
+        changes: list[str] = []
+        session.default_buffer.on_text_changed += lambda buffer: changes.append(buffer.text)
+        processed_keys = 0
+
+        def key_processed(_event: object) -> None:
+            nonlocal processed_keys
+            processed_keys += 1
+
+        session.app.key_processor.after_key_press += key_processed
+
+        async with owned_app(app) as owner:
+            prompt_task = owner.task(asyncio.create_task(session.prompt_async()))
+            await wait_until(lambda: session.app.is_running)
+
+            if journey in {"up", "down"}:
+                for index, expected in enumerate(reversed(prompts)):
+                    before = processed_keys
+                    pipe.send_text("\x1b[A")
+                    if index == 0:
+                        await wait_until(
+                            lambda expected=expected: session.default_buffer.text == expected
+                        )
+                    else:
+                        await wait_until(
+                            lambda before=before: processed_keys > before
+                        )
+                    assert session.default_buffer.text == expected, (
+                        f"Up did not select prompt {expected!r}"
+                    )
+                if journey == "down":
+                    for expected in (*prompts[1:], ""):
+                        before = processed_keys
+                        pipe.send_text("\x1b[B")
+                        await wait_until(
+                            lambda before=before: processed_keys > before
+                        )
+                        assert session.default_buffer.text == expected, (
+                            f"Down did not select prompt {expected!r}"
+                        )
+            elif journey == "edit":
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: session.default_buffer.text == prompts[-1])
+                pipe.send_text("x")
+                edited = f"{prompts[-1]}x"
+                await wait_until(lambda: session.default_buffer.text == edited)
+                before = processed_keys
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: processed_keys > before)
+                assert session.default_buffer.document.cursor_position_row == 0
+                assert session.default_buffer.text == edited
+            elif journey == "in-flight":
+                pipe.send_text("\x1b[A")
+                await await_or_fail(started.wait(), what="cold prompt history load")
+                pipe.send_text("\x1b[A")
+                await wait_until(lambda: processed_keys >= 2)
+                release.set()
+                await wait_until(lambda: session.default_buffer.text == prompts[-2])
+                assert changes[-2:] == [prompts[-1], prompts[-2]]
+            else:
+                history_tasks: list[asyncio.Task[None]] = []
+                create_task = asyncio.create_task
+
+                def track_history_task(
+                    coro: Coroutine[object, object, None],
+                ) -> asyncio.Task[None]:
+                    task = create_task(coro)
+                    if coro.cr_code.co_qualname.endswith(
+                        "TUIApp._history_previous.<locals>.load"
+                    ):
+                        history_tasks.append(task)
+                    return task
+
+                monkeypatch.setattr(asyncio, "create_task", track_history_task)
+                pipe.send_text("\x1b[A")
+                await await_or_fail(started.wait(), what="cold prompt history load")
+                pipe.send_text("typed draft")
+                await wait_until(lambda: session.default_buffer.text == "typed draft")
+                release.set()
+                await wait_until(lambda: bool(history_tasks))
+                await await_or_fail(history_tasks[0], what="cold prompt history navigation")
+                assert session.default_buffer.text == "typed draft"
+
+            session.app.exit()
+            await await_or_fail(prompt_task, what="prompt key journey")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("journey", ("up", "finder"))
+async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
+    tmp_path: Path,
+    journey: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    prompts = ("old nightly wipe request", "middle prompt", "newest prompt")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent(prompts[0])]),
+            MessageOrigin.USER,
+        )
+    )
+    for prompt in prompts[1:]:
+        for index in range(256):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"child notice {index}")]),
+                    MessageOrigin.AGENT_SEND,
+                )
+            )
+        store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(prompt)]),
+                MessageOrigin.USER,
+            )
+        )
+    if journey == "finder":
+        for index in range(300):
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent(f"recent prompt {index}")]),
+                    MessageOrigin.USER,
+                )
+            )
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+
+    async with owned_app(app):
+        if journey == "up":
+            buffer = Buffer()
+            for expected in reversed(prompts):
+                app._history_previous(buffer)
+                await wait_until(lambda expected=expected: buffer.text == expected)
+            assert buffer.text == prompts[0]
+        else:
+            branch_ref_reads = 0
+            original_branch_refs = store.branch_refs
+
+            def counted_branch_refs():
+                nonlocal branch_ref_reads
+                branch_ref_reads += 1
+                return original_branch_refs()
+
+            monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
+            buffer = Buffer()
+            app._history_finder_open(buffer)
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task,
+                what="initial empty ctrl+r prompt scan",
+            )
+            app._finder_input("nightly wipe")
+            assert app._prompt_history.finder_task is not None
+            await await_or_fail(
+                app._prompt_history.finder_task,
+                what="typed ctrl+r prompt scan",
+            )
+            if app._finder_prepare_task is not None:
+                await await_or_fail(
+                    app._finder_prepare_task,
+                    what="ctrl+r candidate preparation",
+                )
+            await wait_until(
+                lambda: (
+                    (state := app._history_finder.finder_state()) is not None
+                    and state.complete
+                    and any("nightly wipe" in row.excerpt for row in state.rows)
+                )
+            )
+            assert branch_ref_reads == 2, "ctrl+r rebuilt a prompt list within a scan"
+
+
 def test_agent_transcript_source_keeps_snapshot_during_active_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16694,23 +16972,23 @@ async def test_root_tui_paging_render_path_table(
                     "switched to branch"
                 )
 
-            original_prompt_page = app._history_source.prompt_page
+            original_prompt_pages = app._history_source.prompt_pages
             started = asyncio.Event()
             release = asyncio.Event()
 
-            async def delayed_prompt_page(cursor=None, *, direction="older"):
-                page = await original_prompt_page(cursor, direction=direction)
-                started.set()
-                await asyncio.wait_for(release.wait(), 10)
-                return page
+            async def delayed_prompt_pages():
+                async for page in original_prompt_pages():
+                    started.set()
+                    await asyncio.wait_for(release.wait(), 10)
+                    yield page
 
-            monkeypatch.setattr(app._history_source, "prompt_page", delayed_prompt_page)
+            monkeypatch.setattr(app._history_source, "prompt_pages", delayed_prompt_pages)
             published: list[tuple[str, ...]] = []
             original_set_snapshot = app._history_finder.set_snapshot
 
-            def record_snapshot(snapshot: tuple[str, ...]) -> None:
+            def record_snapshot(snapshot: tuple[str, ...]) -> object | None:
                 published.append(snapshot)
-                original_set_snapshot(snapshot)
+                return original_set_snapshot(snapshot)
 
             monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
             app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
@@ -16748,7 +17026,7 @@ async def test_root_tui_paging_render_path_table(
                 pass
             assert all("branch-a-prompt" not in snapshot for snapshot in published)
 
-            monkeypatch.setattr(app._history_source, "prompt_page", original_prompt_page)
+            monkeypatch.setattr(app._history_source, "prompt_pages", original_prompt_pages)
             published.clear()
             finder_buffer = Buffer(document=Document("branch-b-prompt"))
             app._history_finder_open(finder_buffer)
