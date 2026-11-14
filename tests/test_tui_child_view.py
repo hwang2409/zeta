@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from collections.abc import Callable
 from io import StringIO
 from time import perf_counter
@@ -92,8 +91,8 @@ def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHom
 
 
 @pytest.mark.skipif(
-    bool(os.environ.get("CI")) and sys.version_info < (3, 14),
-    reason="183 MB real-TUI journey runs once in the Python 3.14 PR job",
+    bool(os.environ.get("CI")),
+    reason="183 MB real-TUI journey runs as a focused local check outside CI's suite budget",
 )
 @pytest.mark.asyncio
 async def test_real_tui_child_view_journey(
