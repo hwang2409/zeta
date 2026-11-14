@@ -965,10 +965,35 @@ async def test_serve_retention_stays_dormant_until_requested_session(
     try:
         reader, writer = await _connect(server)
         assert server._retention_owner is not None
-        await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
-        assert (tmp_path / "retention-arm.json").is_file()
-        assert (tmp_path / "retention-state.json").is_file()
+        frames = await _request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.1", "features": ["session_retention"]},
+        )
+        assert not any(
+            frame.get("params", {}).get("event") == "session_retention"
+            for frame in frames
+        )
+    finally:
+        if writer is not None:
+            await close_serve(server, writer)
+        else:
+            await server.close()
+
+    assert (tmp_path / "retention-arm.json").is_file()
+    assert (tmp_path / "retention-state.json").is_file()
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader = writer = None
+    try:
+        reader, writer = await _connect(server)
+        await _request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.1", "features": ["session_retention"]},
+        )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        assert server._retention_owner is not None
         assert server._retention_owner.task is not None
     finally:
         if writer is not None:
