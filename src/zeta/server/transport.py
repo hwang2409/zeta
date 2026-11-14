@@ -83,6 +83,8 @@ class WebSocketServer:
         port: int,
         origins: Sequence[str],
         path: Path,
+        lock_path: Path,
+        secure_parent: bool,
         accept: Callable[[object, object], Awaitable[None]],
     ) -> None:
         if not 0 <= port <= 65535:
@@ -90,6 +92,8 @@ class WebSocketServer:
         self.port = port
         self.origins = validate_origins(origins)
         self.path = path
+        self.lock_path = lock_path
+        self.secure_parent = secure_parent
         self.accept = accept
         self.token: str | None = None
         self.controller_token: str | None = None
@@ -99,7 +103,7 @@ class WebSocketServer:
 
     async def start(self) -> None:
         self._lock_fd = await asyncio.to_thread(
-            acquire_connection_lock, self.path.with_name("serve.ws.lock")
+            acquire_connection_lock, self.lock_path, self.secure_parent
         )
         self.controller_token = secrets.token_urlsafe(32)
         self.observer_token = secrets.token_urlsafe(32)
@@ -124,6 +128,7 @@ class WebSocketServer:
         await asyncio.to_thread(
             write_connection_file,
             self.path,
+            secure_parent=self.secure_parent,
             port=self.port,
             controller_token=self.controller_token,
             observer_token=self.observer_token,
@@ -186,6 +191,7 @@ class WebSocketServer:
             await asyncio.to_thread(
                 release_connection_lock,
                 self.path,
+                secure_parent=self.secure_parent,
                 token=self.token,
                 lock_fd=self._lock_fd,
             )
@@ -267,12 +273,27 @@ async def run_server(server: ZetaServer) -> None:
             loop.remove_signal_handler(signum)
 
 
-def acquire_connection_lock(path: Path) -> int:
+def _prepare_parent(
+    path: Path, *, secure_parent: bool, repair_parent: bool = True
+) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    info = os.fstat(parent_fd)
+    if secure_parent and repair_parent:
+        os.fchmod(parent_fd, 0o700)
+    elif info.st_uid != os.getuid() or info.st_mode & 0o022:
+        os.close(parent_fd)
+        raise ValueError(
+            "refusing unsafe WebSocket discovery parent; make a private "
+            "subdirectory instead of using /tmp"
+        )
+    return parent_fd
+
+
+def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
+    parent_fd = _prepare_parent(path, secure_parent=secure_parent)
     fd = -1
     try:
-        os.fchmod(parent_fd, 0o700)
         fd = os.open(
             path.name,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -307,10 +328,12 @@ def acquire_connection_lock(path: Path) -> int:
         os.close(parent_fd)
 
 
-def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> None:
+def release_connection_lock(
+    path: Path, *, secure_parent: bool, token: str | None, lock_fd: int
+) -> None:
     try:
         if token is not None:
-            remove_connection_file(path, token=token)
+            remove_connection_file(path, secure_parent=secure_parent, token=token)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
@@ -319,13 +342,13 @@ def release_connection_lock(path: Path, *, token: str | None, lock_fd: int) -> N
 def write_connection_file(
     path: Path,
     *,
+    secure_parent: bool = True,
     port: int,
     controller_token: str,
     observer_token: str,
     origins: tuple[str, ...],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent_fd = _prepare_parent(path, secure_parent=secure_parent)
     temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
     payload = json.dumps(
         {
@@ -342,7 +365,6 @@ def write_connection_file(
     ).encode()
     fd = -1
     try:
-        os.fchmod(parent_fd, 0o700)
         fd = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -355,6 +377,14 @@ def write_connection_file(
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            existing = os.lstat(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode)
+        ):
+            raise ValueError(f"refusing unsafe WebSocket discovery file: {path}")
         os.replace(temporary, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
@@ -365,24 +395,36 @@ def write_connection_file(
         os.close(parent_fd)
 
 
-def remove_connection_file(path: Path, *, token: str) -> None:
+def remove_connection_file(
+    path: Path, *, secure_parent: bool, token: str
+) -> None:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+        parent_fd = _prepare_parent(
+            path, secure_parent=secure_parent, repair_parent=False
+        )
+    except (OSError, ValueError) as exc:
+        _LOGGER.warning("could not safely remove WebSocket discovery file: %s", exc)
         return
+    fd = -1
     try:
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return
         with os.fdopen(fd) as handle:
             fd = -1
             value = json.load(handle)
         if value.get("token") == token:
-            path.unlink()
+            os.unlink(path.name, dir_fd=parent_fd)
     except (OSError, ValueError, AttributeError):
         return
     finally:
         if fd >= 0:
             os.close(fd)
+        os.close(parent_fd)
 
 
 __all__ = ["WebSocketServer", "run_server"]
