@@ -150,7 +150,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
 
     async def append(*args: Any, **kwargs: Any):
         append_started.set()
-        await release_append.wait()
+        await await_or_fail(release_append.wait(), what="append release")
         result = await original_append(*args, **kwargs)
         assert request_task is not None
         request_task.cancel()
@@ -189,10 +189,10 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     request_task = asyncio.create_task(
         getattr(requests, method)({"text": "hello", "delivery_id": "cancel-1"}, features)
     )
-    await append_started.wait()
+    await await_or_fail(append_started.wait(), what="append start")
     release_append.set()
     with pytest.raises(asyncio.CancelledError):
-        await request_task
+        await await_or_fail(request_task, what="canceled delivery request")
 
     assert store.client_delivery("cancel-1") is not None
     # canceled at commit: no echo, the work still runs once
