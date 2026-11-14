@@ -24,6 +24,23 @@ from zeta.session_retention.handshake import planner_request_pending
 from zeta.storage_format import open_writer
 
 
+def _probe_exclusive(path: str, result) -> None:
+    fd = os.open(path, os.O_RDWR)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            result.send(False)
+        else:
+            result.send(True)
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _hold_user_request(path: str, ready, release) -> None:
     fd = os.open(path, os.O_RDWR)
     try:
@@ -82,6 +99,31 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
         return original_charge(budget, size)
 
     monkeypatch.setattr(transaction_module._Budget, "charge", charge)
+    probes: list[bool] = []
+    original_close = RetentionPlanner.close
+    active_path = home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "planner-active")
+
+    def close(planner):
+        probe_index = len(probes)
+        if charge_calls == 1 and probe_index < 2:
+            probes.append(False)
+        result_read, result_write = multiprocessing.Pipe(False)
+        probe = multiprocessing.get_context("spawn").Process(
+            target=_probe_exclusive, args=(str(active_path), result_write)
+        )
+        probe.start()
+        assert result_read.poll(10)
+        if probes and probe_index < len(probes):
+            probes[probe_index] = not result_read.recv()
+        result_read.close()
+        result_write.close()
+        probe.join(10)
+        if probe.is_alive():
+            probe.terminate()
+            probe.join(10)
+        return original_close(planner)
+
+    monkeypatch.setattr(RetentionPlanner, "close", close)
     baseline_rows = read_retention_history(home)
     owner = make_retention_owner(home, lease, lambda: 30)
     episodes: list[object] = []
@@ -132,6 +174,8 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
             await asyncio.wait_for(stop_task, 10)
 
         assert episodes
+        assert probes
+        assert all(probes)
         rows = read_retention_history(home)
         new_rows = rows[len(baseline_rows) :]
         assert all(row.get("mode") not in {"yielded", "none"} for row in new_rows)
