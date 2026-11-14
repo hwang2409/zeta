@@ -1716,3 +1716,143 @@ async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: s
         await asyncio.wait_for(asyncio.shield(request), 1)
     assert control.start_calls + control.steer_calls == 1
     assert not control.echo_started.is_set()
+
+
+class HeldLaterStepBackend:
+    """Return scripted steps; stream and hold the last one before MESSAGE_END."""
+
+    def __init__(self, steps: list[ScriptedTurn]) -> None:
+        self.steps = steps
+        self.calls = 0
+        self.streaming = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        del messages, tool_schemas
+        self.calls += 1
+        if self.calls <= len(self.steps):
+            step = self.steps[self.calls - 1]
+            message = Message(
+                MessageRole.ASSISTANT,
+                [*step.content, *(ToolUseContent(call) for call in step.tool_calls)],
+            )
+            yield StreamEvent(StreamEventType.MESSAGE_END, message=message)
+            return
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_UPDATE, content=TextContent("still streaming")
+        )
+        self.streaming.set()
+        await await_or_fail(self.release.wait(), what="held step release")
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, [TextContent("still streaming")]),
+        )
+
+
+@pytest.mark.parametrize("answer", ["deny", "approve"])
+@pytest.mark.asyncio
+async def test_turn_after_tool_step_stays_busy_for_steer_and_send(
+    tmp_path: Path, answer: str
+) -> None:
+    # achilles turn-end-race-frames.log: after a deny, the next model step was
+    # streaming, yet steer got -32005 and a retried send aborted that turn.
+    target = tmp_path / "input.txt"
+    target.write_text("data")
+    backend = HeldLaterStepBackend(
+        [
+            ScriptedTurn([TextContent("first turn done")]),
+            ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": str(target)})]),
+        ]
+    )
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "warm up"})
+        await _event(reader, "agent_end")
+        await _request(reader, writer, 4, "send", {"text": "read"})
+        await _event(reader, "approval_request")
+        await _request(reader, writer, 5, answer, {"request_id": "read-1"})
+        await _event(reader, "assistant_delta")
+        await await_or_fail(backend.streaming.wait(), what="later step streaming")
+
+        steer = await _request(
+            reader,
+            writer,
+            6,
+            "steer",
+            {"text": "also this", "delivery_id": "late-steer"},
+        )
+        retry = await _request(
+            reader,
+            writer,
+            7,
+            "send",
+            {"text": "also this", "delivery_id": "late-send"},
+        )
+        # steer joins the live turn; a send is OPERATION_BUSY instead of replacing it
+        assert (
+            steer[-1].get("result"),
+            retry[-1].get("error", {}).get("code"),
+        ) == ({"accepted": True}, -32004), (steer[-1], retry[-1])
+
+        backend.release.set()
+        await _event(reader, "agent_end")
+        assert backend.calls == 3
+    finally:
+        backend.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_turn_stays_busy_for_steer_after_earlier_turn_end(
+    tmp_path: Path,
+) -> None:
+    backend = HeldLaterStepBackend([ScriptedTurn([TextContent("first turn done")])])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "warm up"})
+        await _event(reader, "agent_end")
+        await _request(reader, writer, 4, "send", {"text": "second"})
+        await _event(reader, "assistant_delta")
+        await await_or_fail(backend.streaming.wait(), what="second turn streaming")
+
+        steer = await _request(
+            reader,
+            writer,
+            5,
+            "steer",
+            {"text": "also this", "delivery_id": "steer-2"},
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+    finally:
+        backend.release.set()
+        await close_serve(server, writer)
