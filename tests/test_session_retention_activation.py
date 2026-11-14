@@ -159,6 +159,11 @@ def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path:
             assert projections[-1].projection["mode"] == "preview"
         if mutation == "arm" and result_path == "preview":
             assert retention_authority(home, lease, days=30).applied
+            owner = make_retention_owner(home, lease, lambda: days[0])
+            projections, failure = owner._run_episode()
+            assert failure is None
+            assert read_retention_history(home)[-1]["mode"] == "armed"
+            assert projections[-1].projection["mode"] == "armed"
         elif mutation == "disarm" and result_path == "deleted":
             assert disarm_retention(home, lease).applied is True
         elif mutation == "days change" and result_path == "preview":

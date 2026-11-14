@@ -86,6 +86,11 @@ def make_retention_owner(
         nonlocal last_projection
         with _coordinator_authority(root) as token:
             history = read_retention_history(root)
+            if history and history[-1].get("mode") == "armed" and not getattr(result, "changed", False):
+                planner.close()
+                projection = dict(history[-1])
+                last_projection = projection
+                return Published(projection, complete=True)
             effectful = bool(getattr(result, "changed", False))
             status = append_retention_history(
                 token, root, retained, projection,
