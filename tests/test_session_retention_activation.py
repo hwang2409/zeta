@@ -42,9 +42,7 @@ async def test_arm_before_owner_generation_keeps_armed_projection(
     initialize_storage_home(home)
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     lease = await asyncio.to_thread(open_writer, home)
-    with RetentionPlanner(home, lease) as planner:
-        seeded = await asyncio.to_thread(planner.run_pass, days=30)
-    assert seeded.complete
+    owner = make_retention_owner(home, lease, lambda: 30)
     entered = threading.Event()
     release = threading.Event()
     original = RetentionPlanner.run_pass
@@ -54,9 +52,11 @@ async def test_arm_before_owner_generation_keeps_armed_projection(
         assert release.wait(10)
         return original(planner, days=days, commit_state=commit_state, yield_check=yield_check)
 
-    monkeypatch.setattr(RetentionPlanner, "run_pass", gated)
     try:
-        owner = make_retention_owner(home, lease, lambda: 30)
+        with RetentionPlanner(home, lease) as planner:
+            seeded = await asyncio.to_thread(planner.run_pass, days=30)
+        assert seeded.complete
+        monkeypatch.setattr(RetentionPlanner, "run_pass", gated)
         task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
         armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
@@ -70,6 +70,7 @@ async def test_arm_before_owner_generation_keeps_armed_projection(
         assert last["preview_id"] == armed.projection["preview_id"]
     finally:
         release.set()
+        await owner.stop()
         await asyncio.to_thread(lease.close)
 
 
@@ -84,9 +85,7 @@ async def test_arm_during_owner_scan_keeps_armed_projection(
     session_id = await asyncio.to_thread(_create_closed, manager, [], name="old")
     _age_tree(home / "sessions" / session_id, days=100)
     lease = await asyncio.to_thread(open_writer, home)
-    with RetentionPlanner(home, lease) as planner:
-        seeded = await asyncio.to_thread(planner.run_pass, days=30)
-    assert seeded.complete
+    owner = make_retention_owner(home, lease, lambda: 30)
     entered = threading.Event()
     release = threading.Event()
     original = retention_module._Budget.charge_entry
@@ -100,9 +99,11 @@ async def test_arm_during_owner_scan_keeps_armed_projection(
             assert release.wait(10)
         return original(budget, size)
 
-    monkeypatch.setattr(retention_module._Budget, "charge_entry", gated)
     try:
-        owner = make_retention_owner(home, lease, lambda: 30)
+        with RetentionPlanner(home, lease) as planner:
+            seeded = await asyncio.to_thread(planner.run_pass, days=30)
+        assert seeded.complete
+        monkeypatch.setattr(retention_module._Budget, "charge_entry", gated)
         task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
         armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
@@ -116,6 +117,7 @@ async def test_arm_during_owner_scan_keeps_armed_projection(
         assert last["preview_id"] == armed.projection["preview_id"]
     finally:
         release.set()
+        await owner.stop()
         await asyncio.to_thread(lease.close)
 
 
