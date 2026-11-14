@@ -179,7 +179,7 @@ class ServeControl:
             and loop is not None
             and loop.notification_turn_state != "idle"
         ):
-            notification_task = self._turn_task
+            notification_task = self._notification_task
             loop.cancel_scheduled_notification_turn()
             if notification_task is not None and not notification_task.done():
                 notification_task.cancel()
