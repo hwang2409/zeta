@@ -166,8 +166,10 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
     if not result.enabled:
         return retention_result(timestamp=timestamp, mode="disabled", days=0)
     if result.mode is not None:
+        root_ids = tuple(reason.root_id for reason in result.reasons if reason.root_id != "recovery")
         return retention_result(
             timestamp=timestamp, mode=result.mode, days=days,
+            root_ids=root_ids,
             errors=tuple(reason.reason for reason in result.reasons if reason.reason),
         )
     if preview is None:
@@ -273,16 +275,19 @@ def retention_authority(
     root = Path(home)
     try:
         if days == 0:
-            with SessionReferenceGate(root, lease).exclusive(timeout=10):
+            with (
+                _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
+                SessionReferenceGate(root, lease).exclusive(timeout=10),
+            ):
                 home_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
                     unlink_session_file(home_fd, _ARM_FILENAME)
                     unlink_session_file(home_fd, _STATE_FILENAME)
                 finally:
                     os.close(home_fd)
-            projection = retention_result(timestamp=now(), mode="disarmed", days=0)
-            append_retention_history(root, lease, projection)
-            return RetentionAuthorityResult("retention disabled", projection, True)
+                projection = retention_result(timestamp=now(), mode="disarmed", days=0)
+                append_retention_history(root, lease, projection, authority_held=True)
+                return RetentionAuthorityResult("retention disabled", projection, True)
         with (
             _try_authority(root, exclusive=True, deadline=time.monotonic() + 35),
             SessionReferenceGate(root, lease).exclusive(timeout=10),
@@ -316,7 +321,7 @@ def retention_authority(
         )
         if days == 0:
             try:
-                append_retention_history(root, lease, projection)
+                append_retention_history(root, lease, projection, authority_held=True)
             except (OSError, RetentionPlannerError):
                 pass
         return RetentionAuthorityResult(message, projection, False)
@@ -654,7 +659,7 @@ class RetentionPlanner:
             self._latest = None
         reasons = (
             (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
-            if outcome.blocked is not None
+            if outcome.session_id is not None or outcome.blocked is not None
             else ()
         )
         return PassResult(

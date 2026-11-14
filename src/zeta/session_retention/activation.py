@@ -28,7 +28,8 @@ class _PublishedPass(dict[str, object]):
 
 
 def make_retention_owner(
-    home: str | Path, lease: Any, days: Callable[[], int] | None = None
+    home: str | Path, lease: Any, days: Callable[[], int] | None = None,
+    *, bounds: Any | None = None, now_ns: Callable[[], int] | None = None,
 ) -> RetentionActivationOwner:
     """Build the process owner from an already-open home lease."""
     from ..config.settings import load_settings
@@ -41,7 +42,12 @@ def make_retention_owner(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
         history = read_retention_history(root)
-        if history and history[-1].get("mode") == "armed" and result.mode is None:
+        if (
+            history
+            and history[-1].get("mode") == "armed"
+            and history[-1].get("days") == current_days
+            and result.mode is None
+        ):
             projection = dict(history[-1])
         append_retention_history(root, retained, projection)
         return _PublishedPass(projection, complete=result.complete)
@@ -57,7 +63,13 @@ def make_retention_owner(
         return projection
 
     return RetentionActivationOwner(
-        lambda: RetentionPlanner(root, retained),
+        lambda: RetentionPlanner(
+            root, retained,
+            **{
+                key: value for key, value in (("bounds", bounds), ("now_ns", now_ns))
+                if value is not None
+            },
+        ),
         days or (lambda: load_settings(home=root).settings.retention_days),
         run_pass=run_pass,
         on_error=record_error,
@@ -155,8 +167,12 @@ class RetentionActivationOwner:
                 if days == 0:
                     if self._disable is not None:
                         projections.append(self._disable())
-                elif self._home is None or not planner_request_pending(self._home):
-                    projections.append(self._run_pass(planner, days))
+                else:
+                    while self._home is None or not planner_request_pending(self._home):
+                        projection = self._run_pass(planner, days)
+                        projections.append(projection)
+                        if getattr(projection, "complete", True):
+                            break
                 planner.close()
                 planner = None
                 self._planner = None
