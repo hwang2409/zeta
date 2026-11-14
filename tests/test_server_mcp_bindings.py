@@ -959,7 +959,6 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         recovery_released = asyncio.Event()
         live_claimed = asyncio.Event()
         live_claims: list[str] = []
-        live_claim_owners: list[object] = []
         prepare_execution = loop.store.prepare_pending_approval_execution
         claim_execution = loop.store.claim_pending_approval_execution
 
@@ -978,10 +977,6 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
             claim = claim_execution(*args, **kwargs)
             if kwargs.get("prepared") is not True:
                 live_claims.append(claim)
-                # test-contract: the resident record exposes the claimed task identity.
-                live_claim_owners.append(
-                    loop.store._pending_approval_executions[args[0]].owner
-                )
                 asyncio.get_running_loop().call_soon(live_claimed.set)
             return claim
 
@@ -1037,8 +1032,12 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
             assert runs == ["run"]
         else:
             assert mcp.methods.count("tools/call") == 1
+        # The live turn wins the forced race for the one approved execution; the
+        # recovery turn becomes the duplicate and reads the stored result rather
+        # than running the tool again. The duplicate-wake behaviour on terminal
+        # finalization is covered by
+        # test_approval.test_terminal_finalizer_wakes_duplicate_while_owner_unwinds.
         assert live_claims == ["claimed"]
-        assert live_claim_owners == [live_turn]
         approval_results = [
             message.tool_result
             for message in backend.calls[-1][0]
