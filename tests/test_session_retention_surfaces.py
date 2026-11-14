@@ -385,7 +385,9 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
             assert (home / "retention-state.json").is_file()
 
 
-@pytest.mark.parametrize("owner_state", ("idle", "mid-preview", "crashed"))
+@pytest.mark.parametrize(
+    "owner_state", ("idle", "mid-preview", "armed-mid-pass", "crashed")
+)
 def test_cli_session_list_and_rename_survive_retention_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     owner_state: str,
@@ -395,6 +397,8 @@ def test_cli_session_list_and_rename_survive_retention_owner(
     monkeypatch.setenv("ZETA_HOME", str(home))
     holder = command = None
     try:
+        if owner_state == "armed-mid-pass":
+            (home / "retention-arm.json").write_text("{}\n")
         if owner_state != "idle":
             holder, command = _start_retention_holder(
                 home, sid, crashed=owner_state == "crashed"
@@ -415,7 +419,9 @@ def test_cli_session_list_and_rename_survive_retention_owner(
             assert holder.exitcode == 0
 
 
-@pytest.mark.parametrize("owner_state", ("idle", "mid-preview", "crashed"))
+@pytest.mark.parametrize(
+    "owner_state", ("idle", "mid-preview", "armed-mid-pass", "crashed")
+)
 def test_tui_resume_entry_survives_retention_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_state: str,
 ) -> None:
@@ -447,9 +453,13 @@ def test_tui_resume_entry_survives_retention_owner(
         current.loop.store.close()
         return False, False
 
+    # test-contract: seam run the real TUI entry with a controlled app lifecycle.
     monkeypatch.setattr(cli_main_module, "_create_tui_app", create_app)
+    # test-contract: seam run the real TUI entry without opening a terminal.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     try:
+        if owner_state == "armed-mid-pass":
+            (home / "retention-arm.json").write_text("{}\n")
         if owner_state != "idle":
             holder, command = _start_retention_holder(
                 home, sid, crashed=owner_state == "crashed"

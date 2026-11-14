@@ -199,6 +199,14 @@ def test_planner_crash_releases_the_target(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_guard_rejects_direct_on_loop_lock_without_retention_pass() -> None:
+    from zeta.core.session_files import require_off_loop_lock
+
+    with pytest.raises(RuntimeError, match="use asyncio.to_thread"):
+        require_off_loop_lock("test session")
+
+
+@pytest.mark.asyncio
 async def test_on_loop_contention_rejects_before_wait(tmp_path: Path) -> None:
     _prepare(tmp_path)
     process, _ = _start_holder(tmp_path)
