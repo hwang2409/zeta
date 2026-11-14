@@ -7,7 +7,6 @@ import pytest
 
 from tests.support.storage_homes import initialize_storage_home
 from zeta.session_retention import (
-    RetentionBounds,
     RetentionPlanner,
     retention_authority,
 )
