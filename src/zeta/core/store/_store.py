@@ -587,9 +587,9 @@ class ConversationStore(
             current = by_id.get(current.parent_id)
         return False
 
-    def _validate_entry_payload(self, entry: ConversationEntry) -> None:
+    def _validate_entry_payload(self, entry: ConversationEntry) -> object | None:
         try:
-            validate_conversation_entry(self, entry)
+            return validate_conversation_entry(self, entry)
         except (KeyError, TypeError, ValueError) as exc:
             raise ConversationIntegrityError(
                 f"invalid payload for conversation entry {entry.id}"
@@ -650,6 +650,7 @@ class ConversationStore(
         parent_id = self._resident_rows.rows[-1].id if self._resident_rows.rows else None
         next_seq = self._resident_rows.rows[-1].seq + 1 if self._resident_rows.rows else 1
         entries: list[ConversationEntry] = []
+        validated_messages: list[Message | None] = []
         for index, (entry_type, data) in enumerate(rows):
             self._validate_notification_write(entry_type, data)
             entry_id = uuid.uuid4().hex
@@ -666,7 +667,10 @@ class ConversationStore(
                 type=entry_type,
                 data=copy.deepcopy(data),
             )
-            self._validate_entry_payload(entry)
+            validated_payload = self._validate_entry_payload(entry)
+            validated_messages.append(
+                validated_payload if isinstance(validated_payload, Message) else None
+            )
             entries.append(entry)
             parent_id = entry_id
         # Validate the complete candidate sequence before authoritative bytes
@@ -699,14 +703,19 @@ class ConversationStore(
         self._apply_history_index_entries(tuple(entries))
         fold = self._delivery_fold.staged()
         offset = start_offset
-        for entry, encoded_row in zip(entries, encoded_rows, strict=True):
+        for entry, encoded_row, validated_message in zip(
+            entries, encoded_rows, validated_messages, strict=True
+        ):
             self._resident_rows.append(
                 entry, offset=offset, length=len(encoded_row)
             )
             offset += len(encoded_row)
             self._record_entry_prefix(entry)
             self._entry_ids.add(entry.id)
-            fold.apply(entry)
+            if validated_message is None:
+                fold.apply(entry)
+            else:
+                fold.apply_validated(entry, None, validated_message)
             self._sent_message_receipts.extend(sent_message_receipts(entry))
             self._record_physical_entry(entry)
         self._delivery_fold = fold
@@ -747,7 +756,10 @@ class ConversationStore(
         )
         # Reject with the same payload and relation validators used while loading
         # before any authoritative bytes reach disk.
-        self._validate_entry_payload(entry)
+        validated_payload = self._validate_entry_payload(entry)
+        validated_message = (
+            validated_payload if isinstance(validated_payload, Message) else None
+        )
         linear = not self._resident_rows.rows or entry.parent_id == self._resident_rows.rows[-1].id
         touched = _ApprovalValidationOverlay.touched([entry])
         if touched or entry.type == "approval_request":
@@ -794,7 +806,10 @@ class ConversationStore(
         self._sent_message_receipts.extend(sent_message_receipts(entry))
         if linear:
             fold = self._delivery_fold.staged()
-            fold.apply(entry)
+            if validated_message is None:
+                fold.apply(entry)
+            else:
+                fold.apply_validated(entry, None, validated_message)
             self._delivery_fold = fold
         else:
             # Explicit branch appends are rare; rebuild active-branch indexes.

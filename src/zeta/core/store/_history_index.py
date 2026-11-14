@@ -88,7 +88,7 @@ class HistoryIndex:
 
     PAGE_LIMIT = 128
     PAGE_BYTES = 1024 * 1024
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
     _NAME = "history-index.sqlite3"
 
     def __init__(
@@ -105,6 +105,8 @@ class HistoryIndex:
         self._lock = threading.Lock()
         self._closed = False
         self._available = False
+        self._status_projection: tuple[int, int, tuple[object, ...]] | None = None
+        self._warm_active_ids: tuple[str, ...] | None = None
 
     @property
     def available(self) -> bool:
@@ -249,11 +251,16 @@ class HistoryIndex:
         row = connection.execute("SELECT value FROM meta WHERE key='facts'").fetchone()
         return self._facts(json.loads(row[0])) if row is not None else None
 
+    @property
+    def warm_active_ids(self) -> tuple[str, ...] | None:
+        return self._warm_active_ids
+
     def warm_snapshot(
         self, stat: os.stat_result
     ) -> tuple[list[tuple[object, ...]], list[dict[str, object]], dict[str, object]] | None:
         """Return a compact unchanged message transcript, or require full validation."""
         with self._lock:
+            self._warm_active_ids = None
             try:
                 connection = self._connection(write=False)
             except (HistoryIndexError, OSError, sqlite3.Error):
@@ -309,6 +316,12 @@ class HistoryIndex:
                     digest = hashlib.sha256(digest + encoded_line).digest()
                 if digest != expected_digest:
                     return None
+                self._warm_active_ids = tuple(
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT id FROM entries WHERE tui_group IS NOT NULL ORDER BY seq"
+                    )
+                )
                 rows = connection.execute(
                     "SELECT e.seq,e.id,e.parent_id,e.lane,e.type,w.byte_offset,"
                     "w.byte_length,w.facts FROM entries e JOIN warm_rows w USING(seq) "
@@ -348,6 +361,126 @@ class HistoryIndex:
                 return None
             finally:
                 connection.close()
+
+    def _write_status_projection(self, connection: sqlite3.Connection) -> None:
+        from ...context_accounting import message_token_count
+        from ..slash import compaction_history
+
+        rows = connection.execute(
+            "SELECT seq,id,parent_id,lane,type,data FROM entries "
+            "WHERE tui_group IS NOT NULL ORDER BY seq"
+        )
+        entries = tuple(
+            ConversationEntry(
+                seq=row[0], id=row[1], parent_id=row[2], lane=row[3],
+                type=row[4], data=json.loads(row[5]),
+            )
+            for row in rows
+        )
+        history = compaction_history(entries, message_token_count)
+        value = [asdict(item) for item in history]
+        connection.execute(
+            "INSERT INTO meta(key,value) VALUES('slash_status',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (self._value(value),),
+        )
+        marker_count, checkpoint_count = connection.execute(
+            "SELECT SUM(type='compaction'),SUM(type='checkpoint') "
+            "FROM entries WHERE tui_group IS NOT NULL"
+        ).fetchone()
+        self._status_projection = (
+            int(marker_count or 0), int(checkpoint_count or 0), history
+        )
+
+    def _update_status_projection(
+        self, connection: sqlite3.Connection, entries: tuple[object, ...]
+    ) -> None:
+        from ...context_accounting import message_token_count
+        from ..slash import compaction_summary
+
+        if self._status_projection is None:
+            self._write_status_projection(connection)
+            return
+        marker_count, checkpoint_count, history = self._status_projection
+        summaries = list(history)
+        for raw_entry in entries:
+            entry = (
+                raw_entry
+                if isinstance(raw_entry, ConversationEntry)
+                else ConversationEntry.from_dict(raw_entry)
+            )
+            marker_count += int(entry.type == "compaction")
+            checkpoint_count += int(entry.type == "checkpoint")
+            if entry.type != "compaction":
+                continue
+            replaces = tuple(entry.data.get("replaces", ()))
+            replacement_clause = (
+                f" OR id IN ({','.join('?' for _ in replaces)})"
+                if replaces
+                else ""
+            )
+            rows = connection.execute(
+                "SELECT seq,id,parent_id,lane,type,data FROM entries "
+                "WHERE tui_group IS NOT NULL AND "
+                "((type='message' AND seq>=? AND seq<=?)"
+                f"{replacement_clause}) ORDER BY seq",
+                (
+                    int(entry.data["source_seq_start"]),
+                    int(entry.data["source_seq_end"]),
+                    *replaces,
+                ),
+            )
+            source_entries = tuple(
+                ConversationEntry(
+                    seq=row[0], id=row[1], parent_id=row[2], lane=row[3],
+                    type=row[4], data=json.loads(row[5]),
+                )
+                for row in rows
+            )
+            user_turn_row = connection.execute(
+                "SELECT COUNT(*) FROM entries WHERE tui_group IS NOT NULL "
+                "AND type='message' AND seq<=? "
+                "AND json_extract(data,'$.message.role')='user'",
+                (entry.seq,),
+            ).fetchone()
+            user_turn = int(user_turn_row[0]) if user_turn_row is not None else 0
+            summaries.append(
+                compaction_summary(
+                    entry,
+                    source_entries,
+                    message_token_count,
+                    max(1, user_turn),
+                )
+            )
+        self._status_projection = (marker_count, checkpoint_count, tuple(summaries))
+        connection.execute(
+            "INSERT INTO meta(key,value) VALUES('slash_status',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (self._value([asdict(item) for item in summaries]),),
+        )
+
+    def _load_status_projection(self, connection: sqlite3.Connection) -> None:
+        from ..slash import CompactionSummary
+
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key='slash_status'"
+        ).fetchone()
+        if row is None:
+            self._status_projection = None
+            return
+        marker_count, checkpoint_count = connection.execute(
+            "SELECT SUM(type='compaction'),SUM(type='checkpoint') "
+            "FROM entries WHERE tui_group IS NOT NULL"
+        ).fetchone()
+        self._status_projection = (
+            int(marker_count or 0),
+            int(checkpoint_count or 0),
+            tuple(CompactionSummary(**item) for item in json.loads(row[0])),
+        )
+
+    @property
+    def status_projection(self) -> tuple[int, int, tuple[object, ...]] | None:
+        return self._status_projection
 
     def _set_meta(
         self,
@@ -517,6 +650,7 @@ class HistoryIndex:
                 self._set_meta(
                     connection, source_facts, total=group, tui_total=tui_group
                 )
+                self._write_status_projection(connection)
                 connection.execute(
                     "INSERT INTO meta(key,value) VALUES('startup_projection',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -675,6 +809,7 @@ class HistoryIndex:
             self._set_meta(
                 connection, facts, total=total, tui_total=tui_total
             )
+            self._update_status_projection(connection, entries)
 
     def catch_up_validated(
         self, source_facts: object, validated_rows: Sequence[object]
@@ -695,6 +830,7 @@ class HistoryIndex:
                 if all(
                     stored.get(key) == value for key, value in expected.items()
                 ) and stored.get("schema_version") == self.SCHEMA_VERSION:
+                    self._load_status_projection(connection)
                     self._available = True
                     return True
                 suffix_start = self._suffix_start(stored, expected, validated_rows)
@@ -746,6 +882,7 @@ class HistoryIndex:
                         and stored.get("schema_version") == self.SCHEMA_VERSION
                         and warm_count == len(refs)
                     ):
+                        self._load_status_projection(connection)
                         self._available = True
                         return
                 finally:
@@ -1258,6 +1395,12 @@ def _decide_approval(
 
 
 class HistoryPageStoreMixin:
+    def slash_status_projection(
+        self: ConversationStore,
+    ) -> tuple[int, int, tuple[object, ...]] | None:
+        index = self._history_index
+        return index.status_projection if index is not None and index.available else None
+
     def _refresh_repair_generation(self: ConversationStore) -> None:
         record = recovery_status(self.directory_fd, self._repair_target).latest_committed
         self._repair_generation = record.quarantine_id if record is not None else None

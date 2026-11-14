@@ -2866,33 +2866,46 @@ def test_full_load_validates_the_final_branch_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path, session_id="branch-rich")
-    root = store.append_message(message(MessageRole.USER, "root"))
+    call = ToolCall("rich-root", "bash", {"command": "true"})
+    root = store.append_message_with_approval_requests(
+        Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+    )
     for index in range(118):
         store.append_message(
             message(MessageRole.ASSISTANT, f"branch-{index}"), parent_id=root.id
         )
     store.close()
+    primed = ConversationStore(tmp_path, session_id="branch-rich")
+    primed.close()
     validations = 0
+    reused_messages = 0
     original = ConversationStore._apply_to_working_fold
 
     def count_validation(
         self: ConversationStore,
         entry: ConversationEntry,
         approvals: object | None = None,
+        parsed_message: Message | None = None,
     ) -> None:
-        nonlocal validations
+        nonlocal reused_messages, validations
         validations += 1
-        original(self, entry, approvals)
+        if parsed_message is None:
+            original(self, entry, approvals)
+        else:
+            reused_messages += 1
+            original(self, entry, approvals, parsed_message)
 
     # test-contract: seam count active-branch validation through a real store reopen
     monkeypatch.setattr(ConversationStore, "_apply_to_working_fold", count_validation)
 
-    reopened = ConversationStore(tmp_path, session_id="branch-rich", _read_only=True)
-
-    assert len(resident_entries(reopened)) == 119
-    assert len(branch_entries(reopened)) == 2
-    assert validations == 2
-    reopened.close()
+    reopened = ConversationStore(tmp_path, session_id="branch-rich")
+    try:
+        assert len(resident_entries(reopened)) == 119
+        assert len(branch_entries(reopened)) == 2
+        assert validations == 2
+        assert reused_messages == 2, "warm load did not reuse validated messages"
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize("damage", ["future_schema", "future_entry"])
