@@ -172,7 +172,8 @@ async def test_two_owners_append_without_lost_rows(
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     lease = await asyncio.to_thread(open_writer, home)
     barrier = threading.Barrier(2)
-    planner_roles: dict[int, str] = {}
+    planner_roles: dict[RetentionPlanner, str] = {}
+    thread_roles: dict[int, str] = {}
     planner_lock = threading.Lock()
     b_reached = threading.Event()
     a_holds_coordinator = threading.Event()
@@ -183,9 +184,10 @@ async def test_two_owners_append_without_lost_rows(
     def synchronized_run_pass(planner, *, days, commit_state=True, yield_check=None):
         thread_id = threading.get_ident()
         with planner_lock:
-            first_pass = thread_id not in planner_roles
+            first_pass = planner not in planner_roles
             if first_pass:
-                planner_roles[thread_id] = "a" if not planner_roles else "b"
+                planner_roles[planner] = "a" if not planner_roles else "b"
+            thread_roles[thread_id] = planner_roles[planner]
         if first_pass:
             try:
                 barrier.wait(10)
@@ -195,21 +197,21 @@ async def test_two_owners_append_without_lost_rows(
             result = original_run_pass(planner, days=days, yield_check=yield_check)
         else:
             result = original_run_pass(planner, days=days, commit_state=False, yield_check=yield_check)
-        if first_pass and planner_roles[thread_id] == "b":
+        if first_pass and planner_roles[planner] == "b":
             b_reached.set()
         return result
 
     @contextlib.contextmanager
     def observed_authority(*args, **kwargs):
-        if planner_roles.get(threading.get_ident()) == "a":
+        if thread_roles.get(threading.get_ident()) == "a":
             a_holds_coordinator.set()
-        elif planner_roles.get(threading.get_ident()) == "b":
+        elif thread_roles.get(threading.get_ident()) == "b":
             b_reached.set()
         with original_authority(*args, **kwargs):
             yield
 
     def ordered_publish(directory_fd, name, data, **kwargs):
-        role = planner_roles.get(threading.get_ident())
+        role = thread_roles.get(threading.get_ident())
         if role == "a" and name == "retention-history.jsonl":
             assert b_reached.wait(10), "owner b did not reach its commit attempt"
         original_publish(directory_fd, name, data, **kwargs)
