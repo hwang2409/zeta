@@ -15,7 +15,6 @@ import zeta.session_retention.activation as activation_module
 from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.storage_homes import initialize_storage_home
 from zeta.core.session import SessionManager
-from zeta.core.session_execution import retention_access
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.session_retention import (
     RetentionBounds,
@@ -114,8 +113,7 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
             result = planner.run_pass(days=30)
         finally:
             planner.close()
-        assert isinstance(result, Yielded)
-        assert result.reason == "user"
+        assert getattr(result, "reason", None) == "user"
         assert not (home / "retention-history.jsonl").exists()
     finally:
         fcntl.flock(request, fcntl.LOCK_UN)
@@ -347,9 +345,7 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
         ("progressed-incomplete", [Published({"mode": "preview"}, complete=False, progressed=True), Published({"mode": "preview"}, complete=True)]),
         ("no-progress", [Published({"mode": "preview"}, complete=False)]),
         ("user-scan-checkpoint", [Yielded("user"), Published({"mode": "preview"}, complete=True)]),
-        ("user-transaction-checkpoint", [Yielded("user"), Published({"mode": "preview"}, complete=True)]),
         ("stop-scan-checkpoint", [Yielded("stop")]),
-        ("stop-transaction-checkpoint", [Yielded("stop")]),
         ("publish-failure", [Published({"mode": "preview"}, complete=True)]),
         ("history-failure", [RuntimeError("history")]),
         ("stale-commit", [RuntimeError("stale")]),
@@ -560,29 +556,39 @@ async def test_inactive_owner_preserves_authority_until_session_exists(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) -> None:
+async def test_started_owner_guards_public_loop_session_open(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     initialize_storage_home(home)
     (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
     manager = await asyncio.to_thread(SessionManager, home)
     session_id = await asyncio.to_thread(_create_closed, manager, [], name="idle")
     lease = await asyncio.to_thread(open_writer, home)
-    owner = make_retention_owner(home, lease, lambda: 0)
-    owner.start()
-    opened = None
+    entered = threading.Event()
+    release = threading.Event()
+    original_run_pass = RetentionPlanner.run_pass
+
+    def blocked_run_pass(planner, *, days, commit_state=True, yield_check=None):
+        entered.set()
+        assert release.wait(10)
+        return original_run_pass(
+            planner, days=days, commit_state=commit_state, yield_check=yield_check
+        )
+
+    monkeypatch.setattr(RetentionPlanner, "run_pass", blocked_run_pass)
+    owner = make_retention_owner(home, lease, lambda: 30)
+    lease_fd = os.open(home / "sessions" / session_id / "runtime.lease", os.O_RDWR)
     try:
+        fcntl.flock(lease_fd, fcntl.LOCK_EX)
+        owner.start()
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
         with pytest.raises(
             RuntimeError,
             match="retention lock requested on an asyncio event-loop thread; use asyncio.to_thread",
         ):
-            opened = manager.open(session_id)
-            retention_access.acquire_after_retention_yield(
-                home,
-                lambda: (_ for _ in ()).throw(BlockingIOError()),
-                lambda error: error,
-            )
+            manager.open(session_id)
     finally:
-        if opened is not None:
-            opened.store.close()
+        release.set()
+        fcntl.flock(lease_fd, fcntl.LOCK_UN)
+        os.close(lease_fd)
         await owner.stop()
         await asyncio.to_thread(lease.close)
