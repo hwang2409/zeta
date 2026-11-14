@@ -19,7 +19,6 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.raw_frames import assert_raw_frames_preserved
 from tests.support.serve_close import close_serve
-from tests.support.server_client import read as read_frame
 from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_agent import CancelledBeforeAnswerBackend, _collect
@@ -41,9 +40,7 @@ from zeta.protocol.types import (
     StreamEvent,
     StreamEventType,
     TextContent,
-    ToolCall,
     ToolSchema,
-    ToolUseContent,
 )
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
@@ -630,142 +627,6 @@ def _controller_fixture_frames() -> bytes:
     frames = expected.splitlines(keepends=True)
     split = next(index for index, frame in enumerate(frames) if b'"id":1' in frame)
     return b"".join(frames[:split])
-
-
-async def _assert_steer_is_read_while_response_write_waits(
-    server: ZetaServer,
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    request_id: int,
-    method: str,
-    params: dict[str, object],
-    turn_started: asyncio.Event,
-) -> None:
-    response_write_started = asyncio.Event()
-    release_response = asyncio.Event()
-    steered = asyncio.Event()
-    write = _Client._write
-
-    async def hold_response(self: _Client, payload: bytes) -> bool:
-        if json.loads(payload).get("id") == request_id:
-            response_write_started.set()
-            await await_or_fail(release_response.wait(), what="release held response")
-        return await write(self, payload)
-
-    assert server.runtime.loop is not None
-    steer = server.runtime.loop.steer
-
-    def observe_steer(message: Message) -> None:
-        steer(message)
-        steered.set()
-
-    async def write_request(
-        sent_id: int, sent_method: str, sent_params: dict[str, object]
-    ) -> None:
-        writer.write(
-            (
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": sent_id,
-                        "method": sent_method,
-                        "params": sent_params,
-                    }
-                )
-                + "\n"
-            ).encode()
-        )
-        await asyncio.wait_for(writer.drain(), 10)
-
-    monkeypatch.setattr(_Client, "_write", hold_response)
-    monkeypatch.setattr(server.runtime.loop, "steer", observe_steer)
-    try:
-        await write_request(request_id, method, params)
-        await await_or_fail(turn_started.wait(), what=f"{method} turn started")
-        await await_or_fail(
-            response_write_started.wait(), what=f"{method} response write started"
-        )
-        await write_request(request_id + 1, "steer", {"text": "continue"})
-        await await_or_fail(
-            steered.wait(), what="steer delivered while prior response write waited"
-        )
-    finally:
-        release_response.set()
-        while (await read_frame(reader)).get("id") != request_id:
-            pass
-
-
-@pytest.mark.asyncio
-async def test_send_response_write_does_not_block_steer_on_same_socket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = _GatedBackend()
-    server = ZetaServer(
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        provider="codex",
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer = await _connect(server)
-    try:
-        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        await _assert_steer_is_read_while_response_write_waits(
-            server,
-            reader,
-            writer,
-            monkeypatch,
-            request_id=3,
-            method="send",
-            params={"text": "start"},
-            turn_started=backend.entered,
-        )
-    finally:
-        backend.release.set()
-        await close_serve(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_deny_response_write_does_not_block_steer_on_resumed_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = _GatedBackend()
-    server = ZetaServer(
-        home=tmp_path,
-        socket_path=_socket_path(tmp_path),
-        provider="codex",
-        cwd="/tmp",
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer = await _connect(server)
-    call = ToolCall("call-1", "read", {"path": "/tmp/input"})
-    try:
-        await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.opened is not None
-        server.runtime.opened.store.append_message_with_approval_requests(
-            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
-        )
-        await server.control._event(
-            StreamEvent(StreamEventType.TOOL_APPROVAL_START, tool_call=call)
-        )
-        server.control.start_turn("active approval turn")
-
-        await _assert_steer_is_read_while_response_write_waits(
-            server,
-            reader,
-            writer,
-            monkeypatch,
-            request_id=3,
-            method="deny",
-            params={"request_id": call.id},
-            turn_started=backend.entered,
-        )
-    finally:
-        backend.release.set()
-        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

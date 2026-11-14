@@ -55,8 +55,6 @@ logger = logging.getLogger(__name__)
 # or another process stays refused the session until serve's next lease call.
 IDLE_DRAIN_INTERVAL = 1.0
 
-_TURN_ACCEPTING_METHODS = frozenset({"send", "send_images", "approve", "deny"})
-
 
 async def _drain_released_leases() -> None:
     while True:
@@ -444,7 +442,6 @@ class _Client:
         self._closed = False
         self._local_close = False
         self._controller_release: asyncio.Task[None] | None = None
-        self._response_writes: set[asyncio.Task[bool]] = set()
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -555,12 +552,7 @@ class _Client:
                             self, request_id, result, baseline_builder
                         )
                     else:
-                        response = self.codec.response(request_id, result)
-                        if request["method"] in _TURN_ACCEPTING_METHODS:
-                            self._defer_response_write(response)
-                            written = False
-                        else:
-                            written = await self._write(response)
+                        written = await self._write(self.codec.response(request_id, result))
                     if (
                         written
                         and request["method"] == "hello"
@@ -572,19 +564,6 @@ class _Client:
                     break
         finally:
             await self.close(graceful=graceful and not self._transport_failed)
-
-    def _defer_response_write(self, response: _Frame) -> None:
-        task = asyncio.create_task(self._write(response))
-        self._response_writes.add(task)
-        task.add_done_callback(self._response_write_finished)
-
-    def _response_write_finished(self, task: asyncio.Task[bool]) -> None:
-        self._response_writes.discard(task)
-        if not task.cancelled() and (error := task.exception()) is not None:
-            logger.error(
-                "serve response write failed",
-                exc_info=(type(error), error, error.__traceback__),
-            )
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -657,11 +636,6 @@ class _Client:
             await self.logins.close()
             if graceful:
                 await self.connections.flush(self)
-            else:
-                for task in tuple(self._response_writes):
-                    task.cancel()
-            if self._response_writes:
-                await asyncio.gather(*tuple(self._response_writes), return_exceptions=True)
             self._local_close = True
             self.writer.close()
             with contextlib.suppress(Exception):
