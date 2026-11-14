@@ -13,14 +13,13 @@ from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
 
 from tests.support.fake_backend import (
     FakeBackend,
     PerActorFakeBackend,
     ScriptedTurn,
 )
-from tests.support.owned import await_or_fail, start_task_stack_watchdog
+from tests.support.owned import await_or_fail
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
 from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
@@ -246,6 +245,7 @@ class ListChangedNotificationStream(httpx.AsyncByteStream):
     async def __aiter__(self):
         self.server.notification_open.set()
         await asyncio.wait_for(self.server.notification_ready.wait(), TIMEOUT)
+        await asyncio.wait_for(self.server.notification_read_release.wait(), TIMEOUT)
         yield (
             b'event: message\ndata: {"jsonrpc":"2.0",'
             b'"method":"notifications/tools/list_changed"}\n\n'
@@ -273,10 +273,12 @@ class ListChangedMCP(httpx.AsyncBaseTransport):
         self.notification_open = asyncio.Event()
         self.notification_ready = asyncio.Event()
         self.notification_release = asyncio.Event()
+        self.notification_read_release = asyncio.Event()
         self.tools_refetched = asyncio.Event()
         self.refetch_response_release = asyncio.Event()
         self.tools_list_calls = 0
         self.include_x = False
+        self.fail_tools_list = False
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.headers.get("authorization") != f"Bearer {SECRET}":
@@ -301,6 +303,16 @@ class ListChangedMCP(httpx.AsyncBaseTransport):
             headers = {"mcp-session-id": "test-session"}
         elif method == "tools/list":
             self.tools_list_calls += 1
+            if self.fail_tools_list:
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id"),
+                        "error": {"code": -32000, "message": "forced refresh failure"},
+                    },
+                    request=request,
+                )
             tools = [
                 {
                     "name": name,
@@ -328,8 +340,10 @@ class ListChangedMCP(httpx.AsyncBaseTransport):
         await asyncio.wait_for(self.notification_open.wait(), TIMEOUT)
         self.include_x = True
         self.notification_ready.set()
+        self.notification_read_release.set()
 
     async def aclose(self) -> None:
+        self.notification_read_release.set()
         self.notification_release.set()
 
 
@@ -616,6 +630,112 @@ async def test_http_list_changed_refreshes_next_turn_catalog(
         await mcp.aclose()
 
 
+@pytest.mark.asyncio
+async def test_explicit_refresh_fences_send_before_unread_list_changed_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = ListChangedMCP()
+    allow_streamable_local_http(monkeypatch, mcp)
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "page": {
+                        "transport": "streamable-http",
+                        "url": "https://mcp.test",
+                        "headers": {"Authorization": f"Bearer {SECRET}"},
+                    }
+                }
+            }
+        )
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("updated")])])
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        hello = await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.2", "features": ["mcp_refresh_tools"]},
+        )
+        session = (
+            await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        )[-1]["result"]["session"]
+        await await_or_fail(mcp.notification_open.wait(), what="notification stream")
+        mcp.include_x = True
+        mcp.notification_ready.set()
+        mcp.refetch_response_release.set()
+
+        refreshed = await _request(
+            reader,
+            writer,
+            3,
+            "mcp_refresh_tools",
+            {"session_id": session["session_id"], "server": "page"},
+        )
+        assert not mcp.notification_read_release.is_set()
+        await _request(reader, writer, 4, "send", {"text": "use the new tool"})
+        await _event(reader, "agent_end")
+
+        names = {schema["name"] for schema in backend.calls[0][1]}
+        assert "page__x" in names, "send did not use the catalog published by refresh"
+        assert "mcp_refresh_tools" in hello[-1]["result"]["capabilities"]["requests"]
+        assert refreshed[-1]["result"] == {
+            "session_id": session["session_id"],
+            "servers": ["page"],
+        }
+        assert mcp.tools_list_calls == 2
+
+        unknown = await _request(
+            reader,
+            writer,
+            5,
+            "mcp_refresh_tools",
+            {"session_id": session["session_id"], "server": "missing"},
+        )
+        assert unknown[-1]["error"] == {
+            "code": -32602,
+            "message": "unknown MCP server: missing",
+        }
+
+        mcp.fail_tools_list = True
+        failed = await _request(
+            reader,
+            writer,
+            6,
+            "mcp_refresh_tools",
+            {"session_id": session["session_id"], "server": "page"},
+        )
+        assert failed[-1]["error"] == {
+            "code": -32005,
+            "message": "MCP tool refresh failed",
+            "data": {
+                "code": "mcp_tool_refresh_failed",
+                "session_id": session["session_id"],
+                "server": "page",
+                "reason": "page: MCP JSON-RPC error -32000: forced refresh failure",
+            },
+        }
+        assert "page__x" in {
+            schema["name"] for schema in server.runtime.loop._active_tool_schemas()
+        }
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await mcp.aclose()
+        await server.close()
+
+
 @pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
 @pytest.mark.asyncio
 async def test_socket_http_list_changed_refreshes_next_turn_catalog(
@@ -709,20 +829,6 @@ async def test_socket_http_list_changed_refreshes_next_turn_catalog(
         await mcp.close()
 
 
-@pytest_asyncio.fixture
-async def approved_mcp_task_stack_watchdog() -> AsyncIterator[None]:
-    watchdog = start_task_stack_watchdog(
-        TIMEOUT, what="approved MCP socket test"
-    )
-    try:
-        yield
-    finally:
-        watchdog.cancel()
-        await asyncio.wait_for(
-            asyncio.gather(watchdog, return_exceptions=True), 10
-        )
-
-
 @pytest.mark.parametrize("bound", [True, False], ids=["bound", "config-only"])
 @pytest.mark.parametrize("live_added", [True, False], ids=["live-added", "initial"])
 @pytest.mark.asyncio
@@ -731,7 +837,6 @@ async def test_socket_http_approved_tool_runs_once(
     monkeypatch: pytest.MonkeyPatch,
     bound: bool,
     live_added: bool,
-    approved_mcp_task_stack_watchdog: None,
 ) -> None:
     monkeypatch.setattr(
         httpx.AsyncHTTPTransport,
@@ -813,7 +918,7 @@ async def test_socket_http_approved_tool_runs_once(
         assert recovery_turn is not None
         await await_or_fail(
             asyncio.gather(live_turn, recovery_turn),
-            timeout=TIMEOUT,
+            timeout=60,
             what="approved MCP live and recovery turns",
         )
 

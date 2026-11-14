@@ -6,7 +6,14 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..client import MCPClient, MCPTool, degrades_server, error_text, notice
+from ..client import (
+    MCPClient,
+    MCPTool,
+    MCPToolRefreshError,
+    degrades_server,
+    error_text,
+    notice,
+)
 from ..config import mcp_log_path
 
 if TYPE_CHECKING:
@@ -24,6 +31,11 @@ class ToolsListRefreshed:
     task: asyncio.Task[list[MCPTool]]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolsListRefreshRequested:
+    result: asyncio.Future[None]
+
+
 class ToolRefreshActor:
     """Own notification buffering and the active catalog refresh task."""
 
@@ -35,6 +47,7 @@ class ToolRefreshActor:
         self._settled = asyncio.Event()
         self._settled.set()
         self._setup_notification_client: MCPClient | None = None
+        self._request_waiters: list[asyncio.Future[None]] = []
 
     def start_setup(self, client: MCPClient) -> None:
         self._setup_client = client
@@ -78,6 +91,20 @@ class ToolRefreshActor:
     async def wait(self) -> None:
         await self._settled.wait()
 
+    def request(self, message: ToolsListRefreshRequested) -> None:
+        owner = self._owner
+        client = owner._client
+        if client is None or owner._status.state != "mounted":
+            if not message.result.done():
+                message.result.set_exception(
+                    MCPToolRefreshError(f"MCP server {owner.name} is not mounted")
+                )
+            return
+        self._request_waiters.append(message.result)
+        self._settled.clear()
+        if self._task is None:
+            self.handle_changed(ToolsListChanged(client))
+
     def handle_changed(self, message: ToolsListChanged) -> None:
         owner = self._owner
         if message.client is not owner._client or owner._status.state != "mounted":
@@ -107,15 +134,25 @@ class ToolRefreshActor:
         if message.client is not owner._client or owner._status.state != "mounted":
             self._pending = False
             return
+        waiters = self._request_waiters
         try:
             tools = owner._filter_tools(message.task.result(), owner._notice_sink)
         except Exception as exc:  # noqa: BLE001 - classify refresh failure
-            self._pending = False
-            # A request error stays local and keeps the published tools; any
-            # other failure degrades the server with a typed reason.
-            if degrades_server(exc):
+            self._resolve_requests(waiters, exc)
+            self._request_waiters = []
+            # An explicit refresh reports the error and retains the last published
+            # catalog. Notification-only transport failures keep existing behavior.
+            if waiters:
+                notice(
+                    owner._notice_sink,
+                    f"mcp · {owner.name} tool refresh failed: {error_text(exc)}",
+                )
+                self._continue_or_settle(message.client)
+            elif degrades_server(exc):
+                self._pending = False
                 owner._degrade_current(error_text(exc))
             else:
+                self._pending = False
                 notice(
                     owner._notice_sink,
                     f"mcp · {owner.name} tool refresh failed: {error_text(exc)}",
@@ -139,11 +176,28 @@ class ToolRefreshActor:
             owner.config.allowed_tools is not None or owner.config.disallowed_tools
         ):
             notice(owner._notice_sink, f"mcp · {owner.name} mounted with zero tools")
+        self._resolve_requests(waiters)
+        self._request_waiters = []
+        self._continue_or_settle(message.client)
+
+    def _continue_or_settle(self, client: MCPClient) -> None:
         if self._pending:
             self._pending = False
-            self.handle_changed(ToolsListChanged(message.client))
+            self.handle_changed(ToolsListChanged(client))
         else:
             self.settle()
+
+    @staticmethod
+    def _resolve_requests(
+        waiters: list[asyncio.Future[None]], error: Exception | None = None
+    ) -> None:
+        for waiter in waiters:
+            if waiter.done():
+                continue
+            if error is None:
+                waiter.set_result(None)
+            else:
+                waiter.set_exception(MCPToolRefreshError(error_text(error)))
 
     def cancel(self) -> asyncio.Task[list[MCPTool]] | None:
         task = self._task
@@ -151,6 +205,11 @@ class ToolRefreshActor:
         self._pending = False
         if task is not None:
             task.cancel()
+        self._resolve_requests(
+            self._request_waiters,
+            MCPToolRefreshError("MCP tool refresh was cancelled"),
+        )
+        self._request_waiters = []
         return task
 
     def settle(self) -> None:
