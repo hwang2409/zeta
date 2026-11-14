@@ -20,6 +20,7 @@ from .client import (
     MCPPrompt,
     MCPResourceContent,
     MCPTool,
+    MCPToolRefreshError,
     degraded_result as _degraded_result,
     error_text as _error_text,
     make_error_result,
@@ -57,6 +58,7 @@ from .actors.tool_refresh import (
     ToolRefreshActor,
     ToolsListChanged as _ToolsListChanged,
     ToolsListRefreshed as _ToolsListRefreshed,
+    ToolsListRefreshRequested as _ToolsListRefreshRequested,
 )
 from .actors.prompt import (
     CallFinished as _CallFinished,
@@ -248,6 +250,13 @@ class MCPServerActor(MCPDefinitionPublisher):
     ) -> MCPServerStatus:
         return await self._request_operation("manual", notice_sink)
 
+    async def refresh_tools(self) -> None:
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        if self.is_terminal:
+            raise MCPToolRefreshError(f"MCP server {self.name} is unavailable")
+        self._queue.put_nowait(_ToolsListRefreshRequested(future))
+        await future
+
     async def replace(
         self,
         config: MCPServerConfig,
@@ -392,6 +401,8 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._tool_refresh.handle_changed(message)
                 elif isinstance(message, _ToolsListRefreshed):
                     self._tool_refresh.handle_refreshed(message)
+                elif isinstance(message, _ToolsListRefreshRequested):
+                    self._tool_refresh.request(message)
                 elif isinstance(message, _CallRequest):
                     self._handle_call(message)
                 elif isinstance(message, _CallFinished):
@@ -1154,6 +1165,11 @@ class MCPServerActor(MCPDefinitionPublisher):
             _set_result(message.result, None)
         elif isinstance(message, (_CancelOperation, _CancelRequest)):
             _set_result(message.acknowledged, None)
+        elif isinstance(message, _ToolsListRefreshRequested):
+            if not message.result.done():
+                message.result.set_exception(
+                    MCPToolRefreshError(f"MCP server {self.name} is unavailable")
+                )
         elif isinstance(message, _CallRequest):
             _set_result(message.result, _unavailable_result(self.name))
         elif isinstance(message, _CallFinished):

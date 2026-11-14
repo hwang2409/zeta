@@ -41,6 +41,10 @@ class MCPRequestError(MCPError):
     """Raised when an MCP request returns a JSON-RPC error response."""
 
 
+class MCPToolRefreshError(MCPError):
+    """Raised when an explicit tools/list refresh cannot publish a new catalog."""
+
+
 class MCPUnsupportedError(MCPRequestError):
     """Raised when a server does not advertise an optional capability."""
 
@@ -483,6 +487,7 @@ __all__ = [
     "MCPResource",
     "MCPResourceContent",
     "MCPTool",
+    "MCPToolRefreshError",
     "MCPTransportError",
     "canceled_result",
     "initialize_params",
