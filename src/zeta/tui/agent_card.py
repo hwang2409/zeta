@@ -1490,11 +1490,11 @@ class AgentNavigation:
 
     def focus_list(self) -> None:
         self.transcript_control.capture_root_view()
-        self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         else:
             self.focus_composer()
+        self.refresh(force=True)
 
     def list_back(self) -> None:
         self.back_to_parent()
@@ -1507,9 +1507,9 @@ class AgentNavigation:
         self.transcript_control.activate(self.root_path)
 
     def focus_child_list(self) -> None:
-        self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
+        self.refresh(force=True)
 
     def move_selection(self, amount: int) -> None:
         if not self.entries:

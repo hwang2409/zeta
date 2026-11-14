@@ -75,8 +75,14 @@ async def _enter_child(app: TUIApp, pipe) -> None:
                 ),
                 what="visible composer before picker key",
             )
+        await _wait_until(
+            app.composer_can_focus_agent_list,
+            what="composer ready to open the visible agent picker",
+        )
         await _send(pipe, "\x1b[B")
         await _wait_until(navigation.list_focused, what="agent picker focus")
+    await navigation.wait_for_publication()
+    await _wait_until(navigation.list_focused, what="published focused agent picker")
     while navigation.entries[navigation.selected_index].path.name != CHILD_ID:
         before = navigation.selected_index
         await _send(pipe, "\x1b[B")

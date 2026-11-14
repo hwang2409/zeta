@@ -597,7 +597,7 @@ class TUIApp(
             on_child_view_top=lambda: app._agent_navigation.child_top(),
             on_child_view_bottom=lambda: app._agent_navigation.child_bottom(),
             composer_agent_navigation_ready=lambda: (
-                app._composer_can_focus_agent_list()
+                app.composer_can_focus_agent_list()
             ),
             interaction_ready=lambda: not app._startup_replay_active,
             key_remap=self._key_remap,
@@ -964,7 +964,7 @@ class TUIApp(
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
 
-    def _composer_can_focus_agent_list(self) -> bool:
+    def composer_can_focus_agent_list(self) -> bool:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return False
