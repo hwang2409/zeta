@@ -114,7 +114,7 @@ async def test_real_transaction_checkpoint_yield_has_no_projection(
                 ),
             )
             request_process.start()
-            assert await asyncio.to_thread(ready_request.recv)
+            assert await asyncio.wait_for(asyncio.to_thread(ready_request.recv), 10)
             assert planner_request_pending(home)
             request_seen.set()
             open_task = asyncio.create_task(asyncio.to_thread(manager.open, session_id))
