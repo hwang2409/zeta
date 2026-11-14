@@ -34,6 +34,7 @@ from ..core.project_context import (
     project_instructions_editor_command,
 )
 from ..core.session import SessionMetadata
+from ..core.session_files import SessionNotFoundError
 from ..core.slash import (
     SlashStatus,
     UsageTracker,
@@ -698,7 +699,12 @@ class TUIApp(
                 source = await worker
                 await source.close()
                 raise
-            except (ConversationIntegrityError, OSError, ValueError):
+            except (
+                ConversationIntegrityError,
+                OSError,
+                SessionNotFoundError,
+                ValueError,
+            ):
                 return
         if generation != self._history_view_generation:
             if source is not self._history_source and source is not previous:
@@ -718,7 +724,15 @@ class TUIApp(
         )
         self._history_pager.reset(endpoint_id=endpoint)
         self._prompt_history.bind(path, source, endpoint)
-        page = await self._history_pager.load()
+        try:
+            page = await self._history_pager.load()
+        except (
+            ConversationIntegrityError,
+            OSError,
+            SessionNotFoundError,
+            ValueError,
+        ):
+            return
         if (
             generation != self._history_view_generation
             or path != self._viewed_session_path()
