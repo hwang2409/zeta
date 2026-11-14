@@ -139,6 +139,35 @@ def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path:
                 assert planner.run_pass(days=30).complete
             assert retention_authority(home, lease, days=30).applied
         elif result_path == "blocked":
+            if mutation == "arm":
+                session_id = _create_closed(manager, [], name="old")
+                _age_tree(home / "sessions" / session_id, days=100)
+                with RetentionPlanner(home, lease) as planner:
+                    preview = planner.run_pass(days=30)
+                assert preview.complete and preview.preview is not None and preview.preview.root_ids
+                assert retention_authority(home, lease, days=30).applied
+                days[0] = 60
+                decided = threading.Event()
+                release = threading.Event()
+                original = RetentionPlanner.run_pass
+                def gated(planner, **kwargs):
+                    result = original(planner, **kwargs)
+                    decided.set()
+                    assert release.wait(10)
+                    return result
+                RetentionPlanner.run_pass = gated
+                try:
+                    owner = make_retention_owner(home, lease, lambda: days[0])
+                    thread = threading.Thread(target=lambda: owner._run_episode())
+                    thread.start()
+                    assert decided.wait(10)
+                    assert retention_authority(home, lease, days=30).applied
+                    release.set()
+                    thread.join(10)
+                finally:
+                    RetentionPlanner.run_pass = original
+                assert read_retention_history(home)[-1]["mode"] == "armed"
+                return
             result = retention_authority(home, lease, days=30)
             assert not result.applied
             assert read_retention_history(home)[-1]["mode"] == "none"
@@ -153,17 +182,38 @@ def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path:
             finally:
                 RetentionPlanner.run_pass = original
         else:
-            owner = make_retention_owner(home, lease, lambda: days[0])
-            projections, failure = owner._run_episode()
-            assert failure is None
-            assert projections[-1].projection["mode"] == "preview"
+            if mutation == "arm" and result_path == "preview":
+                session_id = _create_closed(manager, [], name="old")
+                _age_tree(home / "sessions" / session_id, days=100)
+                with RetentionPlanner(home, lease) as planner:
+                    assert planner.run_pass(days=30).complete
+                decided = threading.Event()
+                release = threading.Event()
+                original = RetentionPlanner.run_pass
+                def gated(planner, **kwargs):
+                    result = original(planner, **kwargs)
+                    decided.set()
+                    assert release.wait(10)
+                    return result
+                RetentionPlanner.run_pass = gated
+                try:
+                    owner = make_retention_owner(home, lease, lambda: days[0])
+                    thread = threading.Thread(target=lambda: owner._run_episode())
+                    thread.start()
+                    assert decided.wait(10)
+                    assert retention_authority(home, lease, days=30).applied
+                    release.set()
+                    thread.join(10)
+                finally:
+                    RetentionPlanner.run_pass = original
+                assert read_retention_history(home)[-1]["mode"] == "armed"
+            else:
+                owner = make_retention_owner(home, lease, lambda: days[0])
+                projections, failure = owner._run_episode()
+                assert failure is None
+                assert projections[-1].projection["mode"] == "preview"
         if mutation == "arm" and result_path == "preview":
-            assert retention_authority(home, lease, days=30).applied
-            owner = make_retention_owner(home, lease, lambda: days[0])
-            projections, failure = owner._run_episode()
-            assert failure is None
             assert read_retention_history(home)[-1]["mode"] == "armed"
-            assert projections[-1].projection["mode"] == "armed"
         elif mutation == "disarm" and result_path == "deleted":
             assert disarm_retention(home, lease).applied is True
         elif mutation == "days change" and result_path == "preview":

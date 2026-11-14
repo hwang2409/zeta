@@ -86,7 +86,12 @@ def make_retention_owner(
         nonlocal last_projection
         with _coordinator_authority(root) as token:
             history = read_retention_history(root)
-            if history and history[-1].get("mode") == "armed" and not getattr(result, "changed", False):
+            if (
+                history
+                and history[-1].get("mode") == "armed"
+                and history[-1].get("days") == current_days
+                and not getattr(result, "changed", False)
+            ):
                 planner.close()
                 projection = dict(history[-1])
                 last_projection = projection
