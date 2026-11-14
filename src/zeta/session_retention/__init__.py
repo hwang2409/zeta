@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -549,7 +550,7 @@ class RetentionPlanner:
         self.lease = lease
         self.bounds = bounds or RetentionBounds()
         self._now_ns = now_ns
-        self._lease_epoch = uuid.uuid4().hex
+        self._lease_epoch = secrets.token_hex(16)
         self._sweep: _Sweep | None = None
         self._flight: _InFlight | None = None
         self._latest: object = _UNLOADED

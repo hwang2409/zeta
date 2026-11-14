@@ -320,6 +320,7 @@ async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) ->
     lease = await asyncio.to_thread(open_writer, home)
     owner = make_retention_owner(home, lease, lambda: 0)
     owner.start()
+    opened = None
     try:
         with pytest.raises(
             RuntimeError,
@@ -332,6 +333,7 @@ async def test_started_idle_owner_guards_on_loop_session_open(tmp_path: Path) ->
                 lambda error: error,
             )
     finally:
-        opened.store.close()
+        if opened is not None:
+            opened.store.close()
         await owner.stop()
         await asyncio.to_thread(lease.close)
