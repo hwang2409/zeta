@@ -38,7 +38,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.tui import agent_card
+from zeta.tui import agent_card, agent_view_state
 from zeta.tui.agent_card import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
@@ -136,14 +136,14 @@ def test_agent_metadata_cache_reads_only_changed_lifecycle(
     second = _child(root, 2, description="second")
     navigation = AgentNavigation(root)
     reads: list[Path] = []
-    original = agent_card._read_json
+    original = agent_view_state._read_json
 
     def record(path: Path) -> dict[str, object]:
         if path.name == "agent_lifecycle.json":
             reads.append(path)
         return original(path)
 
-    monkeypatch.setattr(agent_card, "_read_json", record)
+    monkeypatch.setattr(agent_view_state, "_read_json", record)
     navigation.refresh(force=True)
     assert reads == []
 
@@ -256,7 +256,7 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
     delays: list[float] = []
     invalidations: list[None] = []
     lifecycle_reads: list[Path] = []
-    original_read = agent_card._read_json
+    original_read = agent_view_state._read_json
 
     class Handle:
         canceled = False
@@ -276,7 +276,7 @@ def test_bound_navigation_recurs_and_repaints_only_on_agent_changes(
         return original_read(path)
 
     monkeypatch.setattr(agent_card.asyncio, "get_running_loop", Loop)
-    monkeypatch.setattr(agent_card, "_read_json", record_read)
+    monkeypatch.setattr(agent_view_state, "_read_json", record_read)
     navigation.bind_layout(None, None, lambda: invalidations.append(None))
     assert len(callbacks) == 1
     assert delays == [pytest.approx(1.0)]
@@ -2080,14 +2080,14 @@ def test_child_transcript_scans_only_a_bounded_tail(
     path = child / "conversation.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for _ in range(10_000)))
     parsed_rows = 0
-    load_session_json = agent_card.load_session_json
+    load_session_json = agent_view_state.load_session_json
 
     def count_rows(raw_line: bytes) -> object:
         nonlocal parsed_rows
         parsed_rows += 1
         return load_session_json(raw_line)
 
-    monkeypatch.setattr(agent_card, "load_session_json", count_rows)
+    monkeypatch.setattr(agent_view_state, "load_session_json", count_rows)
     lines = read_agent_transcript(child)
 
     assert lines[-1] == "assistant: tail"
@@ -2201,7 +2201,7 @@ def test_child_transcript_truncation_accounting_sweep(
         scan_bytes = file_size - prefix_end
     else:
         scan_bytes = file_size + 1
-    monkeypatch.setattr(agent_card, "MAX_AGENT_SCAN_BYTES", scan_bytes)
+    monkeypatch.setattr(agent_view_state, "MAX_AGENT_SCAN_BYTES", scan_bytes)
     child.joinpath("conversation.jsonl").write_bytes(b"".join(rows))
 
     lines = read_agent_transcript(child, limit=limit)
@@ -2232,13 +2232,13 @@ def test_child_transcript_keeps_tail_of_one_oversized_message(
     )
 
     raw_tail_sizes: list[int] = []
-    recover_oversized_message = agent_card._oversized_message
+    recover_oversized_message = agent_view_state._oversized_message
 
     def record_raw_tail(raw_tail: bytes) -> object:
         raw_tail_sizes.append(len(raw_tail))
         return recover_oversized_message(raw_tail)
 
-    monkeypatch.setattr(agent_card, "_oversized_message", record_raw_tail)
+    monkeypatch.setattr(agent_view_state, "_oversized_message", record_raw_tail)
     lines = read_agent_transcript(child.session_dir)
 
     assert len(raw_tail_sizes) == 1

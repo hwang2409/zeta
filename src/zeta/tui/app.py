@@ -599,7 +599,7 @@ class TUIApp(
             composer_agent_navigation_ready=lambda: (
                 app.composer_can_focus_agent_list()
             ),
-            interaction_ready=app.interaction_ready,
+            interaction_ready=lambda: app.interaction_ready(),
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
