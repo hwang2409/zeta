@@ -728,7 +728,11 @@ class ContextAssembler(ContextMarkerMixin):
                     self._record_compaction_telemetry(plan.telemetry or {})
                     self._request_budget.reset_provider_total()
             if stale:
-                branch = [self.store.entry(ref) for ref in self.store.context_refs()]
+                branch = await asyncio.to_thread(
+                    lambda: [
+                        self.store.entry(ref) for ref in self.store.context_refs()
+                    ]
+                )
                 branch_changed = True
                 stale_plans += 1
                 if stale_plans == 3:
