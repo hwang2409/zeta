@@ -150,6 +150,7 @@ class RetentionActivationOwner:
         self._close_lease = close_lease
         self._activation_enabled = activation_enabled
         self._disable = disable
+        self._episode_user_yield = False
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -200,10 +201,16 @@ class RetentionActivationOwner:
                     if self._disable is not None:
                         projections.append(self._disable())
                 else:
-                    if self._stop.is_set():
-                        return projections, None
-                    if self._home is None or not planner_request_pending(self._home):
-                        projections.append(self._run_pass(planner, days))
+                    while not self._stop.is_set():
+                        if self._home is not None and planner_request_pending(self._home):
+                            self._episode_user_yield = True
+                            break
+                        projection = self._run_pass(planner, days)
+                        projections.append(projection)
+                        if getattr(projection, "complete", True) or not getattr(
+                            projection, "progressed", False
+                        ):
+                            break
                 planner.close()
                 planner = None
                 self._planner = None
@@ -255,15 +262,8 @@ class RetentionActivationOwner:
                     failure = exc
                 if self._stop.is_set():
                     return
-                if (
-                    projections
-                    and any(
-                        not getattr(p, "complete", True)
-                        and getattr(p, "progressed", False)
-                        for p in projections
-                    )
-                    and not (self._home is not None and planner_request_pending(self._home))
-                ):
+                if self._episode_user_yield and not self._stop.is_set():
+                    self._episode_user_yield = False
                     await asyncio.sleep(0)
                     continue
                 self._wake.clear()
