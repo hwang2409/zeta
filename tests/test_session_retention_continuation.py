@@ -166,6 +166,14 @@ async def test_armed_owner_continue_stop_or_yield_table(
         return result
 
     monkeypatch.setattr(RetentionPlanner, "run_pass", counted_pass)
+    episodes = [0]
+    original_episode = owner._run_episode
+
+    def counted_episode():
+        episodes[0] += 1
+        return original_episode()
+
+    owner._run_episode = counted_episode
     in_final_walk: list[str] = []
     original_walk = RetentionPlanner._walk
 
@@ -246,6 +254,12 @@ async def test_armed_owner_continue_stop_or_yield_table(
             # a user open yields: no error card, nothing deleted while the request is held
             assert errors == [] and deleted() == set(), (errors, deleted())
             assert left == sorted(roots)
+            if row == "user-open-yield":
+                # held at episode start: each retry is one episode with no pass, then a wait
+                held = (episodes[0], passes[0])
+                signal.idle.clear()
+                await _settle(signal.idle)
+                assert (episodes[0], passes[0]) == (held[0] + 1, held[1]), (held, episodes[0], passes[0])
             # released: the owner resumes by itself, with no wake
             await asyncio.to_thread(request.close)
             request = None
