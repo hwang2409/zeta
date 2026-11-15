@@ -2392,6 +2392,37 @@ async def test_subagent_sync_rebuilds_after_file_replacement(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_inactive_child_views_keep_eight_scalar_states_and_reject_huge_drafts(
+    tmp_path: Path,
+) -> None:
+    root = ConversationStore(tmp_path / "sessions", session_id="root")
+    children = [_child(root, index, description=f"Child {index}") for index in range(11)]
+    for child in children:
+        _append_child_lines(child, (f"line {child.name}",))
+    control = agent_card.AgentTranscriptControl()
+    try:
+        for child in children:
+            load = control.activate(child)
+            assert load is not None
+            await await_or_fail(load, what="child transcript activation")
+        # The active child is not parked; the oldest two parked children were evicted.
+        assert list(control._child_view_states) == children[2:10]
+        assert all(
+            isinstance(state, agent_view_state.InactiveViewState)
+            for state in control._child_view_states.values()
+        )
+
+        control._composer_buffer = Buffer()
+        control._composer_buffer.text = "x" * (256 * 1024 + 1)
+        assert control.activate(children[0]) is None
+        assert control._path == children[10]
+        assert list(control._child_view_states) == children[2:10]
+    finally:
+        await control.close()
+        root.close()
+
+
+@pytest.mark.asyncio
 async def test_subagent_sync_rebuilds_after_truncation(tmp_path: Path) -> None:
     root = ConversationStore(tmp_path / "sessions", session_id="root")
     child = _child(root, 1, description="Truncate")
