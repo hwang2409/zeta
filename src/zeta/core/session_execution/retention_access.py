@@ -88,17 +88,24 @@ def acquire_after_retention_yield(
         if not _enabled(home, observed_epoch):
             raise blocked(first) from first
 
-    active_fd = _active(home)
-    if active_fd is None:
-        # the planner may have ended its pass after the refusal; try once more
+    # a planner pass may end, and a new one start, between a refusal and the
+    # active check: retry while no planner shows, and refuse only after the
+    # last try so a fresh pass still gets the yield path below.
+    refused = first
+    for _ in range(3):
+        active_fd = _active(home)
+        if active_fd is not None:
+            break
         try:
             return acquire()
-        except BlockingIOError as second:
-            raise blocked(second) from second
+        except BlockingIOError as exc:
+            refused = exc
+    else:
+        raise blocked(refused) from refused
     request_fd = _existing_lock(home, "user-open-request")
     if request_fd is None:
         os.close(active_fd)
-        raise blocked(first) from first
+        raise blocked(refused) from refused
     try:
         _off_loop()
         fcntl.flock(request_fd, fcntl.LOCK_SH)
