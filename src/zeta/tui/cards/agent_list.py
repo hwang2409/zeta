@@ -52,6 +52,9 @@ class AgentListControl(UIControl):
                 selected = list_focused and entry_index == self.navigator.selected_index
                 marker = ">" if selected else " "
                 label = f"{entry.label} · {entry.agent_type} · {entry.state}"
+                if entry.path == self.navigator.transcript_control.loading_path:
+                    # First, so a long label cannot push it off screen.
+                    label = f"loading… {label}"
                 style = "class:agent-list.selected" if selected else "class:agent-list"
                 return [(style, f"{marker} {label}")]
 

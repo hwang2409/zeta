@@ -164,6 +164,13 @@ class AgentTranscriptControl(UIControl):
     def history_pager(self) -> Any:
         return self._history_pager
 
+    @property
+    def loading_path(self) -> Path | None:
+        """The view being opened, until its first page paints (not a refresh)."""
+
+        pending = self._pending_path
+        return pending if pending != self._path else None
+
     def transition_pending(self) -> bool:
         """Return whether a view change still owns unpublished work."""
 

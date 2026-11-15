@@ -96,7 +96,7 @@ async def _click_composer(app: TUIApp, pipe) -> None:
     await _send(pipe, f"\x1b[<0;10;{row}M\x1b[<0;10;{row}m")
 
 
-async def _enter_child(app: TUIApp, pipe) -> None:
+async def _enter_child(app: TUIApp, pipe, *, expect_loading: bool = False) -> None:
     navigation = app._agent_navigation
     await _wait_until(
         lambda: any(entry.path.name == CHILD_ID for entry in navigation.entries),
@@ -135,6 +135,11 @@ async def _enter_child(app: TUIApp, pipe) -> None:
             what="next visible child picker row",
         )
     await _send(pipe, "\r")
+    if expect_loading:
+        # The 23 MiB child takes a while to open; the picker row says so.
+        await _wait_for_screen(
+            app, "loading… ", "child-loading: no loading state while the child opens"
+        )
     await _wait_until(
         lambda: navigation.child_view_active
         and navigation.current_path.name == CHILD_ID
@@ -318,7 +323,7 @@ async def test_real_tui_child_view_journey(
             before = Text.from_ansi(app._transcript.render(120)).plain
             assert ROOT_MARKER in before, "root anchor fixture marker was not rendered"
 
-            await _enter_child(app, pipe)
+            await _enter_child(app, pipe, expect_loading=True)
             await _wait_until(
                 app._agent_navigation.child_view_focused,
                 what="visible focused child before finder key",
