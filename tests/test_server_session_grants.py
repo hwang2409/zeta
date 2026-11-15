@@ -1797,7 +1797,8 @@ async def test_turn_end_send_ready_orders(
                 frame = await receive()
                 if frame.get("id") in {4, 5}:
                     responses[frame["id"]] = frame
-            assert responses[4]["result"]["state"] == "idle"
+            # the admitted wake refuses state changes, so status says running; send still wins
+            assert responses[4]["result"]["state"] == "running"
             assert responses[5]["result"]["accepted"] is True
             release_notification_run.set()
             await await_or_fail(owner_task, what="turn owner return")
@@ -1806,7 +1807,7 @@ async def test_turn_end_send_ready_orders(
                 notification_run_started.wait(), what="notification turn scheduling"
             )
             status_frames = await request(4, "status", {})
-            assert status_frames[-1]["result"]["state"] == "idle"
+            assert status_frames[-1]["result"]["state"] == "running"
             owner_task = server.control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
