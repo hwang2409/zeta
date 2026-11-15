@@ -104,6 +104,9 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.set_session_available()
+                self.server._retention_owner.start()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -122,27 +125,21 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         state = self.server.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
+        if "resume_attach" in self.features and self.server.control.turn_busy():
+            session_id = await _resolve_session_id(self, params)
+            state = self.server.runtime.state
+            control = self.server.control
+            if (
+                state is not None
+                and state.session_id == session_id
+                and control.turn_busy()
+                and not control._session_swap_active
+                and not control.unhealthy()
+            ):
+                return await _attach_live_turn(self, bindings, candidate)
         with self.server.control.reserve_session_swap():
             self.server.connections.replay_session_replaced()
-            session_id = validation.required_string(params, "session_id")
-            try:
-                session_id = await asyncio.to_thread(
-                    self.server.runtime.manager.resolve_id,
-                    session_id,
-                    min_prefix_length=4,
-                )
-            except SessionIdAmbiguousError as exc:
-                raise ProtocolError(
-                    ErrorDescriptor.SESSION_ID_AMBIGUOUS,
-                    str(exc),
-                    {"session_id": session_id, "candidates": list(exc.candidates)},
-                ) from exc
-            except SessionNotFoundError as exc:
-                raise ProtocolError(
-                    ErrorDescriptor.SESSION_NOT_FOUND,
-                    str(exc),
-                    {"session_id": session_id},
-                ) from exc
+            session_id = await _resolve_session_id(self, params)
             unhealthy_same_session = (
                 self.server.control.unhealthy()
                 and self.server.runtime.session_id == session_id
@@ -192,6 +189,9 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.set_session_available()
+                self.server._retention_owner.start()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -202,6 +202,69 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             self.server.control._active_host_commands = None
             self.server.control._host_binding_required = False
         raise
+
+
+async def _resolve_session_id(self, params: dict[str, Any]) -> str:
+    session_id = validation.required_string(params, "session_id")
+    try:
+        return await asyncio.to_thread(
+            self.server.runtime.manager.resolve_id,
+            session_id,
+            min_prefix_length=4,
+        )
+    except SessionIdAmbiguousError as exc:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_ID_AMBIGUOUS,
+            str(exc),
+            {"session_id": session_id, "candidates": list(exc.candidates)},
+        ) from exc
+    except SessionNotFoundError as exc:
+        raise ProtocolError(
+            ErrorDescriptor.SESSION_NOT_FOUND,
+            str(exc),
+            {"session_id": session_id},
+        ) from exc
+
+
+async def _attach_live_turn(
+    self,
+    bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
+    candidate: SessionHostCommands,
+) -> dict[str, object]:
+    """Attach to the active session's busy turn without a swap: the turn, its
+    approvals and children stay; only this connection's bindings are re-supplied."""
+    control = self.server.control
+    reattach = None
+    if bindings is not None:
+        headers, configs = bindings
+        if (
+            not control._mcp_binding_required
+            or frozenset(headers) != control._mcp_binding_servers
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS,
+                "mcp_bindings must match the active session",
+            )
+        if not control._active_mcp_bindings:
+            reattach = (headers, configs)
+        elif control._active_mcp_bindings != headers:
+            # A running tool call may hold the current headers; swap them only when idle.
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY,
+                "mcp_bindings cannot change during a live turn",
+            )
+    # Bind host commands before the await, so a turn that ends meanwhile never
+    # sees a half-attached session. The running turn keeps its snapshot.
+    previous = (control._active_host_commands, control._host_binding_required)
+    control._active_host_commands = candidate
+    control._host_binding_required = "session_host_commands" in self.features
+    if reattach is not None:
+        try:
+            await control.reattach_mcp_bindings(*reattach)
+        except BaseException:
+            control._active_host_commands, control._host_binding_required = previous
+            raise
+    return {"session": session_snapshot(self), "attached": "live_turn"}
 
 
 async def mcp_bindings(
@@ -461,6 +524,12 @@ async def status(
 
 
 def list_sessions(
+    self, request_id: str | int, params: dict[str, Any]
+) -> tuple[dict[str, object], list[str]]:
+    return _list_sessions(self, request_id, params)
+
+
+def _list_sessions(
     self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features

@@ -456,7 +456,23 @@ class CheckpointTranscriptMixin:
         session = self._active_session
         if session is not None:
             future = session.app.future
-            if future is not None and not future.done():
+            before_exit = getattr(self, "_before_prompt_exit", None)
+            if (
+                future is not None
+                and not future.done()
+                and before_exit is not None
+            ):
+                self._before_prompt_exit = None
+
+                async def stop_before_exit() -> None:
+                    try:
+                        await before_exit()
+                    finally:
+                        if not future.done():
+                            session.app.exit(exception=EOFError())
+
+                asyncio.create_task(stop_before_exit())
+            elif future is not None and not future.done():
                 session.app.exit(exception=EOFError())
 
     def _begin_startup_replay(self) -> None:

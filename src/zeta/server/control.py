@@ -60,6 +60,7 @@ from .protocol import (
 from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
+    from ..mcp import MCPServerConfig
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
@@ -386,6 +387,18 @@ class ServeControl:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
         return True
+
+    async def reattach_mcp_bindings(
+        self,
+        headers: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        """Re-bind the active session's released MCP headers for a returning client."""
+        loop = self.server.runtime.loop
+        assert loop is not None
+        await loop.set_mcp_bindings(headers, configs)
+        await loop._ensure_mcp_servers()
+        self._active_mcp_bindings = headers
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:

@@ -209,6 +209,11 @@ class PromptRuntimeMixin:
                     if isinstance(session, FullScreenPromptSession):
                         self._release_ui_ownership()
                         self._detach_ui_notice_sinks()
+                        before_restore = getattr(
+                            self, "_before_terminal_restore", None
+                        )
+                        if before_restore is not None:
+                            await before_restore()
                         session.restore_terminal()
                         self._active_session = None
                         self._terminal_restored = True
