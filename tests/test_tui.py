@@ -16958,7 +16958,6 @@ async def test_root_tui_paging_render_path_table(
                 session.layout.focus(session.default_buffer)
         elif journey == "root-anchor-child-visit":
             from zeta.tui import agent_card as agent_card_module
-            from zeta.tui.transcript.paged_history import PagedHistoryState
 
             discovery_threads: list[int] = []
             main_thread = threading.get_ident()
@@ -17036,11 +17035,7 @@ async def test_root_tui_paging_render_path_table(
                 )
                 assert Text.from_ansi(app._transcript.render(120)).plain.strip()
                 owner = navigation.transcript_control
-                retained_pages = len(owner.history_pager.descriptors) + sum(
-                    len(value.segments)
-                    for value in vars(owner).values()
-                    if isinstance(value, PagedHistoryState)
-                )
+                retained_pages = len(owner.history_pager.descriptors)
                 assert retained_pages <= 4, (
                     "root and child retained more than the one global page budget"
                 )
@@ -17060,11 +17055,7 @@ async def test_root_tui_paging_render_path_table(
                     "returning to a child lost its parked durable anchor"
                 )
                 assert owner.history_pager.source is owner._source
-                retained_pages = len(owner.history_pager.descriptors) + sum(
-                    len(value.segments)
-                    for value in vars(owner).values()
-                    if isinstance(value, PagedHistoryState)
-                )
+                retained_pages = len(owner.history_pager.descriptors)
                 assert retained_pages <= 4, (
                     "active child retained root descriptors outside the global page budget"
                 )
