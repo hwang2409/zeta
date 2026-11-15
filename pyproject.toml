@@ -46,6 +46,7 @@ faulthandler_exit_on_timeout = true
 filterwarnings = ["error::pytest.PytestUnhandledThreadExceptionWarning"]
 markers = [
     "environment_sensitive: test behavior that depends on terminal environment",
+    "retention_on_loop_allowed: test deliberately exercising on-loop retention access",
 ]
 
 [tool.ruff.lint.per-file-ignores]

@@ -102,7 +102,8 @@ async def test_child_run_events_returns_real_join_over_both_transports(
         assert "child_run_events" in hello["result"]["capabilities"]["features"]
         created = await client.request(2, "new_session", {"provider": "codex"})
         session_id = created["result"]["session"]["session_id"]
-        child = ConversationStore(
+        child = await asyncio.to_thread(
+            ConversationStore,
             server.runtime.opened.store.session_dir / "agents",
             session_id="1",
             _storage_lease=server.runtime.opened.store._storage_lease,
@@ -165,7 +166,8 @@ async def test_late_unknown_child_join_activates_no_stream(
         )
         assert failed["error"]["code"] == -32012
 
-        child = ConversationStore(
+        child = await asyncio.to_thread(
+            ConversationStore,
             server.runtime.opened.store.session_dir / "agents",
             session_id="1",
             _storage_lease=server.runtime.opened.store._storage_lease,

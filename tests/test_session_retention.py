@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.storage_homes import initialize_storage_home
 from zeta import session_retention
 from zeta.attention_records import AttentionStore
 from zeta.core.session import SessionManager, SessionMetadata
@@ -22,7 +24,11 @@ from zeta.project_inbox import ProjectInbox
 from zeta.project_inbox_sent import SentMessageTracker
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import Message, MessageRole, TextContent
-from zeta.session_retention import RetentionBounds, RetentionPlanner
+from zeta.session_retention import (
+    RetentionBounds,
+    RetentionPlanner,
+    _coordinator_authority,
+)
 from zeta.session_retention.pin import (
     RETENTION_PIN_FILENAME,
     is_retention_pinned,
@@ -36,6 +42,238 @@ from zeta.transcript_search.index import TranscriptIndex, TranscriptSource
 def _directory(path):
     path.mkdir()
     return session_root(path)
+
+
+def test_retention_durable_writers_have_one_owner():
+    package = Path(__file__).parents[1] / "src" / "zeta" / "session_retention"
+    source = Path(__file__).parents[1] / "src"
+    names = {
+        "retention-history.jsonl", "retention-state.json", "retention-arm.json",
+        "reservations", "transactions", "manifest.json", "session-trash",
+    }
+    constants = {
+        "_STATE_NAME", "_STATE_FILENAME", "_ARM_NAME", "_ARM_FILENAME",
+        "_HISTORY_FILENAME", "_MANIFEST_NAME", "_TRASH_NAME", "_RESERVATIONS_NAME",
+        "_TRANSACTIONS_NAME",
+    }
+    primitives = {
+        "open", "write", "write_text", "write_bytes", "replace", "rename", "link",
+        "unlink", "rmdir", "mkdir", "atomic_publish_file", "publish_json", "delete",
+        "_delete", "_publish", "_publish_state", "unlink_session_file",
+    }
+    seams = {
+        ("__init__.py", "append_retention_history"),
+        ("__init__.py", "_store_state"),
+        ("__init__.py", "_publish_arm"),
+        ("__init__.py", "_remove_sidecars"),
+        ("transaction.py", "_publish"),
+        ("transaction.py", "_publish_state"),
+        ("transaction.py", "_delete"),
+        ("transaction.py", "_move_to_trash"),
+        ("transaction.py", "_unlink_tree_entry"),
+        ("transaction.py", "_remove_empty_tree_directory"),
+        ("transaction.py", "_remove_empty_transaction"),
+        ("transaction.py", "_durable_child_directory"),
+        ("transaction.py", "_start_one"),
+    }
+    readonly = {
+        ("zeta/session_retention/activation.py", "_run_episode"),
+        ("zeta/core/session_files.py", "reservation_path"),
+        ("zeta/core/session_files.py", "quarantine_path"),
+    }
+    violations = []
+
+    def call_name(call):
+        return call.func.id if isinstance(call.func, ast.Name) else (
+            call.func.attr if isinstance(call.func, ast.Attribute) else None
+        )
+
+    def is_write(call):
+        return call_name(call) != "open" or any(
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, int)
+            and value.value & (os.O_WRONLY | os.O_CREAT)
+            for value in ast.walk(call)
+        )
+
+    def owner(node, parents):
+        parts = []
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                parts.append(current.name)
+        return parts
+
+    def mentions_target(node, assigned):
+        return any(
+            (isinstance(value, ast.Constant) and value.value in names)
+            or (isinstance(value, ast.Name) and value.id in constants)
+            or (isinstance(value, ast.Name) and value.id in assigned)
+            for value in ast.walk(node)
+        )
+
+    for path in source.rglob("*.py"):
+        path_in_package = path.is_relative_to(package)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        relative = path.relative_to(source).as_posix()
+        parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        assigned = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and mentions_target(node.value, set())
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = call_name(node)
+            if name not in primitives:
+                continue
+            if name == "open" and not any(
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, int)
+                and value.value & (os.O_WRONLY | os.O_CREAT)
+                for value in ast.walk(node)
+            ):
+                continue
+            owners = owner(node, parents)
+            if not path_in_package:
+                continue
+            if not mentions_target(node, assigned):
+                continue
+            path_name = path.relative_to(package).as_posix()
+            if name in {"_publish", "_publish_state", "_delete"}:
+                if not node.args or not isinstance(node.args[0], ast.Name) or node.args[0].id != "token":
+                    violations.append(f"{relative}:{node.lineno}: {name} missing coordinator token")
+                continue
+            if any((path_name, value) in seams for value in owners):
+                continue
+            violations.append(f"{relative}:{node.lineno}: {name} is outside an exact token seam")
+        if not path_in_package:
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Constant) and node.value in names
+                    or isinstance(node, ast.Name) and node.id in constants
+                ):
+                    continue
+                owners = owner(node, parents)
+                if (relative, ".".join(reversed(owners))) not in readonly:
+                    violations.append(f"{relative}:{node.lineno}: durable retention name outside read-only allowlist")
+            continue
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            seam = (path.relative_to(package).as_posix(), function.name)
+            if seam not in seams:
+                continue
+            args = {arg.arg for arg in function.args.args}
+            if "token" not in args:
+                violations.append(f"{seam[0]}:{function.lineno}: seam has no token parameter")
+                continue
+            writes = [node for node in ast.walk(function) if isinstance(node, ast.Call) and call_name(node) in primitives and is_write(node)]
+            first_write = min(writes, key=lambda node: node.lineno) if writes else None
+            checks = [node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "require_active" and isinstance(node.func.value, ast.Name) and node.func.value.id == "token"]
+            if first_write is None or not any(check.lineno < first_write.lineno for check in checks):
+                violations.append(f"{seam[0]}:{function.lineno}: seam does not require token before its first write")
+    assert not violations, "\\n".join(violations)
+    transaction_source = (package / "transaction.py").read_text(encoding="utf-8")
+    for seam in ("_publish", "_publish_state", "_delete", "_move_to_trash", "_unlink_tree_entry", "_start_one"):
+        tree = ast.parse(transaction_source)
+        function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == seam)
+        assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_mark_changed" for node in ast.walk(function)), seam
+
+
+def test_transaction_deadline_includes_prepare(tmp_path, monkeypatch):
+    from zeta.session_retention import transaction
+
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    now = [0]
+
+    def clock():
+        return now[0]
+
+    with _opened_lease(home) as lease:
+        planner = RetentionPlanner(
+            home, lease, now_ns=clock,
+            bounds=RetentionBounds(entries_total=10, worker_ns=10),
+        )
+        real_prepare = transaction._QuarantineTransaction.prepare
+        seen = False
+
+        def prepare(owner):
+            real_prepare(owner)
+            now[0] = 11
+
+        def advance(owner, **kwargs):
+            nonlocal seen
+            seen = True
+            deadline_ns = kwargs.get("deadline_ns", clock() + 10)
+            budget = transaction._Budget(
+                entries=10, deadline_ns=deadline_ns, clock=clock,
+            )
+            with pytest.raises(transaction.TransactionError, match="bound reached"):
+                budget.charge()
+            assert kwargs["deadline_ns"] == 10
+            return transaction.TransactionOutcome(False, "retention transaction bound reached")
+
+        monkeypatch.setattr(transaction._QuarantineTransaction, "prepare", prepare)
+        monkeypatch.setattr(transaction._QuarantineTransaction, "advance", advance)
+        planner.run_pass(days=30)
+        planner.close()
+        assert seen
+
+
+def test_retention_generation_exists_only_from_live_token(tmp_path):
+    # A publication's freshness generation must come from the pre-scan token
+    # section; nothing else may build, edit, or recompute one.
+    with _coordinator_authority(tmp_path) as token:
+        generation = token.generation(30)
+    with pytest.raises(TypeError, match="coordinator-owned"):
+        session_retention.RetentionGeneration(object(), 30, None, None, None)
+    with pytest.raises(TypeError):
+        replace(generation, days=31)
+    with pytest.raises(AttributeError):
+        generation.days = 31
+    with pytest.raises(RuntimeError, match="no longer active"):
+        token.generation(30)
+
+
+def test_retention_publication_rejects_token_after_authority_exit(tmp_path):
+    from zeta.session_retention import append_retention_history, retention_result
+
+    with _opened_lease(tmp_path) as lease:
+        with _coordinator_authority(tmp_path) as token:
+            pass
+        with pytest.raises(RuntimeError, match="no longer active"):
+            append_retention_history(
+                token,
+                tmp_path,
+                lease,
+                retention_result(timestamp="0", mode="preview", days=30),
+            )
+
+
+def test_retention_history_trims_oldest_row(tmp_path):
+    from zeta.session_retention import append_retention_history, retention_result
+
+    with _opened_lease(tmp_path) as lease:
+        for index in range(129):
+            with _coordinator_authority(tmp_path) as token:
+                append_retention_history(
+                    token,
+                    tmp_path,
+                    lease,
+                    retention_result(timestamp=str(index), mode="preview", days=30),
+                )
+    rows = session_retention.read_retention_history(tmp_path)
+    assert len(rows) == 128
+    assert rows[0]["timestamp"] == "1"
+    assert rows[-1]["timestamp"] == "128"
 
 
 def test_pin_round_trip_and_idempotent_unpin(tmp_path):
@@ -134,38 +372,18 @@ def test_metadata_writes_do_not_change_pin(tmp_path):
         assert (session / RETENTION_PIN_FILENAME).read_bytes()
 
 
-_DAY_NS = 86_400 * 1_000_000_000
-_OLD = "2020-01-01T00:00:00+00:00"
-
-
-def _manager(home):
-    return SessionManager(home)
-
-
-def _create_closed(manager, stack, **kwargs):
-    opened = manager.create(
-        provider="codex", model="gpt-5.6-sol", cwd=str(manager.home),
-        auto_project=False, **kwargs,
-    )
-    opened.store.close()
-    return opened.metadata.session_id
-
-
-def _true_tree_bytes(session_dir) -> int:
-    total = 0
-    for dirpath, _dirs, files in os.walk(session_dir):
-        for name in files:
-            path = os.path.join(dirpath, name)
-            if os.path.islink(path):
-                continue
-            total += os.path.getsize(path)
-    return total
-
-
-def _planner(stack, *args, **kwargs):
-    planner = RetentionPlanner(*args, **kwargs)
-    stack.callback(getattr(planner, "close", lambda: None))
-    return planner
+from tests.support.retention_owner import (
+    _DAY_NS,
+    _OLD,
+    _age_tree,
+    _create_closed,
+    _manager,
+    _opened_lease,
+    _planner,
+    _run_sweep,
+    _run_sweep_without_error,
+    _true_tree_bytes,
+)
 
 
 def test_not_old_blocks_under_real_clock(tmp_path):
@@ -412,18 +630,6 @@ def test_below_feature_epoch_writes_nothing(tmp_path):
     assert not (tmp_path / "retention-state.json").exists()
 
 
-def test_planner_entry_points_have_no_production_callers():
-    root = Path(__file__).resolve().parents[1] / "src" / "zeta"
-    offenders = []
-    for path in root.rglob("*.py"):
-        if path.relative_to(root) == Path("session_retention/__init__.py"):
-            continue  # the module that defines the planner
-        text = path.read_text(encoding="utf-8")
-        if "RetentionPlanner" in text or ".run_pass(" in text:
-            offenders.append(str(path.relative_to(root)))
-    assert offenders == [], f"planner must stay dormant, used in: {offenders}"
-
-
 def _future_ns() -> int:
     return time.time_ns() + 60 * _DAY_NS
 
@@ -443,20 +649,6 @@ def _create_with_message(manager, text):
     return opened.metadata.session_id
 
 
-def _age_tree(session_dir, *, days=100, keep_metadata=False):
-    """Make a session look ``days`` old: metadata timestamps and every mtime."""
-    if not keep_metadata:
-        meta = session_dir / "meta.json"
-        value = json.loads(meta.read_text())
-        value["created_at"] = value["updated_at"] = _OLD
-        meta.write_text(json.dumps(value))
-    old = time.time_ns() - days * _DAY_NS
-    for dirpath, _dirs, files in os.walk(session_dir, topdown=False):
-        for name in files:
-            os.utime(os.path.join(dirpath, name), ns=(old, old), follow_symlinks=False)
-        os.utime(dirpath, ns=(old, old))
-
-
 def _write_sent_ledger(home, session_id, reported):
     """A v1 sent ledger, the shape ``SentMessageTracker`` itself loads."""
     record = {
@@ -466,33 +658,6 @@ def _write_sent_ledger(home, session_id, reported):
     path = home / "sessions" / session_id / "project-inbox-sent.json"
     path.write_text(json.dumps({"schema_version": 1, "records": [record]}))
     path.chmod(0o600)
-
-
-def _run_sweep(planner, days=30):
-    """Run passes to the end of one sweep; return the result and every reason."""
-    reasons = {}
-    for _ in range(500):
-        result = planner.run_pass(days=days)
-        reasons.update({row.root_id: (row.closed, row.reason) for row in result.reasons})
-        if result.complete:
-            return result, reasons
-    raise AssertionError("sweep did not complete in 500 passes")
-
-
-def _run_sweep_without_error(planner, days=30):
-    try:
-        return _run_sweep(planner, days)
-    except OSError:
-        return None, {}
-
-
-@contextmanager
-def _opened_lease(home):
-    lease = open_writer(home)
-    try:
-        yield lease
-    finally:
-        lease.close()
 
 
 def test_isolated_all_roots_behavior(tmp_path):
@@ -839,7 +1004,7 @@ def _generation_reader(monkeypatch):
         calls += 1
         return 0 if calls % 2 else 1
 
-    monkeypatch.setattr("zeta.session_retention.read_reference_generation", read)
+    monkeypatch.setattr("zeta.session_retention._helpers.read_reference_generation", read)
 
 
 def _check_authority_case(tmp_path, monkeypatch, kind, mode):
@@ -1752,9 +1917,9 @@ def _run_fault_transaction(home, details, monkeypatch, *, fail_at=None, cancel=F
         finally:
             active = False
 
-    def publish(owner, directory_fd, name, payload, validate):
+    def publish(owner, token, directory_fd, name, payload, validate):
         step(f"publish:{name}")
-        return real_publish(owner, directory_fd, name, payload, validate)
+        return real_publish(owner, token, directory_fd, name, payload, validate)
 
     class TransactionOs:
         def __getattr__(self, name):

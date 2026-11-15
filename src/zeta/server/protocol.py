@@ -233,6 +233,7 @@ class EventDescriptor(StrEnum):
     CHILD_PROGRESS = "child_progress"
     CHILD_ENDED = "child_ended"
     BACKGROUND_TASK_UPDATED = "background_task_updated"
+    SESSION_RETENTION = "session_retention"
     TODO_UPDATED = "todo_updated"
     ZETA_UPDATED = "zeta_updated"
 
@@ -277,6 +278,7 @@ FEATURES = (
     "run_work",
     "zeta_updated",
     "approval_restart_reason",
+    "session_retention",
     "mcp_refresh_tools",
 )
 
@@ -408,6 +410,7 @@ class MethodDescriptor(Enum):
 
 EVENT_ACCESS = {
     EventDescriptor.BACKGROUND_TASK_UPDATED: Access.CONTROLLER_READ,
+    EventDescriptor.SESSION_RETENTION: Access.CONTROLLER_READ,
     EventDescriptor.TODO_UPDATED: Access.CONTROLLER_READ,
 }
 
