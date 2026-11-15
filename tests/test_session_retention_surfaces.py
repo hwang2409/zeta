@@ -259,16 +259,18 @@ def _hold_retention_root(home_text: str, session_id: str, ready, command, crashe
     fcntl.flock(active, fcntl.LOCK_SH)
     fcntl.flock(root, fcntl.LOCK_EX)
     ready.send(True)
-    if crashed:
-        return
-    from zeta.session_retention.handshake import planner_request_pending
+    if not crashed:
+        from zeta.session_retention.handshake import planner_request_pending
 
-    while not planner_request_pending(home) and not command.poll():
-        pass
+        while not planner_request_pending(home) and not command.poll():
+            pass
+    # crashed: released at once, as by process death
     fcntl.flock(root, fcntl.LOCK_UN)
     fcntl.flock(active, fcntl.LOCK_UN)
     os.close(root)
     os.close(active)
+    # stay alive until the test's command, so its send never meets a closed pipe
+    assert command.poll(30)
 
 
 def _start_retention_holder(home: Path, session_id: str, *, crashed: bool = False):
@@ -379,7 +381,7 @@ async def test_real_serve_access_matrix_never_busy_or_partial(
         if owner_state == "mid-preview" and route != "list-project" and route in {"list-full", "list-paged"}:
                 assert sid in {row["session_id"] for row in rows}
     finally:
-        if holder is not None and holder.is_alive():
+        if holder is not None:
             command.send(True)
             holder.join(10)
         await close_serve(server, writer)
@@ -415,7 +417,7 @@ def test_cli_session_list_and_rename_survive_retention_owner(
         assert f"renamed {sid}" in capsys.readouterr().out
         assert SessionManager(home).read_metadata(sid).name == "from-cli"
     finally:
-        if holder is not None and holder.is_alive():
+        if holder is not None:
             command.send(True)
             holder.join(10)
         if holder is not None:
@@ -472,7 +474,7 @@ def test_tui_resume_entry_survives_retention_owner(
     finally:
         if app is not None and not app.loop.store._closed:
             app.loop.store.close()
-        if holder is not None and holder.is_alive():
+        if holder is not None:
             command.send(True)
             holder.join(10)
         if holder is not None:
