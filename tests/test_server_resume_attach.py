@@ -304,3 +304,86 @@ async def test_resume_without_attach_feature_stays_busy(tmp_path: Path) -> None:
     finally:
         await _close(writer)
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support.owned import await_or_fail
+    from tests.test_server_turn_reconnect import RECONNECT, _drop, _reconnect
+
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = FakeBackend([
+        ScriptedTurn([TextContent("warm")]),
+        ScriptedTurn([TextContent("woke")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    features = [*RECONNECT, "new_session_settings", "session_mcp_bindings", "resume_attach"]
+    page = {"server": "page", "headers": {"Authorization": "Bearer page"}}
+    reader, writer = await _connect(server)
+    writer2 = None
+    release_setup = asyncio.Event()
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        other_id = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol",
+        }))[-1]["result"]["session"]["session_id"]
+        session_id = (await _request(reader, writer, 3, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol", "mcp_bindings": [page],
+        }))[-1]["result"]["session"]["session_id"]
+        await _request(reader, writer, 4, "send", {"text": "warm"})
+        await _event(reader, "agent_end")
+
+        loop = server.runtime.loop
+        in_setup = asyncio.Event()
+        original_ensure = loop._ensure_mcp_servers
+
+        async def held_ensure() -> None:
+            # hold only the wake's call; the attach's own MCP rebind passes.
+            if not in_setup.is_set():
+                in_setup.set()
+                await await_or_fail(release_setup.wait(), what="wake setup release")
+            await original_ensure()
+
+        # test-contract: seam MCP startup is the slow step a wake runs before turn_start
+        monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
+        server.runtime.opened.store.append_agent_notification(
+            "child", child_session_path="/tmp/child", description="child",
+            status="completed", text="child done",
+        )
+        server.runtime._background_wake_sink(session_id)
+        await await_or_fail(in_setup.wait(), what="wake in setup")
+
+        # a page reload during the wake's setup: reconnect and resume the open session.
+        await _drop(writer, server)
+        reader2, writer2 = await _reconnect(server, 5, features)
+        elsewhere = await _request(reader2, writer2, 6, "resume", {"session_id": other_id})
+        assert _error_code(elsewhere) == BUSY
+        attached = await _request(reader2, writer2, 7, "resume", {
+            "session_id": session_id, "mcp_bindings": [page]
+        })
+        result = attached[-1].get("result", {})
+        assert result.get("attached") == "live_turn", attached[-1]
+        assert result["session"]["session_id"] == session_id
+
+        release_setup.set()
+        await _event(reader2, "turn_start")
+        end = await _event(reader2, "agent_end")
+        assert end["session_id"] == session_id
+        assert server.runtime.session_id == session_id
+    finally:
+        release_setup.set()
+        await _close(writer2, writer)
+        await server.close()
+        await mcp.close()

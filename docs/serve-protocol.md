@@ -1540,7 +1540,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    that arrives first wins. State changes are stricter: once a queued
    notification turn has started its setup (before its `turn_start`),
    `slash_run` commands that `runs_while_busy` does not allow, idle-only
-   requests, and `new_session`/`resume` return `-32004` until that turn ends.
+   requests, `new_session`, and `resume` of another session return `-32004`
+   until that turn ends. With `resume_attach`, `resume` of the open session
+   attaches to that turn, and the client then sees its `turn_start`.
    A notification turn does not start its setup while a session-mutation or
    controller-write request is running. When the turn left a steer unread, the
    server starts the next turn after `agent_end`; a `send` that arrives after
