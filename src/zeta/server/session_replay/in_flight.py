@@ -2,8 +2,8 @@
 
 History has no row for a reply until its `assistant_message`, and a running
 tool's streamed output has no row at all. A replay join with `in_flight_replay`
-replaces its held copies of these live frames with the merged frames kept here,
-so a client that joins mid-reply gets the whole partial reply once, then the
+does not hold these live frames while it reads history; it sends the merged
+frames kept here instead, so a client that joins mid-reply gets the whole partial reply once, then the
 live deltas after it.
 """
 from __future__ import annotations

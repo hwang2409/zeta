@@ -30,6 +30,7 @@ from zeta.protocol.types import (
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor
+from zeta.server.session_replay import REPLAY_SCOPE_MAX_RECORDS
 from zeta.server.session_replay.in_flight import IN_FLIGHT_MAX_PARTS, InFlightReply
 
 FEATURES = [
@@ -418,3 +419,63 @@ def test_tool_output_parts_are_capped_per_tool_not_across_the_reply() -> None:
     outputs = [fields["output"] for event, fields in frames[1:]]
     assert len(outputs) == IN_FLIGHT_MAX_PARTS
     assert outputs[-1] == f"{IN_FLIGHT_MAX_PARTS + 3};"
+
+
+@pytest.mark.asyncio
+async def test_forced_order_fast_stream_during_history_read_keeps_the_join(
+    tmp_path: Path,
+) -> None:
+    """Forced order: more deltas than a replay scope can hold arrive while the
+    join reads history. They are in the in-flight frames, so the join must not
+    hold them and run out of room (-32009)."""
+    deltas = [TextContent(f"{index:03d} ") for index in range(REPLAY_SCOPE_MAX_RECORDS + 16)]
+    backend = GatedBackend([
+        ([TextContent("start "), HOLD, *deltas, HOLD, TextContent("end")],
+         [TextContent("start " + "".join(d.text for d in deltas) + "end")]),
+    ])
+    server = _server(tmp_path, backend)
+    reader, writer = await _connect(server)
+    writer2 = None
+    try:
+        session_id = await _start(server, reader, writer)
+        await await_or_fail(backend.held[0].wait(), what="mid-reply")
+        reader2, writer2 = await _reattach(server, session_id, writer)
+
+        connections = server.connections
+        original_read = connections.read_replay_history
+        reading = asyncio.Event()
+        proceed = asyncio.Event()
+
+        async def held_read(*args, **kwargs):
+            reading.set()
+            await await_or_fail(proceed.wait(), what="held history read")
+            return await original_read(*args, **kwargs)
+
+        connections.read_replay_history = held_read
+        last = _published(server, "assistant_delta", deltas[-1].text)
+        join = asyncio.create_task(
+            _request(reader2, writer2, 6, "session_history_and_subscribe", {
+                "session_id": session_id
+            })
+        )
+        try:
+            await await_or_fail(reading.wait(), what="join reading history")
+            backend.gates[0].set()
+            await await_or_fail(last.wait(), what="fast stream published")
+            proceed.set()
+            response = (await await_or_fail(join, what="join"))[-1]
+        finally:
+            proceed.set()
+            if not join.done():
+                join.cancel()
+        assert "result" in response, response
+        view = ClientView(response["result"]["messages"])
+        backend.gates[1].set()
+        view.apply(
+            response["result"]["replay"]["stream_id"],
+            await frames_until_event(reader2, "agent_end"),
+        )
+        assert view.committed == ["start " + "".join(d.text for d in deltas) + "end"]
+    finally:
+        backend.open_all()
+        await _close(server, writer2, writer)

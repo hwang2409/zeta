@@ -1708,8 +1708,9 @@ error code and message. Provider status and origin remain internal.
   stream: one `assistant_delta` per run of reply text or thinking (`kind` as
   live) and one `tool_output` per running tool call, merged from the live
   events, each with the next `seq`. Live events after them continue the same
-  reply. The join drops its own copies of earlier live `assistant_delta` and
-  foreground `tool_output` events, so each part reaches the client once, and a
+  reply. While it reads history, the join does not hold live `assistant_delta`
+  and foreground `tool_output` events (these frames carry them), so each part
+  reaches the client once, a fast stream does not fill the join's buffer, and a
   reply that committed during the join reaches it only as its history row or
   its `assistant_message`. Apply these events like live ones. A tool that
   starts and ends during the join shows only `tool_start` and `tool_end`; its

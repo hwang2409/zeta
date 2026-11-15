@@ -230,13 +230,13 @@ class ReplayOutput:
         return self.replay.finish_join(connection, history, frontier_seq, frontier_row_id)
 
     def _hold_in_flight(self, connection: Any, scope: ReplayScopeId) -> None:
-        """Replace held reply deltas and tool output with the whole in-flight state.
+        """Hold the whole in-flight state in place of the live frames it carries.
 
-        Runs in the same loop step as the join's seq assignment, so each frame
+        A pending join never holds those live frames (``_publish_replay``). This
+        runs in the same loop step as the join's seq assignment, so each frame
         published before it is in these frames and each one after gets a later seq.
         """
         state = self._connections[connection]
-        self.replay.drop_held(connection, self.in_flight.owns)
         stream_id = self.replay.pending_stream_id(connection)
         for event, fields in self.in_flight.frames(scope.value):
             shaped = self._fields_for_connection(state, event, fields)
@@ -424,6 +424,14 @@ class ReplayOutput:
             return False
         if prepared is None or state.output is None:
             return False
+        if (
+            prepared.seq is None
+            and scope.kind == "top"
+            and "in_flight_replay" in state.features
+            and self.in_flight.owns(event, fields)
+        ):
+            # the join's in-flight frames carry it, so holding it only costs room
+            return True
         # a pending join's frames get their seq when the join ends
         position = {"stream_id": prepared.stream_id}
         if prepared.seq is not None:
