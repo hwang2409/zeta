@@ -239,12 +239,12 @@ async def test_real_tui_child_view_journey(
             def oldest_resident() -> str:
                 return pager.pages[0].units[0].entry_id
 
-            def child_place() -> tuple[int, str, int, object]:
-                # The pager generation moves on every reset, so it proves no pager work.
+            def child_place() -> tuple[int, str, object]:
+                # The pager generation moves on every reset, so it proves no pager
+                # work; the durable anchor is the top row the user sees.
                 return (
                     pager.generation,
                     oldest_resident(),
-                    control.transcript.scroll_offset,
                     control.transcript.durable_scroll_anchor,
                 )
 
@@ -280,6 +280,7 @@ async def test_real_tui_child_view_journey(
                     "child-paging: after five older loads the newest page came back "
                     "(the scrolled view jumped back to the newest window)"
                 )
+                await _terminal_text(app)
                 before_tick = child_place()
                 ticked_at = navigation._last_refresh_at
                 await _wait_until(
