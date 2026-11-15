@@ -48,8 +48,9 @@ class _IdleSignal(asyncio.Event):
         super().__init__()
         self.idle = asyncio.Event()
 
-    def wait(self):  # the owner awaits the returned coroutine under its own deadline
+    def wait(self):
         self.idle.set()
+        # test-contract: seam the owner awaits this coroutine under its own wake deadline
         return super().wait()
 
 
