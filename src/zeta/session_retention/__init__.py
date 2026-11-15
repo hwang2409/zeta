@@ -14,6 +14,7 @@ import os
 import secrets
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ _MAX_HISTORY = 128
 _ARM_FILENAME = "retention-arm.json"
 _COORDINATOR_DOMAIN = "coordinator"
 _ARM_WARNING = "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
+_UPGRADE_HINT = "retention unavailable: upgrade the home before arming"
 _METADATA_NAME = "meta.json"
 _SESSION_STATE_NAME = "session_state.json"
 _PENDING_LINK_NAME = "project_link_pending.json"
@@ -64,6 +66,35 @@ _LIFECYCLE_NAME = "agent_lifecycle.json"
 _MAX_JSON_BYTES = 1 << 20
 _MAX_TREE_DEPTH = 64
 _NS_PER_DAY = 86_400 * 1_000_000_000
+_MAX_ERRORS = 8
+# the closed set of conservative reasons a root is kept: shown as skips, never as errors
+SKIP_REASONS = (
+    "not old enough",
+    "session is open or in use",
+    "pinned",
+    "live or recoverable child",
+    "pending project link",
+    "pending child link",
+    "pending inbox reference",
+    "published top-level dependent",
+    "unacknowledged sent message",
+    "session is being deleted",
+    "references changed during scan",
+    "references not fully scanned",
+    "unresolved transcript recovery",
+    "unresolved memory reconciliation",
+    "session or entry disappeared",
+    "no transcript",
+    "malformed transcript header",
+)
+
+
+def _tally(reason: str, skips: Counter[str], errors: list[str]) -> None:
+    """Count one kept root's reason as a skip, or keep it as one of a bounded list of errors."""
+    if reason in SKIP_REASONS:
+        skips[reason] += 1
+    elif len(errors) < _MAX_ERRORS:
+        errors.append(reason)
 
 
 @dataclass(frozen=True)
@@ -153,6 +184,9 @@ class PassResult:
     changed: bool = False
     # a root of the armed preview got its terminal outcome (deleted or rejected) in this pass
     stepped: bool = False
+    # kept roots by reason (closed set SKIP_REASONS) and real failures, for the projection
+    skip_counts: Mapping[str, int] = field(default_factory=dict)
+    errors: tuple[str, ...] = ()
 
 
 class RetentionPlannerError(Exception):
@@ -200,19 +234,22 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
         root_ids = tuple(reason.root_id for reason in result.reasons if reason.root_id != "recovery")
         return retention_result(
             timestamp=timestamp, mode=result.mode, days=days,
-            root_ids=root_ids,
-            errors=tuple(reason.reason for reason in result.reasons if reason.reason),
+            root_ids=root_ids, skip_counts=dict(result.skip_counts), errors=result.errors,
         )
     if preview is None:
-        errors = tuple(reason.reason for reason in result.reasons if reason.reason)
         return retention_result(
             timestamp=timestamp, mode="preview", days=days,
-            errors=errors, progress_counts={"roots": len(result.reasons)},
+            # no partial skip tally: it grows each pass, so every pass would be a new row
+            errors=result.errors,
+            progress_counts={"roots": len(result.reasons)},
         )
     return retention_result(
         timestamp=timestamp, mode="preview", days=days,
         root_ids=preview.root_ids, count=preview.count, bytes=preview.bytes,
         preview_id=preview.preview_id, cutoff=preview.cutoff,
+        # a partial re-sweep's tallies are not this preview's; the owner reuses the preview's row
+        skip_counts=dict(result.skip_counts) if result.complete else None,
+        errors=result.errors if result.complete else (),
     )
 
 
@@ -335,8 +372,12 @@ def _keeps_deleting(days: object) -> str:
     return f"arming keeps deleting closed, unpinned sessions older than {days} days until /retention disarm"
 
 
-def retention_status(home: str | Path) -> tuple[tuple[dict[str, object], ...], str]:
+def retention_status(
+    home: str | Path, lease: WriterLease,
+) -> tuple[tuple[dict[str, object], ...], str]:
     """Read history and the arm file; return them with the bare `/retention` reply for both surfaces."""
+    if not feature_enabled(lease.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION):
+        return (), _UPGRADE_HINT
     history = read_retention_history(home)
     if not history:
         return history, "retention: none"
@@ -417,7 +458,7 @@ def _refusal(
         return None
     # display only: no coordinator, no decision, no write
     empty = retention_result(timestamp=now(), mode="none", days=_checked_days(days()))
-    return RetentionAuthorityResult("retention unavailable: upgrade the home before arming", empty, False)
+    return RetentionAuthorityResult(_UPGRADE_HINT, empty, False)
 
 
 def _busy(days: int, now: Callable[[], str]) -> RetentionAuthorityResult:
@@ -711,6 +752,8 @@ class _Sweep:
     discovery_blocked: bool = False
     selected: list[str] = field(default_factory=list)
     bytes: int = 0
+    skips: Counter[str] = field(default_factory=Counter)
+    errors: list[str] = field(default_factory=list)
 
     @property
     def cutoff_ns(self) -> int:
@@ -905,6 +948,7 @@ class RetentionPlanner:
             preview=_preview_snapshot(self._latest),
             in_progress_root=None if complete else sweep.current_root,
             expected_generation=expected_generation,
+            skip_counts=dict(sweep.skips), errors=tuple(sweep.errors),
         )
 
     def commit_state(self, token: CoordinatorToken) -> bool:
@@ -939,6 +983,10 @@ class RetentionPlanner:
             if outcome.session_id is not None or outcome.blocked is not None
             else ()
         )
+        skips: Counter[str] = Counter()
+        errors: list[str] = []
+        if outcome.blocked:
+            _tally(outcome.blocked, skips, errors)
         return PassResult(
             enabled=True,
             complete=False,
@@ -948,6 +996,7 @@ class RetentionPlanner:
             expected_generation=expected_generation,
             changed=outcome.changed,
             stepped=stepped,
+            skip_counts=dict(skips), errors=tuple(errors),
         )
 
     @contextmanager
@@ -1025,6 +1074,8 @@ class RetentionPlanner:
                 if outcome.closed:
                     sweep.selected.append(outcome.root_id)
                     sweep.bytes += outcome.bytes
+                elif outcome.reason:
+                    _tally(outcome.reason, sweep.skips, sweep.errors)
         return reasons
 
     def _decide(self, home_fd, sessions_fd, sweep: _Sweep, budget: _Budget) -> RootOutcome | None:

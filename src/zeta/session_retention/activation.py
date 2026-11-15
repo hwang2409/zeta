@@ -144,6 +144,13 @@ def make_retention_owner(
             # the one read of the setting at publication; every decision below uses current.days
             current = token.generation(days())
             history = read_retention_history(root)
+            if (
+                not result.complete and result.mode is None and projection["preview_id"] is not None
+                and history and history[-1].get("mode") == "preview"
+                and history[-1].get("preview_id") == projection["preview_id"]
+            ):
+                # a partial re-sweep under this preview says what the preview said: no new row or card
+                projection = {**projection, "skip_counts": history[-1]["skip_counts"], "errors": history[-1]["errors"]}
             # a transaction outcome (deleted, rejected, or blocked) is a fact: always publish it
             effectful = result.mode is not None or bool(getattr(result, "changed", False))
             if (
@@ -330,28 +337,32 @@ class RetentionActivationOwner:
                 return projections, None
             context = planner_active(self._home) if self._home is not None else _null_context()
             with context:
-                days = self._days()
-                if days == 0:
-                    if self._disable is not None:
-                        projections.append(Published(self._disable(), complete=True))
-                else:
-                    while not self._stop.is_set():
-                        if self._home is not None and planner_request_pending(self._home):
-                            return projections, Yielded("user")
-                        projection = self._run_pass(
-                            planner, days,
-                            lambda: "stop" if self._stop.is_set() else (
-                                "user" if self._home is not None and planner_request_pending(self._home) else None
-                            ),
-                        )
-                        if isinstance(projection, Yielded):
-                            return projections, projection
-                        projections.append(projection)
-                        # a stepped root ends the episode so its card shows now; _run continues the chain
-                        if projection.stepped or projection.complete or not projection.progressed:
-                            break
-                planner.close()
-                planner = None
+                # close inside the block: planner-active must not be free while
+                # the planner still holds a session lock, or a user open fails.
+                try:
+                    days = self._days()
+                    if days == 0:
+                        if self._disable is not None:
+                            projections.append(Published(self._disable(), complete=True))
+                    else:
+                        while not self._stop.is_set():
+                            if self._home is not None and planner_request_pending(self._home):
+                                return projections, Yielded("user")
+                            projection = self._run_pass(
+                                planner, days,
+                                lambda: "stop" if self._stop.is_set() else (
+                                    "user" if self._home is not None and planner_request_pending(self._home) else None
+                                ),
+                            )
+                            if isinstance(projection, Yielded):
+                                return projections, projection
+                            projections.append(projection)
+                            # a stepped root ends the episode so its card shows now; _run continues the chain
+                            if projection.stepped or projection.complete or not projection.progressed:
+                                break
+                finally:
+                    planner.close()
+                    planner = None
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - keep the owner alive after pass errors
