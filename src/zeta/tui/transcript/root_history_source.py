@@ -294,25 +294,29 @@ class RootTUIHistorySource:
                 return
             cursor = older
 
-    def _visible_users(self) -> list[Any]:
-        return [
-            ref for ref in self._store.branch_refs()
-            if ref.type == "message"
-            and isinstance(ref.facts, MessageFacts)
-            and ref.facts.is_user_forkpoint
-        ]
-
     async def adjacent_visible_user(
         self, entry_id: str, *, direction: Literal["older", "newer"]
     ) -> str | None:
+        """The nearest prompt before or after any row, prompt or not."""
+
         def read() -> str | None:
-            users = self._visible_users()
-            positions = {ref.id: index for index, ref in enumerate(users)}
-            position = positions.get(entry_id)
+            refs = self._store.branch_refs()
+            position = next(
+                (index for index, ref in enumerate(refs) if ref.id == entry_id), None
+            )
             if position is None:
                 return None
-            target = position + (-1 if direction == "older" else 1)
-            return users[target].id if 0 <= target < len(users) else None
+            scan = reversed(refs[:position]) if direction == "older" else refs[position + 1:]
+            return next(
+                (
+                    ref.id
+                    for ref in scan
+                    if ref.type == "message"
+                    and isinstance(ref.facts, MessageFacts)
+                    and ref.facts.is_user_forkpoint
+                ),
+                None,
+            )
 
         return await self._store._to_thread_store(read)
 

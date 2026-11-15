@@ -41,7 +41,6 @@ from ..core.slash import (
 )
 from ..protocol.types import (
     Message,
-    MessageRole,
 )
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
@@ -688,32 +687,36 @@ class TUIApp(
     async def _reveal_adjacent_user(self, direction: str) -> None:
         """Page to the adjacent prompt the resident rows cannot put on the top row."""
 
-        pager = self._history_pager
-        target = self._transcript.next_user_entry() if direction == "newer" else None
+        pager, transcript = self._history_pager, self._transcript
+        if direction == "newer" and not pager.can_load_newer:
+            # The session tail is resident, so the next prompt is too close to
+            # the end to reach the top row: show the end instead.
+            transcript.scroll_to_bottom()
+            self._invalidate_prompt()
+            return
+        target = transcript.next_user_entry() if direction == "newer" else None
         if target is not None:
             await pager.reveal(target)
         else:
-            users = [
-                unit.value.id
+            durable = [
+                unit.entry_id
                 for page in pager.pages
                 for unit in page.units
-                if (message := getattr(unit.value, "message", None)) is not None
-                and message.role is MessageRole.USER
+                if ":dependency:" not in unit.entry_id
             ]
-            if users:
+            if durable:
                 target = await pager.navigate_user(
-                    users[0 if direction == "older" else -1], direction
+                    durable[0 if direction == "older" else -1], direction
                 )
-        if target is None:
-            if direction == "newer":
-                if pager.can_load_newer:
-                    await self._load_transcript_page(reset=True)
-                self._transcript.scroll_to_bottom()
+        if target is not None:
+            self._render_resident_history()
+            if transcript.restore_durable_scroll_anchor((target, 0, 0)):
                 self._invalidate_prompt()
-            return
-        self._render_resident_history()
-        self._transcript.restore_durable_scroll_anchor((target, 0, 0))
-        self._invalidate_prompt()
+                return
+        if direction == "newer":
+            await self._load_transcript_page(reset=True)
+            transcript.scroll_to_bottom()
+            self._invalidate_prompt()
 
     def _resident_page_keys(self) -> tuple[str, ...]:
         return tuple(descriptor.key for descriptor in self._history_pager.descriptors)

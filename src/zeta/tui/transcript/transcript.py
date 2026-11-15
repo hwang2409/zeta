@@ -1131,6 +1131,12 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         locations = self._locations(self._content_width)
         if self._follow_tail:
             self._scroll_offset = max(0, len(lines) - self._viewport_height)
+        elif self._anchor is not None:
+            # A restored anchor (after pages were rebuilt) owns the position
+            # until a frame resolves it; the old line number points elsewhere.
+            index = self._anchor_index(locations, self._anchor)
+            if index is not None:
+                self._scroll_offset = index
         self._line_locations = locations
         self._locations_revision = self._revision
         self._lazy_viewport = False

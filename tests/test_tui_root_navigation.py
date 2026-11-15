@@ -75,8 +75,9 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
     """Write a ~3,600-row root session with the shape of a real long session.
 
     Each turn has an agent notification that the TUI already presented (a row
-    the history pages skip), and every tenth turn starts with a compaction
-    larger than the 1 MiB page budget, so it fills a page on its own.
+    the history pages skip). Compactions larger than the 1 MiB page budget sit
+    just before or just after some prompts, so the page next to such a prompt
+    holds only a few rows.
     """
 
     home = tmp_path_factory.mktemp("root-nav")
@@ -115,8 +116,21 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
         def message(value: Message) -> None:
             write("message", {"message": value.to_dict()})
 
+        def compaction() -> None:
+            write(
+                "compaction",
+                {
+                    "replaces": [],
+                    "source_seq_start": 1,
+                    "source_seq_end": seq,
+                    "summary": huge_summary,
+                },
+            )
+
         for turn in range(TURNS):
             word = OLD_WORDS.get(turn, "")
+            if turn % 10 == 5:
+                compaction()
             message(
                 Message(
                     MessageRole.USER,
@@ -124,17 +138,10 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
                     metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
                 )
             )
-            if turn % 10 == 5:
-                write(
-                    "compaction",
-                    {
-                        "replaces": [],
-                        "source_seq_start": 1,
-                        "source_seq_end": seq,
-                        "summary": huge_summary,
-                    },
-                )
-            for tool in range(TOOLS_PER_TURN):
+            if turn % 10 == 7:
+                compaction()
+            # The last turn is short, so its prompt cannot reach the top row.
+            for tool in range(TOOLS_PER_TURN if turn < TURNS - 1 else 0):
                 call = ToolCall(f"call-{turn}-{tool}", "read", {"path": f"f{tool}.txt"})
                 message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
                 message(
@@ -300,7 +307,8 @@ async def running_tui(home: RootHome) -> AsyncIterator[Driver]:
 async def _ctrl_up_to(driver: Driver, oldest: int) -> None:
     """Press ctrl+up from the tail; each press puts the next older prompt on top."""
 
-    for turn in range(TURNS - 1, oldest - 1, -1):
+    # The newest prompt already shows on the tail screen and cannot go higher.
+    for turn in range(TURNS - 2, oldest - 1, -1):
         await driver.until(driver.idle, what="settled screen before ctrl+up")
         await driver.send(CTRL_UP)
         await driver.until(
@@ -383,28 +391,54 @@ async def test_ctrl_down_returns_to_the_tail(root_home: RootHome) -> None:
         )
 
 
+async def _page_down_to_tail(driver: Driver) -> None:
+    """PageDown until the newest answer shows; no press may move back or stall."""
+
+    for press in range(400):
+        await driver.until(driver.idle, what="settled screen before PageDown")
+        driver.assert_in_order(f"before PageDown {press + 1}")
+        if _answer(TURNS - 1) in driver.screen():
+            return
+        before = driver.rows()
+        top_before = driver.order()[:1]
+        await driver.send(PAGE_DOWN)
+        await driver.until(
+            lambda before=before: driver.rows() != before,
+            what=f"PageDown {press + 1} did not move the view",
+        )
+        await driver.until(driver.idle, what="settled screen after PageDown")
+        assert driver.order()[:1] >= top_before, (
+            f"PageDown {press + 1} jumped back from {top_before} to "
+            f"{driver.order()[:1]}; screen:\n{driver.screen()}"
+        )
+    raise AssertionError("PageDown never reached the tail")
+
+
 @pytest.mark.asyncio
 async def test_page_down_loads_newer_pages_back_to_the_tail(root_home: RootHome) -> None:
     async with running_tui(root_home) as driver:
         await _ctrl_up_past(driver, TURNS - 30)
-        for press in range(400):
-            await driver.until(driver.idle, what="settled screen before PageDown")
-            driver.assert_in_order(f"before PageDown {press + 1}")
-            if _answer(TURNS - 1) in driver.screen():
-                break
-            before = driver.rows()
-            top_before = driver.order()[:1]
-            await driver.send(PAGE_DOWN)
-            await driver.until(
-                lambda before=before: driver.rows() != before,
-                what=f"PageDown {press + 1} did not move the view",
-            )
-            await driver.until(driver.idle, what="settled screen after PageDown")
-            assert driver.order()[:1] >= top_before, (
-                f"PageDown {press + 1} jumped back from {top_before} to "
-                f"{driver.order()[:1]}; screen:\n{driver.screen()}"
-            )
-        assert _answer(TURNS - 1) in driver.screen(), "PageDown never reached the tail"
+        await _page_down_to_tail(driver)
+
+
+@pytest.mark.asyncio
+async def test_page_down_from_a_prompt_behind_a_compaction(root_home: RootHome) -> None:
+    async with running_tui(root_home) as driver:
+        # A compaction sits right before prompt 75, so its page holds few rows
+        # and the view keeps line numbers instead of the virtual window.
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send(_prompt(75))
+        await driver.settle("the finder settles on the old prompt")
+        await driver.send(ENTER)
+        await driver.until(
+            lambda: not driver.finder_drawn() and _prompt(75) in driver.top(),
+            what=f"Enter did not put {_prompt(75)} on the top row",
+        )
+        # End the match highlight so PageDown scrolls the transcript.
+        await driver.settle("accept settles")
+        await driver.send(ESCAPE)
+        await _page_down_to_tail(driver)
 
 
 @pytest.mark.asyncio
