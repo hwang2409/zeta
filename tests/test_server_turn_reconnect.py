@@ -458,3 +458,64 @@ async def test_resume_attach_takes_over_turn_in_grace_and_rebinds_mcp(
             release.set()
         await _close(server, writer2, writer)
         await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_inside_grace_ends_it_so_later_wake_survives_deadline(
+    tmp_path: Path,
+) -> None:
+    backend = HeldBackend([
+        ([TextContent("first")], True), ([TextContent("wake reply")], True)
+    ])
+    server = _server(tmp_path, backend)
+    deadline = asyncio.Event()
+
+    async def injected_deadline() -> None:
+        await await_or_fail(deadline.wait(), what="injected grace deadline")
+
+    server.control._grace_deadline = injected_deadline
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, 1, RECONNECT)
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.streaming[0].wait(), what="first request")
+        first = server.control._turn_task
+        assert first is not None
+
+        await _drop(writer, server)
+        grace = server.control._grace_task
+        assert grace is not None
+        backend.release[0].set()
+        await await_or_fail(asyncio.shield(first), what="first turn end")
+
+        # a background completion wakes the session after the client's turn ended.
+        store = server.runtime.opened.store
+        store.append_agent_notification(
+            "child",
+            child_session_path="/tmp/child",
+            description="child",
+            status="completed",
+            text="child done",
+        )
+        sink = server.runtime._background_wake_sink
+        assert sink is not None
+        sink(server.runtime.session_id)
+        await await_or_fail(backend.streaming[1].wait(), what="wake turn")
+        wake = server.control._turn_task
+        assert wake is not None
+
+        # the old grace deadline passes while the wake turn runs.
+        deadline.set()
+        await await_or_fail(asyncio.shield(grace), what="grace end")
+        backend.release[1].set()
+        await await_or_fail(
+            asyncio.gather(wake, return_exceptions=True), what="wake turn end"
+        )
+        assert store.last_turn_end().data["reason"] == "completed"
+        assert backend.calls == 2
+    finally:
+        deadline.set()
+        for release in backend.release:
+            release.set()
+        await _close(server, writer)

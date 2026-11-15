@@ -1550,9 +1550,14 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    notice after backoff and immediately precedes the next attempt's assistant
    events.
 7. The server awaits `drain()` after each frame. A slow client delays later
-   notifications. A disconnected client drops writes and cancels its turn.
-8. Disconnect marks unresolved approvals as `abort`. They are not pending after
-   reconnect, and an approve request cannot run an aborted tool.
+   notifications. A disconnected client drops writes and cancels its turn,
+   unless it negotiated `turn_reconnect`: then the turn keeps running for the
+   reconnect grace, a reclaiming controller takes it over, and the end of the
+   grace with nobody back cancels it with reason `disconnect`.
+8. Disconnect marks unresolved approvals as `abort`, unless the client
+   negotiated `approval_reconnect`: then they stay pending for the grace. Aborted
+   approvals are not pending after reconnect, and an approve request cannot run
+   an aborted tool.
 9. SIGINT, SIGTERM, and orderly close use one path. The server closes clients
    and turns, closes the listener, and removes the Unix socket.
 10. Match responses by `id`. Continue processing notifications until the

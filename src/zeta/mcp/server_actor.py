@@ -86,7 +86,6 @@ CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
-_BINDING_DETACHED = "binding detached"
 
 NoticeSink = Callable[[str], None]
 
@@ -188,6 +187,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._generation = 0
         self._failure_count = 0
         self._manual_recovery_probe = False
+        # suspended because its session binding left; cleared by any later status.
+        self._binding_detached = False
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
@@ -839,7 +840,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._tool_refresh.settle()
 
     def _handle_call(self, request: _CallRequest) -> None:
-        if self._status.reason == _BINDING_DETACHED:
+        if self._binding_detached:
             _set_result(request.result, _detached_result(self.name))
             return
         if not self.config.allows_tool(request.tool_name) or not any(
@@ -1058,10 +1059,11 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self.name,
                 self.config.transport,
                 "degraded",
-                reason=_BINDING_DETACHED,
+                reason="binding detached",
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
         )
+        self._binding_detached = True
         self._tool_refresh.settle()
         _set_result(message.result, None)
 
@@ -1135,6 +1137,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
             self._status = terminal_status
+            self._binding_detached = False
             try:
                 self._publish_callback(self, terminal_status, None)
             except BaseException:  # noqa: BLE001 - finalization must complete
@@ -1286,6 +1289,7 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     def _set_status(self, status: MCPServerStatus) -> None:
         self._status = status
+        self._binding_detached = False
         self._publish_callback(
             self,
             status,
