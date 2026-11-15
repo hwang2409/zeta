@@ -448,7 +448,9 @@ async def test_agent_cancel_racing_child_finish_reports_already_finished(
 
     async def cancel_after_finish_cleanup(fence: TerminalTransitionFence) -> bool:
         child_backend.release.set()
-        await loop._background_owner.wait()
+        await await_or_fail(
+            loop._background_owner.wait(), what="child finish cleanup"
+        )
         return await original_cancel(fence)
 
     # test-contract: seam park the cancel write until the finish path closed the store
