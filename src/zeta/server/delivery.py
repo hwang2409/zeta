@@ -379,13 +379,9 @@ class DeliveryRequests:
             if steering is None:
                 control._schedule_background_wake(session_id)
                 return
-            detached = (
-                control._host_binding_required
-                and control._active_host_commands is None
-            )
             if (
                 not control.closing
-                and not detached
+                and not control.client_turn_detached()
                 and control.server.runtime.state is state
             ):
                 # the next turn's first provider request drains the queue,
@@ -401,7 +397,7 @@ class DeliveryRequests:
                     allow_assistant_reset=allow_assistant_reset,
                 )
                 return
-        # no client can see the next turn: the server closes or the host left.
+        # a send would be refused here too: the server closes or the bindings left.
         await self._drop_steering(session_id, state, "disconnect")
 
     async def _drop_steering(

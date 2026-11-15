@@ -205,11 +205,14 @@ class ServeControl:
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
 
-    def reject_client_turn_if_detached(self) -> None:
-        if (
+    def client_turn_detached(self) -> bool:
+        return (
             (self._host_binding_required and self._active_host_commands is None)
             or (self._mcp_binding_required and not self._active_mcp_bindings)
-        ):
+        )
+
+    def reject_client_turn_if_detached(self) -> None:
+        if self.client_turn_detached():
             raise ProtocolError(
                 ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
