@@ -304,3 +304,127 @@ async def test_resume_without_attach_feature_stays_busy(tmp_path: Path) -> None:
     finally:
         await _close(writer)
         await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold_mount"])
+async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cold: bool
+) -> None:
+    from tests.support.owned import await_or_fail
+    from tests.test_server_turn_reconnect import (
+        RECONNECT,
+        HeldBackend,
+        _drop,
+        _reconnect,
+    )
+
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    # the wake's reply holds mid-stream, so the turn is still live at the attach reply.
+    replies = [([TextContent("woke")], True)]
+    if not cold:
+        replies.insert(0, ([TextContent("warm")], False))
+    backend = HeldBackend(replies)
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    features = [*RECONNECT, "new_session_settings", "session_mcp_bindings", "resume_attach"]
+    page = {"server": "page", "headers": {"Authorization": "Bearer page"}}
+    reader, writer = await _connect(server)
+    writer2 = None
+    release_setup = asyncio.Event()
+    release_mount = asyncio.Event()
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        other_id = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol",
+        }))[-1]["result"]["session"]["session_id"]
+        session_id = (await _request(reader, writer, 3, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol", "mcp_bindings": [page],
+        }))[-1]["result"]["session"]["session_id"]
+        if not cold:
+            await _request(reader, writer, 4, "send", {"text": "warm"})
+            await _event(reader, "agent_end")
+
+        loop = server.runtime.loop
+        in_setup = asyncio.Event()
+        original_ensure = loop._ensure_mcp_servers
+
+        async def held_ensure() -> None:
+            # hold only the wake's call; the attach's own MCP rebind passes.
+            if not in_setup.is_set():
+                in_setup.set()
+                await await_or_fail(release_setup.wait(), what="wake setup release")
+            await original_ensure()
+
+        # test-contract: seam MCP startup is the slow step a wake runs before turn_start
+        monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
+        server.runtime.opened.store.append_agent_notification(
+            "child", child_session_path="/tmp/child", description="child",
+            status="completed", text="child done",
+        )
+        server.runtime._background_wake_sink(session_id)
+        await await_or_fail(in_setup.wait(), what="wake in setup")
+
+        # a page reload during the wake's setup: reconnect and resume the open session.
+        await _drop(writer, server)
+        reader2, writer2 = await _reconnect(server, 5, features)
+        elsewhere = await _request(reader2, writer2, 6, "resume", {"session_id": other_id})
+        assert _error_code(elsewhere) == BUSY
+
+        resume = {"session_id": session_id, "mcp_bindings": [page]}
+        if cold:
+            # the wake's first MCP mount is still running when the attach rebinds.
+            mounting = asyncio.Event()
+            rebinding = asyncio.Event()
+            original_mount = loop._mount_mcp_servers
+            original_reattach = server.control.reattach_mcp_bindings
+
+            async def held_mount() -> None:
+                mounting.set()
+                await await_or_fail(release_mount.wait(), what="mount release")
+                await original_mount()
+
+            async def observed_reattach(*args) -> None:
+                rebinding.set()
+                await original_reattach(*args)
+
+            # test-contract: seam the first mount is the wake's slow MCP step
+            monkeypatch.setattr(loop, "_mount_mcp_servers", held_mount)
+            # test-contract: seam signal when the attach starts its MCP rebind
+            monkeypatch.setattr(server.control, "reattach_mcp_bindings", observed_reattach)
+            release_setup.set()
+            await await_or_fail(mounting.wait(), what="wake mount running")
+            attaching = asyncio.create_task(_request(reader2, writer2, 7, "resume", resume))
+            await await_or_fail(rebinding.wait(), what="attach rebinding")
+            release_mount.set()
+            attached = await await_or_fail(attaching, what="attach reply")
+        else:
+            attached = await _request(reader2, writer2, 7, "resume", resume)
+            release_setup.set()
+        result = attached[-1].get("result", {})
+        assert result.get("attached") == "live_turn", attached[-1]
+        assert result["session"]["session_id"] == session_id
+
+        start = await _event(reader2, "turn_start")
+        assert start["session_id"] == session_id
+        backend.release[-1].set()
+        end = await _event(reader2, "agent_end")
+        assert end["session_id"] == session_id
+        assert server.runtime.session_id == session_id
+    finally:
+        release_setup.set()
+        release_mount.set()
+        for event in backend.release:
+            event.set()
+        await _close(writer2, writer)
+        await server.close()
+        await mcp.close()
