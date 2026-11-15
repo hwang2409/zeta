@@ -294,21 +294,38 @@ class AgentTranscriptControl(UIControl):
         source = self._source
         if path != self._root_path and source is not None:
             anchor = self.transcript.durable_scroll_anchor
-            fresh = await _anchored_pages(source, anchor)
+            follow_tail = self.transcript.follow_tail
+            latest = await source.page(None, direction="older")
+            resident = self._history_pager.pages
+            newest = resident[-1] if resident else None
+            # A scrolled window above the tail stays as is: its rows are durable,
+            # newer paging reaches appends, and stale cursors reset in load().
+            stale = newest is None or (
+                latest.repair_generation != newest.repair_generation
+                or (
+                    not self._history_pager.can_load_newer
+                    and latest.endpoint_id != newest.endpoint_id
+                )
+            )
+            fresh = (
+                (latest,)
+                if follow_tail
+                else await _anchored_pages(source, anchor)
+                if stale and anchor is not None
+                else resident
+            )
             # A scroll made during the reads wins; the next refresh catches up.
             if (
                 generation == self._activation_generation
                 and self.transcript.durable_scroll_anchor == anchor
-                and fresh != self._history_pager.pages
+                and self.transcript.follow_tail == follow_tail
+                and fresh != resident
             ):
                 self._history_pager.reset()
-                for index, fresh_page in enumerate(fresh):
-                    self._history_pager.adopt(
-                        fresh_page, direction="newer" if index else "older"
-                    )
+                for index, page in enumerate(fresh):
+                    self._history_pager.adopt(page, direction="newer" if index else "older")
                 self.render_pages(self._history_pager.pages)
-                if anchor is not None:
-                    # A short revealed window reads as the tail; keep the anchor.
+                if anchor is not None and not follow_tail:
                     self._history_pager.set_anchor(*anchor)
                     self._restore_anchor(self.transcript, anchor)
         if self._invalidate is not None:

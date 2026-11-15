@@ -17083,6 +17083,38 @@ async def test_root_tui_paging_render_path_table(
                     "a refresh of a scrolled child stopped newer paging"
                 )
                 assert owner.transcript.durable_scroll_anchor == child_anchor
+
+                # A refresh tick after every scroll key must not move the view, and
+                # PageUp must keep loading older rows; "k" makes blank lines reach the top.
+                session.layout.focus(navigation.transcript_window)
+
+                def child_view() -> tuple[str, list[int]]:
+                    content = owner.create_content(120, 20)
+                    top_line = "".join(text for _, text in content.get_line(owner.offset))
+                    plain = Text.from_ansi(owner.transcript.render(120)).plain
+                    numbers = [int(n) for n in re.findall(r"child visit (\d+)", plain)]
+                    return top_line, numbers
+
+                top_line, rows = child_view()
+                for press in range(300):
+                    if rows[0] == 0:
+                        break
+                    key = KeyPress("k", data="k") if press % 2 else KeyPress(Keys.PageUp)
+                    session.app.key_processor.feed(key)
+                    session.app.key_processor.process_keys()
+                    if owner.offset == 0 and owner.history_pager.can_load_older:
+                        await wait_until(
+                            lambda top=rows[0]: child_view()[1][0] < top
+                        )
+                    top_line, rows = child_view()
+                    navigation.refresh(force=True)
+                    await navigation.wait_for_publication()
+                    assert child_view() == (top_line, rows), (
+                        "a refresh tick moved or reloaded the scrolled child view"
+                    )
+                assert rows == list(range(rows[-1] + 1)), (
+                    "child page-up stopped loading older rows after refresh ticks"
+                )
         elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 

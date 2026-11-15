@@ -205,6 +205,62 @@ async def test_real_tui_child_view_journey(
                 app._agent_navigation.child_view_focused,
                 what="visible focused child before finder key",
             )
+
+            # ux b4 / review T7: page up a few pages, let a real refresh tick
+            # run, and keep paging older without a jump to the newest window.
+            navigation = app._agent_navigation
+            control = navigation.transcript_control
+            pager = control.history_pager
+
+            def oldest_resident() -> str:
+                return pager.pages[0].units[0].entry_id
+
+            def child_place() -> tuple[str, int, object]:
+                return (
+                    oldest_resident(),
+                    control.transcript.scroll_offset,
+                    control.transcript.durable_scroll_anchor,
+                )
+
+            async def page_up_until_older_loads() -> None:
+                oldest = oldest_resident()
+                for _press in range(400):
+                    await _send(pipe, "\x1b[5~")
+                    await navigation.wait_for_publication()
+                    # test-contract: latency the edge load is an untracked app task
+                    await asyncio.sleep(0.02)
+                    if oldest_resident() != oldest:
+                        return
+                raise AssertionError(
+                    "child-paging: PageUp at the top stopped loading older rows "
+                    f"(can_load_older={pager.can_load_older})"
+                )
+
+            try:
+                for _page in range(5):
+                    await page_up_until_older_loads()
+                assert pager.can_load_newer, (
+                    "child-paging: after five older loads the newest page came back "
+                    "(the scrolled view jumped back to the newest window)"
+                )
+                before_tick = child_place()
+                ticked_at = navigation._last_refresh_at
+                await _wait_until(
+                    lambda: navigation._last_refresh_at > ticked_at,
+                    what="a real child refresh tick",
+                )
+                await navigation.wait_for_publication()
+                assert child_place() == before_tick, (
+                    "child-paging: a refresh tick moved the scrolled child view "
+                    f"before={before_tick!r} after={child_place()!r}"
+                )
+                await page_up_until_older_loads()
+                assert pager.can_load_newer, (
+                    "child-paging: paging older after a refresh tick jumped to the newest window"
+                )
+            except AssertionError as exc:
+                failures.append(str(exc))
+
             await _send(pipe, "\x06")
             await _wait_until(
                 lambda: app._active_finder.finder_active,
