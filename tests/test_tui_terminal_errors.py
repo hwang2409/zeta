@@ -638,4 +638,5 @@ def test_resume_override_rejection_reaches_the_terminal(tmp_path: Path, monkeypa
     )
     output, returncode = _run_pty_python(code, _capture_env(home), timeout=30)
     assert b"session override rejected" in output, output
-    assert returncode != 0
+    assert b"'claude' (from --provider)" in output, output
+    assert returncode == 1

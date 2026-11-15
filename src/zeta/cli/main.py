@@ -841,9 +841,7 @@ def _tui_print(message: str) -> None:
     write_terminal(message)
 
 
-def _create_tui_app(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> object | None:
+def _create_tui_app(args: argparse.Namespace) -> object | None:
     return create_tui_app(args, _tui_print, _has_console_message)
 
 
@@ -899,7 +897,6 @@ def _attach_retention_owner(app: object, owner: object | None) -> None:
 
 def _run_tui_lifecycle_captured(
     args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
 ) -> tuple[int, str | None]:
     retained_drafts: list[_UnsavedDraft] = []
     current_session_id = ""
@@ -909,7 +906,7 @@ def _run_tui_lifecycle_captured(
     retention_owner: object | None = None
     try:
         while True:
-            app = _create_tui_app(args, parser)
+            app = _create_tui_app(args)
             if app is None:
                 exit_status = 1
                 break
@@ -1023,14 +1020,13 @@ def _run_console(run: Callable[[], int]) -> int:
 
 def _run_tui_command(
     args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
     entrypoint: str,
     original_argv: list[str],
 ) -> int:
     from ..tui.stderr_capture import run_tui_lifecycle
 
     exit_status, restart_session_id = run_tui_lifecycle(
-        args, parser, _run_tui_lifecycle_captured
+        args, _run_tui_lifecycle_captured
     )
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
@@ -1265,7 +1261,7 @@ def _main(argv: list[str] | None = None) -> int:
         return run_headless(args, args.prompt)
     if args.format != "text":
         parser.error("--format requires --print")
-    return _run_tui_command(args, parser, entrypoint, original_argv)
+    return _run_tui_command(args, entrypoint, original_argv)
 
 
 def main(argv: list[str] | None = None) -> int:

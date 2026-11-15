@@ -13489,7 +13489,7 @@ def test_new_session_continues_after_failed_draft_save(
     # Pytest's log record would retain the failure traceback and the old app.
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     # test-contract: seam Patch the CLI TUI application lifecycle seam.
-    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
@@ -13580,7 +13580,7 @@ def test_failed_active_draft_is_printed_on_every_exit(
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     # test-contract: seam Patch the CLI TUI application lifecycle seam.
-    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -13667,7 +13667,7 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
     _patch_draft_publish(monkeypatch, fail_write)
     monkeypatch.setattr(persistence_module._LOGGER, "warning", lambda *_args: None)
     # test-contract: seam Patch the CLI TUI application lifecycle seam.
-    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     # test-contract: seam Observe the CLI restart boundary without replacing the process.
@@ -13716,7 +13716,7 @@ def test_new_session_with_successful_draft_prints_nothing(
 
     # test-contract: seam Run the CLI against controlled session applications.
     # test-contract: seam Patch the CLI TUI application lifecycle seam.
-    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args, _parser: create(args))
+    monkeypatch.setattr(cli_main_module, "_create_tui_app", lambda args: create(args))
     # test-contract: seam Run the CLI through a controlled TUI boundary.
     monkeypatch.setattr(cli_main_module, "_run_tui", run_tui)
     monkeypatch.setattr(
