@@ -189,7 +189,7 @@ def test_tui_card_uses_text_renderable() -> None:
 @pytest.mark.asyncio
 def _unarmed_authority(home: Path):
     with open_writer(home) as lease:
-        return retention_authority(home, lease, days=30)
+        return retention_authority(home, lease, days=lambda: 30)
 
 
 @pytest.mark.asyncio

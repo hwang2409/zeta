@@ -167,10 +167,10 @@ class ServerSlashSession:
                 await publish(result.projection)
             return result.message
         if command == "arm":
-            days = load_settings(home=self._runtime.home).settings.retention_days
+            home = self._runtime.home
             result = await asyncio.to_thread(
-                retention_authority, self._runtime.home,
-                self._runtime.manager._storage_lease, days=days,
+                retention_authority, home, self._runtime.manager._storage_lease,
+                days=lambda: load_settings(home=home).settings.retention_days,
             )
             publish = getattr(self._runtime, "retention_event_sink", None)
             if publish is not None:

@@ -593,10 +593,9 @@ class SlashHandlerMixin:
                 self._presenter.print_unit(render_retention_card(result.projection))
             return result.message
         if command == "arm":
-            days = load_settings(home=home).settings.retention_days
             result = await asyncio.to_thread(
                 retention_authority, home, self.loop.store._storage_lease,
-                days=days,
+                days=lambda: load_settings(home=home).settings.retention_days,
             )
             if result.projection["mode"] != "none" or result.projection["errors"]:
                 self._presenter.print_unit(render_retention_card(result.projection))

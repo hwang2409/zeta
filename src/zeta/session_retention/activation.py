@@ -24,9 +24,9 @@ from . import (
     _load_state,
     _read_json,
     append_retention_history,
+    disarm_retention,
     project_retention_result,
     read_retention_history,
-    retention_authority,
     retention_result,
 )
 from .handshake import ensure_handshake_files, planner_active, planner_request_pending
@@ -63,11 +63,10 @@ def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
 
 
 def _stale_projection(
-    root: Path, days: Callable[[], int],
+    root: Path, current_days: int,
     history: tuple[dict[str, object], ...],
 ) -> Published:
     """Re-decide stale no-side-effect work from bounded durable state."""
-    current_days = days()
     if history and (
         history[-1].get("days") == current_days
         or history[-1].get("mode") in {"disarmed", "disabled"}
@@ -124,6 +123,7 @@ def make_retention_owner(
     from ..config.settings import load_settings
 
     root = Path(home)
+    days = days or (lambda: load_settings(home=root).settings.retention_days)
     retained = lease.retain()
     activation_enabled = feature_enabled(
         retained.observed_epoch, StorageFeature.SESSION_RETENTION_ACTIVATION
@@ -147,12 +147,14 @@ def make_retention_owner(
         )
         nonlocal last_projection
         with _coordinator_authority(root) as token:
+            # the one read of the setting at publication; every decision below uses current.days
+            current = token.generation(days())
             history = read_retention_history(root)
             effectful = bool(getattr(result, "changed", False))
             if (
                 history
                 and history[-1].get("mode") == "armed"
-                and history[-1].get("days") == current_days
+                and history[-1].get("days") == current.days
                 and not effectful
             ):
                 planner.close()
@@ -162,22 +164,22 @@ def make_retention_owner(
             status = append_retention_history(
                 token, root, retained, projection,
                 expected=result.expected_generation,
-                current_days=days,
+                current=current,
                 before_append=None if effectful else lambda: planner.commit_state(token),
                 publish_if_stale=effectful,
             )
             if status == "stale":
                 planner.close()
-                current = _stale_projection(root, days, history)
-                if not current.complete:
-                    append_retention_history(token, root, retained, current.projection)
-                last_projection = current.projection
-                return current
+                redecided = _stale_projection(root, current.days, history)
+                if not redecided.complete:
+                    append_retention_history(token, root, retained, redecided.projection)
+                last_projection = redecided.projection
+                return redecided
             if status == "not_committed":
                 planner.close()
-                current = _stale_projection(root, days, history)
-                last_projection = current.projection
-                return current
+                redecided = _stale_projection(root, current.days, history)
+                last_projection = redecided.projection
+                return redecided
             if status == "fresh":
                 last_projection = projection
         return Published(
@@ -205,14 +207,14 @@ def make_retention_owner(
                 if value is not None
             },
         ),
-        days or (lambda: load_settings(home=root).settings.retention_days),
+        days,
         run_pass=run_pass,
         on_error=record_error,
         home=root,
         close_lease=retained.close,
         activation_enabled=activation_enabled,
         session_available=session_available,
-        disable=lambda: retention_authority(root, retained, days=0).projection,
+        disable=lambda: disarm_retention(root, retained).projection,
     )
 
 
@@ -361,7 +363,7 @@ class RetentionActivationOwner:
                                 await published
                         published_projection = projection.projection
                     if isinstance(outcome, Exception) and not self._stop.is_set():
-                        error = await asyncio.to_thread(self._on_error, outcome, self._days())
+                        error = await asyncio.to_thread(lambda failed=outcome: self._on_error(failed, self._days()))
                         if self._publish is not None:
                             published = self._publish(error)
                             if inspect.isawaitable(published):

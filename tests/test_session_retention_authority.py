@@ -10,7 +10,11 @@ from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _request
 from tests.test_session_retention_surfaces import _hello
 from zeta.server import ZetaServer
-from zeta.session_retention import RetentionPlanner, retention_authority
+from zeta.session_retention import (
+    RetentionPlanner,
+    disarm_retention,
+    retention_authority,
+)
 from zeta.storage_format import open_writer
 
 
@@ -75,14 +79,14 @@ async def test_authority_zero_to_thirty_requires_fresh_preview(tmp_path: Path) -
             finally:
                 planner.close()
             # an unarmed completed preview is also invalidated by disabling retention
-            assert retention_authority(home, lease, days=0).applied
-            stale = retention_authority(home, lease, days=30).applied
+            assert disarm_retention(home, lease).applied
+            stale = retention_authority(home, lease, days=lambda: 30).applied
             planner = RetentionPlanner(home, lease)
             try:
                 fresh = planner.run_pass(days=30).complete
             finally:
                 planner.close()
-            reapplied = retention_authority(home, lease, days=30).applied
+            reapplied = retention_authority(home, lease, days=lambda: 30).applied
             return stale, fresh, reapplied
         finally:
             lease.close()
@@ -91,3 +95,24 @@ async def test_authority_zero_to_thirty_requires_fresh_preview(tmp_path: Path) -
     assert not stale
     assert fresh
     assert reapplied
+
+
+@pytest.mark.asyncio
+async def test_slash_arm_with_days_zero_disarms(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+
+    def seed_armed() -> None:
+        with open_writer(home) as lease:
+            with RetentionPlanner(home, lease) as planner:
+                assert planner.run_pass(days=30).complete
+            assert retention_authority(home, lease, days=lambda: 30).applied
+
+    await asyncio.to_thread(seed_armed)
+    (home / "settings.toml").write_text("[retention]\ndays = 0\n")
+    result = await _slash(home, "/retention arm")
+    # serve's own owner may disarm first; either way the arm is gone and nothing was armed
+    assert result["text"] in {"retention disabled", "retention already disabled"}
+    assert not (home / "retention-arm.json").exists()
+    assert '"mode":"armed"' not in (home / "retention-history.jsonl").read_text().splitlines()[-1]

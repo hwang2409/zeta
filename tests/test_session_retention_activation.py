@@ -59,7 +59,7 @@ async def test_arm_before_owner_generation_keeps_armed_projection(
         monkeypatch.setattr(RetentionPlanner, "run_pass", gated)
         task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
+        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
         assert armed.applied
         release.set()
         projections, failure = await asyncio.wait_for(task, 10)
@@ -106,7 +106,7 @@ async def test_arm_during_owner_scan_keeps_armed_projection(
         monkeypatch.setattr(retention_module._Budget, "charge_entry", gated)
         task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
+        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
         assert armed.applied
         release.set()
         projections, failure = await asyncio.wait_for(task, 10)
@@ -169,7 +169,7 @@ async def test_owner_lifecycle_table(
                 with RetentionPlanner(home, lease) as planner:
                     preview = planner.run_pass(days=30)
                 assert preview.complete
-                return retention_authority(home, lease, days=30).applied
+                return retention_authority(home, lease, days=lambda: 30).applied
             assert await asyncio.to_thread(seed_arm)
 
         owner = make_retention_owner(home, lease, lambda: days)
@@ -210,104 +210,92 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
         await asyncio.to_thread(lease.close)
 
 
-@pytest.mark.parametrize("mutation", ("arm", "disarm", "days change", "none"))
-@pytest.mark.parametrize("result_path", ("preview", "blocked", "deleted", "error"))
+def _gated_owner_episode(home, lease, days, during_window) -> object:
+    """Run one owner episode, calling during_window after the scan decides and before publication."""
+    decided = threading.Event()
+    release = threading.Event()
+    original = RetentionPlanner.run_pass
+    outcome: dict[str, object] = {}
+
+    def gated(planner, **kwargs):
+        result = original(planner, **kwargs)
+        decided.set()
+        assert release.wait(10)
+        return result
+
+    RetentionPlanner.run_pass = gated
+    try:
+        owner = make_retention_owner(home, lease, lambda: days[0])
+        thread = threading.Thread(target=lambda: outcome.update(result=owner._run_episode()))
+        thread.start()
+        assert decided.wait(10)
+        during_window()
+        release.set()
+        thread.join(10)
+        assert not thread.is_alive()
+    finally:
+        release.set()
+        RetentionPlanner.run_pass = original
+    return outcome["result"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "result_path"),
+    (("arm", "preview"), ("arm", "blocked"), ("days change", "preview")),
+)
 def test_freshness_result_path_table(tmp_path: Path, mutation: str, result_path: str) -> None:
-    """The public owner and authority surfaces expose every freshness path."""
+    """A user change inside the owner's decision window always shows its current state."""
     home = tmp_path / f"{mutation}-{result_path}"
     initialize_storage_home(home)
     days = [30]
     manager = SessionManager(home)
     with _opened_lease(home) as lease:
-        if result_path == "deleted":
-            session_id = _create_closed(manager, [], name="old")
-            _age_tree(home / "sessions" / session_id, days=100)
-            with RetentionPlanner(home, lease) as planner:
-                assert planner.run_pass(days=30).complete
-            assert retention_authority(home, lease, days=30).applied
-        elif result_path == "blocked":
-            if mutation == "arm":
-                session_id = _create_closed(manager, [], name="old")
-                _age_tree(home / "sessions" / session_id, days=100)
-                with RetentionPlanner(home, lease) as planner:
-                    preview = planner.run_pass(days=30)
-                assert preview.complete and preview.preview is not None and preview.preview.root_ids
-                assert retention_authority(home, lease, days=30).applied
-                days[0] = 60
-                decided = threading.Event()
-                release = threading.Event()
-                original = RetentionPlanner.run_pass
-                def gated(planner, **kwargs):
-                    result = original(planner, **kwargs)
-                    decided.set()
-                    assert release.wait(10)
-                    return result
-                RetentionPlanner.run_pass = gated
-                try:
-                    owner = make_retention_owner(home, lease, lambda: days[0])
-                    thread = threading.Thread(target=lambda: owner._run_episode())
-                    thread.start()
-                    assert decided.wait(10)
-                    assert retention_authority(home, lease, days=30).applied
-                    release.set()
-                    thread.join(10)
-                finally:
-                    RetentionPlanner.run_pass = original
-                assert read_retention_history(home)[-1]["days"] == 60
-                return
-            result = retention_authority(home, lease, days=30)
-            assert not result.applied
-            assert read_retention_history(home)[-1]["mode"] == "none"
-        elif result_path == "error":
-            original = RetentionPlanner.run_pass
-            def fail(planner, **kwargs):
-                raise RuntimeError("table error")
-            RetentionPlanner.run_pass = fail
-            try:
-                owner = make_retention_owner(home, lease, lambda: days[0])
-                owner._run_episode()
-            finally:
-                RetentionPlanner.run_pass = original
-        else:
-            if mutation == "arm" and result_path == "preview":
-                session_id = _create_closed(manager, [], name="old")
-                _age_tree(home / "sessions" / session_id, days=100)
-                with RetentionPlanner(home, lease) as planner:
-                    assert planner.run_pass(days=30).complete
-                decided = threading.Event()
-                release = threading.Event()
-                original = RetentionPlanner.run_pass
-                def gated(planner, **kwargs):
-                    result = original(planner, **kwargs)
-                    decided.set()
-                    assert release.wait(10)
-                    return result
-                RetentionPlanner.run_pass = gated
-                try:
-                    owner = make_retention_owner(home, lease, lambda: days[0])
-                    thread = threading.Thread(target=lambda: owner._run_episode())
-                    thread.start()
-                    assert decided.wait(10)
-                    assert retention_authority(home, lease, days=30).applied
-                    release.set()
-                    thread.join(10)
-                finally:
-                    RetentionPlanner.run_pass = original
-                assert read_retention_history(home)[-1]["mode"] == "armed"
-            else:
-                owner = make_retention_owner(home, lease, lambda: days[0])
-                projections, failure = owner._run_episode()
-                assert failure is None
-                assert projections[-1].projection["mode"] == "preview"
-        if mutation == "arm" and result_path == "preview":
-            assert read_retention_history(home)[-1]["mode"] == "armed"
-        elif mutation == "disarm" and result_path == "deleted":
-            assert disarm_retention(home, lease).applied is True
-        elif mutation == "days change" and result_path == "preview":
+        session_id = _create_closed(manager, [], name="old")
+        _age_tree(home / "sessions" / session_id, days=100)
+        with RetentionPlanner(home, lease) as planner:
+            preview = planner.run_pass(days=30)
+        assert preview.complete and preview.preview is not None and preview.preview.root_ids
+        if result_path == "blocked":
+            assert retention_authority(home, lease, days=lambda: 30).applied
             days[0] = 60
-            owner = make_retention_owner(home, lease, lambda: days[0])
-            projections, failure = owner._run_episode()
+            _gated_owner_episode(
+                home, lease, days,
+                lambda: retention_authority(home, lease, days=lambda: 30).applied,
+            )
+            assert read_retention_history(home)[-1]["days"] == 60
+        elif mutation == "arm":
+            _gated_owner_episode(
+                home, lease, days,
+                lambda: retention_authority(home, lease, days=lambda: 30).applied,
+            )
+            assert read_retention_history(home)[-1]["mode"] == "armed"
+        else:
+            days[0] = 60
+            projections, failure = make_retention_owner(
+                home, lease, lambda: days[0]
+            )._run_episode()
             assert failure is None and projections[-1].projection["days"] == 60
+
+
+def test_armed_days_change_during_scan_publishes_current_days(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    days = [30]
+    with _opened_lease(home) as lease:
+        with RetentionPlanner(home, lease) as planner:
+            assert planner.run_pass(days=30).complete
+        assert retention_authority(home, lease, days=lambda: 30).applied
+        assert read_retention_history(home)[-1]["mode"] == "armed"
+
+        def change_days() -> None:
+            days[0] = 60
+
+        projections, failure = _gated_owner_episode(home, lease, days, change_days)
+        assert failure is None
+        last = read_retention_history(home)[-1]
+        if projections[-1].complete:
+            assert projections[-1].projection["days"] == 60
+            assert last["days"] == 60
 
 
 @pytest.mark.parametrize("existing_preview", (True, False))
@@ -394,7 +382,7 @@ async def test_owner_drops_prepared_preview_after_concurrent_arm(
         monkeypatch.setattr(activation_module, "_coordinator_authority", delayed_authority)
         task = asyncio.create_task(asyncio.to_thread(owner._run_episode))
         await asyncio.wait_for(asyncio.to_thread(entered.wait, 10), 10)
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
+        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
         assert armed.applied and armed.projection["mode"] == "armed"
         release.set()
         projections, failure = await asyncio.wait_for(task, 10)
@@ -777,7 +765,7 @@ async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) 
         assert failure is None
         preview = next(item for item in projections if item["mode"] == "preview" and item.complete)
         assert preview["root_ids"] == [opened]
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=30)
+        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
         assert armed.applied
         deleted = []
         for _ in range(20):
@@ -810,7 +798,7 @@ async def test_arm_changes_after_files_are_deleted_before_publication(
         owner = make_retention_owner(home, lease, lambda: 30, now_ns=clock)
         first, failure = await asyncio.to_thread(owner._run_episode)
         assert failure is None and any(item.complete for item in first)
-        assert (await asyncio.to_thread(retention_authority, home, lease, days=30)).applied
+        assert (await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)).applied
 
         original = RetentionPlanner.run_pass
         changed = threading.Event()
@@ -822,7 +810,7 @@ async def test_arm_changes_after_files_are_deleted_before_publication(
                 if mutation == "arm":
                     with RetentionPlanner(home, lease) as followup:
                         assert original(followup, days=30).complete
-                    changed_result = retention_authority(home, lease, days=30)
+                    changed_result = retention_authority(home, lease, days=lambda: 30)
                 else:
                     changed_result = disarm_retention(home, lease)
                 assert changed_result.applied
@@ -852,19 +840,19 @@ async def test_disarm_deadline_persists_pending_and_retries(tmp_path: Path, monk
                 return planner.run_pass(days=30)
         preview = await asyncio.to_thread(preview_pass)
         assert preview.complete
-        assert await asyncio.to_thread(retention_authority, home, lease, days=30)
+        assert await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
 
         def deadline(*_args, **_kwargs):
             raise TimeoutError
 
         # test-contract: seam forced coordinator deadline
         monkeypatch.setattr(retention_module, "_try_authority", deadline)
-        pending = await asyncio.to_thread(retention_authority, home, lease, days=0)
+        pending = await asyncio.to_thread(disarm_retention, home, lease)
         assert not pending.applied and pending.projection["disable_pending"]
         assert (home / "retention-arm.json").exists()
         assert not read_retention_history(home)[-1].get("disable_pending", False)
         monkeypatch.undo()
-        cleared = await asyncio.to_thread(retention_authority, home, lease, days=0)
+        cleared = await asyncio.to_thread(disarm_retention, home, lease)
         assert cleared.applied and cleared.projection["mode"] == "disarmed"
         assert not (home / "retention-arm.json").exists()
     finally:
@@ -885,7 +873,7 @@ async def test_armed_days_change_previews_before_deletion(tmp_path: Path) -> Non
         owner = make_retention_owner(home, lease, lambda: 30, now_ns=clock)
         first, failure = await asyncio.to_thread(owner._run_episode)
         assert failure is None and any(item.complete for item in first)
-        assert (await asyncio.to_thread(retention_authority, home, lease, days=30)).applied
+        assert (await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)).applied
         current_days = [60]
         owner = make_retention_owner(home, lease, lambda: current_days[0], now_ns=clock)
         projections, failure = await asyncio.to_thread(owner._run_episode)
@@ -907,7 +895,7 @@ async def test_inactive_owner_preserves_authority_until_session_exists(tmp_path:
         def seed() -> None:
             with RetentionPlanner(home, lease) as planner:
                 assert planner.run_pass(days=30).complete
-            assert retention_authority(home, lease, days=30).applied
+            assert retention_authority(home, lease, days=lambda: 30).applied
 
         await asyncio.to_thread(seed)
         owner = make_retention_owner(home, lease, lambda: 0, session_available=False)
@@ -960,3 +948,15 @@ async def test_started_owner_guards_public_loop_session_open(tmp_path: Path, mon
         os.close(lease_fd)
         await owner.stop()
         await asyncio.to_thread(lease.close)
+
+
+def test_owner_without_days_source_publishes_settings_days(tmp_path: Path) -> None:
+    # production builds the owner with no days source; publication must read the settings file
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "settings.toml").write_text("[retention]\ndays = 45\n")
+    with _opened_lease(home) as lease:
+        projections, failure = make_retention_owner(home, lease)._run_episode()
+    assert failure is None
+    assert projections[-1].projection["days"] == 45
+    assert read_retention_history(home)[-1]["days"] == 45

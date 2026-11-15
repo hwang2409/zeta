@@ -65,7 +65,7 @@ async def _armed_home(tmp_path: Path) -> tuple[Path, SessionManager, str, object
         with RetentionPlanner(home, lease) as planner:
             result, _reasons = _run_sweep(planner)
         assert result.complete
-        assert retention_authority(home, lease, days=30).applied
+        assert retention_authority(home, lease, days=lambda: 30).applied
 
     await asyncio.to_thread(seed)
     return home, manager, session_id, lease

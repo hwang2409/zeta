@@ -952,7 +952,7 @@ async def test_serve_retention_stays_dormant_until_requested_session(
         def seed_retention() -> None:
             with RetentionPlanner(tmp_path, lease) as planner:
                 assert planner.run_pass(days=30).complete
-            assert retention_authority(tmp_path, lease, days=30).applied
+            assert retention_authority(tmp_path, lease, days=lambda: 30).applied
 
         await asyncio.to_thread(seed_retention)
     finally:
