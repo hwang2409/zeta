@@ -395,3 +395,66 @@ async def test_close_finishes_end_of_turn_step_before_runtime_closes(
         for release in backend.release:
             release.set()
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_resume_attach_takes_over_turn_in_grace_and_rebinds_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = HeldBackend([
+        ([TextContent("mounted")], False),
+        ([TextContent("kept reply")], True),
+        ([ToolUseContent(ToolCall("page-1", "page__echo", {}))], False),
+        ([TextContent("used page")], False),
+    ])
+    server = _server(tmp_path, backend)
+    features = [
+        *RECONNECT, "new_session_settings", "session_mcp_bindings", "resume_attach"
+    ]
+    old = {"server": "page", "headers": {"Authorization": "Bearer old-page"}}
+    new = {"server": "page", "headers": {"Authorization": "Bearer new-page"}}
+    reader, writer = await _connect(server)
+    writer2 = None
+    try:
+        await _hello(reader, writer, 1, features)
+        session_id = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol",
+            "approval_mode": "allow", "mcp_bindings": [old],
+        }))[-1]["result"]["session"]["session_id"]
+        await _request(reader, writer, 3, "send", {"text": "warm"})
+        await _event(reader, "agent_end")
+        await _request(reader, writer, 4, "send", {"text": "reply"})
+        await await_or_fail(backend.streaming[1].wait(), what="mid-stream")
+
+        await _drop(writer, server)
+        # achilles reload: a bare hello, then resume of the session with bindings.
+        reader2, writer2 = await _reconnect(server, 5, features)
+        attached = await _request(reader2, writer2, 6, "resume", {
+            "session_id": session_id, "mcp_bindings": [new]
+        })
+        assert attached[-1].get("result", {}).get("attached") == "live_turn", attached
+        backend.release[1].set()
+        frames = await frames_until_event(reader2, "agent_end")
+        assert _replies(frames) == ["kept reply"]
+        status = (await _request(reader2, writer2, 7, "status", {}))[-1]["result"]
+        assert status["last_turn_outcome"]["reason"] == "completed"
+
+        await _request(reader2, writer2, 8, "send", {"text": "use page"})
+        await _event(reader2, "agent_end")
+        calls = [
+            header
+            for method, header in zip(mcp.methods, mcp.headers, strict=False)
+            if method == "tools/call"
+        ]
+        assert calls == ["Bearer new-page"]
+    finally:
+        for release in backend.release:
+            release.set()
+        await _close(server, writer2, writer)
+        await mcp.close()
