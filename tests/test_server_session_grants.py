@@ -1726,11 +1726,11 @@ async def test_turn_end_send_ready_orders(
     async def gated_notification_turn(
         session_id: str, loop: object, emit: object, **kwargs: object
     ) -> object:
-        if order == "send_first":
-            notification_run_started.set()
-            await await_or_fail(
-                release_notification_run.wait(), what="notification turn scheduling"
-            )
+        # the produce below wakes this turn at once, so hold it before setup in both orders
+        notification_run_started.set()
+        await await_or_fail(
+            release_notification_run.wait(), what="notification turn scheduling"
+        )
         async def gated_emit(event: object, **emit_kwargs: object) -> object:
             result = await emit(event, **emit_kwargs)  # type: ignore[misc]
             if (
@@ -1802,11 +1802,15 @@ async def test_turn_end_send_ready_orders(
             release_notification_run.set()
             await await_or_fail(owner_task, what="turn owner return")
         else:
+            await await_or_fail(
+                notification_run_started.wait(), what="notification turn scheduling"
+            )
             status_frames = await request(4, "status", {})
             assert status_frames[-1]["result"]["state"] == "idle"
             owner_task = server.control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
+            release_notification_run.set()
             await await_or_fail(
                 notification_start_ready.wait(), what="notification start write"
             )
@@ -1825,6 +1829,7 @@ async def test_turn_end_send_ready_orders(
         assert session_id == server.runtime.session_id
     finally:
         release_turn_end.set()
+        release_notification_run.set()
         release_notification_start.set()
         await close_serve(server, writer)
 
