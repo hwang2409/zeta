@@ -479,3 +479,46 @@ def test_tui_resume_entry_survives_retention_owner(
             holder.join(10)
         if holder is not None:
             assert holder.exitcode == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_opens_when_planner_ends_between_refusal_and_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_server import _ready_extensions
+    from zeta.core.session_execution import retention_access
+
+    # no real planner pass: the test plays the planner with one session lock.
+    (tmp_path / "settings.toml").write_text("[retention]\ndays = 0\n")
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer, session_id = await _ready_extensions(server)
+    planner_fd: int | None = None
+
+    def end_planner_pass() -> None:
+        nonlocal planner_fd
+        if planner_fd is not None:
+            fcntl.flock(planner_fd, fcntl.LOCK_UN)
+            os.close(planner_fd)
+            planner_fd = None
+
+    original_active = retention_access._active
+
+    def planner_ends_before_check(home: Path) -> int | None:
+        end_planner_pass()
+        return original_active(home)
+
+    try:
+        await _request(reader, writer, "new", "new_session", {"provider": "codex"})
+        planner_fd = os.open(tmp_path / "sessions" / session_id, os.O_RDONLY)
+        # a planner pass holds the closed session's directory, as a retention walk does.
+        fcntl.flock(planner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # test-contract: seam the planner can end between a refused open and this check
+        monkeypatch.setattr(retention_access, "_active", planner_ends_before_check)
+        resumed = (
+            await _request(reader, writer, "resume", "resume", {"session_id": session_id})
+        )[-1]
+        assert "result" in resumed, resumed
+        assert resumed["result"]["session"]["session_id"] == session_id
+    finally:
+        end_planner_pass()
+        await close_serve(server, writer)
