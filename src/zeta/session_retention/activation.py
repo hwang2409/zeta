@@ -144,6 +144,13 @@ def make_retention_owner(
             # the one read of the setting at publication; every decision below uses current.days
             current = token.generation(days())
             history = read_retention_history(root)
+            if (
+                not result.complete and result.mode is None and projection["preview_id"] is not None
+                and history and history[-1].get("mode") == "preview"
+                and history[-1].get("preview_id") == projection["preview_id"]
+            ):
+                # a partial re-sweep under this preview says what the preview said: no new row or card
+                projection = {**projection, "skip_counts": history[-1]["skip_counts"], "errors": history[-1]["errors"]}
             # a transaction outcome (deleted, rejected, or blocked) is a fact: always publish it
             effectful = result.mode is not None or bool(getattr(result, "changed", False))
             if (

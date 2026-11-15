@@ -239,14 +239,17 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
     if preview is None:
         return retention_result(
             timestamp=timestamp, mode="preview", days=days,
-            skip_counts=dict(result.skip_counts), errors=result.errors,
+            # no partial skip tally: it grows each pass, so every pass would be a new row
+            errors=result.errors,
             progress_counts={"roots": len(result.reasons)},
         )
     return retention_result(
         timestamp=timestamp, mode="preview", days=days,
         root_ids=preview.root_ids, count=preview.count, bytes=preview.bytes,
         preview_id=preview.preview_id, cutoff=preview.cutoff,
-        skip_counts=dict(result.skip_counts), errors=result.errors,
+        # a partial re-sweep's tallies are not this preview's; the owner reuses the preview's row
+        skip_counts=dict(result.skip_counts) if result.complete else None,
+        errors=result.errors if result.complete else (),
     )
 
 

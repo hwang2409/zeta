@@ -20,6 +20,7 @@ from tests.test_session_retention_continuation import (
 from zeta.cli.main import _attach_retention_owner
 from zeta.core.session import SessionManager
 from zeta.server import ZetaServer
+from zeta.session_retention import read_retention_history
 from zeta.session_retention.activation import make_retention_owner
 from zeta.session_retention.pin import set_retention_pin
 from zeta.storage_format import open_writer
@@ -76,6 +77,48 @@ async def test_tui_preview_card_shows_kept_roots_as_skips(tmp_path: Path) -> Non
         "skipped: 1 not old enough", "skipped: 1 pinned", "skipped: 1 session is open or in use",
     ]
     assert "error:" not in card
+
+
+def _young_home(tmp_path: Path, roots: int) -> Path:
+    home = tmp_path / "home"
+    open_writer(home).close()
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    manager = SessionManager(home)
+    for index in range(roots):
+        _create_closed(manager, [], name=f"young-{index}")
+    return home
+
+
+async def _owner_start(home: Path) -> list[dict[str, object]]:
+    """One process start: the real owner runs until idle; returns what it published."""
+    published: list[dict[str, object]] = []
+    lease = await asyncio.to_thread(open_writer, home)
+    try:
+        owner = make_retention_owner(home, lease, lambda: 30)
+        owner.set_publish(published.append)
+        signal = owner._wake = _IdleSignal()
+        try:
+            owner.start()
+            await _settle(signal.idle)
+        finally:
+            await owner.stop()
+    finally:
+        await asyncio.to_thread(lease.close)
+    return published
+
+
+@pytest.mark.asyncio
+async def test_restart_resweep_of_a_large_home_shows_one_card(tmp_path: Path) -> None:
+    # 20 young roots: more than one pass advances (production bounds), so the second start
+    # re-sweeps in several partial passes under the first start's complete preview
+    home = await asyncio.to_thread(_young_home, tmp_path, 20)
+    first = await _owner_start(home)
+    assert first[-1]["preview_id"] is not None and first[-1]["skip_counts"] == {"not old enough": 20}
+    rows = len(await asyncio.to_thread(read_retention_history, home))
+    second = await _owner_start(home)
+    added = len(await asyncio.to_thread(read_retention_history, home)) - rows
+    assert (len(second) <= 1, added <= 1) == (True, True), (second, added)
+    assert all(card["skip_counts"] == {"not old enough": 20} for card in second)
 
 
 @pytest.mark.asyncio
