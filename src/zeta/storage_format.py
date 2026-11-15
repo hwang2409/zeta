@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 10
+WRITER_EPOCH: Final = 12
 P06_FEATURE_EPOCH: Final = 6
 
 
