@@ -18,6 +18,8 @@ def render_retention_card(projection: Mapping[str, object]) -> Panel:
     lines.append(f"sessions: {projection['count']}")
     if projection.get("bytes"):
         lines.append(f"bytes: {projection['bytes']}")
+    skips = projection.get("skip_counts") or {}
+    lines.extend(f"skipped: {skips[reason]} {reason}" for reason in sorted(skips))
     errors = projection.get("errors") or []
     lines.extend(f"error: {error}" for error in errors)
     if projection.get("disable_pending"):

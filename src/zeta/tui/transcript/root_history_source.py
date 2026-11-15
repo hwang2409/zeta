@@ -111,10 +111,13 @@ class RootTUIHistorySource:
         indexed = self._store.tui_history_index_page(request)
         if indexed is None:
             return TUIHistoryPage(())
-        entries = tuple(entry for group in indexed.groups for entry in group)
+        # Cursors count every indexed group, shown or not: a hidden row still
+        # takes one position, so counting only kept rows makes pages overlap.
+        window_stop = indexed.start + len(indexed.groups)
         entries = tuple(
-            entry
-            for entry in entries
+            (position, entry)
+            for position, group in enumerate(indexed.groups, indexed.start)
+            for entry in group
             if entry.type != "notification"
             or (
                 self._store.is_agent_notification_active(entry.id)
@@ -155,25 +158,24 @@ class RootTUIHistorySource:
         scan = reversed(entries) if direction == "older" else iter(entries)
         selected: list[tuple[list[TUIHistoryUnit], int]] = []
         row_count = decoded_bytes = 0
-        consumed = 0
-        for entry in scan:
+        edge = indexed.start if direction == "older" else window_stop
+        for position, entry in scan:
             units, size = bundle(entry)
             if selected and (
                 row_count + len(units) > 128
                 or decoded_bytes + size > 1024 * 1024
             ):
+                # The page ends just before the first row that does not fit.
+                edge = position + 1 if direction == "older" else position
                 break
             selected.append((units, size))
             row_count += len(units)
             decoded_bytes += size
-            consumed += 1
         if direction == "older":
             selected.reverse()
-            start = indexed.start + len(entries) - consumed
-            stop = indexed.start + len(entries)
+            start, stop = edge, window_stop
         else:
-            start = indexed.start
-            stop = indexed.start + consumed
+            start, stop = indexed.start, edge
         units = tuple(unit for bundle_units, _size in selected for unit in bundle_units)
         segments = (TUIPaintSegment(units, decoded_bytes=decoded_bytes),) if units else ()
         return TUIHistoryPage(
@@ -292,25 +294,29 @@ class RootTUIHistorySource:
                 return
             cursor = older
 
-    def _visible_users(self) -> list[Any]:
-        return [
-            ref for ref in self._store.branch_refs()
-            if ref.type == "message"
-            and isinstance(ref.facts, MessageFacts)
-            and ref.facts.is_user_forkpoint
-        ]
-
     async def adjacent_visible_user(
         self, entry_id: str, *, direction: Literal["older", "newer"]
     ) -> str | None:
+        """The nearest prompt before or after any row, prompt or not."""
+
         def read() -> str | None:
-            users = self._visible_users()
-            positions = {ref.id: index for index, ref in enumerate(users)}
-            position = positions.get(entry_id)
+            refs = self._store.branch_refs()
+            position = next(
+                (index for index, ref in enumerate(refs) if ref.id == entry_id), None
+            )
             if position is None:
                 return None
-            target = position + (-1 if direction == "older" else 1)
-            return users[target].id if 0 <= target < len(users) else None
+            scan = reversed(refs[:position]) if direction == "older" else refs[position + 1:]
+            return next(
+                (
+                    ref.id
+                    for ref in scan
+                    if ref.type == "message"
+                    and isinstance(ref.facts, MessageFacts)
+                    and ref.facts.is_user_forkpoint
+                ),
+                None,
+            )
 
         return await self._store._to_thread_store(read)
 

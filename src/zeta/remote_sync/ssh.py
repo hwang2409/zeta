@@ -438,7 +438,8 @@ with _reference_gate(home, (ident,), referenced):
                         if source.read(1): sys.exit(50)
                     target.chmod(0o600)
                     # Retention age is transcript mtime; a copy must not reset it.
-                    os.utime(target, (member.mtime, member.mtime))
+                    try: os.utime(target, (member.mtime, member.mtime))
+                    except (OverflowError, ValueError): _reject(f"archive member {member.name}: invalid mtime")
                 else: _reject(f"archive member {member.name}: not a file or directory")
         manifest = json.loads((staging / "transfer.json").read_text())
         resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
@@ -965,7 +966,10 @@ def _unpack(
                         )
                 target.chmod(0o600)
                 # Retention age is transcript mtime; a copy must not reset it.
-                os.utime(target, (member.mtime, member.mtime))
+                try:
+                    os.utime(target, (member.mtime, member.mtime))
+                except (OverflowError, ValueError) as exc:
+                    raise RemoteSyncError("remote archive member has an invalid mtime") from exc
         if destination.exists():
             shutil.rmtree(destination)
         staging.rename(destination)

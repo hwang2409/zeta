@@ -1476,6 +1476,17 @@ Event fields are:
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
 | `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
+In `session_retention` data, `skip_counts` maps a skip reason to the number of
+sessions kept for that reason. The keys are a closed set: `not old enough`,
+`session is open or in use`, `pinned`, `live or recoverable child`,
+`pending project link`, `pending child link`, `pending inbox reference`,
+`published top-level dependent`, `unacknowledged sent message`,
+`session is being deleted`, `references changed during scan`,
+`references not fully scanned`, `unresolved transcript recovery`,
+`unresolved memory reconciliation`, `session or entry disappeared`,
+`no transcript`, and `malformed transcript header`. A skip is not a failure:
+`errors` carries only real failures (for example an unreadable entry), at most 8.
+
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
 retry is scheduled. A provider retry can also include `kind: "provider_retry"`,
