@@ -1243,11 +1243,16 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     async def _shutdown_children(self) -> None:
         # a setup that ignores its cancel (httpcore can lose it) still queues a
-        # connected client while we wait; drain again so that client gets closed
+        # connected client while we wait; drain again so that client gets closed.
+        # wait, not gather: gather returns at once for done tasks, before their
+        # queued done callback has put _SetupFinished in the queue
         while tasks := tuple(
             task for task in self._children if task is not asyncio.current_task()
         ):
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.wait(tasks)
+            for task in tasks:
+                if not task.cancelled():
+                    task.exception()  # mark retrieved, as gather did
             self._children.difference_update(tasks)
             self._drain_queue()
         self._children.clear()

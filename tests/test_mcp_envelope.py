@@ -364,6 +364,92 @@ async def test_close_closes_client_from_setup_that_ignored_cancel(
 
 
 @pytest.mark.asyncio
+async def test_close_closes_abandoned_setup_client_whose_result_is_still_queued(
+    tmp_path: Path,
+) -> None:
+    # forced order: an abandoned auto setup finishes in the loop pass right
+    # before close runs, so its done callback is still queued when close drains
+    clients: list[object] = []
+    closed: list[object] = []
+    sinks: list[object] = []
+    auto_entered = asyncio.Event()
+    release_auto = asyncio.Event()
+    closing: list[asyncio.Task[None]] = []
+
+    class Client:
+        def set_failure_sink(self, sink) -> None:
+            if sink is not None:
+                sinks.append(sink)
+
+        async def close(self) -> None:
+            closed.append(self)
+
+    def build_client(_config) -> Client:
+        client = Client()
+        clients.append(client)
+        return client
+
+    async def spin_until(ready) -> None:
+        for _ in range(1000):
+            if ready():
+                return
+            await asyncio.sleep(0)
+        raise AssertionError("actor did not reach the expected state")
+
+    def start_close() -> None:
+        loop = asyncio.get_running_loop()
+        closing.append(asyncio.eager_task_factory(loop, actor.close()))
+
+    async def connect_and_list(_client) -> list[MCPTool]:
+        setup = len(clients)
+        if setup == 2:
+            auto_entered.set()
+            try:
+                await await_or_fail(release_auto.wait(), what="auto setup release")
+            except asyncio.CancelledError:
+                await await_or_fail(release_auto.wait(), what="auto setup release")
+            asyncio.get_running_loop().call_soon(start_close)
+        if setup == 3:
+            raise RuntimeError("manual setup failed")
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    actor = MCPServerActor(
+        MCPServerConfig("local", "stdio", "unused"),
+        source=tmp_path / "mcp.json",
+        registry=None,
+        publish=lambda *_args: None,
+        build_client=build_client,
+        connect_and_list=connect_and_list,
+    )
+    actor.start()
+    call: asyncio.Task[object] | None = None
+    try:
+        started = await await_or_fail(actor.wait_started(None), what="actor start")
+        assert started.state == "mounted"
+        sinks[-1]("transport lost")
+        await spin_until(lambda: closed == clients[:1])
+        call = asyncio.create_task(
+            actor.call_tool(
+                "echo", {}, AbortSignal(), generation=actor.generation
+            )
+        )
+        await await_or_fail(auto_entered.wait(), what="auto setup start")
+        await await_or_fail(actor.reconnect(), what="manual reconnect")
+        await spin_until(lambda: len(closed) == 2)
+        release_auto.set()
+        await spin_until(lambda: bool(closing))
+        await await_or_fail(closing[0], what="actor close")
+    finally:
+        await await_or_fail(actor.close(), what="actor close cleanup")
+        if call is not None:
+            await await_or_fail(call, what="auto call result")
+
+    assert closed == [clients[0], clients[2], clients[1]], (
+        "close left the abandoned auto setup client open"
+    )
+
+
+@pytest.mark.asyncio
 async def test_deadline_covers_call_work_before_first_yield(tmp_path: Path) -> None:
     now = 0.0
 
