@@ -775,7 +775,9 @@ async def test_fetch_temp_file_write_does_not_block_loop_and_cleans_up_on_cancel
     await asyncio.to_thread(entered.wait)
     fetch.cancel()
 
-    await asyncio.gather(fetch, return_exceptions=True)
+    await await_or_fail(
+        asyncio.gather(fetch, return_exceptions=True), what="cancelled fetch"
+    )
     await asyncio.to_thread(worker.join)
 
     assert outcomes == [True]
