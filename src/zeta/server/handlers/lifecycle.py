@@ -104,6 +104,9 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.set_session_available()
+                self.server._retention_owner.start()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -192,6 +195,9 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 "session_host_commands" in self.features
             )
             self.server.control.session_replaced()
+            if self.server._retention_owner is not None:
+                self.server._retention_owner.set_session_available()
+                self.server._retention_owner.start()
             self.server.control.clear_approvals()
             await self.server.control.controller_ready()
             await _publish_project_registry_notice(self)
@@ -461,6 +467,12 @@ async def status(
 
 
 def list_sessions(
+    self, request_id: str | int, params: dict[str, Any]
+) -> tuple[dict[str, object], list[str]]:
+    return _list_sessions(self, request_id, params)
+
+
+def _list_sessions(
     self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features

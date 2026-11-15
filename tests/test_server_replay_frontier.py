@@ -857,7 +857,7 @@ async def test_replay_frontier_table(
                 serve.store.append_message_async(Message(MessageRole.ASSISTANT, [TextContent("trigger")]))
             )
             await await_or_fail(asyncio.to_thread(write_entered.wait, 10), what="async store write")
-            external = ConversationStore(serve.store.root_dir, session_id=serve.session_id)
+            external = await asyncio.to_thread(ConversationStore, serve.store.root_dir, session_id=serve.session_id)
             try:
                 external.append_message(Message(MessageRole.ASSISTANT, [TextContent("external")]))
             finally:

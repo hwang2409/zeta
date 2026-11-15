@@ -154,12 +154,20 @@ def restore_stderr_for_cli() -> None:
     _restore()
 
 
-def run_tui_session(app: Any, args: Any, run_tui: Any) -> tuple[bool, bool]:
+def run_tui_session(
+    app: Any, args: Any, run_tui: Any, owner: Any | None = None
+) -> tuple[bool, bool]:
     async def run() -> tuple[bool, bool]:
         from ..runtime.update_notice import start_tui_update_notice
 
         start_tui_update_notice()
-        return await run_tui(app, args)
+        if owner is not None:
+            owner.start()
+        try:
+            return await run_tui(app, args)
+        finally:
+            if owner is not None:
+                await owner.stop()
 
     with patch_stdout(raw=True):
         # prompt_toolkit temporarily proxies stderr to the terminal; incidental
