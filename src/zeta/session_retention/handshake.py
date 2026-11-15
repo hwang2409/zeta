@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from ..core.session_files import require_off_loop_lock
 from ..locking import RETENTION_HOME_ID, domain_lock_name
 
 
@@ -84,11 +85,18 @@ def planner_request_pending(home: Path) -> bool:
     except FileNotFoundError:
         return False
     try:
+        require_off_loop_lock("retention probe")
+        # probers queue here, so one prober's brief LOCK_EX never reads as a user open to another
+        probe_fd = _fd(Path(home), "planner-probe")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
+            fcntl.flock(probe_fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(probe_fd)
     finally:
         os.close(fd)
