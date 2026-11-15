@@ -14,7 +14,9 @@ from tests.test_server_mcp_bindings import (
     _wait_for_controller_release,
     allow_local_http,
 )
+from tests.test_server_turn_reconnect import HeldBackend
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
 
 BUSY = -32004
@@ -306,21 +308,31 @@ async def test_resume_without_attach_feature_stays_busy(tmp_path: Path) -> None:
         await server.close()
 
 
+class _ToolsSeenBackend(HeldBackend):
+    """A HeldBackend that records the tool names of each provider request."""
+
+    def __init__(self, replies) -> None:
+        super().__init__(replies)
+        self.tools: list[list[str]] = []
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        self.tools.append([schema["name"] for schema in tool_schemas])
+        async for event in HeldBackend.complete.__wrapped__(self, messages, tool_schemas):
+            yield event
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold_mount"])
 async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cold: bool
 ) -> None:
     from tests.support.owned import await_or_fail
-    from tests.test_server_turn_reconnect import (
-        RECONNECT,
-        HeldBackend,
-        _drop,
-        _reconnect,
-    )
+    from tests.test_server_turn_reconnect import RECONNECT, _drop, _reconnect
 
     allow_local_http(monkeypatch)
-    mcp = LocalMCP()
+    # page lists its tools only to a request with the client's header.
+    mcp = LocalMCP(reject_missing_auth=True)
     port = await mcp.start()
     (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
         "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
@@ -329,7 +341,7 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
     replies = [([TextContent("woke")], True)]
     if not cold:
         replies.insert(0, ([TextContent("warm")], False))
-    backend = HeldBackend(replies)
+    backend = _ToolsSeenBackend(replies)
     server = ZetaServer(
         home=tmp_path, port=0, provider="codex",
         backend_factory=lambda *_: (backend, "offline"),
@@ -416,6 +428,9 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
 
         start = await _event(reader2, "turn_start")
         assert start["session_id"] == session_id
+        await await_or_fail(backend.streaming[-1].wait(), what="wake request")
+        # the wake's first request carries the bound server's tools.
+        assert "page__echo" in backend.tools[-1], backend.tools
         backend.release[-1].set()
         end = await _event(reader2, "agent_end")
         assert end["session_id"] == session_id
@@ -423,6 +438,67 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
     finally:
         release_setup.set()
         release_mount.set()
+        for event in backend.release:
+            event.set()
+        await _close(writer2, writer)
+        await server.close()
+        await mcp.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_attach_reports_idle_when_turn_ends_during_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.support.owned import await_or_fail
+    from tests.test_server_turn_reconnect import RECONNECT, _drop, _reconnect
+
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    backend = HeldBackend([([TextContent("held")], True)])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    features = [*RECONNECT, "new_session_settings", "session_mcp_bindings", "resume_attach"]
+    page = {"server": "page", "headers": {"Authorization": "Bearer page"}}
+    reader, writer = await _connect(server)
+    writer2 = None
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        session_id = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol", "mcp_bindings": [page],
+        }))[-1]["result"]["session"]["session_id"]
+        await _request(reader, writer, 3, "send", {"text": "hold"})
+        await await_or_fail(backend.streaming[0].wait(), what="turn streaming")
+        turn = server.control._turn_task
+        assert turn is not None
+        await _drop(writer, server)
+        reader2, writer2 = await _reconnect(server, 4, features)
+
+        loop = server.runtime.loop
+        original_rebind = loop.rebind_mcp
+
+        async def rebind_after_turn_end(*args) -> None:
+            backend.release[0].set()
+            await await_or_fail(asyncio.wait({turn}), what="turn end")
+            await original_rebind(*args)
+
+        # test-contract: seam the turn ends while the attach re-binds its MCP headers
+        monkeypatch.setattr(loop, "rebind_mcp", rebind_after_turn_end)
+        attached = await _request(reader2, writer2, 5, "resume", {
+            "session_id": session_id, "mcp_bindings": [page]
+        })
+        result = attached[-1].get("result", {})
+        assert "attached" not in result, attached[-1]
+        assert result["session"]["session_id"] == session_id
+        assert server.control._active_mcp_bindings == {"page": {"Authorization": "Bearer page"}}
+    finally:
         for event in backend.release:
             event.set()
         await _close(writer2, writer)
