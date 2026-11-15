@@ -280,6 +280,7 @@ FEATURES = (
     "approval_restart_reason",
     "session_retention",
     "mcp_refresh_tools",
+    "resume_attach",
 )
 
 
