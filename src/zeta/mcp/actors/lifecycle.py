@@ -31,6 +31,13 @@ class Suspend:
     config: MCPServerConfig
     source: Path
     result: asyncio.Future[None]
+    # while pending, calls wait for the binding to return instead of failing.
+    hold: asyncio.Future[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HoldEnded:
+    hold: asyncio.Future[None]
 
 
 @dataclass(frozen=True, slots=True)

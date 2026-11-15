@@ -42,6 +42,7 @@ from .actors.lifecycle import (
     CancelOperation as _CancelOperation,
     ChildFinished as _ChildFinished,
     Close as _Close,
+    HoldEnded as _HoldEnded,
     Remove as _Remove,
     Suspend as _Suspend,
     TransportFailure as _TransportFailure,
@@ -189,6 +190,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._manual_recovery_probe = False
         # suspended because its session binding left; cleared by any later status.
         self._binding_detached = False
+        # calls made while detached wait in _requests (no task) until this ends.
+        self._detached_hold: asyncio.Future[None] | None = None
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
@@ -271,12 +274,22 @@ class MCPServerActor(MCPDefinitionPublisher):
             "manual", notice_sink, config=config, source=source
         )
 
-    async def suspend(self, config: MCPServerConfig, source: Path) -> None:
-        """Withdraw definitions and close the client without terminating the actor."""
+    async def suspend(
+        self,
+        config: MCPServerConfig,
+        source: Path,
+        *,
+        hold: asyncio.Future[None] | None = None,
+    ) -> None:
+        """Withdraw definitions and close the client without terminating the actor.
+
+        Until ``hold`` is done, a call waits for the next binding instead of
+        failing at once with the detached result.
+        """
         if self.is_terminal:
             return
         future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        self._queue.put_nowait(_Suspend(config, source, future))
+        self._queue.put_nowait(_Suspend(config, source, future, hold))
         await asyncio.shield(future)
 
     async def remove(self) -> None:
@@ -426,6 +439,8 @@ class MCPServerActor(MCPDefinitionPublisher):
                     self._children.discard(message.task)
                 elif isinstance(message, _Suspend):
                     await self._handle_suspend(message)
+                elif isinstance(message, _HoldEnded):
+                    self._handle_hold_ended(message.hold)
                 elif isinstance(message, _Remove):
                     await self._handle_remove(message.result)
                     return
@@ -841,6 +856,10 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     def _handle_call(self, request: _CallRequest) -> None:
         if self._binding_detached:
+            hold = self._detached_hold
+            if hold is not None and not hold.done():
+                self._requests[request.identifier] = request
+                return
             _set_result(request.result, _detached_result(self.name))
             return
         if not self.config.allows_tool(request.tool_name) or not any(
@@ -1064,8 +1083,28 @@ class MCPServerActor(MCPDefinitionPublisher):
             )
         )
         self._binding_detached = True
+        self._detached_hold = message.hold
+        if message.hold is not None:
+            message.hold.add_done_callback(
+                lambda hold: self._queue.put_nowait(_HoldEnded(hold))
+            )
         self._tool_refresh.settle()
         _set_result(message.result, None)
+
+    def _held_calls(self) -> list[_CallRequest]:
+        return [
+            request
+            for request in self._requests.values()
+            if isinstance(request, _CallRequest) and request.task is None
+        ]
+
+    def _handle_hold_ended(self, hold: asyncio.Future[None]) -> None:
+        if hold is not self._detached_hold:
+            return
+        self._detached_hold = None
+        for request in self._held_calls():
+            self._requests.pop(request.identifier)
+            _set_result(request.result, _detached_result(self.name))
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
@@ -1289,6 +1328,13 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     def _set_status(self, status: MCPServerStatus) -> None:
         self._status = status
+        if self._binding_detached:
+            # the binding is back: held calls run against the new generation.
+            self._detached_hold = None
+            for request in self._held_calls():
+                self._requests.pop(request.identifier)
+                request.generation = self._generation
+                self._queue.put_nowait(request)
         self._binding_detached = False
         self._publish_callback(
             self,

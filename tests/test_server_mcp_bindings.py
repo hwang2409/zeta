@@ -1645,9 +1645,9 @@ async def test_session_mcp_binding_disconnect_suspends_all_servers_together(
         suspend_server = mount.suspend_server
 
         async def observe_suspend(
-            config: MCPServerConfig, *, source: Path
+            config: MCPServerConfig, *, source: Path, hold: object = None
         ) -> None:
-            await suspend_server(config, source=source)
+            await suspend_server(config, source=source, hold=hold)
             (first_suspended if config.name == "first" else second_suspended).set()
 
         monkeypatch.setattr(mount, "suspend_server", observe_suspend)
