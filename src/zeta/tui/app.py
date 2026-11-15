@@ -273,6 +273,8 @@ class TUIApp(
         )
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        self._user_nav_presses: deque[str] = deque()
+        self._user_nav_task: asyncio.Task[None] | None = None
         # Root view from before the finder opened: (follow tail, top row, pages).
         self._finder_return: tuple[bool, Any, tuple[str, ...]] | None = None
         self._history_search_results: tuple[Any, ...] = ()
@@ -675,14 +677,22 @@ class TUIApp(
         self._move_history("newer", self._transcript.scroll_down)
 
     def _navigate_history_user(self, direction: str) -> None:
+        # Presses wait for the reveal before them, so each moves one prompt.
+        self._user_nav_presses.append(direction)
+        if self._user_nav_task is None or self._user_nav_task.done():
+            self._user_nav_task = asyncio.create_task(self._run_user_nav_presses())
+
+    async def _run_user_nav_presses(self) -> None:
         transcript = self._transcript
-        moved = (
-            transcript.previous_user_message()
-            if direction == "older"
-            else transcript.next_user_message()
-        )
-        if not moved:
-            asyncio.create_task(self._reveal_adjacent_user(direction))
+        while self._user_nav_presses:
+            direction = self._user_nav_presses.popleft()
+            moved = (
+                transcript.previous_user_message()
+                if direction == "older"
+                else transcript.next_user_message()
+            )
+            if not moved:
+                await self._reveal_adjacent_user(direction)
 
     async def _reveal_adjacent_user(self, direction: str) -> None:
         """Page to the adjacent prompt the resident rows cannot put on the top row."""
@@ -725,6 +735,9 @@ class TUIApp(
 
     def _finder_open(self) -> None:
         transcript = self._transcript
+        if transcript.search_active:
+            # A new search replaces the accepted one and its match keys.
+            self._end_history_search()
         self._finder_return = (
             None
             if getattr(self, "_history_pager", None) is None

@@ -982,7 +982,7 @@ def build_key_bindings(
 
     if on_finder_open is not None:
 
-        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode & ~transcript_search_mode, eager=True)
+        @bindings.add(*resolved_keys["search-start"], filter=full_screen_mode & ~panel_mode, eager=True)
         def open_message_finder(event: KeyPressEvent) -> None:
             event.current_buffer.cancel_completion()
             on_finder_open()

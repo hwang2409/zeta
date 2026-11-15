@@ -615,10 +615,23 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def durable_scroll_anchor(self) -> tuple[str, int, int] | None:
         if self._anchor is None or self._anchor[0] is None:
             return None
-        identity = self._anchor[0].history_identity
+        unit, text_offset = self._anchor
+        if unit.history_identity is None and unit in self._unit_set:
+            # A spacer line has no durable identity: anchor on the row after it.
+            index = self._units.index(unit)
+            unit = next(
+                (
+                    later
+                    for later in self._units[index + 1 :]
+                    if later is not None and later.history_identity is not None
+                ),
+                unit,
+            )
+            text_offset = 0
+        identity = unit.history_identity
         if identity is None:
             return None
-        return identity[0], identity[1], self._anchor[1]
+        return identity[0], identity[1], text_offset
 
     def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
         """Restore a non-tail viewport anchor after transcript reconstruction."""
@@ -845,11 +858,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         """Find the adjacent user unit and whether it can reach the top row."""
 
         if self._uses_virtual_history():
-            current = (
-                self._virtual_start[0]
-                if self._virtual_start is not None
-                else len(self._units)
-            )
+            if self._virtual_start is not None:
+                current = self._virtual_start[0]
+            elif self._anchor is not None and self._anchor[0] in self._unit_set:
+                # A restored anchor sets the place before a frame resolves it.
+                current = self._units.index(self._anchor[0])
+            else:
+                current = len(self._units)
             indexed = [(self._units.index(unit), unit) for unit in self._user_units]
             candidates = (
                 (item for item in indexed if item[0] > current)

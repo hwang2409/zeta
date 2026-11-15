@@ -155,7 +155,11 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
                 message(
                     Message(
                         MessageRole.TOOL_RESULT,
-                        tool_result=ToolResult(call.id, f"line one {turn}-{tool}\nline two"),
+                        tool_result=ToolResult(
+                            call.id,
+                            # Uneven card heights, so a page edge can land on any row.
+                            f"line one {turn}-{tool}" + "\nline two" * ((turn * 7 + tool) % 4),
+                        ),
                     )
                 )
                 if tool == TOOLS_PER_TURN // 2:
@@ -289,6 +293,10 @@ class Driver:
             and self.app._finder_prepare_task is None
             and self.app._finder_rank_task is None
             and (
+                getattr(self.app, "_user_nav_task", None) is None
+                or self.app._user_nav_task.done()
+            )
+            and (
                 self.app._history_search_task is None
                 or self.app._history_search_task.done()
             )
@@ -412,12 +420,17 @@ async def test_ctrl_down_returns_to_the_tail(root_home: RootHome) -> None:
 
 
 async def _page_down_to_tail(driver: Driver) -> None:
-    """PageDown until the newest answer shows; no press may move back or stall."""
+    """PageDown until the newest answer shows; no press may move back, stall, or skip."""
 
+    seen: set[tuple[int, int]] = set()
     for press in range(400):
         await driver.until(driver.idle, what="settled screen before PageDown")
         driver.assert_in_order(f"before PageDown {press + 1}")
+        seen.update(driver.order())
         if _answer(TURNS - 1) in driver.screen():
+            first = min(seen)[0]
+            skipped = [_prompt(turn) for turn in range(first + 1, TURNS) if (turn, 0) not in seen]
+            assert not skipped, f"PageDown never showed {skipped}"
             return
         before = driver.rows()
         top_before = driver.order()[:1]
@@ -624,7 +637,7 @@ class _RowPages:
     async def _pass(self, name: str) -> None:
         if name in self.gates:
             self.waiting.setdefault(name, asyncio.Event()).set()
-            await self.gates[name].wait()
+            await asyncio.wait_for(self.gates[name].wait(), 10)
 
     async def page(self, cursor=None, *, direction="older") -> TUIHistoryPage:
         if direction == "newer":
@@ -717,7 +730,7 @@ async def test_finder_escape_before_the_old_match_lands_keeps_the_view(
 
         async def gated_reveal(entry_id: str) -> TUIHistoryPage:
             entered.set()
-            await gate.wait()
+            await asyncio.wait_for(gate.wait(), 10)
             return await real_reveal(entry_id)
 
         source.reveal = gated_reveal
@@ -748,7 +761,7 @@ async def test_finder_shows_searching_until_old_history_answers(
 
         async def gated_search(query: str, **kwargs: object) -> object:
             entered.set()
-            await gate.wait()
+            await asyncio.wait_for(gate.wait(), 10)
             return await real_search(query, **kwargs)
 
         source.search = gated_search
@@ -817,7 +830,7 @@ async def test_page_up_while_a_reveal_loads_newer_pages_keeps_paging(
         async def gated_page(cursor=None, *, direction="older"):
             if direction == "newer":
                 entered.set()
-                await gate.wait()
+                await asyncio.wait_for(gate.wait(), 10)
             return await real_page(cursor, direction=direction)
 
         source.page = gated_page
@@ -853,3 +866,51 @@ async def test_page_up_while_a_reveal_loads_newer_pages_keeps_paging(
         await driver.settle("settled after the held newer read")
         _assert_pages_adjacent(driver, "after a newer read whose edge moved")
         await _page_down_to_tail(driver)
+
+
+@pytest.mark.asyncio
+async def test_a_burst_of_ctrl_down_moves_one_prompt_per_press(root_home: RootHome) -> None:
+    async with running_tui(root_home) as driver:
+        await _ctrl_up_past(driver, TURNS - 40)
+        await driver.settle("settled old prompt")
+        start = int(driver.top()[7:11])
+        # Six presses in one write, before any reveal finishes.
+        await driver.send(CTRL_DOWN * 6)
+        await driver.settle("settled after the burst")
+        await driver.until(
+            lambda: _prompt(start + 6) in driver.top(),
+            what=f"six ctrl+down from {_prompt(start)} did not put {_prompt(start + 6)} on top",
+        )
+
+
+@pytest.mark.asyncio
+async def test_ctrl_f_after_an_accepted_match_opens_a_new_search(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send(OLD_WORDS[40])
+        await driver.settle("the finder settles on the first query")
+        await driver.send(ENTER)
+        await driver.until(
+            lambda: not driver.finder_drawn() and _prompt(40) in driver.screen(),
+            what="Enter on the first query did not show its match",
+        )
+        await driver.settle("accept settles")
+        # The match highlight is still on; ctrl+f starts a new search anyway.
+        await driver.send(CTRL_F)
+        await driver.until(
+            driver.finder_drawn, what="ctrl+f during the accepted search drew no finder"
+        )
+        await driver.send(OLD_WORDS[3])
+        await driver.settle("the finder settles on the second query")
+        await driver.send(ENTER)
+        await driver.until(
+            lambda: not driver.finder_drawn() and _prompt(3) in driver.screen(),
+            what="Enter on the second query did not show its match",
+        )
+        composer = [row for row in driver.all_rows() if row.lstrip().startswith("›")]
+        assert composer and not any(OLD_WORDS[3] in row for row in composer), (
+            f"the second query went into the composer: {composer}"
+        )
