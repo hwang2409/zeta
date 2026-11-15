@@ -627,6 +627,9 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             return
         self._follow_tail = False
         self._anchor = (unit, max(0, text_offset))
+        # A virtual start from before the rebuild points at other units.
+        self._virtual_start = None
+        self._pending_virtual_scroll = 0
         self._bump_revision()
 
     def restore_durable_scroll_anchor(
@@ -836,7 +839,11 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._focus_search_match()
         return True
 
-    def _jump_to_user(self, *, next_message: bool) -> bool:
+    def _user_target(
+        self, *, next_message: bool
+    ) -> tuple[_TranscriptUnit, int, bool] | None:
+        """Find the adjacent user unit and whether it can reach the top row."""
+
         if self._uses_virtual_history():
             current = (
                 self._virtual_start[0]
@@ -851,14 +858,9 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             )
             target = next(candidates, None)
             if target is None:
-                return False
-            self._virtual_start = (target[0], 0)
-            self._anchor = (target[1], 0)
-            self._scroll_offset = self._estimated_prefix(
-                self._content_width, target[0], 0
-            )
-            self._follow_tail = False
-            return True
+                return None
+            tail = self._virtual_tail_start(self._content_width, self._viewport_height)
+            return target[1], target[0], (target[0], 0) <= tail
         self._materialize_for_interaction()
         if self._locations_revision != self._revision:
             self.create_content(self._content_width, self._viewport_height)
@@ -867,23 +869,41 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             self._locations_revision = self._revision
         user_units = self._user_unit_set
         seen: set[_TranscriptUnit] = set()
-        targets: list[int] = []
+        targets: list[tuple[int, _TranscriptUnit]] = []
         for index, (unit, _offset) in enumerate(self._line_locations):
             if unit in user_units and unit not in seen:
                 seen.add(unit)
-                targets.append(index)
+                targets.append((index, unit))
         if next_message:
-            target = next(
-                (index for index in targets if index > self._scroll_offset), None
+            line = next(
+                (item for item in targets if item[0] > self._scroll_offset), None
             )
         else:
-            target = next(
-                (index for index in reversed(targets) if index < self._scroll_offset),
+            line = next(
+                (item for item in reversed(targets) if item[0] < self._scroll_offset),
                 None,
             )
-        if target is None:
+        if line is None:
+            return None
+        tail = max(0, len(self._line_locations) - self._viewport_height)
+        return line[1], line[0], line[0] <= tail
+
+    def _jump_to_user(self, *, next_message: bool) -> bool:
+        """Put the adjacent user unit on the top row; False when it cannot get there."""
+
+        target = self._user_target(next_message=next_message)
+        if target is None or not target[2]:
             return False
-        self._set_scroll_offset(target)
+        unit, position, _reachable = target
+        if self._uses_virtual_history():
+            self._virtual_start = (position, 0)
+            self._anchor = (unit, 0)
+            self._scroll_offset = self._estimated_prefix(
+                self._content_width, position, 0
+            )
+            self._follow_tail = False
+            return True
+        self._set_scroll_offset(position)
         return True
 
     def next_user_message(self) -> bool:
@@ -891,6 +911,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
 
     def previous_user_message(self) -> bool:
         return self._jump_to_user(next_message=False)
+
+    def next_user_entry(self) -> str | None:
+        """Durable id of the next user unit below the top row, even near the tail."""
+
+        target = self._user_target(next_message=True)
+        identity = None if target is None else target[0].history_identity
+        return None if identity is None else identity[0]
 
     def search_status(self) -> tuple[int, int] | None:
         if not self._search_active:

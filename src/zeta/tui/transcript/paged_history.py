@@ -380,6 +380,10 @@ class PagedTranscriptHistory:
         if generation == self.generation and page.segments:
             self._segments.clear()
             self.adopt(page)
+            # The revealed page ends at the target; rows after it let the view
+            # put the target on the top row instead of the bottom one.
+            if self.can_load_newer:
+                await self.load("newer")
         return page
 
     async def navigate_user(

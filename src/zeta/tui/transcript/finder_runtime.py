@@ -68,12 +68,14 @@ class FinderRuntimeMixin:
         )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
+        self._finder_accept_pending = False
 
     def _finder_target(self) -> FinderRuntimeTarget:
         finder = getattr(self, "_active_finder", None)
         return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
+        self._finder_accept_pending = False
         self._finder_field.reset(notify=False)
         self._active_finder = self._viewed_transcript()
         finder = self._active_finder
@@ -85,6 +87,7 @@ class FinderRuntimeMixin:
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
+        self._finder_accept_pending = False
         self._active_finder = self._history_finder
         finder = self._history_finder
         session = getattr(self, "_active_session", None)
@@ -123,6 +126,8 @@ class FinderRuntimeMixin:
                 self._invalidate_prompt()
                 if finder.finder_needs_ranking():
                     self._start_finder_ranking()
+                else:
+                    self._finder_accept_when_ready()
         finally:
             if self._finder_prepare_task is task:
                 self._finder_prepare_task = None
@@ -155,6 +160,7 @@ class FinderRuntimeMixin:
                 if finder.finder_publish(result):
                     self._invalidate_prompt()
                     if not finder.finder_needs_ranking():
+                        self._finder_accept_when_ready()
                         return
         finally:
             if self._finder_rank_task is task:
@@ -184,7 +190,26 @@ class FinderRuntimeMixin:
         self._finder_target().finder_move(delta)
         self._invalidate_prompt()
 
+    def _finder_loading(self) -> bool:
+        """True while the open finder's rows can still change."""
+
+        state = self._finder_target().finder_state()
+        return state is not None and not state.complete
+
+    def _finder_accept_when_ready(self) -> None:
+        # Run after the calling worker returns: accepting cancels the workers.
+        if self._finder_accept_pending:
+            asyncio.get_running_loop().call_soon(self._finder_accept_if_ready)
+
+    def _finder_accept_if_ready(self) -> None:
+        if self._finder_accept_pending and not self._finder_loading():
+            self._finder_accept()
+
     def _finder_accept(self) -> None:
+        # Enter typed before the rows are ready waits for them instead of dropping.
+        self._finder_accept_pending = self._finder_loading()
+        if self._finder_accept_pending:
+            return
         finder = self._finder_target()
         if finder.finder_accept():
             self._cancel_finder_workers()
@@ -194,6 +219,7 @@ class FinderRuntimeMixin:
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
+        self._finder_accept_pending = False
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
