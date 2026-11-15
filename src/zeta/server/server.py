@@ -12,13 +12,20 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from ..config.settings import load_settings
 from ..core.session import SessionError
 from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
 from ..runtime.foreground_events import ForegroundEventPublisher
-from ..storage_format import drain_releases, pending_releases
+from ..session_retention.activation import make_retention_owner
+from ..storage_format import (
+    StorageFeature,
+    drain_releases,
+    feature_enabled,
+    pending_releases,
+)
 from . import (
     accounts,
     login,
@@ -264,6 +271,26 @@ class ZetaServer:
         self._client_active = False
         self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
+        self._retention_owner = (
+            make_retention_owner(
+                self.home,
+                self.runtime.manager._storage_lease,
+                lambda: (
+                    0
+                    if self.runtime.opened is None
+                    else load_settings(home=self.home).settings.retention_days
+                ),
+                session_available=False,
+            )
+            if (
+                not self._borrowed
+                and feature_enabled(
+                    self.runtime.manager._storage_lease.observed_epoch,
+                    StorageFeature.SESSION_RETENTION_ACTIVATION,
+                )
+            )
+            else None
+        )
         self._account_warnings: tuple[str, ...] = ()
         self._unix_listener: _UnixSocketListener | None = None
         self._prebound_socket = prebound_socket
@@ -347,6 +374,19 @@ class ZetaServer:
         if self._foreground_event_publisher is not None:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
+        if self._retention_owner is not None:
+            async def publish_retention(projection: dict[str, object]) -> None:
+                if projection.get("mode") == "none" and not projection.get("errors"):
+                    return
+                if self.connections is None or self.runtime.opened is None:
+                    return
+                await self.connections.publish_feature_event(
+                    "session_retention", EventDescriptor.SESSION_RETENTION,
+                    self.runtime.opened.metadata.session_id, data=projection,
+                )
+
+            self.runtime.retention_event_sink = publish_retention
+            self._retention_owner.set_publish(publish_retention)
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -356,6 +396,8 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
+        if self._retention_owner is not None:
+            await self._retention_owner.stop()
         if self._idle_drain is not None:
             self._idle_drain.cancel()
             await asyncio.wait([self._idle_drain])

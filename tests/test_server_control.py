@@ -691,7 +691,9 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
             server_sink(event)
 
         root_loop.set_background_event_sink(forward)
-        child_store = ConversationStore(tmp_path / f"child-{child_instance_id}")
+        child_store = await asyncio.to_thread(
+            ConversationStore, tmp_path / f"child-{child_instance_id}"
+        )
         child_loop = AgentLoop(
             FakeBackend([]),
             child_store,
@@ -787,7 +789,7 @@ async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    child_store = ConversationStore(tmp_path / "child")
+    child_store = await asyncio.to_thread(ConversationStore, tmp_path / "child")
     child_loop: AgentLoop | None = None
     child_backend = CancelledBeforeAnswerBackend()
     try:
