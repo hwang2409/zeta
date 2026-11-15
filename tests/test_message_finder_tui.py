@@ -62,6 +62,8 @@ def _app_for_finder(
             search_results=(),
             end_search=lambda: None,
             start_search=lambda *_args: None,
+            search_task=None,
+            history_pager=SimpleNamespace(descriptors=()),
         ),
         viewed_transcript=child or transcript,
     )
