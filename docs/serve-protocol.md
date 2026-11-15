@@ -582,6 +582,18 @@ running. With the `user_message_event` feature, a `user_message` event with
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
 ```
 
+A steer that the running turn did not read, for example one sent while the final
+reply streams, is not dropped when that turn completes. After the turn's
+`turn_end` and `agent_end`, the server starts the next turn with no new user
+message, and that turn's first provider request carries the steer, so its
+`delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
+through `agent_end` events. The next turn does not start, and the steer is
+`dropped` with reason `disconnect`, if the server is closing or a `send` would be
+refused because the session is not attached. A `send` that arrives right after
+`turn_end` either starts the turn that carries the steer, or gets `-32004`
+because that turn has already started; the client should then retry the text as
+a `steer`.
+
 ### delivery session guard (`delivery_session_guard` feature)
 
 `send`, `steer`, and `send_images` accept an optional `session_id`: the session
@@ -657,8 +669,11 @@ where status is:
 - `delivered`: steering was durably appended as a user message at that boundary,
   or a `send` user message was durably appended and its turn was scheduled;
 - `dropped`: accepted steering left the live queue without delivery because of
-  restart, session abort, explicit clearing, disconnect, or turn end. It is not
-  restored after restart; resend still-wanted work with a new ID;
+  restart, session abort, explicit clearing, disconnect, or a failed turn. Old
+  sessions and the TUI also record turn end. Steering that a completed served
+  turn did not read is not dropped; it starts the next turn (see `steer`). A
+  dropped steer is not restored after restart; resend still-wanted work with a
+  new ID;
 - `evicted`: the ID was accepted but is outside the 1,000-entry detail bound;
   the result also contains its retained `outcome`, which is `queued`,
   `delivered`, or `dropped`;
@@ -1492,7 +1507,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
    and `status.state` is `idle` until the next `turn_start`; a queued
    notification turn is not busy until its `turn_start` is published, so a send
-   that arrives first wins. Clients must wait for `agent_end` before idle-only
+   that arrives first wins. When the turn left a steer unread, the server starts
+   the next turn after `agent_end`; a `send` that arrives after that start gets
+   `-32004` and should be retried as `steer`. Clients must wait for `agent_end` before idle-only
    requests such as `new_session`; the server commits `served_turn_end` before
    cleanup. Error
    and abort paths still end with `error` or `turn_aborted`.
