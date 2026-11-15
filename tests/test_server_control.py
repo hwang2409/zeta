@@ -1072,7 +1072,7 @@ class _GateSignalingEvent(asyncio.Event):
     async def wait(self) -> bool:
         if not self.is_set():
             self._waiting.set()
-        return await super().wait()
+        return await asyncio.wait_for(super().wait(), 10)
 
 
 @pytest.mark.asyncio
@@ -1086,8 +1086,8 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
     order: list[str] = []
     in_command = asyncio.Event()
     release_command = asyncio.Event()
-    wake_in_setup = asyncio.Event()
-    wake_gated = asyncio.Event()
+    # set when the wake either waits on the start gate or reaches its setup.
+    wake_progressed = asyncio.Event()
     original_model = ServerSlashSession.slash_model
     original_ensure = loop._ensure_mcp_servers
 
@@ -1099,7 +1099,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
 
     async def observed_ensure() -> None:
         order.append("wake setup")
-        wake_in_setup.set()
+        wake_progressed.set()
         await original_ensure()
 
     monkeypatch.setattr(ServerSlashSession, "slash_model", held_model)
@@ -1109,7 +1109,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
     monkeypatch.setattr(
         server.control,
         "_no_slash_command",
-        _GateSignalingEvent(wake_gated),
+        _GateSignalingEvent(wake_progressed),
         raising=False,
     )
     try:
@@ -1122,16 +1122,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
         )
         await await_or_fail(in_command.wait(), what="slash command running")
         _schedule_wake(server, session_id)
-        gated = asyncio.ensure_future(wake_gated.wait())
-        setup = asyncio.ensure_future(wake_in_setup.wait())
-        try:
-            await await_or_fail(
-                asyncio.wait({gated, setup}, return_when=asyncio.FIRST_COMPLETED),
-                what="wake gated or in setup",
-            )
-        finally:
-            gated.cancel()
-            setup.cancel()
+        await await_or_fail(wake_progressed.wait(), what="wake gated or in setup")
         release_command.set()
         frames = await read_until(
             reader, _is_turn_end(session_id), what="wake turn_end"
