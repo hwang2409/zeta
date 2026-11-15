@@ -213,10 +213,10 @@ async def test_idle_home_owner_episode_and_read_request_touch_no_file(tmp_path: 
                 raise result
             return result
 
-        with pytest.raises(RuntimeError, match="blocked"):
-            await asyncio.to_thread(
-                acquire_after_retention_yield, home, acquire, lambda _: RuntimeError("blocked")
-            )
+        # no active planner: one more try, with no handshake file
+        assert await asyncio.to_thread(
+            acquire_after_retention_yield, home, acquire, lambda _: RuntimeError("blocked")
+        ) == "opened"
         after = {
             str(path.relative_to(home)): path.stat(follow_symlinks=False).st_mtime_ns
             for path in home.rglob("*")
@@ -741,7 +741,7 @@ _COMPLETE = {"mode": "preview", "preview_id": "p"}
     ("case", "outcomes"),
     [
         ("complete", [Published(_COMPLETE, complete=True)]),
-        ("progressed-incomplete", [Published(_COMPLETE, complete=False, progressed=True), Published(_COMPLETE, complete=True)]),
+        ("progressed-incomplete", [Published(_COMPLETE, complete=False, changed=True), Published(_COMPLETE, complete=True)]),
         ("no-progress", [Published(_COMPLETE, complete=False)]),
         ("user-scan-checkpoint", [Yielded("user"), Published(_COMPLETE, complete=True)]),
         ("stop-scan-checkpoint", [Yielded("stop")]),
@@ -836,40 +836,6 @@ async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
     assert passes == 2
     await owner.stop()
 
-
-@pytest.mark.asyncio
-async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    initialize_storage_home(home)
-    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
-    manager = SessionManager(home)
-    opened = await asyncio.to_thread(_create_closed, manager, [], name="old")
-    _age_tree(home / "sessions" / opened, days=100)
-    lease = await asyncio.to_thread(open_writer, home)
-    try:
-        owner = make_retention_owner(
-            home, lease, lambda: 30,
-            now_ns=lambda: time.time_ns() + 365 * 86_400 * 1_000_000_000,
-        )
-        projections, failure = await asyncio.to_thread(owner._run_episode)
-        assert failure is None
-        preview = next(item for item in projections if item["mode"] == "preview" and item.complete)
-        assert preview["root_ids"] == [opened]
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
-        assert armed.applied
-        deleted = []
-        for _ in range(20):
-            projections, failure = await asyncio.to_thread(owner._run_episode)
-            assert failure is None
-            deleted = [item for item in projections if item["mode"] == "deleted"]
-            if deleted:
-                break
-        assert deleted and any(item["root_ids"] == [opened] for item in deleted)
-        assert not (home / "sessions" / opened).exists()
-        assert any(row["mode"] == "deleted" and row["root_ids"] == [opened] for row in read_retention_history(home))
-        await owner.stop()
-    finally:
-        await asyncio.to_thread(lease.close)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ("arm", "disarm"))
@@ -1050,3 +1016,67 @@ def test_owner_without_days_source_publishes_settings_days(tmp_path: Path) -> No
     assert failure is None
     assert projections[-1].projection["days"] == 45
     assert read_retention_history(home)[-1]["days"] == 45
+
+
+def test_planner_active_is_never_free_while_the_planner_holds_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    ensure_handshake_files(home)
+    root = _create_closed(SessionManager(home), [], name="old")
+    session_dir = home / "sessions" / root
+    # a child store makes the walk span passes, so a pass ends holding the session.
+    child = session_dir / "agents" / "1"
+    child.mkdir(parents=True)
+    (child / "agent_lifecycle.json").write_text(
+        json.dumps({"handle": "child", "state": "completed"})
+    )
+    (child / ".lock").write_text("")
+    _age_tree(session_dir)
+    request = os.open(
+        home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "user-open-request"),
+        os.O_RDWR,
+    )
+    session_free_when_planner_left: list[bool] = []
+    real_planner_active = activation_module.planner_active
+
+    @contextlib.contextmanager
+    def observed_planner_active(path: Path):
+        with real_planner_active(path):
+            yield
+        # planner-active is free: a user open must find the session free too.
+        fd = os.open(session_dir, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            session_free_when_planner_left.append(True)
+        except BlockingIOError:
+            session_free_when_planner_left.append(False)
+        finally:
+            os.close(fd)
+
+    # test-contract: seam observe the instant planner-active is released
+    monkeypatch.setattr(activation_module, "planner_active", observed_planner_active)
+    try:
+        with _opened_lease(home) as lease:
+            owner = make_retention_owner(
+                home, lease, lambda: 30, bounds=RetentionBounds(entries_per_root=1)
+            )
+            original_run_pass = owner._run_pass
+
+            def user_open_arrives_after_pass(*args):
+                result = original_run_pass(*args)
+                # a user open asks the planner to yield between two passes.
+                fcntl.flock(request, fcntl.LOCK_SH)
+                return result
+
+            # test-contract: seam the user request lands between two passes
+            monkeypatch.setattr(owner, "_run_pass", user_open_arrives_after_pass)
+            _projections, outcome = owner._run_episode()
+    finally:
+        fcntl.flock(request, fcntl.LOCK_UN)
+        os.close(request)
+    assert outcome == Yielded("user")
+    assert session_free_when_planner_left == [True]

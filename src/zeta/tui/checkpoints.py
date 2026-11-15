@@ -651,7 +651,11 @@ class CheckpointTranscriptMixin:
         return not self._exit_requested
 
     async def _load_transcript_page(
-        self, *, reset: bool = False, direction: str = "older"
+        self,
+        *,
+        reset: bool = False,
+        direction: str = "older",
+        then: Callable[[], None] | None = None,
     ) -> None:
         """Read one page off-loop, then repaint the bounded resident window."""
 
@@ -673,6 +677,8 @@ class CheckpointTranscriptMixin:
         self._render_active_resident_history()
         if restore_anchor is not None:
             transcript.restore_durable_scroll_anchor(restore_anchor)
+        if then is not None:
+            then()
         if self._history_marker_tasks:
             await asyncio.gather(*tuple(self._history_marker_tasks))
         self._invalidate_prompt()

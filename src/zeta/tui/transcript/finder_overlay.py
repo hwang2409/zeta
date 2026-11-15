@@ -169,6 +169,8 @@ class FinderControl(UIControl):
                         width=content_width,
                     )
                 )
+            if not state.complete:
+                lines.append([(theme.DIM, "searching…")])
         # Preview pane.
         if state.preview_visible and state.preview:
             lines.append([(theme.DIM, "─" * content_width)])

@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.padding import Padding
 from rich.text import Text
 
+from tests.support.owned import await_or_fail
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.tui.agent_card import AgentNavigation
@@ -535,7 +536,7 @@ async def test_switching_from_child_to_root_cancels_stale_finder_work(
 
 
 @pytest.mark.asyncio
-async def test_enter_before_candidate_preparation_keeps_finder_usable() -> None:
+async def test_enter_before_candidate_preparation_jumps_when_rows_are_ready() -> None:
     transcript = TranscriptWidget()
     for index in range(400):
         transcript.append(Text(f"history line {index}"))
@@ -549,22 +550,16 @@ async def test_enter_before_candidate_preparation_keeps_finder_usable() -> None:
     app._finder_open()
     prepare_task = app._finder_prepare_task
     assert prepare_task is not None
-
-    app._finder_accept()
-
-    assert transcript.finder_active
-    assert app._finder_prepare_task is prepare_task
-    await prepare_task
-    state = transcript.finder_state()
-    assert state is not None and state.rows
-
     app._finder_input("zebra")
-    rank_task = app._finder_rank_task
-    assert rank_task is not None
-    await rank_task
     app._finder_accept()
 
-    assert not transcript.finder_active
+    assert transcript.finder_active, "Enter before the rows were ready closed the finder"
+    await await_or_fail(prepare_task, what="finder candidate preparation")
+    while (rank_task := app._finder_rank_task) is not None:
+        await await_or_fail(rank_task, what="finder ranking")
+    await asyncio.sleep(0)  # the kept Enter runs after the last worker returns
+
+    assert not transcript.finder_active, "the early Enter was dropped"
     assert transcript._virtual_start is not None
     assert transcript._virtual_start[0] == target_index
 

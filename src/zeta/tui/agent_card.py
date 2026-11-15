@@ -239,8 +239,12 @@ class AgentTranscriptControl(UIControl):
                 for page in self._history_pager.pages
                 for unit in page.units
             }
-            if target.entry_id not in resident:
-                await self._history_pager.reveal(target.entry_id)
+            if (
+                target.entry_id not in resident
+                and not (await self._history_pager.reveal(target.entry_id)).segments
+            ):
+                # A later reveal or reset owns the view now.
+                return
             self._render_resident()
             transcript.restore_durable_scroll_anchor(
                 (target.entry_id, target.unit_ordinal, 0)
@@ -260,9 +264,11 @@ class AgentTranscriptControl(UIControl):
         target = self.search_results[self.search_index]
 
         async def reveal() -> None:
-            await self._history_pager.reveal(target.entry_id)
             # n/N run after the finder closed; the search itself must still be shown.
-            if not transcript.search_active:
+            if (
+                not (await self._history_pager.reveal(target.entry_id)).segments
+                or not transcript.search_active
+            ):
                 return
             query = transcript.search_query
             self._render_resident()

@@ -149,7 +149,9 @@ class ServerSlashSession:
     async def slash_retention(self, args: str) -> str:
         command = args.strip()
         if command == "":
-            _history, message = await asyncio.to_thread(retention_status, self._runtime.home)
+            _history, message = await asyncio.to_thread(
+                retention_status, self._runtime.home, self._runtime.manager._storage_lease
+            )
             return message
         _loop, _opened = self._active_loop_and_session()
         if command == "disarm":
