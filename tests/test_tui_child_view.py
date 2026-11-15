@@ -253,14 +253,25 @@ async def test_real_tui_child_view_journey(
                 for _press in range(400):
                     await _send(pipe, "\x1b[5~")
                     await navigation.wait_for_publication()
-                    # test-contract: latency the edge load is an untracked app task
-                    await asyncio.sleep(0.02)
+                    await _terminal_text(app)
                     if oldest_resident() != oldest:
                         return
-                raise AssertionError(
-                    "child-paging: PageUp at the top stopped loading older rows "
-                    f"(can_load_older={pager.can_load_older})"
-                )
+                    if control.transcript.scroll_offset == 0:
+                        break
+                else:
+                    raise AssertionError("child-paging: PageUp never reached the top")
+                # At the top, PageUp asks for the older page, as a user presses it.
+                await _send(pipe, "\x1b[5~")
+                try:
+                    await _wait_until(
+                        lambda: oldest_resident() != oldest,
+                        what="older child page after PageUp at the top",
+                    )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "child-paging: PageUp at the top stopped loading older rows "
+                        f"(can_load_older={pager.can_load_older})"
+                    ) from exc
 
             try:
                 for _page in range(5):
