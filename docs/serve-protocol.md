@@ -500,7 +500,9 @@ re-supplies this connection's bindings:
 
 The result adds `attached: "live_turn"`. The client then reads the current
 state with `status` or `session_history_and_subscribe`; pending approvals are
-in that result and can be answered. `resume` of a different session during a
+in that result and can be answered. With `in_flight_replay`, the join also
+starts with the reply streamed so far (see "joining during a reply").
+`resume` of a different session during a
 busy turn still returns `-32004`, and `resume` of an idle session is unchanged.
 serve-only: no TUI surface.
 
@@ -1183,7 +1185,10 @@ the same grace. A steer it did not read still starts the next turn, which the
 grace also covers. The first replacement controller that negotiates
 `approval_reconnect` takes the turn over with `hello`; it receives the live
 events from that point, and rebuilds earlier output with
-`session_history_and_subscribe` or `status` plus `session_history`. A
+`session_history_and_subscribe` or `status` plus `session_history`. History
+has no row for the unfinished reply; to see the text that streamed before the
+reconnect, join with `session_history_and_subscribe` and negotiate
+`in_flight_replay` (see "joining during a reply"). A
 replacement that does not negotiate `approval_reconnect`, or the end of the
 grace with nobody back, cancels the turn as an immediate disconnect does:
 `served_turn_end` reason `disconnect`, and queued steers `dropped` with reason
@@ -1466,6 +1471,17 @@ Event fields are:
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
 | `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
+In `session_retention` data, `skip_counts` maps a skip reason to the number of
+sessions kept for that reason. The keys are a closed set: `not old enough`,
+`session is open or in use`, `pinned`, `live or recoverable child`,
+`pending project link`, `pending child link`, `pending inbox reference`,
+`published top-level dependent`, `unacknowledged sent message`,
+`session is being deleted`, `references changed during scan`,
+`references not fully scanned`, `unresolved transcript recovery`,
+`unresolved memory reconciliation`, `session or entry disappeared`,
+`no transcript`, and `malformed transcript header`. A skip is not a failure:
+`errors` carries only real failures (for example an unreadable entry), at most 8.
+
 The `retry` data can contain `retry: integer`, `delay: number` (seconds),
 `text: string`, and `is_stall: boolean`. It is an informational notice that a
 retry is scheduled. A provider retry can also include `kind: "provider_retry"`,
@@ -1705,6 +1721,25 @@ error code and message. Provider status and origin remain internal.
   events (one `assistant_message`, one echo). they count in these limits until pressure eviction, then remain bounded at two without being charged. Older pages continue to use
   `session_history` and do not change the live stream.
 - `child_run_history`: takes `session_id` for the active top-level session and a durable child `run_id`. It returns the same backward history projection as `session_history`: `messages`, `next_before`, and `history_validator`. Omit `before` or set it to null for the newest page; continuations supply `before` and the returned validator. The method requires the negotiated `child_run_history` feature, is available to observers, and returns `-32012` with `child_run_not_found` for a valid but absent child, and `-32602` for malformed ids or parameters. Only a continuation that supplies `before` with its `history_validator` returns `-32009` with `stale_history_snapshot`; a newest-page read (`before` omitted or null) retries a child transcript that moves during reader acquisition and serves a consistent snapshot instead.
+- joining during a reply (`in_flight_replay` feature, requires
+  `session_replay_seq`): history has no row for an assistant reply until its
+  `assistant_message`, and a running tool's streamed output has no row at all.
+  With the feature, a `session_history_and_subscribe` join that ends while a
+  reply or tool streams puts the state streamed so far at the start of the new
+  stream: one `assistant_delta` per run of reply text or thinking (`kind` as
+  live) and one `tool_output` per running tool call, merged from the live
+  events, each with the next `seq`. Live events after them continue the same
+  reply. While it reads history, the join does not hold live `assistant_delta`
+  and foreground `tool_output` events (these frames carry them), so each part
+  reaches the client once, a fast stream does not fill the join's buffer, and a
+  reply that committed during the join reaches it only as its history row or
+  its `assistant_message`. Apply these events like live ones. A tool that
+  starts and ends during the join shows only `tool_start` and `tool_end`; its
+  `tool_end` carries the result. In-flight state over 256 KiB, or a reply or
+  tool call with more than 16 merged parts, starts from its newest parts; the
+  final `assistant_message` or `tool_end` still carries all of it. The
+  result and every other event are unchanged; without the feature the join is
+  unchanged. serve-only: no TUI surface.
 - `child_run_events`: takes exactly `{session_id, run_id}` for the active top-level session. It atomically returns the newest child history page plus `replay: {stream_id, history_seq: 0}`, `child`, and `revision`, then subscribes that connection to a child scope. The scope delivers: the `child_started`, `child_progress`, and `child_ended` lifecycle events of the selected run's own children; and the selected run's and its descendants' own `tool_start`/`tool_output`/`tool_end` and `approval_request`/`approval_end` events (every event whose `agent_instance_id` equals the selected `run_id` or starts with `run_id + ":"`). The selected run's own `child_progress` and `child_ended` go only to its immediate parent's scope, not this stream. The selected run's `assistant_message`, `assistant_delta`, `usage`, and turn events are never streamed; read them with `child_run_history`. Parent snapshot rows are event-shaped `child_progress` rows placed in `messages` immediately after their `child_started` row. A `session_history_and_subscribe` connection with `child_run_events` negotiated receives durable parent lifecycle rows and these bounded snapshot rows; without that feature, parent history is unchanged. `child_run_events` connections receive the same baseline for the selected child scope. Live events carry `stream_id` and consecutive `seq`; progress also carries `revision`. The shared child payload is the z5 child-run row, whose `parent_run_id` is null for a direct child of the session and the parent run's `run_id` for a nested child. Malformed parameters use `-32602` (`invalid_params`), an absent child uses `-32012` (`child_run_not_found`), and an invalid join uses `-32009` (`stale_event_sequence`).
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
@@ -2047,6 +2082,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
+| `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
