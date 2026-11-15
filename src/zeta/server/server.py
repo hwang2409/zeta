@@ -386,6 +386,7 @@ class ZetaServer:
                 )
 
             self.runtime.retention_event_sink = publish_retention
+            self.runtime.retention_wake = self._retention_owner.wake
             self._retention_owner.set_publish(publish_retention)
 
     async def serve_forever(self) -> None:

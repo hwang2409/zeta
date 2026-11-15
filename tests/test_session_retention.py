@@ -268,7 +268,8 @@ def test_retention_history_trims_oldest_row(tmp_path):
                     token,
                     tmp_path,
                     lease,
-                    retention_result(timestamp=str(index), mode="preview", days=30),
+                    # distinct days: a row equal to the last one is not appended again
+                    retention_result(timestamp=str(index), mode="preview", days=index + 1),
                 )
     rows = session_retention.read_retention_history(tmp_path)
     assert len(rows) == 128

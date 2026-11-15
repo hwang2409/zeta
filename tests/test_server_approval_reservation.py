@@ -2210,6 +2210,11 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         )
         server.approval_reconnect_grace = 0
         gate.install(monkeypatch)
+        # restart the grace as a release does: a fresh deadline, then the expiry.
+        server.control._end_grace_deadline()
+        server.control._grace_deadline_task = asyncio.create_task(
+            server.control._grace_deadline()
+        )
         server.control._grace_task = asyncio.create_task(server.control._expire_grace())
         await _wait_thread_gate(gate)
 
