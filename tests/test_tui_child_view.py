@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 from collections.abc import Callable
 from io import StringIO
@@ -167,6 +168,99 @@ async def _return_to_root(app: TUIApp, pipe) -> None:
     await navigation.wait_for_publication()
 
 
+async def _leave_via_picker(app: TUIApp, pipe) -> None:
+    navigation = app._agent_navigation
+    session = app._active_session
+    if not navigation.list_focused():
+        await _click_composer(app, pipe)
+        await _wait_until(
+            lambda: session.layout.has_focus(session.default_buffer)
+            and app.composer_can_focus_agent_list(),
+            what="child composer ready to open the agent picker",
+        )
+        await _send(pipe, "\x1b[B")
+        await _wait_until(navigation.list_focused, what="agent picker from the child")
+    while navigation.entries[navigation.selected_index].path != navigation.root_path:
+        before = navigation.selected_index
+        await _send(pipe, "\x1b[A")
+        await _wait_until(
+            lambda before=before: navigation.selected_index != before,
+            what="previous picker row toward root",
+        )
+    await _send(pipe, "\r")
+    await _wait_until(
+        lambda: not navigation.child_view_active, what="root transcript after picker"
+    )
+    await navigation.wait_for_publication()
+
+
+async def _child_rows(app: TUIApp) -> list[str]:
+    """Read the rows the terminal drew for the focused child transcript."""
+
+    await _terminal_text(app)
+    screen = app._active_session.app.renderer._last_screen
+    control = app._agent_navigation.transcript_control
+    position = next(
+        position
+        for window, position in screen.visible_windows_to_write_positions.items()
+        if window.content is control
+    )
+    return [
+        "".join(screen.data_buffer[row][column].char for column in range(120)).rstrip()
+        for row in range(position.ypos, position.ypos + position.height)
+    ]
+
+
+async def _scroll_to_separator(app: TUIApp, pipe) -> list[str]:
+    """Scroll the child up line by line until a blank separator is the top row.
+
+    Child 651 in the real home parks with a separator on top (ux r5 M7).
+    """
+
+    navigation = app._agent_navigation
+    if not navigation.child_view_focused():
+        await _send(pipe, "\x1b[<0;10;10M\x1b[<0;10;10m")
+        await _wait_until(navigation.child_view_focused, what="child transcript focus")
+    rows = await _child_rows(app)
+    for _press in range(40):
+        # The prompt draws its own blank first line; any other blank top row
+        # is a separator.
+        if not rows[0] and rows[1] and VISIBLE_PROMPT not in rows[1]:
+            return rows
+        before = rows
+        await _send(pipe, "k")
+        try:
+            async with asyncio.timeout(30):
+                while (rows := await _child_rows(app)) == before:
+                    # test-contract: latency real prompt-toolkit redraw
+                    await asyncio.sleep(0.05)
+        except TimeoutError as exc:
+            raise AssertionError("child-keeps-place: k did not scroll the child") from exc
+    raise AssertionError("child-keeps-place: no separator row reached the top")
+
+
+async def _assert_child_keeps_place(app: TUIApp, rows: list[str], how: str) -> None:
+    navigation = app._agent_navigation
+    await _wait_until(
+        lambda: not navigation.transcript_control.transition_pending(),
+        what="published child re-entry",
+    )
+    # A refresh tick after the commit must not move the restored place.
+    ticked_at = navigation._last_refresh_at
+    await _wait_until(
+        lambda: navigation._last_refresh_at > ticked_at, what="child refresh tick"
+    )
+    await navigation.wait_for_publication()
+    after = await _child_rows(app)
+    assert after == rows, (
+        f"child-keeps-place ({how}): re-entry drew other rows; "
+        f"before={rows[:3]!r} after={after[:3]!r}"
+    )
+    assert re.search(r"line \d+/~?\d+", await _terminal_text(app)), (
+        f"child-keeps-place ({how}): no line label after re-entry"
+    )
+
+
 @pytest.fixture(scope="module")
 def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHome:
     return generate_child_view_home(tmp_path_factory.mktemp("child-view-home"))
@@ -229,6 +323,21 @@ async def test_real_tui_child_view_journey(
                 app._agent_navigation.child_view_focused,
                 what="visible focused child before finder key",
             )
+
+            # ux r5 M7: mid-window in the newest page, park on a separator row,
+            # leave with h, and come back to the same rows.
+            try:
+                await _send(pipe, "\x1b[5~")
+                await _wait_until(
+                    lambda: not app._agent_navigation.transcript_control.transcript.follow_tail,
+                    what="child mid-window after PageUp",
+                )
+                rows = await _scroll_to_separator(app, pipe)
+                await _return_to_root(app, pipe)
+                await _enter_child(app, pipe)
+                await _assert_child_keeps_place(app, rows, "mid-window, h")
+            except AssertionError as exc:
+                failures.append(str(exc))
 
             # ux b4 / review T7: page up a few pages, let a real refresh tick
             # run, and keep paging older without a jump to the newest window.
@@ -296,6 +405,16 @@ async def test_real_tui_child_view_journey(
                 assert pager.can_load_newer, (
                     "child-paging: paging older after a refresh tick jumped to the newest window"
                 )
+            except AssertionError as exc:
+                failures.append(str(exc))
+
+            # ux r5 M7: after older loads, park on a separator row, leave via the
+            # picker, and come back to the same rows.
+            try:
+                rows = await _scroll_to_separator(app, pipe)
+                await _leave_via_picker(app, pipe)
+                await _enter_child(app, pipe)
+                await _assert_child_keeps_place(app, rows, "older loads, picker")
             except AssertionError as exc:
                 failures.append(str(exc))
 
