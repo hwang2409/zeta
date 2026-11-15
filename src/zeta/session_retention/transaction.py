@@ -369,7 +369,11 @@ class _QuarantineTransaction:
         if not preview.get("root_ids"):
             return TransactionOutcome(False)
         session_id = preview["root_ids"][0]
-        with verify(session_id, days) as candidate:
+        with ExitStack() as held:
+            try:
+                candidate = held.enter_context(verify(session_id, days))
+            except CandidateRejected as exc:
+                return TransactionOutcome(False, _bounded(str(exc)), session_id)
             txid = uuid.uuid4().hex
             reservation = {
                 "schema_version": 1,
