@@ -328,3 +328,33 @@ async def test_join_without_feature_is_unchanged(tmp_path: Path) -> None:
     finally:
         backend.open_all()
         await _close(server, writer2, writer)
+
+
+@pytest.mark.asyncio
+async def test_join_after_aborted_turn_replays_nothing(tmp_path: Path) -> None:
+    go = tmp_path / "go"
+    command = f"echo out-1; while [ ! -e {go} ]; do sleep 0.05; done"
+    call = ToolUseContent(ToolCall("bash-1", "bash", {"command": command}))
+    backend = GatedBackend([([TextContent("running")], [TextContent("running"), call])])
+    server = _server(tmp_path, backend)
+    reader, writer = await _connect(server)
+    out_1 = _published(server, "tool_output", "out-1")
+    try:
+        session_id = await _start(server, reader, writer, approval="allow")
+        await await_or_fail(out_1.wait(), what="tool output")
+        # the server answers abort after the canceled turn stopped
+        aborted = await _request(reader, writer, 4, "abort", {})
+        assert aborted[-1]["result"] == {"aborted": True}
+
+        frames = await _request(reader, writer, 6, "session_history_and_subscribe", {
+            "session_id": session_id
+        })
+        # frames the join sends after its response arrive before the next response
+        frames += await _request(reader, writer, 7, "status", {})
+        assert not [
+            f for f in frames
+            if f.get("params", {}).get("event") in {"assistant_delta", "tool_output"}
+        ]
+    finally:
+        go.touch()
+        await _close(server, writer)

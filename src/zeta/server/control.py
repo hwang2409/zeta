@@ -574,8 +574,13 @@ class ServeControl:
         return None if opened is None else opened.store.active_branch_head_sequence()
 
     def _close_deferred_replay(self, session_id: str | None) -> None:
-        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        """At a turn's end, admit deferred replay copies; rows not found never install.
+
+        The turn's unfinished reply ends too: a cancel publishes no agent_end.
+        """
         connections = self.server.connections
+        if connections is not None:
+            connections.in_flight.end_run()
         if connections is not None and session_id is not None:
             connections.release_deferred_replay(session_id, close=True)
 
@@ -1018,8 +1023,6 @@ class ServeControl:
         if in_flight is not None:
             if kind is StreamEventType.AGENT_START:
                 in_flight.start_run(session_id)
-            elif kind is StreamEventType.AGENT_END:
-                in_flight.end_run()
             elif kind in {StreamEventType.MESSAGE_START, StreamEventType.ASSISTANT_RESET}:
                 in_flight.end_message()
         if kind not in {
