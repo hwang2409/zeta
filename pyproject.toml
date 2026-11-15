@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "zeta: custom agent harness: own loop, plan-authenticated provider backends"
 requires-python = ">=3.12"
 dependencies = [
+    # 4.16 fixes a lost task cancel and a socket leak when a cancel ends connect_tcp
+    "anyio>=4.16",
     "httpx>=0.27",
     "markdown-it-py>=3.0",
     "mdit-py-plugins>=0.4",

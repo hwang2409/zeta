@@ -321,6 +321,181 @@ async def test_http_deadline_retains_cancellation_resistant_call_until_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_close_closes_client_from_setup_that_ignored_cancel(
+    tmp_path: Path,
+) -> None:
+    setup_entered = asyncio.Event()
+    never = asyncio.Event()
+    closed: list[object] = []
+
+    class Client:
+        def set_failure_sink(self, _sink) -> None:
+            pass
+
+        async def close(self) -> None:
+            closed.append(self)
+
+    async def connect_and_list(_client) -> list[MCPTool]:
+        setup_entered.set()
+        try:
+            await await_or_fail(never.wait(), timeout=30, what="setup cancel")
+        except asyncio.CancelledError:
+            pass  # httpcore can lose a cancel this way and return the response
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    client = Client()
+    actor = MCPServerActor(
+        MCPServerConfig("local", "stdio", "unused"),
+        source=tmp_path / "mcp.json",
+        registry=None,
+        publish=lambda *_args: None,
+        build_client=lambda _config: client,
+        connect_and_list=connect_and_list,
+    )
+    actor.start()
+    started = asyncio.create_task(actor.wait_started(None))
+    try:
+        await await_or_fail(setup_entered.wait(), what="actor setup start")
+    finally:
+        await await_or_fail(actor.close(), what="actor close")
+        await await_or_fail(started, what="actor start result")
+
+    assert closed == [client], "close left the late setup client open"
+
+
+@pytest.mark.asyncio
+async def test_close_closes_abandoned_setup_client_whose_result_is_still_queued(
+    tmp_path: Path,
+) -> None:
+    # forced order: an abandoned auto setup finishes in the loop pass right
+    # before close runs, so its done callback is still queued when close drains
+    clients: list[object] = []
+    closed: list[object] = []
+    sinks: list[object] = []
+    auto_entered = asyncio.Event()
+    release_auto = asyncio.Event()
+    closing: list[asyncio.Task[None]] = []
+
+    class Client:
+        def set_failure_sink(self, sink) -> None:
+            if sink is not None:
+                sinks.append(sink)
+
+        async def close(self) -> None:
+            closed.append(self)
+
+    def build_client(_config) -> Client:
+        client = Client()
+        clients.append(client)
+        return client
+
+    async def spin_until(ready) -> None:
+        for _ in range(1000):
+            if ready():
+                return
+            await asyncio.sleep(0)
+        raise AssertionError("actor did not reach the expected state")
+
+    def start_close() -> None:
+        loop = asyncio.get_running_loop()
+        closing.append(asyncio.eager_task_factory(loop, actor.close()))
+
+    async def connect_and_list(_client) -> list[MCPTool]:
+        setup = len(clients)
+        if setup == 2:
+            auto_entered.set()
+            try:
+                await await_or_fail(release_auto.wait(), what="auto setup release")
+            except asyncio.CancelledError:
+                await await_or_fail(release_auto.wait(), what="auto setup release")
+            asyncio.get_running_loop().call_soon(start_close)
+        if setup == 3:
+            raise RuntimeError("manual setup failed")
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    actor = MCPServerActor(
+        MCPServerConfig("local", "stdio", "unused"),
+        source=tmp_path / "mcp.json",
+        registry=None,
+        publish=lambda *_args: None,
+        build_client=build_client,
+        connect_and_list=connect_and_list,
+    )
+    actor.start()
+    call: asyncio.Task[object] | None = None
+    try:
+        started = await await_or_fail(actor.wait_started(None), what="actor start")
+        assert started.state == "mounted"
+        sinks[-1]("transport lost")
+        await spin_until(lambda: closed == clients[:1])
+        call = asyncio.create_task(
+            actor.call_tool(
+                "echo", {}, AbortSignal(), generation=actor.generation
+            )
+        )
+        await await_or_fail(auto_entered.wait(), what="auto setup start")
+        await await_or_fail(actor.reconnect(), what="manual reconnect")
+        await spin_until(lambda: len(closed) == 2)
+        release_auto.set()
+        await spin_until(lambda: bool(closing))
+        await await_or_fail(closing[0], what="actor close")
+    finally:
+        await await_or_fail(actor.close(), what="actor close cleanup")
+        if call is not None:
+            await await_or_fail(call, what="auto call result")
+
+    assert closed == [clients[0], clients[2], clients[1]], (
+        "close left the abandoned auto setup client open"
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_request_cancelled_as_its_connect_finishes_closes_the_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # anyio < 4.16 kept the connected socket when the cancel came in the same
+    # pass as the connect result; the open socket hung the MCP server's close
+    from anyio._backends._asyncio import AsyncIOBackend
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _REAL_ASYNC_HTTP
+    )
+    real_connect = AsyncIOBackend.connect_tcp.__func__
+
+    async def connect_then_cancel(cls, *args, **kwargs):
+        stream = await real_connect(cls, *args, **kwargs)
+        for state in client._active_requests.values():
+            state.task.cancel()  # the task that awaits connect_tcp
+        return stream
+
+    monkeypatch.setattr(AsyncIOBackend, "connect_tcp", classmethod(connect_then_cancel))
+    peer_closed = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read()
+            peer_closed.set()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = _http_client(f"http://127.0.0.1:{port}", tmp_path / "home")
+    connecting = asyncio.create_task(client.connect())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(connecting, what="cancelled connect")
+        await await_or_fail(
+            peer_closed.wait(), what="cancelled connect socket close"
+        )
+    finally:
+        connecting.cancel()
+        await await_or_fail(client.close(), what="client close")
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_deadline_covers_call_work_before_first_yield(tmp_path: Path) -> None:
     now = 0.0
 
