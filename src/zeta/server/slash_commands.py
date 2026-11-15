@@ -44,7 +44,6 @@ from ..project_registry import ProjectRegistryError
 from ..runtime.status import capture_slash_status
 from ..session_retention import (
     disarm_retention,
-    read_retention_history,
     retention_authority,
     retention_status,
 )
@@ -150,8 +149,8 @@ class ServerSlashSession:
     async def slash_retention(self, args: str) -> str:
         command = args.strip()
         if command == "":
-            history = await asyncio.to_thread(read_retention_history, self._runtime.home)
-            return retention_status(history)
+            _history, message = await asyncio.to_thread(retention_status, self._runtime.home)
+            return message
         _loop, _opened = self._active_loop_and_session()
         if command == "disarm":
             result = await asyncio.to_thread(
@@ -173,7 +172,7 @@ class ServerSlashSession:
                 await publish(result.projection)
             wake = getattr(self._runtime, "retention_wake", None)
             if result.applied and result.projection["mode"] == "armed" and wake is not None:
-                wake()
+                wake(result.projection)
             return result.message
         return "usage: /retention [arm|disarm]"
 

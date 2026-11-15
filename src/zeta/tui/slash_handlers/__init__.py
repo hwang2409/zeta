@@ -48,7 +48,6 @@ from ...providers.factory import build_backend
 from ...runtime.status import capture_slash_status
 from ...session_retention import (
     disarm_retention,
-    read_retention_history,
     retention_authority,
     retention_status,
 )
@@ -580,10 +579,10 @@ class SlashHandlerMixin:
         command = args.strip()
         home = self._zeta_home or env_home()
         if command == "":
-            history = await asyncio.to_thread(read_retention_history, home)
+            history, message = await asyncio.to_thread(retention_status, home)
             if history:
                 self._presenter.print_unit(render_retention_card(history[-1]))
-            return retention_status(history)
+            return message
         if command == "disarm":
             result = await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
             if result.projection["mode"] != "none" or result.projection["errors"]:
@@ -598,7 +597,7 @@ class SlashHandlerMixin:
                 self._presenter.print_unit(render_retention_card(result.projection))
             owner = getattr(self, "_retention_owner", None)
             if result.applied and result.projection["mode"] == "armed" and owner is not None:
-                owner.wake()
+                owner.wake(result.projection)
             return result.message
         return "usage: /retention [arm|disarm]"
 

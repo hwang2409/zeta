@@ -148,7 +148,8 @@ async def test_real_slash_retention_read_mutation_and_idempotence(tmp_path: Path
         arm = (await _request(reader, writer, 4, "slash_run", {"session_id": sid, "text": "/retention arm"}))[-1]["result"]
         assert arm["text"] == (
             "retention armed: deleting 0 sessions older than 30 days starts now in this process; "
-            "other zeta processes on this home start on their next pass"
+            "other zeta processes on this home start on their next pass\n"
+            "arming keeps deleting closed, unpinned sessions older than 30 days until /retention disarm"
         )
         assert (home / "retention-arm.json").is_file()
         arm_again = (await _request(reader, writer, 5, "slash_run", {"session_id": sid, "text": "/retention arm"}))[-1]["result"]

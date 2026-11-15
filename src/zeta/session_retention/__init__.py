@@ -151,6 +151,8 @@ class PassResult:
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
     changed: bool = False
+    # a root of the armed preview got its terminal outcome (deleted or rejected) in this pass
+    stepped: bool = False
 
 
 class RetentionPlannerError(Exception):
@@ -329,18 +331,25 @@ def append_retention_history(
     return "fresh"
 
 
-def retention_status(history: tuple[dict[str, object], ...]) -> str:
-    """The bare `/retention` reply, shared by the TUI and serve."""
+def _keeps_deleting(days: object) -> str:
+    return f"arming keeps deleting closed, unpinned sessions older than {days} days until /retention disarm"
+
+
+def retention_status(home: str | Path) -> tuple[tuple[dict[str, object], ...], str]:
+    """Read history and the arm file; return them with the bare `/retention` reply for both surfaces."""
+    history = read_retention_history(home)
     if not history:
-        return "retention: none"
+        return history, "retention: none"
     latest = history[-1]
     message = "retention: " + ", ".join(
         f"{key}={latest[key]}" for key in ("mode", "days", "count", "preview_id")
     )
-    if latest["mode"] == "preview" and latest["preview_id"] is not None:
+    # "unarmed" comes from the arm file: a completed chain ends on a preview row while still armed
+    armed = (Path(home) / _ARM_FILENAME).exists()
+    if latest["mode"] == "preview" and latest["preview_id"] is not None and not armed:
         # the decision point: the user can arm this complete preview next
-        message += "\n" + _ARM_WARNING
-    return message
+        message += "\n" + _ARM_WARNING + "\n" + _keeps_deleting(latest["days"])
+    return history, message
 
 
 @dataclass(frozen=True)
@@ -487,7 +496,7 @@ def retention_authority(
                 return RetentionAuthorityResult(
                     f"retention armed: deleting {projection['count']} sessions older than "
                     f"{current.days} days starts now in this process; other zeta processes "
-                    "on this home start on their next pass",
+                    "on this home start on their next pass\n" + _keeps_deleting(current.days),
                     projection, True,
                 )
             finally:
@@ -773,6 +782,7 @@ class RetentionPlanner:
         walk = flight.walk if flight is not None else None
         return (
             len(self._attempted[1]), sweep.days, sweep.current_root, sweep.decided, sweep.discovery_done,
+            flight.deferred if flight is not None else False,
             sweep.discovery_blocked, tuple(sweep.selected), sweep.bytes,
             tuple(walk.frontier) if walk is not None else (),
             tuple(walk.fingerprints) if walk is not None else (),
@@ -816,11 +826,12 @@ class RetentionPlanner:
         self._prepared_commit = None
         self._commit_baseline = _load_state(home_fd)
         if self._latest is _UNLOADED or self._reload_latest:
-            # other processes can write state; a removal step clears its preview, so keep ours then
+            # other processes can write state; a removal step clears its preview, so keep ours
+            # then, but a removed state (disarm) drops it
             stored = self._commit_baseline["preview"] if self._commit_baseline is not None else None
             if type(stored) is dict and stored.get("days") == days:
                 self._latest = stored
-            elif self._latest is _UNLOADED:
+            elif self._latest is _UNLOADED or self._commit_baseline is None:
                 self._latest = None
             self._reload_latest = False
         if type(self._latest) is dict and self._latest.get("days") != days:
@@ -916,7 +927,12 @@ class RetentionPlanner:
     def _transaction_result(self, outcome: TransactionOutcome, expected_generation: RetentionGeneration) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
             return None
-        if outcome.session_id is not None and (outcome.completed or outcome.blocked is not None):
+        stepped = (
+            outcome.session_id is not None
+            and (outcome.completed or outcome.blocked is not None)
+            and outcome.session_id not in self._attempted[1]
+        )
+        if stepped:
             self._attempted[1].add(outcome.session_id)
         reasons = (
             (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
@@ -931,6 +947,7 @@ class RetentionPlanner:
             preview=_preview_snapshot(self._latest),
             expected_generation=expected_generation,
             changed=outcome.changed,
+            stepped=stepped,
         )
 
     @contextmanager
@@ -945,10 +962,15 @@ class RetentionPlanner:
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             with child_directory(home_fd, "sessions") as sessions_fd:
-                flight = self._hold(sessions_fd, root_id, scan)
-                if not self._walk(flight, budget):
-                    raise CandidateRejected("final candidate walk exceeded its bound")
-                reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
+                # a failure of this one root (open, gone, unreadable) rejects only it;
+                # opening the home or sessions/ above is not about the root and stays an error
+                try:
+                    flight = self._hold(sessions_fd, root_id, scan)
+                    if not self._walk(flight, budget):
+                        raise CandidateRejected("final candidate walk exceeded its bound")
+                    reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
+                except (OSError, SessionError, RetentionPlannerError) as exc:
+                    reason = _failure_reason(exc)
                 if reason is not None:
                     raise CandidateRejected(reason)
                 generation = read_reference_generation(self.home)

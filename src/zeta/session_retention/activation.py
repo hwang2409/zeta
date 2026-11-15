@@ -34,10 +34,15 @@ from .handshake import ensure_handshake_files, planner_active, planner_request_p
 
 
 class Published:
-    def __init__(self, projection: dict[str, object], *, complete: bool, progressed: bool = False) -> None:
+    def __init__(
+        self, projection: dict[str, object], *, complete: bool,
+        progressed: bool = False, stepped: bool = False,
+    ) -> None:
         self.projection = projection
         self.complete = complete
         self.progressed = progressed
+        # one armed root got its outcome: the chain goes on to the next root at once
+        self.stepped = stepped
 
     def __getitem__(self, key: str) -> object:
         return self.projection[key]
@@ -121,7 +126,6 @@ def make_retention_owner(
     )
     if activation_enabled:
         ensure_handshake_files(root)
-    last_projection: dict[str, object] | None = None
 
     def run_pass(
         planner: Any, current_days: int, yield_check: Callable[[], bool] | None = None
@@ -136,12 +140,12 @@ def make_retention_owner(
         projection = project_retention_result(
             result, days=current_days, timestamp=datetime.now(UTC).isoformat()
         )
-        nonlocal last_projection
         with _coordinator_authority(root) as token:
             # the one read of the setting at publication; every decision below uses current.days
             current = token.generation(days())
             history = read_retention_history(root)
-            effectful = bool(getattr(result, "changed", False))
+            # a transaction outcome (deleted, rejected, or blocked) is a fact: always publish it
+            effectful = result.mode is not None or bool(getattr(result, "changed", False))
             if (
                 history
                 and history[-1].get("mode") == "armed"
@@ -150,7 +154,6 @@ def make_retention_owner(
             ):
                 planner.close()
                 projection = dict(history[-1])
-                last_projection = projection
                 return Published(projection, complete=True)
             status = append_retention_history(
                 token, root, retained, projection,
@@ -164,19 +167,15 @@ def make_retention_owner(
                 redecided = _stale_projection(root, current.days, history)
                 if not redecided.complete:
                     append_retention_history(token, root, retained, redecided.projection)
-                last_projection = redecided.projection
                 return redecided
             if status == "not_committed":
                 planner.close()
-                redecided = _stale_projection(root, current.days, history)
-                last_projection = redecided.projection
-                return redecided
-            if status == "fresh":
-                last_projection = projection
+                return _stale_projection(root, current.days, history)
         return Published(
             projection,
             complete=result.complete,
             progressed=bool(getattr(result, "changed", False)) or before != _progress_marker(planner),
+            stepped=result.stepped,
         )
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:
@@ -257,7 +256,10 @@ class RetentionActivationOwner:
         self._session_available = True
         self.wake()
 
-    def wake(self) -> None:
+    def wake(self, shown: dict[str, object] | None = None) -> None:
+        """Start an episode now; ``shown`` is a card the caller already published."""
+        if shown is not None:
+            self._last_published = shown
         self._wake.set()
 
     @property
@@ -345,10 +347,8 @@ class RetentionActivationOwner:
                         if isinstance(projection, Yielded):
                             return projections, projection
                         projections.append(projection)
-                        if projection.complete or not projection.progressed:
-                            break
-                        # a deleted root ends the episode so its card shows now; _run continues the chain
-                        if projection.get("mode") == "deleted":
+                        # a stepped root ends the episode so its card shows now; _run continues the chain
+                        if projection.stepped or projection.complete or not projection.progressed:
                             break
                 planner.close()
                 planner = None
@@ -395,8 +395,8 @@ class RetentionActivationOwner:
                         return
                     await asyncio.sleep(0)
                     continue
-                if outcome is None and projections and projections[-1].get("mode") == "deleted":
-                    # continuation: the armed set is not done until a pass deletes nothing
+                if outcome is None and projections and projections[-1].stepped:
+                    # continuation: the armed set is not done until no unattempted root is left
                     await asyncio.sleep(0)
                     continue
                 try:
