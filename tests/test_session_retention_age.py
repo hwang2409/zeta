@@ -8,7 +8,10 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from tests.support.retention_owner import (
     _DAY_NS,
@@ -17,11 +20,14 @@ from tests.support.retention_owner import (
     _opened_lease,
     _planner,
     _run_sweep,
+    _set_header_created_at,
 )
+from tests.test_remote_sync import _install_ssh_shim
 from zeta.cli.main import main as cli_main
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.remote_sync import LocalTransport, pull_session, push_session
+from zeta.remote_sync.ssh import SshTransport
 
 
 def _closed_session(home, *, child: bool) -> str:
@@ -136,7 +142,8 @@ def test_cutover_keeps_transcript_age(tmp_path, monkeypatch):
     assert reasons[recent] == (False, "not old enough")
 
 
-def test_push_and_pull_keep_transcript_mtimes(tmp_path):
+@pytest.mark.parametrize("kind", ("local", "ssh"))
+def test_push_and_pull_keep_transcript_mtimes(tmp_path, monkeypatch, kind):
     source, remote, destination = (tmp_path / name for name in ("source", "remote", "destination"))
     session_id = _closed_session(source, child=True)
     _age_tree(source / "sessions" / session_id, days=40)
@@ -144,7 +151,12 @@ def test_push_and_pull_keep_transcript_mtimes(tmp_path):
         path.relative_to(source / "sessions").as_posix(): path.stat().st_mtime_ns
         for path in (source / "sessions").rglob("conversation.jsonl")
     }
-    transport = LocalTransport(remote)
+    if kind == "ssh":
+        # The real remote scripts run locally through a fake ssh.
+        _install_ssh_shim(tmp_path, monkeypatch)
+        transport = SshTransport("fake", str(remote), name="cloud")
+    else:
+        transport = LocalTransport(remote)
 
     push_session(source, transport, session_id=session_id)
     pull_session(destination, transport, session_id=session_id)
@@ -154,4 +166,23 @@ def test_push_and_pull_keep_transcript_mtimes(tmp_path):
             path.relative_to(home / "sessions").as_posix(): path.stat().st_mtime_ns
             for path in (home / "sessions").rglob("conversation.jsonl")
         }
-        assert copied == expected, home.name
+        assert copied.keys() == expected.keys(), home.name
+        # A tar member keeps the mtime in seconds, so allow under one second.
+        drift = {name: abs(copied[name] - expected[name]) for name in expected}
+        assert max(drift.values()) < 1_000_000_000, (home.name, drift)
+
+
+def test_recent_header_created_at_keeps_old_transcript_young(tmp_path):
+    # Clock skew or an old copy can leave the transcript mtime older than the
+    # session's own header time; the header time still counts as activity.
+    session_id = _closed_session(tmp_path, child=False)
+    session_dir = tmp_path / "sessions" / session_id
+    _age_tree(session_dir, days=40)
+    _set_header_created_at(
+        session_dir, datetime.fromtimestamp(time.time() - 5 * 86400, UTC).isoformat()
+    )
+    _set_mtime(session_dir / "conversation.jsonl", 40)
+
+    _result, reasons = _preview(tmp_path)
+
+    assert reasons[session_id] == (False, "not old enough")

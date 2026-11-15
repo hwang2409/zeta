@@ -390,17 +390,21 @@ def _create_app_with_root(
         model_override = cli_model or loaded_settings.settings.model
         mismatches = []
         if provider_override is not None and provider_override != metadata.provider:
+            source = "--provider" if cli_provider else "settings.toml"
             mismatches.append(
-                f"provider {provider_override!r} does not match {metadata.provider!r}"
+                f"provider {provider_override!r} (from {source}) does not match {metadata.provider!r}"
             )
         if model_override is not None and model_override != metadata.model:
+            source = "--model" if cli_model else "settings.toml"
             mismatches.append(
-                f"model {model_override!r} does not match {metadata.model!r}"
+                f"model {model_override!r} (from {source}) does not match {metadata.model!r}"
             )
         if mismatches and not force_provider:
+            # Matching flags win over settings.toml, so this works for both sources.
             raise SessionError(
                 f"session override rejected: {'; '.join(mismatches)}; "
-                "use --force-provider to override"
+                f"to resume as stored, pass --provider {metadata.provider} --model {metadata.model}; "
+                "to switch, pass --model <model> --force-provider"
             )
         provider = provider_override or metadata.provider
         model = model_override or metadata.model

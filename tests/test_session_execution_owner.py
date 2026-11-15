@@ -574,10 +574,8 @@ def test_tui_real_render_refuses_owned_session(tmp_path: Path) -> None:
     home = tmp_path / "home"
     session_id = _created_session(home, tmp_path)
     script = (
-        "from zeta.cli.main import _create_tui_app, build_parser; "
-        "parser = build_parser(); "
-        f"args = parser.parse_args(['--provider', 'codex', '--resume', '{session_id}']); "
-        "_create_tui_app(args, parser)"
+        "from zeta.cli.main import main; "
+        f"raise SystemExit(main(['--provider', 'codex', '--resume', '{session_id}']))"
     )
     env = os.environ | {"ZETA_HOME": str(home)}
 
@@ -592,7 +590,7 @@ def test_tui_real_render_refuses_owned_session(tmp_path: Path) -> None:
             check=False,
         )
 
-    assert rendered.returncode == 2
+    assert rendered.returncode == 1
     assert "active in another zeta process" in rendered.stderr
 
 

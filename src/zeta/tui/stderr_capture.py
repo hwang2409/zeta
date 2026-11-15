@@ -176,7 +176,7 @@ def run_tui_session(
         return asyncio.run(run())
 
 
-def run_tui_lifecycle(args: Any, parser: Any, lifecycle: Any) -> tuple[int, str | None]:
+def run_tui_lifecycle(args: Any, lifecycle: Any) -> tuple[int, str | None]:
     if sys_isatty():
         try:
             _setup()
@@ -186,8 +186,8 @@ def run_tui_lifecycle(args: Any, parser: Any, lifecycle: Any) -> tuple[int, str 
                 file=sys.stderr,
             )
             return 1, None
-        return lifecycle(args, parser)
-    return lifecycle(args, parser)
+        return lifecycle(args)
+    return lifecycle(args)
 
 
 def sys_isatty() -> bool:
