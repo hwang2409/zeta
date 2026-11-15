@@ -33,7 +33,7 @@ from .paged_history import (
     TUIHistoryUnit,
     TUIPaintSegment,
 )
-from .root_history_source import _project_entry
+from .root_history_source import _project_entry, dependency_unit_id, owning_entry_id
 from .transcript_finder import finder_row_contains
 
 
@@ -152,7 +152,7 @@ class ChildLogHistorySource:
             message = Message.from_dict(bounded)
             dependency = self._dependency(store, refs, position, message)
             if dependency is not None:
-                projected.append((f"{dependency.id}:dependency:{entry.id}", dependency))
+                projected.append((dependency_unit_id(dependency.id, entry.id), dependency))
         projected.append((entry.id, entry))
         units: list[TUIHistoryUnit] = []
         decoded_bytes = 0
@@ -290,7 +290,7 @@ class ChildLogHistorySource:
         )
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
-        return await self._run(self._entry_page_sync, entry_id)
+        return await self._run(self._entry_page_sync, owning_entry_id(entry_id))
 
     def _prompt_refs(self, refs: tuple[Any, ...]) -> list[Any]:
         return [

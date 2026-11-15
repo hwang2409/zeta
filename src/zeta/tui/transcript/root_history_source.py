@@ -37,6 +37,21 @@ class TUIReplayEntry:
     message: Message | None = None
 
 
+_DEPENDENCY = ":dependency:"
+
+
+def dependency_unit_id(dependency_id: str, owner_id: str) -> str:
+    """Name a dependency card projected into its owning entry's bundle."""
+
+    return f"{dependency_id}{_DEPENDENCY}{owner_id}"
+
+
+def owning_entry_id(unit_id: str) -> str:
+    """Return the store entry whose bundle holds this history unit."""
+
+    return unit_id.rpartition(_DEPENDENCY)[2]
+
+
 def _project_entry(entry: Any) -> TUIReplayEntry:
     message = None
     if entry.type == "message":
@@ -132,7 +147,7 @@ class RootTUIHistorySource:
                     dependency = self._store.tui_user_dependency(entry.seq)
                     if dependency is not None:
                         projected.append(
-                            (f"{dependency.id}:dependency:{entry.id}", dependency)
+                            (dependency_unit_id(dependency.id, entry.id), dependency)
                         )
                 result = message.tool_result
                 if result is not None:
@@ -141,7 +156,7 @@ class RootTUIHistorySource:
                     )
                     if dependency is not None:
                         projected.append(
-                            (f"{dependency.id}:dependency:{entry.id}", dependency)
+                            (dependency_unit_id(dependency.id, entry.id), dependency)
                         )
             projected.append((entry.id, entry))
             units: list[TUIHistoryUnit] = []
@@ -203,8 +218,9 @@ class RootTUIHistorySource:
         return self._page_sync(HistoryCursor(str(position + 1)), "older")
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
+        owner = owning_entry_id(entry_id)
         return await self._store._to_thread_store(
-            lambda: self._entry_page_sync(entry_id)
+            lambda: self._entry_page_sync(owner)
         )
 
     def _prompt_refs_sync(self) -> list[Any]:

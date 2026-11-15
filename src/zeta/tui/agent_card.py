@@ -337,13 +337,7 @@ class AgentTranscriptControl(UIControl):
                 and self.transcript.follow_tail == follow_tail
             )
             if published and fresh != resident:
-                self._history_pager.reset()
-                for index, page in enumerate(fresh):
-                    self._history_pager.adopt(page, direction="newer" if index else "older")
-                self.render_pages(self._history_pager.pages)
-                if anchor is not None and not follow_tail:
-                    self._history_pager.set_anchor(*anchor)
-                    self._restore_anchor(self.transcript, anchor)
+                self.show_pages(fresh, None if follow_tail else anchor)
             if published and (follow_tail or not stale or anchor is not None):
                 self._source_revision = revision
         if self._invalidate is not None:
@@ -444,6 +438,29 @@ class AgentTranscriptControl(UIControl):
         while pending := asyncio.all_tasks() - {current}:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    def show_pages(
+        self,
+        pages: tuple[Any, ...],
+        anchor: tuple[str, int, int] | None,
+        *,
+        endpoint: str | None = None,
+    ) -> None:
+        """Make `pages` the resident window and paint the active view at `anchor`.
+
+        Transitions and refreshes both end here, so a re-entry and a refresh
+        restore a place the same way (ux r5 M7).
+        """
+
+        self._history_pager.reset(endpoint_id=endpoint)
+        for index, page in enumerate(pages):
+            self._history_pager.adopt(page, direction="newer" if index else "older")
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
+        self._render_resident()
+        transcript = self._active_transcript()
+        if anchor is not None and transcript is not None:
+            self._restore_anchor(transcript, anchor)
+
     @staticmethod
     def _restore_anchor(transcript: Any, anchor: tuple[str, int, int]) -> None:
         if not transcript.restore_durable_scroll_anchor(anchor):
@@ -534,11 +551,8 @@ class AgentTranscriptControl(UIControl):
             self._source = None if prepared_source is self._root_source else prepared_source
             self._source_revision = None
             self._history_pager.source = prepared_source
-            self._history_pager.reset(endpoint_id=endpoint)
-            for index, page in enumerate(prepared_pages):
-                self._history_pager.adopt(page, direction="newer" if index else "older")
-            if state is not None and state.anchor is not None:
-                self._history_pager.set_anchor(*state.anchor)
+            anchor = state.anchor if state is not None else None
+            self.show_pages(prepared_pages, anchor, endpoint=endpoint)
             restored = state or _InactiveViewState(None, "", 0, None, None, "", 0)
             if self._prompt_history is not None:
                 self._prompt_history.bind(path, prepared_source, endpoint)
@@ -563,15 +577,14 @@ class AgentTranscriptControl(UIControl):
                 else:
                     buffer.set_document(document, bypass_readonly=True)
             self.search_index = restored.finder_cursor
-            self._render_resident()
             transcript = self._active_transcript()
             if transcript is not None and restored.finder_query:
                 transcript.open_finder()
                 transcript.finder_set_query(restored.finder_query)
-            if state is not None and state.anchor is not None and transcript is not None:
-                self._restore_anchor(transcript, state.anchor)
+            if anchor is not None and transcript is not None:
+                self._restore_anchor(transcript, anchor)
                 asyncio.get_running_loop().call_soon(
-                    self._restore_anchor, transcript, state.anchor
+                    self._restore_anchor, transcript, anchor
                 )
             if self._finish_path is not None:
                 self._finish_path(generation)

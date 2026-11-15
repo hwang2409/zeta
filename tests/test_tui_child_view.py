@@ -719,3 +719,146 @@ async def test_real_tui_child_view_journey(
         f"real TUI journey: {journey_seconds:.3f}s"
     )
     assert not failures, "real TUI child-view journey failures:\n- " + "\n- ".join(failures)
+
+
+async def _top_rows_after(app: TUIApp) -> tuple[str, ...]:
+    """Draw the child widget at the size of its window; return its top rows."""
+
+    control = app._agent_navigation.transcript_control
+    positions = app._active_session.app.renderer._last_screen.visible_windows_to_write_positions
+    position = next(
+        (position for window, position in positions.items() if window.content is control),
+        None,
+    )
+    if position is None:
+        rows = await _child_rows(app)
+        return tuple(rows[:3])
+    content = control.create_content(position.width, position.height)
+    return tuple(
+        "".join(fragment[1] for fragment in content.get_line(row)).rstrip()
+        for row in range(3)
+    )
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("CI")) and sys.version_info < (3, 14),
+    reason="real-TUI sweep runs once in the Python 3.14 PR job",
+)
+@pytest.mark.asyncio
+async def test_child_keeps_every_top_row_across_park_and_reentry(
+    child_view_fixture: ChildViewHome,
+) -> None:
+    """ux r5 M7: for every top row from the last row before the tail up past a
+    page boundary, and at the top of history, the parked anchor brings back the
+    same rows: through show_pages with the source open at every row, and through
+    the real re-entry transition at every 25th row."""
+
+    from zeta.tui.agent_card import _anchored_pages
+
+    fixture = child_view_fixture
+    store = await asyncio.to_thread(
+        ConversationStore, fixture.home / "sessions", session_id=fixture.session_id
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+        zeta_home=fixture.home,
+    )
+    output = Vt100_Output(StringIO(), lambda: Size(rows=42, columns=120), enable_cpr=False)
+    misses: list[str] = []
+    rows_checked = 0
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        session = app._make_session()
+        run_task = asyncio.create_task(app.run(session))
+        try:
+            await _wait_until(lambda: session.app.is_running, what="running TUIApp")
+            await _wait_until(lambda: bool(app._transcript.units), what="root first paint")
+            await _enter_child(app, pipe)
+            navigation = app._agent_navigation
+            control = navigation.transcript_control
+            pager = control.history_pager
+            child_path = navigation.current_path
+            pages_by_entry: dict[str, tuple[object, ...]] = {}
+
+            async def check(where: str, *, transition: bool) -> None:
+                nonlocal rows_checked
+                rows_checked += 1
+                before = await _top_rows_after(app)
+                anchor = control.transcript.durable_scroll_anchor
+                if anchor is None:
+                    misses.append(f"{where}: no durable anchor while scrolled, top={before!r}")
+                    return
+                if transition:
+                    assert control._park_active_view()
+                    control._start_transition(child_path, refresh=False)
+                    await _wait_until(
+                        lambda: not control.transition_pending(), what="child re-entry"
+                    )
+                    await navigation.wait_for_publication()
+                else:
+                    # The re-entry's page load: the anchor's page and the next one
+                    # (one read per entry; the rows of an entry share it).
+                    if anchor[0] not in pages_by_entry:
+                        pages_by_entry.clear()
+                        pages_by_entry[anchor[0]] = await _anchored_pages(
+                            control._source, anchor
+                        )
+                    control.show_pages(pages_by_entry[anchor[0]], anchor)
+                after = await _top_rows_after(app)
+                if after != before:
+                    misses.append(f"{where}: before={before!r} after={after!r}")
+
+            async def sweep(*, transition: bool) -> None:
+                control.bottom()
+                await _top_rows_after(app)
+                newest_page_start = pager.pages[-1].units[0].entry_id
+                past_boundary = 0
+                for step in range(3_000):
+                    control.scroll(-1)
+                    if not transition or step % 25 == 0:
+                        await check(f"line {step + 1} above the tail", transition=transition)
+                        if misses:
+                            return
+                    anchor = control.transcript.durable_scroll_anchor
+                    # Fixture ids sort by seq: go one screen past the newest page.
+                    if anchor is not None and anchor[0] < newest_page_start:
+                        past_boundary += 1
+                        if past_boundary == 40:
+                            return
+                raise AssertionError("child-sweep: the sweep never crossed a page boundary")
+
+            # Every 25th row through the real re-entry transition, then every row
+            # through the page load and paint that the transition ends with.
+            await sweep(transition=True)
+            assert not misses, (
+                f"child-sweep (transition): {len(misses)} of {rows_checked} top rows "
+                "moved:\n- " + "\n- ".join(misses[:8])
+            )
+            await sweep(transition=False)
+
+            for _load in range(400):
+                if not pager.can_load_older:
+                    break
+                oldest = pager.pages[0].units[0].entry_id
+                control.top()
+                await _top_rows_after(app)
+                # test-contract: latency the edge load runs on the history worker
+                await asyncio.sleep(0.05)
+                await navigation.wait_for_publication()
+                if pager.pages[0].units[0].entry_id == oldest:
+                    control.scroll(-1)
+            assert not pager.can_load_older, "child-sweep: never reached the top of history"
+            control.top()
+            for step in range(4):
+                await check(f"line {step + 1} of history", transition=step == 0)
+                control.scroll(1)
+        finally:
+            app.request_exit()
+            await await_or_fail(run_task, what="real child-view TUI shutdown")
+    print(f"child-sweep: {rows_checked} top rows checked")
+    assert not misses, (
+        f"child-sweep: {len(misses)} of {rows_checked} top rows moved:\n- "
+        + "\n- ".join(misses[:8])
+    )

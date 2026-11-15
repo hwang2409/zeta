@@ -201,7 +201,9 @@ def _child_rows() -> list[dict[str, Any]]:
                 content += " word" * 450 + " Henry long result tail"
             data = _message(role, [{"type": "text", "text": f"visible result {index} "}])
             data["message"]["tool_result"] = {
-                "tool_call_id": f"child-call-{index}",
+                # Real logs answer the previous call, so each result carries
+                # a dependency card (the shape of child 651, ux r5 M7).
+                "tool_call_id": f"child-call-{index - 1}" if index else "child-tool-1",
                 "content": content,
                 "structured_content": {"hidden_owner": hidden},
                 "is_error": False,
