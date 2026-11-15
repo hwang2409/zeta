@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from ..core.store._client_delivery import (
+    DeliveryDropReason,
     tag_client_delivery,
     valid_client_delivery_id,
 )
@@ -46,9 +47,23 @@ class DeliveryRequests:
 
     def __init__(self, control: ServeControl) -> None:
         self._control = control
-        self._steer_turn_guard = asyncio.Lock()
+        # orders every busy check and turn start (send, steer acceptance, and
+        # the end-of-turn decision in continue_after_turn) so only one wins.
+        self._turn_guard = asyncio.Lock()
 
     async def send(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        async with self._turn_guard:
+            return await self._send(params, features)
+
+    async def send_images(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        async with self._turn_guard:
+            return await self._send_images(params, features)
+
+    async def _send(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         control = self._control
@@ -124,7 +139,7 @@ class DeliveryRequests:
         )
         return outcome
 
-    async def send_images(
+    async def _send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         from .handlers import send_images
@@ -243,7 +258,7 @@ class DeliveryRequests:
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
         canceled_after_commit = False
-        async with self._steer_turn_guard:
+        async with self._turn_guard:
             if not control.turn_busy():
                 raise ProtocolError(
                     ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running"
@@ -277,8 +292,6 @@ class DeliveryRequests:
         state: SessionState,
         turn_id: str,
         outcome: TurnOutcome,
-        *,
-        schedule_wake: bool,
     ) -> None:
         """Finish durable lifecycle work despite cancellation of the turn task."""
 
@@ -289,7 +302,6 @@ class DeliveryRequests:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=schedule_wake,
                 owner_task=owner_task,
             )
         )
@@ -307,31 +319,18 @@ class DeliveryRequests:
         turn_id: str,
         outcome: TurnOutcome,
         *,
-        schedule_wake: bool,
         owner_task: asyncio.Task[Any] | None,
     ) -> None:
         control = self._control
+        # a completed turn keeps its unconsumed steering: continue_after_turn
+        # starts the next turn with it once turn_end is published.
         reason = {
-            TurnOutcome.COMPLETED: "turn_end",
             TurnOutcome.FAILED: "failed",
             TurnOutcome.SESSION_CANCELED: "abort",
             TurnOutcome.DISCONNECTED: "disconnect",
         }.get(outcome)
         if reason is not None:
-            async with self._steer_turn_guard:
-                dropped = await state.opened.store.drop_client_steering_async(reason)
-            connections = control.server.connections
-            if connections is not None:
-                for entry, accepted_message in dropped:
-                    row = event_contract.delivery_status_row(entry, accepted_message)
-                    await connections.publish_controller(
-                        event_contract.AUXILIARY_WIRE_EVENTS[
-                            event_contract.AuxiliaryEvent.DELIVERY_STATUS
-                        ],
-                        session_id,
-                        replay_row=RowFacts(seq=entry.seq),
-                        **{key: value for key, value in row.items() if key != "event"},
-                    )
+            await self._drop_steering(session_id, state, reason)
         turn_reason = {
             TurnOutcome.COMPLETED: "completed",
             TurnOutcome.FOREGROUND_CANCELED: "user_stop",
@@ -348,13 +347,77 @@ class DeliveryRequests:
             control._turn_end_published = False
             control._turn_task = None
             control._turn_cancel_outcome = None
-        if (
-            schedule_wake
-            and outcome is TurnOutcome.COMPLETED
-            and control.server.runtime.state is state
-            and state.loop.notification_system_message() is not None
-        ):
-            control._schedule_background_wake(session_id)
+
+    async def continue_after_turn(
+        self,
+        session_id: str,
+        state: SessionState,
+        *,
+        allow_assistant_reset: bool = True,
+    ) -> None:
+        """Answer steering a completed turn did not consume, else wake for notifications.
+
+        Call last in the finished turn task, after its turn_end is published.
+        The guard orders this decision against send and steer: a steer that
+        passed its busy check is queued before this check, a later steer sees
+        no running turn, and a send either starts the turn this check finds or
+        sees the turn this decision starts and gets OPERATION_BUSY.
+        """
+
+        control = self._control
+        async with self._turn_guard:
+            running = control._turn_task
+            if (
+                running is not None
+                and not running.done()
+                and running is not asyncio.current_task()
+            ):
+                # a send started that turn under the guard; its first provider
+                # request reads the queued steering, and its end wakes as needed.
+                return
+            steering = state.opened.store.pending_client_steering()
+            if steering is None:
+                control._schedule_background_wake(session_id)
+                return
+            if (
+                not control.closing
+                and not control.client_turn_detached()
+                and control.server.runtime.state is state
+            ):
+                # the next turn's first provider request drains the queue,
+                # so each steer becomes delivered exactly as a mid-turn steer.
+                control.start_turn(
+                    "\n\n".join(
+                        block.text
+                        for message in steering.messages
+                        for block in message.content
+                        if isinstance(block, TextContent)
+                    ),
+                    persist_user_message=False,
+                    allow_assistant_reset=allow_assistant_reset,
+                )
+                return
+        # a send would be refused here too: the server closes or the bindings left.
+        await self._drop_steering(session_id, state, "disconnect")
+
+    async def _drop_steering(
+        self, session_id: str, state: SessionState, reason: DeliveryDropReason
+    ) -> None:
+        async with self._turn_guard:
+            dropped = await state.opened.store.drop_client_steering_async(reason)
+        connections = self._control.server.connections
+        if connections is None:
+            return
+        for entry, accepted_message in dropped:
+            row = event_contract.delivery_status_row(entry, accepted_message)
+            await connections.publish_controller(
+                event_contract.AUXILIARY_WIRE_EVENTS[
+                    event_contract.AuxiliaryEvent.DELIVERY_STATUS
+                ],
+                session_id,
+                replay_row=RowFacts(seq=entry.seq),
+                **{key: value for key, value in row.items() if key != "event"},
+            )
 
     def status(
         self, params: dict[str, Any], features: frozenset[str]
