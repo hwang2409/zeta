@@ -416,3 +416,60 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
 
 async def _collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
     return [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_racing_child_finish_reports_already_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Forced order: the cancel request reaches the child's store only after its
+    # accepted finish has unregistered the child and closed that store.
+    from zeta.agent import background_owner
+    from zeta.agent.terminal_fence import TerminalTransitionFence
+
+    child_backend = _GrandchildBackend(1, rich_report=False)
+    monkeypatch.setattr(
+        "zeta.agent.runner.resolve_child_backend",
+        lambda _loop, _model: (child_backend, None),
+    )
+    # test-contract: seam a slow CI host must not turn the forced order into a timeout
+    monkeypatch.setattr(background_owner, "_AGENT_CANCEL_CONFIRM_TIMEOUT", 10.0)
+    store = ConversationStore(tmp_path, cwd=tmp_path)
+    loop = AgentLoop(
+        _ParentBackend("explicit-test"),
+        store,
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=_catalog(),
+        token_budget=8_192,
+        max_turns=2,
+    )
+    loop.explicit_finish = True
+    original_cancel = TerminalTransitionFence.cancel
+
+    async def cancel_after_finish_cleanup(fence: TerminalTransitionFence) -> bool:
+        child_backend.release.set()
+        await loop._background_owner.wait()
+        return await original_cancel(fence)
+
+    # test-contract: seam park the cancel write until the finish path closed the store
+    monkeypatch.setattr(TerminalTransitionFence, "cancel", cancel_after_finish_cleanup)
+    try:
+        await await_or_fail(
+            _collect(loop.run_turn("start", origin=MessageOrigin.USER)),
+            what="parent starts child",
+        )
+        handle = next(iter(store.agent_children()))
+        await await_or_fail(child_backend.started.wait(), what="child starts")
+        result = await await_or_fail(
+            loop.tool_registry.execute(
+                ToolCall("cancel-child", "agent_cancel", {"handle": handle})
+            ),
+            what="agent_cancel during child finish",
+        )
+        assert result["structuredContent"]["status"] == "already_finished", result
+        assert result["isError"] is False
+    finally:
+        child_backend.release.set()
+        await await_or_fail(loop._background_owner.wait(), what="child drains")
+        await loop.close()
+        store.close()
