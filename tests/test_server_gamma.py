@@ -1603,7 +1603,9 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
             {"session_id": session_id},
         )
         captured.append(server.runtime.metadata.to_dict())
-        captured.append(server.runtime.manager.export(session_id))
+        captured.append(
+            await asyncio.to_thread(server.runtime.manager.export, session_id)
+        )
 
         snapshots = server.runtime.loop.tool_registry.background_tasks.snapshot()
         assert snapshots
