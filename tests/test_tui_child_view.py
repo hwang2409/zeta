@@ -299,7 +299,9 @@ async def test_real_tui_child_view_journey(
             )
             search_task = app._agent_navigation.transcript_control.search_task
             assert search_task is not None
-            await await_or_fail(search_task, what="focused child history scan")
+            # A full scan of the 23 MiB fixture child can pass 10 s on a loaded CI runner.
+            # A full scan of the 23 MiB fixture child can pass 10 s on a loaded CI runner.
+            await await_or_fail(search_task, timeout=90, what="focused child history scan")
             try:
                 await _wait_until(
                     lambda: (
@@ -494,7 +496,7 @@ async def test_real_tui_child_view_journey(
                 )
                 search_task = owner.search_task
                 assert search_task is not None
-                await await_or_fail(search_task, what="child history scan")
+                await await_or_fail(search_task, timeout=90, what="child history scan")
                 await _wait_until(
                     lambda: (
                         (state := owner.transcript.finder_state()) is not None
@@ -551,7 +553,7 @@ async def test_real_tui_child_view_journey(
                 )
                 search_task = owner.search_task
                 assert search_task is not None
-                await await_or_fail(search_task, what="root history scan")
+                await await_or_fail(search_task, timeout=90, what="root history scan")
                 await _wait_until(
                     lambda: (
                         (state := app._transcript.finder_state()) is not None
