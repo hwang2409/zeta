@@ -13,17 +13,20 @@ from dataclasses import dataclass
 
 from ..protocol import EventDescriptor
 
-# shortcut: a longer in-flight reply keeps only its newest frames; the final
-# assistant_message still carries all of it. Raise it if replies grow past this.
+# a longer in-flight reply or tool output keeps only its newest parts; the
+# final assistant_message or tool_end still carries all of it
 IN_FLIGHT_MAX_BYTES = 256 * 1024
-IN_FLIGHT_MAX_FRAMES = 16
+IN_FLIGHT_MAX_PARTS = 16  # per reply and per tool call
 _MERGE_MAX_BYTES = 64 * 1024
 
 
 @dataclass(slots=True)
 class _Part:
     event: EventDescriptor
-    fields: dict[str, object]
+    group: object  # the reply or one tool call; the part cap counts per group
+    fields: dict[str, object]  # the frame without its text
+    text_key: str
+    texts: list[str]
     size: int
 
 
@@ -32,44 +35,47 @@ def _tool_call_id(fields: Mapping[str, object]) -> object:
     return call.get("id") if isinstance(call, Mapping) else None
 
 
+_REPLY = object()
+
+
 class InFlightReply:
     """The active session's unfinished reply text and running tools' output."""
 
     def __init__(self) -> None:
         self._session_id: str | None = None
-        self._frames: list[_Part] = []
+        self._parts: list[_Part] = []
         # foreground tool calls of this run, so a join drops their held output
         self._tools: set[object] = set()
 
     def start_run(self, session_id: str | None) -> None:
         self._session_id = session_id
-        self._frames.clear()
+        self._parts.clear()
         self._tools.clear()
 
     def end_run(self) -> None:
-        self._frames.clear()
+        self._parts.clear()
 
     def delta(self, session_id: str | None, delta: str, kind: str) -> None:
-        self._add(
-            session_id,
-            EventDescriptor.ASSISTANT_DELTA,
-            {"delta": delta, "kind": kind},
-            "delta",
-        )
+        self._add(session_id, EventDescriptor.ASSISTANT_DELTA, _REPLY, {"kind": kind}, "delta", delta)
 
     def tool_output(self, session_id: str | None, fields: dict[str, object]) -> None:
-        self._tools.add(_tool_call_id(fields))
-        self._add(session_id, EventDescriptor.TOOL_OUTPUT, dict(fields), "output")
+        tool_call_id = _tool_call_id(fields)
+        self._tools.add(tool_call_id)
+        rest = {key: value for key, value in fields.items() if key != "output"}
+        self._add(
+            session_id, EventDescriptor.TOOL_OUTPUT, tool_call_id, rest, "output",
+            str(fields.get("output", "")),
+        )
 
     def end_message(self) -> None:
         """The reply was committed, reset, or ended; history or a live frame has it."""
-        self._frames = [f for f in self._frames if f.event is not EventDescriptor.ASSISTANT_DELTA]
+        self._parts = [p for p in self._parts if p.group is not _REPLY]
 
     def end_tool(self, fields: Mapping[str, object]) -> None:
         tool_call_id = _tool_call_id(fields)
-        self._frames = [
-            f for f in self._frames
-            if f.event is not EventDescriptor.TOOL_OUTPUT or _tool_call_id(f.fields) != tool_call_id
+        self._parts = [
+            p for p in self._parts
+            if p.event is not EventDescriptor.TOOL_OUTPUT or p.group != tool_call_id
         ]
 
     def owns(self, event: object, fields: Mapping[str, object]) -> bool:
@@ -81,32 +87,36 @@ class InFlightReply:
     def frames(self, session_id: str) -> list[tuple[EventDescriptor, dict[str, object]]]:
         if session_id != self._session_id:
             return []
-        return [(f.event, dict(f.fields)) for f in self._frames]
+        return [
+            (p.event, {**p.fields, p.text_key: "".join(p.texts)}) for p in self._parts
+        ]
 
     def _add(
         self,
         session_id: str | None,
         event: EventDescriptor,
+        group: object,
         fields: dict[str, object],
         text_key: str,
+        text: str,
     ) -> None:
         if session_id != self._session_id:
             self.start_run(session_id)
-        text = str(fields[text_key])
         size = len(text.encode("utf-8"))
-        last = self._frames[-1] if self._frames else None
+        # parts of different groups are independent, so a group merges into its own last part
+        last = next((p for p in reversed(self._parts) if p.group == group), None)
         if (
             last is not None
             and last.event is event
+            and last.fields == fields
             and last.size + size <= _MERGE_MAX_BYTES
-            and {k: v for k, v in last.fields.items() if k != text_key}
-            == {k: v for k, v in fields.items() if k != text_key}
         ):
-            last.fields[text_key] = str(last.fields[text_key]) + text
+            last.texts.append(text)
             last.size += size
         else:
-            self._frames.append(_Part(event, fields, size))
-        while len(self._frames) > IN_FLIGHT_MAX_FRAMES or (
-            len(self._frames) > 1 and sum(f.size for f in self._frames) > IN_FLIGHT_MAX_BYTES
-        ):
-            self._frames.pop(0)
+            self._parts.append(_Part(event, group, fields, text_key, [text], size))
+            in_group = [p for p in self._parts if p.group == group]
+            if len(in_group) > IN_FLIGHT_MAX_PARTS:
+                self._parts.remove(in_group[0])
+        while len(self._parts) > 1 and sum(p.size for p in self._parts) > IN_FLIGHT_MAX_BYTES:
+            self._parts.pop(0)

@@ -1711,9 +1711,11 @@ error code and message. Provider status and origin remain internal.
   reply. The join drops its own copies of earlier live `assistant_delta` and
   foreground `tool_output` events, so each part reaches the client once, and a
   reply that committed during the join reaches it only as its history row or
-  its `assistant_message`. Apply these events like live ones. A reply longer
-  than 256 KiB in flight, or more than 16 merged parts, starts from its newest
-  parts; the final `assistant_message` still carries the whole reply. The
+  its `assistant_message`. Apply these events like live ones. A tool that
+  starts and ends during the join shows only `tool_start` and `tool_end`; its
+  `tool_end` carries the result. In-flight state over 256 KiB, or a reply or
+  tool call with more than 16 merged parts, starts from its newest parts; the
+  final `assistant_message` or `tool_end` still carries all of it. The
   result and every other event are unchanged; without the feature the join is
   unchanged. serve-only: no TUI surface.
 - `child_run_events`: takes exactly `{session_id, run_id}` for the active top-level session. It atomically returns the newest child history page plus `replay: {stream_id, history_seq: 0}`, `child`, and `revision`, then subscribes that connection to a child scope. The scope delivers: the `child_started`, `child_progress`, and `child_ended` lifecycle events of the selected run's own children; and the selected run's and its descendants' own `tool_start`/`tool_output`/`tool_end` and `approval_request`/`approval_end` events (every event whose `agent_instance_id` equals the selected `run_id` or starts with `run_id + ":"`). The selected run's own `child_progress` and `child_ended` go only to its immediate parent's scope, not this stream. The selected run's `assistant_message`, `assistant_delta`, `usage`, and turn events are never streamed; read them with `child_run_history`. Parent snapshot rows are event-shaped `child_progress` rows placed in `messages` immediately after their `child_started` row. A `session_history_and_subscribe` connection with `child_run_events` negotiated receives durable parent lifecycle rows and these bounded snapshot rows; without that feature, parent history is unchanged. `child_run_events` connections receive the same baseline for the selected child scope. Live events carry `stream_id` and consecutive `seq`; progress also carries `revision`. The shared child payload is the z5 child-run row, whose `parent_run_id` is null for a direct child of the session and the parent run's `run_id` for a nested child. Malformed parameters use `-32602` (`invalid_params`), an absent child uses `-32012` (`child_run_not_found`), and an invalid join uses `-32009` (`stale_event_sequence`).

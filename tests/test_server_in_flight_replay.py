@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from tests.support.owned import await_or_fail
-from tests.support.server_client import frames_until_event
+from tests.support.server_client import frames_until_event, read, send
 from tests.test_server import _connect, _request
 from tests.test_server_turn_reconnect import RECONNECT, _close, _drop, _reconnect
 from zeta.protocol.types import (
@@ -29,6 +29,8 @@ from zeta.protocol.types import (
 )
 from zeta.providers.completion import owned_completion
 from zeta.server import ZetaServer
+from zeta.server.protocol import EventDescriptor
+from zeta.server.session_replay.in_flight import IN_FLIGHT_MAX_PARTS, InFlightReply
 
 FEATURES = [
     *RECONNECT,
@@ -146,6 +148,15 @@ class ClientView:
                 self.committed.append(text)
                 self.text = ""
                 self.thinking = ""
+
+
+async def _frames_through(reader, writer, request_id: int, method: str) -> list[dict[str, Any]]:
+    """Send one request and return every frame up to and including its response."""
+    await send(reader, writer, request_id, method)
+    frames = [await read(reader)]
+    while frames[-1].get("id") != request_id:
+        frames.append(await read(reader))
+    return frames
 
 
 async def _start(server: ZetaServer, reader, writer, approval: str = "ask") -> str:
@@ -346,15 +357,64 @@ async def test_join_after_aborted_turn_replays_nothing(tmp_path: Path) -> None:
         aborted = await _request(reader, writer, 4, "abort", {})
         assert aborted[-1]["result"] == {"aborted": True}
 
-        frames = await _request(reader, writer, 6, "session_history_and_subscribe", {
+        joined = await _request(reader, writer, 6, "session_history_and_subscribe", {
             "session_id": session_id
         })
+        stream_id = joined[-1]["result"]["replay"]["stream_id"]
         # frames the join sends after its response arrive before the next response
-        frames += await _request(reader, writer, 7, "status", {})
+        frames = await _frames_through(reader, writer, 7, "status")
+        assert frames[-1]["result"]["state"] == "idle"
         assert not [
-            f for f in frames
-            if f.get("params", {}).get("event") in {"assistant_delta", "tool_output"}
+            f for f in frames if f.get("params", {}).get("stream_id") == stream_id
         ]
     finally:
         go.touch()
         await _close(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_join_after_tool_end_replays_no_tool_output(tmp_path: Path) -> None:
+    call = ToolUseContent(ToolCall("bash-1", "bash", {"command": "echo out-1"}))
+    backend = GatedBackend([
+        ([TextContent("running")], [TextContent("running"), call]),
+        ([TextContent("after "), HOLD, TextContent("done")], [TextContent("after done")]),
+    ])
+    server = _server(tmp_path, backend)
+    reader, writer = await _connect(server)
+    after = _published(server, "assistant_delta", "after")
+    try:
+        session_id = await _start(server, reader, writer, approval="allow")
+        await await_or_fail(after.wait(), what="reply after the tool")
+
+        frames = await _request(reader, writer, 6, "session_history_and_subscribe", {
+            "session_id": session_id
+        })
+        stream_id = frames[-1]["result"]["replay"]["stream_id"]
+        # frames the join sends after its response arrive before the next response
+        frames = await _frames_through(reader, writer, 7, "status")
+        joined = [
+            f["params"] for f in frames
+            if f.get("params", {}).get("stream_id") == stream_id
+        ]
+        assert [p["event"] for p in joined] == ["assistant_delta"], joined
+        assert joined[0]["delta"] == "after "
+    finally:
+        backend.open_all()
+        await _close(server, writer)
+
+
+def test_tool_output_parts_are_capped_per_tool_not_across_the_reply() -> None:
+    in_flight = InFlightReply()
+    in_flight.delta("s", "reply start", "assistant")
+    call = {"id": "bash-1", "name": "bash", "arguments": {}}
+    for index in range(IN_FLIGHT_MAX_PARTS + 4):
+        stream = "stderr" if index % 2 else "stdout"
+        in_flight.tool_output(
+            "s", {"tool_call": call, "output": f"{index};", "data": {"stream": stream}}
+        )
+
+    frames = in_flight.frames("s")
+    assert frames[0] == (EventDescriptor.ASSISTANT_DELTA, {"kind": "assistant", "delta": "reply start"})
+    outputs = [fields["output"] for event, fields in frames[1:]]
+    assert len(outputs) == IN_FLIGHT_MAX_PARTS
+    assert outputs[-1] == f"{IN_FLIGHT_MAX_PARTS + 3};"
