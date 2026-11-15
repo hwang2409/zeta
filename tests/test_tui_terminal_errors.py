@@ -613,3 +613,29 @@ def test_stray_stderr_never_reaches_the_terminal(tmp_path: Path) -> None:
     assert "resume with:" in terminal
     log = next((home / "logs" / "tui-stderr").glob("*.log")).read_text()
     assert [text for text in NOISE if text not in log] == []
+
+
+def test_resume_override_rejection_reaches_the_terminal(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.support.owned import owned_app
+    from zeta.cli.main import build_parser
+    from zeta.tui.bootstrap import create_app
+
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    async def stored_session() -> str:
+        app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+        async with owned_app(app):
+            return app.loop.store.session_id
+
+    session_id = asyncio.run(stored_session())
+    code = (
+        "import sys; from zeta.cli.main import main; "
+        f"sys.exit(main(['--resume', {session_id!r}, '--provider', 'claude']))"
+    )
+    output, returncode = _run_pty_python(code, _capture_env(home), timeout=30)
+    assert b"session override rejected" in output, output
+    assert returncode != 0

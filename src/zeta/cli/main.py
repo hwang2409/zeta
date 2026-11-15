@@ -844,7 +844,7 @@ def _tui_print(message: str) -> None:
 def _create_tui_app(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> object | None:
-    return create_tui_app(args, parser, _tui_print, _has_console_message)
+    return create_tui_app(args, _tui_print, _has_console_message)
 
 
 def _print_exit_hint(app: object) -> None:
