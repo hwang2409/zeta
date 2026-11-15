@@ -188,8 +188,22 @@ def _child_rows() -> list[dict[str, Any]]:
             ],
         ),
     )
+    # Real child 651's unit kinds: tool cards of several kinds and uneven
+    # heights, dependency cards, separators, system notices, hidden rows
+    # between messages, and a few huge rows (ux r5 M7).
+    tools = ("read", "bash", "edit", "task_output")
+    system_at = {41 + 40 * step for step in range(23)}
+    huge_at = {96 + 100 * step for step in range(10)}
     for index in range(1_089):
         role = "tool_result" if index % 2 == 0 else "assistant"
+        if index in system_at:
+            add(
+                "message",
+                _message("system", [{"type": "text", "text": f"Background updates only. fixture notice {index}"}]),
+            )
+            notification_id = add("notification", {"kind": "task_exited", "origin": "notification", "task_id": f"child-task-{index}", "headline": "fixture", "output_tail": "done", "exit_code": 0})
+            add("notification_ack", {"notification_id": notification_id})
+            continue
         hidden = "Henry" if index < 919 else "ordinary"
         if role == "tool_result":
             content = f"visible result {index}"
@@ -199,6 +213,10 @@ def _child_rows() -> list[dict[str, Any]]:
             if index == 1_080:
                 # A newer visible match past the finder's 2,000-character row text.
                 content += " word" * 450 + " Henry long result tail"
+            if index not in (1_078, 1_080):
+                content += "".join(f"\nout {line}" for line in range(index % 11))
+            if index in huge_at:
+                content += ("\n" + "h" * 99) * (1_300 if index != 996 else 13_000)
             data = _message(role, [{"type": "text", "text": f"visible result {index} "}])
             data["message"]["tool_result"] = {
                 # Real logs answer the previous call, so each result carries
@@ -214,15 +232,10 @@ def _child_rows() -> list[dict[str, Any]]:
                 [
                     {"type": "thinking", "text": f"thought {index}"},
                     {"type": "text", "text": f"visible assistant {index} "},
-                    {"type": "tool_use", "tool_call": {"id": f"child-call-{index}", "name": "read", "arguments": {"hidden_owner": hidden}}},
+                    {"type": "tool_use", "tool_call": {"id": f"child-call-{index}", "name": tools[index // 2 % 4], "arguments": {"hidden_owner": hidden, "path": f"src/fixture_{index}.py", "command": f"echo {index}", "old_string": "a\n" * (index % 5 + 1), "new_string": "b\n" * (index % 7 + 1), "task_id": f"child-task-{index}"}}},
                 ],
             )
         add("message", data)
-    notification_ids: list[str] = []
-    for index in range(23):
-        notification_ids.append(add("notification", {"kind": "task_exited", "origin": "notification", "task_id": f"child-task-{index}", "headline": "fixture", "output_tail": "done", "exit_code": 0}))
-    for notification_id in notification_ids:
-        add("notification_ack", {"notification_id": notification_id})
     for index in range(10):
         add("compaction", {"kind": "summary", "replaces": [], "source_seq_start": 1, "source_seq_end": 1, "summary": f"child compaction {index}"})
     prompt_ids = [add("pending_prompt", {"text": f"queued prompt {index}"}) for index in range(2)]
