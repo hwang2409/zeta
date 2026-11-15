@@ -720,7 +720,6 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -734,7 +733,9 @@ class ServeControl:
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(
+                session_id, state, allow_assistant_reset=allow_assistant_reset
+            )
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -833,14 +834,13 @@ class ServeControl:
                     state,
                     turn_id,
                     outcome,
-                    schedule_wake=False,
                 )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -901,11 +901,11 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None
