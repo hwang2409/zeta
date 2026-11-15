@@ -1076,7 +1076,7 @@ class RetentionPlanner:
                         entries.close()
                         walk.listing = None
                         break
-                    _visit(walk, dfd, comps, entry)
+                    _visit(flight, dfd, comps, entry)
                     root_entries += 1
                 else:
                     return False

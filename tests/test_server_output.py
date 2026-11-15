@@ -365,8 +365,8 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     pending_requests: list[asyncio.Task[dict[str, Any]]] = []
     fenced = False
 
-    def gated_release(reconnect: bool) -> Awaitable[None]:
-        operation = original_release(reconnect)
+    def gated_release(reconnect: bool, **kwargs: Any) -> Awaitable[None]:
+        operation = original_release(reconnect, **kwargs)
 
         async def wait() -> None:
             await asyncio.wait_for(operation, RELEASE_GATE_GUARD_SECONDS)

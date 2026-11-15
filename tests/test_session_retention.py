@@ -383,6 +383,7 @@ from tests.support.retention_owner import (
     _planner,
     _run_sweep,
     _run_sweep_without_error,
+    _set_header_created_at,
     _true_tree_bytes,
 )
 
@@ -393,15 +394,11 @@ def test_not_old_blocks_under_real_clock(tmp_path):
         fresh = _create_closed(manager, stack)
         aged = _create_closed(manager, stack)
         _age_tree(tmp_path / "sessions" / aged)
-        recent_meta = _create_closed(manager, stack)
-        _age_tree(tmp_path / "sessions" / recent_meta, keep_metadata=True)
         lease = stack.enter_context(_opened_lease(tmp_path))
         planner = _planner(stack, tmp_path, lease, now_ns=time.time_ns)
         _, reasons = _run_sweep(planner)
     assert reasons[fresh] == (False, "not old enough")
     assert reasons[aged] == (True, None)
-    # Metadata timestamps are activity even when every mtime is old.
-    assert reasons[recent_meta] == (False, "not old enough")
 
 
 def test_resume_completes_over_passes_with_exact_bytes(tmp_path):
@@ -479,9 +476,9 @@ def test_restart_rewalks_a_file_changed_between_planners(tmp_path):
         )
         planner_a.run_pass(days=30)
         getattr(planner_a, "close", lambda: None)()  # process exit: the walked root directory is not rewalked
-        # A file in the already-listed root directory changes; the directory
-        # mtime does not, so only a fresh walk can see it.
-        walked = min(p for p in root_dir.iterdir() if p.is_file())
+        # The transcript in the already-listed root directory changes; the
+        # directory mtime does not, so only a fresh walk can see it.
+        walked = root_dir / "conversation.jsonl"
         with walked.open("ab") as stream:
             stream.write(b"z" * 17)
         recent = _future_ns() - _DAY_NS
@@ -979,11 +976,9 @@ def _setup_authority_tail(tmp_path, manager, stack, root, kind, mode):
     elif kind == "age":
         if mode == "present":
             recent = _future_ns() - _DAY_NS
-            os.utime(root_dir / "meta.json", ns=(recent, recent))
+            os.utime(root_dir / "conversation.jsonl", ns=(recent, recent))
         elif mode == "malformed":
-            meta = json.loads((root_dir / "meta.json").read_text())
-            meta["updated_at"] = "not-a-time"
-            (root_dir / "meta.json").write_text(json.dumps(meta))
+            _set_header_created_at(root_dir, "not-a-time")
     elif kind == "generation":
         (tmp_path / "session-reference-generation").write_text(
             "broken" if mode == "malformed" else "0\n"

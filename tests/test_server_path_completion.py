@@ -421,6 +421,7 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
     scanner_before_request = threading.Event()
     handler_finished = threading.Event()
     scanner_observed_cancel = threading.Event()
+    scan_return_gate = threading.Event()
     drain_entered = asyncio.Event()
     drain_waiting = asyncio.Event()
     path_module = None
@@ -467,6 +468,8 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
                 return result
             finally:
                 scanner_finished.set()
+                # Hold the scan thread so the test wakes before the handler can see the scan end.
+                assert scan_return_gate.wait(10), "scan return gate was not released"
 
         async def tracked_drain(scan, cancel_event):
             drain_entered.set()
@@ -548,9 +551,11 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
             asyncio.to_thread(scanner_finished.wait, 10), what="path scanner drain"
         )
         assert scanner_observed_cancel.is_set()
-        assert handler_finished.is_set()
+        assert not handler_finished.is_set()
+        scan_return_gate.set()
         with suppress(asyncio.CancelledError):
             await await_or_fail(request_task, what="cancelled path request completion")
+        assert handler_finished.is_set()
         assert scanner_before_request.is_set()
 
         frames = await _frames_until_eof(reader)
@@ -561,6 +566,7 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         )
     finally:
         release.set()
+        scan_return_gate.set()
         if request_task is not None and not request_task.done():
             request_task.cancel()
         await close_serve(server, observer_writer or writer)
