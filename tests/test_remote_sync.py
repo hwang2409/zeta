@@ -797,6 +797,7 @@ def test_ssh_archive_with_invalid_mtime_is_a_clear_remote_sync_error(
             pack(source, destination)
             _with_pax_mtime(destination, mtime)
 
+        # test-contract: seam no real file can carry an inf/nan mtime, so the archive is rewritten in transit
         monkeypatch.setattr(ssh_module, "_pack", bad_pack)
         with pytest.raises(RemoteSyncError, match=r"zeta-remote: archive member payload/\S+: invalid mtime"):
             push_session(local, transport, session_id=session_id)
@@ -811,6 +812,7 @@ def test_ssh_archive_with_invalid_mtime_is_a_clear_remote_sync_error(
         _with_pax_mtime(destination, mtime)
         return result
 
+    # test-contract: seam no real file can carry an inf/nan mtime, so the fetched archive is rewritten
     monkeypatch.setattr(SshTransport, "_run_to_file", bad_fetch)
     pulled = tmp_path / "pulled"
     with pytest.raises(RemoteSyncError, match="remote archive member has an invalid mtime"):
