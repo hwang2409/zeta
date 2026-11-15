@@ -1554,7 +1554,7 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    until that turn ends. With `resume_attach`, `resume` of the open session
    attaches to that turn, and the client then sees its `turn_start`.
    A notification turn does not start its setup while a session-mutation or
-   controller-write request other than `abort` is running. When the turn left a steer unread, the
+   controller-write request is running. When the turn left a steer unread, the
    server starts the next turn after `agent_end`; a `send` that arrives after
    that start gets `-32004` and should be retried as `steer`. Clients must wait
    for `agent_end` before idle-only requests such as `new_session`; the server

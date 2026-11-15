@@ -761,9 +761,12 @@ class ServeControl:
                 self._terminate_pending_approvals, reason="turn_canceled"
             ),
             before_cancel=mark_canceled,
+            # a wake still at the start gate has nothing to keep; cancel it, as
+            # waiting for it would hold this request's gate forever.
             cancel_task=not any(
                 isinstance(key, str) for key in self._approvals.active_keys()
-            ),
+            )
+            or (turn_task is self._notification_task and not self._wake_admitted),
         )
         if aborted:
             await self._notify(
