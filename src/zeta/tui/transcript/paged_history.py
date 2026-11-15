@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any, Literal, Protocol
 
 
@@ -103,6 +104,7 @@ class PagedTranscriptHistory:
     def __init__(self, source: TUIHistorySource) -> None:
         self.source: TUIHistorySource | None = source
         self.generation = 0
+        self._resets = 0
         self.endpoint_id: str | None = None
         self._segments: deque[PageDescriptor] = deque()
         self._older: HistoryCursor | None = None
@@ -178,6 +180,7 @@ class PagedTranscriptHistory:
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1
+        self._resets += 1
         for task in self._loads.values():
             task.cancel()
         self._loads.clear()
@@ -368,22 +371,45 @@ class PagedTranscriptHistory:
                 live_index += 1
             while len(self._segments) > self.max_pages:
                 self._segments.popleft()
+        self._check_contiguous()
         self._refresh_edges()
+
+    def _check_contiguous(self) -> None:
+        """Resident durable pages must be adjacent and in order; a gap is a bug."""
+
+        durable = [d for d in self._segments if not d.key.startswith("live:")]
+        for older, newer in pairwise(durable):
+            if older.page.newer != newer.page.older:
+                raise RuntimeError(
+                    f"history pages not adjacent: {older.key} ends at "
+                    f"{older.page.newer} but {newer.key} starts at {newer.page.older}"
+                )
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
         self._reveal_target = entry_id
-        generation = self.generation
+        resets = self._resets
         source = self.source
         if source is None:
             return TUIHistoryPage(())
         page = await source.reveal(entry_id)
-        if generation == self.generation and page.segments:
+        if resets == self._resets and page.segments:
+            # Loads started before the reveal belong to the pages it replaces.
+            self.generation += 1
+            generation = self.generation
             self._segments.clear()
             self.adopt(page)
             # The revealed page ends at the target; rows after it let the view
-            # put the target on the top row instead of the bottom one.
-            if self.can_load_newer:
-                await self.load("newer")
+            # put the target on the top row. One huge row (a compaction) can
+            # fill a whole page, so load until a page of rows follows.
+            while (
+                generation == self.generation
+                and self.can_load_newer
+                and len(self._segments) < self.max_pages
+                and sum(len(d.page.units) for d in self._segments) - len(page.units)
+                < self.max_segment_rows
+            ):
+                if not (await self.load("newer")).segments:
+                    break
         return page
 
     async def navigate_user(

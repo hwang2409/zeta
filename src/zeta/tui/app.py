@@ -274,6 +274,8 @@ class TUIApp(
         )
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        # Root view from before the finder opened: (follow tail, top row, pages).
+        self._finder_return: tuple[bool, Any, tuple[str, ...]] | None = None
         self._history_search_results: tuple[Any, ...] = ()
         self._history_search_index = 0
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
@@ -711,6 +713,42 @@ class TUIApp(
             return
         self._render_resident_history()
         self._transcript.restore_durable_scroll_anchor((target, 0, 0))
+        self._invalidate_prompt()
+
+    def _resident_page_keys(self) -> tuple[str, ...]:
+        return tuple(descriptor.key for descriptor in self._history_pager.descriptors)
+
+    def _finder_open(self) -> None:
+        transcript = self._transcript
+        self._finder_return = (
+            None
+            if self._agent_navigation.child_view_active
+            else (
+                transcript.follow_tail,
+                transcript.durable_scroll_anchor,
+                self._resident_page_keys(),
+            )
+        )
+        FinderRuntimeMixin._finder_open(self)
+
+    def _finder_cancel(self) -> None:
+        saved, self._finder_return = self._finder_return, None
+        FinderRuntimeMixin._finder_cancel(self)
+        if saved is not None and saved[2] != self._resident_page_keys():
+            # A durable preview replaced the pages: the line index no longer
+            # points at the old rows, so load them back.
+            if self._history_search_task is not None:
+                self._history_search_task.cancel()
+            asyncio.create_task(self._return_to_view(saved[0], saved[1]))
+
+    async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
+        if follow_tail or anchor is None:
+            await self._load_transcript_page(reset=True)
+            self._transcript.scroll_to_bottom()
+        else:
+            await self._history_pager.reveal(anchor[0])
+            self._render_resident_history()
+            self._transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
 
     def _finder_input(self, query: str) -> None:

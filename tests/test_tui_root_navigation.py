@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from io import StringIO
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -48,6 +51,8 @@ PAGE_DOWN = "\x1b[6~"
 CTRL_F = "\x06"
 ENTER = "\r"
 ESCAPE = "\x1b"
+BACKSPACE = "\x7f"
+ROW_ORDER = re.compile(r"(prompt|answer|line one)[- ](\d+)(?:-(\d+))?")
 
 
 def _prompt(turn: int) -> str:
@@ -67,7 +72,12 @@ class RootHome:
 
 @pytest.fixture(scope="module")
 def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
-    """Write a 3,200-row root session (25 pages of 128 rows) once per module."""
+    """Write a ~3,600-row root session with the shape of a real long session.
+
+    Each turn has an agent notification that the TUI already presented (a row
+    the history pages skip), and every tenth turn starts with a compaction
+    larger than the 1 MiB page budget, so it fills a page on its own.
+    """
 
     home = tmp_path_factory.mktemp("root-nav")
     store = ConversationStore(home / "sessions")
@@ -82,13 +92,11 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
     seq = store.branch_refs()[-1].seq
     root, session_id, log_path = store.root_dir, store.session_id, store.path
     store.close()
-
-    def message(value: Message) -> dict:
-        return {"message": value.to_dict()}
+    huge_summary = "x" * (1024 * 1024 + 1)
 
     with log_path.open("a", encoding="utf-8") as handle:
 
-        def write(value: Message) -> None:
+        def write(entry_type: str, data: dict) -> str:
             nonlocal parent_id, seq
             seq += 1
             entry_id = f"{seq:032x}"
@@ -97,31 +105,60 @@ def root_home(tmp_path_factory: pytest.TempPathFactory) -> RootHome:
                 "id": entry_id,
                 "parent_id": parent_id,
                 "lane": "main",
-                "type": "message",
-                "data": message(value),
+                "type": entry_type,
+                "data": data,
             }
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             parent_id = entry_id
+            return entry_id
+
+        def message(value: Message) -> None:
+            write("message", {"message": value.to_dict()})
 
         for turn in range(TURNS):
             word = OLD_WORDS.get(turn, "")
-            write(
+            message(
                 Message(
                     MessageRole.USER,
                     [TextContent(f"{_prompt(turn)} please check the build {word}".strip())],
                     metadata={MESSAGE_ORIGIN_METADATA: MessageOrigin.USER.value},
                 )
             )
+            if turn % 10 == 5:
+                write(
+                    "compaction",
+                    {
+                        "replaces": [],
+                        "source_seq_start": 1,
+                        "source_seq_end": seq,
+                        "summary": huge_summary,
+                    },
+                )
             for tool in range(TOOLS_PER_TURN):
                 call = ToolCall(f"call-{turn}-{tool}", "read", {"path": f"f{tool}.txt"})
-                write(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
-                write(
+                message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+                message(
                     Message(
                         MessageRole.TOOL_RESULT,
                         tool_result=ToolResult(call.id, f"line one {turn}-{tool}\nline two"),
                     )
                 )
-            write(
+                if tool == TOOLS_PER_TURN // 2:
+                    notification = write(
+                        "notification",
+                        {
+                            "child_instance_id": f"{session_id}:{turn + 1}",
+                            "child_session_path": str(home),
+                            "description": "review",
+                            "kind": "agent_completion",
+                            "origin": "notification",
+                            "status": "completed",
+                            "text": "done: reviewed",
+                        },
+                    )
+                    write("notification_tui_presented", {"notification_id": notification})
+                    write("notification_ack", {"notification_id": notification})
+            message(
                 Message(
                     MessageRole.ASSISTANT,
                     [TextContent(f"{_answer(turn)} done.\nsecond line\nthird line")],
@@ -163,6 +200,32 @@ class Driver:
     def top(self) -> str:
         return next((row for row in self.rows() if row.strip()), "")
 
+    def finder_drawn(self) -> bool:
+        """True while the renderer last drew the finder overlay."""
+
+        screen = self.session.app.renderer._last_screen
+        return screen is not None and any(
+            window.content is self.app._finder_control
+            for window in screen.visible_windows_to_write_positions
+        )
+
+    def order(self) -> list[tuple[int, int]]:
+        """(turn, place) of each numbered row drawn, top to bottom."""
+
+        places = []
+        for row in self.rows():
+            for match in ROW_ORDER.finditer(row):
+                kind, turn, tool = match.groups()
+                place = {"prompt": 0, "answer": 99}.get(kind, int(tool or 0) + 1)
+                places.append((int(turn), place))
+        return places
+
+    def assert_in_order(self, what: str) -> None:
+        places = self.order()
+        assert places == sorted(set(places)), (
+            f"{what}: rows out of order or repeated {places}; screen:\n{self.screen()}"
+        )
+
     def screen(self) -> str:
         return "\n".join(self.rows())
 
@@ -183,10 +246,21 @@ class Driver:
                 f"{what}; top row {self.top()!r}; screen:\n{self.screen()}"
             ) from exc
 
+    async def settle(self, what: str) -> None:
+        """Wait until idle holds across one more loop turn, after queued callbacks."""
+
+        for _turn in range(2):
+            await self.until(self.idle, what=what)
+            # test-contract: latency let callbacks queued by a finished load run
+            await asyncio.sleep(0.01)
+        await self.until(self.idle, what=what)
+
     def idle(self) -> bool:
         return (
             not self.session.app.invalidated
             and not self.app._history_pager._loads
+            and self.app._finder_prepare_task is None
+            and self.app._finder_rank_task is None
             and (
                 self.app._history_search_task is None
                 or self.app._history_search_task.done()
@@ -233,6 +307,8 @@ async def _ctrl_up_to(driver: Driver, oldest: int) -> None:
             lambda turn=turn: _prompt(turn) in driver.top(),
             what=f"ctrl+up did not put {_prompt(turn)} on the top row",
         )
+        await driver.until(driver.idle, what="settled screen after ctrl+up")
+        driver.assert_in_order(f"after ctrl+up to {_prompt(turn)}")
 
 
 async def _page_up_to(driver: Driver, turn: int) -> None:
@@ -272,6 +348,7 @@ async def test_page_up_across_pages_shows_every_prompt(root_home: RootHome) -> N
     async with running_tui(root_home) as driver:
         for turn in range(TURNS - 1, TURNS - 31, -1):
             await _page_up_to(driver, turn)
+            driver.assert_in_order(f"PageUp to {_prompt(turn)}")
 
 
 @pytest.mark.asyncio
@@ -279,7 +356,7 @@ async def test_ctrl_up_lands_on_each_older_prompt_across_pages(
     root_home: RootHome,
 ) -> None:
     async with running_tui(root_home) as driver:
-        # 70 prompts back crosses several 128-row page reveals.
+        # 70 prompts back crosses several page reveals and compaction pages.
         await _ctrl_up_to(driver, TURNS - 70)
 
 
@@ -306,22 +383,55 @@ async def test_ctrl_down_returns_to_the_tail(root_home: RootHome) -> None:
         )
 
 
-
 @pytest.mark.asyncio
 async def test_page_down_loads_newer_pages_back_to_the_tail(root_home: RootHome) -> None:
     async with running_tui(root_home) as driver:
         await _ctrl_up_past(driver, TURNS - 30)
         for press in range(400):
+            await driver.until(driver.idle, what="settled screen before PageDown")
+            driver.assert_in_order(f"before PageDown {press + 1}")
             if _answer(TURNS - 1) in driver.screen():
                 break
-            await driver.until(driver.idle, what="settled screen before PageDown")
             before = driver.rows()
+            top_before = driver.order()[:1]
             await driver.send(PAGE_DOWN)
             await driver.until(
                 lambda before=before: driver.rows() != before,
                 what=f"PageDown {press + 1} did not move the view",
             )
+            await driver.until(driver.idle, what="settled screen after PageDown")
+            assert driver.order()[:1] >= top_before, (
+                f"PageDown {press + 1} jumped back from {top_before} to "
+                f"{driver.order()[:1]}; screen:\n{driver.screen()}"
+            )
         assert _answer(TURNS - 1) in driver.screen(), "PageDown never reached the tail"
+
+
+@pytest.mark.asyncio
+async def test_finder_escape_after_old_preview_restores_the_tail(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.until(driver.idle, what="settled tail before the finder")
+        tail = driver.rows()
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send(OLD_WORDS[3])
+        await driver.until(
+            lambda: _prompt(3) in driver.screen() and driver.idle(),
+            what="the finder did not preview the old match",
+        )
+        # vi insert mode: the first Esc leaves insert mode, the second closes.
+        await driver.send(ESCAPE)
+        await driver.until(driver.idle, what="settled screen after the first Esc")
+        await driver.send(ESCAPE)
+        await driver.until(
+            lambda: not driver.finder_drawn() and driver.idle(),
+            what="Esc did not close the finder",
+        )
+        assert driver.rows() == tail, (
+            f"Esc did not restore the tail; screen:\n{driver.screen()}"
+        )
 
 
 @pytest.mark.asyncio
@@ -331,7 +441,7 @@ async def test_finder_match_in_unloaded_history_opens_on_enter(
     async with running_tui(root_home) as driver:
         app = driver.app
         await driver.send(CTRL_F)
-        await driver.until(lambda: app._active_finder.finder_active, what="open finder")
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         await driver.send(OLD_WORDS[3])
         await driver.until(
             lambda: app._history_search_task is not None and app._history_search_task.done(),
@@ -340,7 +450,7 @@ async def test_finder_match_in_unloaded_history_opens_on_enter(
         await driver.until(driver.idle, what="settled screen before Enter")
         await driver.send(ENTER)
         await driver.until(
-            lambda: not app._active_finder.finder_active and _prompt(3) in driver.screen(),
+            lambda: not driver.finder_drawn() and _prompt(3) in driver.screen(),
             what="Enter on the old match did not close the finder and show it",
         )
 
@@ -348,12 +458,95 @@ async def test_finder_match_in_unloaded_history_opens_on_enter(
 @pytest.mark.asyncio
 async def test_finder_enter_typed_while_rows_load_is_kept(root_home: RootHome) -> None:
     async with running_tui(root_home) as driver:
-        app = driver.app
         await driver.send(CTRL_F)
-        await driver.until(lambda: app._active_finder.finder_active, what="open finder")
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         # The query and Enter arrive in one write, before any row is ready.
         await driver.send(OLD_WORDS[40] + ENTER)
         await driver.until(
-            lambda: not app._active_finder.finder_active and _prompt(40) in driver.screen(),
+            lambda: not driver.finder_drawn() and _prompt(40) in driver.screen(),
             what="Enter typed during the load was dropped",
         )
+
+
+@pytest.mark.asyncio
+async def test_finder_typing_after_a_queued_enter_does_not_accept(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        # Enter queued for one query, then the query changes before rows are ready.
+        await driver.send(OLD_WORDS[40] + ENTER + BACKSPACE * 6 + OLD_WORDS[3])
+        await driver.until(
+            lambda: _prompt(3) in driver.screen() and driver.idle(),
+            what="the finder did not settle on the changed query",
+        )
+        await driver.settle("settled screen after the changed query")
+        assert driver.finder_drawn(), (
+            f"the Enter for the old query accepted the new one; screen:\n{driver.screen()}"
+        )
+
+
+def _assert_pages_adjacent(driver: Driver, what: str) -> None:
+    """Resident pages touch, come in seq order, and no page or row shows twice."""
+
+    durable = [
+        descriptor
+        for descriptor in driver.app._history_pager.descriptors
+        if not descriptor.key.startswith("live:")
+    ]
+    keys = [descriptor.key for descriptor in durable]
+    assert len(keys) == len(set(keys)), f"{what}: a page is resident twice {keys}"
+    for older, newer in pairwise(durable):
+        assert older.page.newer == newer.page.older, (
+            f"{what}: pages not adjacent: {older.page.newer} then {newer.page.older}"
+        )
+    seqs = [
+        unit.value.seq
+        for descriptor in durable
+        for unit in descriptor.page.units
+        if ":dependency:" not in unit.entry_id
+    ]
+    assert seqs == sorted(set(seqs)), f"{what}: resident rows out of seq order"
+    driver.assert_in_order(what)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", [11, 23, 37])
+async def test_random_navigation_keeps_pages_adjacent_and_in_order(
+    root_home: RootHome, seed: int
+) -> None:
+    rng = random.Random(seed)
+    keys = {"ctrl+up": CTRL_UP, "ctrl+down": CTRL_DOWN, "pageup": PAGE_UP, "pagedown": PAGE_DOWN}
+    done: list[str] = []
+    async with running_tui(root_home) as driver:
+        for _step in range(40):
+            action = rng.choice([*keys, "find+enter", "find+esc"])
+            if action.startswith("find"):
+                turn = rng.randrange(TURNS)
+                done.append(f"{action} {_prompt(turn)}")
+                await driver.send(CTRL_F)
+                await driver.until(
+                    driver.finder_drawn, what=f"seed {seed}: no finder after {done}"
+                )
+                await driver.send(_prompt(turn))
+                await driver.settle(f"seed {seed}: finder settles after {done}")
+                if action == "find+enter":
+                    await driver.send(ENTER)
+                else:
+                    await driver.send(ESCAPE)
+                    await driver.settle(f"seed {seed}: first Esc after {done}")
+                    await driver.send(ESCAPE)
+                await driver.until(
+                    lambda: not driver.finder_drawn(),
+                    what=f"seed {seed}: the finder stayed open after {done}",
+                )
+                if action == "find+enter":
+                    # Accept leaves match highlighting on, which takes ctrl+f; Esc ends it.
+                    await driver.settle(f"seed {seed}: accept settles after {done}")
+                    await driver.send(ESCAPE)
+            else:
+                done.append(action)
+                await driver.send(keys[action])
+            await driver.settle(f"seed {seed}: screen settles after {done}")
+            _assert_pages_adjacent(driver, f"seed {seed} after {done}")

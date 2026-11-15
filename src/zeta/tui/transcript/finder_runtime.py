@@ -133,6 +133,8 @@ class FinderRuntimeMixin:
                 self._finder_prepare_task = None
 
     def _finder_input(self, query: str) -> None:
+        # A queued Enter belongs to the query it was typed for, not a later one.
+        self._finder_accept_pending = False
         finder = self._finder_target()
         finder.finder_set_query(query)
         state = finder.finder_state()
