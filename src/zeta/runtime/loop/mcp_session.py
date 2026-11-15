@@ -139,7 +139,11 @@ class MCPSession:
                 self._mcp_mount.set_primary_registry_only(name, True)
             await self._replace_mcp_binding_configs(bindings, self._mcp_binding_configs)
 
-    async def clear_mcp_bindings(self) -> None:
+    async def clear_mcp_bindings(
+        self, *, hold: asyncio.Future[None] | None = None
+    ) -> None:
+        """Suspend the bound servers; until ``hold`` is done, their calls wait
+        for ``set_mcp_bindings`` instead of failing as detached."""
         if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
             self._mcp_mount_task.cancel()
             await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
@@ -151,6 +155,7 @@ class MCPSession:
                 self._mcp_mount.suspend_server(
                     self._mcp_binding_configs[name],
                     source=self._mcp_mount.sources[name],
+                    hold=hold,
                 )
                 for name in names
             ))

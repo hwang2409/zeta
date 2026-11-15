@@ -408,15 +408,19 @@ class MCPMount:
         server_config: MCPServerConfig,
         *,
         source: Path,
+        hold: asyncio.Future[None] | None = None,
     ) -> None:
-        """Suspend one connection while keeping its actor available for replacement."""
+        """Suspend one connection while keeping its actor available for replacement.
+
+        Calls wait for the next binding until ``hold`` is done (see the actor).
+        """
         async with self._config_lock:
             actor = self._actors.get(server_config.name)
             if actor is None or self._closed:
                 raise ValueError(f"unknown MCP server: {server_config.name}")
             self.configs[server_config.name] = server_config
             self.sources[server_config.name] = source
-        await actor.suspend(server_config, source)
+        await actor.suspend(server_config, source, hold=hold)
 
     async def replace_server(
         self,
