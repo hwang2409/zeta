@@ -213,10 +213,10 @@ async def test_idle_home_owner_episode_and_read_request_touch_no_file(tmp_path: 
                 raise result
             return result
 
-        with pytest.raises(RuntimeError, match="blocked"):
-            await asyncio.to_thread(
-                acquire_after_retention_yield, home, acquire, lambda _: RuntimeError("blocked")
-            )
+        # no active planner: one more try, with no handshake file
+        assert await asyncio.to_thread(
+            acquire_after_retention_yield, home, acquire, lambda _: RuntimeError("blocked")
+        ) == "opened"
         after = {
             str(path.relative_to(home)): path.stat(follow_symlinks=False).st_mtime_ns
             for path in home.rglob("*")
