@@ -202,7 +202,7 @@ async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) 
         fcntl.flock(request, fcntl.LOCK_EX)
         planner = RetentionPlanner(home, lease)
         try:
-            result = planner.run_pass(days=30)
+            result = await asyncio.to_thread(planner.run_pass, days=30)
         finally:
             planner.close()
         assert getattr(result, "reason", None) == "user"
