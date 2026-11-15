@@ -207,6 +207,43 @@ def test_planner_crash_releases_the_target(tmp_path: Path) -> None:
 
 
 
+def test_planner_that_ends_its_pass_after_the_refusal_does_not_refuse_the_user(
+    tmp_path: Path,
+) -> None:
+    # The planner releases its target and then planner-active between the
+    # user's refused try and the active-planner check (a listing once dropped
+    # an idle session from `list_sessions` this way).
+    _prepare(tmp_path)
+    process, command = _start_holder(tmp_path)
+    target = _target(tmp_path)
+    tries = 0
+
+    def acquire() -> object:
+        nonlocal tries
+        tries += 1
+        try:
+            return _blocked(target)()
+        except BlockingIOError:
+            if tries == 1:
+                command.send(True)
+                process.join(10)
+            raise
+
+    try:
+        try:
+            result = acquire_after_retention_yield(
+                tmp_path, acquire, lambda exc: RuntimeError("refused"),
+                clock=lambda: 0.0, wait=lambda _: None,
+            )
+        except RuntimeError as exc:
+            result = exc
+        assert result == target, "a finished planner must not refuse the user"
+    finally:
+        os.close(target)
+        process.join(10)
+        assert process.exitcode == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.retention_on_loop_allowed
 async def test_on_loop_contention_rejects_before_wait(tmp_path: Path) -> None:

@@ -90,7 +90,11 @@ def acquire_after_retention_yield(
 
     active_fd = _active(home)
     if active_fd is None:
-        raise blocked(first) from first
+        # the planner may have ended its pass after the refusal; try once more
+        try:
+            return acquire()
+        except BlockingIOError as second:
+            raise blocked(second) from second
     request_fd = _existing_lock(home, "user-open-request")
     if request_fd is None:
         os.close(active_fd)
