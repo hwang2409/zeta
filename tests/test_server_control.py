@@ -981,3 +981,68 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     assert server.runtime._memory_notice_sink is not None
     assert server.runtime._background_wake_sink is not None
     assert reference() is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_serve_runs_slash_command_before_queued_wake_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_server import _ready_extensions
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    wake_entered = asyncio.Event()
+    release_wake = asyncio.Event()
+    original_notification_turn = server.turn_contexts.run_notification_turn
+
+    async def gated_notification_turn(*args: object, **kwargs: object):
+        wake_entered.set()
+        await await_or_fail(release_wake.wait(), what="queued wake release")
+        return await original_notification_turn(*args, **kwargs)
+
+    # test-contract: seam serve has no public notification-turn start gate
+    monkeypatch.setattr(
+        server.turn_contexts, "run_notification_turn", gated_notification_turn
+    )
+    writer = None
+    try:
+        reader, writer, session_id = await _ready_extensions(server)
+        server.runtime.opened.store.append_agent_notification(
+            "child",
+            child_session_path="/tmp/child",
+            description="child",
+            status="completed",
+            text="child done",
+        )
+        sink = server.runtime._background_wake_sink
+        assert sink is not None
+        sink(session_id)
+        await await_or_fail(wake_entered.wait(), what="queued wake")
+
+        # no turn has started on this fresh serve; the queued wake must not
+        # refuse the client's command with "a turn is already running".
+        reply = (
+            await _request(
+                reader,
+                writer,
+                "mcp",
+                "slash_run",
+                {"session_id": session_id, "text": "/mcp"},
+            )
+        )[-1]
+        assert "result" in reply, reply
+
+        release_wake.set()
+        await read_until(
+            reader,
+            lambda frame: frame.get("params", {}).get("event") == "turn_end"
+            and frame["params"].get("session_id") == session_id,
+            what="queued wake turn_end",
+        )
+    finally:
+        release_wake.set()
+        if writer is None:
+            await close_serve(server)
+        else:
+            await close_serve(server, writer)
