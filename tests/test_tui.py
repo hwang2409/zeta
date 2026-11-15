@@ -16972,8 +16972,12 @@ async def test_root_tui_paging_render_path_table(
                 assert anchor_text == Text.from_ansi(
                     app._transcript._render_unit(expected_unit, 120)
                 ).plain
-            assert app._failed_turn is not None
-            assert app._failed_turn[0] == "retry-target-user"
+            # The reveal also pages in the rows after the failure, so the view
+            # agrees with a full replay: later rows close the retry offer.
+            assert app._failed_turn is None
+            await app._history_pager.reveal(target.entry_id)
+            app._render_resident_history()
+            assert "retry-target-user" in Text.from_ansi(app._transcript.render(120)).plain
         elif journey == "branch-prompt-reset":
             app._prompt_history.bind(
                 app._viewed_session_path(), app._history_source
