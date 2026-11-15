@@ -21,7 +21,7 @@ _MERGE_MAX_BYTES = 64 * 1024
 
 
 @dataclass(slots=True)
-class _Frame:
+class _Part:
     event: EventDescriptor
     fields: dict[str, object]
     size: int
@@ -37,7 +37,7 @@ class InFlightReply:
 
     def __init__(self) -> None:
         self._session_id: str | None = None
-        self._frames: list[_Frame] = []
+        self._frames: list[_Part] = []
         # foreground tool calls of this run, so a join drops their held output
         self._tools: set[object] = set()
 
@@ -105,7 +105,7 @@ class InFlightReply:
             last.fields[text_key] = str(last.fields[text_key]) + text
             last.size += size
         else:
-            self._frames.append(_Frame(event, fields, size))
+            self._frames.append(_Part(event, fields, size))
         while len(self._frames) > IN_FLIGHT_MAX_FRAMES or (
             len(self._frames) > 1 and sum(f.size for f in self._frames) > IN_FLIGHT_MAX_BYTES
         ):
