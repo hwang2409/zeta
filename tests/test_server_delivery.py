@@ -2091,3 +2091,107 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
     finally:
         backend.release.set()
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_holding_its_echo_orders_against_end_of_turn_steering(
+    tmp_path: Path,
+) -> None:
+    # a send that passed its busy check is still echoing when the finished turn
+    # decides about its unread steer; without one guard both start a turn.
+    backend = OneAtATimeBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    control = server.control
+    deliveries = control.deliveries
+    original_event = control._event
+    original_echo = control.user_message
+    original_start = control.start_turn
+    original_continue = deliveries.continue_after_turn
+    at_agent_end = asyncio.Event()
+    publish_agent_end = asyncio.Event()
+    echo_held = asyncio.Event()
+    release_echo = asyncio.Event()
+    decision_entered = asyncio.Event()
+    turns: list[asyncio.Task[None]] = []
+    send: asyncio.Task[list[dict[str, Any]]] | None = None
+
+    async def hold_first_agent_end(event: StreamEvent, *args: Any, **kwargs: Any):
+        if event.type is StreamEventType.AGENT_END and not at_agent_end.is_set():
+            at_agent_end.set()
+            await await_or_fail(publish_agent_end.wait(), what="agent_end release")
+        return await original_event(event, *args, **kwargs)
+
+    async def hold_send_echo(text: str, mode: str, *args: Any, **kwargs: Any) -> None:
+        if mode == "send" and text == "user next":
+            echo_held.set()
+            await await_or_fail(release_echo.wait(), what="send echo release")
+        await original_echo(text, mode, *args, **kwargs)
+
+    def record_start(*args: Any, **kwargs: Any) -> None:
+        original_start(*args, **kwargs)
+        turns.append(control._turn_task)
+
+    async def enter_decision(*args: Any, **kwargs: Any) -> None:
+        decision_entered.set()
+        await original_continue(*args, **kwargs)
+
+    # test-contract: seam serve has no public hold between turn_end and agent_end
+    control._event = hold_first_agent_end
+    # test-contract: seam serve has no public hold inside a send's echo
+    control.user_message = hold_send_echo
+    # test-contract: seam serve has no public turn-start observation
+    control.start_turn = record_start
+    # test-contract: seam serve has no public end-of-turn decision observation
+    deliveries.continue_after_turn = enter_decision
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.streaming.wait(), what="first reply streaming")
+        steer = await _request(
+            reader, writer, 4, "steer", {"text": "steered", "delivery_id": "s2"}
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+        backend.release.set()
+        await await_or_fail(at_agent_end.wait(), what="first turn_end published")
+        send = asyncio.create_task(
+            _request(reader, writer, 5, "send", {"text": "user next"})
+        )
+        await await_or_fail(echo_held.wait(), what="send echo held")
+        publish_agent_end.set()
+        await await_or_fail(decision_entered.wait(), what="end-of-turn decision")
+        release_echo.set()
+        sent = await await_or_fail(send, what="send response")
+        assert sent[-1]["result"]["accepted"] is True, sent[-1]
+        await await_or_fail(
+            asyncio.gather(*turns, return_exceptions=True), what="started turns"
+        )
+
+        assert backend.max_active == 1, backend.requests
+        assert len(backend.requests) == 2, backend.requests
+        assert backend.requests[1].count("user next") == 1, backend.requests
+        assert backend.requests[1].count("steered") == 1, backend.requests
+        assert len(turns) == 2, turns
+        status = await _request(
+            reader, writer, 6, "delivery_status", {"delivery_id": "s2"}
+        )
+        assert status[-1]["result"]["status"] == "delivered"
+    finally:
+        publish_agent_end.set()
+        release_echo.set()
+        backend.release.set()
+        if send is not None:
+            await asyncio.gather(send, return_exceptions=True)
+        await close_serve(server, writer)
