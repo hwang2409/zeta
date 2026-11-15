@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import weakref
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any, Protocol
 
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.key_binding.vi_state import InputMode
+from prompt_toolkit.shortcuts import PromptSession
 
 from ..overlay_text_field import OverlayTextField
 from .finder_overlay import FinderControl
@@ -64,34 +67,50 @@ class FinderRuntimeMixin:
             ),
         )
         self._finder_control = FinderControl(
-            lambda: app_ref()._active_finder.finder_state(), self._finder_field
+            lambda: app_ref()._finder_drawn_state(), self._finder_field
         )
         self._finder_prepare_task: asyncio.Task[None] | None = None
         self._finder_rank_task: asyncio.Task[None] | None = None
+        self._finder_accept_pending = False
+        self._finder_vi_mode: InputMode | None = None
+
+    def _finder_drawn_state(self) -> Any:
+        """The open finder's state, still searching while any result source runs."""
+
+        state = self._finder_target().finder_state()
+        if state is not None and state.complete and self._finder_loading():
+            return replace(state, complete=False)
+        return state
+
+    def _focus_finder_field(self) -> PromptSession[str] | None:
+        session = getattr(self, "_active_session", None)
+        field = getattr(self, "_finder_field", None)
+        if session is None or field is None:
+            return None
+        # Esc in the finder leaves vi insert mode; closing it gives this back.
+        self._finder_vi_mode = session.app.vi_state.input_mode
+        field.focus(session.layout)
+        return session
 
     def _finder_target(self) -> FinderRuntimeTarget:
         finder = getattr(self, "_active_finder", None)
         return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
+        self._finder_accept_pending = False
         self._finder_field.reset(notify=False)
         self._active_finder = self._viewed_transcript()
         finder = self._active_finder
-        session = getattr(self, "_active_session", None)
-        field = getattr(self, "_finder_field", None)
-        if session is not None and field is not None:
-            field.focus(session.layout)
+        self._focus_finder_field()
         request = finder.open_finder()
         self._start_finder_preparation(request)
 
     def _history_finder_open(self, buffer: Buffer) -> None:
+        self._finder_accept_pending = False
         self._active_finder = self._history_finder
         finder = self._history_finder
-        session = getattr(self, "_active_session", None)
-        field = getattr(self, "_finder_field", None)
-        if session is not None and field is not None:
-            field.focus(session.layout)
-            field.set_document(buffer.document, notify=False)
+        if self._focus_finder_field() is not None:
+            self._finder_field.set_document(buffer.document, notify=False)
         request = finder.open_finder(buffer)
         self._start_finder_preparation(request)
 
@@ -123,11 +142,15 @@ class FinderRuntimeMixin:
                 self._invalidate_prompt()
                 if finder.finder_needs_ranking():
                     self._start_finder_ranking()
+                else:
+                    self._finder_accept_when_ready()
         finally:
             if self._finder_prepare_task is task:
                 self._finder_prepare_task = None
 
     def _finder_input(self, query: str) -> None:
+        # A queued Enter belongs to the query it was typed for, not a later one.
+        self._finder_accept_pending = False
         finder = self._finder_target()
         finder.finder_set_query(query)
         state = finder.finder_state()
@@ -155,6 +178,7 @@ class FinderRuntimeMixin:
                 if finder.finder_publish(result):
                     self._invalidate_prompt()
                     if not finder.finder_needs_ranking():
+                        self._finder_accept_when_ready()
                         return
         finally:
             if self._finder_rank_task is task:
@@ -184,7 +208,26 @@ class FinderRuntimeMixin:
         self._finder_target().finder_move(delta)
         self._invalidate_prompt()
 
+    def _finder_loading(self) -> bool:
+        """True while the open finder's rows can still change."""
+
+        state = self._finder_target().finder_state()
+        return state is not None and not state.complete
+
+    def _finder_accept_when_ready(self) -> None:
+        # Run after the calling worker returns: accepting cancels the workers.
+        if self._finder_accept_pending:
+            asyncio.get_running_loop().call_soon(self._finder_accept_if_ready)
+
+    def _finder_accept_if_ready(self) -> None:
+        if self._finder_accept_pending and not self._finder_loading():
+            self._finder_accept()
+
     def _finder_accept(self) -> None:
+        # Enter typed before the rows are ready waits for them instead of dropping.
+        self._finder_accept_pending = self._finder_loading()
+        if self._finder_accept_pending:
+            return
         finder = self._finder_target()
         if finder.finder_accept():
             self._cancel_finder_workers()
@@ -194,6 +237,7 @@ class FinderRuntimeMixin:
         self._invalidate_prompt()
 
     def _finder_cancel(self) -> None:
+        self._finder_accept_pending = False
         self._finder_target().finder_cancel()
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
@@ -205,6 +249,8 @@ class FinderRuntimeMixin:
         session = getattr(self, "_active_session", None)
         if session is not None:
             session.layout.focus(session.default_buffer)
+            if self._finder_vi_mode is not None:
+                session.app.vi_state.input_mode = self._finder_vi_mode
 
     async def _prepare_ui_session_change(self) -> None:
         """Close work scoped to a UI session before replacing or removing it."""

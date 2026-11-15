@@ -77,6 +77,15 @@ class TranscriptFinderMixin:
         self._finder_generation += 1
         return FinderCandidateRequest(generation=self._finder_generation)
 
+    def restart_finder(self) -> FinderCandidateRequest | None:
+        """Rebuild an open finder's rows after paging replaced the units."""
+
+        if self._finder is None:
+            return None
+        self._finder = MessageFinder((), complete=False)
+        self._finder_generation += 1
+        return FinderCandidateRequest(generation=self._finder_generation)
+
     async def build_finder_candidate_batches(
         self, request: FinderCandidateRequest
     ) -> AsyncIterator[tuple[tuple[Candidate, ...], bool]]:
