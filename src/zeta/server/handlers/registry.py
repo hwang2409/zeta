@@ -249,21 +249,20 @@ async def slash_run(client, request_id, params):
     validation.active(runtime, params)
     text = validation.required_string(params, "text")
     registry = await slash_commands.registry_for_request(runtime)
-    # a command that starts no turn does not steal a wake that has not started.
-    if client.server.control.turn_busy(
-        queued_wake_counts=False
-    ) and not slash_commands.can_run_while_busy(registry, text):
-        await client.server.control.require_idle()
-    register = client.server.control.model_input_registrar(client.features)
-    return await slash_commands.run_command(
-        runtime,
-        text,
-        register_model_input=register,
-        approval_control=client.server.control,
-        slash_lock=client.server.control.slash_lock,
-        busy=client.server.control.turn_busy(),
-        registry=registry,
-    )
+    control = client.server.control
+    if control.slash_busy() and not slash_commands.can_run_while_busy(registry, text):
+        raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
+    register = control.model_input_registrar(client.features)
+    with control.hold_wake_start():
+        return await slash_commands.run_command(
+            runtime,
+            text,
+            register_model_input=register,
+            approval_control=control,
+            slash_lock=control.slash_lock,
+            busy=control.turn_busy(),
+            registry=registry,
+        )
 
 
 async def account_list(client, request_id, params):

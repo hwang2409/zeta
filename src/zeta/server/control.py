@@ -132,6 +132,12 @@ class ServeControl:
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
         self._notification_turn_started = False
+        # a wake past this gate may be in setup before its turn_start; slash
+        # commands then count it as busy, and a running command holds the gate.
+        self._wake_admitted = False
+        self._slash_commands = 0
+        self._no_slash_command = asyncio.Event()
+        self._no_slash_command.set()
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -236,12 +242,7 @@ class ServeControl:
         if task is not None and not task.done():
             self._turn_cancel_outcome = TurnOutcome.SESSION_CANCELED
 
-    def turn_busy(self, *, queued_wake_counts: bool = True) -> bool:
-        """Report a running turn.
-
-        Before the first turn_end, a queued wake that has not started counts so
-        a send cannot steal it; a caller that starts no turn passes False.
-        """
+    def turn_busy(self) -> bool:
         loop = self.server.runtime.loop
         return (
             self._session_swap_active
@@ -253,7 +254,7 @@ class ServeControl:
                     or loop is None
                     or loop.notification_turn_state == "idle"
                     or self._notification_turn_started
-                    or (queued_wake_counts and not self._turn_end_published)
+                    or not self._turn_end_published
                 )
             )
             or (
@@ -262,6 +263,28 @@ class ServeControl:
                 and not self._turn_end_published
             )
         )
+
+    def slash_busy(self) -> bool:
+        """Report a turn a state-changing slash command must wait for."""
+        task = self._turn_task
+        return self.turn_busy() or (
+            self._wake_admitted
+            and task is not None
+            and task is self._notification_task
+            and not task.done()
+        )
+
+    @contextmanager
+    def hold_wake_start(self) -> Iterator[None]:
+        """Keep a scheduled wake from starting until this slash command ends."""
+        self._slash_commands += 1
+        self._no_slash_command.clear()
+        try:
+            yield
+        finally:
+            self._slash_commands -= 1
+            if not self._slash_commands:
+                self._no_slash_command.set()
 
     async def require_idle(self) -> None:
         if self.turn_busy():
@@ -869,6 +892,8 @@ class ServeControl:
                     state.turn_started()
 
         try:
+            await self._no_slash_command.wait()
+            self._wake_admitted = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
@@ -901,6 +926,7 @@ class ServeControl:
             ):
                 self._schedule_background_wake(session_id)
             self._notification_turn_started = False
+            self._wake_admitted = False
             if started:
                 self._close_deferred_replay(session_id)
                 await self.deliveries.finalize_turn(
