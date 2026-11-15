@@ -136,6 +136,9 @@ class ServeControl:
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
+        # the grace deadline; under a turn grace it also bounds held bound MCP
+        # calls, so it outlives a hello reclaim until the bindings return.
+        self._grace_deadline_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
         # a controller holds the slot; the end-of-turn step starts no turn without one.
@@ -393,6 +396,7 @@ class ServeControl:
         if reconnect:
             await self._approvals.transition(Reclaim())
         else:
+            self._end_grace_deadline()
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
         return True
@@ -406,6 +410,7 @@ class ServeControl:
         loop = self.server.runtime.loop
         assert loop is not None
         await loop.set_mcp_bindings(headers, configs)
+        self._end_grace_deadline()
         await loop._ensure_mcp_servers()
         self._active_mcp_bindings = headers
 
@@ -424,12 +429,27 @@ class ServeControl:
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         self._active_mcp_bindings = {}
+        grace_running = reconnect and self._grace_task is not None
+        begin_grace = not grace_running and reconnect and (
+            self._approvals.has_pending_approvals()
+            or (keep_turn and bool(self._grace_protected(self._notification_task)))
+        )
+        if begin_grace:
+            self._end_grace_deadline()
+            self._grace_deadline_task = asyncio.create_task(self._grace_deadline())
+        # under a turn grace a bound MCP call waits for the client's return.
+        hold = (
+            self._grace_deadline_task
+            if keep_turn and (begin_grace or grace_running)
+            else None
+        )
+
         async def clear_mcp() -> None:
             loop = self.server.runtime.loop
             if loop is not None:
-                await loop.clear_mcp_bindings()
+                await loop.clear_mcp_bindings(hold=hold)
         clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
-        if reconnect and self._grace_task is not None:
+        if grace_running:
 
             async def wait_for_grace() -> None:
                 if clear_task is not None:
@@ -438,10 +458,7 @@ class ServeControl:
                 await asyncio.shield(self._grace_task)
 
             return wait_for_grace()
-        if reconnect and (
-            self._approvals.has_pending_approvals()
-            or (keep_turn and bool(self._grace_protected(self._notification_task)))
-        ):
+        if begin_grace:
             self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
 
@@ -481,8 +498,16 @@ class ServeControl:
     async def _grace_deadline(self) -> None:
         await asyncio.sleep(self.server.approval_reconnect_grace)
 
+    def _end_grace_deadline(self) -> None:
+        """End the deadline; held bound MCP calls get the detached result."""
+        task = self._grace_deadline_task
+        self._grace_deadline_task = None
+        if task is not None:
+            task.cancel()
+
     async def _expire_grace(self) -> None:
-        deadline = asyncio.create_task(self._grace_deadline())
+        deadline = self._grace_deadline_task
+        assert deadline is not None
         wake = self._notification_task
         try:
             # the grace ends early once no client turn runs and no approval
@@ -490,6 +515,7 @@ class ServeControl:
             while not deadline.done():
                 protected = self._grace_protected(wake)
                 if not protected and not self._approvals.has_pending_approvals():
+                    self._end_grace_deadline()
                     return
                 await asyncio.wait(
                     {deadline, *protected}, return_when=asyncio.FIRST_COMPLETED
@@ -502,8 +528,9 @@ class ServeControl:
                 await expiry
                 raise
             await self._disconnect_turn()
+            if self._grace_deadline_task is deadline:
+                self._grace_deadline_task = None
         finally:
-            deadline.cancel()
             self._grace_expiring = False
             if self._grace_task is asyncio.current_task():
                 self._grace_task = None
@@ -526,6 +553,7 @@ class ServeControl:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             self._grace_task = None
+        self._end_grace_deadline()
         await self.controller_released()
         await self._finish_turn_handoff()
 
@@ -574,8 +602,13 @@ class ServeControl:
         return None if opened is None else opened.store.active_branch_head_sequence()
 
     def _close_deferred_replay(self, session_id: str | None) -> None:
-        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        """At a turn's end, admit deferred replay copies; rows not found never install.
+
+        The turn's unfinished reply ends too: a cancel publishes no agent_end.
+        """
         connections = self.server.connections
+        if connections is not None:
+            connections.in_flight.end_run()
         if connections is not None and session_id is not None:
             connections.release_deferred_replay(session_id, close=True)
 
@@ -1012,6 +1045,14 @@ class ServeControl:
         if foreground:
             state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
+        connections = getattr(self.server, "connections", None)
+        # updated in the loop step that publishes, so a join's snapshot is exact
+        in_flight = connections.in_flight if foreground and connections is not None else None
+        if in_flight is not None:
+            if kind is StreamEventType.AGENT_START:
+                in_flight.start_run(session_id)
+            elif kind in {StreamEventType.MESSAGE_START, StreamEventType.ASSISTANT_RESET}:
+                in_flight.end_message()
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
@@ -1026,10 +1067,13 @@ class ServeControl:
                 delta = getattr(event.content, "text", None)
                 stream_kind = str(getattr(event.content, "type", "content"))
             if delta:
+                delta = bounded(delta)
+                if in_flight is not None:
+                    in_flight.delta(session_id, delta, stream_kind)
                 await self._notify(
                     wire_event,
                     session_id,
-                    delta=bounded(delta),
+                    delta=delta,
                     kind=stream_kind,
                 )
             return
@@ -1046,6 +1090,8 @@ class ServeControl:
                     session_id,
                     usage=dict(usage),
                 )
+            if in_flight is not None:
+                in_flight.end_message()
             if event.message is not None:
                 await self._notify(
                     wire_event,
@@ -1054,7 +1100,6 @@ class ServeControl:
                     **event_contract.assistant_message(event),
                 )
             return
-        connections = getattr(self.server, "connections", None)
         controller = (
             connections.controller_metadata() if connections is not None else None
         )
@@ -1072,11 +1117,10 @@ class ServeControl:
             await self._notify(wire_event, session_id, data=data)
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_output(event, fidelity=fidelity),
-            )
+            fields = event_contract.tool_output(event, fidelity=fidelity)
+            if in_flight is not None:
+                in_flight.tool_output(session_id, fields)
+            await self._notify(wire_event, session_id, **fields)
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
             if foreground:
@@ -1091,6 +1135,8 @@ class ServeControl:
             if foreground:
                 state.tool_finished()
             fields = event_contract.tool_end(event, fidelity=fidelity)
+            if in_flight is not None:
+                in_flight.end_tool(fields)
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):

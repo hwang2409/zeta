@@ -221,7 +221,39 @@ class ReplayOutput:
         scope = self.replay.scope_for(connection)
         if scope is not None and not self._frontier_holds(connection, scope):
             self.replay.mark_pending_stale(connection)
+        elif (
+            scope is not None
+            and scope.kind == "top"
+            and "in_flight_replay" in self._connections[connection].features
+        ):
+            self._hold_in_flight(connection, scope)
         return self.replay.finish_join(connection, history, frontier_seq, frontier_row_id)
+
+    def _hold_in_flight(self, connection: Any, scope: ReplayScopeId) -> None:
+        """Hold the whole in-flight state in place of the live frames it carries.
+
+        A pending join never holds those live frames (``_publish_replay``). This
+        runs in the same loop step as the join's seq assignment, so each frame
+        published before it is in these frames and each one after gets a later seq.
+        """
+        state = self._connections[connection]
+        stream_id = self.replay.pending_stream_id(connection)
+        for event, fields in self.in_flight.frames(scope.value):
+            shaped = self._fields_for_connection(state, event, fields)
+            # the largest seq bounds the frame size the stream sends
+            frame = connection.codec.notification(
+                event, scope.value, stream_id=stream_id, seq=2**53, **shaped
+            )
+            if frame is None:
+                self.replay.mark_pending_stale(connection)
+                return
+            while (victim := self.replay.reserve(scope, len(frame))) is not None:
+                self.invalidate_replay_scope(victim, "evicted")
+                if not self.replay.is_pending(connection):
+                    return
+            self.replay.hold(
+                connection, event, {**shaped, "_session_id": scope.value}, len(frame)
+            )
 
     def _frontier_holds(
         self,
@@ -392,6 +424,14 @@ class ReplayOutput:
             return False
         if prepared is None or state.output is None:
             return False
+        if (
+            prepared.seq is None
+            and scope.kind == "top"
+            and "in_flight_replay" in state.features
+            and self.in_flight.owns(event, fields)
+        ):
+            # the join's in-flight frames carry it, so holding it only costs room
+            return True
         # a pending join's frames get their seq when the join ends
         position = {"stream_id": prepared.stream_id}
         if prepared.seq is not None:

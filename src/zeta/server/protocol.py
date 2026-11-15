@@ -282,6 +282,7 @@ FEATURES = (
     "mcp_refresh_tools",
     "resume_attach",
     "turn_reconnect",
+    "in_flight_replay",
 )
 
 

@@ -360,6 +360,10 @@ class SessionReplay:
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 
+    def hold(self, connection: Any, event: Any, fields: dict[str, object], size: int) -> None:
+        """Append one charged live frame to a pending join that has no frontier yet."""
+        self._pending[connection].frames.append(HeldFrame(event, fields, None, size))
+
     def pending_tail(self, connection: Any) -> list[HeldFrame]:
         pending = self._pending.get(connection)
         return [] if pending is None else list(pending.frames)

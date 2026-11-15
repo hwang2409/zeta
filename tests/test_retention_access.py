@@ -207,6 +207,92 @@ def test_planner_crash_releases_the_target(tmp_path: Path) -> None:
 
 
 
+def test_planner_that_ends_its_pass_after_the_refusal_does_not_refuse_the_user(
+    tmp_path: Path,
+) -> None:
+    # The planner releases its target and then planner-active between the
+    # user's refused try and the active-planner check (a listing once dropped
+    # an idle session from `list_sessions` this way).
+    _prepare(tmp_path)
+    process, command = _start_holder(tmp_path)
+    target = _target(tmp_path)
+    tries = 0
+
+    def acquire() -> object:
+        nonlocal tries
+        tries += 1
+        try:
+            return _blocked(target)()
+        except BlockingIOError:
+            if tries == 1:
+                command.send(True)
+                process.join(10)
+            raise
+
+    try:
+        try:
+            result = acquire_after_retention_yield(
+                tmp_path, acquire, lambda exc: RuntimeError("refused"),
+                clock=lambda: 0.0, wait=lambda _: None,
+            )
+        except RuntimeError as exc:
+            result = exc
+        assert result == target, "a finished planner must not refuse the user"
+    finally:
+        os.close(target)
+        process.join(10)
+        assert process.exitcode == 0
+
+
+def test_new_planner_pass_after_a_failed_retry_still_yields_to_the_user(
+    tmp_path: Path,
+) -> None:
+    # One pass ends after the user's refusal and the next pass takes the
+    # target before the user's retry: the user must wait for that pass to
+    # yield instead of getting "in use".
+    _prepare(tmp_path)
+    first_pass, end_first = _start_holder(tmp_path)
+    second_pass = end_second = None
+    target = _target(tmp_path)
+    tries = 0
+
+    def acquire() -> object:
+        nonlocal tries, second_pass, end_second
+        tries += 1
+        if tries == 2:
+            second_pass, end_second = _start_holder(tmp_path)
+        try:
+            return _blocked(target)()
+        except BlockingIOError:
+            if tries == 1:
+                end_first.send(True)
+                first_pass.join(10)
+            raise
+
+    def wait(_: float) -> None:
+        # the second pass sees the user request and yields.
+        end_second.send(True)
+        second_pass.join(10)
+
+    try:
+        try:
+            result = acquire_after_retention_yield(
+                tmp_path, acquire, lambda exc: RuntimeError("refused"),
+                clock=lambda: 0.0, wait=wait,
+            )
+        except RuntimeError as exc:
+            result = exc
+        assert result == target, "a new planner pass must yield, not refuse the user"
+    finally:
+        os.close(target)
+        for process, command in ((first_pass, end_first), (second_pass, end_second)):
+            if process is not None:
+                if process.is_alive():
+                    command.send(True)
+                process.join(10)
+                assert process.exitcode == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.retention_on_loop_allowed
 async def test_on_loop_contention_rejects_before_wait(tmp_path: Path) -> None:
