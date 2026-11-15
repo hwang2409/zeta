@@ -19,6 +19,7 @@ import zeta.session_retention.handshake as handshake_module
 from tests.support.retention_owner import _age_tree, _create_closed, _opened_lease
 from tests.support.storage_homes import initialize_storage_home
 from zeta.core.session import SessionManager
+from zeta.core.session_execution.retention_access import acquire_after_retention_yield
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.session_retention import (
     RetentionBounds,
@@ -186,6 +187,46 @@ async def test_owner_lifecycle_table(
         assert (result.mode if hasattr(result, "mode") else result["mode"]) == expected
     finally:
         await asyncio.to_thread(lease.close)
+
+@pytest.mark.asyncio
+async def test_idle_home_owner_episode_and_read_request_touch_no_file(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    owner = None
+    try:
+        owner = make_retention_owner(home, lease, lambda: 0)
+        before = {
+            str(path.relative_to(home)): path.stat(follow_symlinks=False).st_mtime_ns
+            for path in home.rglob("*")
+        }
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert (projections, failure) == ([], None)
+        # a read request's retention checks: the probe and the yield primitive
+        assert not await asyncio.to_thread(handshake_module.planner_request_pending, home)
+        attempts = iter([BlockingIOError(), "opened"])
+
+        def acquire() -> object:
+            result = next(attempts)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        with pytest.raises(RuntimeError, match="blocked"):
+            await asyncio.to_thread(
+                acquire_after_retention_yield, home, acquire, lambda _: RuntimeError("blocked")
+            )
+        after = {
+            str(path.relative_to(home)): path.stat(follow_symlinks=False).st_mtime_ns
+            for path in home.rglob("*")
+        }
+        assert after == before, "an idle home must not gain, lose, or touch any file"
+    finally:
+        if owner is not None:
+            await owner.stop()
+        await asyncio.to_thread(lease.close)
+
 
 @pytest.mark.asyncio
 async def test_pending_request_is_typed_yield_not_empty_preview(tmp_path: Path) -> None:
