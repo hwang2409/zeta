@@ -1330,6 +1330,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
             scan_release.wait(10)
         return flight
 
+    # test-contract: seam holds the retention scan on this session to force the CI order
     monkeypatch.setattr(RetentionPlanner, "_hold", held_scan)
     try:
         await _make_unhealthy(server, call, monkeypatch)
@@ -1359,6 +1360,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         finally:
             await asyncio.to_thread(reopened.store.close)
         # serve scans only while a session is open; keep this scan enabled.
+        # test-contract: seam enables the scan after the session closed
         monkeypatch.setattr(retention, "_days", lambda: 30)
         scan_armed.set()
         retention.wake()
