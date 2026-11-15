@@ -236,7 +236,12 @@ class ServeControl:
         if task is not None and not task.done():
             self._turn_cancel_outcome = TurnOutcome.SESSION_CANCELED
 
-    def turn_busy(self) -> bool:
+    def turn_busy(self, *, queued_wake_counts: bool = True) -> bool:
+        """Report a running turn.
+
+        Before the first turn_end, a queued wake that has not started counts so
+        a send cannot steal it; a caller that starts no turn passes False.
+        """
         loop = self.server.runtime.loop
         return (
             self._session_swap_active
@@ -248,7 +253,7 @@ class ServeControl:
                     or loop is None
                     or loop.notification_turn_state == "idle"
                     or self._notification_turn_started
-                    or not self._turn_end_published
+                    or (queued_wake_counts and not self._turn_end_published)
                 )
             )
             or (

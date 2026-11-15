@@ -249,9 +249,10 @@ async def slash_run(client, request_id, params):
     validation.active(runtime, params)
     text = validation.required_string(params, "text")
     registry = await slash_commands.registry_for_request(runtime)
-    if client.server.control.turn_busy() and not slash_commands.can_run_while_busy(
-        registry, text
-    ):
+    # a command that starts no turn does not steal a wake that has not started.
+    if client.server.control.turn_busy(
+        queued_wake_counts=False
+    ) and not slash_commands.can_run_while_busy(registry, text):
         await client.server.control.require_idle()
     register = client.server.control.model_input_registrar(client.features)
     return await slash_commands.run_command(
