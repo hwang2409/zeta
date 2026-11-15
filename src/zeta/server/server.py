@@ -756,6 +756,8 @@ class _Client:
             accepted.remove("projects-memory-v2")
         if "turn_reconnect" in accepted and "approval_reconnect" not in accepted:
             accepted.remove("turn_reconnect")
+        if "in_flight_replay" in accepted and "session_replay_seq" not in accepted:
+            accepted.remove("in_flight_replay")
         if (
             "child_run_events" in accepted
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)

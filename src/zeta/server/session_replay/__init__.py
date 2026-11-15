@@ -360,6 +360,23 @@ class SessionReplay:
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 
+    def drop_held(self, connection: Any, owned: Any) -> None:
+        """Drop a pending join's held frames that ``owned`` accepts; free their charges."""
+        pending = self._pending.get(connection)
+        if pending is None:
+            return
+        kept = []
+        for held in pending.frames:
+            if owned(held.event, held.fields):
+                self.release(pending.scope, held.size)
+            else:
+                kept.append(held)
+        pending.frames = kept
+
+    def hold(self, connection: Any, event: Any, fields: dict[str, object], size: int) -> None:
+        """Append one charged live frame to a pending join that has no frontier yet."""
+        self._pending[connection].frames.append(HeldFrame(event, fields, None, size))
+
     def pending_tail(self, connection: Any) -> list[HeldFrame]:
         pending = self._pending.get(connection)
         return [] if pending is None else list(pending.frames)
