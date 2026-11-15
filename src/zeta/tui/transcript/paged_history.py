@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any, Literal, Protocol
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +107,6 @@ class PagedTranscriptHistory:
     def __init__(self, source: TUIHistorySource) -> None:
         self.source: TUIHistorySource | None = source
         self.generation = 0
-        self._resets = 0
         self.endpoint_id: str | None = None
         self._segments: deque[PageDescriptor] = deque()
         self._older: HistoryCursor | None = None
@@ -180,7 +182,6 @@ class PagedTranscriptHistory:
 
     def reset(self, *, endpoint_id: str | None = None) -> None:
         self.generation += 1
-        self._resets += 1
         for task in self._loads.values():
             task.cancel()
         self._loads.clear()
@@ -304,7 +305,12 @@ class PagedTranscriptHistory:
                 self._loads.pop(key, None)
             if generation != self.generation:
                 return TUIHistoryPage(())
-            self.adopt(page, direction=direction)
+            if cursor != (self._older if direction == "older" else self._newer):
+                # The edge moved while this page loaded, so it no longer
+                # touches the resident pages: drop it and load the new edge.
+                return await self.load(direction)
+            if not self.adopt(page, direction=direction):
+                return TUIHistoryPage(())
             return page
         return await task
 
@@ -313,9 +319,11 @@ class PagedTranscriptHistory:
         page: TUIHistoryPage,
         *,
         direction: Literal["older", "newer"] = "older",
-    ) -> None:
+    ) -> bool:
+        """Attach ``page`` at one edge; False when it was empty or not adjacent."""
+
         if not page.segments:
-            return
+            return False
         if page.endpoint_id is not None:
             self.endpoint_id = page.endpoint_id
             self._frozen_endpoint = page.endpoint_id
@@ -350,67 +358,94 @@ class PagedTranscriptHistory:
                     ),
                 )
             )
-        self._segments = reconciled
         descriptors = [self._descriptor(page, index) for index in range(len(page.segments))]
         if direction == "older":
             for descriptor in reversed(descriptors):
-                self._segments.appendleft(descriptor)
-            while len(self._segments) > self.max_pages:
-                self._segments.pop()
+                reconciled.appendleft(descriptor)
+            while len(reconciled) > self.max_pages:
+                reconciled.pop()
         else:
             live_index = next(
                 (
                     index
-                    for index, descriptor in enumerate(self._segments)
+                    for index, descriptor in enumerate(reconciled)
                     if descriptor.key.startswith("live:")
                 ),
-                len(self._segments),
+                len(reconciled),
             )
             for descriptor in descriptors:
-                self._segments.insert(live_index, descriptor)
+                reconciled.insert(live_index, descriptor)
                 live_index += 1
-            while len(self._segments) > self.max_pages:
-                self._segments.popleft()
-        self._check_contiguous()
-        self._refresh_edges()
-
-    def _check_contiguous(self) -> None:
-        """Resident durable pages must be adjacent and in order; a gap is a bug."""
-
-        durable = [d for d in self._segments if not d.key.startswith("live:")]
+            while len(reconciled) > self.max_pages:
+                reconciled.popleft()
+        # Resident durable pages must stay adjacent and in order. A page that
+        # breaks that is a bug; drop it so the resident pages stay usable.
+        durable = [d for d in reconciled if not d.key.startswith("live:")]
         for older, newer in pairwise(durable):
             if older.page.newer != newer.page.older:
-                raise RuntimeError(
-                    f"history pages not adjacent: {older.key} ends at "
-                    f"{older.page.newer} but {newer.key} starts at {newer.page.older}"
+                logger.error(
+                    "history pages not adjacent: %s ends at %s but %s starts at %s",
+                    older.key,
+                    older.page.newer,
+                    newer.key,
+                    newer.page.older,
                 )
+                return False
+        self._segments = reconciled
+        self._refresh_edges()
+        return True
 
     async def reveal(self, entry_id: str) -> TUIHistoryPage:
         self._reveal_target = entry_id
-        resets = self._resets
         source = self.source
         if source is None:
             return TUIHistoryPage(())
-        page = await source.reveal(entry_id)
-        if resets == self._resets and page.segments:
-            # Loads started before the reveal belong to the pages it replaces.
-            self.generation += 1
-            generation = self.generation
-            self._segments.clear()
-            self.adopt(page)
-            # The revealed page ends at the target; rows after it let the view
-            # put the target on the top row. One huge row (a compaction) can
-            # fill a whole page, so load until a page of rows follows.
-            while (
-                generation == self.generation
-                and self.can_load_newer
-                and len(self._segments) < self.max_pages
-                and sum(len(d.page.units) for d in self._segments) - len(page.units)
-                < self.max_segment_rows
-            ):
-                if not (await self.load("newer")).segments:
-                    break
+        # The latest reveal or reset wins; loads started before it belong to
+        # the pages it replaces.
+        self.generation += 1
+        generation = self.generation
+        page = await self._read(("reveal", entry_id), source.reveal(entry_id))
+        # The revealed page ends at the target; rows after it let the view put
+        # the target on the top row. One huge row (a compaction) can fill a
+        # whole page, so read until a page of rows follows. All reads finish
+        # before any page is replaced, so keys pressed meanwhile page the old
+        # view and never mix with the revealed pages.
+        pages = [page] if page.segments else []
+        while (
+            pages
+            and generation == self.generation
+            and pages[-1].newer is not None
+            and sum(len(read.segments) for read in pages) < self.max_pages
+            and sum(len(read.units) for read in pages[1:]) < self.max_segment_rows
+        ):
+            cursor = pages[-1].newer
+            newer = await self._read(
+                ("newer", cursor.value), source.page(cursor, direction="newer")
+            )
+            if not newer.segments:
+                break
+            pages.append(newer)
+        if not pages or generation != self.generation:
+            # A later reveal or reset owns the view now.
+            return TUIHistoryPage(())
+        self._segments.clear()
+        for read in pages:
+            self.adopt(read, direction="newer")
         return page
+
+    async def _read(
+        self, what: tuple[str, str], read: Coroutine[Any, Any, TUIHistoryPage]
+    ) -> TUIHistoryPage:
+        """Run one source read as a task that a reset cancels."""
+
+        key = (self.generation, self.endpoint_id, *what)
+        task = asyncio.create_task(read)
+        self._loads[key] = task
+        try:
+            return await task
+        finally:
+            if self._loads.get(key) is task:
+                del self._loads[key]
 
     async def navigate_user(
         self, entry_id: str, direction: Literal["older", "newer"]

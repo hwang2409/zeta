@@ -21,6 +21,7 @@ import pytest
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.output.vt100 import Vt100_Output
 
 from tests.support.fake_backend import FakeBackend
@@ -39,6 +40,13 @@ from zeta.protocol.types import (
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.transcript.paged_history import (
+    HistoryCursor,
+    PagedTranscriptHistory,
+    TUIHistoryPage,
+    TUIHistoryUnit,
+    TUIPaintSegment,
+)
 
 TURNS = 100
 TOOLS_PER_TURN = 15
@@ -202,6 +210,18 @@ class Driver:
                 for x in range(position.xpos, position.xpos + position.width)
             ).rstrip()
             for y in range(position.ypos, position.ypos + position.height)
+        ]
+
+    def all_rows(self) -> list[str]:
+        """Every row the renderer last drew, composer included."""
+
+        screen = self.session.app.renderer._last_screen
+        if screen is None:
+            return []
+        size = self.session.app.output.get_size()
+        return [
+            "".join(screen.data_buffer[y][x].char for x in range(size.columns)).rstrip()
+            for y in range(size.rows)
         ]
 
     def top(self) -> str:
@@ -584,3 +604,252 @@ async def test_random_navigation_keeps_pages_adjacent_and_in_order(
                 await driver.send(keys[action])
             await driver.settle(f"seed {seed}: screen settles after {done}")
             _assert_pages_adjacent(driver, f"seed {seed} after {done}")
+
+
+class _RowPages:
+    """Fake history source: page i holds the one row ``e{i}``; reads can be gated."""
+
+    def __init__(self, total: int = 20) -> None:
+        self.total = total
+        self.gates: dict[str, asyncio.Event] = {}
+        self.waiting: dict[str, asyncio.Event] = {}
+
+    def row(self, index: int) -> TUIHistoryPage:
+        return TUIHistoryPage(
+            (TUIPaintSegment((TUIHistoryUnit(f"e{index}", index),)),),
+            older=HistoryCursor(str(index)) if index else None,
+            newer=HistoryCursor(str(index + 1)) if index + 1 < self.total else None,
+        )
+
+    async def _pass(self, name: str) -> None:
+        if name in self.gates:
+            self.waiting.setdefault(name, asyncio.Event()).set()
+            await self.gates[name].wait()
+
+    async def page(self, cursor=None, *, direction="older") -> TUIHistoryPage:
+        if direction == "newer":
+            await self._pass("newer")
+            return self.row(int(cursor.value))
+        return self.row(int(cursor.value) - 1 if cursor else self.total - 1)
+
+    async def reveal(self, entry_id: str) -> TUIHistoryPage:
+        await self._pass(entry_id)
+        return self.row(int(entry_id[1:]))
+
+
+def _resident(pager: PagedTranscriptHistory) -> list[str]:
+    return [unit.entry_id for page in pager.pages for unit in page.units]
+
+
+@pytest.mark.asyncio
+async def test_a_page_whose_edge_moved_while_it_loaded_is_dropped() -> None:
+    source = _RowPages()
+    pager = PagedTranscriptHistory(source)
+    pager.adopt(source.row(10))
+    await pager.load("newer")
+    await pager.load("newer")
+    source.gates["newer"] = asyncio.Event()
+    stale = asyncio.create_task(pager.load("newer"))
+    try:
+        await await_or_fail(
+            asyncio.ensure_future(source.waiting.setdefault("newer", asyncio.Event()).wait()),
+            what="the newer read of e13 started",
+        )
+        # Two older pages evict e12, so e13 no longer touches the newest page.
+        await pager.load("older")
+        await pager.load("older")
+        assert _resident(pager) == ["e8", "e9", "e10", "e11"]
+        source.gates["newer"].set()
+        await await_or_fail(
+            asyncio.gather(stale, return_exceptions=True), what="the stale e13 read"
+        )
+        # e13 is dropped; the newer edge is read again and e12 comes back.
+        assert _resident(pager) == ["e9", "e10", "e11", "e12"], (
+            "a page read for an edge that moved was attached"
+        )
+        await pager.load("older")
+        assert _resident(pager) == ["e8", "e9", "e10", "e11"], "older paging is stuck"
+    finally:
+        stale.cancel()
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_reveal_that_finishes_last_is_dropped() -> None:
+    source = _RowPages()
+    pager = PagedTranscriptHistory(source)
+    source.gates["e3"] = asyncio.Event()
+    first = asyncio.create_task(pager.reveal("e3"))
+    try:
+        await await_or_fail(
+            asyncio.ensure_future(source.waiting.setdefault("e3", asyncio.Event()).wait()),
+            what="the first reveal started",
+        )
+        await pager.reveal("e15")
+        source.gates["e3"].set()
+        await await_or_fail(first, what="the first reveal")
+        assert _resident(pager)[0] == "e15", (
+            f"the older reveal replaced the newer one: {_resident(pager)}"
+        )
+    finally:
+        first.cancel()
+
+
+async def _close_finder_with_escape(driver: Driver) -> None:
+    # vi insert mode: the first Esc leaves insert mode, the second closes.
+    await driver.send(ESCAPE)
+    await driver.until(
+        lambda: driver.session.app.vi_state.input_mode is InputMode.NAVIGATION,
+        what="the first Esc did not leave insert mode",
+    )
+    await driver.send(ESCAPE)
+    await driver.until(lambda: not driver.finder_drawn(), what="Esc did not close the finder")
+
+
+@pytest.mark.asyncio
+async def test_finder_escape_before_the_old_match_lands_keeps_the_view(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.settle("settled tail before the finder")
+        tail = driver.rows()
+        source = driver.app._history_pager.source
+        real_reveal, entered, gate = source.reveal, asyncio.Event(), asyncio.Event()
+
+        async def gated_reveal(entry_id: str) -> TUIHistoryPage:
+            entered.set()
+            await gate.wait()
+            return await real_reveal(entry_id)
+
+        source.reveal = gated_reveal
+        try:
+            await driver.send(CTRL_F)
+            await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+            await driver.send(OLD_WORDS[3])
+            await await_or_fail(
+                asyncio.ensure_future(entered.wait()), what="the old match started to load"
+            )
+            await _close_finder_with_escape(driver)
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the old match loaded")
+        assert driver.rows() == tail, (
+            f"the cancelled match moved the view; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_finder_shows_searching_until_old_history_answers(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        app = driver.app
+        source = app._history_pager.source
+        real_search, entered, gate = source.search, asyncio.Event(), asyncio.Event()
+
+        async def gated_search(query: str, **kwargs: object) -> object:
+            entered.set()
+            await gate.wait()
+            return await real_search(query, **kwargs)
+
+        source.search = gated_search
+        try:
+            await driver.send(CTRL_F)
+            await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+            await driver.send(OLD_WORDS[3])
+            await await_or_fail(
+                asyncio.ensure_future(entered.wait()), what="the old-history search started"
+            )
+            await driver.until(
+                lambda: app._finder_prepare_task is None
+                and app._finder_rank_task is None
+                and not driver.session.app.invalidated,
+                what="resident rows ranked",
+            )
+            drawn = "\n".join(driver.all_rows())
+            assert "searching…" in drawn and "no matches" not in drawn, (
+                f"the finder did not show that old history is still searched:\n{drawn}"
+            )
+            await driver.send(ENTER)
+            await driver.until(
+                lambda: not driver.session.app.invalidated, what="Enter was drawn"
+            )
+            assert driver.finder_drawn(), "Enter accepted before the old-history answer"
+        finally:
+            gate.set()
+        await driver.until(
+            lambda: not driver.finder_drawn() and _prompt(3) in driver.screen(),
+            what="Enter did not open the old match once it was found",
+        )
+
+
+@pytest.mark.asyncio
+async def test_finder_escape_returns_the_composer_to_insert_mode(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send(OLD_WORDS[40])
+        await driver.settle("the finder settles")
+        await _close_finder_with_escape(driver)
+        await driver.settle("finder closed")
+        # In vi normal mode "x" deletes and "a" appends, so this draws differently.
+        await driver.send("xabc")
+        await driver.settle("typed text drawn")
+        composer = [row for row in driver.all_rows() if row.strip()][-6:]
+        assert any("› xabc" in row for row in composer), (
+            "typed text after finder Esc did not reach the composer as typed:\n"
+            + "\n".join(composer)
+        )
+
+
+@pytest.mark.asyncio
+async def test_page_up_while_a_reveal_loads_newer_pages_keeps_paging(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        app = driver.app
+        await _ctrl_up_past(driver, TURNS - 30)
+        await driver.settle("settled old history")
+        source = app._history_pager.source
+        real_page, entered, gate = source.page, asyncio.Event(), asyncio.Event()
+
+        async def gated_page(cursor=None, *, direction="older"):
+            if direction == "newer":
+                entered.set()
+                await gate.wait()
+            return await real_page(cursor, direction=direction)
+
+        source.page = gated_page
+        try:
+            # ctrl+down past the resident pages reveals the next prompt from the
+            # store, then reads newer pages after it.
+            for _press in range(TURNS):
+                rows = driver.rows()
+                await driver.send(CTRL_DOWN)
+                await driver.until(
+                    lambda rows=rows: entered.is_set()
+                    or (driver.rows() != rows and driver.idle()),
+                    what="ctrl+down neither moved nor read a newer page",
+                )
+                if entered.is_set():
+                    break
+            assert entered.is_set(), "ctrl+down never revealed a prompt from the store"
+            held = app._history_pager.scalar_tokens[1]
+            for press in range(400):
+                await driver.send(PAGE_UP)
+                await driver.until(
+                    lambda: not driver.session.app.invalidated
+                    and not any(key[2] == "older" for key in app._history_pager._loads),
+                    what=f"PageUp {press + 1} during the held reveal",
+                )
+                if app._history_pager.scalar_tokens[1] != held:
+                    break
+            assert app._history_pager.scalar_tokens[1] != held, (
+                "PageUp never evicted the page the held newer read extends"
+            )
+        finally:
+            gate.set()
+        await driver.settle("settled after the held newer read")
+        _assert_pages_adjacent(driver, "after a newer read whose edge moved")
+        await _page_down_to_tail(driver)

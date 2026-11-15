@@ -696,7 +696,9 @@ class TUIApp(
             return
         target = transcript.next_user_entry() if direction == "newer" else None
         if target is not None:
-            await pager.reveal(target)
+            if not (await pager.reveal(target)).segments:
+                # A later reveal or reset owns the view now.
+                return
         else:
             durable = [
                 unit.entry_id
@@ -738,11 +740,12 @@ class TUIApp(
     def _finder_cancel(self) -> None:
         saved, self._finder_return = getattr(self, "_finder_return", None), None
         FinderRuntimeMixin._finder_cancel(self)
+        # A search or reveal still in flight must not move the view after Esc.
+        if getattr(self, "_history_search_task", None) is not None:
+            self._history_search_task.cancel()
         if saved is not None and saved[2] != self._resident_page_keys():
             # A durable preview replaced the pages: the line index no longer
             # points at the old rows, so load them back.
-            if self._history_search_task is not None:
-                self._history_search_task.cancel()
             asyncio.create_task(self._return_to_view(saved[0], saved[1]))
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
@@ -750,7 +753,8 @@ class TUIApp(
             await self._load_transcript_page(reset=True)
             self._transcript.scroll_to_bottom()
         else:
-            await self._history_pager.reveal(anchor[0])
+            if not (await self._history_pager.reveal(anchor[0])).segments:
+                return
             self._render_resident_history()
             self._transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
@@ -793,8 +797,11 @@ class TUIApp(
                 for page in history_pager.pages
                 for unit in page.units
             }
-            if target.entry_id not in resident:
-                await history_pager.reveal(target.entry_id)
+            if (
+                target.entry_id not in resident
+                and not (await history_pager.reveal(target.entry_id)).segments
+            ):
+                return
             self._show_history_search_target(target, query)
 
         self._history_search_task = asyncio.create_task(reveal_match())
@@ -816,8 +823,10 @@ class TUIApp(
         target = self._history_search_results[self._history_search_index]
 
         async def reveal() -> None:
-            await self._history_pager.reveal(target.entry_id)
-            if not self._transcript.finder_active:
+            if (
+                not (await self._history_pager.reveal(target.entry_id)).segments
+                or not self._transcript.finder_active
+            ):
                 return
             self._show_history_search_target(target, self._transcript.search_query)
 
