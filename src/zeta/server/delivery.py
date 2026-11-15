@@ -47,9 +47,23 @@ class DeliveryRequests:
 
     def __init__(self, control: ServeControl) -> None:
         self._control = control
-        self._steer_turn_guard = asyncio.Lock()
+        # orders every busy check and turn start (send, steer acceptance, and
+        # the end-of-turn decision in continue_after_turn) so only one wins.
+        self._turn_guard = asyncio.Lock()
 
     async def send(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        async with self._turn_guard:
+            return await self._send(params, features)
+
+    async def send_images(
+        self, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        async with self._turn_guard:
+            return await self._send_images(params, features)
+
+    async def _send(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         control = self._control
@@ -125,7 +139,7 @@ class DeliveryRequests:
         )
         return outcome
 
-    async def send_images(
+    async def _send_images(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         from .handlers import send_images
@@ -244,7 +258,7 @@ class DeliveryRequests:
         outcome: dict[str, object] = {"accepted": True}
         tagged = tag_client_delivery(message, delivery_id)
         canceled_after_commit = False
-        async with self._steer_turn_guard:
+        async with self._turn_guard:
             if not control.turn_busy():
                 raise ProtocolError(
                     ErrorDescriptor.STATE_UNAVAILABLE, "no turn is running"
@@ -343,13 +357,24 @@ class DeliveryRequests:
     ) -> None:
         """Answer steering a completed turn did not consume, else wake for notifications.
 
-        Call last in the finished turn task, after its turn_end is published:
-        the guard waits for a steer that is between its busy check and its
-        publication, and a later steer sees no running turn.
+        Call last in the finished turn task, after its turn_end is published.
+        The guard orders this decision against send and steer: a steer that
+        passed its busy check is queued before this check, a later steer sees
+        no running turn, and a send either starts the turn this check finds or
+        sees the turn this decision starts and gets OPERATION_BUSY.
         """
 
         control = self._control
-        async with self._steer_turn_guard:
+        async with self._turn_guard:
+            running = control._turn_task
+            if (
+                running is not None
+                and not running.done()
+                and running is not asyncio.current_task()
+            ):
+                # a send started that turn under the guard; its first provider
+                # request reads the queued steering, and its end wakes as needed.
+                return
             steering = state.opened.store.pending_client_steering()
             if steering is None:
                 control._schedule_background_wake(session_id)
@@ -382,7 +407,7 @@ class DeliveryRequests:
     async def _drop_steering(
         self, session_id: str, state: SessionState, reason: DeliveryDropReason
     ) -> None:
-        async with self._steer_turn_guard:
+        async with self._turn_guard:
             dropped = await state.opened.store.drop_client_steering_async(reason)
         connections = self._control.server.connections
         if connections is None:
