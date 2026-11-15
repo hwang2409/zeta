@@ -982,7 +982,8 @@ class TUIApp(
         self._agent_navigation.focus_list()
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
-        if renderable is not None:
+        # The shared pager holds the child's pages; root reloads from its anchor on return.
+        if renderable is not None and not self._agent_navigation.child_view_active:
             self._transcript.append(renderable)
             if not self._rendering_history:
                 entry_id = self.loop.store.active_branch_head_id()

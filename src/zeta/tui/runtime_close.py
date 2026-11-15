@@ -77,13 +77,6 @@ class RuntimeCloseMixin:
             close_history_pager = getattr(self, "_close_history_pager", None)
             if close_history_pager is not None:
                 await attempt_async(close_history_pager)
-            else:
-                history_pager = getattr(self, "_history_pager", None)
-                if history_pager is not None:
-                    await attempt_async(history_pager.close)
-            prompt_history = getattr(self, "_prompt_history", None)
-            if prompt_history is not None:
-                await attempt_async(prompt_history.close)
             await attempt_async(self._close_approval_labels)
             pending = attempt(
                 lambda: (

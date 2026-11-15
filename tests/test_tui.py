@@ -17069,6 +17069,20 @@ async def test_root_tui_paging_render_path_table(
                 assert main_thread not in discovery_threads, (
                     "open, return, or refresh discovery ran on the TUI loop thread"
                 )
+                rows = [
+                    int(number)
+                    for number in re.findall(
+                        r"child visit (\d+)",
+                        Text.from_ansi(owner.transcript.render(120)).plain,
+                    )
+                ]
+                assert rows == list(range(rows[0], rows[-1] + 1)), (
+                    "a refresh of a scrolled child dropped rows below the anchor"
+                )
+                assert owner.history_pager.can_load_newer, (
+                    "a refresh of a scrolled child stopped newer paging"
+                )
+                assert owner.transcript.durable_scroll_anchor == child_anchor
         elif journey == "child-cancel-replace-close":
             from zeta.tui.transcript.child_history_source import ChildLogHistorySource
 

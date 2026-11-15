@@ -103,6 +103,18 @@ __all__ = [
 _AGENT_REFRESH_INTERVAL_SECONDS = 1.0
 _AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
 
+
+async def _anchored_pages(source: Any, anchor: tuple[Any, ...] | None) -> tuple[Any, ...]:
+    """Return the tail page, or the anchor's page plus the rows after it."""
+
+    if anchor is None:
+        return (await source.page(None, direction="older"),)
+    page = await source.reveal(anchor[0])
+    if page.newer is None:
+        return (page,)
+    # Rows after the anchor let the viewport start exactly at it.
+    return (page, await source.page(page.newer, direction="newer"))
+
 class AgentTranscriptControl(UIControl):
     """Render the shared pager for the focused child view."""
     def __init__(self, history_pager: Any = None) -> None:
@@ -282,15 +294,7 @@ class AgentTranscriptControl(UIControl):
         source = self._source
         if path != self._root_path and source is not None:
             anchor = self.transcript.durable_scroll_anchor
-            page = await (
-                source.reveal(anchor[0])
-                if anchor is not None
-                else source.page(None, direction="older")
-            )
-            latest = (
-                await source.page(None, direction="older") if anchor is not None else None
-            )
-            fresh = (page,) if latest is None or latest == page else (page, latest)
+            fresh = await _anchored_pages(source, anchor)
             # A scroll made during the reads wins; the next refresh catches up.
             if (
                 generation == self._activation_generation
@@ -453,18 +457,11 @@ class AgentTranscriptControl(UIControl):
                     await prepared_source.close()
                 return
 
-            prepared_page = None
-            prepared_newer = None
+            prepared_pages: tuple[Any, ...] = ()
             if prepared_source is not None:
-                if state is not None and state.anchor is not None:
-                    prepared_page = await prepared_source.reveal(state.anchor[0])
-                    # Rows after the anchor let the viewport start exactly at it.
-                    if prepared_page.newer is not None:
-                        prepared_newer = await prepared_source.page(
-                            prepared_page.newer, direction="newer"
-                        )
-                else:
-                    prepared_page = await prepared_source.page(None, direction="older")
+                prepared_pages = await _anchored_pages(
+                    prepared_source, state.anchor if state is not None else None
+                )
             if generation != self._activation_generation:
                 if prepared_source not in {None, self._root_source}:
                     await prepared_source.close()
@@ -474,12 +471,11 @@ class AgentTranscriptControl(UIControl):
                 if prepared_source is self._root_source and self._root_endpoint
                 else None
             )
-            if (
-                prepared_page is not None
-                and endpoint is not None
-                and not prepared_page.endpoint_id
-            ):
-                prepared_page = replace(prepared_page, endpoint_id=endpoint)
+            if prepared_pages and endpoint is not None and not prepared_pages[0].endpoint_id:
+                prepared_pages = (
+                    replace(prepared_pages[0], endpoint_id=endpoint),
+                    *prepared_pages[1:],
+                )
 
             committed = (
                 self._commit_path(path, prepared_navigation, generation)
@@ -503,10 +499,8 @@ class AgentTranscriptControl(UIControl):
             self._source = None if prepared_source is self._root_source else prepared_source
             self._history_pager.source = prepared_source
             self._history_pager.reset(endpoint_id=endpoint)
-            if prepared_page is not None:
-                self._history_pager.adopt(prepared_page)
-            if prepared_newer is not None:
-                self._history_pager.adopt(prepared_newer, direction="newer")
+            for index, page in enumerate(prepared_pages):
+                self._history_pager.adopt(page, direction="newer" if index else "older")
             if state is not None and state.anchor is not None:
                 self._history_pager.set_anchor(*state.anchor)
             restored = state or _InactiveViewState(None, "", 0, None, None, "", 0)
