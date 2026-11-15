@@ -1189,11 +1189,21 @@ grace with nobody back, cancels the turn as an immediate disconnect does:
 `served_turn_end` reason `disconnect`, and queued steers `dropped` with reason
 `disconnect`. When the turn ends inside the grace, the grace ends with it, so a
 later background wake is not cancelled. Tools of transient MCP bindings are
-detached at the disconnect as before: a call to one during the grace returns an
+detached at the disconnect as before, and the server never uses the gone
+client's headers again; a call already running at the disconnect returns an
 error result that says the client that provides the tool disconnected and may
-reconnect, and the server never uses the gone client's headers. Re-supply the
-bindings with `hello` or `resume` (`resume_attach`) to use those tools again.
-serve-only: the TUI is not a serve controller.
+reconnect, and that the call was already sent, so it may or may not have taken
+effect. A call made during the grace waits instead: when a controller
+re-supplies the bindings with `hello` or `resume` (`resume_attach`), the call
+runs once with the new headers. The wait keeps the grace deadline that started
+at the disconnect, also after a `hello` takes the turn over without bindings.
+At that deadline, or when the turn is aborted or the server closes, the call
+ends without reaching the MCP server; at the deadline it returns the same
+"client disconnected" error result. If the rebind fails to connect, the
+waiting call returns the usual "filtered or unavailable" tool error. A second
+disconnect after a `hello` without bindings starts a new grace deadline, and
+bound calls, waiting or new, then return the "client disconnected" result at
+once, as before this feature. serve-only: the TUI is not a serve controller.
 
 A disconnected client does not stop the active served session or its
 background children. When a client attaches with `hello`, `new_session`, or
