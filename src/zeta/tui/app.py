@@ -41,7 +41,6 @@ from ..core.slash import (
 )
 from ..protocol.types import (
     Message,
-    MessageRole,
 )
 from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
@@ -274,6 +273,10 @@ class TUIApp(
         )
         self._history_pager = PagedTranscriptHistory(self._history_source)
         self._history_search_task: asyncio.Task[None] | None = None
+        self._user_nav_presses: deque[str] = deque()
+        self._user_nav_task: asyncio.Task[None] | None = None
+        # Root view from before the finder opened: (follow tail, top row, pages).
+        self._finder_return: tuple[bool, Any, tuple[str, ...]] | None = None
         self._history_search_results: tuple[Any, ...] = ()
         self._history_search_index = 0
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
@@ -515,7 +518,7 @@ class TUIApp(
             on_decisions_open=lambda: app.open_decisions_panel(),
             on_decisions_key=lambda key: app._decisions_key(key),
             on_page_up=lambda: app._page_history_up(),
-            on_page_down=self._transcript.page_down,
+            on_page_down=lambda: app._page_history_down(),
             on_finder_open=lambda: app._finder_open(),
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
             on_history_previous=lambda buffer: app._history_previous(buffer),
@@ -548,7 +551,7 @@ class TUIApp(
             approval_active=lambda: bool(app.pending_approvals),
             on_plan_toggle=lambda: app.toggle_plan_mode(),
             on_scroll_up=lambda: app._scroll_history_up(),
-            on_scroll_down=self._transcript.scroll_down,
+            on_scroll_down=lambda: app._scroll_history_down(),
             on_picker_move=lambda delta: app._picker_move(delta),
             on_picker_select=lambda: app._picker_select(),
             on_picker_cancel=lambda: app._picker_cancel(),
@@ -643,61 +646,131 @@ class TUIApp(
         self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
 
-    def _request_history_edge(self, direction: str) -> None:
-        if direction == "older":
-            if not self._history_pager.can_load_older or self._transcript.scroll_offset > 0:
+    def _move_history(self, direction: str, move: Callable[[], None]) -> None:
+        """Own root scrolling: move the view and load the page at the edge it meets."""
+
+        transcript, pager = self._transcript, self._history_pager
+        if direction == "newer":
+            if transcript.follow_tail and pager.can_load_newer:
+                # The resident tail is not the session tail: load first so this
+                # press moves into the newer rows instead of doing nothing.
+                asyncio.create_task(
+                    self._load_transcript_page(direction="newer", then=move)
+                )
                 return
-        elif not self._history_pager.can_load_newer or not self._transcript.follow_tail:
+            move()
             return
-        asyncio.create_task(self._load_transcript_page(direction=direction))
+        move()
+        if pager.can_load_older and transcript.scroll_offset == 0:
+            asyncio.create_task(self._load_transcript_page(direction="older"))
 
     def _page_history_up(self) -> None:
-        self._transcript.page_up()
-        self._request_history_edge("older")
+        self._move_history("older", self._transcript.page_up)
 
     def _scroll_history_up(self) -> None:
-        self._transcript.scroll_up()
-        self._request_history_edge("older")
+        self._move_history("older", self._transcript.scroll_up)
 
     def _page_history_down(self) -> None:
-        self._transcript.page_down()
-        self._request_history_edge("newer")
+        self._move_history("newer", self._transcript.page_down)
 
     def _scroll_history_down(self) -> None:
-        self._transcript.scroll_down()
-        self._request_history_edge("newer")
+        self._move_history("newer", self._transcript.scroll_down)
 
     def _navigate_history_user(self, direction: str) -> None:
-        moved = (
-            self._transcript.previous_user_message()
-            if direction == "older"
-            else self._transcript.next_user_message()
-        )
-        if moved:
-            return
-        users = [
-            unit.value
-            for page in self._history_pager.pages
-            for unit in page.units
-            if unit.value.message is not None
-            and unit.value.message.role is MessageRole.USER
-        ]
-        if not users:
-            return
-        anchor = users[0 if direction == "older" else -1].id
+        # Presses wait for the reveal before them, so each moves one prompt.
+        self._user_nav_presses.append(direction)
+        if self._user_nav_task is None or self._user_nav_task.done():
+            self._user_nav_task = asyncio.create_task(self._run_user_nav_presses())
 
-        async def reveal() -> None:
-            target = await self._history_pager.navigate_user(anchor, direction)
-            if target is None:
+    async def _run_user_nav_presses(self) -> None:
+        transcript = self._transcript
+        while self._user_nav_presses:
+            direction = self._user_nav_presses.popleft()
+            moved = (
+                transcript.previous_user_message()
+                if direction == "older"
+                else transcript.next_user_message()
+            )
+            if not moved:
+                await self._reveal_adjacent_user(direction)
+
+    async def _reveal_adjacent_user(self, direction: str) -> None:
+        """Page to the adjacent prompt the resident rows cannot put on the top row."""
+
+        pager, transcript = self._history_pager, self._transcript
+        if direction == "newer" and not pager.can_load_newer:
+            # The session tail is resident, so the next prompt is too close to
+            # the end to reach the top row: show the end instead.
+            transcript.scroll_to_bottom()
+            self._invalidate_prompt()
+            return
+        target = transcript.next_user_entry() if direction == "newer" else None
+        if target is not None:
+            if not (await pager.reveal(target)).segments:
+                # A later reveal or reset owns the view now.
                 return
+        else:
+            durable = [
+                unit.entry_id
+                for page in pager.pages
+                for unit in page.units
+                if ":dependency:" not in unit.entry_id
+            ]
+            if durable:
+                target = await pager.navigate_user(
+                    durable[0 if direction == "older" else -1], direction
+                )
+        if target is not None:
             self._render_resident_history()
-            if direction == "older":
-                self._transcript.previous_user_message()
-            else:
-                self._transcript.next_user_message()
+            if transcript.restore_durable_scroll_anchor((target, 0, 0)):
+                self._invalidate_prompt()
+                return
+        if direction == "newer":
+            await self._load_transcript_page(reset=True)
+            transcript.scroll_to_bottom()
             self._invalidate_prompt()
 
-        asyncio.create_task(reveal())
+    def _resident_page_keys(self) -> tuple[str, ...]:
+        return tuple(descriptor.key for descriptor in self._history_pager.descriptors)
+
+    def _finder_open(self) -> None:
+        transcript = self._transcript
+        if transcript.search_active:
+            # A new search replaces the accepted one and its match keys.
+            self._end_history_search()
+        self._finder_return = (
+            None
+            if getattr(self, "_history_pager", None) is None
+            or self._agent_navigation.child_view_active
+            else (
+                transcript.follow_tail,
+                transcript.durable_scroll_anchor,
+                self._resident_page_keys(),
+            )
+        )
+        FinderRuntimeMixin._finder_open(self)
+
+    def _finder_cancel(self) -> None:
+        saved, self._finder_return = getattr(self, "_finder_return", None), None
+        FinderRuntimeMixin._finder_cancel(self)
+        # A search or reveal still in flight must not move the view after Esc.
+        if getattr(self, "_history_search_task", None) is not None:
+            self._history_search_task.cancel()
+        if saved is not None and saved[2] != self._resident_page_keys():
+            # A durable preview replaced the pages: the line index no longer
+            # points at the old rows, so load them back.
+            asyncio.create_task(self._return_to_view(saved[0], saved[1]))
+
+    async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
+        if follow_tail or anchor is None:
+            await self._load_transcript_page(reset=True)
+            self._transcript.scroll_to_bottom()
+        else:
+            if not (await self._history_pager.reveal(anchor[0])).segments:
+                return
+            self._render_resident_history()
+            self._transcript.restore_durable_scroll_anchor(anchor)
+        self._invalidate_prompt()
 
     def _finder_input(self, query: str) -> None:
         self._history_search_results = ()
@@ -737,19 +810,17 @@ class TUIApp(
                 for page in history_pager.pages
                 for unit in page.units
             }
-            if target.entry_id not in resident:
-                await history_pager.reveal(target.entry_id)
-            self._render_resident_history()
-            self._transcript.restore_durable_scroll_anchor(
-                (target.entry_id, target.unit_ordinal, 0)
-            )
-            request = self._transcript.open_finder()
-            self._active_finder = self._transcript
-            self._start_finder_preparation(request)
-            self._transcript.finder_set_query(query)
-            self._invalidate_prompt()
+            if (
+                target.entry_id not in resident
+                and not (await history_pager.reveal(target.entry_id)).segments
+            ):
+                return
+            self._show_history_search_target(target, query)
 
         self._history_search_task = asyncio.create_task(reveal_match())
+        self._history_search_task.add_done_callback(
+            lambda _task: self._finder_accept_when_ready()
+        )
 
     def _navigate_history_search(self, delta: int) -> bool:
         if not self._history_search_results:
@@ -765,22 +836,36 @@ class TUIApp(
         target = self._history_search_results[self._history_search_index]
 
         async def reveal() -> None:
-            await self._history_pager.reveal(target.entry_id)
-            if not self._transcript.finder_active:
+            if (
+                not (await self._history_pager.reveal(target.entry_id)).segments
+                or not self._transcript.finder_active
+            ):
                 return
-            query = self._transcript.search_query
-            self._render_resident_history()
-            self._transcript.restore_durable_scroll_anchor(
-                (target.entry_id, target.unit_ordinal, 0)
-            )
-            request = self._transcript.open_finder()
-            self._active_finder = self._transcript
-            self._start_finder_preparation(request)
-            self._transcript.finder_set_query(query)
-            self._invalidate_prompt()
+            self._show_history_search_target(target, self._transcript.search_query)
 
         self._history_search_task = asyncio.create_task(reveal())
         return True
+
+    def _show_history_search_target(self, target: Any, query: str) -> None:
+        """Paint the revealed match and rebuild the open finder's rows from it."""
+
+        self._render_resident_history()
+        self._transcript.restore_durable_scroll_anchor(
+            (target.entry_id, target.unit_ordinal, 0)
+        )
+        self._cancel_finder_workers()
+        self._active_finder = self._transcript
+        self._start_finder_preparation(self._transcript.restart_finder())
+        self._transcript.finder_set_query(query)
+        self._invalidate_prompt()
+
+    def _finder_loading(self) -> bool:
+        task = getattr(self, "_history_search_task", None)
+        return FinderRuntimeMixin._finder_loading(self) or (
+            task is not None
+            and not task.done()
+            and self._active_finder is self._transcript
+        )
 
     def _end_history_search(self) -> None:
         self._history_search_results = ()

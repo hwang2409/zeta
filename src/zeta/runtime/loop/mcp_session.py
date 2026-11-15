@@ -125,6 +125,11 @@ class MCPSession:
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
 
+    async def finish_mcp_mount(self) -> None:
+        """Wait for a running first mount; a turn may be waiting on it."""
+        if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+            await asyncio.wait({self._mcp_mount_task})
+
     async def set_mcp_bindings(
         self,
         bindings: dict[str, dict[str, str]],

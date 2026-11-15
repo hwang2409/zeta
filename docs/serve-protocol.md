@@ -498,6 +498,11 @@ re-supplies this connection's bindings:
   session's host commands when the approval is answered, so it uses the
   binding that is active at that time.
 
+When the turn is still waiting for its first MCP connection, the rebind waits
+for that connection to finish, so the turn keeps running. If the turn ends
+while the bindings are re-supplied, the result has no `attached` field, as for
+an idle resume, and a pending notification starts its turn as usual.
+
 The result adds `attached: "live_turn"`. The client then reads the current
 state with `status` or `session_history_and_subscribe`; pending approvals are
 in that result and can be answered. With `in_flight_replay`, the join also
@@ -1553,12 +1558,19 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
    and `status.state` is `idle` until the next `turn_start`; a queued
    notification turn is not busy until its `turn_start` is published, so a send
-   that arrives first wins. When the turn left a steer unread, the server starts
-   the next turn after `agent_end`; a `send` that arrives after that start gets
-   `-32004` and should be retried as `steer`. Clients must wait for `agent_end` before idle-only
-   requests such as `new_session`; the server commits `served_turn_end` before
-   cleanup. Error
-   and abort paths still end with `error` or `turn_aborted`.
+   that arrives first wins. State changes are stricter: once a queued
+   notification turn has started its setup (before its `turn_start`),
+   `slash_run` commands that `runs_while_busy` does not allow, idle-only
+   requests, `new_session`, and `resume` of another session return `-32004`
+   until that turn ends. With `resume_attach`, `resume` of the open session
+   attaches to that turn, and the client then sees its `turn_start`.
+   A notification turn does not start its setup while a session-mutation or
+   controller-write request is running. When the turn left a steer unread, the
+   server starts the next turn after `agent_end`; a `send` that arrives after
+   that start gets `-32004` and should be retried as `steer`. Clients must wait
+   for `agent_end` before idle-only requests such as `new_session`; the server
+   commits `served_turn_end` before cleanup. Error and abort paths still end
+   with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
