@@ -579,7 +579,9 @@ class SlashHandlerMixin:
         command = args.strip()
         home = self._zeta_home or env_home()
         if command == "":
-            history, message = await asyncio.to_thread(retention_status, home)
+            history, message = await asyncio.to_thread(
+                retention_status, home, self.loop.store._storage_lease
+            )
             if history:
                 self._presenter.print_unit(render_retention_card(history[-1]))
             return message
