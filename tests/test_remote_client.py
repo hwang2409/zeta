@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import threading
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -263,6 +265,38 @@ async def test_ssh_failure_is_reported_not_shown_as_no_sessions(tmp_path: Path) 
     rows, errors = await client.discover(("good", "laptop"))
     assert [row.session_id for row in rows] == ["abc123"]
     assert errors == ("ssh to laptop failed: Permission denied (publickey).",)
+
+
+@pytest.mark.asyncio
+async def test_ssh_exit_is_reported_when_pipes_close_before_the_reap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # forced order: ssh closes its pipes and exits, but asyncio has not reaped it yet when the
+    # transport signals its group. darwin refuses killpg on an unreaped group (EPERM).
+    signalled = threading.Event()
+    real_killpg, real_waitpid = os.killpg, os.waitpid
+
+    def killpg(pgid: int, sig: int) -> None:
+        try:
+            real_killpg(pgid, sig)
+        finally:
+            signalled.set()
+
+    def waitpid(pid: int, options: int) -> tuple[int, int]:
+        if options == 0:
+            signalled.wait(10)
+        return real_waitpid(pid, options)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(os, "waitpid", waitpid)
+    client = RemoteSessionClient(tmp_path, ssh=_fake_ssh(tmp_path))
+    task = asyncio.create_task(client.discover(("bad",)))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=10)
+        assert done, "the ssh exit was never reported after its pipes closed"
+        with pytest.raises(RemoteWireError, match=r"^ssh to bad failed: Permission denied \(publickey\)\.$"):
+            task.result()
+    finally:
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
 
 
 @pytest.mark.asyncio
