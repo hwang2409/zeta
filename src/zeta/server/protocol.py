@@ -278,6 +278,7 @@ FEATURES = (
     "zeta_updated",
     "approval_restart_reason",
     "mcp_refresh_tools",
+    "resume_attach",
 )
 
 
