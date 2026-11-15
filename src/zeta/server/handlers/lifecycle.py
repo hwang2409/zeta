@@ -234,6 +234,7 @@ async def _attach_live_turn(
     """Attach to the active session's busy turn without a swap: the turn, its
     approvals and children stay; only this connection's bindings are re-supplied."""
     control = self.server.control
+    reattach = None
     if bindings is not None:
         headers, configs = bindings
         if (
@@ -245,16 +246,24 @@ async def _attach_live_turn(
                 "mcp_bindings must match the active session",
             )
         if not control._active_mcp_bindings:
-            await control.reattach_mcp_bindings(headers, configs)
+            reattach = (headers, configs)
         elif control._active_mcp_bindings != headers:
             # A running tool call may hold the current headers; swap them only when idle.
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY,
                 "mcp_bindings cannot change during a live turn",
             )
-    # The running turn keeps its snapshot; the new set applies from the next turn.
+    # Bind host commands before the await, so a turn that ends meanwhile never
+    # sees a half-attached session. The running turn keeps its snapshot.
+    previous = (control._active_host_commands, control._host_binding_required)
     control._active_host_commands = candidate
     control._host_binding_required = "session_host_commands" in self.features
+    if reattach is not None:
+        try:
+            await control.reattach_mcp_bindings(*reattach)
+        except BaseException:
+            control._active_host_commands, control._host_binding_required = previous
+            raise
     return {"session": session_snapshot(self), "attached": "live_turn"}
 
 

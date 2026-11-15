@@ -214,6 +214,58 @@ async def test_resume_attach_resupplies_host_commands_for_next_turn(
 
 
 @pytest.mark.asyncio
+async def test_resume_attach_rejects_mcp_bindings_for_unbound_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
+        "transport": "streamable-http", "url": "http://127.0.0.1:9"
+    }}}))
+    backend = FakeBackend([
+        ScriptedTurn(tool_calls=[ToolCall("probe-1", "probe", {})]),
+        ScriptedTurn([TextContent("probed")]),
+    ])
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    features = [
+        "approval_reconnect", "new_session_settings", "session_mcp_bindings",
+        "resume_attach",
+    ]
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": features
+        })
+        session_id = (await _request(reader, writer, 2, "new_session", {
+            "provider": "codex", "model": "gpt-5.6-sol", "approval_mode": "ask",
+        }))[-1]["result"]["session"]["session_id"]
+
+        async def probe(arguments: dict[str, object], abort_signal: object) -> str:
+            return "ok"
+
+        assert server.runtime.loop is not None
+        server.runtime.loop.tool_registry.register("probe", probe)
+        await _request(reader, writer, 3, "send", {"text": "probe"})
+        approval = await _event(reader, "approval_request")
+        rejected = await _request(reader, writer, 4, "resume", {
+            "session_id": session_id,
+            "mcp_bindings": [{"server": "page", "headers": {"X-Key": "k"}}],
+        })
+        assert _error_code(rejected) == INVALID_PARAMS, rejected[-1]
+        assert server.control._active_mcp_bindings == {}
+        allowed = await _request(reader, writer, 5, "approve", {
+            "request_id": approval["request_id"]
+        })
+        assert "error" not in allowed[-1]
+        await _event(reader, "agent_end")
+    finally:
+        await _close(writer)
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_without_attach_feature_stays_busy(tmp_path: Path) -> None:
     backend = FakeBackend([
         ScriptedTurn(tool_calls=[ToolCall("probe-1", "probe", {})]),

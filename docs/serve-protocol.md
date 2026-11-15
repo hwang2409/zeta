@@ -493,7 +493,10 @@ re-supplies this connection's bindings:
   bindings are still attached on this connection, equal headers are a no-op and
   different headers return `-32004`; send them again when the session is idle.
 - `host_commands` replace the session's binding. The running turn keeps the
-  commands it started with; the new binding applies from the next turn.
+  commands it started with; the new binding applies from the next turn. One
+  exception: a tool resumed from a durable approval after a restart reads the
+  session's host commands when the approval is answered, so it uses the
+  binding that is active at that time.
 
 The result adds `attached: "live_turn"`. The client then reads the current
 state with `status` or `session_history_and_subscribe`; pending approvals are
