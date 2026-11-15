@@ -763,6 +763,64 @@ def test_ssh_remote_install_rejects_byte_bomb_and_cleans_staging(
     assert not list((remote / "sessions").glob(".*.incoming-*"))
 
 
+def _with_pax_mtime(archive: Path, mtime: str) -> None:
+    """Rewrite every member with a pax mtime header no filesystem accepts."""
+    members = []
+    with tarfile.open(archive, mode="r:gz") as source:
+        for member in source.getmembers():
+            data = source.extractfile(member).read() if member.isfile() else None
+            members.append((member, data))
+    with tarfile.open(archive, mode="w:gz", format=tarfile.PAX_FORMAT) as output:
+        for member, data in members:
+            member.pax_headers = {**member.pax_headers, "mtime": mtime}
+            output.addfile(member, io.BytesIO(data) if data is not None else None)
+
+
+@pytest.mark.parametrize("mtime", ("inf", "nan", "1e30"))
+@pytest.mark.parametrize("direction", ("push", "pull"))
+def test_ssh_archive_with_invalid_mtime_is_a_clear_remote_sync_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str, mtime: str,
+) -> None:
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    repo = tmp_path / "repo"
+    _install_ssh_shim(tmp_path, monkeypatch)
+    _git_repo(repo)
+    _, opened = _session(local, repo)
+    session_id = opened.metadata.session_id
+    opened.store.close()
+    transport = SshTransport("fake", str(remote), name="cloud")
+    if direction == "push":
+        pack = ssh_module._pack
+
+        def bad_pack(source: Path, destination: Path) -> None:
+            pack(source, destination)
+            _with_pax_mtime(destination, mtime)
+
+        # test-contract: seam no real file can carry an inf/nan mtime, so the archive is rewritten in transit
+        monkeypatch.setattr(ssh_module, "_pack", bad_pack)
+        with pytest.raises(RemoteSyncError, match=r"zeta-remote: archive member payload/\S+: invalid mtime"):
+            push_session(local, transport, session_id=session_id)
+        assert not (remote / "sessions" / session_id).exists()
+        assert not list((remote / "sessions").glob(".*.incoming-*"))
+        return
+    push_session(local, transport, session_id=session_id)
+    fetch = SshTransport._run_to_file
+
+    def bad_fetch(self, script, arguments, destination):
+        result = fetch(self, script, arguments, destination)
+        _with_pax_mtime(destination, mtime)
+        return result
+
+    # test-contract: seam no real file can carry an inf/nan mtime, so the fetched archive is rewritten
+    monkeypatch.setattr(SshTransport, "_run_to_file", bad_fetch)
+    pulled = tmp_path / "pulled"
+    with pytest.raises(RemoteSyncError, match="remote archive member has an invalid mtime"):
+        pull_session(pulled, transport, session_id=session_id)
+    assert not (pulled / "sessions" / session_id).exists()
+    assert not list(pulled.rglob("*.incoming-*"))
+
+
 def _ssh_session(home: Path, *, parent: str | None = None) -> str:
     opened = SessionManager(home).create(
         provider="codex", model="fake", cwd=home, parent_session_id=parent

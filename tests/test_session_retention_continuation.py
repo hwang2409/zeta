@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import fcntl
 import functools
+import os
+import re
 import time
 from io import StringIO
 from pathlib import Path
@@ -13,6 +17,7 @@ import pytest
 from rich.console import Console
 
 import zeta.server.server as server_module
+import zeta.session_retention.transaction as transaction_module
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import owned_app
 from tests.support.retention_owner import _age_tree, _create_closed
@@ -20,9 +25,12 @@ from tests.support.serve_close import close_serve
 from tests.test_server import _connect, _event, _request
 from zeta.cli.main import _attach_retention_owner
 from zeta.core.session import SessionManager
+from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.session_retention import (
+    RetentionBounds,
+    RetentionPlanner,
     read_retention_history,
     retention_authority,
 )
@@ -75,44 +83,193 @@ def _epoch_11_home(tmp_path: Path, old_roots: int) -> tuple[Path, list[str]]:
     return home, roots
 
 
+class _NoSpaceForTransactions:
+    """transaction.py's ``os``: only the per-transaction txid mkdir fails, with ENOSPC."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(os, name)
+
+    def mkdir(self, path, mode=0o777, *, dir_fd=None) -> None:
+        if dir_fd is not None and re.fullmatch("[0-9a-f]{32}", str(path)):
+            self.attempts += 1
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        os.mkdir(path, mode, dir_fd=dir_fd)
+
+
+class _Request:
+    """The real user-open request handshake lock, held the way a user open holds it."""
+
+    def __init__(self, home: Path) -> None:
+        self.fd = os.open(
+            home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "user-open-request"),
+            os.O_RDWR,
+        )
+
+    def hold(self) -> None:
+        fcntl.flock(self.fd, fcntl.LOCK_SH)
+
+    def close(self) -> None:
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+# row: (old roots, what happens after the arm). every row ends with the owner idle.
+_OWNER_ROWS = {
+    "deleted": 2,
+    "pinned-head": 3,
+    "opened-head": 3,
+    "repeated-outcome": 1,
+    "error-after-changed": 1,
+    "final-walk-yield": 2,
+    "final-walk-budget": 3,
+    "user-open-yield": 2,
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("rejection", "index"),
-    (("pinned", 0), ("pinned", 1), ("opened", 0), ("opened", 1)),
-)
-async def test_armed_owner_deletes_every_eligible_root_past_a_rejected_one(
-    tmp_path: Path, rejection: str, index: int,
+@pytest.mark.parametrize("row", tuple(_OWNER_ROWS))
+async def test_armed_owner_continue_stop_or_yield_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str,
 ) -> None:
-    home, roots = await asyncio.to_thread(_epoch_11_home, tmp_path, 4)
+    """When the real owner continues, ends the episode and waits, or yields (s4c F1)."""
+    home, roots = await asyncio.to_thread(_epoch_11_home, tmp_path, _OWNER_ROWS[row])
     lease = await asyncio.to_thread(open_writer, home)
-    owner = make_retention_owner(home, lease, lambda: 30, now_ns=_future)
+    clock_offset = [0]
+    owner = make_retention_owner(
+        home, lease, lambda: 30, now_ns=lambda: _future() + clock_offset[0],
+    )
     signal = owner._wake = _IdleSignal()
     published: list[dict[str, object]] = []
-    owner.set_publish(published.append)
-    opened = None
+    chain_done = asyncio.Event()
+
+    def publish(projection: dict[str, object]) -> None:
+        published.append(projection)
+        if projection["mode"] == "preview" and projection["preview_id"] and projection["root_ids"] == []:
+            chain_done.set()
+
+    owner.set_publish(publish)
+    passes = [0]
+    original_pass = RetentionPlanner.run_pass
+
+    def counted_pass(planner, **kwargs):
+        passes[0] += 1
+        # a spin guard, not a proof: the owner fails this pass, so even a spinning base goes idle
+        if passes[0] > 500:
+            raise RuntimeError("owner spun past 500 passes")
+        result = original_pass(planner, **kwargs)
+        if row == "repeated-outcome" and getattr(result, "mode", "") is None and result.changed:
+            # the root id is published again right after its quarantine step
+            (home / "sessions" / roots[0]).mkdir(exist_ok=True)
+        return result
+
+    monkeypatch.setattr(RetentionPlanner, "run_pass", counted_pass)
+    episodes = [0]
+    original_episode = owner._run_episode
+
+    def counted_episode():
+        episodes[0] += 1
+        return original_episode()
+
+    owner._run_episode = counted_episode
+    in_final_walk: list[str] = []
+    original_walk = RetentionPlanner._walk
+
+    def walk(planner, flight, budget):
+        # fires once, in the first walk after the arm: the transaction's final candidate walk
+        if in_final_walk and flight.root_id == in_final_walk[0]:
+            in_final_walk.clear()
+            if row == "final-walk-yield":
+                request.hold()
+            else:
+                clock_offset[0] += RetentionBounds().worker_ns
+        return original_walk(planner, flight, budget)
+
+    # test-contract: seam times a real user-open request or a 30 s clock step inside the final walk
+    monkeypatch.setattr(RetentionPlanner, "_walk", walk)
+    no_space = _NoSpaceForTransactions()
+    if row == "error-after-changed":
+        monkeypatch.setattr(transaction_module, "os", no_space)
+    request = opened = None
     try:
         owner.start()
         await _settle(signal.idle)
         preview = published[-1]
         assert preview["mode"] == "preview" and sorted(preview["root_ids"]) == sorted(roots)
-        # rejected after the preview; index 0 is the head of the armed set
-        kept = preview["root_ids"][index]
-        if rejection == "pinned":
-            await asyncio.to_thread(set_retention_pin, home, kept, lease, pinned=True)
-        else:
+        head = preview["root_ids"][0]
+        request = await asyncio.to_thread(_Request, home)
+        if row == "pinned-head":
+            await asyncio.to_thread(set_retention_pin, home, head, lease, pinned=True)
+        elif row == "opened-head":
             # the user holds this session open for the whole chain
-            opened = await asyncio.to_thread(SessionManager(home).open, kept)
+            opened = await asyncio.to_thread(SessionManager(home).open, head)
+        elif row in {"final-walk-yield", "final-walk-budget"}:
+            in_final_walk.append(head)
+        elif row == "user-open-yield":
+            request.hold()
         assert (await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)).applied
         signal.idle.clear()
+        before = passes[0]
         owner.wake()
         await _settle(signal.idle)
+        armed_passes = passes[0] - before
 
-        deleted = {root for row in published if row["mode"] == "deleted" for root in row["root_ids"]}
-        assert deleted == set(roots) - {kept}, f"{len(deleted)} of 3 eligible roots deleted"
-        assert sorted(path.name for path in (home / "sessions").iterdir()) == [kept]
-        # the chain ends with a fresh complete preview, then waits for the next wake
-        assert published[-1]["mode"] == "preview" and published[-1]["root_ids"] == []
+        def deleted() -> set[str]:
+            return {root for item in published if item["mode"] == "deleted" for root in item["root_ids"]}
+
+        errors = [error for item in published for error in item.get("errors") or ()]
+        left = sorted(path.name for path in (home / "sessions").iterdir())
+        if row in {"deleted", "pinned-head", "opened-head", "final-walk-budget"}:
+            kept = set() if row == "deleted" else {head}
+            # one wake deletes every other root: a rejected head does not end the chain
+            assert deleted() == set(roots) - kept, f"{len(deleted())} of {len(roots) - len(kept)} eligible roots deleted"
+            assert left == sorted(kept)
+            # the armed set is done: the chain ends on a fresh complete preview, then waits
+            assert published[-1]["mode"] == "preview" and published[-1]["preview_id"] is not None
+            if row == "final-walk-budget":
+                from zeta.session_retention import FINAL_WALK_BUDGET_REASON
+
+                assert errors == [FINAL_WALK_BUDGET_REASON], errors
+                # the kept root is old and closed, so the next preview lists it again
+                assert published[-1]["root_ids"] == [head]
+            else:
+                assert published[-1]["root_ids"] == []
+        elif row == "repeated-outcome":
+            # quarantine, then the republished id blocks the root: once a step, once a repeat
+            assert armed_passes == 3, f"{armed_passes} passes"
+            assert left == [head] and errors == ["id_republished"], errors
+        elif row == "error-after-changed":
+            # the failed transaction ends the episode; it is not progress to repeat at once
+            assert armed_passes == 1, f"{armed_passes} passes, {no_space.attempts} failed mkdirs"
+            assert errors == [str(OSError(errno.ENOSPC, os.strerror(errno.ENOSPC)))], errors
+            assert left == roots
+            signal.idle.clear()
+            owner.wake()
+            await _settle(signal.idle)
+            # the next wake retries once; the same error is not published again
+            assert (passes[0] - before, no_space.attempts) == (2, 2)
+            assert [error for item in published for error in item.get("errors") or ()] == errors
+        else:
+            # a user open yields: no error card, nothing deleted while the request is held
+            assert errors == [] and deleted() == set(), (errors, deleted())
+            assert left == sorted(roots)
+            if row == "user-open-yield":
+                # held at episode start: each retry is one episode with no pass, then a wait
+                held = (episodes[0], passes[0])
+                signal.idle.clear()
+                await _settle(signal.idle)
+                assert (episodes[0], passes[0]) == (held[0] + 1, held[1]), (held, episodes[0], passes[0])
+            # released: the owner resumes by itself, with no wake
+            await asyncio.to_thread(request.close)
+            request = None
+            await _settle(chain_done)
+            assert deleted() == set(roots), f"{len(deleted())} of {len(roots)} roots deleted after the user open"
+            assert [error for item in published for error in item.get("errors") or ()] == []
     finally:
+        if request is not None:
+            await asyncio.to_thread(request.close)
         if opened is not None:
             await asyncio.to_thread(opened.store.close)
         await owner.stop()
