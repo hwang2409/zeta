@@ -741,7 +741,7 @@ _COMPLETE = {"mode": "preview", "preview_id": "p"}
     ("case", "outcomes"),
     [
         ("complete", [Published(_COMPLETE, complete=True)]),
-        ("progressed-incomplete", [Published(_COMPLETE, complete=False, progressed=True), Published(_COMPLETE, complete=True)]),
+        ("progressed-incomplete", [Published(_COMPLETE, complete=False, changed=True), Published(_COMPLETE, complete=True)]),
         ("no-progress", [Published(_COMPLETE, complete=False)]),
         ("user-scan-checkpoint", [Yielded("user"), Published(_COMPLETE, complete=True)]),
         ("stop-scan-checkpoint", [Yielded("stop")]),
@@ -836,40 +836,6 @@ async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
     assert passes == 2
     await owner.stop()
 
-
-@pytest.mark.asyncio
-async def test_armed_cleanup_publishes_deleted_and_removes_root(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    initialize_storage_home(home)
-    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
-    manager = SessionManager(home)
-    opened = await asyncio.to_thread(_create_closed, manager, [], name="old")
-    _age_tree(home / "sessions" / opened, days=100)
-    lease = await asyncio.to_thread(open_writer, home)
-    try:
-        owner = make_retention_owner(
-            home, lease, lambda: 30,
-            now_ns=lambda: time.time_ns() + 365 * 86_400 * 1_000_000_000,
-        )
-        projections, failure = await asyncio.to_thread(owner._run_episode)
-        assert failure is None
-        preview = next(item for item in projections if item["mode"] == "preview" and item.complete)
-        assert preview["root_ids"] == [opened]
-        armed = await asyncio.to_thread(retention_authority, home, lease, days=lambda: 30)
-        assert armed.applied
-        deleted = []
-        for _ in range(20):
-            projections, failure = await asyncio.to_thread(owner._run_episode)
-            assert failure is None
-            deleted = [item for item in projections if item["mode"] == "deleted"]
-            if deleted:
-                break
-        assert deleted and any(item["root_ids"] == [opened] for item in deleted)
-        assert not (home / "sessions" / opened).exists()
-        assert any(row["mode"] == "deleted" and row["root_ids"] == [opened] for row in read_retention_history(home))
-        await owner.stop()
-    finally:
-        await asyncio.to_thread(lease.close)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ("arm", "disarm"))

@@ -8,7 +8,7 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..storage_format import (
     StorageFeature,
@@ -36,19 +36,48 @@ from .handshake import ensure_handshake_files, planner_active, planner_request_p
 class Published:
     def __init__(
         self, projection: dict[str, object], *, complete: bool,
-        progressed: bool = False, stepped: bool = False,
+        mode: str | None = None, stepped: bool = False,
+        changed: bool = False, moved: bool = False,
     ) -> None:
         self.projection = projection
         self.complete = complete
-        self.progressed = progressed
-        # one armed root got its outcome: the chain goes on to the next root at once
+        # the facts next_step decides from: the transaction mode (None for a sweep pass),
+        # an armed root's terminal outcome, a durable change, and a moved progress marker
+        self.mode = mode
         self.stepped = stepped
+        self.changed = changed
+        self.moved = moved
 
     def __getitem__(self, key: str) -> object:
         return self.projection[key]
 
     def get(self, key: str, default: object = None) -> object:
         return self.projection.get(key, default)
+
+
+Step = Literal["pass", "episode", "wait", "yield", "stop"]
+# a user open is short: retry this soon after yielding to one, not at the next daily wake
+_YIELD_RETRY_SECONDS = 1.0
+
+
+def next_step(outcome: Published | Yielded | Exception | None) -> Step:
+    """The one owner rule: from one pass outcome, continue now, end and wait, or yield.
+
+    pass: next pass in this episode. episode: publish this card, then the next root at once.
+    wait: publish and wait for the next wake. yield: release, retry after a user open.
+    """
+    if isinstance(outcome, Yielded):
+        return "stop" if outcome.reason == "stop" else "yield"
+    if not isinstance(outcome, Published):
+        # no pass ran, or it failed: its error is published once and the next wake retries
+        return "wait"
+    if outcome.stepped:
+        return "episode"
+    if outcome.complete or outcome.mode is not None:
+        # a transaction outcome that is not a step (repeated, or a failure before any root
+        # outcome) touched disk but moved nothing: continuing would repeat it forever
+        return "wait"
+    return "pass" if outcome.changed or outcome.moved else "wait"
 
 
 _UNSEEDED = object()
@@ -145,7 +174,7 @@ def make_retention_owner(
             current = token.generation(days())
             history = read_retention_history(root)
             # a transaction outcome (deleted, rejected, or blocked) is a fact: always publish it
-            effectful = result.mode is not None or bool(getattr(result, "changed", False))
+            effectful = result.mode is not None or result.changed
             if (
                 history
                 and history[-1].get("mode") == "armed"
@@ -174,8 +203,10 @@ def make_retention_owner(
         return Published(
             projection,
             complete=result.complete,
-            progressed=bool(getattr(result, "changed", False)) or before != _progress_marker(planner),
+            mode=result.mode,
             stepped=result.stepped,
+            changed=result.changed,
+            moved=before != _progress_marker(planner),
         )
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:
@@ -298,6 +329,7 @@ class RetentionActivationOwner:
         return not (isinstance(last, dict) and same_retention_result(last, projection))
 
     def _run_episode(self) -> tuple[list[Published], Yielded | Exception | None]:
+        """Run passes while next_step says pass; return the cards and a yield or failure."""
         projections: list[Published] = []
         failure: Exception | None = None
         planner = None
@@ -319,7 +351,7 @@ class RetentionActivationOwner:
                     history = ()
                 self._last_published = history[-1] if history else None
             if self._home is not None and planner_request_pending(self._home):
-                return projections, None
+                return projections, Yielded("user")
             if disarm:
                 projections.append(Published(self._disable(), complete=True))
                 return projections, None
@@ -347,8 +379,7 @@ class RetentionActivationOwner:
                         if isinstance(projection, Yielded):
                             return projections, projection
                         projections.append(projection)
-                        # a stepped root ends the episode so its card shows now; _run continues the chain
-                        if projection.stepped or projection.complete or not projection.progressed:
+                        if next_step(projection) != "pass":
                             break
                 planner.close()
                 planner = None
@@ -388,19 +419,18 @@ class RetentionActivationOwner:
                     raise
                 except Exception:  # noqa: BLE001,S110 - publication must not kill the owner
                     pass
-                if self._stop.is_set():
+                step = next_step(outcome if outcome is not None else (projections[-1] if projections else None))
+                if self._stop.is_set() or step == "stop":
                     return
-                if isinstance(outcome, Yielded):
-                    if outcome.reason == "stop":
-                        return
-                    await asyncio.sleep(0)
-                    continue
-                if outcome is None and projections and projections[-1].stepped:
+                if step in {"pass", "episode"}:
                     # continuation: the armed set is not done until no unattempted root is left
                     await asyncio.sleep(0)
                     continue
                 try:
-                    await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
+                    await asyncio.wait_for(
+                        self._wake.wait(),
+                        _YIELD_RETRY_SECONDS if step == "yield" else self._wake_seconds,
+                    )
                 except TimeoutError:
                     pass
         finally:

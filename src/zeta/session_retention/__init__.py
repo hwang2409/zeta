@@ -265,6 +265,7 @@ from .transaction import (
     Candidate,
     CandidateRejected,
     TransactionOutcome,
+    TransactionYield,
     _QuarantineTransaction,
 )
 
@@ -602,6 +603,14 @@ class _Deferred(Exception):
     """The shared pass budget ran out; the in-flight root resumes next pass."""
 
 
+# a root whose final walk outlasts one pass budget is kept: a retry would repeat the same walk
+FINAL_WALK_BUDGET_REASON = "final candidate walk exceeded its budget"
+
+
+class _UserYield(_Deferred):
+    """A user open (or stop) is pending; the pass releases at once."""
+
+
 @dataclass
 class _Budget:
     """One pass's shared work budget, checked after each entry and record."""
@@ -617,7 +626,7 @@ class _Budget:
     def charge_entry(self, size: int = 0) -> None:
         self.entries += 1
         if self.yield_check is not None and self.yield_check():
-            raise _Deferred
+            raise _UserYield
         if self.entries > self.bounds.entries_total or self.clock() >= self.deadline:
             raise _Deferred
 
@@ -971,6 +980,11 @@ class RetentionPlanner:
                     reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
                 except (OSError, SessionError, RetentionPlannerError) as exc:
                     reason = _failure_reason(exc)
+                except _UserYield as exc:
+                    raise TransactionYield from exc
+                except _Deferred:
+                    # the final walk cannot resume across passes (its flight closes below)
+                    reason = FINAL_WALK_BUDGET_REASON
                 if reason is not None:
                     raise CandidateRejected(reason)
                 generation = read_reference_generation(self.home)
