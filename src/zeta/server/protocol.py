@@ -281,6 +281,7 @@ FEATURES = (
     "session_retention",
     "mcp_refresh_tools",
     "resume_attach",
+    "turn_reconnect",
 )
 
 
