@@ -36,14 +36,14 @@ from .handshake import ensure_handshake_files, planner_active, planner_request_p
 class Published:
     def __init__(
         self, projection: dict[str, object], *, complete: bool,
-        mode: str | None = None, stepped: bool = False,
+        transaction_mode: str | None = None, stepped: bool = False,
         changed: bool = False, moved: bool = False,
     ) -> None:
         self.projection = projection
         self.complete = complete
-        # the facts next_step decides from: the transaction mode (None for a sweep pass),
+        # the facts next_step decides from: the transaction's mode (None for a sweep pass),
         # an armed root's terminal outcome, a durable change, and a moved progress marker
-        self.mode = mode
+        self.transaction_mode = transaction_mode
         self.stepped = stepped
         self.changed = changed
         self.moved = moved
@@ -73,7 +73,7 @@ def next_step(outcome: Published | Yielded | Exception | None) -> Step:
         return "wait"
     if outcome.stepped:
         return "episode"
-    if outcome.complete or outcome.mode is not None:
+    if outcome.complete or outcome.transaction_mode is not None:
         # a transaction outcome that is not a step (repeated, or a failure before any root
         # outcome) touched disk but moved nothing: continuing would repeat it forever
         return "wait"
@@ -203,7 +203,7 @@ def make_retention_owner(
         return Published(
             projection,
             complete=result.complete,
-            mode=result.mode,
+            transaction_mode=result.mode,
             stepped=result.stepped,
             changed=result.changed,
             moved=before != _progress_marker(planner),
