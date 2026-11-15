@@ -2193,5 +2193,5 @@ async def test_send_holding_its_echo_orders_against_end_of_turn_steering(
         release_echo.set()
         backend.release.set()
         if send is not None:
-            await asyncio.gather(send, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(send, return_exceptions=True), 10)
         await close_serve(server, writer)
