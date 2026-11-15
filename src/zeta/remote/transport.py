@@ -117,7 +117,8 @@ class RemoteTransport:
         stop_waiter = asyncio.create_task(asyncio.to_thread(self._stop.wait))
         done, _ = await asyncio.wait({waiter, *readers, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
         if process.returncode is None and (self._stop.is_set() or any(task in done for task in readers)):
-            with contextlib.suppress(ProcessLookupError):
+            # darwin answers EPERM when ssh already exited but is not reaped yet; wait() below reaps it.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGTERM)
         await process.wait()
         stop_waiter.cancel()

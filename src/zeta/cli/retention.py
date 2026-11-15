@@ -6,13 +6,11 @@ import argparse
 import asyncio
 from collections.abc import Callable
 
-from ..core.session import SessionError
 from ..storage_format import StorageFormatError
 
 
 def create_tui_app(
     args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
     tui_print: Callable[[str], None],
     has_console_message: Callable[[Exception], bool],
 ) -> object | None:
@@ -23,11 +21,10 @@ def create_tui_app(
             tui_print("Loading session…")
             return asyncio.run(asyncio.to_thread(create_app, args))
         return create_app(args)
-    except SessionError as exc:
-        parser.error(str(exc))
     except StorageFormatError:
         raise
     except ValueError as exc:
+        # SessionError lands here too; stderr goes to logs/tui-stderr while the TUI owns the terminal.
         tui_print(f"zeta: {exc}")
         return None
     except Exception as exc:

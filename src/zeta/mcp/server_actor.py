@@ -26,6 +26,7 @@ from .client import (
     make_error_result,
     notice as _notice,
     retry_text as _retry_text,
+    detached_result as _detached_result,
     safe_close,
     unavailable_result as _unavailable_result,
 )
@@ -186,6 +187,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._generation = 0
         self._failure_count = 0
         self._manual_recovery_probe = False
+        # suspended because its session binding left; cleared by any later status.
+        self._binding_detached = False
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
@@ -837,6 +840,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._tool_refresh.settle()
 
     def _handle_call(self, request: _CallRequest) -> None:
+        if self._binding_detached:
+            _set_result(request.result, _detached_result(self.name))
+            return
         if not self.config.allows_tool(request.tool_name) or not any(
             tool.name == request.tool_name for tool in self._tools
         ):
@@ -1025,7 +1031,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             if request.task is not None:
                 request.task.cancel()
             if isinstance(request, _CallRequest):
-                _set_result(request.result, _unavailable_result(self.name))
+                _set_result(request.result, _detached_result(self.name))
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()
@@ -1036,7 +1042,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._tools = ()
         self._prompts = ()
         self._generation += 1
-        self._unregister_tools()
+        # hidden, not removed: a call the model already chose gets the detached
+        # result rather than "unknown tool" until the client re-attaches.
+        self._unregister_tools(keep_primary=True)
         if client is not None:
             await self._schedule_close(client)
         if self._scheduled_closes:
@@ -1055,6 +1063,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
         )
+        self._binding_detached = True
         self._tool_refresh.settle()
         _set_result(message.result, None)
 
@@ -1128,6 +1137,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
             self._status = terminal_status
+            self._binding_detached = False
             try:
                 self._publish_callback(self, terminal_status, None)
             except BaseException:  # noqa: BLE001 - finalization must complete
@@ -1279,6 +1289,7 @@ class MCPServerActor(MCPDefinitionPublisher):
 
     def _set_status(self, status: MCPServerStatus) -> None:
         self._status = status
+        self._binding_detached = False
         self._publish_callback(
             self,
             status,
