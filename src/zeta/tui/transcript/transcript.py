@@ -617,10 +617,21 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def durable_scroll_anchor(self) -> tuple[str, int, int] | None:
         if self._anchor is None or self._anchor[0] is None:
             return None
-        identity = self._anchor[0].history_identity
-        if identity is None:
+        unit, text_offset = self._anchor
+        if unit.history_identity is not None:
+            return (*unit.history_identity, text_offset)
+        if unit not in self._unit_set:
             return None
-        return identity[0], identity[1], self._anchor[1]
+        # Separators and other rows without identity are named by the nearest
+        # identified unit: -n means n units before the next one (ux r5 M7).
+        index = self._units.index(unit)
+        for distance, later in enumerate(self._units[index + 1 :], start=1):
+            if later is not None and later.history_identity is not None:
+                return (*later.history_identity, -distance)
+        for earlier in reversed(self._units[:index]):
+            if earlier is not None and earlier.history_identity is not None:
+                return (*earlier.history_identity, 0)
+        return None
 
     def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
         """Restore a non-tail viewport anchor after transcript reconstruction."""
@@ -639,8 +650,15 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         """Restore a viewport anchor after durable rows are reconstructed."""
 
         entry_id, unit_ordinal, text_offset = anchor
-        for unit in self._units:
+        for index, unit in enumerate(self._units):
             if unit is not None and unit.history_identity == (entry_id, unit_ordinal):
+                # Step back over the rows without identity that -n names.
+                while text_offset < 0 and index:
+                    previous = self._units[index - 1]
+                    if previous is None or previous.history_identity is not None:
+                        break
+                    index, unit, text_offset = index - 1, previous, text_offset + 1
+                text_offset = max(0, text_offset)
                 self.restore_scroll_anchor(unit, text_offset)
                 return True
         return False
