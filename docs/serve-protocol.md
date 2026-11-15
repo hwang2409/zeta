@@ -963,8 +963,10 @@ The result contains `session` (full metadata or `null`), `state` (`idle`,
 instance that owns the approval. An approval may also carry `label`, an optional
 display-only string naming the call's target; it is absent when there is none.
 
-`state` is `"running"` whenever `send` would refuse with `-32004`
-(`a turn is already running`) because `turn_busy()` is true. If the server is
+`state` is `"running"` whenever a state-changing request would refuse with
+`-32004` (`a turn is already running`): during a turn, and while a queued
+notification turn runs its setup before its `turn_start`. In that setup window
+`send` is still accepted and replaces the queued turn. If the server is
 unhealthy because approval persistence failed, `state` remains `"idle"` and
 `send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
 separate error and does not change the unhealthy status behavior.
@@ -1556,10 +1558,10 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    provider-segment `turn_start` in that served turn. It occurs at most once per
    served turn and has one closed `data.reason`: `completed`, `user_stop`,
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
-   and `status.state` is `idle` until the next `turn_start`; a queued
-   notification turn is not busy until its `turn_start` is published, so a send
-   that arrives first wins. State changes are stricter: once a queued
-   notification turn has started its setup (before its `turn_start`),
+   until the next `turn_start`; a queued notification turn is not busy for
+   `send` until its `turn_start` is published, so a send that arrives first
+   wins. State changes are stricter: once a queued notification turn has
+   started its setup (before its `turn_start`), `status.state` is `running` and
    `slash_run` commands that `runs_while_busy` does not allow, idle-only
    requests, `new_session`, and `resume` of another session return `-32004`
    until that turn ends. With `resume_attach`, `resume` of the open session
