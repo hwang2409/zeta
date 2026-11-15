@@ -332,6 +332,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
     from tests.support.fake_backend import FakeBackend
     from tests.support.owned import await_or_fail, owned_app
     from tests.support.serve_close import close_serve
+    from tests.support.server_client import read_until
     from tests.test_server import _ready_extensions, _request
     from zeta.cli.main import main as cli_main
 
@@ -409,6 +410,22 @@ async def test_p06_below_epoch_real_tui_serve_journey(
         session = app._make_session()
         app._active_session = session
         app._install_full_screen_layout(session)
+        # both sessions are in this project and race for the one model wake per
+        # inbox message. hold the TUI poller so the serve session always wins and
+        # runs its notification turn; the slash_run below must wait for its end.
+        serve_turn_ended = asyncio.Event()
+        tui_poll = app.loop._poll_project_inbox_once
+
+        async def tui_poll_after_serve_turn() -> None:
+            await await_or_fail(
+                serve_turn_ended.wait(), what="serve inbox notification turn end"
+            )
+            await tui_poll()
+
+        # test-contract: seam the poll is the only point that orders two sessions' wake claims
+        monkeypatch.setattr(
+            app.loop, "_poll_project_inbox_once", tui_poll_after_serve_turn
+        )
         async with owned_app(app):
             await await_or_fail(app.loop.activate(), what="below-epoch TUI activation")
             sent = await await_or_fail(
@@ -441,6 +458,14 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 message["id"] == message_id
                 for message in listed["structuredContent"]["messages"]
             )
+            server.runtime.loop.notify_project_inbox_publication()
+            await read_until(
+                reader,
+                lambda frame: frame.get("params", {}).get("event") == "turn_end"
+                and frame["params"].get("session_id") == serve_session_id,
+                what="serve inbox notification turn_end",
+            )
+            serve_turn_ended.set()
 
             record = await asyncio.to_thread(
                 AttentionStore(
