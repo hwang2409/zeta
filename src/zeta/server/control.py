@@ -126,6 +126,8 @@ class ServeControl:
         self.server = server
         self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
+        # The scheduled notification turn; a send may preempt it before it starts.
+        self._notification_task: asyncio.Task[None] | None = None
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
         self._notification_turn_started = False
@@ -177,7 +179,7 @@ class ServeControl:
             and loop is not None
             and loop.notification_turn_state != "idle"
         ):
-            notification_task = self._turn_task
+            notification_task = self._notification_task
             loop.cancel_scheduled_notification_turn()
             if notification_task is not None and not notification_task.done():
                 notification_task.cancel()
@@ -230,7 +232,8 @@ class ServeControl:
                 self._turn_task is not None
                 and not self._turn_task.done()
                 and (
-                    loop is None
+                    self._turn_task is not self._notification_task
+                    or loop is None
                     or loop.notification_turn_state == "idle"
                     or self._notification_turn_started
                     or not self._turn_end_published
@@ -746,7 +749,7 @@ class ServeControl:
         ) or not loop.schedule_notification_turn():
             return
         self._notification_turn_started = False
-        self._turn_task = asyncio.create_task(
+        self._turn_task = self._notification_task = asyncio.create_task(
             self._run_notification_turn(
                 session_id, host_commands, turn_id=uuid.uuid4().hex
             )
