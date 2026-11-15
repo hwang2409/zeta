@@ -450,6 +450,52 @@ async def test_close_closes_abandoned_setup_client_whose_result_is_still_queued(
 
 
 @pytest.mark.asyncio
+async def test_http_request_cancelled_as_its_connect_finishes_closes_the_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # anyio < 4.16 kept the connected socket when the cancel came in the same
+    # pass as the connect result; the open socket hung the MCP server's close
+    from anyio._backends._asyncio import AsyncIOBackend
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _REAL_ASYNC_HTTP
+    )
+    real_connect = AsyncIOBackend.connect_tcp.__func__
+
+    async def connect_then_cancel(cls, *args, **kwargs):
+        stream = await real_connect(cls, *args, **kwargs)
+        for state in client._active_requests.values():
+            state.task.cancel()  # the task that awaits connect_tcp
+        return stream
+
+    monkeypatch.setattr(AsyncIOBackend, "connect_tcp", classmethod(connect_then_cancel))
+    peer_closed = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.read()
+            peer_closed.set()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = _http_client(f"http://127.0.0.1:{port}", tmp_path / "home")
+    connecting = asyncio.create_task(client.connect())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(connecting, what="cancelled connect")
+        await await_or_fail(
+            peer_closed.wait(), what="cancelled connect socket close"
+        )
+    finally:
+        connecting.cancel()
+        await await_or_fail(client.close(), what="client close")
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_deadline_covers_call_work_before_first_yield(tmp_path: Path) -> None:
     now = 0.0
 
