@@ -657,7 +657,8 @@ class _Client:
             return self._controller_release
         if self.role == "controller" and self.connections.is_controller(self):
             self._controller_release = self.server.control.begin_controller_release(
-                reconnect="approval_reconnect" in self.features
+                reconnect="approval_reconnect" in self.features,
+                keep_turn="turn_reconnect" in self.features,
             )
         return self._controller_release
 
@@ -753,6 +754,8 @@ class _Client:
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
+        if "turn_reconnect" in accepted and "approval_reconnect" not in accepted:
+            accepted.remove("turn_reconnect")
         if (
             "child_run_events" in accepted
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)

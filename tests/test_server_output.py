@@ -365,8 +365,8 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     pending_requests: list[asyncio.Task[dict[str, Any]]] = []
     fenced = False
 
-    def gated_release(reconnect: bool) -> Awaitable[None]:
-        operation = original_release(reconnect)
+    def gated_release(reconnect: bool, **kwargs: Any) -> Awaitable[None]:
+        operation = original_release(reconnect, **kwargs)
 
         async def wait() -> None:
             await asyncio.wait_for(operation, RELEASE_GATE_GUARD_SECONDS)
@@ -780,12 +780,11 @@ async def test_controller_overflow_does_not_cancel_active_turn(
         session_id: str,
         state: Any,
         *args: Any,
-        schedule_wake: bool,
     ) -> None:
         turn_id, outcome = args if len(args) == 2 else (None, args[0])
         finalized_turn_ids.append(turn_id)
         outcomes.append(str(outcome))
-        await original_finalize(session_id, state, *args, schedule_wake=schedule_wake)
+        await original_finalize(session_id, state, *args)
         turn_finalized.set()
 
     # test-contract: seam stalls the real transport at a deterministic write

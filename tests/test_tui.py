@@ -6107,8 +6107,13 @@ def test_background_agent_refresh_invalidates_transcript_search(
 
 
 def test_agent_card_toggle_is_symmetric_during_and_after_execution(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from zeta.tui.cards import agent as agent_card_module
+
+    # The card times itself with time.monotonic; a fixed clock keeps the text exact on slow runners.
+    now = [100.0]
+    monkeypatch.setattr(agent_card_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
     child = ConversationStore(tmp_path / "agents", session_id="1")
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("live tail")]))
     call = ToolCall(
@@ -6147,8 +6152,9 @@ def test_agent_card_toggle_is_symmetric_during_and_after_execution(
             },
         ),
     )
+    now[0] += 0.1
     transcript.finish_tool(call.id, render_event(event), event)
-    assert "1 turns · 0.0s · completed" in transcript.render(120)
+    assert "1 turns · 0.1s · completed" in transcript.render(120)
     assert transcript.toggle_latest_agent()
     rendered = Text.from_ansi(transcript.render(120)).plain
     assert "expand: ctrl+x ctrl+o" not in rendered

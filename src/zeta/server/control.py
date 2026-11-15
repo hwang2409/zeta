@@ -138,6 +138,8 @@ class ServeControl:
         self._grace_task: asyncio.Task[None] | None = None
         self._controller_release_task: asyncio.Task[None] | None = None
         self._grace_expiring = False
+        # a controller holds the slot; the end-of-turn step starts no turn without one.
+        self._controller_attached = False
         self._model_inputs = PendingModelInputs()
         self.deliveries = DeliveryRequests(self)
         # Serve reads requests serially per connection and has one controller,
@@ -206,11 +208,20 @@ class ServeControl:
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
 
-    def reject_client_turn_if_detached(self) -> None:
-        if (
+    def controller_present(self) -> bool:
+        """A controller is attached, or one may still reclaim within the grace."""
+        return self._controller_attached or (
+            self._grace_task is not None and not self._grace_expiring
+        )
+
+    def client_turn_detached(self) -> bool:
+        return (
             (self._host_binding_required and self._active_host_commands is None)
             or (self._mcp_binding_required and not self._active_mcp_bindings)
-        ):
+        )
+
+    def reject_client_turn_if_detached(self) -> None:
+        if self.client_turn_detached():
             raise ProtocolError(
                 ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
@@ -333,14 +344,14 @@ class ServeControl:
             await self._approvals.wait_for_approval_settlement(timeout)
 
     def begin_controller_release(
-        self, *, reconnect: bool = False
+        self, *, reconnect: bool = False, keep_turn: bool = False
     ) -> asyncio.Task[None]:
         previous = self._controller_release_task
         # Establish approval grace before the physical controller slot is released.
         operation = (
             None
             if previous is not None and not previous.done()
-            else self._controller_release(reconnect)
+            else self._controller_release(reconnect, keep_turn=keep_turn)
         )
 
         async def release() -> None:
@@ -369,6 +380,7 @@ class ServeControl:
             if self._controller_release_task is release:
                 self._controller_release_task = None
         self._host_binding_required |= require_host_binding
+        self._controller_attached = True
         task = self._grace_task
         if task is None:
             return True
@@ -405,7 +417,10 @@ class ServeControl:
     async def controller_released(self, *, reconnect: bool = False) -> None:
         await self._controller_release(reconnect)
 
-    def _controller_release(self, reconnect: bool) -> Awaitable[None]:
+    def _controller_release(
+        self, reconnect: bool, *, keep_turn: bool = False
+    ) -> Awaitable[None]:
+        self._controller_attached = False
         self._active_host_commands = None
         had_mcp_bindings = bool(self._active_mcp_bindings)
         self._active_mcp_bindings = {}
@@ -423,7 +438,10 @@ class ServeControl:
                 await asyncio.shield(self._grace_task)
 
             return wait_for_grace()
-        if reconnect and self._approvals.has_pending_approvals():
+        if reconnect and (
+            self._approvals.has_pending_approvals()
+            or (keep_turn and bool(self._grace_protected(self._notification_task)))
+        ):
             self._approvals.transition(BeginGrace())
             self._grace_task = asyncio.create_task(self._expire_grace())
 
@@ -444,9 +462,38 @@ class ServeControl:
 
         return disconnect()
 
+    def _grace_protected(
+        self, wake: asyncio.Task[None] | None = None
+    ) -> set[asyncio.Task[None]]:
+        """The client's running turn or its end-of-turn step, which may start the next.
+
+        A background wake turn is protected only when it ran at the disconnect
+        (``wake``); one that starts later is not the gone client's work.
+        """
+        return {
+            task
+            for task in (self._turn_task, self._turn_handoff_task)
+            if task is not None
+            and not task.done()
+            and (task is not self._notification_task or task is wake)
+        }
+
+    async def _grace_deadline(self) -> None:
+        await asyncio.sleep(self.server.approval_reconnect_grace)
+
     async def _expire_grace(self) -> None:
+        deadline = asyncio.create_task(self._grace_deadline())
+        wake = self._notification_task
         try:
-            await asyncio.sleep(self.server.approval_reconnect_grace)
+            # the grace ends early once no client turn runs and no approval
+            # waits, so a later wake is not cancelled by this old deadline.
+            while not deadline.done():
+                protected = self._grace_protected(wake)
+                if not protected and not self._approvals.has_pending_approvals():
+                    return
+                await asyncio.wait(
+                    {deadline, *protected}, return_when=asyncio.FIRST_COMPLETED
+                )
             self._grace_expiring = True
             expiry = asyncio.create_task(self._approvals.transition(Expire()))
             try:
@@ -456,6 +503,7 @@ class ServeControl:
                 raise
             await self._disconnect_turn()
         finally:
+            deadline.cancel()
             self._grace_expiring = False
             if self._grace_task is asyncio.current_task():
                 self._grace_task = None
@@ -479,6 +527,14 @@ class ServeControl:
             await asyncio.gather(task, return_exceptions=True)
             self._grace_task = None
         await self.controller_released()
+        await self._finish_turn_handoff()
+
+    async def _finish_turn_handoff(self) -> None:
+        # the finished turn's end-of-turn step may still drop steering; it must
+        # write before the runtime closes.
+        task = self._turn_handoff_task
+        if task is not None and task is not asyncio.current_task():
+            await asyncio.gather(task, return_exceptions=True)
 
     async def user_message(
         self,
@@ -733,7 +789,6 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -747,7 +802,9 @@ class ServeControl:
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(
+                session_id, state, allow_assistant_reset=allow_assistant_reset
+            )
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -846,14 +903,13 @@ class ServeControl:
                     state,
                     turn_id,
                     outcome,
-                    schedule_wake=False,
                 )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -914,11 +970,11 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None

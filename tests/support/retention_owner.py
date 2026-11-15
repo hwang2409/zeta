@@ -45,18 +45,22 @@ def _planner(stack, *args, **kwargs):
     return planner
 
 
-def _age_tree(session_dir, *, days=100, keep_metadata=False):
-    """Make a session look old: metadata timestamps and every mtime."""
-    if not keep_metadata:
-        meta = session_dir / "meta.json"
-        value = json.loads(meta.read_text())
-        value["created_at"] = value["updated_at"] = _OLD
-        meta.write_text(json.dumps(value))
+def _age_tree(session_dir, *, days=100):
+    """Make a session look old: the root header time and every mtime."""
+    _set_header_created_at(session_dir, _OLD)
     old = time.time_ns() - days * _DAY_NS
     for dirpath, _dirs, files in os.walk(session_dir, topdown=False):
         for name in files:
             os.utime(os.path.join(dirpath, name), ns=(old, old), follow_symlinks=False)
         os.utime(dirpath, ns=(old, old))
+
+
+def _set_header_created_at(session_dir, text):
+    transcript = session_dir / "conversation.jsonl"
+    header, newline, rest = transcript.read_bytes().partition(b"\n")
+    value = json.loads(header)
+    value["data"]["created_at"] = text
+    transcript.write_bytes(json.dumps(value).encode() + newline + rest)
 
 
 def _run_sweep(planner, days=30):

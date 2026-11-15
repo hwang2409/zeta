@@ -197,6 +197,14 @@ def unavailable_result(name: str) -> StructuredToolResult:
     )
 
 
+def detached_result(name: str) -> StructuredToolResult:
+    return make_error_result(
+        f"MCP server '{name}' is unavailable because the client that provides it "
+        "disconnected. The tool is not broken: the client may reconnect soon and "
+        "re-attach it."
+    )
+
+
 def require_capability(
     capabilities: Mapping[str, object] | None, name: str, server: str
 ) -> None:
