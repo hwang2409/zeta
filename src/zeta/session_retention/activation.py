@@ -28,6 +28,7 @@ from . import (
     project_retention_result,
     read_retention_history,
     retention_result,
+    same_retention_result,
 )
 from .handshake import ensure_handshake_files, planner_active, planner_request_pending
 
@@ -45,21 +46,11 @@ class Published:
         return self.projection.get(key, default)
 
 
-def _progress_marker(planner: Any, projection: dict[str, object] | None = None) -> str:
-    progress = projection or {}
-    return repr(
-        (
-            getattr(planner, "progress_marker", lambda: ())(),
-            progress.get("progress_counts"), progress.get("skip_counts"),
-            progress.get("mode"), progress.get("root_ids"),
-        )
-    )
+_UNSEEDED = object()
 
 
-def _same_projection(left: dict[str, object], right: dict[str, object]) -> bool:
-    return {key: value for key, value in left.items() if key != "timestamp"} == {
-        key: value for key, value in right.items() if key != "timestamp"
-    }
+def _progress_marker(planner: Any) -> tuple[object, ...]:
+    return getattr(planner, "progress_marker", lambda: ())()
 
 
 def _stale_projection(
@@ -184,8 +175,8 @@ def make_retention_owner(
                 last_projection = projection
         return Published(
             projection,
-            complete=result.complete or projection.get("mode") == "deleted",
-            progressed=before != _progress_marker(planner, projection),
+            complete=result.complete,
+            progressed=bool(getattr(result, "changed", False)) or before != _progress_marker(planner),
         )
 
     def record_error(exc: Exception, current_days: int) -> dict[str, object]:
@@ -255,6 +246,9 @@ class RetentionActivationOwner:
         self._activation_enabled = activation_enabled
         self._session_available = session_available
         self._disable = disable
+        # one planner per process keeps the armed preview and its attempted roots across episodes
+        self._planner: Any = None
+        self._last_published: object = _UNSEEDED
 
     def set_publish(self, publish: Callable[[Any], Any] | None) -> None:
         self._publish = publish
@@ -290,6 +284,17 @@ class RetentionActivationOwner:
             await asyncio.to_thread(self._close_lease)
             self._close_lease = None
 
+    def _should_publish(self, projection: dict[str, object]) -> bool:
+        """Publish only what changed since the last card, across episodes and restarts."""
+        if (
+            projection.get("mode") == "preview"
+            and projection.get("preview_id") is None
+            and not projection.get("errors")
+        ):
+            return False
+        last = self._last_published
+        return not (isinstance(last, dict) and same_retention_result(last, projection))
+
     def _run_episode(self) -> tuple[list[Published], Yielded | Exception | None]:
         projections: list[Published] = []
         failure: Exception | None = None
@@ -305,12 +310,20 @@ class RetentionActivationOwner:
             )
             if days == 0 and not disarm:
                 return projections, None
+            if self._last_published is _UNSEEDED and self._home is not None:
+                try:
+                    history = read_retention_history(self._home)
+                except Exception:  # noqa: BLE001 - a corrupt history only means no seed
+                    history = ()
+                self._last_published = history[-1] if history else None
             if self._home is not None and planner_request_pending(self._home):
                 return projections, None
             if disarm:
                 projections.append(Published(self._disable(), complete=True))
                 return projections, None
-            planner = self._planner_factory()
+            if self._planner is None:
+                self._planner = self._planner_factory()
+            planner = self._planner
             if not getattr(planner, "enabled", True):
                 return projections, None
             context = planner_active(self._home) if self._home is not None else _null_context()
@@ -334,6 +347,9 @@ class RetentionActivationOwner:
                         projections.append(projection)
                         if projection.complete or not projection.progressed:
                             break
+                        # a deleted root ends the episode so its card shows now; _run continues the chain
+                        if projection.get("mode") == "deleted":
+                            break
                 planner.close()
                 planner = None
         except asyncio.CancelledError:
@@ -349,28 +365,23 @@ class RetentionActivationOwner:
         try:
             await asyncio.sleep(0)
             while not self._stop.is_set():
+                # cleared before the episode, so a wake (an arm) during the episode is not lost
+                self._wake.clear()
                 self._episode_task = asyncio.create_task(
                     asyncio.to_thread(self._run_episode), name="retention-episode"
                 )
                 projections, outcome = await asyncio.shield(self._episode_task)
                 self._episode_task = None
                 try:
-                    published_projection: dict[str, object] | None = None
-                    for projection in projections:
-                        if (
-                            published_projection is not None
-                            and _same_projection(published_projection, projection.projection)
-                        ):
-                            continue
-                        if self._publish is not None:
-                            published = self._publish(projection.projection)
-                            if inspect.isawaitable(published):
-                                await published
-                        published_projection = projection.projection
+                    outputs = [projection.projection for projection in projections]
                     if isinstance(outcome, Exception) and not self._stop.is_set():
-                        error = await asyncio.to_thread(lambda failed=outcome: self._on_error(failed, self._days()))
+                        outputs.append(await asyncio.to_thread(lambda failed=outcome: self._on_error(failed, self._days())))
+                    for output in outputs:
+                        if not self._should_publish(output):
+                            continue
+                        self._last_published = output
                         if self._publish is not None:
-                            published = self._publish(error)
+                            published = self._publish(output)
                             if inspect.isawaitable(published):
                                 await published
                 except asyncio.CancelledError:
@@ -384,7 +395,10 @@ class RetentionActivationOwner:
                         return
                     await asyncio.sleep(0)
                     continue
-                self._wake.clear()
+                if outcome is None and projections and projections[-1].get("mode") == "deleted":
+                    # continuation: the armed set is not done until a pass deletes nothing
+                    await asyncio.sleep(0)
+                    continue
                 try:
                     await asyncio.wait_for(self._wake.wait(), self._wake_seconds)
                 except TimeoutError:

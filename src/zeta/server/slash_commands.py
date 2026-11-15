@@ -46,6 +46,7 @@ from ..session_retention import (
     disarm_retention,
     read_retention_history,
     retention_authority,
+    retention_status,
 )
 from ..session_retention.pin import set_retention_pin
 from .handlers import validation
@@ -150,12 +151,7 @@ class ServerSlashSession:
         command = args.strip()
         if command == "":
             history = await asyncio.to_thread(read_retention_history, self._runtime.home)
-            if not history:
-                return "retention: none"
-            latest = history[-1]
-            return "retention: " + ", ".join(
-                f"{key}={latest[key]}" for key in ("mode", "days", "count", "preview_id")
-            )
+            return retention_status(history)
         _loop, _opened = self._active_loop_and_session()
         if command == "disarm":
             result = await asyncio.to_thread(
@@ -175,6 +171,9 @@ class ServerSlashSession:
             publish = getattr(self._runtime, "retention_event_sink", None)
             if publish is not None:
                 await publish(result.projection)
+            wake = getattr(self._runtime, "retention_wake", None)
+            if result.applied and result.projection["mode"] == "armed" and wake is not None:
+                wake()
             return result.message
         return "usage: /retention [arm|disarm]"
 

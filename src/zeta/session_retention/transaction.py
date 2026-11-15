@@ -23,6 +23,7 @@ from ..attention_forks import remove_attention_source_links
 from ..attention_records import remove_fork_session_links
 from ..core.session_files import (
     SessionError,
+    SessionNotFoundError,
     SessionReferenceGate,
     atomic_publish_file,
     child_directory,
@@ -369,7 +370,13 @@ class _QuarantineTransaction:
         if not preview.get("root_ids"):
             return TransactionOutcome(False)
         session_id = preview["root_ids"][0]
-        with verify(session_id, days) as candidate:
+        with ExitStack() as held:
+            try:
+                candidate = held.enter_context(verify(session_id, days))
+            except SessionNotFoundError:
+                return TransactionOutcome(False, "session or entry disappeared", session_id)
+            except CandidateRejected as exc:
+                return TransactionOutcome(False, _bounded(str(exc)), session_id)
             txid = uuid.uuid4().hex
             reservation = {
                 "schema_version": 1,

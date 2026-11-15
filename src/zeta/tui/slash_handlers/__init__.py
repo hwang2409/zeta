@@ -50,6 +50,7 @@ from ...session_retention import (
     disarm_retention,
     read_retention_history,
     retention_authority,
+    retention_status,
 )
 from ...session_retention.pin import set_retention_pin
 from ...tools._shared.user_discovery import trust_project_tools
@@ -580,13 +581,9 @@ class SlashHandlerMixin:
         home = self._zeta_home or env_home()
         if command == "":
             history = await asyncio.to_thread(read_retention_history, home)
-            if not history:
-                return "retention: none"
-            projection = history[-1]
-            self._presenter.print_unit(render_retention_card(projection))
-            return "retention: " + ", ".join(
-                f"{key}={projection[key]}" for key in ("mode", "days", "count", "preview_id")
-            )
+            if history:
+                self._presenter.print_unit(render_retention_card(history[-1]))
+            return retention_status(history)
         if command == "disarm":
             result = await asyncio.to_thread(disarm_retention, home, self.loop.store._storage_lease)
             if result.projection["mode"] != "none" or result.projection["errors"]:
@@ -599,6 +596,9 @@ class SlashHandlerMixin:
             )
             if result.projection["mode"] != "none" or result.projection["errors"]:
                 self._presenter.print_unit(render_retention_card(result.projection))
+            owner = getattr(self, "_retention_owner", None)
+            if result.applied and result.projection["mode"] == "armed" and owner is not None:
+                owner.wake()
             return result.message
         return "usage: /retention [arm|disarm]"
 

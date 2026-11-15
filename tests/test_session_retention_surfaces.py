@@ -146,7 +146,10 @@ async def test_real_slash_retention_read_mutation_and_idempotence(tmp_path: Path
         assert bare["kind"] == "output"
         assert bare["text"].startswith("retention: ")
         arm = (await _request(reader, writer, 4, "slash_run", {"session_id": sid, "text": "/retention arm"}))[-1]["result"]
-        assert arm["text"] == "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
+        assert arm["text"] == (
+            "retention armed: deleting 0 sessions older than 30 days starts now in this process; "
+            "other zeta processes on this home start on their next pass"
+        )
         assert (home / "retention-arm.json").is_file()
         arm_again = (await _request(reader, writer, 5, "slash_run", {"session_id": sid, "text": "/retention arm"}))[-1]["result"]
         assert arm_again["kind"] == "output"
@@ -198,7 +201,7 @@ async def test_retention_policy_stays_preview_only_until_later_armed_pass(tmp_pa
     await _seed_preview_async(home)
     assert not (home / "retention-arm.json").exists()
     result = await asyncio.to_thread(_unarmed_authority, home)
-    assert result.message == "restart every zeta process on every host that pushes or pulls sessions to this home before arming"
+    assert result.message.startswith("retention armed: deleting 0 sessions older than 30 days")
     assert (home / "retention-arm.json").is_file()
     assert not list(home.glob("retention-quarantine*"))
 
