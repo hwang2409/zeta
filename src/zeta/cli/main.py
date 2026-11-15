@@ -404,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=90,
         metavar="SECONDS",
-        help="keep approvals pending after a controller drops (default: 90)",
+        help="keep approvals pending, and turn_reconnect turns running, after a controller drops (default: 90)",
     )
     serve_parser.add_argument(
         "--auto-memory",

@@ -381,6 +381,7 @@ class DeliveryRequests:
                 return
             if (
                 not control.closing
+                and control.controller_present()
                 and not control.client_turn_detached()
                 and control.server.runtime.state is state
             ):
@@ -397,7 +398,8 @@ class DeliveryRequests:
                     allow_assistant_reset=allow_assistant_reset,
                 )
                 return
-        # a send would be refused here too: the server closes or the bindings left.
+        # no client can see this turn: the server closes, the bindings left, or
+        # the controller is gone with no reconnect grace.
         await self._drop_steering(session_id, state, "disconnect")
 
     async def _drop_steering(

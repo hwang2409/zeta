@@ -18,7 +18,7 @@ code `-32001`, then closes. The limits are shared by all enabled transports.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
-negotiated approval reconnect grace and defaults to `90`. Set
+negotiated approval and turn reconnect grace and defaults to `90`. Set
 `ZETA_ACCOUNT_HOME` to an absolute directory when
 served sessions must use a shared provider account store while all other state
 remains under `ZETA_HOME`.
@@ -588,8 +588,9 @@ reply streams, is not dropped when that turn completes. After the turn's
 message, and that turn's first provider request carries the steer, so its
 `delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
 through `agent_end` events. The next turn does not start, and the steer is
-`dropped` with reason `disconnect`, if the server is closing or a `send` would be
-refused because the session is not attached. A `send` that arrives right after
+`dropped` with reason `disconnect`, if the server is closing, a `send` would be
+refused because the session is not attached, or the controller is gone with no
+`turn_reconnect` grace running. A `send` that arrives right after
 `turn_end` either starts the turn that carries the steer, or gets `-32004`
 because that turn has already started; the client should then retry the text as
 a `steer`.
@@ -1174,6 +1175,25 @@ the approval is replayed. If the replacement does not negotiate
 the feature, or the grace expires first, the server durably aborts the approval
 once with reason `grace_expired`; a later decision returns `-32006`. Clients
 without the feature keep immediate disconnect abort and the prior wire shapes.
+
+When the controller also negotiated `turn_reconnect` (it is accepted only
+together with `approval_reconnect`), a disconnect (a browser reload, a closed
+tab, a network drop) does not cancel a running turn. The turn keeps running for
+the same grace. A steer it did not read still starts the next turn, which the
+grace also covers. The first replacement controller that negotiates
+`approval_reconnect` takes the turn over with `hello`; it receives the live
+events from that point, and rebuilds earlier output with
+`session_history_and_subscribe` or `status` plus `session_history`. A
+replacement that does not negotiate `approval_reconnect`, or the end of the
+grace with nobody back, cancels the turn as an immediate disconnect does:
+`served_turn_end` reason `disconnect`, and queued steers `dropped` with reason
+`disconnect`. When the turn ends inside the grace, the grace ends with it, so a
+later background wake is not cancelled. Tools of transient MCP bindings are
+detached at the disconnect as before: a call to one during the grace returns an
+error result that says the client that provides the tool disconnected and may
+reconnect, and the server never uses the gone client's headers. Re-supply the
+bindings with `hello` or `resume` (`resume_attach`) to use those tools again.
+serve-only: the TUI is not a serve controller.
 
 A disconnected client does not stop the active served session or its
 background children. When a client attaches with `hello`, `new_session`, or
@@ -2011,6 +2031,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
+| `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to

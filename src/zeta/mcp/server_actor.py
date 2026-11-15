@@ -26,6 +26,7 @@ from .client import (
     make_error_result,
     notice as _notice,
     retry_text as _retry_text,
+    detached_result as _detached_result,
     safe_close,
     unavailable_result as _unavailable_result,
 )
@@ -85,6 +86,7 @@ CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 AUTO_RECONNECT_BASE_DELAY_SECONDS = 1.0
 AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
+_BINDING_DETACHED = "binding detached"
 
 NoticeSink = Callable[[str], None]
 
@@ -837,6 +839,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._tool_refresh.settle()
 
     def _handle_call(self, request: _CallRequest) -> None:
+        if self._status.reason == _BINDING_DETACHED:
+            _set_result(request.result, _detached_result(self.name))
+            return
         if not self.config.allows_tool(request.tool_name) or not any(
             tool.name == request.tool_name for tool in self._tools
         ):
@@ -1025,7 +1030,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             if request.task is not None:
                 request.task.cancel()
             if isinstance(request, _CallRequest):
-                _set_result(request.result, _unavailable_result(self.name))
+                _set_result(request.result, _detached_result(self.name))
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()
@@ -1036,7 +1041,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._tools = ()
         self._prompts = ()
         self._generation += 1
-        self._unregister_tools()
+        # hidden, not removed: a call the model already chose gets the detached
+        # result rather than "unknown tool" until the client re-attaches.
+        self._unregister_tools(keep_primary=True)
         if client is not None:
             await self._schedule_close(client)
         if self._scheduled_closes:
@@ -1051,7 +1058,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 self.name,
                 self.config.transport,
                 "degraded",
-                reason="binding detached",
+                reason=_BINDING_DETACHED,
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
         )
