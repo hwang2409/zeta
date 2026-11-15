@@ -630,8 +630,13 @@ class ServeControl:
         return None if opened is None else opened.store.active_branch_head_sequence()
 
     def _close_deferred_replay(self, session_id: str | None) -> None:
-        """At a turn's end, admit deferred replay copies; rows not found never install."""
+        """At a turn's end, admit deferred replay copies; rows not found never install.
+
+        The turn's unfinished reply ends too: a cancel publishes no agent_end.
+        """
         connections = self.server.connections
+        if connections is not None:
+            connections.in_flight.end_run()
         if connections is not None and session_id is not None:
             connections.release_deferred_replay(session_id, close=True)
 
@@ -1073,6 +1078,14 @@ class ServeControl:
         if foreground:
             state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
+        connections = getattr(self.server, "connections", None)
+        # updated in the loop step that publishes, so a join's snapshot is exact
+        in_flight = connections.in_flight if foreground and connections is not None else None
+        if in_flight is not None:
+            if kind is StreamEventType.AGENT_START:
+                in_flight.start_run(session_id)
+            elif kind in {StreamEventType.MESSAGE_START, StreamEventType.ASSISTANT_RESET}:
+                in_flight.end_message()
         if kind not in {
             StreamEventType.TOOL_APPROVAL_START,
             StreamEventType.TOOL_APPROVAL_END,
@@ -1087,10 +1100,13 @@ class ServeControl:
                 delta = getattr(event.content, "text", None)
                 stream_kind = str(getattr(event.content, "type", "content"))
             if delta:
+                delta = bounded(delta)
+                if in_flight is not None:
+                    in_flight.delta(session_id, delta, stream_kind)
                 await self._notify(
                     wire_event,
                     session_id,
-                    delta=bounded(delta),
+                    delta=delta,
                     kind=stream_kind,
                 )
             return
@@ -1107,6 +1123,8 @@ class ServeControl:
                     session_id,
                     usage=dict(usage),
                 )
+            if in_flight is not None:
+                in_flight.end_message()
             if event.message is not None:
                 await self._notify(
                     wire_event,
@@ -1115,7 +1133,6 @@ class ServeControl:
                     **event_contract.assistant_message(event),
                 )
             return
-        connections = getattr(self.server, "connections", None)
         controller = (
             connections.controller_metadata() if connections is not None else None
         )
@@ -1133,11 +1150,10 @@ class ServeControl:
             await self._notify(wire_event, session_id, data=data)
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
-            await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_output(event, fidelity=fidelity),
-            )
+            fields = event_contract.tool_output(event, fidelity=fidelity)
+            if in_flight is not None:
+                in_flight.tool_output(session_id, fields)
+            await self._notify(wire_event, session_id, **fields)
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
             if foreground:
@@ -1152,6 +1168,8 @@ class ServeControl:
             if foreground:
                 state.tool_finished()
             fields = event_contract.tool_end(event, fidelity=fidelity)
+            if in_flight is not None:
+                in_flight.end_tool(fields)
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):

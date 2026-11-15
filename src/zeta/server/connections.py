@@ -36,6 +36,7 @@ from .session_replay import (
     history_features,
 )
 from .session_replay.children import ChildRunProjection
+from .session_replay.in_flight import InFlightReply
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -182,6 +183,7 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
+        self.in_flight = InFlightReply()
         self.child_runs = ChildRunProjection(loop, self)
         self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
