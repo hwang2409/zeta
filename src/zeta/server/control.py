@@ -132,12 +132,12 @@ class ServeControl:
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
         self._notification_turn_started = False
-        # a wake past this gate may be in setup before its turn_start; slash
-        # commands then count it as busy, and a running command holds the gate.
+        # a wake past this gate may be in setup before its turn_start; state
+        # changes then count it as busy, and a running state change holds the gate.
         self._wake_admitted = False
-        self._slash_commands = 0
-        self._no_slash_command = asyncio.Event()
-        self._no_slash_command.set()
+        self._state_changes = 0
+        self._no_state_change = asyncio.Event()
+        self._no_state_change.set()
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -267,8 +267,8 @@ class ServeControl:
             )
         )
 
-    def slash_busy(self) -> bool:
-        """Report a turn a state-changing slash command must wait for."""
+    def state_change_busy(self) -> bool:
+        """Report a turn a state-changing request must wait for."""
         task = self._turn_task
         return self.turn_busy() or (
             self._wake_admitted
@@ -279,25 +279,25 @@ class ServeControl:
 
     @contextmanager
     def hold_wake_start(self) -> Iterator[None]:
-        """Keep a scheduled wake from starting until this slash command ends."""
-        self._slash_commands += 1
-        self._no_slash_command.clear()
+        """Keep a scheduled wake from starting until this state change ends."""
+        self._state_changes += 1
+        self._no_state_change.clear()
         try:
             yield
         finally:
-            self._slash_commands -= 1
-            if not self._slash_commands:
-                self._no_slash_command.set()
+            self._state_changes -= 1
+            if not self._state_changes:
+                self._no_state_change.set()
 
     async def require_idle(self) -> None:
-        if self.turn_busy():
+        if self.state_change_busy():
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
-        if self.turn_busy() or (
+        if self.state_change_busy() or (
             self._turn_handoff_task is not None
             and not self._turn_handoff_task.done()
         ):
@@ -920,7 +920,9 @@ class ServeControl:
                     state.turn_started()
 
         try:
-            await self._no_slash_command.wait()
+            # a second change can take the hold before this wake resumes
+            while self._state_changes:
+                await self._no_state_change.wait()
             self._wake_admitted = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,

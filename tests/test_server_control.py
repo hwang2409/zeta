@@ -983,7 +983,6 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     assert reference() is None
 
 
-
 async def _serve_after_first_turn(tmp_path: Path):
     """A serve session whose first turn has ended, so a wake no longer counts as busy."""
     from tests.test_server import _ready_extensions
@@ -1022,8 +1021,16 @@ def _is_turn_end(session_id: str):
 
 
 @pytest.mark.asyncio
-async def test_slash_command_waits_for_wake_in_setup_before_turn_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("slash_run", {"text": "/model gpt-5.6-sol"}),
+        ("set_settings", {"model": "gpt-5.6-sol", "approval_mode": "deny"}),
+        ("resume", {}),
+    ],
+)
+async def test_state_change_waits_for_wake_in_setup_before_turn_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, params: dict
 ) -> None:
     server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
     loop = server.runtime.loop
@@ -1040,21 +1047,19 @@ async def test_slash_command_waits_for_wake_in_setup_before_turn_start(
     monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
     try:
         model = server.runtime.model
+        opened = server.runtime.opened
         _schedule_wake(server, session_id)
         await await_or_fail(in_setup.wait(), what="wake in setup")
         assert loop.notification_turn_state == "running"
 
         reply = (
             await _request(
-                reader,
-                writer,
-                "model",
-                "slash_run",
-                {"session_id": session_id, "text": "/model gpt-5.6-sol"},
+                reader, writer, method, method, {"session_id": session_id, **params}
             )
         )[-1]
         assert reply.get("error", {}).get("code") == -32004, reply
         assert server.runtime.model == model
+        assert server.runtime.opened is opened
 
         release_setup.set()
         await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
@@ -1108,7 +1113,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
     # test-contract: seam signal when the wake waits on the start gate; absent on old code
     monkeypatch.setattr(
         server.control,
-        "_no_slash_command",
+        "_no_state_change",
         _GateSignalingEvent(wake_progressed),
         raising=False,
     )
@@ -1132,4 +1137,85 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
         assert reply["result"]["text"] == "model: gpt-5.6-sol", reply
     finally:
         release_command.set()
+        await close_serve(server, writer)
+
+
+class _SecondHoldOnRelease(asyncio.Event):
+    """The start gate; when the first change releases it, a second takes the hold in the same tick."""
+
+    def __init__(self, control: Any, second_holds: list[str]) -> None:
+        super().__init__()
+        super().set()
+        self._control = control
+        self._second_holds = second_holds
+        self.second_hold: Any = None
+
+    def set(self) -> None:
+        super().set()
+        if self.second_hold is None:
+            self.second_hold = self._control.hold_wake_start()
+            self.second_hold.__enter__()
+            self._second_holds.append("second change holds")
+
+    def release_second(self) -> None:
+        self.second_hold.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.slash_commands import ServerSlashSession
+
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    loop = server.runtime.loop
+    order: list[str] = []
+    in_command = asyncio.Event()
+    release_command = asyncio.Event()
+    original_model = ServerSlashSession.slash_model
+    original_ensure = loop._ensure_mcp_servers
+
+    async def held_model(self, args: str) -> str:
+        in_command.set()
+        await await_or_fail(release_command.wait(), what="slash command release")
+        return await original_model(self, args)
+
+    async def observed_ensure() -> None:
+        order.append("wake setup")
+        await original_ensure()
+
+    gate = _SecondHoldOnRelease(server.control, order)
+    monkeypatch.setattr(ServerSlashSession, "slash_model", held_model)
+    # test-contract: seam MCP startup is the first wake step after its start gate
+    monkeypatch.setattr(loop, "_ensure_mcp_servers", observed_ensure)
+    # test-contract: seam a second state change takes the hold in the tick the first releases it
+    monkeypatch.setattr(server.control, "_no_state_change", gate)
+    try:
+        reply = None
+        await send(
+            reader,
+            writer,
+            "model",
+            "slash_run",
+            {"session_id": session_id, "text": "/model gpt-5.6-sol"},
+        )
+        await await_or_fail(in_command.wait(), what="slash command running")
+        _schedule_wake(server, session_id)
+        release_command.set()
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == "model", what="model reply"
+        )
+        reply = frames[-1]
+        # let the woken wake run; it must still wait for the second change.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert order == ["second change holds"]
+        gate.release_second()
+        await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
+        assert order == ["second change holds", "wake setup"]
+        assert reply["result"]["text"] == "model: gpt-5.6-sol", reply
+    finally:
+        release_command.set()
+        if gate.second_hold is not None and server.control._state_changes:
+            gate.release_second()
         await close_serve(server, writer)

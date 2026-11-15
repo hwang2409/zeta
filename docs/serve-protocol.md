@@ -1537,15 +1537,17 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
    and `status.state` is `idle` until the next `turn_start`; a queued
    notification turn is not busy until its `turn_start` is published, so a send
-   that arrives first wins. `slash_run` is stricter: once a queued notification
-   turn has started its setup (before its `turn_start`), commands that
-   `runs_while_busy` does not allow return `-32004` until that turn ends, and a
-   notification turn does not start its setup while a `slash_run` is running. When the turn left a steer unread, the server starts
-   the next turn after `agent_end`; a `send` that arrives after that start gets
-   `-32004` and should be retried as `steer`. Clients must wait for `agent_end` before idle-only
-   requests such as `new_session`; the server commits `served_turn_end` before
-   cleanup. Error
-   and abort paths still end with `error` or `turn_aborted`.
+   that arrives first wins. State changes are stricter: once a queued
+   notification turn has started its setup (before its `turn_start`),
+   `slash_run` commands that `runs_while_busy` does not allow, idle-only
+   requests, and `new_session`/`resume` return `-32004` until that turn ends.
+   A notification turn does not start its setup while a session-mutation or
+   controller-write request is running. When the turn left a steer unread, the
+   server starts the next turn after `agent_end`; a `send` that arrives after
+   that start gets `-32004` and should be retried as `steer`. Clients must wait
+   for `agent_end` before idle-only requests such as `new_session`; the server
+   commits `served_turn_end` before cleanup. Error and abort paths still end
+   with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
    `approval_end` when the request stops being pending, including after a
    decision, child cancellation, turn abort, client close, or server shutdown.
