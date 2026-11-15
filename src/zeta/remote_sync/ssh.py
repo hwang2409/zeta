@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -436,6 +437,8 @@ with _reference_gate(home, (ident,), referenced):
                             output.write(chunk)
                         if source.read(1): sys.exit(50)
                     target.chmod(0o600)
+                    # Retention age is transcript mtime; a copy must not reset it.
+                    os.utime(target, (member.mtime, member.mtime))
                 else: _reject(f"archive member {member.name}: not a file or directory")
         manifest = json.loads((staging / "transfer.json").read_text())
         resume_cwd = pathlib.Path(manifest.get("resume_cwd", ""))
@@ -961,6 +964,8 @@ def _unpack(
                             "remote archive member exceeds its declared size"
                         )
                 target.chmod(0o600)
+                # Retention age is transcript mtime; a copy must not reset it.
+                os.utime(target, (member.mtime, member.mtime))
         if destination.exists():
             shutil.rmtree(destination)
         staging.rename(destination)
