@@ -394,6 +394,4 @@ async def test_close_finishes_end_of_turn_step_before_runtime_closes(
             decide.set()
         for release in backend.release:
             release.set()
-        if not writer.is_closing():
-            writer.close()
-        await server.close()
+        await _close(server, writer)
