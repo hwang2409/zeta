@@ -13,6 +13,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.key_binding.vi_state import InputMode
+from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.text import Text
 
@@ -53,6 +54,23 @@ async def _send(pipe, data: str) -> None:
     await asyncio.sleep(0)
 
 
+async def _click_composer(app: TUIApp, pipe) -> None:
+    """Click the composer's last row where the terminal last drew it."""
+
+    session = app._active_session
+    await _wait_until(
+        lambda: not session.app.invalidated, what="drawn screen before composer click"
+    )
+    screen = session.app.renderer._last_screen
+    row = next(
+        position.ypos + position.height
+        for window, position in screen.visible_windows_to_write_positions.items()
+        if isinstance(window.content, BufferControl)
+        and window.content.buffer is session.default_buffer
+    )
+    await _send(pipe, f"\x1b[<0;10;{row}M\x1b[<0;10;{row}m")
+
+
 async def _enter_child(app: TUIApp, pipe) -> None:
     navigation = app._agent_navigation
     await _wait_until(
@@ -68,7 +86,7 @@ async def _enter_child(app: TUIApp, pipe) -> None:
             lambda: bool(navigation.entries), what="visible agent picker rows"
         )
         if not app._active_session.layout.has_focus(app._active_session.default_buffer):
-            await _send(pipe, "\x1b[<0;10;40M\x1b[<0;10;40m")
+            await _click_composer(app, pipe)
             await _wait_until(
                 lambda: app._active_session.layout.has_focus(
                     app._active_session.default_buffer
@@ -244,7 +262,7 @@ async def test_real_tui_child_view_journey(
                 lambda: not app._viewed_transcript().search_active,
                 what="transcript search close",
             )
-            await _send(pipe, "\x1b[<0;10;40M\x1b[<0;10;40m")
+            await _click_composer(app, pipe)
             await _wait_until(
                 lambda: session.layout.has_focus(session.default_buffer),
                 what="child composer focus from terminal click",
@@ -357,7 +375,7 @@ async def test_real_tui_child_view_journey(
                 assert (
                     app._agent_navigation.transcript_control.prompt_history.navigating
                 ), "child-return: prompt cursor was not restored"
-                session.layout.focus(session.default_buffer)
+                await _click_composer(app, pipe)
                 await _wait_until(
                     lambda: session.layout.has_focus(session.default_buffer),
                     what="visible restored child composer before history-down key",

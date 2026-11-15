@@ -5,6 +5,8 @@ import asyncio
 import weakref
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.filters import to_filter
+from prompt_toolkit.layout.controls import BufferControl
 from rich.text import Text
 
 from ...core.session import env_home
@@ -97,6 +99,13 @@ class PromptRuntimeMixin:
         self._agent_navigation.bind_layout(
             session.layout, session.default_buffer, self._invalidate_prompt
         )
+        # A click returns to the composer from the agent list or a child transcript.
+        for window in session.layout.find_all_windows():
+            if (
+                isinstance(window.content, BufferControl)
+                and window.content.buffer is session.default_buffer
+            ):
+                window.content.focus_on_click = to_filter(True)
         self._bind_fork_navigation()
 
     def _bind_restart_idle_buffer(self, session: PromptSession[str]) -> None:

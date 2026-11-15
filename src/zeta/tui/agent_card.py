@@ -12,11 +12,12 @@ from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any
 
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.document import Document
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.mouse_events import MouseEvent
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
@@ -136,7 +137,6 @@ class AgentTranscriptControl(UIControl):
         self._child_view_states: OrderedDict[Path, _InactiveViewState] = OrderedDict()
         self._prompt_history: Any = None
         self._composer_buffer: Any = None
-        self._view_anchor: tuple[str, int, int] | None = None
         self._current_path: Callable[[], Path] | None = None
         self._prepare_path: Callable[[Path], _PreparedNavigation] | None = None
         self._begin_path: Callable[[int], None] | None = None
@@ -162,7 +162,6 @@ class AgentTranscriptControl(UIControl):
     @property
     def offset(self) -> int:
         return self.transcript.scroll_offset
-    @property
     def is_focusable(self) -> bool:
         return True
     def configure_history(
@@ -196,17 +195,6 @@ class AgentTranscriptControl(UIControl):
         self._render_active = render_active
         self._root_endpoint = root_endpoint
         self._invalidate = invalidate
-    async def _activation_failed(self, path: Path, generation: int) -> None:
-        if generation != self._activation_generation or path != self._path:
-            return
-        source, self._source = self._source, None
-        if source is not None:
-            await source.close()
-        self._history_pager.reset()
-        self._history_pager.source = None
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self.presenter.print(Text("transcript unavailable"))
     def start_search(
         self,
         query: str,
@@ -280,17 +268,47 @@ class AgentTranscriptControl(UIControl):
     def _active_transcript(self) -> Any:
         return self._root_transcript if self._path == self._root_path else self.transcript
 
-    async def refresh(self) -> bool:
-        transcript = self._active_transcript()
-        anchor = transcript.durable_scroll_anchor if transcript is not None else None
-        if anchor is not None:
-            self._history_pager.set_anchor(*anchor)
-        changed = await self._history_pager.refresh_tail(
-            follow_tail=transcript.follow_tail if transcript is not None else True
-        )
-        if changed:
-            self.render_pages(self._history_pager.pages)
-        return changed
+    async def _refresh_active(
+        self, path: Path, prepared: _PreparedNavigation, generation: int
+    ) -> None:
+        """Publish fresh navigation and child rows without moving the viewport."""
+
+        if self._commit_path is not None and not self._commit_path(
+            path, prepared, generation
+        ):
+            return
+        if self._finish_path is not None:
+            self._finish_path(generation)
+        source = self._source
+        if path != self._root_path and source is not None:
+            anchor = self.transcript.durable_scroll_anchor
+            page = await (
+                source.reveal(anchor[0])
+                if anchor is not None
+                else source.page(None, direction="older")
+            )
+            latest = (
+                await source.page(None, direction="older") if anchor is not None else None
+            )
+            fresh = (page,) if latest is None or latest == page else (page, latest)
+            # A scroll made during the reads wins; the next refresh catches up.
+            if (
+                generation == self._activation_generation
+                and self.transcript.durable_scroll_anchor == anchor
+                and fresh != self._history_pager.pages
+            ):
+                self._history_pager.reset()
+                for index, fresh_page in enumerate(fresh):
+                    self._history_pager.adopt(
+                        fresh_page, direction="newer" if index else "older"
+                    )
+                self.render_pages(self._history_pager.pages)
+                if anchor is not None:
+                    # A short revealed window reads as the tail; keep the anchor.
+                    self._history_pager.set_anchor(*anchor)
+                    self._restore_anchor(self.transcript, anchor)
+        if self._invalidate is not None:
+            self._invalidate()
 
     def _saved_view(self, path: Path) -> _InactiveViewState | None:
         if path == self._root_path:
@@ -302,9 +320,7 @@ class AgentTranscriptControl(UIControl):
         if path is None:
             return True
         transcript = self._root_transcript if path == self._root_path else self.transcript
-        anchor = self._view_anchor or (
-            transcript.durable_scroll_anchor if transcript is not None else None
-        )
+        anchor = transcript.durable_scroll_anchor if transcript is not None else None
         state = capture_inactive_view(
             buffer=self._composer_buffer,
             prompt_history=self._prompt_history,
@@ -343,7 +359,17 @@ class AgentTranscriptControl(UIControl):
         self._activation_generation += 1
         generation = self._activation_generation
         self._pending_path = path
-        cancelled = self._cancel_transition_work()
+        if refresh:
+            # A refresh replaces no runtime: page, prompt, and finder reads stay.
+            cancelled = tuple(
+                task
+                for task in (self._load_task,)
+                if task is not None and not task.done()
+            )
+            for task in cancelled:
+                task.cancel()
+        else:
+            cancelled = self._cancel_transition_work()
         if self._begin_path is not None:
             self._begin_path(generation)
         try:
@@ -407,9 +433,10 @@ class AgentTranscriptControl(UIControl):
             )
             if generation != self._activation_generation:
                 return
-
             if refresh:
-                self._park_active_view()
+                await self._refresh_active(path, prepared_navigation, generation)
+                return
+
             state = self._saved_view(path)
             if path == self._root_path:
                 prepared_source = self._root_source
@@ -427,13 +454,14 @@ class AgentTranscriptControl(UIControl):
                 return
 
             prepared_page = None
-            prepared_latest = None
+            prepared_newer = None
             if prepared_source is not None:
                 if state is not None and state.anchor is not None:
                     prepared_page = await prepared_source.reveal(state.anchor[0])
-                    if refresh:
-                        prepared_latest = await prepared_source.page(
-                            None, direction="older"
+                    # Rows after the anchor let the viewport start exactly at it.
+                    if prepared_page.newer is not None:
+                        prepared_newer = await prepared_source.page(
+                            prepared_page.newer, direction="newer"
                         )
                 else:
                     prepared_page = await prepared_source.page(None, direction="older")
@@ -477,23 +505,22 @@ class AgentTranscriptControl(UIControl):
             self._history_pager.reset(endpoint_id=endpoint)
             if prepared_page is not None:
                 self._history_pager.adopt(prepared_page)
-            if prepared_latest is not None and prepared_latest != prepared_page:
-                self._history_pager.adopt(prepared_latest, direction="newer")
+            if prepared_newer is not None:
+                self._history_pager.adopt(prepared_newer, direction="newer")
             if state is not None and state.anchor is not None:
                 self._history_pager.set_anchor(*state.anchor)
             restored = state or _InactiveViewState(None, "", 0, None, None, "", 0)
             if self._prompt_history is not None:
                 self._prompt_history.bind(path, prepared_source, endpoint)
-                if not refresh:
-                    self._prompt_history.restore_navigation(
-                        restored.prompt_cursor,
-                        restored.prompt_text,
-                        Document(restored.draft, cursor_position=restored.draft_cursor),
-                    )
+                self._prompt_history.restore_navigation(
+                    restored.prompt_cursor,
+                    restored.prompt_text,
+                    Document(restored.draft, cursor_position=restored.draft_cursor),
+                )
             if path != self._root_path:
                 self._child_view_states.pop(path, None)
             buffer = self._composer_buffer
-            if buffer is not None and not refresh:
+            if buffer is not None:
                 displayed = restored.prompt_text or restored.draft
                 cursor = (
                     len(displayed)
@@ -514,7 +541,6 @@ class AgentTranscriptControl(UIControl):
             if transcript is not None and restored.finder_query:
                 transcript.open_finder()
                 transcript.finder_set_query(restored.finder_query)
-            self._view_anchor = state.anchor if state is not None else None
             if state is not None and state.anchor is not None and transcript is not None:
                 self._restore_anchor(transcript, state.anchor)
                 asyncio.get_running_loop().call_soon(
@@ -655,7 +681,6 @@ class AgentTranscriptControl(UIControl):
 
     def scroll(self, amount: int) -> None:
         self.transcript.scroll_lines(amount)
-        self._view_anchor = self.transcript.durable_scroll_anchor
         if amount < 0 and self.transcript.scroll_offset == 0 and self.on_history_edge:
             self.on_history_edge("older")
         elif amount > 0 and self.transcript.follow_tail and self.on_history_edge:
@@ -666,13 +691,11 @@ class AgentTranscriptControl(UIControl):
 
     def top(self) -> None:
         self.transcript.scroll_to_top()
-        self._view_anchor = self.transcript.durable_scroll_anchor
         if self.on_history_edge:
             self.on_history_edge("older")
 
     def bottom(self) -> None:
         self.transcript.scroll_to_bottom()
-        self._view_anchor = None
         if self.on_history_edge:
             self.on_history_edge("newer")
 
@@ -683,7 +706,11 @@ class AgentTranscriptControl(UIControl):
     def vertical_scroll(self, window: Window) -> int:
         return self.transcript.vertical_scroll(window)
     def mouse_handler(self, mouse_event: MouseEvent):
-        return self.transcript.mouse_handler(mouse_event)
+        result = self.transcript.mouse_handler(mouse_event)
+        if result is NotImplemented and mouse_event.event_type is MouseEventType.MOUSE_DOWN:
+            get_app().layout.focus(self)
+            return None
+        return result
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
@@ -695,7 +722,6 @@ class AgentNavigation:
         self._breadcrumb_labels = ["main"]
         self.entries: list[AgentEntry] = []
         self.selected_index = 0
-        self._list_focus_requested = False
         self._fork_title: str | None = None
         self._fork_main_path: Path | None = None
         self._on_return_to_main: Callable[[], None] | None = None
@@ -1084,7 +1110,6 @@ class AgentNavigation:
         self.refresh(force=True)
 
     def focus_composer(self) -> None:
-        self._list_focus_requested = False
         if self._layout is not None and self._composer_buffer is not None:
             self._layout.focus(self._composer_buffer)
 
@@ -1093,7 +1118,6 @@ class AgentNavigation:
 
     def focus_list(self) -> None:
         self.transcript_control.capture_root_view()
-        self._list_focus_requested = True
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         else:
@@ -1111,7 +1135,6 @@ class AgentNavigation:
         self.transcript_control.activate(self.root_path)
 
     def focus_child_list(self) -> None:
-        self._list_focus_requested = True
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         self.refresh(force=True)
@@ -1236,9 +1259,6 @@ class AgentNavigation:
         if self._navigation_generation != generation:
             return False
         previous = self.current_path
-        preserve_list_focus = path == previous and bool(prepared.entries) and (
-            self.list_focused() or self._list_focus_requested
-        )
         previous_index = self.selected_index
         if path in self._path_stack:
             index = self._path_stack.index(path)
@@ -1251,16 +1271,24 @@ class AgentNavigation:
             )
             self._path_stack.append(path)
             self._breadcrumb_labels.append(label)
+        # A refresh keeps the selected row; a return to root selects the child left.
+        selected = (
+            self.entries[previous_index].path
+            if path == previous and previous_index < len(self.entries)
+            else previous
+        )
         self.current_path = path
         self.entries = list(prepared.entries)
-        if path == self.root_path:
+        if path == self.root_path or path == previous:
             self.selected_index = next(
                 (
                     index
                     for index, entry in enumerate(self.entries)
-                    if entry.path == previous
+                    if entry.path == selected
                 ),
-                0,
+                min(previous_index, max(0, len(self.entries) - 1))
+                if path == previous
+                else 0,
             )
         else:
             self.selected_index = min(
@@ -1269,9 +1297,10 @@ class AgentNavigation:
         self._resize_list_window()
         self._refresh_signature = None
         self._switch_transcript()
-        if preserve_list_focus and self._layout is not None:
-            self._layout.focus(self.list_window)
-            self._list_focus_requested = False
+        if path == previous:
+            # A refresh of the same view keeps the user's focus.
+            if self.list_focused() and not self.entries:
+                self.focus_composer()
         elif self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
         else:

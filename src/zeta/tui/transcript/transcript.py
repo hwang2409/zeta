@@ -409,6 +409,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._line_locations.clear()
         self._locations_cache.clear()
         self._anchor = None
+        self._virtual_start = None
+        self._pending_virtual_scroll = 0
         self._user_units.clear()
         self._user_unit_set.clear()
         self._search_cache.clear()
@@ -627,6 +629,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
             return
         self._follow_tail = False
         self._anchor = (unit, max(0, text_offset))
+        # The next virtual render must start from this anchor, not an old index.
+        self._virtual_start = None
         self._bump_revision()
 
     def restore_durable_scroll_anchor(
