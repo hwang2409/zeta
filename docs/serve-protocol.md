@@ -1192,7 +1192,8 @@ later background wake is not cancelled. Tools of transient MCP bindings are
 detached at the disconnect as before, and the server never uses the gone
 client's headers again; a call already running at the disconnect returns an
 error result that says the client that provides the tool disconnected and may
-reconnect. A call made during the grace waits instead: when a controller
+reconnect, and that the call was already sent, so it may or may not have taken
+effect. A call made during the grace waits instead: when a controller
 re-supplies the bindings with `hello` or `resume` (`resume_attach`), the call
 runs once with the new headers. The wait keeps the grace deadline that started
 at the disconnect, also after a `hello` takes the turn over without bindings.

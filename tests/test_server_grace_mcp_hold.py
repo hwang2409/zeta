@@ -276,6 +276,44 @@ async def test_approval_grace_deadline_also_bounds_the_approved_bound_call(
 
 
 @pytest.mark.asyncio
+async def test_call_in_flight_at_disconnect_says_it_may_have_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grace = Grace(tmp_path, monkeypatch)
+    gate = asyncio.Event()
+    grace.mcp.call_gate = gate
+    try:
+        server, _ = await grace.start([
+            ([TextContent("mounted")], False),
+            ([ToolUseContent(ToolCall("page-1", "page__echo", {}))], False),
+            ([TextContent("after page")], False),
+        ])
+        reader, writer, session_id = await grace.open_session()
+        await _request(reader, writer, 4, "send", {"text": "use page"})
+        await await_or_fail(grace.mcp.tool_called.wait(), what="call in flight")
+        turn = server.control._turn_task
+        assert turn is not None
+
+        await _drop(writer, server)
+        await await_or_fail(asyncio.wait({turn}), what="turn end in grace")
+        reader2, writer2 = await grace.reconnect(5)
+        rows = (await _request(reader2, writer2, 6, "session_history", {
+            "session_id": session_id
+        }))[-1]["result"]["messages"]
+        results = [
+            row["tool_result"]["content"]
+            for row in rows
+            if (row.get("tool_result") or {}).get("tool_call_id") == "page-1"
+        ]
+        assert len(results) == 1, rows
+        assert DETACHED in results[0], results
+        assert "may or may not have taken effect" in results[0], results
+    finally:
+        gate.set()
+        await grace.close()
+
+
+@pytest.mark.asyncio
 async def test_server_close_during_wait_does_not_hang(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

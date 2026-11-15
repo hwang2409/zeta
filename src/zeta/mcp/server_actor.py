@@ -1050,7 +1050,10 @@ class MCPServerActor(MCPDefinitionPublisher):
             if request.task is not None:
                 request.task.cancel()
             if isinstance(request, _CallRequest):
-                _set_result(request.result, _detached_result(self.name))
+                _set_result(
+                    request.result,
+                    _detached_result(self.name, started=request.task is not None),
+                )
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()

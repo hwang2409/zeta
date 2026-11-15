@@ -124,6 +124,8 @@ class LocalMCP:
         self.drop_notification = asyncio.Event()
         self.detached = False
         self.request_after_detach = asyncio.Event()
+        # when set, tools/call answers only after this event.
+        self.call_gate: asyncio.Event | None = None
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> int:
@@ -205,6 +207,8 @@ class LocalMCP:
                     self.tools_refetched.set()
             elif method == "tools/call":
                 self.tool_called.set()
+                if self.call_gate is not None:
+                    await asyncio.wait_for(self.call_gate.wait(), TIMEOUT)
                 result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
             else:
                 result = {}
