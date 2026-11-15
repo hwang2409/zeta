@@ -60,6 +60,7 @@ from .protocol import (
 from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
+    from ..mcp import MCPServerConfig
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
@@ -205,11 +206,14 @@ class ServeControl:
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
 
-    def reject_client_turn_if_detached(self) -> None:
-        if (
+    def client_turn_detached(self) -> bool:
+        return (
             (self._host_binding_required and self._active_host_commands is None)
             or (self._mcp_binding_required and not self._active_mcp_bindings)
-        ):
+        )
+
+    def reject_client_turn_if_detached(self) -> None:
+        if self.client_turn_detached():
             raise ProtocolError(
                 ErrorDescriptor.HOST_BINDING_REQUIRED,
                 "session is not attached",
@@ -383,6 +387,18 @@ class ServeControl:
             await self._approvals.transition(Expire())
             await self._disconnect_turn()
         return True
+
+    async def reattach_mcp_bindings(
+        self,
+        headers: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        """Re-bind the active session's released MCP headers for a returning client."""
+        loop = self.server.runtime.loop
+        assert loop is not None
+        await loop.set_mcp_bindings(headers, configs)
+        await loop._ensure_mcp_servers()
+        self._active_mcp_bindings = headers
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -720,7 +736,6 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=False,
             )
         if terminal_error is not None:
             await self._notify(
@@ -734,7 +749,9 @@ class ServeControl:
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(
+                session_id, state, allow_assistant_reset=allow_assistant_reset
+            )
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -833,14 +850,13 @@ class ServeControl:
                     state,
                     turn_id,
                     outcome,
-                    schedule_wake=False,
                 )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
-            self._schedule_background_wake(session_id)
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _attach_pending_notifications(self) -> None:
         runtime = self.server.runtime
@@ -901,11 +917,11 @@ class ServeControl:
                 state,
                 turn_id,
                 outcome,
-                schedule_wake=agent_end is None,
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
-            self._schedule_background_wake(session_id)
+        if outcome is TurnOutcome.COMPLETED:
+            await self.deliveries.continue_after_turn(session_id, state)
 
     async def _publish_config_changed(
         self, event: StreamEvent, session_id: str | None

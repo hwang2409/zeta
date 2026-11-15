@@ -412,13 +412,14 @@ the session runtime still exists, and clears it when the runtime is gone.
 After a controller disconnect, a host-bound session rejects new `send` and
 `send_images` turns with `-32003` and `data.code: "host_binding_required"`
 until a controller supplies the binding again. An idle session accepts it on
-`resume`.
+`resume`; with `resume_attach`, so does the active session during a live turn,
+and the new binding applies from the next turn.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"resume","params":{"session_id":"abc123","host_commands":[{"name":"gamma-render","executable":"/opt/gamma/bin/render","summary":"render a file in the web surface","environment":{"GAMMA_SESSION":"s-1"}}]}}
 ```
 
-With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume`, or a reconnecting controller's `hello` during a live turn, supplies the binding again. During a running turn or pending approval, the reconnecting controller negotiates both `approval_reconnect` and `session_mcp_bindings` and supplies `session_id` and `mcp_bindings` on `hello`. The session id and server-name set must exactly match the active bound session. A tool call that resumes after approval uses the binding from the replacement attachment. Bound servers are not inherited by child sessions. serve-only: no TUI surface.
+With the `session_mcp_bindings` feature, `new_session` and `resume` accept an optional `mcp_bindings` array. Each item has `server` and a `headers` object. The server name must already exist in the trusted global MCP configuration; project definitions and unknown names are rejected with `-32602`. Header names and values are single-line strings, with limits of 256 bytes and 8192 bytes, and no more than 64 headers. Duplicate server names are rejected. Values are used only for this attachment and are never persisted, returned, or included in logs, history, notifications, or errors. After disconnect, a bound session rejects turns until `resume`, or a reconnecting controller's `hello` during a live turn, supplies the binding again. With `resume_attach`, `resume` of the active session also re-supplies it during a live turn (see `resume`). During a running turn or pending approval, the reconnecting controller negotiates both `approval_reconnect` and `session_mcp_bindings` and supplies `session_id` and `mcp_bindings` on `hello`. The session id and server-name set must exactly match the active bound session. A tool call that resumes after approval uses the binding from the replacement attachment. Bound servers are not inherited by child sessions. serve-only: no TUI surface.
 
 ### `resume`
 
@@ -473,6 +474,42 @@ Real sessions can resume across real providers.
 
 ```json
 {"jsonrpc":"2.0","id":4,"result":{"session":{"session_id":"abc123","provider":"claude","model":"claude-sonnet-4-6"}}}
+```
+
+#### attaching to a live turn (`resume_attach` feature)
+
+Without `resume_attach`, `resume` returns `-32004` while a turn is busy (a
+live turn, a pending approval, or a scheduled or running notification turn).
+With the feature negotiated on the connection, `resume` of the session that is
+already active during a busy turn is an attach. Validation and session id
+resolution are the same as above. The attach does not swap the session: the
+turn, its pending approvals, and its children stay as they are. It only
+re-supplies this connection's bindings:
+
+- `mcp_bindings` follow the `hello` reconnect rule: the server-name set must
+  equal the session's bound set, and a session without MCP bindings accepts
+  none (`-32602` `mcp_bindings must match the active session`). Detached
+  bindings are attached at once, so an approved tool call uses them. When the
+  bindings are still attached on this connection, equal headers are a no-op and
+  different headers return `-32004`; send them again when the session is idle.
+- `host_commands` replace the session's binding. The running turn keeps the
+  commands it started with; the new binding applies from the next turn. One
+  exception: a tool resumed from a durable approval after a restart reads the
+  session's host commands when the approval is answered, so it uses the
+  binding that is active at that time.
+
+The result adds `attached: "live_turn"`. The client then reads the current
+state with `status` or `session_history_and_subscribe`; pending approvals are
+in that result and can be answered. `resume` of a different session during a
+busy turn still returns `-32004`, and `resume` of an idle session is unchanged.
+serve-only: no TUI surface.
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"resume","params":{"session_id":"abc123","mcp_bindings":[{"server":"page","headers":{"Authorization":"Bearer ..."}}]}}
+```
+
+```json
+{"jsonrpc":"2.0","id":6,"result":{"session":{"session_id":"abc123","provider":"claude","model":"claude-sonnet-4-6"},"attached":"live_turn"}}
 ```
 
 ### `mcp_refresh_tools` (`mcp_refresh_tools` feature)
@@ -544,6 +581,18 @@ running. With the `user_message_event` feature, a `user_message` event with
 ```json
 {"jsonrpc":"2.0","id":6,"result":{"accepted":true}}
 ```
+
+A steer that the running turn did not read, for example one sent while the final
+reply streams, is not dropped when that turn completes. After the turn's
+`turn_end` and `agent_end`, the server starts the next turn with no new user
+message, and that turn's first provider request carries the steer, so its
+`delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
+through `agent_end` events. The next turn does not start, and the steer is
+`dropped` with reason `disconnect`, if the server is closing or a `send` would be
+refused because the session is not attached. A `send` that arrives right after
+`turn_end` either starts the turn that carries the steer, or gets `-32004`
+because that turn has already started; the client should then retry the text as
+a `steer`.
 
 ### delivery session guard (`delivery_session_guard` feature)
 
@@ -620,8 +669,11 @@ where status is:
 - `delivered`: steering was durably appended as a user message at that boundary,
   or a `send` user message was durably appended and its turn was scheduled;
 - `dropped`: accepted steering left the live queue without delivery because of
-  restart, session abort, explicit clearing, disconnect, or turn end. It is not
-  restored after restart; resend still-wanted work with a new ID;
+  restart, session abort, explicit clearing, disconnect, or a failed turn. Old
+  sessions and the TUI also record turn end. Steering that a completed served
+  turn did not read is not dropped; it starts the next turn (see `steer`). A
+  dropped steer is not restored after restart; resend still-wanted work with a
+  new ID;
 - `evicted`: the ID was accepted but is outside the 1,000-entry detail bound;
   the result also contains its retained `outcome`, which is `queued`,
   `delivered`, or `dropped`;
@@ -1131,7 +1183,8 @@ synchronously reserves one parent notification turn in the `scheduled` state,
 then streams it to that client. The optional wake delay occurs inside this
 reservation. While the turn is `scheduled` or `running`, idle-only requests such
 as `send` and `resume` return the existing `-32004` busy error; they cannot take
-the reserved turn. `slash_run` follows the same rule for commands that mutate or
+the reserved turn. With `resume_attach`, `resume` of the active session attaches
+instead and leaves the turn running (see `resume`). `slash_run` follows the same rule for commands that mutate or
 produce model input. It still returns client-only results for commands unavailable
 on serve, and it runs read-only slash commands such as `/status` and `/help`
 while the turn is busy. `/mcp` remains blocked while busy because even its
@@ -1454,7 +1507,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    `error`, or `disconnect`. After `turn_end` is published, `send` is accepted
    and `status.state` is `idle` until the next `turn_start`; a queued
    notification turn is not busy until its `turn_start` is published, so a send
-   that arrives first wins. Clients must wait for `agent_end` before idle-only
+   that arrives first wins. When the turn left a steer unread, the server starts
+   the next turn after `agent_end`; a `send` that arrives after that start gets
+   `-32004` and should be retried as `steer`. Clients must wait for `agent_end` before idle-only
    requests such as `new_session`; the server commits `served_turn_end` before
    cleanup. Error
    and abort paths still end with `error` or `turn_aborted`.
@@ -1955,6 +2010,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 | `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
+| `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
