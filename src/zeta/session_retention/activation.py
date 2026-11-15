@@ -295,15 +295,20 @@ class RetentionActivationOwner:
         failure: Exception | None = None
         planner = None
         try:
-            if not self._activation_enabled or not self._session_available or (self._home is not None and planner_request_pending(self._home)):
+            if not self._activation_enabled or not self._session_available:
                 return projections, None
             days = self._days()
-            if days == 0:
-                if self._disable is not None and self._home is not None and any(
-                    (self._home / name).is_file()
-                    for name in ("retention-arm.json", "retention-state.json")
-                ):
-                    projections.append(Published(self._disable(), complete=True))
+            # an idle home (days 0, nothing to disarm) is left untouched: no probe, no lock
+            disarm = days == 0 and self._disable is not None and self._home is not None and any(
+                (self._home / name).is_file()
+                for name in ("retention-arm.json", "retention-state.json")
+            )
+            if days == 0 and not disarm:
+                return projections, None
+            if self._home is not None and planner_request_pending(self._home):
+                return projections, None
+            if disarm:
+                projections.append(Published(self._disable(), complete=True))
                 return projections, None
             planner = self._planner_factory()
             if not getattr(planner, "enabled", True):
