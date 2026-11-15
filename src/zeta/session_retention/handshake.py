@@ -51,8 +51,8 @@ def _fd(home: Path, domain: str) -> int:
 
 
 def ensure_handshake_files(home: Path) -> None:
-    """Create the owner handshake files before retention serves requests."""
-    for domain in ("planner-active", "user-open-request"):
+    """Create every retention lock file once, at owner start, so no later request creates one."""
+    for domain in ("planner-active", "user-open-request", "planner-probe"):
         fd = _fd(home, domain)
         os.close(fd)
 

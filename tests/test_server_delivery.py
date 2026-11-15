@@ -50,6 +50,16 @@ pytest_plugins = ("tests.support.socket_fixtures",)
 TIMEOUT = 3
 
 
+def _replies(frames: list[dict[str, Any]]) -> list[str]:
+    return [
+        block["text"]
+        for frame in frames
+        if frame.get("params", {}).get("event") == "assistant_message"
+        for block in frame["params"]["message"]["content"]
+        if block.get("type") == "text"
+    ]
+
+
 async def _connect(server: ZetaServer):
     await asyncio.wait_for(server.start(), TIMEOUT)
     return await asyncio.wait_for(
@@ -462,7 +472,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
 
 
 @pytest.mark.asyncio
-async def test_steer_commit_and_publish_finish_before_turn_finalization(
+async def test_steer_committed_at_turn_finalization_starts_next_turn(
     tmp_path: Path,
 ) -> None:
     backend = SteerTurnEndBackend()
@@ -489,11 +499,9 @@ async def test_steer_commit_and_publish_finish_before_turn_finalization(
 
         store = server.runtime.opened.store
         committed = asyncio.Event()
-        drop_finished = asyncio.Event()
         finalize_started = asyncio.Event()
         finalize_finished = asyncio.Event()
         original_append = store.append_client_delivery_async
-        original_drop = store.drop_client_steering_async
         original_finalize = server.control.deliveries.finalize_turn
 
         async def pause_after_commit(*args: Any, **kwargs: Any) -> None:
@@ -501,11 +509,6 @@ async def test_steer_commit_and_publish_finish_before_turn_finalization(
             if args[0] == "late-steer":
                 committed.set()
                 await await_or_fail(resume_publish.wait(), what="resume steer publication")
-
-        async def track_drop(*args: Any, **kwargs: Any):
-            result = await original_drop(*args, **kwargs)
-            drop_finished.set()
-            return result
 
         async def track_finalize(*args: Any, **kwargs: Any) -> None:
             finalize_started.set()
@@ -515,7 +518,6 @@ async def test_steer_commit_and_publish_finish_before_turn_finalization(
                 finalize_finished.set()
 
         store.append_client_delivery_async = pause_after_commit
-        store.drop_client_steering_async = track_drop
         server.control.deliveries.finalize_turn = track_finalize
         steer = asyncio.create_task(
             _request(
@@ -523,15 +525,12 @@ async def test_steer_commit_and_publish_finish_before_turn_finalization(
                 writer,
                 4,
                 "steer",
-                {"text": "must not leak", "delivery_id": "late-steer"},
+                {"text": "late steer", "delivery_id": "late-steer"},
             )
         )
         await await_or_fail(committed.wait(), what="durable steer commit")
         backend.release_first.set()
         await await_or_fail(finalize_started.wait(), what="turn finalization start")
-        guard = getattr(server.control.deliveries, "_steer_turn_guard", None)
-        if guard is None:
-            await await_or_fail(drop_finished.wait(), what="old finalization drop")
         resume_publish.set()
 
         accepted = await await_or_fail(steer, what="steer response")
@@ -544,18 +543,25 @@ async def test_steer_commit_and_publish_finish_before_turn_finalization(
             "delivery_status",
             {"delivery_id": "late-steer"},
         )
-        assert status[-1]["result"]["status"] == "dropped"
-        assert len(backend.calls) == 1
-
-        await _request(reader, writer, 6, "send", {"text": "second"})
-        await await_or_fail(backend.second_started.wait(), what="second provider request")
+        assert status[-1]["result"]["status"] != "dropped"
+        await await_or_fail(backend.second_started.wait(), what="next turn request")
         second_texts = [
             block.text
             for message in backend.calls[1]
             for block in message.content
             if isinstance(block, TextContent)
         ]
-        assert "must not leak" not in second_texts
+        assert second_texts.count("late steer") == 1, second_texts
+        await _frames_until_event(reader, "agent_end")
+        assert _replies(await _frames_until_event(reader, "agent_end")) == ["done"]
+        status = await _request(
+            reader,
+            writer,
+            6,
+            "delivery_status",
+            {"delivery_id": "late-steer"},
+        )
+        assert status[-1]["result"]["status"] == "delivered"
         assert len(backend.calls) == 2
         assert not server.runtime.loop.has_pending_steering
     finally:
@@ -1049,21 +1055,6 @@ async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> Non
         )
         assert status[-1]["result"]["status"] == "dropped"
         assert server.runtime.opened.store.client_delivery("drop-me").reason == "disconnect"
-    finally:
-        await close_serve(server, writer)
-
-
-@pytest.mark.asyncio
-async def test_tool_less_turn_end_marks_late_steering_dropped(tmp_path: Path) -> None:
-    server, backend, reader, writer = await _queued_steer_server(tmp_path, "-turn-end")
-    try:
-        backend.release.set()
-        await _event(reader, "agent_end")
-        status = await _request(
-            reader, writer, 5, "delivery_status", {"delivery_id": "drop-me"}
-        )
-        assert status[-1]["result"]["status"] == "dropped"
-        assert server.runtime.opened.store.client_delivery("drop-me").reason == "turn_end"
     finally:
         await close_serve(server, writer)
 
@@ -1724,13 +1715,15 @@ class HeldLaterStepBackend:
     def __init__(self, steps: list[ScriptedTurn]) -> None:
         self.steps = steps
         self.calls = 0
+        self.requests: list[list[Message]] = []
         self.streaming = asyncio.Event()
         self.release = asyncio.Event()
 
     @owned_completion
     async def complete(self, messages, tool_schemas):
-        del messages, tool_schemas
+        del tool_schemas
         self.calls += 1
+        self.requests.append(list(messages))
         if self.calls <= len(self.steps):
             step = self.steps[self.calls - 1]
             message = Message(
@@ -1812,7 +1805,9 @@ async def test_turn_after_tool_step_stays_busy_for_steer_and_send(
 
         backend.release.set()
         await _event(reader, "agent_end")
-        assert backend.calls == 3
+        # the steer arrived during the final step, so the next turn answers it
+        await _event(reader, "agent_end")
+        assert backend.calls == 4
     finally:
         backend.release.set()
         await close_serve(server, writer)
@@ -1855,4 +1850,348 @@ async def test_send_turn_stays_busy_for_steer_after_earlier_turn_end(
         assert steer[-1].get("result") == {"accepted": True}, steer[-1]
     finally:
         backend.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_steer_during_final_response_is_answered_by_next_turn(
+    tmp_path: Path,
+) -> None:
+    # achilles: a steer sent while the final no-tool reply streamed was
+    # accepted, then reported dropped at turn end and never answered.
+    backend = HeldLaterStepBackend([])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await _event(reader, "assistant_delta")
+        await await_or_fail(backend.streaming.wait(), what="final reply streaming")
+        steer = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "also this", "delivery_id": "final-steer"},
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+
+        backend.release.set()
+        await _event(reader, "agent_end")
+        status = await _request(
+            reader, writer, 5, "delivery_status", {"delivery_id": "final-steer"}
+        )
+        assert status[-1]["result"]["status"] != "dropped", status[-1]
+        next_turn = await _frames_until_event(reader, "agent_end")
+        names = [frame.get("params", {}).get("event") for frame in next_turn]
+        assert "agent_start" in names and "turn_end" in names, names
+        assert _replies(next_turn) == ["still streaming"]
+        status = await _request(
+            reader, writer, 6, "delivery_status", {"delivery_id": "final-steer"}
+        )
+        assert status[-1]["result"]["status"] == "delivered"
+        assert backend.calls == 2
+        steered = [
+            block.text
+            for message in backend.requests[1]
+            for block in message.content
+            if isinstance(block, TextContent)
+        ]
+        assert steered.count("also this") == 1, steered
+        assert not server.runtime.loop.has_pending_steering
+    finally:
+        backend.release.set()
+        await close_serve(server, writer)
+
+
+class OneAtATimeBackend:
+    """Stream and hold the first reply; answer later requests at once."""
+
+    def __init__(self) -> None:
+        self.requests: list[list[str]] = []
+        self.active = 0
+        self.max_active = 0
+        self.streaming = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        del tool_schemas
+        self.requests.append(
+            [
+                block.text
+                for message in messages
+                for block in message.content
+                if isinstance(block, TextContent)
+            ]
+        )
+        number = len(self.requests)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if number == 1:
+                yield StreamEvent(StreamEventType.MESSAGE_START)
+                yield StreamEvent(
+                    StreamEventType.MESSAGE_UPDATE, content=TextContent("reply1")
+                )
+                self.streaming.set()
+                await await_or_fail(self.release.wait(), what="first reply release")
+            yield StreamEvent(
+                StreamEventType.MESSAGE_END,
+                message=Message(MessageRole.ASSISTANT, [TextContent(f"reply{number}")]),
+            )
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_send_after_turn_end_and_queued_steer_start_one_turn(
+    tmp_path: Path,
+) -> None:
+    # review of #1323: a send between turn_end and the end-of-turn steering
+    # check started a turn, then the check started a second one on the same loop.
+    backend = OneAtATimeBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    control = server.control
+    original_event = control._event
+    original_start = control.start_turn
+    at_agent_end = asyncio.Event()
+    publish_agent_end = asyncio.Event()
+    turns: list[asyncio.Task[None]] = []
+
+    async def hold_first_agent_end(event: StreamEvent, *args: Any, **kwargs: Any):
+        if event.type is StreamEventType.AGENT_END and not at_agent_end.is_set():
+            at_agent_end.set()
+            await await_or_fail(publish_agent_end.wait(), what="agent_end release")
+        return await original_event(event, *args, **kwargs)
+
+    def record_start(*args: Any, **kwargs: Any) -> None:
+        original_start(*args, **kwargs)
+        turns.append(control._turn_task)
+
+    # test-contract: seam serve has no public hold between turn_end and agent_end
+    control._event = hold_first_agent_end
+    # test-contract: seam serve has no public turn-start observation
+    control.start_turn = record_start
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.streaming.wait(), what="first reply streaming")
+        steer = await _request(
+            reader, writer, 4, "steer", {"text": "steered", "delivery_id": "s1"}
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+        backend.release.set()
+        await await_or_fail(at_agent_end.wait(), what="first turn_end published")
+        sent = await _request(reader, writer, 5, "send", {"text": "user next"})
+        assert sent[-1]["result"]["accepted"] is True, sent[-1]
+        publish_agent_end.set()
+        await await_or_fail(
+            asyncio.gather(*turns, return_exceptions=True), what="started turns"
+        )
+
+        assert backend.max_active == 1, backend.requests
+        assert len(backend.requests) == 2, backend.requests
+        assert backend.requests[1].count("user next") == 1, backend.requests
+        assert backend.requests[1].count("steered") == 1, backend.requests
+        assert len(turns) == 2, turns
+        status = await _request(
+            reader, writer, 6, "delivery_status", {"delivery_id": "s1"}
+        )
+        assert status[-1]["result"]["status"] == "delivered"
+        assert not server.runtime.loop.has_pending_steering
+    finally:
+        publish_agent_end.set()
+        backend.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> None:
+    # the next turn would run without the client's required MCP bindings, and
+    # a send is refused then too, so the late steer ends as a disconnect drop.
+    backend = HeldLaterStepBackend([])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    deliveries = server.control.deliveries
+    original_continue = deliveries.continue_after_turn
+    decided = asyncio.Event()
+
+    async def record_decision(*args: Any, **kwargs: Any) -> None:
+        try:
+            await original_continue(*args, **kwargs)
+        finally:
+            decided.set()
+
+    # test-contract: seam serve has no public end-of-turn decision observation
+    deliveries.continue_after_turn = record_decision
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.streaming.wait(), what="final reply streaming")
+        steer = await _request(
+            reader,
+            writer,
+            4,
+            "steer",
+            {"text": "also this", "delivery_id": "unbound-steer"},
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+        # test-contract: seam serve has no public way to lose MCP bindings mid-turn
+        server.control._mcp_binding_required = True
+        server.control._active_mcp_bindings = {}
+
+        backend.release.set()
+        await await_or_fail(decided.wait(), what="end-of-turn decision")
+        status = await _request(
+            reader, writer, 5, "delivery_status", {"delivery_id": "unbound-steer"}
+        )
+        assert status[-1]["result"]["status"] == "dropped", status[-1]
+        store = server.runtime.opened.store
+        assert store.client_delivery("unbound-steer").reason == "disconnect"
+        assert backend.calls == 1
+        assert not server.runtime.loop.has_pending_steering
+    finally:
+        backend.release.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_holding_its_echo_orders_against_end_of_turn_steering(
+    tmp_path: Path,
+) -> None:
+    # a send that passed its busy check is still echoing when the finished turn
+    # decides about its unread steer; without one guard both start a turn.
+    backend = OneAtATimeBackend()
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    control = server.control
+    deliveries = control.deliveries
+    original_event = control._event
+    original_echo = control.user_message
+    original_start = control.start_turn
+    original_continue = deliveries.continue_after_turn
+    at_agent_end = asyncio.Event()
+    publish_agent_end = asyncio.Event()
+    echo_held = asyncio.Event()
+    release_echo = asyncio.Event()
+    decision_entered = asyncio.Event()
+    turns: list[asyncio.Task[None]] = []
+    send: asyncio.Task[list[dict[str, Any]]] | None = None
+
+    async def hold_first_agent_end(event: StreamEvent, *args: Any, **kwargs: Any):
+        if event.type is StreamEventType.AGENT_END and not at_agent_end.is_set():
+            at_agent_end.set()
+            await await_or_fail(publish_agent_end.wait(), what="agent_end release")
+        return await original_event(event, *args, **kwargs)
+
+    async def hold_send_echo(text: str, mode: str, *args: Any, **kwargs: Any) -> None:
+        if mode == "send" and text == "user next":
+            echo_held.set()
+            await await_or_fail(release_echo.wait(), what="send echo release")
+        await original_echo(text, mode, *args, **kwargs)
+
+    def record_start(*args: Any, **kwargs: Any) -> None:
+        original_start(*args, **kwargs)
+        turns.append(control._turn_task)
+
+    async def enter_decision(*args: Any, **kwargs: Any) -> None:
+        decision_entered.set()
+        await original_continue(*args, **kwargs)
+
+    # test-contract: seam serve has no public hold between turn_end and agent_end
+    control._event = hold_first_agent_end
+    # test-contract: seam serve has no public hold inside a send's echo
+    control.user_message = hold_send_echo
+    # test-contract: seam serve has no public turn-start observation
+    control.start_turn = record_start
+    # test-contract: seam serve has no public end-of-turn decision observation
+    deliveries.continue_after_turn = enter_decision
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        await _request(reader, writer, 3, "send", {"text": "first"})
+        await await_or_fail(backend.streaming.wait(), what="first reply streaming")
+        steer = await _request(
+            reader, writer, 4, "steer", {"text": "steered", "delivery_id": "s2"}
+        )
+        assert steer[-1].get("result") == {"accepted": True}, steer[-1]
+        backend.release.set()
+        await await_or_fail(at_agent_end.wait(), what="first turn_end published")
+        send = asyncio.create_task(
+            _request(reader, writer, 5, "send", {"text": "user next"})
+        )
+        await await_or_fail(echo_held.wait(), what="send echo held")
+        publish_agent_end.set()
+        await await_or_fail(decision_entered.wait(), what="end-of-turn decision")
+        release_echo.set()
+        sent = await await_or_fail(send, what="send response")
+        assert sent[-1]["result"]["accepted"] is True, sent[-1]
+        await await_or_fail(
+            asyncio.gather(*turns, return_exceptions=True), what="started turns"
+        )
+
+        assert backend.max_active == 1, backend.requests
+        assert len(backend.requests) == 2, backend.requests
+        assert backend.requests[1].count("user next") == 1, backend.requests
+        assert backend.requests[1].count("steered") == 1, backend.requests
+        assert len(turns) == 2, turns
+        status = await _request(
+            reader, writer, 6, "delivery_status", {"delivery_id": "s2"}
+        )
+        assert status[-1]["result"]["status"] == "delivered"
+    finally:
+        publish_agent_end.set()
+        release_echo.set()
+        backend.release.set()
+        if send is not None:
+            await asyncio.wait_for(asyncio.gather(send, return_exceptions=True), 10)
         await close_serve(server, writer)

@@ -713,12 +713,9 @@ class _Client:
                         "another client is already connected",
                     )
                 if reconnect_bindings is not None:
-                    headers, configs = reconnect_bindings
-                    loop = self.server.runtime.loop
-                    assert loop is not None
-                    await loop.set_mcp_bindings(headers, configs)
-                    await loop._ensure_mcp_servers()
-                    self.server.control._active_mcp_bindings = headers
+                    await self.server.control.reattach_mcp_bindings(
+                        *reconnect_bindings
+                    )
                 self.server._client_active = True
                 self.server._client = self
                 self.connections.activate_controller(self)
