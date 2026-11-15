@@ -7,7 +7,6 @@ from .agent import (
     render_agent_progress,
     render_agent_receipt,
 )
-from .retention import render_retention_card
 from .shared import (
     MAX_CARD_COLUMNS,
     MAX_CARD_LINES,
@@ -28,6 +27,5 @@ __all__ = [
     "render_agent_expanded",
     "render_agent_progress",
     "render_agent_receipt",
-    "render_retention_card",
     "scan_tool_output",
 ]

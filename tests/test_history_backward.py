@@ -304,8 +304,7 @@ async def test_real_socket_validatorless_history_retries_concurrent_append(
         calls = 0
 
         if route == "child":
-            child = await asyncio.to_thread(
-                ConversationStore,
+            child = ConversationStore(
                 store.session_dir / "agents",
                 session_id="1",
                 _storage_lease=store._storage_lease,
@@ -326,8 +325,7 @@ async def test_real_socket_validatorless_history_retries_concurrent_append(
             assert "result" in warm, warm
             # a real child append races the next reader acquisition; the forced
             # refresh failure stands in for the stat race the append causes.
-            followup = await asyncio.to_thread(
-                ConversationStore,
+            followup = ConversationStore(
                 store.session_dir / "agents",
                 session_id="1",
                 _storage_lease=store._storage_lease,

@@ -334,7 +334,6 @@ def test_builtin_busy_policy_is_explicit_and_read_only() -> None:
         "memory",
         "model",
         "project",
-        "retention",
         "status",
         "vim",
     }
@@ -1142,7 +1141,7 @@ def test_documented_slash_table_matches_shared_registry() -> None:
     )[1].split("\n\n", 2)[1]
     documented = []
     for line in table.splitlines()[2:]:
-        cells = [cell.strip() for cell in line.strip("|").split("|", 2)]
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
         documented.append(
             (
                 cells[0].strip("`"),

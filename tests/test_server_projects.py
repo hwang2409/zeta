@@ -29,7 +29,7 @@ from zeta.server.slash_commands import run_command
 def _server(tmp_path: Path) -> ZetaServer:
     cwd = tmp_path / "launch"
     cwd.mkdir(parents=True)
-    server = ZetaServer(
+    return ZetaServer(
         home=tmp_path / "home",
         cwd=cwd,
         provider="codex",
@@ -39,9 +39,6 @@ def _server(tmp_path: Path) -> ZetaServer:
             model or "offline",
         ),
     )
-    # keep the separate background retention writer idle during filesystem snapshots
-    (server.home / "settings.toml").write_text("[retention]\ndays = 0\n")
-    return server
 
 
 async def _hello(reader, writer, features: list[str] | None = None) -> dict:
