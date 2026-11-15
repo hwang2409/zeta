@@ -32,6 +32,7 @@ FEATURES = [
 OLD = {"server": "page", "headers": {"Authorization": "Bearer old-page"}}
 NEW = {"server": "page", "headers": {"Authorization": "Bearer new-page"}}
 DETACHED = "client that provides it disconnected"
+MAY_HAVE_RUN = "may or may not have taken effect"
 
 
 class Grace:
@@ -187,6 +188,8 @@ async def test_bound_call_without_reattach_gets_detached_text_at_deadline(
         result = tool_end["tool_result"]
         assert result["is_error"] is True
         assert DETACHED in result["content"], result
+        # it never reached the MCP server, so it does not claim it may have run.
+        assert MAY_HAVE_RUN not in result["content"], result
         assert grace.page_calls() == []
         assert _replies(frames) == ["finished without the page"]
         status = (await _request(reader2, writer2, 6, "status", {}))[-1]["result"]
@@ -307,7 +310,7 @@ async def test_call_in_flight_at_disconnect_says_it_may_have_run(
         ]
         assert len(results) == 1, rows
         assert DETACHED in results[0], results
-        assert "may or may not have taken effect" in results[0], results
+        assert MAY_HAVE_RUN in results[0], results
     finally:
         gate.set()
         await grace.close()

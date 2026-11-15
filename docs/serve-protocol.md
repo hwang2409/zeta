@@ -1199,8 +1199,11 @@ runs once with the new headers. The wait keeps the grace deadline that started
 at the disconnect, also after a `hello` takes the turn over without bindings.
 At that deadline, or when the turn is aborted or the server closes, the call
 ends without reaching the MCP server; at the deadline it returns the same
-"client disconnected" error result. serve-only: the TUI is not a serve
-controller.
+"client disconnected" error result. If the rebind fails to connect, the
+waiting call returns the usual "filtered or unavailable" tool error. A second
+disconnect after a `hello` without bindings starts a new grace deadline, and
+bound calls, waiting or new, then return the "client disconnected" result at
+once, as before this feature. serve-only: the TUI is not a serve controller.
 
 A disconnected client does not stop the active served session or its
 background children. When a client attaches with `hello`, `new_session`, or
