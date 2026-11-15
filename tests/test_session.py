@@ -24,6 +24,7 @@ from rich.text import Text
 import zeta.tui.app as tui_app
 from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import owned_app
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -2599,8 +2600,18 @@ def test_resume_honors_provider_from_settings_file(
     (dot_zeta / "settings.toml").write_text('provider = "claude"\n', encoding="utf-8")
     monkeypatch.chdir(project)
     # No CLI --provider; settings.provider alone must trigger the mismatch banner.
-    with pytest.raises(SessionError, match="override rejected"):
+    with pytest.raises(SessionError, match="override rejected") as rejected:
         create_app(build_parser().parse_args(["--resume", session_id]))
+    assert "'claude' (from settings.toml)" in str(rejected.value)
+    hint = "pass --provider codex --model gpt-5.6-luna"
+    assert hint in str(rejected.value)
+
+    async def resume_as_hinted() -> None:
+        args = build_parser().parse_args(["--resume", session_id, *hint.split()[1:]])
+        async with owned_app(await asyncio.to_thread(create_app, args)):
+            pass
+
+    asyncio.run(resume_as_hinted())
 
     create_app(
         build_parser().parse_args(
