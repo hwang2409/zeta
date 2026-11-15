@@ -498,7 +498,7 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
             )[-1]["result"]["session"]["session_id"]
             if index == 0:
                 original_turn_busy = server.control.turn_busy
-                monkeypatch.setattr(server.control, "turn_busy", lambda: True)
+                monkeypatch.setattr(server.control, "turn_busy", lambda **_: True)
                 for request_id in range(3):
                     result = (
                         await _request(
