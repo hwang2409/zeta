@@ -187,6 +187,7 @@ async def test_armed_owner_continue_stop_or_yield_table(
                 clock_offset[0] += RetentionBounds().worker_ns
         return original_walk(planner, flight, budget)
 
+    # test-contract: seam times a real user-open request or a 30 s clock step inside the final walk
     monkeypatch.setattr(RetentionPlanner, "_walk", walk)
     no_space = _NoSpaceForTransactions()
     if row == "error-after-changed":
