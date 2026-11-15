@@ -354,7 +354,15 @@ class DeliveryRequests:
             if steering is None:
                 control._schedule_background_wake(session_id)
                 return
-            if not control.closing and control.server.runtime.state is state:
+            detached = (
+                control._host_binding_required
+                and control._active_host_commands is None
+            )
+            if (
+                not control.closing
+                and not detached
+                and control.server.runtime.state is state
+            ):
                 # the next turn's first provider request drains the queue,
                 # so each steer becomes delivered exactly as a mid-turn steer.
                 control.start_turn(
@@ -368,7 +376,8 @@ class DeliveryRequests:
                     allow_assistant_reset=allow_assistant_reset,
                 )
                 return
-        await self._drop_steering(session_id, state, "turn_end")
+        # no client can see the next turn: the server closes or the host left.
+        await self._drop_steering(session_id, state, "disconnect")
 
     async def _drop_steering(
         self, session_id: str, state: SessionState, reason: DeliveryDropReason
