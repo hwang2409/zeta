@@ -265,6 +265,10 @@ async def _attach_live_turn(
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
             raise
+        if not control.state_change_busy():
+            # the turn ended during the rebind: this is a plain resume of an idle session
+            await control.controller_ready()
+            return {"session": session_snapshot(self)}
     return {"session": session_snapshot(self), "attached": "live_turn"}
 
 

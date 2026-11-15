@@ -1219,3 +1219,37 @@ async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
         if gate.second_hold is not None and server.control._state_changes:
             gate.release_second()
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_wake_held_across_session_change_does_not_run_on_old_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    started: list[str] = []
+    original_run = server.turn_contexts.run_notification_turn
+
+    async def observed_run(woken_session_id: str, *args: Any, **kwargs: Any):
+        started.append(woken_session_id)
+        return await original_run(woken_session_id, *args, **kwargs)
+
+    # test-contract: seam the notification turn body starts only after the start gate
+    monkeypatch.setattr(server.turn_contexts, "run_notification_turn", observed_run)
+    hold = server.control.hold_wake_start()
+    hold.__enter__()
+    held = True
+    try:
+        _schedule_wake(server, session_id)
+        wake = server.control._notification_task
+        assert wake is not None
+        # a session change runs while the wake waits at the start gate.
+        reply = (await _request(reader, writer, "new", "new_session", {}))[-1]
+        assert reply["result"]["session"]["session_id"] != session_id, reply
+        hold.__exit__(None, None, None)
+        held = False
+        await await_or_fail(asyncio.gather(wake, return_exceptions=True), what="wake end")
+        assert session_id not in started
+    finally:
+        if held:
+            hold.__exit__(None, None, None)
+        await close_serve(server, writer)

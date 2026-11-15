@@ -437,6 +437,8 @@ class ServeControl:
         """Re-bind the active session's released MCP headers for a returning client."""
         loop = self.server.runtime.loop
         assert loop is not None
+        # set_mcp_bindings cancels a running mount, which would kill a wake waiting on it
+        await loop.finish_mcp_mount()
         await loop.set_mcp_bindings(headers, configs)
         self._end_grace_deadline()
         await loop._ensure_mcp_servers()
@@ -928,6 +930,8 @@ class ServeControl:
             # a second change can take the hold before this wake resumes
             while self._state_changes:
                 await self._no_state_change.wait()
+            if self.server.runtime.loop is not loop:
+                return  # a session change ran while this wake waited
             self._wake_admitted = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,

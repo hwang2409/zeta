@@ -516,8 +516,11 @@ async def dispatch(
         raise feature_error(descriptor)
     if descriptor.access is Access.DELIVERY:
         _require_attached_session(client.server.runtime, params)  # type: ignore[attr-defined]
-    if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
-        # a queued wake may not start its setup while a state change runs
+    # a queued wake may not start its setup while a state change runs; abort is
+    # not held, as it can wait for the very turn it stops.
+    if descriptor.access in {
+        Access.SESSION_MUTATION, Access.CONTROLLER_WRITE
+    } and descriptor is not MethodDescriptor.ABORT:
         with client.server.control.hold_wake_start():  # type: ignore[attr-defined]
             return await HANDLERS[descriptor](client, request_id, params)
     return await HANDLERS[descriptor](client, request_id, params)

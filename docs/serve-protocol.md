@@ -498,6 +498,11 @@ re-supplies this connection's bindings:
   session's host commands when the approval is answered, so it uses the
   binding that is active at that time.
 
+When the turn is still waiting for its first MCP connection, the rebind waits
+for that connection to finish, so the turn keeps running. If the turn ends
+while the bindings are re-supplied, the result has no `attached` field, as for
+an idle resume, and a pending notification starts its turn as usual.
+
 The result adds `attached: "live_turn"`. The client then reads the current
 state with `status` or `session_history_and_subscribe`; pending approvals are
 in that result and can be answered. With `in_flight_replay`, the join also
@@ -1549,7 +1554,7 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    until that turn ends. With `resume_attach`, `resume` of the open session
    attaches to that turn, and the client then sees its `turn_start`.
    A notification turn does not start its setup while a session-mutation or
-   controller-write request is running. When the turn left a steer unread, the
+   controller-write request other than `abort` is running. When the turn left a steer unread, the
    server starts the next turn after `agent_end`; a `send` that arrives after
    that start gets `-32004` and should be retried as `steer`. Clients must wait
    for `agent_end` before idle-only requests such as `new_session`; the server
