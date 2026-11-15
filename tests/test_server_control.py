@@ -1060,6 +1060,8 @@ async def test_state_change_waits_for_wake_in_setup_before_turn_start(
         assert reply.get("error", {}).get("code") == -32004, reply
         assert server.runtime.model == model
         assert server.runtime.opened is opened
+        status = (await _request(reader, writer, "status", "status", {}))[-1]
+        assert status["result"]["state"] == "running", status
 
         release_setup.set()
         await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
