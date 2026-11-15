@@ -422,6 +422,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             )
             await tui_poll()
 
+        # test-contract: seam the poll is the only point that orders two sessions' wake claims
         monkeypatch.setattr(
             app.loop, "_poll_project_inbox_once", tui_poll_after_serve_turn
         )
