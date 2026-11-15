@@ -125,14 +125,15 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         state = self.server.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
-        if "resume_attach" in self.features and self.server.control.turn_busy():
+        # a wake in setup counts too: resuming the open session attaches, never swaps
+        if "resume_attach" in self.features and self.server.control.state_change_busy():
             session_id = await _resolve_session_id(self, params)
             state = self.server.runtime.state
             control = self.server.control
             if (
                 state is not None
                 and state.session_id == session_id
-                and control.turn_busy()
+                and control.state_change_busy()
                 and not control._session_swap_active
                 and not control.unhealthy()
             ):
@@ -264,6 +265,10 @@ async def _attach_live_turn(
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
             raise
+        if not control.state_change_busy():
+            # the turn ended during the rebind: this is a plain resume of an idle session
+            await control.controller_ready()
+            return {"session": session_snapshot(self)}
     return {"session": session_snapshot(self), "attached": "live_turn"}
 
 
