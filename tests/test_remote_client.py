@@ -272,7 +272,7 @@ async def test_ssh_exit_is_reported_when_pipes_close_before_the_reap(tmp_path: P
     # forced order: ssh closes its pipes and exits, but asyncio has not reaped it yet when the
     # transport signals its group. darwin refuses killpg on an unreaped group (EPERM).
     signalled = threading.Event()
-    real_killpg, real_waitpid = os.killpg, os.waitpid
+    real_killpg = os.killpg
 
     def killpg(pgid: int, sig: int) -> None:
         try:
@@ -280,13 +280,18 @@ async def test_ssh_exit_is_reported_when_pipes_close_before_the_reap(tmp_path: P
         finally:
             signalled.set()
 
-    def waitpid(pid: int, options: int) -> tuple[int, int]:
-        if options == 0:
-            signalled.wait(10)
-        return real_waitpid(pid, options)
+    def held(real):
+        # hold asyncio's child-watcher thread (waitpid on 3.13, waitid on 3.14+); never block a loop.
+        def wait(*args):
+            if asyncio._get_running_loop() is None:
+                signalled.wait(10)
+            return real(*args)
+        return wait
 
     monkeypatch.setattr(os, "killpg", killpg)
-    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(os, "waitpid", held(os.waitpid))
+    if hasattr(os, "waitid"):
+        monkeypatch.setattr(os, "waitid", held(os.waitid))
     client = RemoteSessionClient(tmp_path, ssh=_fake_ssh(tmp_path))
     task = asyncio.create_task(client.discover(("bad",)))
     try:
