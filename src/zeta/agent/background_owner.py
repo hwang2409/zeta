@@ -138,17 +138,27 @@ class BackgroundAgentOwner:
         by_task = {confirmation.task: confirmation for confirmation in confirmations}
         error: str | None = None
         unconfirmed = bool(pending)
+        requested_confirmed = False
         for confirmation in confirmations:
             if confirmation.task not in done:
                 continue
+            # An unregistered child ended on its own path (its finish won) and
+            # may have closed its store under this request; that is no failure.
+            finished = confirmation.instance_id not in self._cancellers
             try:
                 confirmed = confirmation.task.result()
             except asyncio.CancelledError:
-                error = error or "cancellation confirmation was canceled"
+                if not finished:
+                    error = error or "cancellation confirmation was canceled"
                 confirmed = False
             except Exception as exc:  # noqa: BLE001 - confirmation failures are data
-                error = error or str(exc)
+                if not finished:
+                    error = error or str(exc)
                 confirmed = False
+            if confirmation.instance_id == instance_id:
+                requested_confirmed = confirmed is True
+            if confirmed is False and finished:
+                continue
             if confirmed is False:
                 self._cancel_requested.discard(confirmation.instance_id)
                 if (
@@ -161,6 +171,8 @@ class BackgroundAgentOwner:
             self._cancel_requested.discard(by_task[task].instance_id)
         if error is not None:
             return CancellationOutcome("failed", error)
+        if not requested_confirmed and instance_id not in self._cancellers:
+            return CancellationOutcome("already_finished")
         if unconfirmed:
             return CancellationOutcome("unconfirmed")
         return CancellationOutcome("confirmed")

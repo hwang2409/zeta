@@ -732,19 +732,23 @@ async def test_owner_repeats_bounded_preview_without_daily_wake(tmp_path: Path) 
         await asyncio.to_thread(lease.close)
 
 
+# a complete preview has a preview_id; a partial one (no id) is never published
+_COMPLETE = {"mode": "preview", "preview_id": "p"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("case", "outcomes"),
     [
-        ("complete", [Published({"mode": "preview"}, complete=True)]),
-        ("progressed-incomplete", [Published({"mode": "preview"}, complete=False, progressed=True), Published({"mode": "preview"}, complete=True)]),
-        ("no-progress", [Published({"mode": "preview"}, complete=False)]),
-        ("user-scan-checkpoint", [Yielded("user"), Published({"mode": "preview"}, complete=True)]),
+        ("complete", [Published(_COMPLETE, complete=True)]),
+        ("progressed-incomplete", [Published(_COMPLETE, complete=False, progressed=True), Published(_COMPLETE, complete=True)]),
+        ("no-progress", [Published(_COMPLETE, complete=False)]),
+        ("user-scan-checkpoint", [Yielded("user"), Published(_COMPLETE, complete=True)]),
         ("stop-scan-checkpoint", [Yielded("stop")]),
-        ("publish-failure", [Published({"mode": "preview"}, complete=True)]),
+        ("publish-failure", [Published(_COMPLETE, complete=True)]),
         ("history-failure", [RuntimeError("history")]),
         ("stale-commit", [RuntimeError("stale")]),
-        ("restart", [Published({"mode": "preview"}, complete=True)]),
+        ("restart", [Published(_COMPLETE, complete=True)]),
     ],
 )
 async def test_owner_outcome_table_real_epoch_home(
@@ -816,7 +820,7 @@ async def test_owner_no_progress_waits_for_wake(tmp_path: Path) -> None:
     def run_pass(_planner, _days, _yield_check=None):
         nonlocal passes
         passes += 1
-        return Published({"mode": "preview", "days": 30}, complete=False)
+        return Published({"mode": "preview", "days": 30, "preview_id": f"p{passes}"}, complete=False)
 
     owner = RetentionActivationOwner(
         lambda: Planner(), lambda: 30, run_pass=run_pass, wake_seconds=60

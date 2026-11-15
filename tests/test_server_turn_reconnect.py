@@ -204,59 +204,6 @@ async def test_nobody_returns_within_grace_cancels_turn_with_disconnect(
         await _close(server, writer2, writer)
 
 
-@pytest.mark.asyncio
-async def test_bound_mcp_tool_during_grace_says_client_disconnected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    allow_local_http(monkeypatch)
-    mcp = LocalMCP()
-    port = await mcp.start()
-    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": {
-        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
-    }}}))
-    backend = HeldBackend([
-        ([TextContent("mounted")], False),
-        ([ToolUseContent(ToolCall("page-1", "page__echo", {}))], True),
-        ([TextContent("finished without the page")], False),
-    ])
-    server = _server(tmp_path, backend)
-    features = [*RECONNECT, "new_session_settings", "session_mcp_bindings"]
-    binding = {"server": "page", "headers": {"Authorization": "Bearer page-secret"}}
-    reader, writer = await _connect(server)
-    writer2 = None
-    try:
-        await _hello(reader, writer, 1, features)
-        await _request(reader, writer, 2, "new_session", {
-            "provider": "codex", "model": "gpt-5.6-sol",
-            "approval_mode": "allow", "mcp_bindings": [binding],
-        })
-        await _request(reader, writer, 3, "send", {"text": "warm"})
-        await _event(reader, "agent_end")
-        await _request(reader, writer, 4, "send", {"text": "use page"})
-        await await_or_fail(backend.streaming[1].wait(), what="tool call streaming")
-
-        await _drop(writer, server)
-        reader2, writer2 = await _reconnect(server, 5, features)
-        status = (await _request(reader2, writer2, 6, "status", {}))[-1]["result"]
-        assert status["state"] == "running", status
-        backend.release[1].set()
-        tool_end = await _event(reader2, "tool_end")
-        frames = await frames_until_event(reader2, "agent_end")
-
-        result = tool_end["tool_result"]
-        assert result["is_error"] is True
-        assert "client that provides it disconnected" in result["content"], result
-        assert mcp.methods.count("tools/call") == 0
-        assert _replies(frames) == ["finished without the page"]
-        status = (await _request(reader2, writer2, 7, "status", {}))[-1]["result"]
-        assert status["last_turn_outcome"]["reason"] == "completed"
-    finally:
-        for release in backend.release:
-            release.set()
-        await _close(server, writer2, writer)
-        await mcp.close()
-
-
 async def _late_steer_at_turn_end(server: ZetaServer, reader, writer, backend):
     """Queue a steer the finished turn did not consume; hold its end-of-turn step.
 

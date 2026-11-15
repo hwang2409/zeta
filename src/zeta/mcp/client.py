@@ -197,12 +197,18 @@ def unavailable_result(name: str) -> StructuredToolResult:
     )
 
 
-def detached_result(name: str) -> StructuredToolResult:
-    return make_error_result(
+def detached_result(name: str, *, started: bool = False) -> StructuredToolResult:
+    text = (
         f"MCP server '{name}' is unavailable because the client that provides it "
         "disconnected. The tool is not broken: the client may reconnect soon and "
         "re-attach it."
     )
+    if started:
+        text += (
+            " This call was already sent, so it may or may not have taken effect; "
+            "check before you call it again."
+        )
+    return make_error_result(text)
 
 
 def require_capability(
