@@ -12,7 +12,6 @@ from ..storage_format import StorageFormatError
 def create_tui_app(
     args: argparse.Namespace,
     tui_print: Callable[[str], None],
-    has_console_message: Callable[[Exception], bool],
 ) -> object | None:
     from ..tui.bootstrap import create_app
 
@@ -26,11 +25,4 @@ def create_tui_app(
     except ValueError as exc:
         # SessionError lands here too; stderr goes to logs/tui-stderr while the TUI owns the terminal.
         tui_print(f"zeta: {exc}")
-        return None
-    except Exception as exc:
-        if has_console_message(exc):
-            raise
-        from ..tui.loop_errors import log_tui_crash
-
-        tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
         return None

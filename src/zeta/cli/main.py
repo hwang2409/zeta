@@ -842,7 +842,7 @@ def _tui_print(message: str) -> None:
 
 
 def _create_tui_app(args: argparse.Namespace) -> object | None:
-    return create_tui_app(args, _tui_print, _has_console_message)
+    return create_tui_app(args, _tui_print)
 
 
 def _print_exit_hint(app: object) -> None:
@@ -1025,9 +1025,18 @@ def _run_tui_command(
 ) -> int:
     from ..tui.stderr_capture import run_tui_lifecycle
 
-    exit_status, restart_session_id = run_tui_lifecycle(
-        args, _run_tui_lifecycle_captured
-    )
+    try:
+        exit_status, restart_session_id = run_tui_lifecycle(
+            args, _run_tui_lifecycle_captured
+        )
+    except Exception as exc:
+        # stderr is the log file here; an uncaught traceback would leave the terminal blank.
+        if _has_console_message(exc):
+            raise
+        from ..tui.loop_errors import log_tui_crash
+
+        _tui_print(f"zeta: crashed; details in {log_tui_crash(exc)}")
+        return 1
     if restart_session_id is not None:
         return _exec_restart(entrypoint, original_argv, restart_session_id)
     return exit_status

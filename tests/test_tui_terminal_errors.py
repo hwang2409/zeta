@@ -640,3 +640,34 @@ def test_resume_override_rejection_reaches_the_terminal(tmp_path: Path, monkeypa
     assert b"session override rejected" in output, output
     assert b"'claude' (from --provider)" in output, output
     assert returncode == 1
+
+
+def test_fatal_start_error_after_redirect_reaches_the_terminal(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from tests.support.owned import owned_app
+    from zeta.cli.main import build_parser
+    from zeta.locking import RETENTION_HOME_ID, domain_lock_name
+    from zeta.tui.bootstrap import create_app
+
+    home = tmp_path / "zeta-home"
+    monkeypatch.setenv("ZETA_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    async def stored_session() -> str:
+        app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+        async with owned_app(app):
+            return app.loop.store.session_id
+
+    session_id = asyncio.run(stored_session())
+    # A directory where a retention lock file belongs makes retention owner start fail with OSError.
+    (home / ".domain-locks" / domain_lock_name(RETENTION_HOME_ID, "planner-active")).mkdir(parents=True)
+    code = (
+        "import sys; from zeta.cli.main import main; "
+        f"sys.exit(main(['--resume', {session_id!r}, '--provider', 'codex']))"
+    )
+    output, returncode = _run_pty_python(code, _capture_env(home), timeout=30)
+    assert b"zeta: crashed; details in " in output, output
+    assert returncode == 1
+    crash_log = Path(output.split(b"details in ", 1)[1].split(b"\r", 1)[0].decode())
+    assert "ensure_handshake_files" in crash_log.read_text()
