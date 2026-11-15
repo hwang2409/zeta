@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import stat
 from collections.abc import Callable
@@ -53,7 +54,8 @@ from . import (
 )
 
 _descend = descend_directory
-_TIMESTAMP_FIELDS = ("created_at", "updated_at", "started_at", "finished_at")
+_TRANSCRIPT_NAME = "conversation.jsonl"
+_MAX_HEADER_BYTES = 1024 * 1024
 
 
 class _EntryScan:
@@ -145,11 +147,11 @@ def _walk_directory(flight: _InFlight, walk: _Walk, budget: _Budget):
         info = os.fstat(dfd)
         entries = _EntryScan(dfd, budget.charge_entry)
     walk.fingerprints.append(["/".join(comps), info.st_dev, info.st_ino, info.st_mtime_ns])
-    walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
     return comps, entries
 
 
-def _visit(walk: _Walk, dfd, comps, entry) -> None:
+def _visit(flight: _InFlight, dfd, comps, entry) -> None:
+    walk = flight.walk
     name = entry.name
     info = entry.stat(follow_symlinks=False)
     walk.entries += 1
@@ -161,7 +163,9 @@ def _visit(walk: _Walk, dfd, comps, entry) -> None:
     if info.st_nlink != 1:
         raise PlannerError("hard-linked file in tree")
     walk.bytes += info.st_size
-    walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
+    # Age is transcript time only: lock, index, meta and directory mtimes move without use.
+    if name == _TRANSCRIPT_NAME and comps in flight.store_dirs:
+        walk.max_activity = max(walk.max_activity, info.st_mtime_ns)
 
 
 def _fingerprints_intact(flight: _InFlight) -> bool:
@@ -259,7 +263,7 @@ def _authority_memory_reconciliation_reason(
 
 
 def _authority_store_reason(flight: _InFlight, scan: _ClosureBudget) -> str | None:
-    """Store-local blockers; also folds metadata timestamps into activity."""
+    """Store-local blockers; also folds the root header time into activity."""
     for comps in flight.store_dirs:
         with _descend(flight.root_fd, comps) as dfd:
             pending = _read_json(dfd, _PENDING_LINK_NAME, scan)
@@ -277,9 +281,44 @@ def _authority_store_reason(flight: _InFlight, scan: _ClosureBudget) -> str | No
             metadata = _read_json(dfd, _METADATA_NAME, scan)
             if not comps:
                 _canonical_metadata(metadata, flight.root_id)
-            for value in (metadata, lifecycle):
-                flight.walk.max_activity = max(flight.walk.max_activity, _metadata_activity(value))
+                created = _header_created_ns(dfd, scan)
+                if created is None:
+                    return "no transcript"
+                flight.walk.max_activity = max(flight.walk.max_activity, created)
     return None
+
+
+def _header_created_ns(directory_fd: int, scan: _ClosureBudget) -> int | None:
+    """The root header's ``created_at`` in ns; None without a transcript, 0 when empty."""
+    try:
+        fd = open_session_file(directory_fd, _TRANSCRIPT_NAME, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except (OSError, SessionError) as exc:
+        raise PlannerError("unsafe retention read: transcript") from exc
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            first = stream.readline(_MAX_HEADER_BYTES + 1)
+    except OSError as exc:
+        raise PlannerError("unsafe retention read: transcript") from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
+    scan.charge(len(first))
+    if not first:
+        return 0
+    try:
+        header = json.loads(first)
+        text = header["data"]["created_at"]
+        if header["type"] != "header" or type(text) is not str:
+            raise ValueError
+        moment = datetime.fromisoformat(text)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise PlannerError("malformed transcript header") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return int(moment.timestamp() * 1_000_000_000)
 
 
 def _has_child_marker(directory_fd, scan) -> bool:
@@ -325,27 +364,6 @@ def _canonical_metadata(value, session_id: str) -> SessionMetadata:
     if metadata.session_id != session_id:
         raise PlannerError("metadata id does not match directory")
     return metadata
-
-
-def _metadata_activity(value) -> int:
-    """Latest metadata timestamp in ns; a malformed one makes the root ineligible."""
-    if value is None:
-        return 0
-    if type(value) is not dict:
-        raise PlannerError("malformed metadata")
-    latest = 0
-    for name in _TIMESTAMP_FIELDS:
-        text = value.get(name)
-        if text is None:
-            continue
-        try:
-            moment = datetime.fromisoformat(text)
-        except (TypeError, ValueError) as exc:
-            raise PlannerError("malformed metadata timestamp") from exc
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=UTC)
-        latest = max(latest, int(moment.timestamp() * 1_000_000_000))
-    return latest
 
 
 def _authority_parent_id(sessions_fd, session_id, scan) -> str | None:
