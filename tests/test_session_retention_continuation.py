@@ -48,9 +48,9 @@ class _IdleSignal(asyncio.Event):
         super().__init__()
         self.idle = asyncio.Event()
 
-    async def wait(self) -> bool:
+    def wait(self):  # the owner awaits the returned coroutine under its own deadline
         self.idle.set()
-        return await super().wait()
+        return super().wait()
 
 
 async def _settle(event: asyncio.Event) -> None:
