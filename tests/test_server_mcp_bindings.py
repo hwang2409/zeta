@@ -1149,7 +1149,8 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         monkeypatch.setattr(type(approval_gate), "run", hold_live_after_approval)
         await _request(reader, writer, 4, "send", {"text": "run bash"})
         approval = await _event(reader, "approval_request")
-        assert not server.control.turn_busy()
+        # The live turn waits on approval, so it stays busy after the warm-up turn_end.
+        assert server.control.turn_busy()
         live_turn = server.control._turn_task
         assert live_turn is not None
         live_finished = asyncio.Event()
