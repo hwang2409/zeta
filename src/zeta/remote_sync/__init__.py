@@ -424,7 +424,8 @@ def _copy_tree(source: Path, destination: Path) -> None:
             target.mkdir(parents=True, exist_ok=True, mode=0o700)
         elif path.is_file():
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            shutil.copyfile(path, target)
+            # copy2 keeps the mtime: a copy must not reset the session's retention age.
+            shutil.copy2(path, target)
             target.chmod(0o600)
         else:
             raise RemoteSyncError(f"unsupported file in session snapshot: {relative}")
@@ -538,6 +539,7 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
     _write_metadata(meta_path, meta)
     for log in snapshot.rglob("conversation.jsonl"):
         temporary = log.with_name(f".{log.name}.{os.getpid()}.tmp")
+        original = log.stat()
         try:
             with log.open("rb") as source:
                 first = source.readline(_MAX_CONVERSATION_HEADER_BYTES + 1)
@@ -556,6 +558,8 @@ def _rewrite_cwd(snapshot: Path, cwd: Path) -> None:
                     )
                     shutil.copyfileobj(source, output, length=1024 * 1024)
             temporary.chmod(0o600)
+            # A cwd rewrite is not activity; keep the transcript's retention age.
+            os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
             os.replace(temporary, log)
         finally:
             temporary.unlink(missing_ok=True)
