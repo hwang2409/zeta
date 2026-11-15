@@ -321,6 +321,49 @@ async def test_http_deadline_retains_cancellation_resistant_call_until_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_close_closes_client_from_setup_that_ignored_cancel(
+    tmp_path: Path,
+) -> None:
+    setup_entered = asyncio.Event()
+    never = asyncio.Event()
+    closed: list[object] = []
+
+    class Client:
+        def set_failure_sink(self, _sink) -> None:
+            pass
+
+        async def close(self) -> None:
+            closed.append(self)
+
+    async def connect_and_list(_client) -> list[MCPTool]:
+        setup_entered.set()
+        try:
+            await await_or_fail(never.wait(), timeout=30, what="setup cancel")
+        except asyncio.CancelledError:
+            pass  # httpcore can lose a cancel this way and return the response
+        return [MCPTool("echo", "", {"type": "object"})]
+
+    client = Client()
+    actor = MCPServerActor(
+        MCPServerConfig("local", "stdio", "unused"),
+        source=tmp_path / "mcp.json",
+        registry=None,
+        publish=lambda *_args: None,
+        build_client=lambda _config: client,
+        connect_and_list=connect_and_list,
+    )
+    actor.start()
+    started = asyncio.create_task(actor.wait_started(None))
+    try:
+        await await_or_fail(setup_entered.wait(), what="actor setup start")
+    finally:
+        await await_or_fail(actor.close(), what="actor close")
+        await await_or_fail(started, what="actor start result")
+
+    assert closed == [client], "close left the late setup client open"
+
+
+@pytest.mark.asyncio
 async def test_deadline_covers_call_work_before_first_yield(tmp_path: Path) -> None:
     now = 0.0
 
