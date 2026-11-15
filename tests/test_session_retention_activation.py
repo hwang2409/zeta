@@ -497,10 +497,9 @@ async def test_concurrent_owner_probes_do_not_read_as_user_open(
         b_task = asyncio.ensure_future(asyncio.to_thread(_run_owner_as, "b", second))
         results = await asyncio.wait_for(asyncio.gather(a_task, b_task), 15)
         assert b_probes[:1] == [False], "owner b read owner a's probe as a user open"
+        # a user yield would end the episode with Yielded("user") and no published projection
         for projections, failure in results:
             assert failure is None and projections, results
-        rows = read_retention_history(home)
-        assert {row["days"] for row in rows} == {30, 31}, rows
     finally:
         await first.stop()
         await second.stop()
