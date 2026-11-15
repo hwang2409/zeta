@@ -151,6 +151,8 @@ class PassResult:
     preview: PreviewSnapshot | None = None
     in_progress_root: str | None = None
     changed: bool = False
+    # a root of the armed preview got its terminal outcome (deleted or rejected) in this pass
+    stepped: bool = False
 
 
 class RetentionPlannerError(Exception):
@@ -212,6 +214,14 @@ def project_retention_result(result: PassResult, *, days: int, timestamp: str) -
         root_ids=preview.root_ids, count=preview.count, bytes=preview.bytes,
         preview_id=preview.preview_id, cutoff=preview.cutoff,
     )
+
+
+def same_retention_result(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    """Compare two projections by what they say, not when or how far a partial scan got."""
+    ignored = {"timestamp", "progress_counts"}
+    return {k: v for k, v in left.items() if k not in ignored} == {
+        k: v for k, v in right.items() if k not in ignored
+    }
 
 
 _COORDINATOR_TOKEN_MARKER = object()
@@ -305,6 +315,8 @@ def append_retention_history(
     except (OSError, ValueError, StorageFormatError, RetentionPlannerError):
         # A corrupt history row must not strand the activation owner.
         rows = []
+    if rows and same_retention_result(rows[-1], result):
+        return "fresh"
     rows = (rows + [dict(result)])[-_MAX_HISTORY:]
     def publish() -> None:
         home_fd = os.open(Path(home), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -319,8 +331,25 @@ def append_retention_history(
     return "fresh"
 
 
-def retention_arm_warning() -> str:
-    return _ARM_WARNING
+def _keeps_deleting(days: object) -> str:
+    return f"arming keeps deleting closed, unpinned sessions older than {days} days until /retention disarm"
+
+
+def retention_status(home: str | Path) -> tuple[tuple[dict[str, object], ...], str]:
+    """Read history and the arm file; return them with the bare `/retention` reply for both surfaces."""
+    history = read_retention_history(home)
+    if not history:
+        return history, "retention: none"
+    latest = history[-1]
+    message = "retention: " + ", ".join(
+        f"{key}={latest[key]}" for key in ("mode", "days", "count", "preview_id")
+    )
+    # "unarmed" comes from the arm file: a completed chain ends on a preview row while still armed
+    armed = (Path(home) / _ARM_FILENAME).exists()
+    if latest["mode"] == "preview" and latest["preview_id"] is not None and not armed:
+        # the decision point: the user can arm this complete preview next
+        message += "\n" + _ARM_WARNING + "\n" + _keeps_deleting(latest["days"])
+    return history, message
 
 
 @dataclass(frozen=True)
@@ -464,7 +493,12 @@ def retention_authority(
                 _publish_arm(token, home_fd, arm)
                 projection = retention_result(timestamp=now(), mode="armed", days=current.days, root_ids=tuple(preview.get("root_ids", ())), count=preview.get("count"), bytes=preview.get("bytes", 0), preview_id=preview.get("preview_id"), cutoff=preview.get("cutoff"), armed_by_zeta_version=arm["armed_by_zeta_version"])
                 append_retention_history(token, root, lease, projection)
-                return RetentionAuthorityResult(_ARM_WARNING, projection, True)
+                return RetentionAuthorityResult(
+                    f"retention armed: deleting {projection['count']} sessions older than "
+                    f"{current.days} days starts now in this process; other zeta processes "
+                    "on this home start on their next pass\n" + _keeps_deleting(current.days),
+                    projection, True,
+                )
             finally:
                 os.close(home_fd)
     except (TimeoutError, SessionReferenceUnavailable):
@@ -672,6 +706,7 @@ class _Sweep:
     preview_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     root_scan: _EntryScan | None = None
     current_root: str | None = None
+    decided: int = 0
     discovery_done: bool = False
     discovery_blocked: bool = False
     selected: list[str] = field(default_factory=list)
@@ -711,6 +746,9 @@ class RetentionPlanner:
         self._sweep: _Sweep | None = None
         self._flight: _InFlight | None = None
         self._latest: object = _UNLOADED
+        self._reload_latest = False
+        # (preview_id, roots with a terminal outcome): a rejected root never blocks the rest
+        self._attempted: tuple[object, set[str]] = (None, set())
         self._commit_baseline: dict | None = None
         self._prepared_commit: tuple[dict | None, dict] | None = None
 
@@ -722,6 +760,7 @@ class RetentionPlanner:
 
     def close(self) -> None:
         """Release all live cursors and leases owned by this planner."""
+        self._reload_latest = True
         self._close_flight()
         if self._sweep is not None and self._sweep.root_scan is not None:
             self._sweep.root_scan.close()
@@ -739,10 +778,11 @@ class RetentionPlanner:
         sweep = self._sweep
         flight = self._flight
         if sweep is None:
-            return ()
+            return (len(self._attempted[1]),)
         walk = flight.walk if flight is not None else None
         return (
-            sweep.days, sweep.current_root, sweep.discovery_done,
+            len(self._attempted[1]), sweep.days, sweep.current_root, sweep.decided, sweep.discovery_done,
+            flight.deferred if flight is not None else False,
             sweep.discovery_blocked, tuple(sweep.selected), sweep.bytes,
             tuple(walk.frontier) if walk is not None else (),
             tuple(walk.fingerprints) if walk is not None else (),
@@ -785,12 +825,26 @@ class RetentionPlanner:
         self._yield_check = yield_check
         self._prepared_commit = None
         self._commit_baseline = _load_state(home_fd)
-        if self._latest is _UNLOADED:
-            state = _load_state(home_fd)
-            self._latest = state["preview"] if state is not None else None
+        if self._latest is _UNLOADED or self._reload_latest:
+            # other processes can write state; a removal step clears its preview, so keep ours
+            # then, but a removed state (disarm) drops it
+            stored = self._commit_baseline["preview"] if self._commit_baseline is not None else None
+            if type(stored) is dict and stored.get("days") == days:
+                self._latest = stored
+            elif self._latest is _UNLOADED or self._commit_baseline is None:
+                self._latest = None
+            self._reload_latest = False
         if type(self._latest) is dict and self._latest.get("days") != days:
             self._latest = None
             self.close()
+        candidates = None
+        if type(self._latest) is dict:
+            if self._attempted[0] != self._latest["preview_id"]:
+                self._attempted = (self._latest["preview_id"], set())
+            candidates = {
+                **self._latest,
+                "root_ids": [r for r in self._latest["root_ids"] if r not in self._attempted[1]],
+            }
         transaction = _QuarantineTransaction(
             self.home,
             self.lease,
@@ -803,7 +857,7 @@ class RetentionPlanner:
         with _coordinator_authority(self.home) as token:
             outcome = transaction.advance(
                 days=days,
-                preview=self._latest if type(self._latest) is dict else None,
+                preview=candidates,
                 verify=self._verify_candidate,
                 token=token,
                 deadline_ns=deadline_ns,
@@ -873,8 +927,13 @@ class RetentionPlanner:
     def _transaction_result(self, outcome: TransactionOutcome, expected_generation: RetentionGeneration) -> PassResult | None:
         if not outcome.advanced and outcome.blocked is None:
             return None
-        if outcome.completed:
-            self._latest = None
+        stepped = (
+            outcome.session_id is not None
+            and (outcome.completed or outcome.blocked is not None)
+            and outcome.session_id not in self._attempted[1]
+        )
+        if stepped:
+            self._attempted[1].add(outcome.session_id)
         reasons = (
             (RootOutcome(outcome.session_id or "recovery", False, outcome.blocked),)
             if outcome.session_id is not None or outcome.blocked is not None
@@ -888,6 +947,7 @@ class RetentionPlanner:
             preview=_preview_snapshot(self._latest),
             expected_generation=expected_generation,
             changed=outcome.changed,
+            stepped=stepped,
         )
 
     @contextmanager
@@ -902,10 +962,15 @@ class RetentionPlanner:
         home_fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             with child_directory(home_fd, "sessions") as sessions_fd:
-                flight = self._hold(sessions_fd, root_id, scan)
-                if not self._walk(flight, budget):
-                    raise CandidateRejected("final candidate walk exceeded its bound")
-                reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
+                # a failure of this one root (open, gone, unreadable) rejects only it;
+                # opening the home or sessions/ above is not about the root and stays an error
+                try:
+                    flight = self._hold(sessions_fd, root_id, scan)
+                    if not self._walk(flight, budget):
+                        raise CandidateRejected("final candidate walk exceeded its bound")
+                    reason = self._closure_reason(home_fd, sessions_fd, flight, sweep, scan)
+                except (OSError, SessionError, RetentionPlannerError) as exc:
+                    reason = _failure_reason(exc)
                 if reason is not None:
                     raise CandidateRejected(reason)
                 generation = read_reference_generation(self.home)
@@ -955,6 +1020,7 @@ class RetentionPlanner:
                 if outcome is None:
                     break
                 reasons.append(outcome)
+                sweep.decided += 1
                 sweep.current_root = None
                 if outcome.closed:
                     sweep.selected.append(outcome.root_id)
