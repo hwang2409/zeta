@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from ...core.store import ConversationStore
 from ...core.store._history_index import StaleHistorySnapshot
+from ...core.store._row_history import searchable_units
 from ...core.store._rows import MessageFacts
 from ...protocol.types import (
     FAILED_TURN_MARKER,
@@ -20,11 +21,10 @@ from ...protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-    TextContent,
     ToolUseContent,
     is_passive_harness_message,
 )
-from ..cards.agent_sync import bounded_transcript_message
+from ..agent_view_state import _bounded_message
 from ..user import displayed_user_text
 from .paged_history import (
     HistoryCursor,
@@ -34,6 +34,7 @@ from .paged_history import (
     TUIPaintSegment,
 )
 from .root_history_source import _project_entry
+from .transcript_finder import finder_row_contains
 
 
 class ChildLogHistorySource:
@@ -126,9 +127,7 @@ class ChildLogHistorySource:
             if ref.type != "message":
                 continue
             entry = store.entry(ref)
-            candidate = Message.from_dict(
-                bounded_transcript_message(entry.data["message"])
-            )
+            candidate = Message.from_dict(entry.data["message"])
             if any(
                 isinstance(block, ToolUseContent)
                 and block.tool_call.id == result.tool_call_id
@@ -147,7 +146,8 @@ class ChildLogHistorySource:
             raw_message = entry.data["message"]
             if is_passive_harness_message(raw_message):
                 return [], 0
-            bounded = bounded_transcript_message(raw_message)
+            # The per-line bound main's child replay used; the message stays whole.
+            bounded = _bounded_message(raw_message)
             entry = replace(entry, data={**entry.data, "message": bounded})
             message = Message.from_dict(bounded)
             dependency = self._dependency(store, refs, position, message)
@@ -261,6 +261,12 @@ class ChildLogHistorySource:
         refs = self._refresh_refs(store)
         return self._page_from_refs(store, refs, cursor, direction)
 
+    async def file_revision(self) -> tuple[int, int, int, int]:
+        """Return the log's identity, size, and mtime: a cheap change check."""
+
+        stat = await asyncio.to_thread(os.stat, self.path / "conversation.jsonl")
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
     async def page(
         self,
         cursor: HistoryCursor | None = None,
@@ -318,7 +324,7 @@ class ChildLogHistorySource:
             raw_message = store.entry(ref).data["message"]
             if is_passive_harness_message(raw_message):
                 continue
-            message = Message.from_dict(bounded_transcript_message(raw_message))
+            message = Message.from_dict(raw_message)
             scanned += 1
             if message.metadata.get(MESSAGE_ORIGIN_METADATA) not in {
                 MessageOrigin.USER,
@@ -399,21 +405,6 @@ class ChildLogHistorySource:
     ) -> str | None:
         return await self._run(self._adjacent_user_sync, entry_id, direction)
 
-    @staticmethod
-    def _visible_message_text(raw_message: dict[str, Any]) -> str:
-        """Project only text that the child transcript renderer exposes."""
-
-        message = Message.from_dict(bounded_transcript_message(raw_message))
-        visible = [message.role.value]
-        for block in message.content:
-            if isinstance(block, TextContent):
-                visible.append(block.text)
-            elif isinstance(block, ToolUseContent):
-                visible.append(block.tool_call.name)
-        if message.tool_result is not None:
-            visible.append(message.tool_result.content)
-        return "\n".join(visible)
-
     def _search_sync(
         self,
         store: ConversationStore,
@@ -421,25 +412,21 @@ class ChildLogHistorySource:
         limit: int,
         cancel: threading.Event,
     ) -> tuple[HistorySearchResult, ...]:
-        needle = query.casefold()
         matches: list[HistorySearchResult] = []
         refs = self._refresh_refs(store)
         for entry in store.stream_rows(reversed(refs), batch=256):
             if cancel.is_set():
                 break
             raw_message = entry.data.get("message")
-            if isinstance(raw_message, dict):
-                if is_passive_harness_message(raw_message):
-                    continue
-                searchable = self._visible_message_text(raw_message)
-            elif entry.type == "checkpoint":
-                searchable = json.dumps(entry.data, ensure_ascii=False)
-            else:
+            if isinstance(raw_message, dict) and is_passive_harness_message(raw_message):
                 continue
-            if needle in searchable.casefold():
-                matches.append(HistorySearchResult(entry.id))
-                if len(matches) == limit:
-                    break
+            # Root's unit projection, matched the way a finder row matches, so
+            # every durable hit has a finder row.
+            for ordinal, text in enumerate(searchable_units(entry.type, entry.data)):
+                if finder_row_contains(text, query):
+                    matches.append(HistorySearchResult(entry.id, ordinal))
+                    if len(matches) == limit:
+                        return tuple(matches)
         return tuple(matches)
 
     async def search(

@@ -38,37 +38,7 @@ _MAX_REVERSE_SCAN_BYTES = 1024 * 1024
 _MAX_FULL_FALLBACK_BYTES = 16 * 1024 * 1024
 _BOUNDED_UNAVAILABLE = "child transcript unavailable: history exceeds bounded scan"
 _REFRESH_UNAVAILABLE = "child transcript unavailable: refresh failed"
-_MAX_TRANSCRIPT_TEXT_CHARS = 2_000
 _LOGGER = logging.getLogger(__name__)
-
-
-def bounded_transcript_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Keep decoded child text within the existing TUI line bound."""
-
-    result = dict(message)
-    content = message.get("content")
-    if isinstance(content, list):
-        bounded_content: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            bounded_block = dict(block)
-            if (
-                block.get("type") in {"text", "thinking"}
-                and isinstance(block.get("text"), str)
-            ):
-                bounded_block["text"] = block["text"][:_MAX_TRANSCRIPT_TEXT_CHARS]
-            bounded_content.append(bounded_block)
-        result["content"] = bounded_content
-    tool_result = message.get("tool_result")
-    if isinstance(tool_result, dict) and isinstance(tool_result.get("content"), str):
-        bounded_result = dict(tool_result)
-        bounded = tool_result["content"][:_MAX_TRANSCRIPT_TEXT_CHARS]
-        bounded_result["content"] = bounded
-        if bounded != tool_result["content"]:
-            bounded_result.pop("content_blocks", None)
-        result["tool_result"] = bounded_result
-    return result
 
 
 def registered_child_markers(path: Path) -> dict[Path, dict[str, Any]]:
@@ -487,10 +457,9 @@ class AgentTranscriptSource:
                 continue
             if is_passive_harness_message(message):
                 continue
-            bounded = bounded_transcript_message(message)
             retained = previous_by_id.get(entry.id)
             messages.append(
-                (entry.id, retained if retained == bounded else copy.deepcopy(bounded))
+                (entry.id, retained if retained == message else copy.deepcopy(message))
             )
         acknowledged = {
             entry.data.get("prompt_id")

@@ -134,6 +134,7 @@ class AgentTranscriptControl(UIControl):
         self._path: Path | None = None
         self._source: Any = None
         self._load_task: asyncio.Task[None] | None = None
+        self._source_revision: tuple[tuple[int, int, int, int], bool] | None = None
         self._load_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self._pending_path: Path | None = None
@@ -233,7 +234,7 @@ class AgentTranscriptControl(UIControl):
             }
             if target.entry_id not in resident:
                 await self._history_pager.reveal(target.entry_id)
-            self.render_pages(self._history_pager.pages)
+            self._render_resident()
             transcript.restore_durable_scroll_anchor(
                 (target.entry_id, target.unit_ordinal, 0)
             )
@@ -253,10 +254,11 @@ class AgentTranscriptControl(UIControl):
 
         async def reveal() -> None:
             await self._history_pager.reveal(target.entry_id)
-            if not transcript.finder_active:
+            # n/N run after the finder closed; the search itself must still be shown.
+            if not transcript.search_active:
                 return
             query = transcript.search_query
-            self.render_pages(self._history_pager.pages)
+            self._render_resident()
             transcript.restore_durable_scroll_anchor(
                 (target.entry_id, target.unit_ordinal, 0)
             )
@@ -277,6 +279,14 @@ class AgentTranscriptControl(UIControl):
             await asyncio.gather(task, return_exceptions=True)
         self.end_search()
 
+    def _render_resident(self) -> None:
+        """Paint the resident pages into the widget of the view being shown."""
+
+        if self._render_active is not None:
+            self._render_active()
+        else:
+            self.render_pages(self._history_pager.pages)
+
     def _active_transcript(self) -> Any:
         return self._root_transcript if self._path == self._root_path else self.transcript
 
@@ -292,7 +302,14 @@ class AgentTranscriptControl(UIControl):
         if self._finish_path is not None:
             self._finish_path(generation)
         source = self._source
-        if path != self._root_path and source is not None:
+        revision = (
+            (await source.file_revision(), self.transcript.follow_tail)
+            if source is not None
+            else None
+        )
+        # An unchanged log seen from the same place has nothing to publish, and a
+        # page read costs real CPU; reaching the tail must still show appends.
+        if path != self._root_path and source is not None and revision != self._source_revision:
             anchor = self.transcript.durable_scroll_anchor
             follow_tail = self.transcript.follow_tail
             latest = await source.page(None, direction="older")
@@ -307,20 +324,19 @@ class AgentTranscriptControl(UIControl):
                     and latest.endpoint_id != newest.endpoint_id
                 )
             )
-            fresh = (
-                (latest,)
-                if follow_tail
-                else await _anchored_pages(source, anchor)
-                if stale and anchor is not None
-                else resident
-            )
+            if follow_tail:
+                fresh = (latest,)
+            elif stale and anchor is not None:
+                fresh = await _anchored_pages(source, anchor)
+            else:
+                fresh = resident
             # A scroll made during the reads wins; the next refresh catches up.
-            if (
+            published = (
                 generation == self._activation_generation
                 and self.transcript.durable_scroll_anchor == anchor
                 and self.transcript.follow_tail == follow_tail
-                and fresh != resident
-            ):
+            )
+            if published and fresh != resident:
                 self._history_pager.reset()
                 for index, page in enumerate(fresh):
                     self._history_pager.adopt(page, direction="newer" if index else "older")
@@ -328,6 +344,8 @@ class AgentTranscriptControl(UIControl):
                 if anchor is not None and not follow_tail:
                     self._history_pager.set_anchor(*anchor)
                     self._restore_anchor(self.transcript, anchor)
+            if published and (follow_tail or not stale or anchor is not None):
+                self._source_revision = revision
         if self._invalidate is not None:
             self._invalidate()
 
@@ -514,6 +532,7 @@ class AgentTranscriptControl(UIControl):
 
             self._path = path
             self._source = None if prepared_source is self._root_source else prepared_source
+            self._source_revision = None
             self._history_pager.source = prepared_source
             self._history_pager.reset(endpoint_id=endpoint)
             for index, page in enumerate(prepared_pages):
@@ -544,10 +563,7 @@ class AgentTranscriptControl(UIControl):
                 else:
                     buffer.set_document(document, bypass_readonly=True)
             self.search_index = restored.finder_cursor
-            if self._render_active is not None:
-                self._render_active()
-            else:
-                self.render_pages(self._history_pager.pages)
+            self._render_resident()
             transcript = self._active_transcript()
             if transcript is not None and restored.finder_query:
                 transcript.open_finder()

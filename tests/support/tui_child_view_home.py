@@ -15,8 +15,11 @@ CHILD_ROWS = 1_154
 CHILD_ID = "651"
 VISIBLE_PROMPT = "Henry's task, verbatim"
 _CHILD_PROMPT_PREFIX = VISIBLE_PROMPT + ". Do the focused child fixture task. "
-CHILD_PROMPT = _CHILD_PROMPT_PREFIX + "p" * (2_000 - len(_CHILD_PROMPT_PREFIX))
+CHILD_PROMPT_END = "child-prompt-end-ux1309"
+# Several short lines past 2,000 characters: a per-message cut loses the end.
+CHILD_PROMPT = _CHILD_PROMPT_PREFIX + "\n".join(["pad " * 40] * 16) + CHILD_PROMPT_END
 ROOT_MARKER = "complex-root-anchor-ux1309"
+ROOT_PAIR_MARKER = "root-pair-ux1309"
 
 
 @dataclass(frozen=True)
@@ -99,7 +102,9 @@ def _root_rows(session_id: str) -> list[dict[str, Any]]:
                 "is_error": False,
             }
         else:
-            data = _message(role, [{"type": "text", "text": f"root row {index} "}], origin=origin)
+            # Two old, unloaded rows share one marker for durable root search.
+            pair = f" {ROOT_PAIR_MARKER}" if index in {10, 20} else ""
+            data = _message(role, [{"type": "text", "text": f"root row {index} {pair}"}], origin=origin)
         add("message", data)
 
     notification_ids: list[str] = []
@@ -187,10 +192,17 @@ def _child_rows() -> list[dict[str, Any]]:
         role = "tool_result" if index % 2 == 0 else "assistant"
         hidden = "Henry" if index < 919 else "ordinary"
         if role == "tool_result":
+            content = f"visible result {index}"
+            if index == 1_078:
+                # A newer lowercase hit: the finder's smart case does not list it.
+                content += " /Users/henry/fixture"
+            if index == 1_080:
+                # A newer visible match past the finder's 2,000-character row text.
+                content += " word" * 450 + " Henry long result tail"
             data = _message(role, [{"type": "text", "text": f"visible result {index} "}])
             data["message"]["tool_result"] = {
                 "tool_call_id": f"child-call-{index}",
-                "content": f"visible result {index}",
+                "content": content,
                 "structured_content": {"hidden_owner": hidden},
                 "is_error": False,
             }

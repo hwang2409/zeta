@@ -22,7 +22,9 @@ from tests.support.owned import await_or_fail
 from tests.support.tui_child_view_home import (
     CHILD_ID,
     CHILD_PROMPT,
+    CHILD_PROMPT_END,
     ROOT_MARKER,
+    ROOT_PAIR_MARKER,
     VISIBLE_PROMPT,
     ChildViewHome,
     generate_child_view_home,
@@ -41,6 +43,28 @@ async def _wait_until(check: Callable[[], bool], *, what: str) -> None:
                 await asyncio.sleep(0.01)
     except TimeoutError as exc:
         raise AssertionError(f"timed out waiting for {what}") from exc
+
+
+async def _terminal_text(app: TUIApp) -> str:
+    """Read the characters the terminal last drew."""
+
+    session = app._active_session
+    await _wait_until(lambda: not session.app.invalidated, what="drawn screen")
+    screen = session.app.renderer._last_screen
+    return "\n".join(
+        "".join(screen.data_buffer[row][column].char for column in range(120))
+        for row in range(42)
+    )
+
+
+async def _wait_for_screen(app: TUIApp, text: str, what: str) -> None:
+    try:
+        async with asyncio.timeout(30):
+            while text not in await _terminal_text(app):
+                # test-contract: latency real prompt-toolkit redraw
+                await asyncio.sleep(0.05)
+    except TimeoutError as exc:
+        raise AssertionError(f"{what} is not on the terminal screen") from exc
 
 
 def _screen_text(app: TUIApp) -> str:
@@ -215,8 +239,10 @@ async def test_real_tui_child_view_journey(
             def oldest_resident() -> str:
                 return pager.pages[0].units[0].entry_id
 
-            def child_place() -> tuple[str, int, object]:
+            def child_place() -> tuple[int, str, int, object]:
+                # The pager generation moves on every reset, so it proves no pager work.
                 return (
+                    pager.generation,
                     oldest_resident(),
                     control.transcript.scroll_offset,
                     control.transcript.durable_scroll_anchor,
@@ -297,6 +323,9 @@ async def test_real_tui_child_view_journey(
                 assert VISIBLE_PROMPT in rendered, (
                     "child-search: seq 1 prompt is not on the rendered terminal screen"
                 )
+                assert CHILD_PROMPT_END in rendered, (
+                    "child-long-message: the end of a long child message was cut"
+                )
             except (AssertionError, IndexError) as exc:
                 failures.append(str(exc))
 
@@ -358,10 +387,10 @@ async def test_real_tui_child_view_journey(
             await _send(pipe, "\x1b[A")
             try:
                 await _wait_until(
-                    lambda: session.default_buffer.text == CHILD_PROMPT[:2_000],
+                    lambda: session.default_buffer.text == CHILD_PROMPT,
                     what="old child prompt in composer",
                 )
-                assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
+                assert session.default_buffer.text == CHILD_PROMPT, (
                     "child-prompt-history: Up did not restore the exact old child prompt"
                 )
             except AssertionError as exc:
@@ -374,7 +403,7 @@ async def test_real_tui_child_view_journey(
             prior_child_anchor = child_transcript.durable_scroll_anchor
             await _wait_until(
                 lambda: (
-                    session.default_buffer.text == CHILD_PROMPT[:2_000]
+                    session.default_buffer.text == CHILD_PROMPT
                     and bool(child_transcript.units)
                 ),
                 what="visible selected child prompt and transcript before PageUp",
@@ -421,11 +450,11 @@ async def test_real_tui_child_view_journey(
                 assert len(
                     app._agent_navigation.transcript_control.history_pager.descriptors
                 ) <= 4, "child-return: retained pages exceed the global four-page budget"
-                assert session.default_buffer.text == CHILD_PROMPT[:2_000], (
+                assert session.default_buffer.text == CHILD_PROMPT, (
                     "child-return: selected prompt was not restored"
                 )
                 await _wait_until(
-                    lambda: session.default_buffer.text == CHILD_PROMPT[:2_000],
+                    lambda: session.default_buffer.text == CHILD_PROMPT,
                     what="visible restored prompt before history-down key",
                 )
                 assert (
@@ -446,6 +475,108 @@ async def test_real_tui_child_view_journey(
                 )
             except AssertionError as exc:
                 failures.append(str(exc))
+
+            # ux b2: child ctrl+f finds the old seq-1 prompt and Enter shows it.
+            try:
+                await _click_composer(app, pipe)
+                await _wait_until(
+                    lambda: session.layout.has_focus(session.default_buffer),
+                    what="child composer before finder key",
+                )
+                await _send(pipe, "\x06")
+                await _wait_until(
+                    lambda: app._active_finder.finder_active, what="child finder"
+                )
+                await _send(pipe, "Henry")
+                owner = app._agent_navigation.transcript_control
+                await _wait_until(
+                    lambda: owner.search_task is not None, what="child history scan"
+                )
+                search_task = owner.search_task
+                assert search_task is not None
+                await await_or_fail(search_task, what="child history scan")
+                await _wait_until(
+                    lambda: (
+                        (state := owner.transcript.finder_state()) is not None
+                        and state.complete
+                        and state.query == "Henry"
+                    ),
+                    what="terminal child finder state",
+                )
+                state = owner.transcript.finder_state()
+                assert state is not None
+                target = next(
+                    (
+                        index
+                        for index, row in enumerate(state.rows)
+                        if VISIBLE_PROMPT in row.candidate.text
+                    ),
+                    None,
+                )
+                assert target is not None, (
+                    "child-search: the old seq-1 prompt has no finder row"
+                )
+                for _step in range(target):
+                    await _send(pipe, "\x1b[B")
+                await _wait_until(
+                    lambda: (
+                        (state := owner.transcript.finder_state()) is not None
+                        and state.selected == target
+                    ),
+                    what="seq-1 finder row selected",
+                )
+                await _send(pipe, "\r")
+                await _wait_until(
+                    lambda: not app._active_finder.finder_active,
+                    what="child finder closed after Enter",
+                )
+                await _wait_for_screen(
+                    app, VISIBLE_PROMPT, "child-search: Enter on the old seq-1 match"
+                )
+                await _send(pipe, "\x1b")
+            except AssertionError as exc:
+                failures.append(str(exc))
+
+            # ux b3 / m2: root ctrl+f reveals an old unloaded row, then n moves.
+            await _return_to_root(app, pipe)
+            try:
+                await _send(pipe, "\x06")
+                await _wait_until(
+                    lambda: app._active_finder.finder_active, what="root finder"
+                )
+                await _send(pipe, ROOT_PAIR_MARKER)
+                owner = app._agent_navigation.transcript_control
+                await _wait_until(
+                    lambda: owner.search_task is not None, what="root history scan"
+                )
+                search_task = owner.search_task
+                assert search_task is not None
+                await await_or_fail(search_task, what="root history scan")
+                await _wait_until(
+                    lambda: (
+                        (state := app._transcript.finder_state()) is not None
+                        and state.complete
+                        and state.query == ROOT_PAIR_MARKER
+                    ),
+                    what="terminal root finder state",
+                )
+                await _send(pipe, "\r")
+                await _wait_until(
+                    lambda: not app._active_finder.finder_active,
+                    what="root finder closed after Enter",
+                )
+                await _wait_for_screen(
+                    app, "root row 20 ", "root-search: the newest old root match"
+                )
+                await _send(pipe, "n")
+                await _wait_for_screen(
+                    app, "root row 10 ", "root-search-next: n to the next old root match"
+                )
+            except AssertionError as exc:
+                failures.append(str(exc))
+        except AssertionError as exc:
+            # A later step cannot run; keep the failures found before it.
+            failures.append(f"journey stopped: {exc}")
         finally:
             app.request_exit()
             await await_or_fail(run_task, what="real child-view TUI shutdown")
