@@ -722,7 +722,8 @@ class TUIApp(
         transcript = self._transcript
         self._finder_return = (
             None
-            if self._agent_navigation.child_view_active
+            if getattr(self, "_history_pager", None) is None
+            or self._agent_navigation.child_view_active
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -732,7 +733,7 @@ class TUIApp(
         FinderRuntimeMixin._finder_open(self)
 
     def _finder_cancel(self) -> None:
-        saved, self._finder_return = self._finder_return, None
+        saved, self._finder_return = getattr(self, "_finder_return", None), None
         FinderRuntimeMixin._finder_cancel(self)
         if saved is not None and saved[2] != self._resident_page_keys():
             # A durable preview replaced the pages: the line index no longer
