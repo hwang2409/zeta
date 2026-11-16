@@ -256,10 +256,9 @@ class ServeControl:
             or loop.notification_turn_state != "idle"
             or self.has_pending_approvals()
             or loop.has_running_work
-            or any(
-                record.receipt_pending
-                for record in loop.tool_registry.background_tasks.records
-            )
+            # not ``receipt_pending``: it stays set after a failed delivery, so the
+            # next open recovers the exit; closing the pair is the way to that retry
+            or loop.tool_registry.background_tasks.exit_delivery_pending
         )
 
     def _turn_done(self, _task: asyncio.Task[None]) -> None:
@@ -269,6 +268,17 @@ class ServeControl:
         """Ask the server to report this parked pair's state and close it once
         idle; loop thread only."""
         self.server.parking.changed(self)
+
+    def work_changed(self) -> None:
+        """``_maybe_idle`` from any thread."""
+        connections = self.server.connections
+        if connections is None:
+            return
+        try:
+            connections.loop.call_soon_threadsafe(self._maybe_idle)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
 
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
@@ -1321,15 +1331,13 @@ class ServeControl:
                 self._event(event, session_id=session_id, background=True)
             )
 
-    def _publish_run_work_event(self, session_id: str, event: EventDescriptor | None, fields: dict[str, object]) -> None:
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
         connections = self.server.connections
         if connections is None:
             return
         def publish() -> None:
             # the sink may run on a worker thread; check idleness on the loop
             self._maybe_idle()
-            if event is None:
-                return
             controller = connections.controller_metadata()
             if not self.closing and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:

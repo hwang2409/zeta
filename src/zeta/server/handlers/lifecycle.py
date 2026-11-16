@@ -154,28 +154,11 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         state = self.server.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
-        park = "session_park" in self.features
-        # a wake in setup counts too: resuming the open session attaches, never swaps
-        if "resume_attach" in self.features and (
-            park or self.server.control.state_change_busy()
-        ):
-            session_id = await _resolve_session_id(self, params)
-            await self.server.parking.wait_closed(session_id)
-            state = self.server.runtime.state
-            control = self.server.control
-            if (
-                state is not None
-                and state.session_id == session_id
-                and control.state_change_busy()
-                and not control._session_swap_active
-                and not control.unhealthy()
-            ):
-                return await _attach_live_turn(self, bindings, candidate)
-            parked = self.server.parking.get(session_id)
-            if park and parked is not None:
-                return await _attach_live_turn(self, bindings, candidate, parked=parked)
-            # resuming the attached session itself never takes a new pair
-            park = park and (state is None or state.session_id != session_id)
+        attached, park = await _resume_live_or_parked(
+            self, params, bindings, candidate, "session_park" in self.features
+        )
+        if attached is not None:
+            return attached
         async with _session_swap(self, park) as incoming:
             session_id = await _resolve_session_id(self, params)
             await self.server.parking.wait_closed(session_id)
@@ -246,6 +229,44 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         raise
 
 
+async def _resume_live_or_parked(
+    self,
+    params: dict[str, Any],
+    bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
+    candidate: SessionHostCommands,
+    park: bool,
+) -> tuple[dict[str, object] | None, bool]:
+    """Attach to the open session's busy turn or to a parked pair and return the
+    result; else return None and whether the reopen takes a new pair."""
+    # a wake in setup counts too: resuming the open session attaches, never swaps
+    if "resume_attach" not in self.features or not (
+        park or self.server.control.state_change_busy()
+    ):
+        return None, park
+    session_id = await _resolve_session_id(self, params)
+    parking = self.server.parking
+    await parking.wait_closed(session_id)
+    state = self.server.runtime.state
+    control = self.server.control
+    if (
+        state is not None
+        and state.session_id == session_id
+        and control.state_change_busy()
+        and not control._session_swap_active
+        and not control.unhealthy()
+    ):
+        return await _attach_live_turn(self, bindings, candidate), park
+    parked = parking.get(session_id)
+    if park and parked is not None:
+        if not parked.unhealthy():
+            return await _attach_live_turn(self, bindings, candidate, parked=parked), park
+        # as for the open session: close it (its turn ends disconnect), reopen from disk
+        parking.close(parked)
+        await parking.wait_closed(session_id)
+    # resuming the attached session itself never takes a new pair
+    return None, park and (state is None or state.session_id != session_id)
+
+
 async def _resolve_session_id(self, params: dict[str, Any]) -> str:
     session_id = validation.required_string(params, "session_id")
     try:
@@ -312,6 +333,9 @@ async def _attach_live_turn(
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
             raise
+    if parked is not None:
+        # the attached session changed, as on any resume
+        await control.publish_session_grant_reset()
     if not control.state_change_busy():
         # the turn ended during the rebind, or a parked pair only held background
         # work: this is a plain resume of an idle session

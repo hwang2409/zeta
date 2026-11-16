@@ -346,7 +346,8 @@ request repairs or writes stored state.
 
 Params: optional `provider` and `model`, both non-empty strings. The result has
 `session`, containing the session metadata shape above. Settings provide
-defaults when either field is absent.
+defaults when either field is absent. With `session_park`, a busy attached
+session is parked instead of refused (see "parking a busy session").
 
 With the `session_cwd` feature, optional `cwd` selects the session working
 directory. It must be an absolute path to an existing directory; the server
@@ -543,7 +544,12 @@ the swap is the same as without the feature.
   `request_id`, answerable with `approve`/`deny`); they are not sent again as
   `approval_request` events. With `in_flight_replay`, the join starts with the
   reply that streamed while the session was parked. The session that was
-  attached is parked when it holds work, else closed.
+  attached is parked when it holds work, else closed. As on any `resume`, the
+  controller gets `session_grants_changed` (`change: "reset"`) for the
+  session it attaches. `resume` of a parked session whose server state is
+  unhealthy (approval persistence failed) closes it (its turn ends with reason
+  `disconnect`) and opens it from disk, as for the attached session; the
+  result has no `attached` field.
 - A parked session closes when it no longer holds work. A parked approval has
   no deadline while the controller stays connected. `resume` of a session that
   is closing waits for the close to end, then opens the session from disk.
@@ -560,8 +566,11 @@ the swap is the same as without the feature.
   `status.parked_sessions` row plus `last_turn_outcome` (`{turn_id, reason}`
   or `null`, the same object as in `status`). A session whose turn ends sends
   `state: "idle"` with the turn's outcome, then `state: "closed"` once it holds
-  no work. `resume` of a parked session sends no event. Observers do not get
-  this event.
+  no work. A parked session reports `running` for its whole turn; `tool` is
+  not sent while a turn runs. `resume` of a parked session sends no
+  `parked_session_changed` event. Observers do not get this event. After a
+  reconnect, read `status.parked_sessions`; events only report changes after
+  that.
 - On a controller disconnect, each parked session follows the same rules as
   the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
   with `session_park` takes over every parked session. A reclaiming `hello`
@@ -1034,17 +1043,17 @@ notification turn runs its setup before its `turn_start`. With `session_park`,
 `state` describes the attached session only: `new_session` and `resume` of
 another session park it instead of refusing, `account_switch`,
 `account_logout`, and `account_refresh` can refuse for a busy parked session, and a full park limit returns `-32004` with
-`data.reason: "parked_limit"`.
+`data.reason: "parked_limit"`. In that setup window
+`send` is still accepted and replaces the queued turn. If the server is
+unhealthy because approval persistence failed, `state` remains `"idle"` and
+`send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
+separate error and does not change the unhealthy status behavior.
 
 With `session_park`, the result also has `parked_sessions`: one
 `{session_id, state, pending_approvals}` object per parked session, oldest
 first. `state` uses the same values as the top-level `state`, and
 `pending_approvals` is the number of its pending approvals. A closing session
-is not listed. Without the feature, the key is omitted. In that setup window
-`send` is still accepted and replaces the queued turn. If the server is
-unhealthy because approval persistence failed, `state` remains `"idle"` and
-`send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
-separate error and does not change the unhealthy status behavior.
+is not listed. Without the feature, the key is omitted.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the live
 projection merged with the durable store projection by `request_id` (a live row
@@ -1562,7 +1571,7 @@ Event fields are:
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
-| `parked_session_changed` (feature `session_park`, controller only) | `event`, `session_id: string` (the parked session), `data: {session_id: string, state: "running"|"tool"|"idle"|"closed", pending_approvals: integer, last_turn_outcome: {turn_id: string, reason: string}|null}` | none |
+| `parked_session_changed` (feature `session_park`, controller only) | `event`, `session_id: string` (the parked session), `data: {session_id: string, state: "running"|"tool"|"idle"|"closed", pending_approvals: integer, last_turn_outcome: {turn_id: string, reason: string}|null}`; a parked session reports `running` for its whole turn, so `tool` is not sent while a turn runs | none |
 | `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
 In `session_retention` data, `skip_counts` maps a skip reason to the number of
@@ -1651,6 +1660,7 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    started its setup (before its `turn_start`), `status.state` is `running` and
    `slash_run` commands that `runs_while_busy` does not allow, idle-only
    requests, `new_session`, and `resume` of another session return `-32004`
+   (with `session_park`, see "parking a busy session")
    until that turn ends. With `resume_attach`, `resume` of the open session
    attaches to that turn, and the client then sees its `turn_start`.
    A notification turn does not start its setup while a session-mutation or

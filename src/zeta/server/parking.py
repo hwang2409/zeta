@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,8 @@ from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 if TYPE_CHECKING:
     from .connections import ConnectionRegistry
     from .control import ServeControl
+
+logger = logging.getLogger(__name__)
 
 
 class ParkedPairs:
@@ -131,7 +134,13 @@ class ParkedPairs:
                 if self._closing.get(session_id) is task:
                     del self._closing[session_id]
 
+        def report(done: asyncio.Task[None]) -> None:
+            # a close that no resume awaits would otherwise fail without a trace
+            if not done.cancelled() and (exc := done.exception()) is not None:
+                logger.error("closing session %s failed", session_id, exc_info=exc)
+
         task = asyncio.create_task(close())
+        task.add_done_callback(report)
         self._closing[session_id] = task
 
     async def wait_closed(self, session_id: str) -> None:
@@ -146,13 +155,21 @@ class ParkedPairs:
     ) -> None:
         """Reclaim each parked pair for a returning controller; close the ones it
         cannot see (no ``session_park``) or cannot claim."""
-        for control in tuple(self._parked.values()):
-            if not (
-                keep
-                and await control.controller_claimed(
-                    reconnect=reconnect, require_host_binding=require_host_binding
+        pairs = tuple(self._parked.values())
+        claimed = (
+            await asyncio.gather(
+                *(
+                    control.controller_claimed(
+                        reconnect=reconnect, require_host_binding=require_host_binding
+                    )
+                    for control in pairs
                 )
-            ):
+            )
+            if keep
+            else [False] * len(pairs)
+        )
+        for control, kept in zip(pairs, claimed, strict=True):
+            if not kept:
                 self.close(control)
 
     def close_all(self, settlement_timeout: float | None) -> None:
