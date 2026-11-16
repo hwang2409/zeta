@@ -65,16 +65,24 @@ def repair_tool_batches[T](
             continue
         batch_results: list[T] = []
         notices: list[T] = []
+        # notices not yet followed by a result or anchor of this batch
+        pending: list[T] = []
         while index < len(items):
             candidate = message_of(items[index])
             if candidate.role is MessageRole.TOOL_RESULT:
                 batch_results.append(items[index])
             elif is_passive_harness_message(candidate):
                 # written mid-batch (shell cwd recovery); it follows the results
-                notices.append(items[index])
+                pending.append(items[index])
+                index += 1
+                continue
             elif not _is_anchor(candidate, call_ids):
                 break
+            notices.extend(pending)
+            pending.clear()
             index += 1
+        # trailing notices are not part of the batch; they stay after it
+        index -= len(pending)
         by_id: dict[str, T] = {}
         for candidate in batch_results:
             tool_result = message_of(candidate).tool_result

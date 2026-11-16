@@ -17,6 +17,7 @@ from tests.support.owned import await_or_fail
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
+from zeta.protocol.tool_batches import complete_tool_batches
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -29,6 +30,7 @@ from zeta.protocol.types import (
     ToolResult,
     ToolSchema,
     ToolUseContent,
+    harness_notice,
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
@@ -440,3 +442,80 @@ async def test_harness_notice_written_mid_batch_follows_its_results(
         await loop.close()
         await registry.close()
         store.close()
+
+
+def _batch_with_notice(*, first_result: bool) -> list[Message]:
+    """A crash after c1 (or before any result), then a notification turn's notice."""
+
+    return [
+        Message(MessageRole.USER, [TextContent("go")]),
+        Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall(call_id, "add_task", {})) for call_id in ("c1", "c2")],
+        ),
+        *(
+            [Message(MessageRole.TOOL_RESULT, [TextContent("one")], tool_result=ToolResult("c1", "one"))]
+            if first_result
+            else []
+        ),
+        harness_notice("agent", "a child finished", event="agent_notifications"),
+    ]
+
+
+@pytest.mark.parametrize("first_result", [True, False], ids=["one-result", "no-result"])
+def test_notice_after_an_interrupted_batch_does_not_make_it_in_flight(
+    first_result: bool,
+) -> None:
+    shaped = complete_tool_batches(_batch_with_notice(first_result=first_result))
+
+    assert [
+        (message.role, message.tool_result.content if message.tool_result else None)
+        for message in shaped[1:]
+    ] == [
+        (MessageRole.ASSISTANT, None),
+        (MessageRole.TOOL_RESULT, "one" if first_result else MAYBE_RUN),
+        (MessageRole.TOOL_RESULT, MAYBE_RUN),
+        (MessageRole.SYSTEM, None),
+    ]
+
+
+def test_notification_turn_after_a_crash_pairs_every_call_on_every_provider() -> None:
+    messages = _batch_with_notice(first_result=True)
+    expected = [("c1", "one"), ("c2", MAYBE_RUN)]
+
+    codex = build_responses_payload(messages, [], model="gpt-5")["input"]
+    first = next(i for i, item in enumerate(codex) if item.get("call_id") == "c1")
+    assert [
+        (item.get("type"), item.get("call_id"), item.get("output"))
+        for item in codex[first : first + 4]
+    ] == [
+        ("function_call", "c1", None),
+        ("function_call", "c2", None),
+        *(("function_call_output", call_id, text) for call_id, text in expected),
+    ]
+    assert "a child finished" in str(codex[first + 4 :])
+
+    anthropic = build_messages_payload(
+        messages, [], model="claude-sonnet-4-5", max_tokens=20_000
+    )["messages"]
+    uses = next(
+        index
+        for index, message in enumerate(anthropic)
+        if any(block.get("type") == "tool_use" for block in message["content"])
+    )
+    following: list[str] = []
+    for message in anthropic[uses + 1 :]:
+        blocks = message["content"]
+        if not all(block.get("type") == "tool_result" for block in blocks):
+            break
+        following.extend(block["tool_use_id"] for block in blocks)
+    assert following == ["c1", "c2"], anthropic
+    assert "a child finished" in str(anthropic[uses + 1 :])
+
+    ollama = ollama_messages(messages)
+    calls_at = next(i for i, message in enumerate(ollama) if message.get("tool_calls"))
+    assert [message["content"] for message in ollama[calls_at + 1 : calls_at + 3]] == [
+        text for _, text in expected
+    ]
+    assert sum(message["role"] == "tool" for message in ollama) == 2
+    assert "a child finished" in str(ollama[calls_at + 3 :])
