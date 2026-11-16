@@ -95,7 +95,7 @@ def test_management_name_cannot_escape_root(tmp_path: Path) -> None:
         trust(home=home, project_dir=None, scope="user", name="link", accept=True)
 
 
-def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path) -> None:
     extension = _extension(tmp_path / "extension")
     outside = tmp_path / "outside.txt"
     outside.write_text("outside", encoding="utf-8")
@@ -106,7 +106,7 @@ def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path, monkeypatch:
     with pytest.raises(ExtensionTrustError, match="symlink"):
         fingerprint(extension)
     (extension / "link").unlink()
-    monkeypatch.setattr(trust_module, "_MAX_TOTAL_BYTES", 3)
+    (extension / "large").write_bytes(b"x" * (64 * 1024 * 1024 + 1))
     with pytest.raises(ExtensionTrustError, match="byte limit"):
         fingerprint(extension)
 
