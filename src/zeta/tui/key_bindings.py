@@ -456,9 +456,10 @@ def build_key_bindings(
 
     @Condition
     def finder_mode() -> bool:
+        # Not gated on startup: ctrl+f and ctrl+r open it then, and while it is
+        # open Enter must stay its own, never the composer's submit.
         return (
-            interactions_enabled()
-            and full_screen_mode()
+            full_screen_mode()
             and finder_active is not None
             and finder_active()
         )
