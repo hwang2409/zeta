@@ -2135,7 +2135,12 @@ def _add_running_children(home: RootHome, count: int) -> None:
 async def _enter_the_child(driver: Driver) -> None:
     navigation = driver.app._agent_navigation
     await driver.until(lambda: bool(navigation.entries), what="no child in the agent list")
-    await driver.until(driver.app.composer_can_focus_agent_list, what="agent list not reachable")
+    # Down's binding also needs startup replay to be over; the last answer can be
+    # drawn before it is.
+    await driver.until(
+        lambda: driver.app.interaction_ready() and driver.app.composer_can_focus_agent_list(),
+        what="agent list not reachable",
+    )
     await driver.send("\x1b[B")
     await driver.until(navigation.list_focused, what="Down did not focus the agent list")
     while navigation.entries[navigation.selected_index].path.name != "1":
