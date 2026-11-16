@@ -23,6 +23,7 @@ from rich.console import Console
 import zeta.agent.background_lifecycle as agent_background_module
 import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.agent.receipt as agent_receipt_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
@@ -9394,6 +9395,22 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
         raise RuntimeError("child setup failed")
 
     monkeypatch.setattr(registry, "clone_for_session", fail_setup)
+    original_agent_stats = agent_receipt_module.agent_stats
+
+    def advance_render_clock(
+        lifecycle: dict[str, object] | None,
+        *,
+        status: str | None = None,
+        turns_used: int = 0,
+    ) -> dict[str, object]:
+        stats = original_agent_stats(
+            lifecycle, status=status, turns_used=turns_used
+        )
+        stats["elapsed"] = 0.2
+        return stats
+
+    # Force the parent finalization render to observe a later clock reading.
+    monkeypatch.setattr(agent_receipt_module, "agent_stats", advance_render_clock)
     await _collect(
         AgentLoop(
             backend,

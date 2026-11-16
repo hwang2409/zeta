@@ -737,9 +737,29 @@ def finalize_agent_results(
         stored_result = result
         child_store = owner._agent_child_stores.get(call.id)
         candidate = result if result is not None else slot
+        canonical_result = (
+            lifecycle_tool_result(call, child_store, child_store.session_dir)
+            if (
+                child_store is not None
+                and candidate is not None
+                and (
+                    candidate.lifecycle_projection is not None
+                    and candidate.lifecycle_projection.get("final_result_is_receipt") is True
+                    or (child_store.agent_lifecycle() or {}).get(
+                        "final_result_is_receipt"
+                    )
+                    is True
+                )
+            )
+            else None
+        )
+        if canonical_result is not None:
+            result = canonical_result
+            candidate = result
         if (
             call.name.casefold() == "agent"
             and candidate is not None
+            and canonical_result is None
             and not (
                 candidate.structured_content is not None
                 and candidate.structured_content.get("status") == "running"
