@@ -226,18 +226,58 @@ def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
         why="Only the user can choose.",
     )
     handler = registry.definitions_by_name["resolve_attention"].handler
-    with pytest.raises(RuntimeError) as foreign:
+    with pytest.raises(ValueError, match="live session"):
         asyncio.run(handler({"attention_id": record.id, "decision": "no"}))
-    assert isinstance(foreign.value.__cause__, FileNotFoundError)
-    with pytest.raises(RuntimeError) as missing:
+    with pytest.raises(ValueError, match="dead predecessor"):
         asyncio.run(handler({"attention_id": "0" * 32, "decision": "no"}))
-    assert isinstance(missing.value.__cause__, FileNotFoundError)
     with pytest.raises(ValueError, match="nonempty"):
         asyncio.run(handler({"attention_id": own_record.id, "decision": "   "}))
     assert "resolve_attention" in registry.registered_names
     asyncio.run(registry.close())
     other.store.close()
     original.store.close()
+
+
+def test_list_and_resolve_attention_recover_dead_predecessor(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    current = _project_session(tmp_path, project.project_id)
+    predecessor = _project_session(tmp_path, project.project_id)
+    record = AttentionStore(predecessor.store.session_dir, writer_epoch=5).request(
+        session_id=predecessor.store.session_id,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="Recover this choice",
+        why="The predecessor stopped before the user answered.",
+    )
+    predecessor.store.close()
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=current.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    listed = asyncio.run(
+        registry.definitions_by_name["list_attention"].handler({})
+    )
+    item = listed["structuredContent"]["items"][0]
+    assert item["id"] == record.id
+    assert item["kind"] == "decision"
+    assert item["title"] == record.title
+    assert item["owning_session"] == record.session_id
+    resolved = asyncio.run(
+        registry.definitions_by_name["resolve_attention"].handler(
+            {"attention_id": record.id, "decision": "Use the fallback."}
+        )
+    )
+    assert resolved["isError"] is False
+    assert AttentionStore(
+        current.store.session_dir.parent / record.session_id, writer_epoch=5
+    ).get(record.id).status == "resolved"
+    asyncio.run(registry.close())
+    current.store.close()
 
 
 def test_popup_and_orchestrator_resolution_conflict_without_overwrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
