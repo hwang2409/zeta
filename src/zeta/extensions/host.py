@@ -202,13 +202,19 @@ class ExtensionHost:
             except Exception:  # noqa: BLE001 - extension notices must not break a session
                 self.notify_dropped += 1
 
-        if self._closed or self._event_sink is None or self._event_loop is None:
+        if self._closed or self._event_sink is None:
             self.notify_dropped += 1
-        else:
+            return
+        if self._event_loop is None:
             try:
-                self._event_loop.call_soon_threadsafe(send)
+                self._event_loop = asyncio.get_running_loop()
             except RuntimeError:
                 self.notify_dropped += 1
+                return
+        try:
+            self._event_loop.call_soon_threadsafe(send)
+        except RuntimeError:
+            self.notify_dropped += 1
 
     def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
         self.statuses[(manifest.name, scope)] = ExtensionStatus(

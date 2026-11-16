@@ -399,9 +399,7 @@ class TUIApp(
             lambda event: app._handle_background_event(event)
         )
         if extensions is not None:
-            extensions.set_event_sink(
-                lambda event: app._handle_background_event(event), asyncio.get_running_loop()
-            )
+            extensions.set_event_sink(lambda event: app._handle_background_event(event))
         self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
         self.loop.set_mcp_notice_sink(
             lambda message: app._handle_background_notice(message)
