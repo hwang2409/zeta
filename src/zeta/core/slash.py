@@ -551,6 +551,7 @@ class SlashStatus:
     connection_setup_counts: tuple[Mapping[str, object], ...] = ()
     max_agent_depth: int = 3
     unavailable_accounts: tuple[str, ...] = ()
+    otel_status: str = "off"
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,6 +734,7 @@ def _format_status(status: SlashStatus) -> str:
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
         f"model: {status.model}",
+        f"otel: {status.otel_status}",
         "completion_client_setups: "
         + (
             ", ".join(

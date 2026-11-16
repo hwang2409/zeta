@@ -56,6 +56,9 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
+            telemetry = getattr(self, "telemetry", None)
+            if telemetry is not None:
+                await attempt_async(lambda: asyncio.to_thread(telemetry.shutdown))
             attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)

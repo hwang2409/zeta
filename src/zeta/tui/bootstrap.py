@@ -694,6 +694,7 @@ def _create_app_with_root(
         on_session_close=recency.flush,
         foreground_event_publisher=foreground_event_publisher,
         observer_host=observer_host,
+        telemetry=composition.telemetry,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system

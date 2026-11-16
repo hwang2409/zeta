@@ -6,8 +6,15 @@ from ...models.catalog import PROVIDER_MODELS, known_model_names
 from ..runtime import ServerRuntime
 
 
-def settings(runtime: ServerRuntime, *, include_plan_mode: bool = False) -> dict:
+def settings(runtime: ServerRuntime, *, include_plan_mode: bool = False, include_telemetry: bool = False) -> dict:
     result = {"model": runtime.model, "approval_mode": runtime.policy.default.value}
+    if include_telemetry:
+        status = runtime.state.telemetry.status()
+        result["telemetry"] = {
+            "enabled": status.enabled,
+            "state": status.state,
+            "reason": status.reason,
+        }
     if include_plan_mode:
         result["plan_mode"] = (
             runtime.loop.plan_mode if runtime.loop is not None else False

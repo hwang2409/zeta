@@ -247,6 +247,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # Optional 1.1 features. A client opts in through ``hello.features``; the
 # server echoes the supported subset in ``capabilities.features``.
 FEATURES = (
+    "otel",
     "session_cwd",
     "new_session_settings",
     "user_message_event",

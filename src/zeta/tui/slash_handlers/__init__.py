@@ -166,6 +166,10 @@ class SlashHandlerMixin:
                 viewed_health.summary if viewed_health is not None else None
             ),
             transcript_session_id=viewed_path.name,
+            otel_status=(
+                "off" if getattr(self, "telemetry", None) is None
+                else self.telemetry.status().state
+            ),
         )
 
     def model_choices(self) -> tuple[str, ...]:

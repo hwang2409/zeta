@@ -213,6 +213,7 @@ class TUIApp(
         on_session_close: Callable[[], Awaitable[None]] | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         observer_host: Any | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -220,6 +221,7 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
+        self.telemetry = telemetry
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)

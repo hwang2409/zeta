@@ -92,6 +92,7 @@ _TOP_KEYS = frozenset(
         "agents",
         "mcp",
         "retention",
+        "otel",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -150,6 +151,7 @@ class Settings:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +188,7 @@ class ResolvedConfig:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +359,7 @@ def resolve(
         mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
+        otel_endpoint=settings.otel_endpoint,
     )
 
 
@@ -603,6 +607,15 @@ def _validate(
     command_niceness = _validated_int_range(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
+    otel = data.get("otel", {})
+    if not isinstance(otel, Mapping) or set(otel) - {"endpoint"}:
+        raise SettingsError("invalid otel settings")
+    otel_endpoint = otel.get("endpoint")
+    if otel_endpoint is not None:
+        if not isinstance(otel_endpoint, str):
+            raise SettingsError("otel.endpoint must be an http(s) URL with a literal loopback host")
+        from ..telemetry.runtime import validate_loopback_endpoint
+        validate_loopback_endpoint(otel_endpoint)
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)
@@ -647,6 +660,7 @@ def _validate(
         mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
         mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
+        otel_endpoint=otel_endpoint,
     )
 
 
