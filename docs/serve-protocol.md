@@ -199,6 +199,7 @@ feature. Observer connections receive only methods with `read` access.
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
+| `extensions_list` | `1.1` | `extensions` | `read` |
 
 ## common JSON-RPC shapes
 

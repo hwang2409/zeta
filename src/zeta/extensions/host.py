@@ -20,10 +20,12 @@ import itertools
 import re
 import sys
 import types
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..protocol.types import StreamEvent, StreamEventType
 from ..tools._shared.user_discovery import PROJECT_SCOPE, USER_SCOPE
 
 if TYPE_CHECKING:
@@ -77,6 +79,17 @@ class LoadingExtension:
         return tuple(self._tools)
 
 
+@dataclass(slots=True)
+class ExtensionStatus:
+    name: str
+    scope: str
+    version: str
+    enabled: bool
+    trusted: bool
+    loaded: bool = False
+    error: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class LoadedExtension:
     """An extension that activated and committed its declarations."""
@@ -119,6 +132,8 @@ class ExtensionHost:
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
         self.warnings: list[str] = []
+        self.statuses: list[ExtensionStatus] = []
+        self._event_sink: Callable[[StreamEvent], None] | None = None
         self._packages: dict[str, Path] = {}
         self._closed = False
 
@@ -155,6 +170,39 @@ class ExtensionHost:
         for package in tuple(self._packages):
             self.remove_package(package)
 
+    def set_event_sink(self, sink: Callable[[StreamEvent], None] | None) -> None:
+        self._event_sink = sink
+
+    def notify(self, extension: str, text: str, level: str) -> None:
+        if self._event_sink is not None:
+            self._event_sink(StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={"kind": "extension", "extension": extension, "text": text, "level": level},
+            ))
+
+    def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
+        self.statuses.append(ExtensionStatus(
+            manifest.name, scope, manifest.version, enabled, scope == USER_SCOPE
+        ))
+
+    def mark_loaded(self, name: str) -> None:
+        for status in self.statuses:
+            if status.name == name:
+                status.loaded = True
+                status.error = None
+
+    def mark_error(self, name: str, error: str) -> None:
+        for status in self.statuses:
+            if status.name == name:
+                status.error = error
+
+    def status_rows(self) -> list[dict[str, object]]:
+        return [{
+            "name": item.name, "scope": item.scope, "version": item.version,
+            "enabled": item.enabled, "trusted": item.trusted, "loaded": item.loaded,
+            "error": item.error,
+        } for item in self.statuses]
+
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
 
@@ -182,6 +230,7 @@ class ExtensionHost:
                     f"extensions · {extension.scope} extension tool '{name}' from "
                     f"{display} shadows {shadow}"
                 )
+        self.mark_loaded(extension.manifest.name)
         self.loaded.append(
             LoadedExtension(
                 name=extension.manifest.name,
@@ -223,6 +272,7 @@ __all__ = [
     "PROJECT_SCOPE",
     "USER_SCOPE",
     "ExtensionHost",
+    "ExtensionStatus",
     "LoadedExtension",
     "LoadingExtension",
     "PendingExtension",

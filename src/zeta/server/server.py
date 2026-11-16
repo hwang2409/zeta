@@ -356,6 +356,10 @@ class ZetaServer:
             runtime = control.runtime
             runtime.set_approval_control_binder(control.bind_policy)
             runtime.set_background_event_sink(control._publish_background_event)
+            if runtime.extensions is not None:
+                runtime.extensions.set_event_sink(
+                    lambda event: control._publish_background_event(runtime.session_id, event)
+                )
             runtime.set_memory_notice_sink(control._publish_memory_notice)
             runtime.set_run_work_event_sink(control._publish_run_work_event)
             runtime.set_background_wake_sink(control._schedule_background_wake)

@@ -231,6 +231,12 @@ async def path_complete(client, request_id, params):
     )
 
 
+async def extensions_list(client, request_id, params):
+    validation.active(client.server.runtime, params)
+    host = client.server.runtime.extensions
+    return [] if host is None else host.status_rows()
+
+
 async def slash_list(client, request_id, params):
     validation.active(client.server.runtime, params)
     include_unavailable = params.get("include_unavailable", False)
@@ -437,6 +443,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.SET_COMPACTION: set_compaction,
     MethodDescriptor.SEND_IMAGES: send_images,
     MethodDescriptor.PATH_COMPLETE: path_complete,
+    MethodDescriptor.EXTENSIONS_LIST: extensions_list,
     MethodDescriptor.SLASH_LIST: slash_list,
     MethodDescriptor.SLASH_RUN: slash_run,
     MethodDescriptor.ACCOUNT_LIST: account_list,

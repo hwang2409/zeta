@@ -281,6 +281,7 @@ FEATURES = (
     "approval_restart_reason",
     "session_retention",
     "mcp_refresh_tools",
+    "extensions",
     "resume_attach",
     "turn_reconnect",
     "in_flight_replay",
@@ -379,6 +380,7 @@ class MethodDescriptor(Enum):
     )
     CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.READ)
     CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
+    EXTENSIONS_LIST = ("extensions_list", "1.1", "extensions", Access.READ)
     MCP_REFRESH_TOOLS = (
         "mcp_refresh_tools",
         None,

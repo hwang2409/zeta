@@ -546,6 +546,14 @@ def render_agent_notification(
     if event.data.get("tui_presented") is True:
         return None
     kind = event.data.get("kind", "agent_completion")
+    if kind == "extension":
+        text = event.data.get("text")
+        extension = event.data.get("extension", "extension")
+        level = event.data.get("level", "info")
+        if not isinstance(text, str) or not isinstance(extension, str):
+            return Text("extension notification unavailable", style=theme.ERROR)
+        style = theme.ERROR if level == "error" else theme.WARNING if level == "warning" else theme.NOTICE
+        return Text(f"{extension}: {text}", style=style, overflow="ellipsis", no_wrap=True)
     if kind == "project_inbox":
         text = event.data.get("text")
         if not isinstance(text, str):

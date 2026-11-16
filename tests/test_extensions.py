@@ -23,9 +23,11 @@ from zeta.extensions import (
     trust_project_extensions,
 )
 from zeta.extensions.host import USER_SCOPE
+from zeta.protocol.types import StreamEventType
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
 from zeta.tools import ToolRegistry
+from zeta.tui.render import render_event
 
 _ECHO_MODULE = """
 def activate(zx):
@@ -104,6 +106,30 @@ def test_manifest_parse_good_and_bad() -> None:
         parse_manifest(_manifest("ok") + 'typo_key = true\n')
     with pytest.raises(ExtensionManifestError):
         parse_manifest('[extension]\nname = "ok"\nversion = "1"\nentry = "m"\n')
+
+
+@pytest.mark.asyncio
+async def test_notify_is_transient_and_status_has_trust(tmp_path: Path) -> None:
+    source = """
+def activate(zx):
+    zx.ui.notify("hello", level="warning")
+"""
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "notify-ext", source=source)
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
+        events = []
+        host.set_event_sink(events.append)
+        # activation happens before the frontend binds its sink; a later call is transient.
+        host.notify("notify-ext", "hello", "warning")
+        assert events[0].type is StreamEventType.AGENT_NOTIFICATION
+        assert events[0].data == {"kind": "extension", "extension": "notify-ext", "text": "hello", "level": "warning"}
+        rendered = render_event(events[0])
+        assert rendered is not None and "notify-ext: hello" in rendered.plain
+        assert host.status_rows() == [{
+            "name": "notify-ext", "scope": "user", "version": "0.1.0",
+            "enabled": True, "trusted": True, "loaded": True, "error": None,
+        }]
 
 
 @pytest.mark.asyncio
