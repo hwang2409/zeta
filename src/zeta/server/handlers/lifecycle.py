@@ -474,16 +474,7 @@ def session_snapshot(self) -> dict[str, object] | None:
 
 
 def session_runtime_state(self) -> str:
-    return _pair_state(self.server.control)
-
-
-def _pair_state(control: ServeControl) -> str:
-    state = control.runtime.state
-    return (
-        "idle"
-        if control.unhealthy() or state is None
-        else "running" if control.state_change_busy() else state.status
-    )
+    return self.server.control.pair_state()
 
 
 async def live_status_baseline(self) -> dict[str, object]:
@@ -579,12 +570,7 @@ async def status(
     status.update(suffix)
     if "session_park" in self.features:
         status["parked_sessions"] = [
-            {
-                "session_id": session_id,
-                "state": _pair_state(control),
-                "pending_approvals": len(control.pending_approvals_now()),
-            }
-            for session_id, control in self.server._parked.items()
+            control.parked_row() for control in self.server._parked.values()
         ]
     slash_command = self.server.control.slash_lock.status()
     if slash_command is not None:
