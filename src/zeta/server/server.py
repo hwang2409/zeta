@@ -31,7 +31,7 @@ from . import (
     accounts,
     login,
 )
-from .connections import ConnectionRegistry, last_turn_outcome
+from .connections import ConnectionRegistry
 from .control import NotificationPresentation, ServeControl
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -39,6 +39,7 @@ from .handlers.projects import (
     project_request_error,
 )
 from .handlers.registry import dispatch as _dispatch_request
+from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
     FEATURES,
@@ -56,9 +57,6 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
-
-# parked plus closing pairs; each holds a loop, its store, and its MCP servers
-PARKED_LIMIT = 3
 
 logger = logging.getLogger(__name__)
 
@@ -305,11 +303,7 @@ class ZetaServer:
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
         self.control = ServeControl(self, runtime, self.foreground_event_publisher)
         self._bind_pair(self.control)
-        # session_park: busy sessions the client left, and idle ones being closed
-        self._parked: dict[str, ServeControl] = {}
-        self._closing: dict[str, asyncio.Task[None]] = {}
-        # the last parked_session_changed data sent per parked session
-        self._parked_sent: dict[str, dict[str, object]] = {}
+        self.parking = ParkedPairs(lambda: self.connections)
 
     @property
     def runtime(self) -> ServerRuntime:
@@ -318,17 +312,11 @@ class ZetaServer:
     def controls(self) -> Iterator[ServeControl]:
         """The attached pair, then every parked pair."""
         yield self.control
-        yield from tuple(self._parked.values())
+        yield from self.parking.pairs()
 
     def new_pair(self) -> ServeControl:
         """An empty pair beside the attached one; it shares the session manager."""
-        held = [*self._parked, *self._closing]
-        if len(held) >= PARKED_LIMIT:
-            raise ProtocolError(
-                ErrorDescriptor.OPERATION_BUSY,
-                "too many parked sessions are running",
-                {"reason": "parked_limit", "parked": held},
-            )
+        self.parking.require_room()
         control = ServeControl(
             self, self.runtime.sibling(), self.foreground_event_publisher
         )
@@ -339,105 +327,14 @@ class ZetaServer:
         """Make ``incoming`` the attached pair in one step (no await): park the
         outgoing pair while it holds work, else start its close."""
         outgoing = self.control
-        session_id = incoming.runtime.session_id
-        if self._parked.get(session_id) is incoming:
-            del self._parked[session_id]
-            self._parked_sent.pop(session_id, None)
-        else:
+        if not self.parking.unpark(incoming):
             # a new pair takes over the controller slot state of the pair it replaces
             incoming._controller_attached = outgoing._controller_attached
         self.control = incoming
         assert self.connections is not None
         self.connections.replay_session_replaced()
-        if outgoing.runtime.opened is None:
-            return
-        if outgoing.holds_work():
-            self._parked[outgoing.runtime.session_id] = outgoing
-            outgoing._maybe_idle()
-        else:
-            self._close_pair(outgoing)
-
-    def _close_if_idle(self, control: ServeControl) -> None:
-        """Report a parked pair's changed state, and close it once idle."""
-        # a resume may have attached the pair since this check was scheduled
-        if control not in self._parked.values():
-            return
-        self._publish_parked(control, control.parked_row())
-        if not control.holds_work():
-            self.close_parked(control)
-
-    def _publish_parked(self, control: ServeControl, row: dict[str, object]) -> None:
-        """Send ``parked_session_changed`` when the row differs from the last one
-        sent; loop thread only. The parked control's own frames stay dropped."""
-        assert control.runtime.opened is not None
-        session_id = control.runtime.session_id
-        data = {
-            **row,
-            "last_turn_outcome": last_turn_outcome(control.runtime.opened.store),
-        }
-        if self._parked_sent.get(session_id) == data or self.connections is None:
-            return
-        self._parked_sent[session_id] = data
-        self.connections.try_admit_controller(
-            EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
-        )
-
-    def close_parked(
-        self, control: ServeControl, settlement_timeout: float | None = None
-    ) -> None:
-        """Close a parked pair now; its turn ends ``disconnect``."""
-        if control in self._parked.values():
-            session_id = control.runtime.session_id
-            del self._parked[session_id]
-            self._publish_parked(
-                control,
-                {"session_id": session_id, "state": "closed", "pending_approvals": 0},
-            )
-            self._parked_sent.pop(session_id, None)
-            self._close_pair(control, settlement_timeout)
-
-    def _close_pair(
-        self, control: ServeControl, settlement_timeout: float | None = None
-    ) -> None:
-        session_id = control.runtime.session_id
-        control.closing = True  # no wake starts from here on
-
-        async def close() -> None:
-            try:
-                try:
-                    await control.close()
-                finally:
-                    try:
-                        await control.runtime.close()
-                    finally:
-                        await control.wait_for_approval_settlement(settlement_timeout)
-            finally:
-                if self._closing.get(session_id) is task:
-                    del self._closing[session_id]
-
-        task = asyncio.create_task(close())
-        self._closing[session_id] = task
-
-    async def wait_closed(self, session_id: str) -> None:
-        """Wait until a closing pair has released ``session_id``."""
-        task = self._closing.get(session_id)
-        if task is not None:
-            # a cancelled request must not cancel the close
-            await asyncio.shield(task)
-
-    async def claim_parked(
-        self, keep: bool, *, reconnect: bool, require_host_binding: bool
-    ) -> None:
-        """Reclaim each parked pair for a returning controller; close the ones it
-        cannot see (no ``session_park``) or cannot claim."""
-        for control in tuple(self._parked.values()):
-            if not (
-                keep
-                and await control.controller_claimed(
-                    reconnect=reconnect, require_host_binding=require_host_binding
-                )
-            ):
-                self.close_parked(control)
+        if outgoing.runtime.opened is not None:
+            self.parking.leave(outgoing)
 
     async def require_all_idle(self) -> None:
         for control in self.controls():
@@ -452,6 +349,9 @@ class ZetaServer:
             runtime.set_memory_notice_sink(control._publish_memory_notice)
             runtime.set_run_work_event_sink(control._publish_run_work_event)
             runtime.set_background_wake_sink(control._schedule_background_wake)
+            runtime.set_work_changed_sink(
+                lambda: self.parking.changed_from_any_thread(control)
+            )
 
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None
@@ -557,8 +457,7 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
-            for control in tuple(self._parked.values()):
-                self.close_parked(control, approval_settlement_timeout)
+            self.parking.close_all(approval_settlement_timeout)
             try:
                 try:
                     await self.control.close()
@@ -574,7 +473,7 @@ class ZetaServer:
                         )
                     finally:
                         await asyncio.gather(
-                            *self._closing.values(), return_exceptions=True
+                            *self.parking.closing_tasks(), return_exceptions=True
                         )
             finally:
                 if self.connections is not None:
@@ -896,7 +795,7 @@ class _Client:
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
-                await self.server.claim_parked(
+                await self.server.parking.claim(
                     "session_park" in self.features,
                     reconnect=reconnect,
                     require_host_binding=require_host_binding,

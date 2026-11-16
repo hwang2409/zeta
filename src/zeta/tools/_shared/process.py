@@ -97,6 +97,9 @@ class BackgroundTaskRegistry:
         self._notification_sink = notification_sink
         self._notification_exists = notification_exists or (lambda _task_id: False)
         self._pending_recovery: dict[str, TaskExitInput] = {}
+        # in memory only: task exits whose delivery has not settled yet
+        self._exit_deliveries: set[str] = set()
+        self._exit_delivery_settled_sink: Callable[[], None] | None = None
         self._records: dict[str, _BackgroundRecord] = {}
         self._owners: dict[str, _BackgroundTaskOwner] = {}
         self._session_dir: Path | None = None
@@ -181,6 +184,27 @@ class BackgroundTaskRegistry:
         """Attach an observer for transitions after their durable commit."""
         self._committed_transition_sink = sink
 
+    def set_exit_delivery_settled_sink(self, sink: Callable[[], None] | None) -> None:
+        """Attach an observer called each time an exit delivery settles, delivered
+        or not; it may run on any thread."""
+        self._exit_delivery_settled_sink = sink
+
+    @property
+    def exit_delivery_pending(self) -> bool:
+        """A task exit is still being delivered; ending the session now would cut it."""
+        return bool(self._exit_deliveries)
+
+    def _begin_exit_delivery(self, task_id: str) -> None:
+        self._exit_deliveries.add(task_id)
+
+    def _end_exit_delivery(self, task_id: str) -> None:
+        if task_id not in self._exit_deliveries:
+            return
+        self._exit_deliveries.discard(task_id)
+        sink = self._exit_delivery_settled_sink
+        if sink is not None:
+            sink()
+
     def set_notification_exists(self, lookup: Callable[[str], bool]) -> None:
         self._notification_exists = lookup
 
@@ -194,17 +218,21 @@ class BackgroundTaskRegistry:
         return tuple(self._pending_recovery.values())
 
     async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
-        await self._notify_exit(
-            item.task_id,
-            item.command,
-            item.exit_code,
-            item.output_tail,
-            item.log_path,
-            item.note,
-            owner=item.owner,
-            phase=item.phase,
-            tui_presented=item.tui_presented,
-        )
+        self._begin_exit_delivery(item.task_id)
+        try:
+            await self._notify_exit(
+                item.task_id,
+                item.command,
+                item.exit_code,
+                item.output_tail,
+                item.log_path,
+                item.note,
+                owner=item.owner,
+                phase=item.phase,
+                tui_presented=item.tui_presented,
+            )
+        finally:
+            self._end_exit_delivery(item.task_id)
 
     def bind_session_dir(
         self,
@@ -948,17 +976,6 @@ class BackgroundTaskRegistry:
                 except BaseException:
                     record.receipt_pending = True
                     raise
-            # the cleared receipt was work an observer may be waiting on
-            sink = self._committed_transition_sink
-            if sink is not None:
-                sink(
-                    BackgroundTaskNotice(
-                        "background task exit delivered: " + record.command,
-                        task_id,
-                        record.terminal_phase or "natural_exit",
-                        record.owner,
-                    )
-                )
         self._pending_recovery.pop(task_id, None)
 
     async def _commit_notice(
