@@ -12,13 +12,13 @@ import pytest
 from zeta.config.settings import load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.protocol.types import ToolCall
 from zeta.runtime.cleanup import close_session
 from zeta.runtime.composition import compose_runtime
-from zeta.skills.agent_catalog import AgentCatalog
 from zeta.skills import SkillCatalog
-from zeta.tools.computer import mac as mac_module
-from zeta.protocol.types import ToolCall
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools.computer import mac as mac_module
 from zeta.tools.computer.backend import Button, ComputerError, ScreenFrame, ScreenState
 from zeta.tools.computer.mac import MacBackend
 
