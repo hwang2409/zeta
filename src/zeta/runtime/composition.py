@@ -269,6 +269,7 @@ def compose_runtime(
             project_id=metadata.project_id,
             project_registry=project_registry,
             inbox_enabled=config.inbox_enabled and project_registry is not None,
+            computer_enabled=config.computer_enabled,
             command_niceness=config.command_niceness,
             tool_allow=tool_policy.allow,
             tool_deny=tool_policy.deny,
