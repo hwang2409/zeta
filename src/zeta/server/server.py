@@ -329,7 +329,6 @@ class ZetaServer:
         control = ServeControl(
             self, self.runtime.sibling(), self.foreground_event_publisher
         )
-        control._controller_attached = self.control._controller_attached
         self._bind_pair(control)
         return control
 
@@ -340,6 +339,9 @@ class ZetaServer:
         session_id = incoming.runtime.session_id
         if self._parked.get(session_id) is incoming:
             del self._parked[session_id]
+        else:
+            # a new pair takes over the controller slot state of the pair it replaces
+            incoming._controller_attached = outgoing._controller_attached
         self.control = incoming
         assert self.connections is not None
         self.connections.replay_session_replaced()
@@ -353,19 +355,20 @@ class ZetaServer:
 
     def _close_if_idle(self, control: ServeControl) -> None:
         # a resume may have attached the pair since this check was scheduled
-        session_id = control.runtime.session_id
-        if self._parked.get(session_id) is control and not control.holds_work():
-            del self._parked[session_id]
-            self._close_pair(control)
+        if control in self._parked.values() and not control.holds_work():
+            self.close_parked(control)
 
-    def close_parked(self, control: ServeControl) -> None:
+    def close_parked(
+        self, control: ServeControl, settlement_timeout: float | None = None
+    ) -> None:
         """Close a parked pair now; its turn ends ``disconnect``."""
-        session_id = control.runtime.session_id
-        if self._parked.get(session_id) is control:
-            del self._parked[session_id]
-            self._close_pair(control)
+        if control in self._parked.values():
+            del self._parked[control.runtime.session_id]
+            self._close_pair(control, settlement_timeout)
 
-    def _close_pair(self, control: ServeControl) -> None:
+    def _close_pair(
+        self, control: ServeControl, settlement_timeout: float | None = None
+    ) -> None:
         session_id = control.runtime.session_id
         control.closing = True  # no wake starts from here on
 
@@ -377,7 +380,7 @@ class ZetaServer:
                     try:
                         await control.runtime.close()
                     finally:
-                        await control.wait_for_approval_settlement()
+                        await control.wait_for_approval_settlement(settlement_timeout)
             finally:
                 if self._closing.get(session_id) is task:
                     del self._closing[session_id]
@@ -525,7 +528,7 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             for control in tuple(self._parked.values()):
-                self.close_parked(control)
+                self.close_parked(control, approval_settlement_timeout)
             try:
                 try:
                     await self.control.close()
