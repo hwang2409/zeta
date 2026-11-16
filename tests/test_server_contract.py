@@ -200,6 +200,7 @@ async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, ob
             "features": [
                 "serve_observers",
                 "session_grants",
+                "multi_controller",
                 "not_a_server_feature",
             ],
         },
@@ -221,6 +222,7 @@ async def test_hello_negotiates_the_same_features(
         "serve_observers",
         "session_grants",
     ]
+    assert "multi_controller" not in hello["capabilities"]["features"]
     assert {
         "new_session",
         "send",
