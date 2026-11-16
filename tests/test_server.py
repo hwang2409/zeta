@@ -8,8 +8,8 @@ import fcntl
 import inspect
 import json
 import multiprocessing
-import queue
 import os
+import queue
 import re
 import shlex
 import signal
