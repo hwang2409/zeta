@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -220,16 +220,18 @@ class AgentTranscriptControl(UIControl):
         query: str,
         transcript: Any,
         publish: Callable[[Any, str], None],
+        on_miss: Callable[[], Awaitable[None]],
     ) -> None:
         self.search_results = ()
         self.search_index = 0
         if self.search_task is not None:
             self.search_task.cancel()
-        if not query:
-            return
         async def reveal_match() -> None:
-            matches = await self._history_pager.search(query)
-            if not matches or not transcript.finder_active:
+            matches = await self._history_pager.search(query) if query else ()
+            if not transcript.finder_active:
+                return
+            if not matches:
+                await on_miss()
                 return
             self.search_results = matches
             self.search_index = 0
