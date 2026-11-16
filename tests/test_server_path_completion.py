@@ -530,12 +530,8 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
 
         client = server._client
         assert client is not None
-        request_task = next(
-            task
-            for task in asyncio.all_tasks()
-            if task is not asyncio.current_task()
-            and any(frame.f_locals.get("client") is client for frame in task.get_stack())
-        )
+        request_task = client._run_task
+        assert request_task is not None
         request_task.add_done_callback(
             lambda _: scanner_before_request.set() if scanner_finished.is_set() else None
         )
