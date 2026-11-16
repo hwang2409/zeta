@@ -717,7 +717,7 @@ def build_key_bindings(
 
         @bindings.add(
             *resolved_keys["open-decisions"],
-            filter=full_screen_mode & ~panel_mode & interactions_enabled,
+            filter=full_screen_mode & ~panel_mode,
             eager=True,
         )
         def open_decisions(event: KeyPressEvent) -> None:
