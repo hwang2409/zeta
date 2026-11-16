@@ -251,6 +251,16 @@ class SlashHandlerMixin:
             self._remote_picker_unit, self._remote_picker_transcript
         )
 
+    def _close_picker_for_composer_text(self, buffer: Any) -> None:
+        """Text typed or pasted into the composer closes a shown picker.
+
+        A picker takes its keys only while the composer is empty; with text in
+        it, Enter sends a prompt, which must never go with a picker on screen.
+        """
+
+        if buffer.text and self._picker_loading is None and self._picker_active:
+            self._picker_cancel()
+
     def _picker_move(self, delta: int) -> None:
         if self._picker_loading is not None:
             return

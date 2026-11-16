@@ -586,6 +586,7 @@ class TUIApp(
             on_picker_rename=lambda: app.accounts_picker_rename(),
             on_picker_refresh=lambda: app.accounts_picker_refresh(),
             picker_active=lambda: app._picker_active,
+            picker_loading=lambda: app._picker_loading is not None,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
             on_agent_list_move=lambda delta: (

@@ -362,6 +362,7 @@ def build_key_bindings(
     on_picker_rename: Callable[[], None] | None = None,
     on_picker_refresh: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
+    picker_loading: Callable[[], bool] | None = None,
     on_agent_list_down: Callable[[], None] | None = None,
     agent_list_active: Callable[[], bool] | None = None,
     on_agent_list_move: Callable[[int], None] | None = None,
@@ -1162,6 +1163,17 @@ def build_key_bindings(
         def picker_cancel(event: KeyPressEvent) -> None:
             del event
             on_picker_cancel()
+
+        if picker_loading is not None:
+            loading = Condition(picker_loading) & ~panel_mode
+
+            # A picker whose rows load owns every key: a typed letter or a paste
+            # would wait in the composer and an Enter would send it as a prompt.
+            # Keys with their own binding (Esc, ctrl keys) still act.
+            @bindings.add(Keys.Any, filter=loading, eager=True)
+            @bindings.add(Keys.BracketedPaste, filter=loading, eager=True)
+            def picker_loading_drop(event: KeyPressEvent) -> None:
+                del event
 
         picker_actions = (
             ("d", on_picker_default),

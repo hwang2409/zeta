@@ -1030,6 +1030,110 @@ async def test_esc_while_a_picker_loads_stops_it(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "state"),
+    [
+        ("/accounts", "loading"),
+        ("/remote", "loading"),
+        ("/model", "shown"),
+        ("/accounts", "shown"),
+        ("/remote", "shown"),
+    ],
+)
+async def test_a_letter_typed_at_a_picker_never_sends_a_prompt_under_it(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    state: str,
+) -> None:
+    # While its rows load, a picker owns every key: `j` and Enter do nothing.
+    # Once shown, the first letter closes it and goes to the composer, so the
+    # Enter after it sends only `j`, with no picker on screen.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+    if state == "shown":
+        gate.set()
+    if command == "/remote":
+        _fake_remote_hosts(None, monkeypatch)
+        loaded = RemoteSessionClient.discover
+
+        async def held_discover(client: object, hosts: object = None) -> tuple:
+            await await_or_fail(gate.wait(), timeout=60, what="remote discovery gate")
+            return await loaded(client, hosts)
+
+        monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        if command == "/accounts":
+            _fake_accounts(app, monkeypatch)
+            listed = app.loop.account_context.list_snapshot
+
+            async def held_list() -> AccountListSnapshot:
+                await await_or_fail(gate.wait(), timeout=60, what="accounts gate")
+                return await listed()
+
+            monkeypatch.setattr(app.loop.account_context, "list_snapshot", held_list)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before the picker")
+
+        def sent() -> list[str]:
+            return [str(messages[-1].content) for messages, _tools in backend.calls]
+
+        try:
+            await driver.send(command + ENTER)
+            await driver.until(
+                lambda: _picker_card_drawn(driver)
+                and (state == "loading" or app._picker_loading is None),
+                what=f"{command} drew no picker",
+            )
+            await driver.settle("picker drawn")
+            await driver.send("j")
+            await driver.settle("letter typed at the picker")
+            if state == "loading":
+                await driver.send(ENTER)
+                await driver.settle("Enter while the rows load")
+                # A turn that the fake account list breaks never reaches the backend.
+                assert app._active_task is None and not sent(), (
+                    f"keys typed while {command} loaded started a turn: sent {sent()}"
+                )
+                assert driver.session.default_buffer.text == "", (
+                    f"keys typed while {command} loaded wait in the composer:"
+                    f" {driver.session.default_buffer.text!r}"
+                )
+        finally:
+            gate.set()
+        if state == "loading":
+            await driver.settle("rows loaded")
+            assert app._active_task is None and app._picker_active and _picker_card_drawn(driver), (
+                f"after the load: sent {sent()}, picker active={app._picker_active};"
+                f" screen:\n{driver.screen()}"
+            )
+            return
+        assert not app._picker_active and not _picker_card_drawn(driver), (
+            f"`j` left {command}'s picker open over the composer; screen:\n{driver.screen()}"
+        )
+        assert driver.session.default_buffer.text == "j", (
+            f"`j` did not reach the composer: {driver.session.default_buffer.text!r}"
+        )
+        # The fake account list cannot run a turn; the real context can.
+        app.loop.account_context = account_context
+        await driver.send(ENTER)
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="Enter did not send the typed text",
+        )
+        await driver.settle("settled screen after the send")
+        assert sent() == [str([TextContent("j")])] and not _picker_card_drawn(driver), (
+            f"sent {sent()}; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_a_panel_behind_a_running_slash_command_owns_its_keys(
     root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

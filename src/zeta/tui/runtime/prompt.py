@@ -112,6 +112,7 @@ class PromptRuntimeMixin:
         buffer = getattr(getattr(session, "app", None), "current_buffer", None)
         if buffer is not None and id(buffer) not in self._restart_idle_buffers:
             buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            buffer.on_text_changed += self._close_picker_for_composer_text
             self._restart_idle_buffers.add(id(buffer))
 
     async def run(
