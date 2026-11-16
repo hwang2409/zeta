@@ -65,14 +65,6 @@ def test_garbage_line_raises_protocol_error() -> None:
         client.request("garbage")
 
 
-def test_kill_stays_killed_for_later_requests() -> None:
-    with make_client() as client:
-        assert client.request("kill") == {}
-        with pytest.raises(HelperError, match="kill switch engaged") as excinfo:
-            client.request("echo", value="later")
-        assert excinfo.value.code == "killed"
-
-
 def test_close_terminates_process() -> None:
     client = make_client()
     client.start()

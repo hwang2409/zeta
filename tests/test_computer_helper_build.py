@@ -7,6 +7,7 @@ prompting and performs no capture or input, so it is safe on a headless CI runne
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -39,9 +40,9 @@ def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
     assert 'window.ignoresMouseEvents = true' in source
     assert 'Thread {' in source
     assert 'app.run()' in source
-    assert 'for point in path.dropFirst()' in source
+    assert 'runInterruptibleSteps(path.dropFirst()' in source
     assert 'try checkKilled()' in source
-    assert 'for ch in text' in source
+    assert 'runInterruptibleSteps(Array(text)' in source
 
 
 def test_helper_builds_and_answers_hello() -> None:
@@ -57,6 +58,26 @@ def test_helper_builds_and_answers_hello() -> None:
     assert reply["version"] == "0.1.0"
     assert isinstance(reply["screen_recording"], bool)
     assert isinstance(reply["accessibility"], bool)
+
+
+def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        output = subprocess.check_output(
+            [str(Path(tmp) / "zeta-computer-helper"), "--selftest-kill"], text=True, timeout=15
+        )
+    results = {item["name"]: item for item in map(json.loads, output.splitlines())}
+    assert results["drag"] == {
+        "name": "drag", "events": ["mouse_down", "drag_1", "mouse_up"],
+        "reply": "killed", "later_reply": "killed"
+    }
+    assert results["type"]["events"] == ["a"]
+    assert results["type"]["reply"] == "killed"
+    assert results["type"]["later_reply"] == "killed"
+    assert results["kill_after_last_step"]["reply"] == "killed"
+    assert results["kill_after_last_step"]["later_reply"] == "killed"
 
 
 def test_helper_exits_when_stdin_reaches_eof() -> None:

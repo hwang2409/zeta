@@ -31,7 +31,6 @@ def respond(obj):
 
 
 def main():
-    killed = False
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -39,13 +38,7 @@ def main():
         req = json.loads(line)
         rid = req.get("id", 0)
         op = req.get("op")
-        if killed and op != "hello":
-            respond({"id": rid, "ok": False,
-                     "error": {"code": "killed", "message": "kill switch engaged"}})
-        elif op == "kill":
-            killed = True
-            respond({"id": rid, "ok": True})
-        elif op == "hello":
+        if op == "hello":
             respond({"id": rid, "ok": True, "version": "fake", "screen_recording": False,
                      "accessibility": False})
         elif op == "state":

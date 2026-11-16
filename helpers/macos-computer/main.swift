@@ -71,6 +71,14 @@ final class Flag {
     }
 
     var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+
+    func withReplyDecision<T>(_ body: () throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        if value { throw HelperError.killed }
+        // linearization point: the kill flag is held through reply publication.
+        return try body()
+    }
 }
 
 let killed = Flag()
@@ -240,15 +248,23 @@ func moveMouse(_ point: CGPoint) {
     postMouse(.mouseMoved, point, .left)
 }
 
-func checkKilled() throws {
-    if killed.isSet { throw HelperError.killed }
+func checkKilled(_ source: Flag = killed) throws {
+    if source.isSet { throw HelperError.killed }
+}
+
+func runInterruptibleSteps<Step>(
+    _ steps: some Sequence<Step>, killSource: Flag, post: (Step) -> Void
+) throws {
+    for step in steps {
+        try checkKilled(killSource)
+        post(step)
+    }
 }
 
 func click(_ point: CGPoint, button name: String, count: Int) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
-    for i in 1...n {
-        try checkKilled()
+    try runInterruptibleSteps(1...n, killSource: killed) { i in
         postMouse(b.down, point, b.button, clickState: i)
         postMouse(b.up, point, b.button, clickState: i)
     }
@@ -258,12 +274,11 @@ func drag(_ path: [CGPoint]) throws {
     guard let start = path.first else { throw HelperError.badRequest("drag path is empty") }
     try checkKilled()
     postMouse(.leftMouseDown, start, .left)
-    for point in path.dropFirst() {
-        try checkKilled()
+    defer { postMouse(.leftMouseUp, path.last ?? start, .left) }
+    try runInterruptibleSteps(path.dropFirst(), killSource: killed) { point in
         postMouse(.leftMouseDragged, point, .left)
     }
     try checkKilled()
-    postMouse(.leftMouseUp, path.last ?? start, .left)
 }
 
 func scroll(at point: CGPoint, dx: Int, dy: Int) {
@@ -277,13 +292,12 @@ func scroll(at point: CGPoint, dx: Int, dy: Int) {
 }
 
 func typeText(_ text: String) throws {
-    for ch in text {
-        try checkKilled()
+    try runInterruptibleSteps(Array(text), killSource: killed) { ch in
         var utf16 = Array(String(ch).utf16)
         guard
             let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
             let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false)
-        else { continue }
+        else { return }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         down.post(tap: .cghidEventTap)
@@ -514,10 +528,64 @@ func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
     return ["id": id, "ok": false, "error": ["code": he.code, "message": he.message]]
 }
 
+func selfTestKill() {
+    func emit(_ name: String, _ events: [String], _ result: Result<String, HelperError>, _ source: Flag) {
+        let reply: String
+        switch result {
+        case .success: reply = "ok"
+        case .failure(let error): reply = error.code
+        }
+        let laterReply = (try? source.withReplyDecision { "ok" }) ?? "killed"
+        print((try? JSONSerialization.data(withJSONObject: ["name": name, "events": events, "reply": reply, "later_reply": laterReply]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+    }
+
+    var dragEvents = ["mouse_down"]
+    let dragKill = Flag()
+    var dragResult: Result<String, HelperError> = .success("ok")
+    do {
+        defer { dragEvents.append("mouse_up") }
+        try runInterruptibleSteps([1, 2], killSource: dragKill) { step in
+            dragEvents.append("drag_\(step)")
+            if step == 1 { dragKill.set() }
+        }
+        try dragKill.withReplyDecision { () }
+    } catch { dragResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
+    emit("drag", dragEvents, dragResult, dragKill)
+
+    var typeEvents = [String]()
+    let typeKill = Flag()
+    var typeResult: Result<String, HelperError> = .success("ok")
+    do {
+        try runInterruptibleSteps(["a", "b"], killSource: typeKill) { character in
+            typeEvents.append(character)
+            if character == "a" { typeKill.set() }
+        }
+        try typeKill.withReplyDecision { () }
+    } catch { typeResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
+    emit("type", typeEvents, typeResult, typeKill)
+
+    var lastEvents = [String]()
+    let lastKill = Flag()
+    var lastResult: Result<String, HelperError> = .success("ok")
+    do {
+        try runInterruptibleSteps([1], killSource: lastKill) { _ in
+            lastEvents.append("last")
+            lastKill.set()
+        }
+        try lastKill.withReplyDecision { () }
+    } catch { lastResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
+    emit("kill_after_last_step", lastEvents, lastResult, lastKill)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let indicator = Indicator()
 killed.observe { DispatchQueue.main.async { indicator.hide() } }
+if CommandLine.arguments.contains("--selftest-kill") {
+    selfTestKill()
+    exit(0)
+}
 installKillSwitch()
 
 Thread {
@@ -542,19 +610,24 @@ Thread {
                 writeResponse(errorResponse(id, HelperError.killed))
                 return
             }
-            DispatchQueue.main.async { indicator.showActive() }
+            DispatchQueue.main.sync { indicator.showActive() }
             do {
                 var payload = try handle(op, req)
                 payload["id"] = id
                 payload["ok"] = true
-                writeResponse(payload)
+                do {
+                    try killed.withReplyDecision { writeResponse(payload) }
+                } catch {
+                    writeResponse(errorResponse(id, error))
+                }
             } catch {
                 writeResponse(errorResponse(id, error))
             }
-            DispatchQueue.main.async { if !killed.isSet { indicator.hide() } }
+            DispatchQueue.main.sync { if !killed.isSet { indicator.hide() } }
         }
     }
-    DispatchQueue.main.async {
+    actionQueue.sync {}
+    DispatchQueue.main.sync {
         indicator.hide()
         app.terminate(nil)
     }
