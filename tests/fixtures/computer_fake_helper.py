@@ -4,6 +4,8 @@ Used by the helper-client tests so they exercise real process spawning, framing,
 error mapping without a real desktop. Behavior is driven by the request op:
 
 - ``hello``/``state``/``cursor_position``: canned ok payloads.
+- ``screenshot``: a 1x1 PNG frame; ``display: 99`` is a sentinel that returns a ``secure_input``
+  error so the MacBackend error mapping can be tested. Input ops (``move``/``click``/...) ok.
 - ``echo``: echoes back the ``value`` arg (to check arbitrary payload fields survive framing).
 - ``fail``: responds ``ok: false`` with the requested ``code``/``message``.
 - ``slow``: sleeps ``seconds`` before answering (to trigger the client timeout).
@@ -12,9 +14,16 @@ error mapping without a real desktop. Behavior is driven by the request op:
 - ``big``: returns a large payload field to force multi-chunk reads on the client side.
 """
 
+import base64
 import json
 import sys
 import time
+
+# a complete 1x1 PNG so MacBackend.screenshot decodes real image bytes.
+_PNG_1x1 = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
+)
 
 
 def respond(obj):
@@ -38,6 +47,16 @@ def main():
                      "frontmost_bundle_id": "dev.zeta.fake"})
         elif op == "cursor_position":
             respond({"id": rid, "ok": True, "x": 12, "y": 34})
+        elif op == "screenshot":
+            # display 99 is a sentinel so MacBackend error-mapping can be tested.
+            if req.get("display") == 99:
+                respond({"id": rid, "ok": False,
+                         "error": {"code": "secure_input", "message": "password field"}})
+            else:
+                respond({"id": rid, "ok": True, "png_b64": base64.b64encode(_PNG_1x1).decode(),
+                         "width": 1, "height": 1, "scale": 2.0, "origin_x": 0, "origin_y": 0})
+        elif op in ("move", "click", "mouse_down", "mouse_up", "drag", "type", "key", "scroll"):
+            respond({"id": rid, "ok": True})
         elif op == "echo":
             respond({"id": rid, "ok": True, "value": req.get("value")})
         elif op == "fail":

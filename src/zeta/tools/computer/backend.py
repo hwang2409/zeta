@@ -15,6 +15,17 @@ from typing import Literal, Protocol
 Button = Literal["left", "right", "middle"]
 
 
+class ComputerError(Exception):
+    """A backend refused or failed one operation. ``code`` is a stable reason
+    (``locked``, ``secure_input``, ``not_permitted``, ``killed``, ``bad_request``,
+    ``internal``); the ``computer`` tool turns it into a per-action message."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
 @dataclass(frozen=True, slots=True)
 class ScreenFrame:
     """One captured frame: encoded image bytes plus the geometry slice 3 maps.

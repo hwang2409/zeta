@@ -293,6 +293,10 @@ def compose_runtime(
         registry.project_registry_state = manager.project_registry_state
         if project_registry is None:
             registry.unregister("project")
+        if config.computer_enabled:
+            from ..tools.computer.mac import make_mac_backend
+
+            registry.computer_backend = make_mac_backend()
             registry.unregister("inbox")
         if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
