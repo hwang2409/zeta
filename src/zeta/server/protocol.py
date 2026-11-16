@@ -236,6 +236,7 @@ class EventDescriptor(StrEnum):
     SESSION_RETENTION = "session_retention"
     TODO_UPDATED = "todo_updated"
     ZETA_UPDATED = "zeta_updated"
+    PARKED_SESSION_CHANGED = "parked_session_changed"
 
 
 PROTOCOL_VERSION = "1.2"
@@ -283,6 +284,7 @@ FEATURES = (
     "resume_attach",
     "turn_reconnect",
     "in_flight_replay",
+    "session_park",
 )
 
 
@@ -415,6 +417,7 @@ EVENT_ACCESS = {
     EventDescriptor.BACKGROUND_TASK_UPDATED: Access.CONTROLLER_READ,
     EventDescriptor.SESSION_RETENTION: Access.CONTROLLER_READ,
     EventDescriptor.TODO_UPDATED: Access.CONTROLLER_READ,
+    EventDescriptor.PARKED_SESSION_CHANGED: Access.CONTROLLER_READ,
 }
 
 

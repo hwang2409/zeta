@@ -821,10 +821,7 @@ class SlashHandlerMixin:
 
     @property
     def restart_has_running_work(self) -> bool:
-        return (
-            self.loop.background_children_running
-            or self.loop.tool_registry.background_tasks.running_count > 0
-        )
+        return self.loop.has_running_work
 
     @property
     def composer_empty(self) -> bool:
