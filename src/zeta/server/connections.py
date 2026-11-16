@@ -644,15 +644,17 @@ class ConnectionRegistry(ReplayOutput):
     ) -> None:
         # the run loop then reads EOF and releases the connection and its role
         state.connection.writer.close()
-        if item is not None:
-            self._finish_future(item.future, False)
+        # fail every waiter before any accounting step, which could raise again
+        for frame in (item, *output.queue):
+            if frame is not None:
+                self._finish_future(frame.future, False)
         self._finish_future(output.ready, False)
         if output.current_frame is not None:
             # the writer failed before this frame left it: it is still charged
             self._end_frame_write(output, output.current_frame)
         output.current_write = None
         # queued frames still hold their replay budget; release it with them
-        self._clear_output(output, result=False)
+        self._clear_output(output)
 
     async def _write_output_frame(
         self, state: _Connection, output: _OutputState, item: _OutputFrame
