@@ -479,7 +479,7 @@ async def test_sealed_oauth_call_sends_nothing_new_with_old_headers(
     finally:
         answer.set()
         if call is not None:
-            await asyncio.gather(call, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(call, return_exceptions=True), 10)
         await client.close()
         await transport.aclose()
 
