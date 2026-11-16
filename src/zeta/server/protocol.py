@@ -36,7 +36,7 @@ class ErrorDescriptor(Enum):
     SESSION_CONTROLLED = (
         -32014,
         "session_controlled",
-        "session is controlled by another client",
+        "the requested session is controlled by another client; the connection stays open",
     )
     PROTOCOL_MISMATCH = (
         -32002,
