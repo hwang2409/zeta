@@ -499,7 +499,9 @@ re-supplies this connection's bindings:
   binding that is active at that time.
 
 When the turn is still waiting for its first MCP connection, the rebind waits
-for that connection to finish, so the turn keeps running. If the turn ends
+for that connection to finish, so the turn keeps running. A turn that has not
+sent its first model request yet waits for the rebind, so that request has the
+bound servers' tools. If the turn ends
 while the bindings are re-supplied, the result has no `attached` field, as for
 an idle resume, and a pending notification starts its turn as usual.
 

@@ -1255,3 +1255,45 @@ async def test_wake_held_across_session_change_does_not_run_on_old_session(
         if held:
             hold.__exit__(None, None, None)
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_abort_with_child_approval_cancels_wake_held_at_start_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    control = server.control
+    in_abort = asyncio.Event()
+    original_abort = control.abort
+
+    async def observed_abort(*args: Any, **kwargs: Any):
+        in_abort.set()
+        return await original_abort(*args, **kwargs)
+
+    # test-contract: seam an open child approval (string key) makes abort wait, not cancel
+    monkeypatch.setattr(control._approvals, "active_keys", lambda: ("child-approval",))
+    # test-contract: seam signal once dispatch holds the start gate for abort
+    monkeypatch.setattr(control, "abort", observed_abort)
+    hold = control.hold_wake_start()
+    hold.__enter__()
+    held = True
+    try:
+        _schedule_wake(server, session_id)
+        wake = control._notification_task
+        assert wake is not None
+        await send(reader, writer, "abort", "abort", {})
+        await await_or_fail(in_abort.wait(), what="abort holds the gate")
+        hold.__exit__(None, None, None)
+        held = False
+        # the abort's own hold keeps the wake at the gate; the abort must not wait for it.
+        reply = (
+            await read_until(
+                reader, lambda frame: frame.get("id") == "abort", what="abort reply"
+            )
+        )[-1]
+        assert reply.get("result") == {"aborted": True}, reply
+        assert wake.cancelled()
+    finally:
+        if held:
+            hold.__exit__(None, None, None)
+        await close_serve(server, writer)
