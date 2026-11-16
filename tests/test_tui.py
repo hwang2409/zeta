@@ -14714,12 +14714,10 @@ async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     try:
         assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         output = StringIO()
-        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        Console(file=output, force_terminal=False, width=80).print(app._picker_card())
         assert (
             "codex:missing  unavailable: credentials missing"
             in Text.from_ansi(output.getvalue()).plain
@@ -14758,8 +14756,6 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     loop.account_context = resolver
     loop.tool_registry.account_context = resolver
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     list_display = AccountStore.list_display
     off_loop_calls: list[str] = []
 
@@ -14773,7 +14769,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
     assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     output = StringIO()
-    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    Console(file=output, force_terminal=False, width=80).print(app._picker_card())
     plain = Text.from_ansi(output.getvalue()).plain
     assert "codex:first" in plain
     assert "current" in plain
@@ -14821,15 +14817,13 @@ async def test_accounts_picker_is_view_only_during_turn_then_switches(
     loop.account_context = context
     loop.tool_registry.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     busy = True
     monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
 
     assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     assert app.accounts_picker_active
     output = StringIO()
-    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    Console(file=output, force_terminal=False, width=80).print(app._picker_card())
     plain = Text.from_ansi(output.getvalue()).plain
     assert "codex:first" in plain
     assert "codex:second" in plain
@@ -15393,11 +15387,6 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
-    app._transcript.replace = lambda unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
 
     refreshed = False
 
@@ -15413,7 +15402,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
         output = StringIO()
-        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        Console(file=output, force_terminal=False, width=100).print(app._picker_card())
         plain = Text.from_ansi(output.getvalue()).plain
         local_reset = reset.astimezone().strftime("%b %d %H:%M").lower()
         assert refreshed
@@ -15449,12 +15438,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
     refresh_rendered = asyncio.Event()
-    app._presenter.print_unit = lambda panel: rendered.append(panel) or panel
-    app._transcript.replace = lambda unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
     repaint = app._repaint_accounts_picker
 
     def repaint_and_signal() -> None:
@@ -15487,7 +15471,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             "account busy; retry after the other account operation finishes"
         )
         output = StringIO()
-        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        Console(file=output, force_terminal=False, width=100).print(app._picker_card())
         plain = Text.from_ansi(output.getvalue()).plain
         assert "refresh failed: account busy" in plain
     finally:
@@ -15733,13 +15717,6 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = lambda renderable: (
-        rendered.append(renderable) or renderable
-    )
-    app._transcript.replace = lambda _unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
     logout = AccountStore.logout
     off_loop_calls = 0
 
@@ -15756,7 +15733,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
-        Console(file=confirmation, force_terminal=False, width=160).print(rendered[-1])
+        Console(file=confirmation, force_terminal=False, width=160).print(app._picker_card())
         assert (
             "press x again to log out codex:removed"
             in Text.from_ansi(confirmation.getvalue()).plain

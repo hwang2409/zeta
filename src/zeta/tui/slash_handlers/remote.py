@@ -23,6 +23,7 @@ from ...remote.discovery import (
 )
 from ...remote.wire import RemoteWireError
 from .. import theme
+from ..cards.picker_card import HINT_MARKER, SELECTED_MARKER
 from ..checkpoints import render_replayed_message
 from ..transcript import TranscriptPresenter, TranscriptWidget
 from ..user import displayed_user_text, user_message
@@ -41,11 +42,18 @@ class RemotePicker:
         return self.rows[self.index]
 
     def render(self) -> Panel:
-        lines = []
+        lines = [Text("select a remote session", style=theme.COMMAND)]
         for index, row in enumerate(self.rows):
-            marker = "› " if index == self.index else "  "
+            marker = SELECTED_MARKER if index == self.index else "  "
             lines.append(Text(f"{marker}{row.host} · {row.name or row.session_id[:8]} · {row.state or 'unknown'}"))
-        return Panel(Group(*lines), title="remote", subtitle="↑/↓ move · enter select · esc cancel")
+        lines.append(Text(f"{HINT_MARKER} move · enter select · esc cancel", style=theme.AFFORDANCE))
+        return Panel(
+            Group(*lines),
+            border_style=theme.ACCENT,
+            style=theme.CARD_BG,
+            padding=(0, 1),
+            expand=True,
+        )
 
 
 @dataclass
@@ -125,9 +133,8 @@ class RemoteViewMixin:
         self._remote_event_task = None
         self._remote_select_task = None
         self._remote_picker = None
-        self._remote_picker_unit = None
-        self._remote_picker_transcript = None
         self._remote_saved_composer = None
+        self._remote_attaching = False
 
     async def _close_remote_view(self) -> None:
         self.remote_picker_cancel()
@@ -151,18 +158,17 @@ class RemoteViewMixin:
     def remote_picker_move(self, delta: int) -> None:
         if self._remote_picker is not None:
             self._remote_picker.move(delta)
-            if self._remote_picker_unit is not None:
-                self._remote_picker_transcript.replace(self._remote_picker_unit, self._remote_picker.render())
             self._invalidate_prompt()
 
     def remote_picker_cancel(self) -> None:
         self._remote_picker = None
-        if self._remote_picker_unit is not None:
-            self._remote_picker_transcript.remove(self._remote_picker_unit)
-        self._remote_picker_unit = self._remote_picker_transcript = None
         self._invalidate_prompt()
 
     def remote_picker_select(self) -> None:
+        # The attach replaces the view that startup still draws into: Enter
+        # acts once startup ends, and the picker stays open until then.
+        if self._startup_replay_active:
+            return
         picker = self._remote_picker
         self.remote_picker_cancel()
         if picker is not None:
@@ -179,7 +185,11 @@ class RemoteViewMixin:
         if self._remote_view is not None:
             # a second attach must stop the old consumer and restore the saved composer first.
             await self.slash_detach("")
-        await client.attach(chosen.host, chosen)
+        self._remote_attaching = True
+        try:
+            await client.attach(chosen.host, chosen)
+        finally:
+            self._remote_attaching = False
         self._save_remote_composer()
         state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
         self._remote_view = state
@@ -241,9 +251,6 @@ class RemoteViewMixin:
                 chosen = rows[0]
             else:
                 self._remote_picker = RemotePicker(tuple(rows))
-                presenter = self._screen_presenter()
-                self._remote_picker_unit = presenter.print_unit(self._remote_picker.render())
-                self._remote_picker_transcript = presenter.transcript
                 self._invalidate_prompt()
                 return ""
             await self._open_remote(client, chosen)

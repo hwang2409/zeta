@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application import create_app_session
@@ -24,9 +25,14 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.output.vt100 import Vt100_Output
+from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
+from zeta.accounts.availability import AccountDisplay
+from zeta.accounts.registry import AccountId
+from zeta.accounts.session import AccountListSnapshot
+from zeta.accounts.usage import UsageState
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -38,9 +44,12 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.remote.client import RemoteSessionClient
+from zeta.remote.discovery import RemoteSession
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.picker_card import SELECTED_MARKER
 from zeta.tui.transcript.paged_history import (
     HistoryCursor,
     PagedTranscriptHistory,
@@ -55,6 +64,8 @@ TOOLS_PER_TURN = 15
 OLD_WORDS = {3: "quokka", 40: "wombat"}
 CTRL_UP = "\x1b[1;5A"
 CTRL_DOWN = "\x1b[1;5B"
+UP = "\x1b[A"
+DOWN = "\x1b[B"
 PAGE_UP = "\x1b[5~"
 PAGE_DOWN = "\x1b[6~"
 CTRL_F = "\x06"
@@ -62,6 +73,7 @@ CTRL_R = "\x12"
 ENTER = "\r"
 ESCAPE = "\x1b"
 BACKSPACE = "\x7f"
+SCREEN = Size(rows=40, columns=120)
 ROW_ORDER = re.compile(r"(prompt|answer|line one)[- ](\d+)(?:-(\d+))?")
 
 
@@ -195,16 +207,22 @@ class Driver:
     pipe: object
 
     def rows(self) -> list[str]:
-        """Rows the renderer last drew for the root transcript window."""
+        """Rows the renderer last drew for the viewed transcript window."""
 
         screen = self.session.app.renderer._last_screen
         if screen is None:
             return []
+        navigation = self.app._agent_navigation
+        control = (
+            navigation.transcript_control
+            if navigation.child_view_active
+            else self.app._transcript
+        )
         position = next(
             (
                 position
                 for window, position in screen.visible_windows_to_write_positions.items()
-                if window.content is self.app._transcript
+                if window.content is control
             ),
             None,
         )
@@ -308,7 +326,11 @@ class Driver:
 
 @asynccontextmanager
 async def running_tui(
-    home: RootHome, backend: FakeBackend | None = None
+    home: RootHome,
+    backend: FakeBackend | None = None,
+    *,
+    painted: bool = True,
+    size: Size = SCREEN,
 ) -> AsyncIterator[Driver]:
     store = await asyncio.to_thread(
         ConversationStore, home.root, session_id=home.session_id
@@ -320,15 +342,18 @@ async def running_tui(
         resumed=True,
         zeta_home=home.home,
     )
-    output = Vt100_Output(StringIO(), lambda: Size(rows=40, columns=120), enable_cpr=False)
+    output = Vt100_Output(StringIO(), lambda: size, enable_cpr=False)
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
         session = app._make_session()
         run_task = asyncio.create_task(app.run(session))
         try:
             driver = Driver(app, session, pipe)
             await driver.until(
-                lambda: _answer(TURNS - 1) in driver.screen(),
-                what="first paint shows the newest answer",
+                (lambda: _answer(TURNS - 1) in driver.screen())
+                if painted
+                # The screen is up and takes keys; the first history page is not drawn.
+                else (lambda: app._full_screen_active() and bool(driver.all_rows())),
+                what="first paint",
                 seconds=90,
             )
             yield driver
@@ -573,13 +598,113 @@ class Opener:
     escapes: int
     # The state once Enter on an empty query is taken.
     empty_accepted: Callable[[Driver], bool]
+    # Fakes the overlay's slow source before the keys (remote hosts, accounts).
+    setup: Callable[[TUIApp, pytest.MonkeyPatch], None] = lambda _app, _patch: None
+
+
+def _window_drawn(driver: Driver, window: object) -> bool:
+    screen = driver.session.app.renderer._last_screen
+    return screen is not None and window in screen.visible_windows_to_write_positions
 
 
 def _decisions_drawn(driver: Driver) -> bool:
-    screen = driver.session.app.renderer._last_screen
-    return screen is not None and driver.app._decisions_panel_window in (
-        screen.visible_windows_to_write_positions
+    return _window_drawn(driver, driver.app._decisions_panel_window)
+
+
+def _panel(drawn: Callable[[Driver], bool]) -> dict:
+    """A panel takes no text: typed letters do nothing, Enter keeps it open."""
+
+    def kept(driver: Driver) -> bool:
+        return drawn(driver) and driver.session.default_buffer.text == ""
+
+    return {"drawn": drawn, "accepted": kept, "empty_accepted": kept}
+
+
+# One marker per picker card, so a card drawn twice counts twice.
+PICKER_CARDS = (
+    "select a model",
+    "select an account",
+    "accounts · loading…",
+    "remote · loading…",
+    "lab · alpha",
+)
+
+
+def _picker_cards(driver: Driver) -> int:
+    """Picker cards on the whole screen: the card window and the transcript."""
+
+    return sum(row.count(card) for row in driver.all_rows() for card in PICKER_CARDS)
+
+
+def _picker_card_drawn(driver: Driver) -> bool:
+    return _picker_cards(driver) > 0
+
+
+def _picker_cards_in_history(app: TUIApp) -> int:
+    """Picker cards in the transcript's pages, which every redraw draws again."""
+
+    console = Console(file=StringIO(), width=120, record=True)
+    for page in app._agent_navigation.transcript_control.history_pager.pages:
+        for unit in page.units:
+            if not hasattr(unit.value, "type"):
+                console.print(unit.value)
+    text = console.export_text()
+    return sum(text.count(card) for card in PICKER_CARDS)
+
+
+def _model_picker_closed(driver: Driver) -> bool:
+    return not driver.app.model_picker_active and driver.session.default_buffer.text == ""
+
+
+def _fake_remote_hosts(_app: TUIApp, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = (
+        RemoteSession("lab", "a1", "alpha", None),
+        RemoteSession("lab", "b2", "beta", None),
     )
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return rows, ()
+
+    async def attach(_client: object, _host: str, _session: object) -> None:
+        raise ValueError("test: attach is not available")
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+
+
+def _fake_accounts(app: TUIApp, monkeypatch: pytest.MonkeyPatch, count: int = 2) -> None:
+    names = ("work", "home", "lab", "spare", "travel", "backup")
+    accounts = tuple(AccountId("codex", name) for name in names[:count])
+    # A usage line under each row, as real accounts have: two rows each.
+    usage = UsageState(None, "never refreshed") if count > 2 else None
+
+    async def list_snapshot() -> AccountListSnapshot:
+        return AccountListSnapshot(
+            tuple(AccountDisplay(account, account.name, usage=usage) for account in accounts),
+            {"codex": accounts[0]},
+            {"codex": accounts[0]},
+        )
+
+    context = SimpleNamespace(list_snapshot=list_snapshot, switching_unavailable=None)
+    monkeypatch.setattr(app.loop, "account_context", context, raising=False)
+
+
+def _loading_picker(active: Callable[[TUIApp], bool], setup: Callable) -> dict:
+    """A picker whose rows load first: Enter before they show must not pick one."""
+
+    def shown(driver: Driver) -> bool:
+        return (
+            active(driver.app)
+            and _picker_card_drawn(driver)
+            and driver.session.default_buffer.text == ""
+        )
+
+    return {
+        "drawn": lambda driver: driver.app._picker_active and _picker_card_drawn(driver),
+        "accepted": shown,
+        "empty_accepted": shown,
+        "setup": setup,
+    }
 
 
 OPENERS = [
@@ -623,14 +748,131 @@ OPENERS = [
         ),
         id="ctrl+t",
     ),
+    # A bare slash command that opens a panel opens it from its own Enter.
+    pytest.param(
+        Opener(
+            "/tasks" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(lambda driver: _window_drawn(driver, driver.app._tasks_panel_window)),
+        ),
+        id="/tasks",
+    ),
+    pytest.param(
+        Opener(
+            "/status" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(
+                lambda driver: _window_drawn(driver, driver.app._status_card_window)
+                and not driver.app._mcp_manager_open
+            ),
+        ),
+        id="/status",
+    ),
+    pytest.param(
+        Opener(
+            "/mcp" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(
+                lambda driver: _window_drawn(driver, driver.app._status_card_window)
+                and driver.app._mcp_manager_open
+            ),
+        ),
+        id="/mcp",
+    ),
+    pytest.param(
+        Opener("/decisions" + ENTER, "zz", field=None, escapes=1, **_panel(_decisions_drawn)),
+        id="/decisions",
+    ),
+    # The pickers' keys are the arrows, Enter, and Esc.
+    pytest.param(
+        Opener(
+            "/model" + ENTER,
+            UP,
+            _model_picker_closed,
+            lambda driver: driver.app.model_picker_active and _picker_card_drawn(driver),
+            None,
+            escapes=1,
+            empty_accepted=_model_picker_closed,
+        ),
+        id="/model",
+    ),
+    pytest.param(
+        Opener(
+            "/accounts" + ENTER,
+            UP,
+            field=None,
+            escapes=1,
+            **_loading_picker(lambda app: app.accounts_picker_active, _fake_accounts),
+        ),
+        id="/accounts",
+    ),
+    pytest.param(
+        Opener(
+            "/remote" + ENTER,
+            UP,
+            field=None,
+            escapes=1,
+            **_loading_picker(lambda app: app.remote_picker_active, _fake_remote_hosts),
+        ),
+        id="/remote",
+    ),
 ]
+# Pickers leave typed letters to the composer by design: no miss+enter case.
+LETTERS_TO_COMPOSER = {"/model", "/accounts", "/remote"}
 MISS = "zzsettled"
 
 
+async def _own_home_with_held_startup(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    before_first_page: bool = False,
+) -> tuple[RootHome, asyncio.Event]:
+    """A copy of the home whose startup waits until the returned event is set.
+
+    The wait is after the first history page is drawn (MCP servers start), or
+    with ``before_first_page`` before it: the slowest part of a long session's
+    startup, whose draw clears the transcript.
+    """
+
+    home = tmp_path / "home"
+    # Own copy: on a failure the typed keys land in the session as a prompt.
+    await asyncio.to_thread(shutil.copytree, root_home.home, home)
+    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
+    startup = asyncio.Event()
+    owner, name = (
+        (TUIApp, "_rebuild_transcript_async")
+        if before_first_page
+        else (AgentLoop, "ensure_mcp_servers")
+    )
+    step = getattr(owner, name)
+
+    async def held_startup(self: object, *args: object, **kwargs: object) -> object:
+        await await_or_fail(startup.wait(), timeout=60, what="startup gate")
+        return await step(self, *args, **kwargs)
+
+    monkeypatch.setattr(owner, name, held_startup)
+    return copy, startup
+
+
+OPENER_CASES = [
+    pytest.param(opener.values[0], phase, burst, id=f"{opener.id}-{phase}-{burst}")
+    for opener in OPENERS
+    for phase in ("before-first-page", "startup", "settled")
+    for burst in ("word+enter", "miss+enter", "word+esc", "enter", "word")
+    if not (opener.id in LETTERS_TO_COMPOSER and burst == "miss+enter")
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("burst", ["word+enter", "miss+enter", "word+esc", "enter"])
-@pytest.mark.parametrize("phase", ["startup", "settled"])
-@pytest.mark.parametrize("opener", OPENERS)
+@pytest.mark.parametrize(("opener", "phase", "burst"), OPENER_CASES)
 async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
     root_home: RootHome,
     tmp_path: Path,
@@ -641,24 +883,16 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
 ) -> None:
     # The opener and the keys after it arrive in one write, before the overlay's
     # first paint: they must reach the overlay, never composer submit.
-    home = tmp_path / "home"
-    # Own copy: on a failure the typed keys land in the session as a prompt.
-    await asyncio.to_thread(shutil.copytree, root_home.home, home)
-    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
-    startup = asyncio.Event()
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=phase == "before-first-page"
+    )
     if phase == "settled":
         startup.set()
-    ensure_mcp_servers = AgentLoop.ensure_mcp_servers
-
-    async def held_startup(loop: AgentLoop) -> None:
-        await await_or_fail(startup.wait(), timeout=60, what="startup gate")
-        await ensure_mcp_servers(loop)
-
-    monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
     backend = FakeBackend([])
-    async with running_tui(copy, backend) as driver:
+    async with running_tui(copy, backend, painted=phase != "before-first-page") as driver:
         app = driver.app
-        if phase == "startup":
+        opener.setup(app, monkeypatch)
+        if phase != "settled":
             assert app._startup_replay_active, "startup finished before the keys"
         else:
             await driver.until(
@@ -667,15 +901,26 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             await driver.settle("settled screen before the opener")
 
         def submitted() -> list[str]:
-            return [value for value, _internal in app._startup_submissions] + [
-                str(messages[-1].content) for messages, _tools in backend.calls
-            ]
+            # Slash commands are not prompts: the opener's own command may queue.
+            return [
+                value
+                for value, _internal in app._startup_submissions
+                if not value.startswith("/")
+            ] + [str(messages[-1].content) for messages, _tools in backend.calls]
 
         def composer() -> str:
             return driver.session.default_buffer.text
 
         typed = {"miss+enter": MISS, "enter": ""}.get(burst, opener.word)
-        if burst == "word+esc":
+        if burst == "word":
+            # Left open while startup ends.
+            await driver.send(opener.key + typed)
+            await driver.until(lambda: opener.drawn(driver), what="the overlay did not open")
+            await driver.settle("overlay holds the typed keys")
+            assert not submitted() and (
+                opener.field is None or opener.field(driver) == typed
+            ), f"the overlay lost {typed!r}: sent {submitted()}; screen:\n{driver.screen()}"
+        elif burst == "word+esc":
             await driver.send(opener.key + typed)
             for _ in range(opener.escapes):
                 await driver.until(lambda: opener.drawn(driver), what="the overlay did not open")
@@ -695,6 +940,14 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             )
         else:
             await driver.send(opener.key + typed + ENTER)
+            if phase == "before-first-page":
+                # Nothing to accept before the first page: the keys wait for it.
+                await driver.settle("keys held before the first page")
+                assert not submitted(), f"keys typed for the overlay were sent: {submitted()}"
+                startup.set()
+                await driver.until(
+                    lambda: not app._startup_replay_active, what="startup did not finish"
+                )
             expected = {
                 "word+enter": lambda: opener.accepted(driver),
                 "enter": lambda: opener.empty_accepted(driver),
@@ -724,6 +977,7 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
                     assert opener.field(driver) == MISS, (
                         f"the overlay query is {opener.field(driver)!r}, typed {MISS!r}"
                     )
+        drawn = opener.drawn(driver)
         startup.set()
         # Startup sends its queued prompts in the same step that ends it; wait
         # for any turn they started, so a sent prompt reaches the backend.
@@ -736,6 +990,678 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
         assert not backend.calls, (
             f"keys typed for the overlay were sent to the model: {submitted()}"
         )
+        # The first history page draw clears the transcript: an open overlay
+        # stays drawn, and a picker's keys never act on a card that is gone.
+        assert opener.drawn(driver) == drawn, (
+            f"startup changed the overlay: drawn {drawn} -> {opener.drawn(driver)};"
+            f" screen:\n{driver.screen()}"
+        )
+        if phase == "before-first-page":
+            # The first page is drawn under an overlay opened before it.
+            assert driver.order(), f"no history after startup; screen:\n{driver.screen()}"
+        # A picker's card is drawn once while its keys act, and is never history.
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert cards == (int(app._picker_active), 0), (
+            f"picker keys active={app._picker_active}, cards on screen and in"
+            f" history {cards}; screen:\n{driver.screen()}"
+        )
+        if phase == "before-first-page":
+            # The history stays once the overlay closes.
+            for _ in range(opener.escapes):
+                await driver.send(ESCAPE)
+                await driver.settle("settled screen after Esc")
+            if not (opener.key == CTRL_F and burst == "word+enter"):
+                # Every other row ends at the tail; an accepted find moved the view.
+                assert _answer(TURNS - 1) in driver.screen(), (
+                    f"the newest answer is not drawn after Esc; screen:\n{driver.screen()}"
+                )
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The panel opens from its Enter during startup; the prompt typed before it
+    # still waits for startup and is sent, and only it.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        assert app._startup_replay_active, "startup finished before the keys"
+        await driver.send("hello" + ENTER + "/tasks" + ENTER + "zz" + ENTER)
+        await driver.settle("settled screen before startup ends")
+        startup.set()
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="the queued prompt was not sent after startup",
+        )
+        await driver.settle("settled screen after startup")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
+        assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+async def test_a_prompt_queued_before_a_picker_command_closes_the_picker_when_sent(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # The picker opens from its Enter during startup, over the prompt typed
+    # before it. When startup ends the prompt is sent, and never with a picker
+    # on screen.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    _fake_remote_hosts(None, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        _fake_accounts(app, monkeypatch)
+        assert app._startup_replay_active, "startup finished before the keys"
+        await driver.send("hello" + ENTER + command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} did not show its picker during startup",
+        )
+        await driver.settle("settled screen with the picker")
+        assert _picker_cards(driver) == 1 and not backend.calls, (
+            f"before startup ends: cards={_picker_cards(driver)}, sent={len(backend.calls)}"
+        )
+        sent_under: list[bool] = []
+        complete = backend.complete
+
+        def recording_complete(*args: object, **kwargs: object) -> object:
+            sent_under.append(app._picker_active)
+            return complete(*args, **kwargs)
+
+        monkeypatch.setattr(backend, "complete", recording_complete)
+        # The turn needs the real account context back; the picker has its rows.
+        app.loop.account_context = account_context
+        startup.set()
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="the queued prompt was not sent after startup",
+        )
+        await driver.settle("settled screen after startup")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
+        assert sent_under == [False] and _picker_cards(driver) == 0, (
+            f"'hello' was sent with the {command} picker on screen: picker at send"
+            f" {sent_under}, cards now {_picker_cards(driver)}; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_esc_while_a_picker_loads_stops_it(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    _fake_remote_hosts(None, monkeypatch)
+    loaded = RemoteSessionClient.discover
+    gate = asyncio.Event()
+
+    async def held_discover(client: object, hosts: object = None) -> tuple:
+        await await_or_fail(gate.wait(), what="remote discovery gate")
+        return await loaded(client, hosts)
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await driver.until(lambda: app._picker_active, what="/remote opened nothing")
+            await driver.send(ESCAPE)
+            await driver.until(lambda: not app._picker_active, what="Esc did not stop the load")
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the load would have ended")
+        assert not app.remote_picker_active and driver.session.default_buffer.text == "", (
+            f"the picker opened after Esc; screen:\n{driver.screen()}"
+        )
+
+
+def _hold_remote_discovery(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Fake remote hosts whose discovery waits for the returned gate."""
+
+    _fake_remote_hosts(None, monkeypatch)
+    loaded = RemoteSessionClient.discover
+    gate = asyncio.Event()
+
+    async def held_discover(client: object, hosts: object = None) -> tuple:
+        await await_or_fail(gate.wait(), timeout=60, what="remote discovery gate")
+        return await loaded(client, hosts)
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    return gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["\x03", "\x04"], ids=["ctrl+c", "ctrl+d"])
+async def test_interrupt_and_exit_act_while_a_picker_loads(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    # A loading picker drops typed keys, but never the keys that stop zeta:
+    # ctrl+c stops the load (as on main, where it stopped the slash command),
+    # and ctrl+d exits.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = _hold_remote_discovery(monkeypatch)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await driver.until(lambda: app._picker_loading is not None, what="/remote opened nothing")
+            await driver.send(key)
+            await driver.settle("key taken while /remote loads")
+            acted = not app._picker_active if key == "\x03" else app._exit_requested
+            assert acted, (
+                f"{key!r} did not act while /remote loaded: picker still loading="
+                f"{app._picker_loading is not None}, exit requested={app._exit_requested}"
+            )
+        finally:
+            gate.set()
+        if key == "\x03":
+            await driver.settle("settled screen after the load would have ended")
+            assert not app.remote_picker_active, "the picker opened after ctrl+c stopped its load"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+async def test_an_open_picker_is_one_card_across_history_redraws(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # PageUp loads older pages and redraws the history: the open picker stays
+    # one card, never a history row, and none is left after Esc.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    _fake_remote_hosts(None, monkeypatch)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        _fake_accounts(app, monkeypatch)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before the picker")
+        redraws = 0
+        draw = app._render_resident_history
+
+        def counted_draw() -> None:
+            nonlocal redraws
+            redraws += 1
+            draw()
+
+        # test-contract: seam counts the history redraws the picker must survive
+        monkeypatch.setattr(app, "_render_resident_history", counted_draw)
+        await driver.send(command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} opened no picker",
+        )
+        for _ in range(60):
+            if redraws >= 3:
+                break
+            await driver.send(PAGE_UP)
+            await driver.settle("PageUp with the picker open")
+        assert redraws >= 3, f"PageUp redrew the history {redraws} times"
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert app._picker_active and cards == (1, 0), (
+            f"after {redraws} redraws: cards on screen and in history {cards};"
+            f" screen:\n{chr(10).join(driver.all_rows())}"
+        )
+        await driver.send(ESCAPE)
+        await driver.settle("settled screen after Esc")
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert not app._picker_active and cards == (0, 0), (
+            f"after Esc: cards on screen and in history {cards};"
+            f" screen:\n{chr(10).join(driver.all_rows())}"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+@pytest.mark.parametrize("close", ["j+enter", "esc"])
+async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    close: str,
+) -> None:
+    # The first page draws while the picker is open. Then exactly one card shows,
+    # and once the picker closes none is left: not on screen, not in the history,
+    # not in the finder's preview rows, and never under a sent prompt.
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=True
+    )
+    _fake_remote_hosts(None, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend, painted=False) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        _fake_accounts(app, monkeypatch)
+
+        def cards() -> tuple[int, int]:
+            return _picker_cards(driver), _picker_cards_in_history(app)
+
+        def rows() -> str:
+            return "\n".join(driver.all_rows())
+
+        await driver.send(command + ENTER)
+        await driver.until(lambda: app._picker_active, what=f"{command} opened nothing")
+        startup.set()
+        await driver.until(
+            lambda: not app._startup_replay_active
+            and app._picker_loading is None
+            and _answer(TURNS - 1) in driver.screen(),
+            what="startup did not draw the history under the picker",
+        )
+        await driver.settle("settled screen with the picker open")
+        assert app._picker_active and cards() == (1, 0), (
+            f"open picker: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+        if close == "esc":
+            await driver.send(ESCAPE)
+            await driver.settle("settled screen after Esc")
+        else:
+            await driver.send("j")
+            await driver.settle("settled screen after j")
+            assert driver.session.default_buffer.text == "j" and cards() == (0, 0), (
+                f"after j: composer {driver.session.default_buffer.text!r}, cards"
+                f" {cards()}; screen:\n{rows()}"
+            )
+            # The fake account list cannot run a turn; the real context can.
+            app.loop.account_context = account_context
+            await driver.send(ENTER)
+            await driver.until(
+                lambda: bool(backend.calls)
+                and (app._active_task is None or app._active_task.done()),
+                what="Enter did not send j",
+            )
+            await driver.settle("settled screen after the send")
+        assert not app._picker_active and cards() == (0, 0), (
+            f"after {close}: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f opened no finder")
+        await driver.settle("settled finder")
+        assert _picker_cards(driver) == 0, f"a card in the finder preview; screen:\n{rows()}"
+        await _close_finder_with_escape(driver)
+        await driver.settle("settled screen after the finder")
+        assert cards() == (0, 0), (
+            f"after the finder: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+
+
+LONG_PICKERS = (
+    [
+        pytest.param(command, count, size, 0, id=f"{command}-{count}-{size.columns}x{size.rows}")
+        for command, count in (("/accounts", 6), ("/remote", 40))
+        for size in (Size(rows=50, columns=160), Size(rows=24, columns=80))
+    ]
+    + [pytest.param("/remote", 40, Size(rows=12, columns=80), 0, id="/remote-40-80x12")]
+    + [
+        # Six children fill the agent list's 6 rows (a page of 5 and its pager).
+        pytest.param(
+            command,
+            count,
+            Size(rows=rows, columns=80),
+            6,
+            id=f"{command}-{count}-80x{rows}-agent-list",
+        )
+        for command, count in (("/accounts", 6), ("/remote", 40))
+        for rows in (12, 16)
+    ]
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("command", "count", "size", "children"), LONG_PICKERS)
+async def test_every_row_of_a_long_picker_shows_with_its_hint_and_border(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    count: int,
+    size: Size,
+    children: int,
+) -> None:
+    # Down through every row: the selected row, the key hint, and the bottom
+    # border show on each step, at every screen size (6 accounts is henry's
+    # real count), with and without the agent list. Enter must never act on a
+    # row the user cannot see.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    _add_running_children(copy, children)
+    startup.set()
+    sessions = tuple(
+        RemoteSession("lab", f"s{index}", f"session-{index:02d}", None) for index in range(count)
+    )
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return sessions, ()
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    async with running_tui(copy, size=size) as driver:
+        app = driver.app
+        _fake_accounts(app, monkeypatch, count=min(count, 6))
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.until(
+            # The list's rows: the root, then each child.
+            lambda: len(app._agent_navigation.entries) == (children and children + 1),
+            what=f"the agent list did not show {children} children",
+        )
+        await driver.settle(f"settled screen before {command}")
+        await driver.send(command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} opened no picker",
+        )
+        for step in range(count):
+            if step:
+                await driver.send(DOWN)
+            await driver.settle(f"settled screen after Down {step}")
+            screen = driver.all_rows()
+            selected = (
+                f"session-{step:02d}"
+                if command == "/remote"
+                else f"codex:{app._accounts_picker.highlighted.name}"
+            )
+            # The hint, however many lines it wraps to, then the bottom border.
+            hint = next((index for index, row in enumerate(screen) if "↑/↓" in row), None)
+            border = next(
+                (index for index, row in enumerate(screen) if "╰" in row and index > (hint or 0)),
+                None,
+            )
+            hint_text = " ".join(
+                row.strip(" │") for row in screen[hint:border] if hint is not None
+            )
+            assert (
+                any(SELECTED_MARKER in row and selected in row for row in screen)
+                and border is not None
+                and hint_text.endswith("esc" if command == "/accounts" else "esc cancel")
+            ), (
+                f"Down {step}: the selected row {selected!r}, the hint, or the bottom border"
+                " is not drawn:\n" + "\n".join(screen)
+            )
+        if size.rows >= 24:
+            # Half the screen is the card's limit: the transcript keeps its rows.
+            assert len(driver.rows()) >= 5, "the card squeezed the transcript:\n" + "\n".join(
+                driver.all_rows()
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "state"),
+    [
+        ("/accounts", "loading"),
+        ("/remote", "loading"),
+        ("/model", "shown"),
+        ("/accounts", "shown"),
+        ("/remote", "shown"),
+    ],
+)
+async def test_a_letter_typed_at_a_picker_never_sends_a_prompt_under_it(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    state: str,
+) -> None:
+    # While its rows load, a picker owns every key: `j` and Enter do nothing.
+    # Once shown, the first letter closes it and goes to the composer, so the
+    # Enter after it sends only `j`, with no picker on screen.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+    if state == "shown":
+        gate.set()
+    if command == "/remote":
+        _fake_remote_hosts(None, monkeypatch)
+        loaded = RemoteSessionClient.discover
+
+        async def held_discover(client: object, hosts: object = None) -> tuple:
+            await await_or_fail(gate.wait(), timeout=60, what="remote discovery gate")
+            return await loaded(client, hosts)
+
+        monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        if command == "/accounts":
+            _fake_accounts(app, monkeypatch)
+            listed = app.loop.account_context.list_snapshot
+
+            async def held_list() -> AccountListSnapshot:
+                await await_or_fail(gate.wait(), timeout=60, what="accounts gate")
+                return await listed()
+
+            monkeypatch.setattr(app.loop.account_context, "list_snapshot", held_list)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before the picker")
+
+        def sent() -> list[str]:
+            return [str(messages[-1].content) for messages, _tools in backend.calls]
+
+        try:
+            await driver.send(command + ENTER)
+            await driver.until(
+                lambda: _picker_card_drawn(driver)
+                and (state == "loading" or app._picker_loading is None),
+                what=f"{command} drew no picker",
+            )
+            await driver.settle("picker drawn")
+            await driver.send("j")
+            await driver.settle("letter typed at the picker")
+            if state == "loading":
+                await driver.send(ENTER)
+                await driver.settle("Enter while the rows load")
+                # A turn that the fake account list breaks never reaches the backend.
+                assert app._active_task is None and not sent(), (
+                    f"keys typed while {command} loaded started a turn: sent {sent()}"
+                )
+                assert driver.session.default_buffer.text == "", (
+                    f"keys typed while {command} loaded wait in the composer:"
+                    f" {driver.session.default_buffer.text!r}"
+                )
+        finally:
+            gate.set()
+        if state == "loading":
+            await driver.settle("rows loaded")
+            assert app._active_task is None and app._picker_active and _picker_card_drawn(driver), (
+                f"after the load: sent {sent()}, picker active={app._picker_active};"
+                f" screen:\n{driver.screen()}"
+            )
+            return
+        assert not app._picker_active and not _picker_card_drawn(driver), (
+            f"`j` left {command}'s picker open over the composer; screen:\n{driver.screen()}"
+        )
+        assert driver.session.default_buffer.text == "j", (
+            f"`j` did not reach the composer: {driver.session.default_buffer.text!r}"
+        )
+        # The fake account list cannot run a turn; the real context can.
+        app.loop.account_context = account_context
+        await driver.send(ENTER)
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="Enter did not send the typed text",
+        )
+        await driver.settle("settled screen after the send")
+        assert sent() == [str([TextContent("j")])] and not _picker_card_drawn(driver), (
+            f"sent {sent()}; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_panel_behind_a_running_slash_command_owns_its_keys(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /compact holds the slash lock; /tasks only shows information, so it opens
+    # from its Enter and the keys after it never wait in the composer as a prompt.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+
+    async def held_compact(_app: TUIApp) -> str:
+        await await_or_fail(gate.wait(), timeout=60, what="compact gate")
+        return "compact: nothing to compact"
+
+    monkeypatch.setattr(TUIApp, "slash_compact", held_compact)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /compact")
+        try:
+            await driver.send("/compact" + ENTER)
+            await driver.until(
+                lambda: app.slash_lock.holder is not None, what="/compact did not start"
+            )
+            await driver.send("/tasks" + ENTER + "zz" + ENTER)
+            await driver.settle("keys taken while /compact runs")
+            assert _window_drawn(driver, app._tasks_panel_window), (
+                f"/tasks waited for /compact; screen:\n{driver.screen()}"
+            )
+        finally:
+            gate.set()
+        await driver.until(
+            lambda: app.slash_lock.holder is None
+            and (app._active_task is None or app._active_task.done()),
+            what="/compact or a queued turn did not end",
+        )
+        await driver.settle("settled screen after /compact")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert not sent and driver.session.default_buffer.text == "", (
+            f"keys typed for the panel were sent {sent} or left in the composer"
+            f" {driver.session.default_buffer.text!r}"
+        )
+        assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
+
+
+@pytest.mark.asyncio
+async def test_a_second_picker_command_replaces_the_one_still_loading(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+    async with running_tui(copy) as driver:
+        app = driver.app
+        _fake_accounts(app, monkeypatch)
+        listed = app.loop.account_context.list_snapshot
+
+        async def held_list() -> AccountListSnapshot:
+            await await_or_fail(gate.wait(), what="accounts gate")
+            return await listed()
+
+        monkeypatch.setattr(app.loop.account_context, "list_snapshot", held_list)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /accounts")
+        try:
+            await driver.send("/accounts" + ENTER + "/accounts" + ENTER)
+            await driver.until(
+                lambda: _picker_card_drawn(driver), what="/accounts opened nothing"
+            )
+            await driver.settle("both commands taken")
+            assert _picker_cards(driver) == 1, (
+                f"two loads for one picker; screen:\n{driver.screen()}"
+            )
+            await driver.send(ESCAPE)
+            await driver.until(lambda: not app._picker_active, what="Esc did not stop the load")
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the loads would have ended")
+        assert not app._picker_active and not _picker_card_drawn(driver), (
+            f"a picker opened after Esc; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_esc_while_remote_attaches_lets_the_attach_finish(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One remote session: /remote attaches without a picker. Esc then must not
+    # cancel the attach halfway and leave the client attached with no view.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    row = RemoteSession("lab", "a1", "alpha", None)
+    started, gate = asyncio.Event(), asyncio.Event()
+    attached: list[str] = []
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return (row,), ()
+
+    async def attach(_client: object, _host: str, session: RemoteSession) -> None:
+        started.set()
+        await await_or_fail(gate.wait(), what="attach gate")
+        attached.append(session.session_id)
+
+    async def next_event(_client: object) -> str:
+        return ""  # the link ended: the view stays, marked disconnected
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+    monkeypatch.setattr(RemoteSessionClient, "next_event", next_event)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await await_or_fail(started.wait(), what="/remote did not attach")
+            await driver.send(ESCAPE)
+            await driver.settle("Esc taken during the attach")
+        finally:
+            gate.set()
+        await driver.until(lambda: not app._picker_active, what="the attach did not end")
+        await driver.settle("settled screen after the attach")
+        assert attached == ["a1"] and app._remote_view is not None, (
+            f"Esc cut the attach: attached={attached}, view={app._remote_view}"
+        )
+        await app.slash_detach("")
+
+
+@pytest.mark.asyncio
+async def test_a_remote_row_chosen_during_startup_attaches_after_it(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The attach would replace the view that startup still draws: Enter on a
+    # row waits for startup to end, with the picker still open.
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=True
+    )
+    _fake_remote_hosts(None, monkeypatch)
+    attached: list[str] = []
+
+    async def attach(_client: object, _host: str, session: RemoteSession) -> None:
+        attached.append(session.session_id)
+
+    async def next_event(_client: object) -> str:
+        return ""  # the link ended: the view stays, marked disconnected
+
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+    monkeypatch.setattr(RemoteSessionClient, "next_event", next_event)
+    async with running_tui(copy, painted=False) as driver:
+        app = driver.app
+        await driver.send("/remote" + ENTER)
+        await driver.until(lambda: app.remote_picker_active, what="/remote opened no picker")
+        await driver.send(ENTER)
+        await driver.settle("Enter taken during startup")
+        assert attached == [] and app._remote_view is None and app.remote_picker_active, (
+            f"a row chosen during startup attached at once: attached={attached},"
+            f" view={app._remote_view}, picker open={app.remote_picker_active}"
+        )
+        startup.set()
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.send(ENTER)
+        await driver.until(lambda: app._remote_view is not None, what="Enter after startup did not attach")
+        assert attached == ["a1"], f"attached {attached}, expected the chosen row once"
+        await app.slash_detach("")
 
 
 def _assert_pages_adjacent(driver: Driver, what: str) -> None:
@@ -1040,9 +1966,13 @@ async def test_finder_shows_no_matches_once_old_history_finds_nothing(
 
 @pytest.mark.asyncio
 async def test_finder_escape_returns_the_composer_to_insert_mode(
-    root_home: RootHome,
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with running_tui(root_home) as driver:
+    # Own copy: the typed text stays as a draft, which the shared session would
+    # restore into the composer of every later test.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    async with running_tui(copy) as driver:
         await driver.send(CTRL_F)
         await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         await driver.send(OLD_WORDS[40])
@@ -1157,3 +2087,99 @@ async def test_ctrl_f_after_an_accepted_match_opens_a_new_search(
         assert composer and not any(OLD_WORDS[3] in row for row in composer), (
             f"the second query went into the composer: {composer}"
         )
+
+
+async def _home_with_a_child(root_home: RootHome, tmp_path: Path) -> RootHome:
+    """A copy of the home whose root session has one running child: the same history."""
+
+    home = tmp_path / "home"
+    await asyncio.to_thread(shutil.copytree, root_home.home, home)
+    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
+    _add_running_children(copy, 1)
+    return copy
+
+
+def _add_running_children(home: RootHome, count: int) -> None:
+    """Give the root session ``count`` running children with its own history."""
+
+    log = (home.root / home.session_id / "conversation.jsonl").read_text().splitlines()
+    for number in range(1, count + 1):
+        child = home.root / home.session_id / "agents" / str(number)
+        child.mkdir(parents=True)
+        header = json.loads(log[0])
+        header["data"]["session_id"] = str(number)
+        (child / "conversation.jsonl").write_text(
+            "\n".join([json.dumps(header), *log[1:]]) + "\n"
+        )
+        (child / "agent_lifecycle.json").write_text(
+            json.dumps(
+                {"agent_type": "worker", "description": "child", "depth": 1, "state": "running"}
+            )
+        )
+
+
+async def _enter_the_child(driver: Driver) -> None:
+    navigation = driver.app._agent_navigation
+    await driver.until(lambda: bool(navigation.entries), what="no child in the agent list")
+    await driver.until(driver.app.composer_can_focus_agent_list, what="agent list not reachable")
+    await driver.send("\x1b[B")
+    await driver.until(navigation.list_focused, what="Down did not focus the agent list")
+    while navigation.entries[navigation.selected_index].path.name != "1":
+        before = navigation.selected_index
+        await driver.send("\x1b[B")
+        await driver.until(
+            lambda before=before: navigation.selected_index != before, what="no next row"
+        )
+    await driver.send(ENTER)
+    await driver.until(
+        lambda: navigation.child_view_active and _answer(TURNS - 1) in driver.screen(),
+        what="the child view did not show its newest answer",
+        seconds=90,
+    )
+    await navigation.wait_for_publication()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["root", "child"])
+@pytest.mark.parametrize("last_key", ["a", BACKSPACE], ids=["miss", "cleared"])
+async def test_finder_typed_one_key_per_frame_searches_the_view_it_opened_on(
+    root_home: RootHome, tmp_path: Path, last_key: str, view: str
+) -> None:
+    # "q" alone matches only turn 3's quokka, far behind the tail, so its search
+    # replaces the pages. The next key must not leave the finder ranking those
+    # pages: "qa" fuzzy-matches quokka but no text holds "qa", and a burst of the
+    # same keys finds nothing.
+    home = root_home if view == "root" else await _home_with_a_child(root_home, tmp_path)
+    async with running_tui(home) as driver:
+        if view == "child":
+            await _enter_the_child(driver)
+        await driver.settle("settled tail before the finder")
+        pager = driver.app._agent_navigation.transcript_control.history_pager
+        tail_pages, tail = _resident(pager), driver.rows()
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send("q")
+        await driver.until(
+            lambda: _prompt(3) in driver.screen() and driver.idle(),
+            what="the search for 'q' did not reveal turn 3",
+        )
+        await driver.settle("settled on 'q'")
+        await driver.send(last_key)
+        await driver.settle(f"settled after {last_key!r}")
+        await driver.send(ENTER)
+        await driver.settle("settled after Enter")
+        if last_key == "a":
+            assert driver.finder_drawn(), (
+                "Enter on 'qa' accepted a row that only the search for 'q' brought in;"
+                f" screen:\n{driver.screen()}"
+            )
+            await _close_finder_with_escape(driver)
+            await driver.settle("settled after Esc")
+            assert driver.rows() == tail, f"Esc did not restore the tail:\n{driver.screen()}"
+        else:
+            # An empty query lists the newest rows of the view the finder opened on.
+            assert not driver.finder_drawn() and _answer(TURNS - 1) in driver.screen(), (
+                "Enter on the cleared query jumped into pages the search for 'q'"
+                f" revealed; screen:\n{driver.screen()}"
+            )
+        assert _resident(pager) == tail_pages, "the pages 'q' revealed are still resident"
