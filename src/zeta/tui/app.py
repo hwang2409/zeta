@@ -75,8 +75,8 @@ from .layout import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
-from .overlay_opener import OverlayOpenerMixin
 from .paste_runtime import PasteRuntime
+from .runtime.overlay_opener import OverlayOpenerMixin
 from .runtime.prompt import PromptRuntimeMixin
 from .runtime.stream import StreamEventMixin
 from .runtime_close import RuntimeCloseMixin
