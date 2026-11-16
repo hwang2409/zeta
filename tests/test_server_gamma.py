@@ -358,8 +358,9 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         await _hello(reader, writer)
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         server.runtime.extensions.notify("notice", "hello", "info")
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(reader.read(1), 0.2)
+        frames = await _request(reader, writer, 3, "ping")
+        assert frames[-1]["error"]["code"] == -32601
+        assert all(frame.get("method") != "extension_notice" for frame in frames)
     finally:
         await close_serve(server, writer)
 
