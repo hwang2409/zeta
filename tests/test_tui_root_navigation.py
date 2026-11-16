@@ -796,6 +796,26 @@ async def test_finder_shows_searching_until_old_history_answers(
 
 
 @pytest.mark.asyncio
+async def test_finder_shows_no_matches_once_old_history_finds_nothing(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send("zzqqxx")
+        await driver.until(
+            lambda: driver.app._history_search_task is not None
+            and driver.app._history_search_task.done(),
+            what="durable search for a query with no hit",
+        )
+        await driver.settle("screen after the empty search")
+        drawn = "\n".join(driver.all_rows())
+        assert "no matches" in drawn and "searching…" not in drawn, (
+            f"the finder still shows searching after the search ended:\n{drawn}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_finder_escape_returns_the_composer_to_insert_mode(
     root_home: RootHome,
 ) -> None:

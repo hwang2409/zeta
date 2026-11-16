@@ -427,7 +427,7 @@ def session_runtime_state(self) -> str:
     return (
         "idle"
         if control.unhealthy() or runtime.state is None
-        else "running" if control.turn_busy() else runtime.state.status
+        else "running" if control.state_change_busy() else runtime.state.status
     )
 
 
