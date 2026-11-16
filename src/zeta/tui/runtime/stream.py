@@ -40,6 +40,10 @@ class StreamEventMixin:
         if event.type is StreamEventType.TOOL_APPROVAL_END:
             if event.tool_call is not None and not event.data.get("inline_shell"):
                 self._submissions.notify_approval_finished(event.tool_call)
+            if event.tool_call is not None and event.data.get("reason") == "turn_canceled":
+                self._print_system(
+                    f"approval for {event.tool_call.id} closed: its turn ended before an answer"
+                )
             self._loop_state = "streaming"
             self._repaint_accounts_picker()
             self._present_pending_approvals()

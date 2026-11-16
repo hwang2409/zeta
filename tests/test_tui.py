@@ -11823,6 +11823,9 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
+    app._present_pending_approvals()
+    assert len(app._approval_units) == 1
 
     app._submit_input("approve the plan")
     # The pipeline consumer starts the turn task on its next loop step.
@@ -11834,6 +11837,11 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     # request of the turn that is over, as an abort, never as an approval.
     assert store.approval_state_now(call.id) == (call, "abort")
     assert app.pending_approvals == ()
+    assert app._approval_units == {}
+    assert (
+        "system · approval for pending-call closed: its turn ended before an answer"
+        in [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    )
     assert [
         block.text
         for message in branch_messages(store)

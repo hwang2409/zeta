@@ -424,6 +424,34 @@ async def test_denied_approval_without_live_turn_resumes_model(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_next_turn_closes_a_recovered_approval_for_every_client(
+    tmp_path: Path,
+) -> None:
+    # The durable request has no live record, as after a restart: the dead
+    # turn's request is still answerable until the next turn starts.
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, call = await _approval_server(tmp_path, backend=backend)
+    try:
+        status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
+        assert [row["request_id"] for row in status["pending_approvals"]] == [call.id]
+
+        await _request(reader, writer, 4, "send", {"text": "continue"})
+        frames = await _frames_until_event(reader, "agent_end")
+
+        ends = _named_events(frames, "approval_end")
+        assert [(end["request_id"], end["data"]["decision"]) for end in ends] == [
+            (call.id, "abort")
+        ]
+        assert ends[0]["data"]["reason"] == "turn_canceled"
+        status = (await _request(reader, writer, 5, "status", {}))[-1]["result"]
+        assert status["pending_approvals"] == []
+        late = await _request(reader, writer, 6, "approve", {"request_id": call.id})
+        assert late[-1].get("result", {}).get("decision") != "allow"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_first", [False, True])
 async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_first: bool
