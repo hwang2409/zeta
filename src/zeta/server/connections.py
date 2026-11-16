@@ -110,6 +110,7 @@ EVENT_FEATURES = {
     EventDescriptor.SESSION_RETENTION: frozenset({"session_retention"}),
     EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
     EventDescriptor.ZETA_UPDATED: frozenset({"zeta_updated"}),
+    EventDescriptor.PARKED_SESSION_CHANGED: frozenset({"session_park"}),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
@@ -1176,15 +1177,16 @@ def project_status(target: object, *, served_turn_end: bool = False) -> dict[str
         store.compaction_marker_count() if store is not None else 0
     )
     if served_turn_end:
-        outcome = None
-        entry = store.last_turn_end() if store is not None else None
-        if entry is not None:
-            outcome = {
-                "turn_id": entry.data["turn_id"],
-                "reason": entry.data["reason"],
-            }
-        status["last_turn_outcome"] = outcome
+        status["last_turn_outcome"] = last_turn_outcome(store)
     return status
+
+
+def last_turn_outcome(store: Any) -> dict[str, object] | None:
+    """The last durable whole-turn outcome on the active branch, or None."""
+    entry = store.last_turn_end() if store is not None else None
+    if entry is None:
+        return None
+    return {"turn_id": entry.data["turn_id"], "reason": entry.data["reason"]}
 
 
 

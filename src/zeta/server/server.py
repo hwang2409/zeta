@@ -31,7 +31,7 @@ from . import (
     accounts,
     login,
 )
-from .connections import ConnectionRegistry
+from .connections import ConnectionRegistry, last_turn_outcome
 from .control import NotificationPresentation, ServeControl
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
@@ -308,6 +308,8 @@ class ZetaServer:
         # session_park: busy sessions the client left, and idle ones being closed
         self._parked: dict[str, ServeControl] = {}
         self._closing: dict[str, asyncio.Task[None]] = {}
+        # the last parked_session_changed data sent per parked session
+        self._parked_sent: dict[str, dict[str, object]] = {}
 
     @property
     def runtime(self) -> ServerRuntime:
@@ -340,6 +342,7 @@ class ZetaServer:
         session_id = incoming.runtime.session_id
         if self._parked.get(session_id) is incoming:
             del self._parked[session_id]
+            self._parked_sent.pop(session_id, None)
         else:
             # a new pair takes over the controller slot state of the pair it replaces
             incoming._controller_attached = outgoing._controller_attached
@@ -355,16 +358,42 @@ class ZetaServer:
             self._close_pair(outgoing)
 
     def _close_if_idle(self, control: ServeControl) -> None:
+        """Report a parked pair's changed state, and close it once idle."""
         # a resume may have attached the pair since this check was scheduled
-        if control in self._parked.values() and not control.holds_work():
+        if control not in self._parked.values():
+            return
+        self._publish_parked(control, control.parked_row())
+        if not control.holds_work():
             self.close_parked(control)
+
+    def _publish_parked(self, control: ServeControl, row: dict[str, object]) -> None:
+        """Send ``parked_session_changed`` when the row differs from the last one
+        sent; loop thread only. The parked control's own frames stay dropped."""
+        assert control.runtime.opened is not None
+        session_id = control.runtime.session_id
+        data = {
+            **row,
+            "last_turn_outcome": last_turn_outcome(control.runtime.opened.store),
+        }
+        if self._parked_sent.get(session_id) == data or self.connections is None:
+            return
+        self._parked_sent[session_id] = data
+        self.connections.try_admit_controller(
+            EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
+        )
 
     def close_parked(
         self, control: ServeControl, settlement_timeout: float | None = None
     ) -> None:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._parked.values():
-            del self._parked[control.runtime.session_id]
+            session_id = control.runtime.session_id
+            del self._parked[session_id]
+            self._publish_parked(
+                control,
+                {"session_id": session_id, "state": "closed", "pending_approvals": 0},
+            )
+            self._parked_sent.pop(session_id, None)
             self._close_pair(control, settlement_timeout)
 
     def _close_pair(

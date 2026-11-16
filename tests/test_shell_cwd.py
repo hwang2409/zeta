@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.store import ConversationStore
 from zeta.skills import SkillCatalog
 from zeta.tools._shared.shell_cwd import bind_shell_cwd_async
 from zeta.tools.registry import ToolRegistry
@@ -166,3 +167,30 @@ async def test_bind_shell_cwd_cancellation_drains_and_does_not_commit(
         os.fstat(returned_fds[0])
     assert error.value.errno == errno.EBADF
     await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_child_registry_keeps_its_own_cwd_recovery_notice(tmp_path: Path) -> None:
+    """A child's removed cwd is reported in the child, not by the parent's next result."""
+    parent_dir = tmp_path / "parent"
+    child_dir = parent_dir / "child"
+    child_dir.mkdir(parents=True)
+    store = ConversationStore(
+        tmp_path / "sessions",
+        session_id="child",
+        cwd=str(child_dir),
+        bash_cwd=str(child_dir),
+    )
+    root = ToolRegistry(parent_dir, skill_catalog=SkillCatalog.empty())
+    child = root.clone_for_session(store, cwd=child_dir)
+    try:
+        child_dir.rmdir()
+        _start, fd = await bind_shell_cwd_async(child, None)
+        os.close(fd)
+
+        assert root.take_cwd_recovery_notices() == ()
+        assert child.take_cwd_recovery_notices() == ((str(child_dir), str(parent_dir)),)
+    finally:
+        await child.close()
+        await root.close()
+        store.close()
