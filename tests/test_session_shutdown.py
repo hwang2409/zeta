@@ -470,6 +470,43 @@ async def test_closed_tui_drops_callbacks_without_gc(
 
 
 @pytest.mark.usefixtures("no_gc")
+async def test_closed_tui_freed_while_update_notice_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed TUI is freed even while its update-notice subscriber is published.
+
+    ProcessUpdateMonitor._publish binds a strong local (`callback = reference()`)
+    to each subscriber while it awaits it. If handle_update strong-captures the
+    app, that local keeps a closed app alive past refcount cleanup. Pinning the
+    subscriber the way _publish does reproduces the flake deterministically.
+    """
+    import weakref
+
+    import zeta
+    from zeta.runtime import update_notice
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app._snapshots()
+    loop = app.loop
+    monitor = update_notice.process_update_monitor(zeta.__file__ or "")
+    pinned = next(
+        reference()
+        for reference in tuple(monitor._subscribers)
+        if reference() is app._update_notice_callback
+    )
+    assert pinned is not None
+    reference = weakref.ref(app)
+    await app.close()
+    del app
+    assert reference() is None
+    del pinned
+    assert reference() is None
+    SessionManager(tmp_path / "home").delete(loop.store.session_id)
+
+
+@pytest.mark.usefixtures("no_gc")
 async def test_closed_tui_drops_pending_paste_callbacks_without_gc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

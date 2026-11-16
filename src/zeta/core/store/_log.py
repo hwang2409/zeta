@@ -906,6 +906,12 @@ class ConversationLogMixin:
             self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_REPAIR
         )
 
+    @property
+    def _tail_evidence_enabled(self: ConversationStore) -> bool:
+        return feature_enabled(
+            self._storage_lease.observed_epoch, StorageFeature.TRANSCRIPT_TAIL_EVIDENCE
+        )
+
     def _repair_explicit_load_error(
         self: ConversationStore, error: TranscriptLoadError, since: tuple[int, int]
     ) -> bool:
@@ -919,6 +925,7 @@ class ConversationLogMixin:
             error._source_facts,
             strict_reopen=self._strict_reopen_repaired_transcript,
             memory_review_required=self._repair_target.child_run_id is None,
+            tail_evidence=self._tail_evidence_enabled,
         )
         self._repair_explicit = False
         self._load_full(since)
@@ -958,6 +965,7 @@ class ConversationLogMixin:
             source_facts,
             strict_reopen=self._strict_reopen_repaired_transcript,
             memory_review_required=False,
+            tail_evidence=self._tail_evidence_enabled,
         )
         warnings.warn(
             f"dropped torn final conversation line from {self.path}",
