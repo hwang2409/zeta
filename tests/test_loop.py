@@ -1453,7 +1453,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     ids=["first-canceled", "second-canceled"],
 )
 @pytest.mark.asyncio
-async def test_parallel_cancellation_keeps_call_order(
+async def test_parallel_cancellation_errors_only_the_canceled_call(
     tmp_path: Path,
     aborted_index: int,
 ) -> None:
@@ -1485,25 +1485,32 @@ async def test_parallel_cancellation_keeps_call_order(
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(started[0].wait(), 10)
-    await asyncio.wait_for(started[1].wait(), 10)
-    await asyncio.wait_for(completed.wait(), 10)
-    await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(started[0].wait(), 10)
+        await asyncio.wait_for(started[1].wait(), 10)
+        await asyncio.wait_for(completed.wait(), 10)
+        await asyncio.sleep(0)
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
 
-    results = [
-        message.tool_result
-        for message in branch_messages(store)
-        if message.tool_result is not None
-    ]
-    assert [result.tool_call_id for result in results] == [call.id for call in calls]
-    assert [result.is_error for result in results] == [
-        aborted_index == 0,
-        aborted_index == 1,
-    ]
+        results = {
+            message.tool_result.tool_call_id: message.tool_result.is_error
+            for message in branch_messages(store)
+            if message.tool_result is not None
+        }
+        # results are stored as calls end, so only the canceled call is an error
+        assert results == {
+            calls[0].id: aborted_index == 0,
+            calls[1].id: aborted_index == 1,
+        }
+    finally:
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await loop.close()
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -1636,15 +1643,16 @@ async def test_parallel_results_persist_as_each_ends_and_reach_the_model_in_call
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
     try:
         events = await asyncio.wait_for(run(), 10)
+        stored = [
+            message.tool_result.tool_call_id
+            for message in branch_messages(store)
+            if message.tool_result is not None
+        ]
     finally:
         await loop.close()
         await registry.close()
+        store.close()
 
-    stored = [
-        message.tool_result.tool_call_id
-        for message in branch_messages(store)
-        if message.tool_result is not None
-    ]
     ended = [
         event.tool_call.id
         for event in events

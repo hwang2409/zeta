@@ -145,6 +145,7 @@ async def _die_at_beta_approval(
             alpha_taken.set()
         return checked
 
+    # test-contract: seam the old base announces nothing until the group ends, so the copy waits here
     monkeypatch.setattr(agent_module, "_validated_tool_result", validated)
 
     store = ConversationStore(root, session_id="session")
