@@ -79,11 +79,14 @@ class ProjectLockingMixin:
         return lock_fd
 
     @staticmethod
-    def _acquire_lock(
-        lock_fd: int,
-        mode: int,
-        *,
-        timeout_seconds: float = _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS,
+    def _acquire_lock(lock_fd: int, mode: int) -> None:
+        ProjectLockingMixin._acquire_lock_with_timeout(
+            lock_fd, mode, timeout_seconds=_PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    def _acquire_lock_with_timeout(
+        lock_fd: int, mode: int, *, timeout_seconds: float
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -96,10 +99,8 @@ class ProjectLockingMixin:
                 time.sleep(_PROJECT_REGISTRY_LOCK_POLL_SECONDS)
 
     def _acquire_identity_lock(self, lock_fd: int) -> None:
-        self._acquire_lock(
-            lock_fd,
-            fcntl.LOCK_EX,
-            timeout_seconds=_IDENTITY_WRITE_LOCK_TIMEOUT_SECONDS,
+        self._acquire_lock_with_timeout(
+            lock_fd, fcntl.LOCK_EX, timeout_seconds=_IDENTITY_WRITE_LOCK_TIMEOUT_SECONDS
         )
 
     @staticmethod

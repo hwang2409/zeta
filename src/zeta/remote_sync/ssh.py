@@ -217,7 +217,7 @@ def _project_authority(home, ident, *, identity, exclusive, nonblocking=False):
 class ProjectRegistry:
     def __init__(self, projects):
         self.projects = pathlib.Path(projects)
-    def _identity_write(self):
+    def _identity_write(self, *, operation="identity_write"):
         return _project_authority(
             self.projects.parent, "", identity=True, exclusive=True
         )

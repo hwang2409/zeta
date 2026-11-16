@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import multiprocessing
 import os
@@ -132,18 +131,18 @@ def test_tui_startup_retries_busy_registry_and_links_project(
     root = repo(tmp_path)
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
     monkeypatch.chdir(root)
-    original = ProjectRegistry._acquire_lock
+    original = ProjectRegistry._acquire_identity_lock
     busy_attempts = 3
 
-    def acquire(fd: int, mode: int) -> None:
+    def acquire(fd: int) -> None:
         nonlocal busy_attempts
-        if busy_attempts and mode == fcntl.LOCK_EX:
+        if busy_attempts:
             busy_attempts -= 1
             raise ProjectRegistryBusyError()
-        original(fd, mode)
+        original(fd)
 
-    # test-contract: seam patch the real registry lock for deterministic contention
-    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    # test-contract: seam patch the real identity lock for deterministic contention
+    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         metadata = SessionManager(tmp_path / "zeta-home").read_metadata(
@@ -162,15 +161,11 @@ def test_tui_busy_registry_notice_renders(
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "zeta-home"))
     monkeypatch.chdir(root)
 
-    original = ProjectRegistry._acquire_lock
+    def acquire(_fd: int) -> None:
+        raise ProjectRegistryBusyError()
 
-    def acquire(fd: int, mode: int) -> None:
-        if mode == fcntl.LOCK_EX:
-            raise ProjectRegistryBusyError()
-        original(fd, mode)
-
-    # test-contract: seam patch the real registry lock for deterministic contention
-    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    # test-contract: seam patch the real identity lock for deterministic contention
+    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     app.console = Console(file=StringIO())
     try:
@@ -185,18 +180,18 @@ def test_busy_registry_retries_project_discovery(
 ) -> None:
     root = repo(tmp_path)
     m = manager(tmp_path)
-    original = ProjectRegistry._acquire_lock
+    original = ProjectRegistry._acquire_identity_lock
     busy_attempts = 3
 
-    def acquire(fd: int, mode: int) -> None:
+    def acquire(fd: int) -> None:
         nonlocal busy_attempts
-        if busy_attempts and mode == fcntl.LOCK_EX:
+        if busy_attempts:
             busy_attempts -= 1
             raise ProjectRegistryBusyError()
-        original(fd, mode)
+        original(fd)
 
     # test-contract: seam force a bounded busy-lock interleaving
-    monkeypatch.setattr(ProjectRegistry, "_acquire_lock", staticmethod(acquire))
+    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
     opened = m.create(provider="codex", model="test", cwd=root)
     try:
         assert opened.metadata.project_id is not None
