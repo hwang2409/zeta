@@ -55,7 +55,8 @@ async def abort_stale_turn_approvals(store: ConversationStore) -> None:
     """
     after_seq = 0
     while True:
-        page = await store.pending_approval_page(after_seq)
+        # Resident read: no thread hop on the common path with nothing open.
+        page = store.pending_approval_page_now(after_seq)
         for request_id, _tool_call in page.items:
             await store.resolve_approval_async(request_id, "abort", reason="turn_canceled")
         if page.next_seq is None:

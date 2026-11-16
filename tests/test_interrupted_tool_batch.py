@@ -188,7 +188,8 @@ async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
                 _drain(events), what="resumed turn after continue"
             )
 
-        assert ran == ["Alpha", "Beta", "Gamma"], "a completed call ran again"
+        # A parallel retry may run Beta and Gamma in either order.
+        assert sorted(ran) == list(TITLES), "a completed call ran again"
         request = model.requests[0]
         batch = [
             (item["type"], item["call_id"], item.get("output"))
@@ -209,7 +210,7 @@ async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
         # run it a second time.
         assert await policy.pending_requests() == []
         assert not policy.approve("dead-0-Beta")
-        assert ran == ["Alpha", "Beta", "Gamma"]
+        assert sorted(ran) == list(TITLES)
     finally:
         await loop.close()
         await registry.close()
