@@ -126,7 +126,7 @@ async def test_suspend_caller_cancel_at_the_close_wait_keeps_actor_consistent(
 async def test_schedule_close_dedups_a_client_already_closing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(server_actor_module, "CLIENT_CLOSE_TIMEOUT_SECONDS", 30.0)
+    monkeypatch.setattr(server_actor_module, "CLIENT_CLOSE_TIMEOUT_SECONDS", 0.2)
     client = _UncancellableCloseClient(CONFIG)
     actor = _actor(client, tmp_path)
     actor.start()
