@@ -82,6 +82,7 @@ _RAW_PUBLICATION = {
     ("attention_replies.py", "stage", "os.replace"),
     ("attention_replies.py", "_finish_journal_locked", "os.replace"),
     ("attention_replies.py", "_prepare_locked", "os.replace"),
+    ("extensions/host.py", "persist_disabled", "os.replace"),
 }
 
 _RAW_DELETION = {
@@ -149,6 +150,7 @@ _RAW_DELETION = {
     ("attention_replies.py", "_send_staged_locked", "unlink"),
     ("attention_replies.py", "_recover_locked", "unlink"),
     ("attention_replies.py", "_cleanup", "unlink"),
+    ("extensions/host.py", "persist_disabled", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
     ("tools/_spill.py", "temporary_file", "unlink"),
     ("tools/_spill.py", "_try_unlink", "unlink"),

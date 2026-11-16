@@ -457,7 +457,6 @@ class SlashCommandRegistry:
                     f"custom command {existing.path}: /{command.name} is shadowed by home; "
                     "keeping the home command"
                 )
-                self._custom_commands[command.name] = command
                 self.add_notice(notice)
                 return
             notice = (
