@@ -225,7 +225,15 @@ def subscribe_tui_update_notice(app: Any) -> None:
     import zeta
 
     package_file = zeta.__file__ or ""
+    app_ref = weakref.ref(app)
+
     async def handle_update(old_revision: str, new_revision: str) -> None:
+        # capture the app weakly so a publish in flight cannot keep a closed TUI
+        # alive across close() + refcount cleanup (its only strong ref is
+        # app._update_notice_callback, which close() nulls).
+        app = app_ref()
+        if app is None:
+            return
         app._invalidate_prompt()
         observer_host = app.observer_host
         if observer_host is not None:
