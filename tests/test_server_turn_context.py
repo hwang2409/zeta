@@ -56,21 +56,21 @@ async def _notify(
     reader: asyncio.StreamReader,
     notification_id: str,
 ) -> None:
-    server.runtime.opened.store.append_agent_notification(
+    server._runtime_for_test.opened.store.append_agent_notification(
         notification_id,
         child_session_path=f"/tmp/{notification_id}",
         description="child",
         status="completed",
         text=f"{notification_id} done",
     )
-    session_id = server.runtime.session_id
-    server.control._schedule_background_wake(session_id)
+    session_id = server._runtime_for_test.session_id
+    server._control_for_test._schedule_background_wake(session_id)
     while True:
         frames = await _frames_until_event(reader, "agent_end")
         if frames[-1]["params"]["session_id"] == session_id:
             break
     async with asyncio.timeout(10):
-        while server.runtime.loop.notification_turn_state != "idle":
+        while server._runtime_for_test.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
 
 
@@ -88,7 +88,7 @@ from tests.support.owned import await_or_fail
 @pytest.mark.asyncio
 async def test_indexed_notification_append_keeps_receipt_and_callback(tmp_path) -> None:
     server, _reader, writer, _ = await _ready(tmp_path, FakeBackend([]))
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.enable_persisted_append_tracking()
     callback_calls = 0
 
@@ -102,7 +102,7 @@ async def test_indexed_notification_append_keeps_receipt_and_callback(tmp_path) 
         metadata={"zeta_event": "agent_notifications"},
     )
     try:
-        await server.runtime.loop._append_turn_message(
+        await server._runtime_for_test.loop._append_turn_message(
             notification, on_persisted=persisted
         )
 
@@ -131,7 +131,7 @@ async def test_notification_turn_consumes_context_once_before_provider_call(
         )
         assert result[-1]["result"] == {
             "accepted": True,
-            "session_id": server.runtime.session_id,
+            "session_id": server._runtime_for_test.session_id,
             "pending": True,
         }
 
@@ -163,7 +163,7 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("handled")])])
     server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     original_durable_write = type(store)._run_committed_mutation
     append_committed = threading.Event()
     release_append = threading.Event()
@@ -202,16 +202,16 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             status="completed",
             text="child-1 done",
         )
-        server.control._schedule_background_wake(server.runtime.session_id)
+        server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
-        turn_task = server.control._turn_task
+        turn_task = server._control_for_test._turn_task
         assert turn_task is not None
         turn_task.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(turn_task, what="test await")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
         # test-contract: seam releases retry from the injected commit pause
@@ -219,12 +219,12 @@ async def test_cancel_after_durable_notification_append_does_not_duplicate_retry
             type(store), "_run_committed_mutation", original_durable_write
         )
         if store.agent_notifications():
-            server.control._schedule_background_wake(server.runtime.session_id)
+            server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         else:
             await _request(reader, writer, 4, "send", {"text": "retry"})
         await _frames_until_event(reader, "agent_end")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
@@ -257,7 +257,7 @@ async def test_persisted_notification_retry_attaches_new_context_once(
         ]
     )
     server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     original_durable_write = type(store)._run_committed_mutation
     append_committed = threading.Event()
     release_append = threading.Event()
@@ -294,16 +294,16 @@ async def test_persisted_notification_retry_attaches_new_context_once(
             status="completed",
             text="child-1 done",
         )
-        server.control._schedule_background_wake(server.runtime.session_id)
+        server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         assert await asyncio.to_thread(append_committed.wait, 2)
-        turn_task = server.control._turn_task
+        turn_task = server._control_for_test._turn_task
         assert turn_task is not None
         turn_task.cancel()
         release_append.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(turn_task, what="test await")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
         # test-contract: seam releases retry from the injected commit pause
@@ -311,10 +311,10 @@ async def test_persisted_notification_retry_attaches_new_context_once(
             type(store), "_run_committed_mutation", original_durable_write
         )
         await _request(reader, writer, 3, "set_turn_context", {"text": CONTEXT})
-        server.control._schedule_background_wake(server.runtime.session_id)
+        server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         await _frames_until_event(reader, "agent_end")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
@@ -345,7 +345,7 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
 ) -> None:
     backend = FakeBackend([ScriptedTurn([TextContent("handled")])])
     server, reader, writer, _ = await _ready(tmp_path, backend, features=[FEATURE])
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     original_stage = type(store)._stage_delivery_request
     failed = False
 
@@ -379,19 +379,19 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
             status="completed",
             text="child-1 done",
         )
-        server.control._schedule_background_wake(server.runtime.session_id)
+        server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         failure = await _frames_until_event(reader, "error")
         assert (
             "injected persistence failure" in failure[-1]["params"]["error"]["message"]
         )
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
-        server.control._schedule_background_wake(server.runtime.session_id)
+        server._control_for_test._schedule_background_wake(server._runtime_for_test.session_id)
         await _frames_until_event(reader, "agent_end")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
 
         assert len(backend.calls) == 1
@@ -429,7 +429,7 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
     server, reader, writer, session_id = await _ready(
         tmp_path, backend, features=[FEATURE]
     )
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     original_stage = type(store)._stage_delivery_request
 
     def fail_append(self, *args, **kwargs):
@@ -445,10 +445,10 @@ async def test_reconnect_keeps_context_released_after_persistence_failure(
         status="completed",
         text="child-1 done",
     )
-    server.control._schedule_background_wake(session_id)
+    server._control_for_test._schedule_background_wake(session_id)
     await _frames_until_event(reader, "error")
     async with asyncio.timeout(10):
-        while server.runtime.loop.notification_turn_state != "idle":
+        while server._runtime_for_test.loop.notification_turn_state != "idle":
             await asyncio.sleep(0)
     writer.close()
     await writer.wait_closed()
@@ -486,7 +486,7 @@ async def test_session_switch_keeps_pending_contexts_separate(
     server, reader, writer, first_session = await _ready(
         tmp_path, backend, features=[FEATURE]
     )
-    first_store = server.runtime.opened.store
+    first_store = server._runtime_for_test.opened.store
     original_stage = type(first_store)._stage_delivery_request
 
     def fail_append(self, *args, **kwargs):
@@ -503,10 +503,10 @@ async def test_session_switch_keeps_pending_contexts_separate(
             status="completed",
             text="first attempt",
         )
-        server.control._schedule_background_wake(first_session)
+        server._control_for_test._schedule_background_wake(first_session)
         await _frames_until_event(reader, "error")
         async with asyncio.timeout(10):
-            while server.runtime.loop.notification_turn_state != "idle":
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
                 await asyncio.sleep(0)
         # test-contract: seam restores delivery staging before the retry
         monkeypatch.setattr(
@@ -626,7 +626,7 @@ async def test_turn_context_is_persisted_as_non_user_notification_input(
 
         persisted = [
             message
-            for message in branch_messages(server.runtime.opened.store)
+            for message in branch_messages(server._runtime_for_test.opened.store)
             if CONTEXT in str(message.to_dict())
         ]
         assert len(persisted) == 1

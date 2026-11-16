@@ -23,7 +23,7 @@ from .run_work import cancel_background_task, list_run_work
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
 
-async def list_sessions(client, request_id, params):
+async def list_sessions(client, request_id, params, controller=None):
     if client.role == "observer" and "project_id" in params:
         raise ProtocolError(
             ErrorDescriptor.OBSERVER_READ_ONLY,
@@ -36,23 +36,23 @@ async def list_sessions(client, request_id, params):
     return result
 
 
-async def new_session(client, request_id, params):
-    return await lifecycle.new_session(client, params)
+async def new_session(client, request_id, params, controller=None):
+    return await lifecycle.new_session(client, params, controller)
 
 
-async def resume(client, request_id, params):
-    return await lifecycle.resume(client, params)
+async def resume(client, request_id, params, controller=None):
+    return await lifecycle.resume(client, params, controller)
 
 
-async def send(client, request_id, params):
-    return await client.server.controllers.owned(client).control.deliveries.send(params, client.features)
+async def send(client, request_id, params, controller=None):
+    return await controller.control.deliveries.send(params, client.features)
 
 
-async def steer(client, request_id, params):
-    return await client.server.controllers.owned(client).control.deliveries.steer(params, client.features)
+async def steer(client, request_id, params, controller=None):
+    return await controller.control.deliveries.steer(params, client.features)
 
 
-async def _resolve_approval(client, params, decision):
+async def _resolve_approval(client, params, decision, controller):
     scope = params.get("scope", "once")
     if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
         raise ProtocolError(
@@ -62,38 +62,40 @@ async def _resolve_approval(client, params, decision):
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' requires approve"
         )
-    return await client.server.controllers.owned(client).control.resolve_approval(
+    return await controller.control.resolve_approval(
         decision, validation.required_string(params, "request_id"), scope
     )
 
 
-async def approve(client, request_id, params):
-    return await _resolve_approval(client, params, ApprovalDecision.APPROVE)
+async def approve(client, request_id, params, controller=None):
+    return await _resolve_approval(client, params, ApprovalDecision.APPROVE, controller)
 
 
-async def deny(client, request_id, params):
-    return await _resolve_approval(client, params, ApprovalDecision.DENY)
+async def deny(client, request_id, params, controller=None):
+    return await _resolve_approval(client, params, ApprovalDecision.DENY, controller)
 
 
-async def abort(client, request_id, params):
-    return await client.server.controllers.owned(client).control.abort(
+async def abort(client, request_id, params, controller=None):
+    if controller.runtime.opened is None:
+        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
+    return await controller.control.abort(
         abort_scope.parse_abort_scope(params, client.features)
     )
 
 
-async def status(client, request_id, params):
-    owned = client.server.controllers.owned(client)
-    runtime = owned.runtime
+async def status(client, request_id, params, controller=None):
+    controller = client.server.controllers.owned(client)
+    runtime = controller.runtime
     session_id = runtime.session_id if runtime.opened is not None else None
-    if session_id is not None:
-        runtime = client.server.controllers.selected(client, session_id).runtime
     if client.role == "observer":
         fallback_config = (
             await client.connections.run_blocking(lambda: runtime._config(None, None))
             if runtime.loop is None
             else None
         )
-        snapshot = await lifecycle.status(client, fallback_config=fallback_config)
+        snapshot = await lifecycle.status(
+            client, fallback_config=fallback_config, controller=controller
+        )
         if runtime.opened is None:
             snapshot.pop("project_context_health", None)
     else:
@@ -102,60 +104,59 @@ async def status(client, request_id, params):
             include_connection_setup_counts=(
                 params.get("include_connection_setup_counts") is True
             ),
-            controller=client.server.controllers.selected(client, session_id)
-            if session_id is not None
-            else client.server.controllers.owned(client),
+            controller=controller,
         )
-    return await client.connections.read_status(client, snapshot, session_id)
+    return await client.connections.read_status(client, snapshot, session_id, controller)
 
 
-async def rename_session(client, request_id, params):
+async def rename_session(client, request_id, params, controller=None):
     return await session.rename(
-        client.server.controllers.owned(client).runtime,
+        controller.runtime,
         validation.required_string(params, "session_id"),
         params.get("name"),
     )
 
 
-async def delete_session(client, request_id, params):
+async def delete_session(client, request_id, params, controller=None):
     operation = lambda: session.delete_session(
-        client.server.controllers.owned(client).runtime,
+        controller.runtime,
         validation.required_string(params, "session_id"),
-        client.server.controllers.owned(client).control.require_idle,
+        controller.control.require_idle,
     )
     return await operation()
 
 
-async def repair_transcript(client, request_id, params):
+async def repair_transcript(client, request_id, params, controller=None):
     return await session.repair_transcript(client, params)
 
 
-async def session_tree(client, request_id, params):
+async def session_tree(client, request_id, params, controller=None):
     return await client.connections.read_tree(client, params)
 
 
-async def session_history(client, request_id, params):
+async def session_history(client, request_id, params, controller=None):
     return await client.connections.read_history(client, params)
 
 
-async def session_history_and_subscribe(client, request_id, params):
+async def session_history_and_subscribe(client, request_id, params, controller=None):
     return await join_history_and_subscribe(client, params)
 
 
-async def content_read(client, request_id, params):
+async def content_read(client, request_id, params, controller=None):
     return await client.connections.read_content(client, params)
 
 
-async def child_run_history(client, request_id, params):
+async def child_run_history(client, request_id, params, controller=None):
     return await client.connections.read_child_run_history(client, params)
 
 
-async def child_run_events(client, request_id, params):
+async def child_run_events(client, request_id, params, controller=None):
     from ..session_replay import ReplayScopeId
     connections = client.connections
     if set(params) != {"session_id", "run_id"} or not all(type(params.get(key)) is str for key in ("session_id", "run_id")):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
-    if client.server.controllers.owned(client).runtime.session_id != params["session_id"]:
+    controller = client.server.controllers.selected(client, params["session_id"])
+    if controller.runtime.session_id != params["session_id"]:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
     try:
         await connections.begin_replay_join(client, ReplayScopeId.child(params["run_id"]))
@@ -178,7 +179,7 @@ async def _mutable_store(client, params):
     return runtime, store
 
 
-async def switch_branch(client, request_id, params):
+async def switch_branch(client, request_id, params, controller=None):
     _runtime, store = await _mutable_store(client, params)
     head = validation.required_string(params, "head_id")
     if store.active_branch_head_id() != head:
@@ -186,7 +187,7 @@ async def switch_branch(client, request_id, params):
     return await client.connections.read_tree(client, params)
 
 
-async def fork_message(client, request_id, params):
+async def fork_message(client, request_id, params, controller=None):
     _runtime, store = await _mutable_store(client, params)
     await store.append_message_fork_async(
         validation.required_string(params, "message_id")
@@ -194,18 +195,18 @@ async def fork_message(client, request_id, params):
     return await client.connections.read_tree(client, params)
 
 
-async def model_catalog(client, request_id, params):
+async def model_catalog(client, request_id, params, controller=None):
     return await client.connections.read_catalog(client)
 
 
-async def session_settings(client, request_id, params):
+async def session_settings(client, request_id, params, controller=None):
     if client.role == "observer":
         return await client.connections.read_settings(client, params)
-    validation.active(client.server.controllers.owned(client).runtime, params)
-    return settings.settings(client.server.controllers.owned(client).runtime, include_plan_mode=True)
+    validation.active(controller.runtime, params)
+    return settings.settings(controller.runtime, include_plan_mode=True)
 
 
-async def set_settings(client, request_id, params):
+async def set_settings(client, request_id, params, controller=None):
     runtime, _store = await _mutable_store(client, params)
     model = validation.required_string(params, "model")
     mode = validation.required_string(params, "approval_mode")
@@ -214,7 +215,7 @@ async def set_settings(client, request_id, params):
     return settings.settings(runtime)
 
 
-async def set_compaction(client, request_id, params):
+async def set_compaction(client, request_id, params, controller=None):
     await _mutable_store(client, params)
     validation.required_string(params, "mode")
     raise ProtocolError(
@@ -223,12 +224,12 @@ async def set_compaction(client, request_id, params):
     )
 
 
-async def send_images(client, request_id, params):
-    validation.active(client.server.controllers.owned(client).runtime, params)
-    return await client.server.controllers.owned(client).control.deliveries.send_images(params, client.features)
+async def send_images(client, request_id, params, controller=None):
+    validation.active(controller.runtime, params)
+    return await controller.control.deliveries.send_images(params, client.features)
 
 
-async def path_complete(client, request_id, params):
+async def path_complete(client, request_id, params, controller=None):
     controller = client.server.controllers.selected(client, params["session_id"])
     store = validation.active(controller.runtime, params)
     return await path_completion.complete(
@@ -238,8 +239,8 @@ async def path_complete(client, request_id, params):
     )
 
 
-async def slash_list(client, request_id, params):
-    validation.active(client.server.controllers.owned(client).runtime, params)
+async def slash_list(client, request_id, params, controller=None):
+    validation.active(controller.runtime, params)
     include_unavailable = params.get("include_unavailable", False)
     if not isinstance(include_unavailable, bool):
         raise ProtocolError(
@@ -247,16 +248,16 @@ async def slash_list(client, request_id, params):
             "include_unavailable must be a boolean",
         )
     return await slash_commands.list_commands(
-        client.server.controllers.owned(client).runtime, include_unavailable=include_unavailable
+        controller.runtime, include_unavailable=include_unavailable
     )
 
 
-async def slash_run(client, request_id, params):
-    runtime = client.server.controllers.owned(client).runtime
+async def slash_run(client, request_id, params, controller=None):
+    runtime = controller.runtime
     validation.active(runtime, params)
     text = validation.required_string(params, "text")
     registry = await slash_commands.registry_for_request(runtime)
-    control = client.server.controllers.owned(client).control
+    control = controller.control
     busy = control.state_change_busy()
     if busy and not slash_commands.can_run_while_busy(registry, text):
         raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
@@ -271,25 +272,25 @@ async def slash_run(client, request_id, params):
     )
 
 
-async def account_list(client, request_id, params):
+async def account_list(client, request_id, params, controller=None):
     validation.active(client.server.controllers.owned(client).runtime, params)
     return await accounts.list_accounts(client.server.controllers.owned(client).runtime)
 
 
-async def account_logout(client, request_id, params):
+async def account_logout(client, request_id, params, controller=None):
     validation.active(client.server.controllers.owned(client).runtime, params)
     return await accounts.logout(
         client.server.controllers.owned(client).runtime, client.server.require_all_idle, params
     )
 
 
-async def account_refresh(client, request_id, params):
+async def account_refresh(client, request_id, params, controller=None):
     validation.active(client.server.controllers.owned(client).runtime, params)
     await client.server.require_all_idle()
     return await accounts.refresh(client.server.controllers.owned(client).runtime)
 
 
-async def account_switch(client, request_id, params):
+async def account_switch(client, request_id, params, controller=None):
     validation.active(client.server.controllers.owned(client).runtime, params)
     operation = accounts.switch(
         client.server.controllers.owned(client).runtime, client.server.require_all_idle, params
@@ -297,27 +298,27 @@ async def account_switch(client, request_id, params):
     return await accounts.run_owned_switch(client, operation)
 
 
-async def login_start(client, request_id, params):
+async def login_start(client, request_id, params, controller=None):
     return await client.logins.login_start(params)
 
 
-async def login_status(client, request_id, params):
+async def login_status(client, request_id, params, controller=None):
     return await client.logins.login_status(params)
 
 
-async def login_cancel(client, request_id, params):
+async def login_cancel(client, request_id, params, controller=None):
     return await client.logins.login_cancel(params)
 
 
-async def login_providers(client, request_id, params):
+async def login_providers(client, request_id, params, controller=None):
     return await client.logins.login_providers(params)
 
 
-async def ping(client, request_id, params):
+async def ping(client, request_id, params, controller=None):
     return {"pong": True}
 
 
-async def set_turn_context(client, request_id, params):
+async def set_turn_context(client, request_id, params, controller=None):
     return client.server.turn_contexts.set_request(
         client.features, client.server.controllers.owned(client).runtime, params
     )
@@ -328,11 +329,11 @@ async def _project(client, request_id, params, operation):
     return await asyncio.to_thread(operation, request_id, params)
 
 
-async def list_projects(client, request_id, params):
+async def list_projects(client, request_id, params, controller=None):
     return await _project(client, request_id, params, client.projects.list_projects)
 
 
-async def project_show(client, request_id, params):
+async def project_show(client, request_id, params, controller=None):
     return await asyncio.to_thread(
         client.projects.show,
         request_id,
@@ -341,7 +342,7 @@ async def project_show(client, request_id, params):
     )
 
 
-async def project_memory_log(client, request_id, params):
+async def project_memory_log(client, request_id, params, controller=None):
     return await asyncio.to_thread(
         client.projects.memory_log,
         request_id,
@@ -350,47 +351,53 @@ async def project_memory_log(client, request_id, params):
     )
 
 
-async def project_inbox(client, request_id, params):
+async def project_inbox(client, request_id, params, controller=None):
     return await _project(client, request_id, params, client.projects.inbox_view)
 
 
-async def clear_steering(client, request_id, params):
+async def clear_steering(client, request_id, params, controller=None):
     return abort_scope.clear_pending_steering(
-        client.features, client.server.controllers.owned(client).runtime.loop
+        client.features, controller.runtime.loop
     )
 
 
-async def delivery_status(client, request_id, params):
-    return client.server.controllers.owned(client).control.deliveries.status(params, client.features)
+async def delivery_status(client, request_id, params, controller=None):
+    controller = controller or client.server.controllers.owned(client)
+    return controller.control.deliveries.status(params, client.features)
 
 
-async def session_grants_read(client, request_id, params):
+async def session_grants_read(client, request_id, params, controller=None):
     session_grants.require_feature(client.features)
-    runtime = client.server.controllers.owned(client).runtime
+    controller = controller or client.server.controllers.owned(client)
+    runtime = controller.runtime
+    if runtime.opened is None:
+        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
     return session_grants.read(runtime.policy, runtime.session_id, params)
 
 
-async def revoke_session_grants(client, request_id, params):
+async def revoke_session_grants(client, request_id, params, controller=None):
     session_grants.require_feature(client.features)
-    runtime = client.server.controllers.owned(client).runtime
+    runtime = controller.runtime
+    if runtime.opened is None:
+        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
     result, change = session_grants.revoke(
         runtime.policy, runtime.session_id, params
     )
     if change.changed:
-        await client.server.controllers.owned(client).control.publish_session_grant_change(change)
+        await controller.control.publish_session_grant_change(change)
     return result
 
 
-async def child_run_list(client, request_id, params):
+async def child_run_list(client, request_id, params, controller=None):
     return await child_runs.list_runs(client, params)
 
 
-async def child_run_send(client, request_id, params):
+async def child_run_send(client, request_id, params, controller=None):
     return await child_runs.send(client, params)
 
 
-async def mcp_refresh_tools(client, request_id, params):
-    runtime = client.server.controllers.owned(client).runtime
+async def mcp_refresh_tools(client, request_id, params, controller=None):
+    runtime = controller.runtime
     validation.active(runtime, params)
     if set(params) - {"session_id", "server"}:
         raise ProtocolError(
@@ -513,18 +520,24 @@ async def dispatch(
         raise ProtocolError(
             ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
         )
+    controller = None
     if descriptor.access is Access.SESSION_MUTATION:
-        client.server.controllers.owned(client).control._reject_if_unhealthy()  # type: ignore[attr-defined]
+        controller = client.server.controllers.owned(client)
+        controller.control._reject_if_unhealthy()  # type: ignore[attr-defined]
     if descriptor.since is not None and tuple(
         int(part) for part in client.protocol_version.split(".")  # type: ignore[attr-defined]
     ) < tuple(int(part) for part in descriptor.since.split(".")):
         raise protocol_error(descriptor)
     if descriptor.feature is not None and descriptor.feature not in client.features:  # type: ignore[attr-defined]
         raise feature_error(descriptor)
+    if descriptor.access is not Access.READ and controller is None:
+        controller = client.server.controllers.owned(client)
     if descriptor.access is Access.DELIVERY:
-        _require_attached_session(client.server.controllers.owned(client).runtime, params)  # type: ignore[attr-defined]
+        assert controller is not None
+        _require_attached_session(controller.runtime, params)
     if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
         # a queued wake may not start its setup while a state change runs
-        with client.server.controllers.owned(client).control.hold_wake_start():  # type: ignore[attr-defined]
-            return await HANDLERS[descriptor](client, request_id, params)
-    return await HANDLERS[descriptor](client, request_id, params)
+        assert controller is not None
+        with controller.control.hold_wake_start():  # type: ignore[attr-defined]
+            return await HANDLERS[descriptor](client, request_id, params, controller)
+    return await HANDLERS[descriptor](client, request_id, params, controller)

@@ -46,10 +46,10 @@ _RESERVED_HEADERS = frozenset({
 _RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-", "x-forwarded-")
 
 
-async def _publish_project_registry_notice(self) -> None:
-    runtime = self.server.controllers.owned(self).runtime
+async def _publish_project_registry_notice(self, controller) -> None:
+    runtime = controller.runtime
     if runtime.project_registry_busy:
-        await self.server.controllers.owned(self).control._event(
+        await controller.control._event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
@@ -66,30 +66,30 @@ async def _publish_project_registry_notice(self) -> None:
 
 
 @asynccontextmanager
-async def _session_swap(self, park: bool) -> AsyncIterator[ServeControl | None]:
+async def _session_swap(self, park: bool, controller) -> AsyncIterator[ServeControl | None]:
     """Hold a session swap. Yield None to swap the attached pair in place, as
     without ``session_park``; or, when ``park`` and the attached pair holds work,
     yield a new pair to set up beside it. The caller commits that pair with
     ``server.attach`` right after its setup returns; a setup that fails first is
     closed here."""
     server = self.server
-    outgoing = server.controllers.owned(self).control
+    outgoing = controller.control
     if not park or not outgoing.holds_work():
         with outgoing.reserve_session_swap():
             server.connections.replay_session_replaced()
             yield None
         return
     incoming = server.new_pair()
-    with incoming.reserve_session_swap():
+    with incoming.control.reserve_session_swap():
         try:
             yield incoming
         except BaseException:
-            if server.controllers.owned(self).control is not incoming:
+            if controller.control is not incoming:
                 await incoming.runtime.close()
             raise
 
 
-async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
+async def new_session(self, params: dict[str, Any], controller) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
         initial_model = validation.optional_string(params, "model")
@@ -100,78 +100,78 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 initial_model = validation.required_string(params, "model")
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
-        async with _session_swap(self, "session_park" in self.features) as incoming:
+        async with _session_swap(self, "session_park" in self.features, controller) as incoming:
             cwd = None
             if "cwd" in params:
                 validation.require_feature(self, "session_cwd", "cwd")
                 cwd = validation.directory(params, "cwd")
             if incoming is None:
-                await self.server.controllers.owned(self).control._terminate_pending_approvals()
-            await (incoming or self.server.controllers.owned(self).control).runtime.create_session(
+                await controller.control._terminate_pending_approvals()
+            await (incoming.control if incoming is not None else controller.control).runtime.create_session(
                 provider=validation.optional_string(params, "provider"),
                 model=initial_model,
                 cwd=cwd,
             )
             if incoming is not None:
-                self.server.attach(incoming)
+                controller = self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:
                 await model_selection.apply_rpc(
-                    self.server.controllers.owned(self).runtime, initial_model, initial_mode
+                    controller.runtime, initial_model, initial_mode
                 )
             if bindings is not None:
                 headers, configs = bindings
                 # assign the control's binding state before the await so a cancel
                 # inside set_mcp_bindings still lets the release clear the loop (F6).
-                self.server.controllers.owned(self).control._active_mcp_bindings = headers
-                self.server.controllers.owned(self).control._mcp_binding_servers = frozenset(headers)
-                self.server.controllers.owned(self).control._mcp_binding_required = bool(headers)
-                await self.server.controllers.owned(self).runtime.loop.set_mcp_bindings(headers, configs)
-            elif self.server.controllers.owned(self).runtime.loop is not None:
-                self.server.controllers.owned(self).control._active_mcp_bindings = {}
-                self.server.controllers.owned(self).control._mcp_binding_servers = frozenset()
-                self.server.controllers.owned(self).control._mcp_binding_required = False
-            self.server.controllers.owned(self).control._active_host_commands = candidate
-            self.server.controllers.owned(self).control._host_binding_required = (
+                controller.control._active_mcp_bindings = headers
+                controller.control._mcp_binding_servers = frozenset(headers)
+                controller.control._mcp_binding_required = bool(headers)
+                await controller.runtime.loop.set_mcp_bindings(headers, configs)
+            elif controller.runtime.loop is not None:
+                controller.control._active_mcp_bindings = {}
+                controller.control._mcp_binding_servers = frozenset()
+                controller.control._mcp_binding_required = False
+            controller.control._active_host_commands = candidate
+            controller.control._host_binding_required = (
                 "session_host_commands" in self.features
             )
-            self.server.controllers.owned(self).control.session_replaced()
+            controller.control.session_replaced()
             if self.server._retention_owner is not None:
                 self.server._retention_owner.set_session_available()
                 self.server._retention_owner.start()
-            self.server.controllers.owned(self).control.clear_approvals()
-            await self.server.controllers.owned(self).control.controller_ready()
-            await _publish_project_registry_notice(self)
-            await self.server.controllers.owned(self).control.publish_session_grant_reset()
-            return {"session": session_snapshot(self)}
+            controller.control.clear_approvals()
+            await controller.control.controller_ready()
+            await _publish_project_registry_notice(self, controller)
+            await controller.control.publish_session_grant_reset()
+            return {"session": session_snapshot(self, controller)}
     except BaseException:
-        if self.server.controllers.owned(self).runtime.state is None:
-            self.server.controllers.owned(self).control._active_host_commands = None
-            self.server.controllers.owned(self).control._host_binding_required = False
+        if controller.runtime.state is None:
+            controller.control._active_host_commands = None
+            controller.control._host_binding_required = False
         raise
 
 
-async def resume(self, params: dict[str, Any]) -> dict[str, object]:
+async def resume(self, params: dict[str, Any], controller) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
-        state = self.server.controllers.owned(self).runtime.state
+        state = controller.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
         attached, park = await _resume_live_or_parked(
-            self, params, bindings, candidate, "session_park" in self.features
+            self, params, bindings, candidate, "session_park" in self.features, controller
         )
         if attached is not None:
             return attached
-        async with _session_swap(self, park) as incoming:
-            session_id = await _resolve_session_id(self, params)
+        async with _session_swap(self, park, controller) as incoming:
+            session_id = await _resolve_session_id(self, params, controller)
             await self.server.parking.wait_closed(session_id)
             unhealthy_same_session = (
                 incoming is None
-                and self.server.controllers.owned(self).control.unhealthy()
-                and self.server.controllers.owned(self).runtime.session_id == session_id
+                and controller.control.unhealthy()
+                and controller.runtime.session_id == session_id
             )
             if incoming is None:
-                await self.server.controllers.owned(self).control._terminate_pending_approvals()
-            runtime = (incoming or self.server.controllers.owned(self).control).runtime
+                await controller.control._terminate_pending_approvals()
+            runtime = (incoming.control if incoming is not None else controller.control).runtime
             if unhealthy_same_session:
                 try:
                     await runtime.resume_session(session_id, force=True)
@@ -200,36 +200,36 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                         {"session_id": session_id},
                     ) from exc
             if incoming is not None:
-                self.server.attach(incoming)
+                controller = self.server.attach(incoming)
             if bindings is not None:
                 headers, configs = bindings
                 # assign the control's binding state before the await so a cancel
                 # inside set_mcp_bindings still lets the release clear the loop (F6).
-                self.server.controllers.owned(self).control._active_mcp_bindings = headers
-                self.server.controllers.owned(self).control._mcp_binding_servers = frozenset(headers)
-                self.server.controllers.owned(self).control._mcp_binding_required = bool(headers)
-                await self.server.controllers.owned(self).runtime.loop.set_mcp_bindings(headers, configs)
+                controller.control._active_mcp_bindings = headers
+                controller.control._mcp_binding_servers = frozenset(headers)
+                controller.control._mcp_binding_required = bool(headers)
+                await controller.runtime.loop.set_mcp_bindings(headers, configs)
             elif previous_session_id != session_id:
-                self.server.controllers.owned(self).control._active_mcp_bindings = {}
-                self.server.controllers.owned(self).control._mcp_binding_servers = frozenset()
-                self.server.controllers.owned(self).control._mcp_binding_required = False
-            self.server.controllers.owned(self).control._active_host_commands = candidate
-            self.server.controllers.owned(self).control._host_binding_required = (
+                controller.control._active_mcp_bindings = {}
+                controller.control._mcp_binding_servers = frozenset()
+                controller.control._mcp_binding_required = False
+            controller.control._active_host_commands = candidate
+            controller.control._host_binding_required = (
                 "session_host_commands" in self.features
             )
-            self.server.controllers.owned(self).control.session_replaced()
+            controller.control.session_replaced()
             if self.server._retention_owner is not None:
                 self.server._retention_owner.set_session_available()
                 self.server._retention_owner.start()
-            self.server.controllers.owned(self).control.clear_approvals()
-            await self.server.controllers.owned(self).control.controller_ready()
-            await _publish_project_registry_notice(self)
-            await self.server.controllers.owned(self).control.publish_session_grant_reset()
-            return {"session": session_snapshot(self)}
+            controller.control.clear_approvals()
+            await controller.control.controller_ready()
+            await _publish_project_registry_notice(self, controller)
+            await controller.control.publish_session_grant_reset()
+            return {"session": session_snapshot(self, controller)}
     except BaseException:
-        if self.server.controllers.owned(self).runtime.state is None:
-            self.server.controllers.owned(self).control._active_host_commands = None
-            self.server.controllers.owned(self).control._host_binding_required = False
+        if controller.runtime.state is None:
+            controller.control._active_host_commands = None
+            controller.control._host_binding_required = False
         raise
 
 
@@ -239,19 +239,20 @@ async def _resume_live_or_parked(
     bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
     candidate: SessionHostCommands,
     park: bool,
+    controller,
 ) -> tuple[dict[str, object] | None, bool]:
     """Attach to the open session's busy turn or to a parked pair and return the
     result; else return None and whether the reopen takes a new pair."""
     # a wake in setup counts too: resuming the open session attaches, never swaps
     if "resume_attach" not in self.features or not (
-        park or self.server.controllers.owned(self).control.state_change_busy()
+        park or controller.control.state_change_busy()
     ):
         return None, park
-    session_id = await _resolve_session_id(self, params)
+    session_id = await _resolve_session_id(self, params, controller)
     parking = self.server.parking
     await parking.wait_closed(session_id)
-    state = self.server.controllers.owned(self).runtime.state
-    control = self.server.controllers.owned(self).control
+    state = controller.runtime.state
+    control = controller.control
     if (
         state is not None
         and state.session_id == session_id
@@ -259,11 +260,11 @@ async def _resume_live_or_parked(
         and not control._session_swap_active
         and not control.unhealthy()
     ):
-        return await _attach_live_turn(self, bindings, candidate), park
+        return await _attach_live_turn(self, bindings, candidate, controller=controller), park
     parked = parking.get(session_id)
     if park and parked is not None:
         if not parked.unhealthy():
-            return await _attach_live_turn(self, bindings, candidate, parked=parked), park
+            return await _attach_live_turn(self, bindings, candidate, parked=parked, controller=controller), park
         # as for the open session: close it (its turn ends disconnect), reopen from disk
         parking.close(parked)
         await parking.wait_closed(session_id)
@@ -271,11 +272,11 @@ async def _resume_live_or_parked(
     return None, park and (state is None or state.session_id != session_id)
 
 
-async def _resolve_session_id(self, params: dict[str, Any]) -> str:
+async def _resolve_session_id(self, params: dict[str, Any], controller) -> str:
     session_id = validation.required_string(params, "session_id")
     try:
         return await asyncio.to_thread(
-            self.server.controllers.owned(self).runtime.manager.resolve_id,
+            controller.runtime.manager.resolve_id,
             session_id,
             min_prefix_length=4,
         )
@@ -299,11 +300,12 @@ async def _attach_live_turn(
     candidate: SessionHostCommands,
     *,
     parked: ServeControl | None = None,
+    controller=None,
 ) -> dict[str, object]:
     """Attach to the active session's busy turn, or to a ``parked`` pair, without
     a reopen: the turn, its approvals and children stay; only this connection's
     bindings are re-supplied."""
-    control = parked or self.server.controllers.owned(self).control
+    control = parked or controller.control
     reattach = None
     if bindings is not None:
         headers, configs = bindings
@@ -325,7 +327,7 @@ async def _attach_live_turn(
             )
     if parked is not None:
         # one step after the last await: the pair cannot start closing first
-        self.server.attach(parked)
+        controller = self.server.attach(self.server.controllers.record_for(parked))
     # Bind host commands before the await, so a turn that ends meanwhile never
     # sees a half-attached session. The running turn keeps its snapshot.
     previous = (control._active_host_commands, control._host_binding_required)
@@ -344,8 +346,8 @@ async def _attach_live_turn(
         # the turn ended during the rebind, or a parked pair only held background
         # work: this is a plain resume of an idle session
         await control.controller_ready()
-        return {"session": session_snapshot(self)}
-    return {"session": session_snapshot(self), "attached": "live_turn"}
+        return {"session": session_snapshot(self, controller)}
+    return {"session": session_snapshot(self, controller), "attached": "live_turn"}
 
 
 async def mcp_bindings(
@@ -487,8 +489,8 @@ def _active_runtime_snapshot(
     return snapshot
 
 
-def session_snapshot(self, controller=None) -> dict[str, object] | None:
-    runtime = (controller or self.server.controllers.owned(self)).runtime
+def session_snapshot(self, controller) -> dict[str, object] | None:
+    runtime = controller.runtime
     if runtime.opened is None:
         return None
     snapshot = _active_runtime_snapshot(runtime.metadata.to_dict(), runtime.loop)
@@ -497,12 +499,11 @@ def session_snapshot(self, controller=None) -> dict[str, object] | None:
     return snapshot
 
 
-def session_runtime_state(self, controller=None) -> str:
-    return (controller or self.server.controllers.owned(self)).control.pair_state()
+def session_runtime_state(self, controller) -> str:
+    return controller.control.pair_state()
 
 
-async def live_status_baseline(self, controller=None) -> dict[str, object]:
-    controller = controller or self.server.controllers.owned(self)
+async def live_status_baseline(self, controller) -> dict[str, object]:
     pending, truncated = await controller.control.reconnect_baseline()
     return {
         "state": session_runtime_state(self, controller),
@@ -516,11 +517,10 @@ async def status(
     *,
     include_connection_setup_counts: bool = False,
     fallback_config: object | None = None,
-    controller=None,
+    controller,
 ) -> dict[str, object]:
-    controller = controller or self.server.controllers.owned(self)
     runtime = controller.runtime
-    session = session_snapshot(self)
+    session = session_snapshot(self, controller)
     reconnect = "approval_reconnect" in self.features
     if reconnect:
         baseline = await live_status_baseline(self, controller)
@@ -597,7 +597,7 @@ async def status(
     status.update(suffix)
     if "session_park" in self.features:
         status["parked_sessions"] = self.server.parking.rows()
-    slash_command = self.server.controllers.owned(self).control.slash_lock.status()
+    slash_command = controller.control.slash_lock.status()
     if slash_command is not None:
         status["slash_command"] = slash_command
     return status

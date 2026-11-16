@@ -44,7 +44,15 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 "session_history_and_subscribe requires session_id and a complete cursor",
             )
         session_id = params["session_id"]
-        if client.server.controllers.selected(client, session_id).runtime.session_id != session_id:
+        try:
+            selected = client.server.controllers.selected(client, session_id)
+        except ProtocolError as exc:
+            if exc.code == ErrorDescriptor.NO_ACTIVE_SESSION.code:
+                raise ProtocolError(
+                    ErrorDescriptor.INTERNAL_ERROR, "server has no active session"
+                ) from exc
+            raise
+        if selected.runtime.session_id != session_id:
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION,
                 "session is not active",

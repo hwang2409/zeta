@@ -115,7 +115,7 @@ async def _real_history_server(tmp_path: Path, count: int = 220) -> AsyncIterato
             reader, writer, 2, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]
         for number in range(count):
-            server.runtime.opened.store.append_message(
+            server._runtime_for_test.opened.store.append_message(
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
                     MessageOrigin.USER,
@@ -237,7 +237,7 @@ async def test_real_socket_backward_continuation_survives_append_but_not_repair(
         assert [row["id"] for row in first["messages"] if row["role"] != "system"]
         assert first["messages"][0]["content"][0]["text"].startswith("message-")
         assert first["next_before"] is not None
-        server.runtime.opened.store.append_message(
+        server._runtime_for_test.opened.store.append_message(
             with_message_origin(Message(MessageRole.USER, [TextContent("new")]), MessageOrigin.USER)
         )
         page = await _history_request(
@@ -246,7 +246,7 @@ async def test_real_socket_backward_continuation_survives_append_but_not_repair(
         )
         assert "new" not in {row["content"][0]["text"] for row in page["messages"] if row["role"] == "user"}
 
-        transcript = server.runtime.opened.store.path
+        transcript = server._runtime_for_test.opened.store.path
         await request(reader, writer, 5, "new_session", {"provider": "codex"})
         with transcript.open("ab") as stream:
             stream.write(b'{"seq":"invalid"}\n')
@@ -298,7 +298,7 @@ async def test_real_socket_validatorless_history_retries_concurrent_append(
     history_params: dict[str, object],
 ) -> None:
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         page_ready = threading.Event()
         release_page = threading.Event()
         calls = 0
@@ -427,7 +427,7 @@ async def test_real_socket_branch_during_read_returns_current_branch(
     """A same-owner branch between g0 and g1 falls back to current history."""
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         old_first = await _history_request(reader, writer, 3, session_id, {"offset": 0})
-        index = server.runtime.opened.store._history_index
+        index = server._runtime_for_test.opened.store._history_index
         original_page = index.page
         branch_ready = threading.Event()
         release_page = threading.Event()
@@ -447,8 +447,8 @@ async def test_real_socket_branch_during_read_returns_current_branch(
         await await_or_fail(
             asyncio.to_thread(wait_for_page), what="history index page"
         )
-        server.runtime.opened.store.append_message_fork(
-            branch_entries(server.runtime.opened.store)[0].id
+        server._runtime_for_test.opened.store.append_message_fork(
+            branch_entries(server._runtime_for_test.opened.store)[0].id
         )
         release_page.set()
         response = (await await_or_fail(pending, what="history request"))[-1]
@@ -468,7 +468,7 @@ async def test_real_socket_backward_fork_is_stale(tmp_path: Path, monkeypatch: p
     async with _real_history_server(tmp_path, count=220) as (reader, writer, session_id, server):
         first = await _history_request(reader, writer, 3, session_id, {"before": None})
         assert first["messages"][0]["content"][0]["text"].startswith("message-")
-        user_id = branch_entries(server.runtime.opened.store)[0].id
+        user_id = branch_entries(server._runtime_for_test.opened.store)[0].id
         fork = (await request(reader, writer, 4, "fork_message", {"session_id": session_id, "message_id": user_id}))[-1]
         assert "error" not in fork
         response = (await request(reader, writer, 5, "session_history", {
@@ -657,7 +657,7 @@ async def test_real_socket_backward_near_limit_groups_never_overflow_frame(
     sizes = range(6_000, 7_600, 10)
     async with _real_history_server(tmp_path, count=0) as (reader, writer, session_id, server):
         for number, size in enumerate(sizes):
-            server.runtime.opened.store.append_message(
+            server._runtime_for_test.opened.store.append_message(
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent(f"g{number:03d}" + "x" * size)]),
                     MessageOrigin.USER,
@@ -725,7 +725,7 @@ async def test_real_socket_backward_after_forward_cache_never_drops_history(
             session = (await _raw_request(
                 reader, writer, next(ids), "new_session", {"provider": "codex"}
             ))["result"]["session"]["session_id"]
-            store = server.runtime.opened.store
+            store = server._runtime_for_test.opened.store
             for number in range(fillers):
                 store.append_message(with_message_origin(
                     Message(MessageRole.USER, [TextContent("f")]), MessageOrigin.USER,
@@ -856,7 +856,7 @@ async def test_real_socket_forward_pages_serve_every_row_once_at_every_split(
         session_id = (await request(
             reader, writer, 2, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]["session_id"]
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         for number in range(6):
             store.append_message(with_message_origin(
                 Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),

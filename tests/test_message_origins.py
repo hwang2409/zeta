@@ -548,14 +548,14 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
         else:
             raise AssertionError(path)
         if path != "serve steer":
-            assert server._client is not None and server.control._turn_task is not None
-            await asyncio.wait_for(server.control._turn_task, 10)
+            assert server._client is not None and server._control_for_test._turn_task is not None
+            await asyncio.wait_for(server._control_for_test._turn_task, 10)
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})
             assert reused[-1]["error"]["code"] == -32602
         messages = [
             entry.to_dict()
-            for entry in resident_entries(server.runtime.opened.store)
+            for entry in resident_entries(server._runtime_for_test.opened.store)
             if entry.type == "message"
             and entry.data["message"]["role"] == MessageRole.USER.value
         ]

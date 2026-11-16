@@ -541,16 +541,16 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         await rpc(reader, writer, "hello", protocol_version=version)
         created = await rpc(reader, writer, "new_session")
         assert "result" in created, created
-        await model_selection.apply(server.runtime, "gpt-5.4", "ask")
-        await server.control._event(
+        await model_selection.apply(server._runtime_for_test, "gpt-5.4", "ask")
+        await server._control_for_test._event(
             StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
                 "http_error" if status else "auth_error", "Not a string classification hint", status, provider_error)),
-            session_id=server.runtime.session_id, background=background,
+            session_id=server._runtime_for_test.session_id, background=background,
         )
         event = await _event(reader, "error")
         assert event["data"].get("login_provider") == expected
         if expected:
-            assert server.runtime.metadata.provider == (
+            assert server._runtime_for_test.metadata.provider == (
                 "codex" if status is None else "claude"
             )
     finally:

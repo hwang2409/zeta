@@ -27,8 +27,25 @@ class SessionControllers:
     """Own the attached record and the records available for selection."""
 
     def __init__(self, control: ServeControl) -> None:
-        self._attached = SessionController(control)
+        self._records: dict[ServeControl, SessionController] = {
+            control: SessionController(control)
+        }
+        self._attached = self._records[control]
         self._parked: dict[str, SessionController] = {}
+
+    def records(self) -> tuple[SessionController, ...]:
+        return tuple(self._records.values())
+
+    def record_for(self, control: ServeControl) -> SessionController:
+        return self._records[control]
+
+    def register(self, control: ServeControl) -> SessionController:
+        record = SessionController(control)
+        self._records[control] = record
+        return record
+
+    def attached_controls(self) -> tuple[ServeControl, ...]:
+        return (self._attached.control,)
 
     def attached(self) -> SessionController:
         return self._attached
@@ -43,7 +60,7 @@ class SessionControllers:
         del connection
         record = self._attached
         try:
-            if record.runtime.session_id == session_id:
+            if record in self._records.values() and record.runtime.session_id == session_id:
                 return record
         except RuntimeError:
             pass
@@ -54,14 +71,41 @@ class SessionControllers:
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
             ) from exc
 
-    def attach(self, control: ServeControl) -> None:
-        self._attached = SessionController(control)
+    def attach(self, record: SessionController) -> SessionController:
+        self._parked.pop(record.runtime.session_id, None)
+        self._attached = record
+        return record
 
-    def register_parked(self, control: ServeControl) -> None:
-        self._parked[control.runtime.session_id] = SessionController(control)
+    def park(self, record: SessionController) -> SessionController:
+        self._parked[record.runtime.session_id] = record
+        return record
 
-    def unregister_parked(self, session_id: str) -> None:
-        self._parked.pop(session_id, None)
+    def unpark(self, record: SessionController) -> SessionController | None:
+        session_id = record.runtime.session_id
+        if self._parked.get(session_id) is not record:
+            return None
+        del self._parked[session_id]
+        return record
+
+    def parked_controls(self) -> tuple[ServeControl, ...]:
+        return tuple(record.control for record in self._parked.values())
+
+    def parked_records(self) -> tuple[SessionController, ...]:
+        return tuple(self._parked.values())
+
+    def parked_control(self, session_id: str) -> ServeControl | None:
+        record = self._parked.get(session_id)
+        return record.control if record is not None else None
+
+    def remove(self, record: SessionController) -> None:
+        control = record.control
+        self._parked.pop(record.runtime.session_id, None)
+        self._records.pop(control, None)
+
+    def require_current(self, connection: Any, record: SessionController) -> None:
+        del connection
+        if record not in self._records.values():
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def is_attached(self, control: ServeControl) -> bool:
         return self._attached.control is control

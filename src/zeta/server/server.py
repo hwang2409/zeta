@@ -60,7 +60,7 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
-from .session_controllers import SessionControllers
+from .session_controllers import SessionController, SessionControllers
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -315,16 +315,14 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         self.controllers = SessionControllers(control)
         self._bind_pair(control)
-        self.parking = ParkedPairs(lambda: self.connections)
+        self.parking = ParkedPairs(lambda: self.connections, self.controllers)
 
     @property
-    def control(self) -> ServeControl:
-        """The attached record's control, retained for embedded callers."""
+    def _control_for_test(self) -> ServeControl:
         return self.controllers.attached().control
 
     @property
-    def runtime(self) -> ServerRuntime:
-        """The attached record's runtime, retained for embedded callers."""
+    def _runtime_for_test(self) -> ServerRuntime:
         return self.controllers.attached().runtime
 
     def controls(self) -> Iterator[ServeControl]:
@@ -332,31 +330,28 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self) -> ServeControl:
+    def new_pair(self) -> SessionController:
         """An empty pair beside the attached one; it shares the session manager."""
         self.parking.require_room()
         control = ServeControl(
             self, self.controllers.attached().runtime.sibling(), self.foreground_event_publisher
         )
         self._bind_pair(control)
-        return control
+        return self.controllers.register(control)
 
-    def attach(self, incoming: ServeControl) -> None:
+    def attach(self, incoming: SessionController) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
         outgoing pair while it holds work, else start its close."""
         outgoing = self.controllers.attached().control
-        if self.parking.unpark(incoming):
-            self.controllers.unregister_parked(incoming.runtime.session_id)
-        else:
+        if not self.parking.unpark(incoming.control):
             # a new pair takes over the controller slot state of the pair it replaces
-            incoming._controller_attached = outgoing._controller_attached
+            incoming.control._controller_attached = outgoing._controller_attached
         self.controllers.attach(incoming)
         assert self.connections is not None
         self.connections.replay_session_replaced()
         if outgoing.runtime.opened is not None:
             self.parking.leave(outgoing)
-            if self.parking.get(outgoing.runtime.session_id) is outgoing:
-                self.controllers.register_parked(outgoing)
+        return incoming
 
     async def require_all_idle(self) -> None:
         for control in self.controls():

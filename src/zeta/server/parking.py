@@ -13,6 +13,7 @@ from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 if TYPE_CHECKING:
     from .connections import ConnectionRegistry
     from .control import ServeControl
+    from .session_controllers import SessionControllers
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +25,19 @@ class ParkedPairs:
     def __init__(
         self,
         connections: Callable[[], ConnectionRegistry | None],
+        controllers: SessionControllers,
         limit: int = 3,
     ) -> None:
         self._connections = connections
+        self._controllers = controllers
         # parked plus closing pairs; each holds a loop, its store, and its MCP servers
         self.limit = limit
-        self._parked: dict[str, ServeControl] = {}
         self._closing: dict[str, asyncio.Task[None]] = {}
         # the last parked_session_changed data sent per parked session
         self._sent: dict[str, dict[str, object]] = {}
 
     def require_room(self) -> None:
-        held = [*self._parked, *self._closing]
+        held = [*(control.runtime.session_id for control in self._controllers.parked_controls()), *self._closing]
         if len(held) >= self.limit:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY,
@@ -44,28 +46,28 @@ class ParkedPairs:
             )
 
     def pairs(self) -> tuple[ServeControl, ...]:
-        return tuple(self._parked.values())
+        return self._controllers.parked_controls()
 
     def get(self, session_id: str) -> ServeControl | None:
-        return self._parked.get(session_id)
+        return self._controllers.parked_control(session_id)
 
     def rows(self) -> list[dict[str, object]]:
         """``status.parked_sessions``."""
-        return [control.parked_row() for control in self._parked.values()]
+        return [control.parked_row() for control in self._controllers.parked_controls()]
 
     def unpark(self, incoming: ServeControl) -> bool:
         """Take ``incoming`` out of the parked set when it is parked."""
         session_id = incoming.runtime.session_id
-        if self._parked.get(session_id) is not incoming:
+        if self._controllers.parked_control(session_id) is not incoming:
             return False
-        del self._parked[session_id]
+        assert self._controllers.unpark(self._controllers.record_for(incoming)) is not None
         self._sent.pop(session_id, None)
         return True
 
     def leave(self, outgoing: ServeControl) -> None:
         """The client left ``outgoing``: park it while it holds work, else close it."""
         if outgoing.holds_work():
-            self._parked[outgoing.runtime.session_id] = outgoing
+            self._controllers.park(self._controllers.record_for(outgoing))
             self.changed(outgoing)
         else:
             self._close_pair(outgoing)
@@ -73,7 +75,7 @@ class ParkedPairs:
     def changed(self, control: ServeControl) -> None:
         """Report this parked pair's state and close it once idle; a no-op for a
         pair that is not parked."""
-        if control in self._parked.values():
+        if control in self._controllers.parked_controls():
             asyncio.get_running_loop().call_soon(self._check, control)
 
     def changed_from_any_thread(self, control: ServeControl) -> None:
@@ -89,7 +91,7 @@ class ParkedPairs:
 
     def _check(self, control: ServeControl) -> None:
         # a resume may have attached the pair since this check was scheduled
-        if control not in self._parked.values():
+        if control not in self._controllers.parked_controls():
             return
         self._publish(control, control.parked_row())
         if not control.holds_work():
@@ -116,9 +118,9 @@ class ParkedPairs:
         self, control: ServeControl, settlement_timeout: float | None = None
     ) -> None:
         """Close a parked pair now; its turn ends ``disconnect``."""
-        if control in self._parked.values():
+        if control in self._controllers.parked_controls():
             session_id = control.runtime.session_id
-            del self._parked[session_id]
+            self._controllers.remove(self._controllers.record_for(control))
             self._publish(
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
@@ -166,7 +168,7 @@ class ParkedPairs:
     ) -> None:
         """Reclaim each parked pair for a returning controller; close the ones it
         cannot see (no ``session_park``) or cannot claim."""
-        pairs = tuple(self._parked.values())
+        pairs = self._controllers.parked_controls()
         claimed = (
             await asyncio.gather(
                 *(
@@ -184,7 +186,7 @@ class ParkedPairs:
                 self.close(control)
 
     def close_all(self, settlement_timeout: float | None) -> None:
-        for control in tuple(self._parked.values()):
+        for control in self._controllers.parked_controls():
             self.close(control, settlement_timeout)
 
     def closing_tasks(self) -> tuple[asyncio.Task[None], ...]:

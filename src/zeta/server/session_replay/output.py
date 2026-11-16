@@ -198,9 +198,11 @@ class ReplayOutput:
 
     async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
         if scope.kind == "child":
+            controller = connection.server.controllers.owned(connection)
             store = self.child_runs.live_store(scope.value)
         else:
-            runtime = connection.server.controllers.selected(connection, scope.value).runtime
+            controller = connection.server.controllers.selected(connection, scope.value)
+            runtime = controller.runtime
             store = validation.active(runtime, {"session_id": scope.value})
         self.invalidate_replay_connection(connection, reason="rejoined")
         pending = self.replay.begin_join(
@@ -209,7 +211,9 @@ class ReplayOutput:
             None if store is None else store.reset_generation(),
             {},
         )
-        pending.status = await lifecycle.live_status_baseline(connection)
+        pending.status = await lifecycle.live_status_baseline(
+            connection, controller
+        )
 
     def finish_replay_join(
         self,

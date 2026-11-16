@@ -51,9 +51,9 @@ async def test_child_history_is_available_to_negotiated_observer(tmp_path: Path)
         tmp_path, ["child_run_history"]
     )
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -111,13 +111,13 @@ async def test_history_validator_contract_is_shared_by_all_serve_history_methods
             "session_replay_seq",
         ],
     )
-    server.runtime.opened.store.append_message(
+    server._runtime_for_test.opened.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("parent")])
     )
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -231,9 +231,9 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         tmp_path, ["child_run_history", "session_history_fidelity"]
     )
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -249,7 +249,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
     nested = await asyncio.to_thread(ConversationStore,
         child.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     nested.start_agent_lifecycle(
         handle=f"{session_id}:1:1",
@@ -304,7 +304,7 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
         )[-1]["result"]
         assert continuation["messages"][0]["content"][0]["text"] == "message-0"
         assert continuation["messages"][-1]["content"][0]["text"] == "message-64"
-        child_path = server.runtime.opened.store.session_dir / "agents" / "1"
+        child_path = server._runtime_for_test.opened.store.session_dir / "agents" / "1"
         rows = (child_path / "conversation.jsonl").read_text().splitlines(True)
         replacement = child_path / "conversation.replacement"
         replacement.write_text("".join(rows[:-1]))
@@ -332,9 +332,9 @@ async def test_child_history_reads_newest_and_continuation_over_unix_socket(
 async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Path) -> None:
     server, _reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1", started_at="2026-01-01T00:00:00+00:00", depth=1,
@@ -391,9 +391,9 @@ async def test_child_history_reports_cached_stable_torn_tail_with_repair_offer(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -408,7 +408,7 @@ async def test_child_history_reports_cached_stable_torn_tail_with_repair_offer(
     try:
         first = (await request(reader, writer, 3, "child_run_history", params))[-1]
         assert "result" in first, first
-        transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+        transcript = server._runtime_for_test.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
         with transcript.open("ab") as stream:
             stream.write(b'{"type":"message"')
         damaged = (await request(reader, writer, 4, "child_run_history", params))[-1]
@@ -437,9 +437,9 @@ async def test_child_history_preserves_corrupt_child_diagnosis_over_unix_socket(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -450,7 +450,7 @@ async def test_child_history_preserves_corrupt_child_diagnosis_over_unix_socket(
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
     child.close()
-    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    transcript = server._runtime_for_test.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
     with transcript.open("ab") as stream:
         stream.write(b"{not json}\n")
     try:
@@ -477,9 +477,9 @@ async def test_child_history_discards_obsolete_corruption_diagnosis(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -490,7 +490,7 @@ async def test_child_history_discards_obsolete_corruption_diagnosis(
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
     child.close()
-    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    transcript = server._runtime_for_test.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
     valid = transcript.read_bytes()
     with transcript.open("ab") as stream:
         stream.write(b"{not json}\n")
@@ -531,9 +531,9 @@ async def test_child_history_bounds_persistent_source_change(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -544,7 +544,7 @@ async def test_child_history_bounds_persistent_source_change(
     )
     child.append_message(Message(MessageRole.ASSISTANT, [TextContent("complete")]))
     child.close()
-    transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+    transcript = server._runtime_for_test.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
     original_read_fd = ConversationStore._read_fd
 
     def replace_after_every_read(fd: int, length: int) -> bytes:
@@ -579,9 +579,9 @@ async def test_child_history_warm_reader_serves_snapshot_when_every_refresh_chan
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -625,9 +625,9 @@ async def test_child_history_rejects_replacement_during_continuation(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -642,7 +642,7 @@ async def test_child_history_rejects_replacement_during_continuation(
     params = {"session_id": session_id, "run_id": f"{session_id}:1"}
     try:
         first = (await request(reader, writer, 3, "child_run_history", params))[-1]["result"]
-        transcript = server.runtime.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
+        transcript = server._runtime_for_test.opened.store.session_dir / "agents" / "1" / "conversation.jsonl"
         original_read_fd = ConversationStore._read_fd
         replaced = False
 
@@ -682,9 +682,9 @@ async def test_child_history_writer_after_idle_probe_does_not_offer_repair(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",
@@ -772,9 +772,9 @@ async def test_child_history_unix_ignores_production_partial_append(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path, ["child_run_history"])
     child = await asyncio.to_thread(ConversationStore,
-        server.runtime.opened.store.session_dir / "agents",
+        server._runtime_for_test.opened.store.session_dir / "agents",
         session_id="1",
-        _storage_lease=server.runtime.opened.store._storage_lease,
+        _storage_lease=server._runtime_for_test.opened.store._storage_lease,
     )
     child.start_agent_lifecycle(
         handle=f"{session_id}:1",

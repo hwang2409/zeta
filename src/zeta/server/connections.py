@@ -1013,32 +1013,38 @@ class ConnectionRegistry(ReplayOutput):
         connection: Any,
         callable: Callable[[], Any],
         *,
+        controller=None,
         session_id: str | None = None,
     ) -> Any:
         if connection not in self._connections:
             raise RuntimeError("connection is not connected")
         result = await self.run_blocking(callable)
-        if (
-            session_id is not None
-            and connection.server.controllers.owned(connection).runtime.session_id != session_id
-        ):
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            )
+        if controller is not None:
+            connection.server.controllers.require_current(connection, controller)
+        elif session_id is not None:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return result
 
     async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
+        if type(params.get("session_id")) is not str or not params["session_id"]:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+            )
         owned = connection.server.controllers.owned(connection)
-        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        selected = connection.server.controllers.selected(connection, params.get("session_id", owned.runtime.session_id))
         runtime = selected.runtime
         store = validation.active(runtime, params)
         return await self.run_read(
             connection,
             lambda: session.tree(_observer_runtime(store)),
-            session_id=runtime.session_id,
+            controller=selected,
         )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
+        if type(params.get("session_id")) is not str or not params["session_id"]:
+            raise ProtocolError(
+                ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+            )
         selected = connection.server.controllers.selected(connection, params["session_id"])
         runtime = selected.runtime
         store = validation.active(runtime, params)
@@ -1054,7 +1060,7 @@ class ConnectionRegistry(ReplayOutput):
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            session_id=runtime.session_id,
+            controller=selected,
         )
         return self._strip_restart_reason(connection, result)
 
@@ -1062,7 +1068,7 @@ class ConnectionRegistry(ReplayOutput):
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
         owned = connection.server.controllers.owned(connection)
-        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        selected = (connection.server.controllers.selected(connection, params["session_id"]) if "session_id" in params else owned)
         runtime = selected.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
@@ -1074,7 +1080,7 @@ class ConnectionRegistry(ReplayOutput):
                 offset=params.get("offset", 0),
                 limit=params.get("limit", content.MAX_CONTENT_READ),
             ),
-            session_id=runtime.session_id,
+            controller=selected,
         )
 
     async def read_catalog(self, connection: Any) -> object:
@@ -1111,7 +1117,7 @@ class ConnectionRegistry(ReplayOutput):
                 registry=self,
                 fidelity="session_history_fidelity" in features,
             ),
-            session_id=runtime.session_id,
+            controller=connection.server.controllers.selected(connection, params["session_id"]),
         )
         return self._strip_restart_reason(connection, result)
 
@@ -1199,13 +1205,13 @@ class ConnectionRegistry(ReplayOutput):
 
     # merge-resolution: src/zeta/server/connections.py pr-lines ConnectionRegistry.read_status@9bb4d2bb8ef9 -> keep the shared status method after adding child history reads
     async def read_status(
-        self, connection: Any, status: dict[str, Any], session_id: str | None
+        self, connection: Any, status: dict[str, Any], session_id: str | None, controller=None
     ) -> object:
         features = self._connections[connection].features
         return await self.run_read(
             connection,
             lambda: project_status(status, served_turn_end="served_turn_end" in features),
-            session_id=session_id,
+            controller=controller,
         )
 
     async def aclose(self) -> None:

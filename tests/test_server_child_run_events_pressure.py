@@ -80,7 +80,7 @@ async def _start_child(
     parent: ConversationStore | None = None,
 ) -> ConversationStore:
     """Install the durable start row in the immediate parent, then start the lifecycle."""
-    root = server.runtime.opened.store
+    root = server._runtime_for_test.opened.store
     parent = parent or root
     parent_run_id = run_id.rpartition(":")[0]
     parent.append_child_run_started(
@@ -121,7 +121,7 @@ async def _lifecycle_applied(server: ZetaServer) -> None:
 async def _publish_turns(server: ZetaServer, session_id: str, count: int) -> None:
     for index in range(count):
         await await_or_fail(
-            server.control._notify(
+            server._control_for_test._notify(
                 EventDescriptor.TURN_START, session_id, data={"turn_id": f"turn-{index}"}
             ),
             what="publish replay event",
@@ -391,7 +391,7 @@ async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_by
         charged: list[int] = []
         while scope in replay._scopes or not charged:
             await await_or_fail(
-                server.control._notify(
+                server._control_for_test._notify(
                     EventDescriptor.TURN_START, session_id, data={"turn_id": large}
                 ),
                 what="publish large frame",
@@ -585,7 +585,7 @@ async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
 ) -> None:
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
         assert server.connections is not None
-        root = server.runtime.opened.store
+        root = server._runtime_for_test.opened.store
         older = [f"{session_id}:{n}" for n in (1, 2, 3)]
         newer = [f"{session_id}:{n}" for n in (4, 5, 6)]
         for run_id in older:

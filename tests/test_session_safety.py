@@ -386,7 +386,7 @@ async def test_server_rename_and_cli_delete_serialize_across_processes(tmp_path,
 import asyncio, sys
 from zeta.server import ZetaServer
 async def main(server):
-    manager = server.runtime.manager
+    manager = server._runtime_for_test.manager
     method = '_write_unlocked' if sys.argv[2] == 'rename-first' else 'record_name'
     original = getattr(manager, method)
     def paused(*args, **kwargs):
