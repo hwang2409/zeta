@@ -306,9 +306,23 @@ class Driver:
             await asyncio.sleep(0.01)
         await self.until(self.idle, what=what)
 
+    def keys_pending(self) -> bool:
+        """True while prompt_toolkit holds typed bytes for its flush timer.
+
+        A lone Esc byte may start an escape sequence, so prompt_toolkit keeps it
+        until ``auto_flush_input`` runs ``ttimeoutlen`` later; only then is the
+        key handled.
+        """
+
+        return any(
+            not task.done() and task.get_coro().__name__ == "auto_flush_input"
+            for task in self.session.app._background_tasks
+        )
+
     def idle(self) -> bool:
         return (
-            not self.session.app.invalidated
+            not self.keys_pending()
+            and not self.session.app.invalidated
             and not self.app._agent_navigation.transcript_control.history_pager._loads
             and self.app._finder_prepare_task is None
             and self.app._finder_rank_task is None
