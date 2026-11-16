@@ -8,7 +8,7 @@ import logging
 import os
 import socket
 import stat
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,9 @@ from .protocol import (
 from .runtime import BackendFactory, ServerRuntime
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
+
+# parked plus closing pairs; each holds a loop, its store, and its MCP servers
+PARKED_LIMIT = 3
 
 logger = logging.getLogger(__name__)
 
@@ -301,10 +304,111 @@ class ZetaServer:
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
         self.control = ServeControl(self, runtime, self.foreground_event_publisher)
         self._bind_pair(self.control)
+        # session_park: busy sessions the client left, and idle ones being closed
+        self._parked: dict[str, ServeControl] = {}
+        self._closing: dict[str, asyncio.Task[None]] = {}
 
     @property
     def runtime(self) -> ServerRuntime:
         return self.control.runtime
+
+    def controls(self) -> Iterator[ServeControl]:
+        """The attached pair, then every parked pair."""
+        yield self.control
+        yield from tuple(self._parked.values())
+
+    def new_pair(self) -> ServeControl:
+        """An empty pair beside the attached one; it shares the session manager."""
+        held = [*self._parked, *self._closing]
+        if len(held) >= PARKED_LIMIT:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY,
+                "too many parked sessions are running",
+                {"reason": "parked_limit", "parked": held},
+            )
+        control = ServeControl(
+            self, self.runtime.sibling(), self.foreground_event_publisher
+        )
+        control._controller_attached = self.control._controller_attached
+        self._bind_pair(control)
+        return control
+
+    def attach(self, incoming: ServeControl) -> None:
+        """Make ``incoming`` the attached pair in one step (no await): park the
+        outgoing pair while it holds work, else start its close."""
+        outgoing = self.control
+        session_id = incoming.runtime.session_id
+        if self._parked.get(session_id) is incoming:
+            del self._parked[session_id]
+        self.control = incoming
+        assert self.connections is not None
+        self.connections.replay_session_replaced()
+        if outgoing.runtime.opened is None:
+            return
+        if outgoing.holds_work():
+            self._parked[outgoing.runtime.session_id] = outgoing
+            outgoing._maybe_idle()
+        else:
+            self._close_pair(outgoing)
+
+    def _close_if_idle(self, control: ServeControl) -> None:
+        # a resume may have attached the pair since this check was scheduled
+        session_id = control.runtime.session_id
+        if self._parked.get(session_id) is control and not control.holds_work():
+            del self._parked[session_id]
+            self._close_pair(control)
+
+    def close_parked(self, control: ServeControl) -> None:
+        """Close a parked pair now; its turn ends ``disconnect``."""
+        session_id = control.runtime.session_id
+        if self._parked.get(session_id) is control:
+            del self._parked[session_id]
+            self._close_pair(control)
+
+    def _close_pair(self, control: ServeControl) -> None:
+        session_id = control.runtime.session_id
+        control.closing = True  # no wake starts from here on
+
+        async def close() -> None:
+            try:
+                try:
+                    await control.close()
+                finally:
+                    try:
+                        await control.runtime.close()
+                    finally:
+                        await control.wait_for_approval_settlement()
+            finally:
+                if self._closing.get(session_id) is task:
+                    del self._closing[session_id]
+
+        task = asyncio.create_task(close())
+        self._closing[session_id] = task
+
+    async def wait_closed(self, session_id: str) -> None:
+        """Wait until a closing pair has released ``session_id``."""
+        task = self._closing.get(session_id)
+        if task is not None:
+            # a cancelled request must not cancel the close
+            await asyncio.shield(task)
+
+    async def claim_parked(
+        self, keep: bool, *, reconnect: bool, require_host_binding: bool
+    ) -> None:
+        """Reclaim each parked pair for a returning controller; close the ones it
+        cannot see (no ``session_park``) or cannot claim."""
+        for control in tuple(self._parked.values()):
+            if not (
+                keep
+                and await control.controller_claimed(
+                    reconnect=reconnect, require_host_binding=require_host_binding
+                )
+            ):
+                self.close_parked(control)
+
+    async def require_all_idle(self) -> None:
+        for control in self.controls():
+            await control.require_idle()
 
     def _bind_pair(self, control: ServeControl) -> None:
         """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
@@ -420,6 +524,8 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            for control in tuple(self._parked.values()):
+                self.close_parked(control)
             try:
                 try:
                     await self.control.close()
@@ -429,9 +535,14 @@ class ZetaServer:
                     if not self._borrowed:
                         await self.runtime.close()
                 finally:
-                    await self.control.wait_for_approval_settlement(
-                        approval_settlement_timeout
-                    )
+                    try:
+                        await self.control.wait_for_approval_settlement(
+                            approval_settlement_timeout
+                        )
+                    finally:
+                        await asyncio.gather(
+                            *self._closing.values(), return_exceptions=True
+                        )
             finally:
                 if self.connections is not None:
                     await self.connections.aclose()
@@ -497,7 +608,7 @@ class _Client:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._local_close = False
-        self._controller_release: asyncio.Task[None] | None = None
+        self._controller_release: asyncio.Future[object] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
@@ -615,7 +726,8 @@ class _Client:
                         and self.role == "controller"
                         and "approval_reconnect" in self.features
                     ):
-                        await self.server.control.controller_ready(reconnect=True)
+                        for control in self.server.controls():
+                            await control.controller_ready(reconnect=True)
                 if not self.handshaken:
                     break
         finally:
@@ -666,14 +778,17 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+    def _begin_controller_release(self) -> asyncio.Future[object] | None:
         if self._controller_release is not None:
             return self._controller_release
         if self.role == "controller" and self.connections.is_controller(self):
-            self._controller_release = self.server.control.begin_controller_release(
-                reconnect="approval_reconnect" in self.features,
-                keep_turn="turn_reconnect" in self.features,
-            )
+            self._controller_release = asyncio.gather(*(
+                control.begin_controller_release(
+                    reconnect="approval_reconnect" in self.features,
+                    keep_turn="turn_reconnect" in self.features,
+                )
+                for control in self.server.controls()
+            ))
         return self._controller_release
 
     def _release_dead_connection(self) -> None:
@@ -717,9 +832,10 @@ class _Client:
                 reconnect_bindings = await reconnect_mcp_bindings(self, params)
             if self.role == "controller":
                 reconnect = "approval_reconnect" in self.features
+                require_host_binding = "session_host_commands" in self.features
                 claimed = await self.server.control.controller_claimed(
                     reconnect=reconnect,
-                    require_host_binding="session_host_commands" in self.features,
+                    require_host_binding=require_host_binding,
                 )
                 if not claimed:
                     self.handshaken = False
@@ -727,6 +843,11 @@ class _Client:
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
+                await self.server.claim_parked(
+                    "session_park" in self.features,
+                    reconnect=reconnect,
+                    require_host_binding=require_host_binding,
+                )
                 if reconnect_bindings is not None:
                     await self.server.control.reattach_mcp_bindings(
                         *reconnect_bindings
@@ -735,7 +856,8 @@ class _Client:
                 self.server._client = self
                 self.connections.activate_controller(self)
                 if not reconnect:
-                    await self.server.control.controller_ready()
+                    for control in self.server.controls():
+                        await control.controller_ready()
             return True, result
         if not self.handshaken:
             raise ProtocolError(
@@ -772,6 +894,11 @@ class _Client:
             accepted.remove("turn_reconnect")
         if "in_flight_replay" in accepted and "session_replay_seq" not in accepted:
             accepted.remove("in_flight_replay")
+        # a borrowed runtime cannot make a second pair
+        if "session_park" in accepted and (
+            "resume_attach" not in accepted or self.server._borrowed
+        ):
+            accepted.remove("session_park")
         if (
             "child_run_events" in accepted
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)

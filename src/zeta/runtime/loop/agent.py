@@ -400,6 +400,14 @@ class AgentLoop(
     def background_children_running(self) -> bool:
         return self._background_owner.running or bool(self._background_child_cancellers)
 
+    @property
+    def has_running_work(self) -> bool:
+        """A background child or task runs; closing the session would end it."""
+        return (
+            self.background_children_running
+            or self.tool_registry.background_tasks.running_count > 0
+        )
+
     def _publish_background_event(self, event: StreamEvent) -> None:
         if self._background_event_sink is not None:
             self._background_event_sink(event)

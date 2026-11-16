@@ -272,20 +272,20 @@ async def account_list(client, request_id, params):
 async def account_logout(client, request_id, params):
     validation.active(client.server.runtime, params)
     return await accounts.logout(
-        client.server.runtime, client.server.control.require_idle, params
+        client.server.runtime, client.server.require_all_idle, params
     )
 
 
 async def account_refresh(client, request_id, params):
     validation.active(client.server.runtime, params)
-    await client.server.control.require_idle()
+    await client.server.require_all_idle()
     return await accounts.refresh(client.server.runtime)
 
 
 async def account_switch(client, request_id, params):
     validation.active(client.server.runtime, params)
     operation = accounts.switch(
-        client.server.runtime, client.server.control.require_idle, params
+        client.server.runtime, client.server.require_all_idle, params
     )
     return await accounts.run_owned_switch(client, operation)
 
