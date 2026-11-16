@@ -8,6 +8,7 @@ behavior tests, not fail-first regression tests.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from zeta.extensions import (
     parse_manifest,
     trust_project_extensions,
 )
+from zeta.extensions.discovery import _import_entry
 from zeta.extensions.host import USER_SCOPE
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
@@ -246,3 +248,59 @@ def activate(zx):
         result = await kit.call_tool("hello", {"who": "zeta"})
         assert result["isError"] is False
         assert result["structuredContent"] == {"text": "hi, zeta"}
+
+
+@pytest.mark.asyncio
+async def test_import_failure_removes_entry_and_sibling_modules(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = "from . import helper\nraise RuntimeError('boom')\n"
+    directory = _write_extension(home / "extensions", "broken", source=source)
+    (directory / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    async with _open_registry(tmp_path) as registry:
+        before = {name for name in sys.modules if name.startswith("_zeta_extensions.")}
+        host = apply_extensions(
+            registry, home=home, project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        after = {
+            name for name in sys.modules
+            if name.startswith("_zeta_extensions.")
+        }
+        assert any("import failed" in notice for notice in host.notices)
+        assert after == before
+
+
+@pytest.mark.asyncio
+async def test_loads_of_one_extension_do_not_share_sibling_state(tmp_path: Path) -> None:
+    directory = _write_extension(
+        tmp_path / "home" / "extensions", "stateful",
+        source="from . import helper\n\ndef activate(zx):\n    pass\n",
+    )
+    (directory / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
+    manifest = parse_manifest((directory / "zeta-extension.toml").read_text())
+    before = {name for name in sys.modules if name.startswith("_zeta_extensions.")}
+    try:
+        first = _import_entry(directory, manifest)
+        second = _import_entry(directory, manifest)
+        assert first.helper.COUNT == 1
+        assert second.helper.COUNT == 1
+        assert first.helper is not second.helper
+    finally:
+        for name in list(sys.modules):
+            if name.startswith("_zeta_extensions.") and name not in before:
+                del sys.modules[name]
+
+
+@pytest.mark.asyncio
+async def test_invalid_utf8_manifest_fails_open(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    bad = _write_extension(home / "extensions", "bad-manifest")
+    (bad / "zeta-extension.toml").write_bytes(b"\xff")
+    _write_extension(home / "extensions", "still-loads")
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(
+            registry, home=home, project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        assert "ext_echo" in registry.registered_names
+        assert any("cannot read manifest" in notice for notice in host.notices)

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import itertools
 import re
 import sys
 import types
@@ -48,6 +49,7 @@ from .manifest import (
 
 EXTENSIONS_DIRNAME = "extensions"
 _NAMESPACE = "_zeta_extensions"
+_LOAD_NUMBER = itertools.count()
 
 
 def apply_extensions(
@@ -181,7 +183,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
     """
 
     safe = re.sub(r"[^0-9A-Za-z_]", "_", manifest.name)
-    pkg_name = f"{_NAMESPACE}.{safe}_{abs(hash(str(directory))):x}"
+    pkg_name = f"{_NAMESPACE}.{safe}_{next(_LOAD_NUMBER):x}"
     _ensure_namespace()
     pkg = types.ModuleType(pkg_name)
     pkg.__path__ = [str(directory)]  # type: ignore[attr-defined]
@@ -199,7 +201,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
         search = [str(directory / manifest.entry_module)]
         entry_package = entry_full
     else:
-        sys.modules.pop(pkg_name, None)
+        _remove_package_modules(pkg_name)
         raise ImportError(
             f"entry module '{manifest.entry_module}' not found in {directory}"
         )
@@ -207,7 +209,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
         entry_full, entry_path, submodule_search_locations=search
     )
     if spec is None or spec.loader is None:
-        sys.modules.pop(pkg_name, None)
+        _remove_package_modules(pkg_name)
         raise ImportError(f"could not build import spec for {entry_path}")
     module = importlib.util.module_from_spec(spec)
     module.__package__ = entry_package
@@ -215,10 +217,15 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop(entry_full, None)
-        sys.modules.pop(pkg_name, None)
+        _remove_package_modules(pkg_name)
         raise
     return module
+
+
+def _remove_package_modules(pkg_name: str) -> None:
+    for name in list(sys.modules):
+        if name == pkg_name or name.startswith(pkg_name + "."):
+            del sys.modules[name]
 
 
 def _ensure_namespace() -> None:
@@ -235,7 +242,7 @@ def _manifest_or_notice(
     path = directory / MANIFEST_FILENAME
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         host.notices.append(
             f"extensions · ignored {scope} extension {_display(directory)}: "
             f"cannot read manifest: {_short(exc)}"
