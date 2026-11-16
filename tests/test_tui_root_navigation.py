@@ -10,6 +10,7 @@ import asyncio
 import json
 import random
 import re
+import shutil
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ CTRL_DOWN = "\x1b[1;5B"
 PAGE_UP = "\x1b[5~"
 PAGE_DOWN = "\x1b[6~"
 CTRL_F = "\x06"
+CTRL_R = "\x12"
 ENTER = "\r"
 ESCAPE = "\x1b"
 BACKSPACE = "\x7f"
@@ -304,12 +306,14 @@ class Driver:
 
 
 @asynccontextmanager
-async def running_tui(home: RootHome) -> AsyncIterator[Driver]:
+async def running_tui(
+    home: RootHome, backend: FakeBackend | None = None
+) -> AsyncIterator[Driver]:
     store = await asyncio.to_thread(
         ConversationStore, home.root, session_id=home.session_id
     )
     app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        AgentLoop(backend or FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
         resumed=True,
@@ -551,6 +555,67 @@ async def test_finder_typing_after_a_queued_enter_does_not_accept(
         await driver.settle("settled screen after the changed query")
         assert driver.finder_drawn(), (
             f"the Enter for the old query accepted the new one; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("opener", "query", "accepted"),
+    [
+        pytest.param(
+            CTRL_F,
+            OLD_WORDS[40],
+            lambda driver: _prompt(40) in driver.screen(),
+            id="message-finder",
+        ),
+        pytest.param(
+            CTRL_R,
+            _prompt(TURNS - 2),
+            lambda driver: driver.session.default_buffer.text.startswith(
+                _prompt(TURNS - 2)
+            ),
+            id="history-finder",
+        ),
+    ],
+)
+async def test_finder_keys_typed_during_startup_never_become_a_prompt(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opener: str,
+    query: str,
+    accepted: Callable[[Driver], bool],
+) -> None:
+    # Own copy: on a failure the typed query lands in the session as a prompt.
+    home = tmp_path / "home"
+    await asyncio.to_thread(shutil.copytree, root_home.home, home)
+    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
+    # Hold startup after the first paint, so the keys arrive while it still runs.
+    startup = asyncio.Event()
+    ensure_mcp_servers = AgentLoop.ensure_mcp_servers
+
+    async def held_startup(loop: AgentLoop) -> None:
+        await await_or_fail(startup.wait(), timeout=60, what="startup gate")
+        await ensure_mcp_servers(loop)
+
+    monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        assert driver.app._startup_replay_active, "startup finished before the keys"
+        await driver.send(opener)
+        await driver.until(driver.finder_drawn, what="the finder did not open")
+        await driver.send(query + ENTER)
+        await driver.until(
+            lambda: not driver.finder_drawn() and accepted(driver),
+            what="Enter typed in the finder during startup did not accept its match",
+        )
+        startup.set()
+        await driver.until(
+            lambda: not driver.app._startup_replay_active, what="startup did not finish"
+        )
+        await driver.settle("settled screen after startup")
+        assert not backend.calls, (
+            f"keys typed in the finder were sent to the model: {backend.calls[0][0][-1]}"
         )
 
 
