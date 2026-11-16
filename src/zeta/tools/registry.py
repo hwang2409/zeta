@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
     from .computer.backend import ComputerBackend
+    from .computer.scaling import ScreenGeometry
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
@@ -267,6 +268,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         # backend exists, or by tests injecting a FakeBackend. None means the
         # enabled tool reports that no backend is available on this machine.
         self.computer_backend: ComputerBackend | None = None
+        # Geometry of the most recent screenshot, so coordinate actions map the
+        # model's downscaled coordinates back to global display points.
+        self.computer_geometry: ScreenGeometry | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)
@@ -704,6 +708,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        # A child must capture its own desktop view before coordinate actions.
+        clone.computer_geometry = None
         # a child's cwd notice belongs in the child's transcript, not the parent's
         clone._cwd_recovery_notices = []
         clone.web_clients = SessionWebClients()
