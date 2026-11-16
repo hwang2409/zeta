@@ -12694,7 +12694,6 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
                             "rename-session",
                             "rename_session",
                             {"session_id": sid, "name": "renamed during switch"},
-                            server.controllers.attached(),
                         )
                     )
                 )
