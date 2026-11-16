@@ -282,6 +282,9 @@ class AgentTranscriptControl(UIControl):
         self.search_task = asyncio.create_task(reveal())
         return True
     def end_search(self) -> None:
+        # No search outlives its query: a late match would replace the view.
+        if self.search_task is not None:
+            self.search_task.cancel()
         self.search_results = ()
         self.search_index = 0
 
