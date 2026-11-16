@@ -124,6 +124,33 @@ def test_registry_lock_wait_is_bounded(
         worker.join(2)
 
 
+@pytest.mark.parametrize("epoch", [5, None], ids=["legacy-root-lock", "named-lock"])
+def test_registry_lock_timeout_closes_its_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, epoch: int | None
+) -> None:
+    from zeta.storage_format import advance
+
+    if epoch is not None:
+        advance(tmp_path, expected_epoch=0, target_epoch=epoch)
+    root = tmp_path / "projects"
+    registry = ProjectRegistry(root)
+    project = registry.create_project("one", "repo")
+    registry.list_session_links(project.project_id)
+    held = root / ".lock" if epoch is not None else root / project.project_id / ".sessions.lock"
+    fd = os.open(held, os.O_RDWR)
+    # test-contract: seam force the registry lock-timeout path
+    monkeypatch.setattr("zeta.project_locking._PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS", 0)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            with pytest.raises(ProjectRegistryBusyError):
+                registry.list_session_links(project.project_id)
+        assert len(os.listdir("/dev/fd")) == before, "a lock timeout leaked its descriptor"
+    finally:
+        os.close(fd)
+
+
 def _make_registry(home: Path) -> tuple[Path, Path]:
     linked = home / "linked-project"
     linked.mkdir(parents=True)
