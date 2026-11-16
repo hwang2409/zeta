@@ -15,6 +15,37 @@ from urllib.parse import urlsplit
 from . import TelemetryError, TelemetryStatus
 from .attributes import RESERVED_CONTENT_ATTRIBUTES
 
+_ALLOWED_ATTRIBUTES = frozenset(
+    {
+        "gen_ai.operation.name",
+        "gen_ai.provider.name",
+        "gen_ai.request.model",
+        "gen_ai.response.model",
+        "gen_ai.response.finish_reasons",
+        "gen_ai.conversation.id",
+        "zeta.agent.depth",
+        "zeta.background",
+        "zeta.turn.number",
+        "zeta.notification",
+        "zeta.tool.count",
+        "zeta.tool.name",
+        "zeta.tool.type",
+        "zeta.tool.call.id",
+        "zeta.agent.name",
+        "rpc.system",
+        "rpc.method",
+        "error.type",
+        "safe",
+    }
+)
+_ALLOWED_EVENT_ATTRIBUTES = frozenset(
+    {"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after", "safe.event"}
+)
+
+
+def _safe_attributes(attributes: Mapping[str, object] | None, allowed: frozenset[str] = _ALLOWED_ATTRIBUTES) -> dict[str, object]:
+    return {key: value for key, value in (attributes or {}).items() if key in allowed and key not in RESERVED_CONTENT_ATTRIBUTES}
+
 
 # This is the single owner of the loopback endpoint policy.
 def validate_loopback_endpoint(endpoint: str) -> str:
@@ -65,15 +96,18 @@ class _SpanHandle:
         self._span = self._scope.__enter__()
         return self
 
-    def __exit__(self, *args: object) -> None:
-        self._scope.__exit__(*args)
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if exc_type is not None:
+            self.set_attribute("error.type", exc_type.__name__)
+        self._scope.__exit__(None, None, None)
+        return False
 
     def set_attribute(self, name: str, value: object) -> None:
-        if name not in RESERVED_CONTENT_ATTRIBUTES:
+        if name in _ALLOWED_ATTRIBUTES and name not in RESERVED_CONTENT_ATTRIBUTES:
             self._span.set_attribute(name, value)
 
     def add_event(self, name: str, attributes: Mapping[str, object] | None = None) -> None:
-        safe = {key: value for key, value in (attributes or {}).items() if key not in RESERVED_CONTENT_ATTRIBUTES}
+        safe = _safe_attributes(attributes, _ALLOWED_EVENT_ATTRIBUTES)
         self._span.add_event(name, attributes=safe)
 
     def record_exception(self, exception: BaseException) -> None:
@@ -82,6 +116,9 @@ class _SpanHandle:
     def set_error(self, error_type: str | None = None) -> None:
         if error_type is not None:
             self.set_attribute("error.type", error_type)
+            from opentelemetry.trace import Status, StatusCode
+
+            self._span.set_status(Status(StatusCode.ERROR))
 
 
 class _Exporter:
@@ -143,12 +180,12 @@ class _Runtime:
                 logger.setLevel(level)
                 logger.handlers[:] = handlers
 
-    def span(self, name: str, *, kind: str, attributes: Mapping[str, object] | None) -> object:
+    def _span(self, name: str, *, kind: str, attributes: Mapping[str, object] | None) -> object:
         from opentelemetry.trace import SpanKind
 
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
-        safe_attributes = {key: value for key, value in (attributes or {}).items() if key not in RESERVED_CONTENT_ATTRIBUTES}
-        return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes))
+        safe_attributes = _safe_attributes(attributes)
+        return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
 
     def current_trace_context(self) -> dict[str, str]:
         carrier: dict[str, str] = {}
@@ -179,7 +216,7 @@ class _Runtime:
         from opentelemetry import trace
 
         span = trace.get_current_span()
-        span.add_event("gen_ai.client.retry", attributes=attributes)
+        span.add_event("gen_ai.client.retry", attributes=_safe_attributes(attributes, _ALLOWED_EVENT_ATTRIBUTES))
 
 
 def configure(endpoint: str) -> _Runtime:

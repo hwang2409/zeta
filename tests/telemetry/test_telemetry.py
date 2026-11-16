@@ -86,7 +86,9 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
             received.set()
             self.send_response(302)
             self.send_header("Location", f"http://127.0.0.1:{redirected_server.server_port}/v1/traces")
+            self.send_header("Content-Length", "0")
             self.end_headers()
+            self.close_connection = True
 
         def log_message(self, *_args):
             return
@@ -95,7 +97,9 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
         def _ok(self):
             redirected.set()
             self.send_response(200)
+            self.send_header("Content-Length", "0")
             self.end_headers()
+            self.close_connection = True
 
         do_GET = _ok
         do_POST = _ok
@@ -118,7 +122,7 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
             pass
         instance.shutdown()
         assert received.wait(5)
-        assert not redirected.wait(0.2)
+        assert not redirected.is_set()
     finally:
         server.shutdown()
         redirected_server.shutdown()
@@ -163,7 +167,9 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
         with instance.turn_span():
             pass
         instance.shutdown()
+        instance.shutdown()
         assert stopped.is_set()
+        assert instance.status() == telemetry.TelemetryStatus(True, "degraded", "export_unavailable")
         assert not records
     finally:
         app_logger.removeHandler(handler)
@@ -211,6 +217,8 @@ def test_facade_drops_content_and_exception_details(monkeypatch: pytest.MonkeyPa
             span.set_attribute("safe", "ok")
             span.add_event("event", {"gen_ai.input.messages": "secret", "safe.event": "ok"})
             span.record_exception(ValueError("secret stack and message"))
+            span.set_error("ExplicitError")
+            instance.retry(**{"gen_ai.input.messages": "retry secret", "gen_ai.retry.attempt": 2})
     finally:
         instance.shutdown()
     assert len(exported) == 1
@@ -220,8 +228,50 @@ def test_facade_drops_content_and_exception_details(monkeypatch: pytest.MonkeyPa
         "gen_ai.tool.call.arguments", "gen_ai.tool.call.result",
     ))
     assert record.attributes["safe"] == "ok"
-    assert record.attributes["error.type"] == "ValueError"
+    assert record.attributes["error.type"] == "ExplicitError"
     assert all("secret" not in str(event.attributes) for event in record.events)
+    assert any(event.name == "gen_ai.client.retry" for event in record.events)
+    assert all("gen_ai.input.messages" not in event.attributes for event in record.events)
+    assert record.status.description is None
+
+
+def test_batch_queue_and_shared_logger_are_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    class MemoryExporter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def export(self, _spans):
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", MemoryExporter)
+    logger = logging.getLogger("opentelemetry.sdk._shared_internal")
+    old = (logger.disabled, logger.propagate)
+    instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
+    try:
+        processor = instance._implementation._provider._active_span_processor._span_processors[0]
+        assert processor._batch_processor._max_queue_size == 2048
+        assert logger.disabled is True
+        assert logger.propagate is False
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger.addHandler(handler)
+        try:
+            batch = processor._batch_processor
+            batch._queue.extend([None] * batch._max_queue_size)
+            batch.emit(None)
+            assert not records
+        finally:
+            logger.removeHandler(handler)
+    finally:
+        instance.shutdown()
+    assert (logger.disabled, logger.propagate) == old
 
 
 def test_status_cell_is_bounded_with_concurrent_publishers() -> None:

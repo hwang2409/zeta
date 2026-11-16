@@ -92,28 +92,28 @@ class Telemetry:
         if self._implementation is not None:
             self._implementation.inject(carrier)
 
-    def span(self, name: str, *, kind: str = "internal", attributes: Mapping[str, object] | None = None) -> Any:
+    def _span(self, name: str, *, kind: str = "internal", attributes: Mapping[str, object] | None = None) -> Any:
         if self._implementation is None:
             return _DisabledSpan()
-        return self._implementation.span(name, kind=kind, attributes=attributes)
+        return self._implementation._span(name, kind=kind, attributes=attributes)
 
     def agent_span(self, profile: str, **attributes: object) -> Any:
-        return self.span(f"invoke_agent {profile}", attributes=attributes)
+        return self._span(f"invoke_agent {profile}", attributes=attributes)
 
     def turn_span(self, **attributes: object) -> Any:
-        return self.span("zeta.turn", attributes=attributes)
+        return self._span("zeta.turn", attributes=attributes)
 
     def inference_span(self, model: str, **attributes: object) -> Any:
-        return self.span(f"chat {model}", kind="client", attributes=attributes)
+        return self._span(f"chat {model}", kind="client", attributes=attributes)
 
     def tool_span(self, name: str, **attributes: object) -> Any:
-        return self.span(f"execute_tool {name}", attributes=attributes)
+        return self._span(f"execute_tool {name}", attributes=attributes)
 
     def context_span(self, **attributes: object) -> Any:
-        return self.span("zeta.context.compact", attributes=attributes)
+        return self._span("zeta.context.compact", attributes=attributes)
 
     def serve_span(self, method: str, **attributes: object) -> Any:
-        return self.span(f"serve {method}", kind="server", attributes=attributes)
+        return self._span(f"serve {method}", kind="server", attributes=attributes)
 
     def retry(self, **attributes: object) -> None:
         if self._implementation is not None:
