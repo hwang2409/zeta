@@ -230,6 +230,7 @@ async def x1_exit_sink_fails(run: Run) -> None:
             hit.set()
             raise OSError("session store write failed")
 
+        # test-contract: seam the exit sink is the delivery step a store write failure breaks
         run.monkeypatch.setattr(_registry(parked), "_notification_sink", sink)
 
     await _failed_delivery_closes_and_reopen_recovers(run, fail)
@@ -246,6 +247,7 @@ async def x2_receipt_commit_fails(run: Run) -> None:
                 raise OSError("background task rows write failed")
             await original(notice)
 
+        # test-contract: seam the receipt commit is the publish step a disk failure breaks
         run.monkeypatch.setattr(registry, "_commit_notice", commit)
 
     # the exit was appended before the failed commit: the reopen must not add one
@@ -399,6 +401,7 @@ async def c3_cancel_exit_delivery(run: Run) -> None:
             hit.set()
             raise asyncio.CancelledError
 
+        # test-contract: seam the exit sink is the delivery step a cancel interrupts
         run.monkeypatch.setattr(_registry(parked), "_notification_sink", sink)
 
     await _failed_delivery_closes_and_reopen_recovers(run, fail)
@@ -533,6 +536,7 @@ async def d2_stale_check_after_resume(run: Run) -> None:
     client, a, parked = await run.parked_turn()
     late_checks: list[ServeControl] = []
     original_check = server.parking._check
+    # test-contract: seam holds the scheduled idle check to force the resume-first order
     run.monkeypatch.setattr(server.parking, "_check", late_checks.append)
     run.backend.gates[0].set()
     # dropped frames of the parked turn schedule checks too; wait for an idle one
