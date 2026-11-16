@@ -65,7 +65,7 @@ async def test_timeout_disables_hook_and_warns() -> None:
     notices: list[str] = []
     extension_hook = ExtensionHook("hooks", "pre_tool", hangs, timeout_seconds=0.001)
     hook = CompositeToolHook(None, [extension_hook], notices.append)
-    assert await hook("bash", {}) is True
+    assert await asyncio.wait_for(hook("bash", {}), 10) is True
     assert extension_hook.disabled
     assert len(notices) == 1
     gate.set()
