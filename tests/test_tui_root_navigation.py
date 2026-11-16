@@ -571,6 +571,8 @@ class Opener:
     # The overlay's own text field; None for an overlay that takes no text.
     field: Callable[[Driver], str] | None
     escapes: int
+    # The state once Enter on an empty query is taken.
+    empty_accepted: Callable[[Driver], bool]
 
 
 def _decisions_drawn(driver: Driver) -> bool:
@@ -589,6 +591,7 @@ OPENERS = [
             Driver.finder_drawn,
             lambda driver: driver.app._finder_field.text,
             escapes=2,
+            empty_accepted=lambda driver: not driver.finder_drawn(),
         ),
         id="ctrl+f",
     ),
@@ -601,6 +604,8 @@ OPENERS = [
             Driver.finder_drawn,
             lambda driver: driver.app._finder_field.text,
             escapes=2,
+            empty_accepted=lambda driver: not driver.finder_drawn()
+            and driver.session.default_buffer.text.startswith(_prompt(TURNS - 1)),
         ),
         id="ctrl+r",
     ),
@@ -613,6 +618,8 @@ OPENERS = [
             _decisions_drawn,
             None,
             escapes=1,
+            empty_accepted=lambda driver: _decisions_drawn(driver)
+            and driver.session.default_buffer.text == "",
         ),
         id="ctrl+t",
     ),
@@ -621,7 +628,7 @@ MISS = "zzsettled"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("burst", ["word+enter", "miss+enter", "word+esc"])
+@pytest.mark.parametrize("burst", ["word+enter", "miss+enter", "word+esc", "enter"])
 @pytest.mark.parametrize("phase", ["startup", "settled"])
 @pytest.mark.parametrize("opener", OPENERS)
 async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
@@ -667,7 +674,7 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
         def composer() -> str:
             return driver.session.default_buffer.text
 
-        typed = MISS if burst == "miss+enter" else opener.word
+        typed = {"miss+enter": MISS, "enter": ""}.get(burst, opener.word)
         if burst == "word+esc":
             await driver.send(opener.key + typed)
             for _ in range(opener.escapes):
@@ -688,13 +695,13 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             )
         else:
             await driver.send(opener.key + typed + ENTER)
-            expected = (
-                (lambda: opener.accepted(driver))
-                if burst == "word+enter"
-                else (
-                    lambda: opener.drawn(driver)
-                    and (opener.field is None or opener.field(driver) == MISS)
-                )
+            expected = {
+                "word+enter": lambda: opener.accepted(driver),
+                "enter": lambda: opener.empty_accepted(driver),
+            }.get(
+                burst,
+                lambda: opener.drawn(driver)
+                and (opener.field is None or opener.field(driver) == MISS),
             )
             await driver.until(
                 lambda: bool(submitted()) or expected(),
@@ -702,8 +709,8 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             )
             await driver.settle("settled screen after Enter")
             assert not submitted(), f"keys typed for the overlay were sent: {submitted()}"
-            if burst == "word+enter":
-                assert opener.accepted(driver), (
+            if burst != "miss+enter":
+                assert expected(), (
                     f"Enter did not accept {typed!r}: composer {composer()!r};"
                     f" screen:\n{driver.screen()}"
                 )

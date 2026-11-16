@@ -163,6 +163,8 @@ class FinderRuntimeMixin:
         finally:
             if self._finder_prepare_task is task:
                 self._finder_prepare_task = None
+                # An Enter held while this task ran runs now that the rows stand.
+                self._finder_accept_when_ready()
 
     def _finder_input(self, query: str) -> None:
         # A queued Enter belongs to the query it was typed for, not a later one.

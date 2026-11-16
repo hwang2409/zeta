@@ -317,9 +317,7 @@ async def test_tui_popup_waits_for_recovery_before_input(
     )
     app = await _make_app(tmp_path, owner, owner.store.session_id, open_panel=False)
     app.close_decisions_panel()
-    await await_or_fail(
-        asyncio.to_thread(lambda: not app.decisions_panel_active), what="close popup"
-    )
+    assert not app.decisions_panel_active
     gate = threading.Event()
     started = threading.Event()
     real_recover = AttentionReplies.recover
@@ -333,24 +331,29 @@ async def test_tui_popup_waits_for_recovery_before_input(
     monkeypatch.setattr(AttentionReplies, "recover", gated_recover)
     try:
         opening = app.open_decisions_panel()
+        assert opening is not None, "the closed popup did not start a recovery"
         await await_or_fail(
             asyncio.to_thread(started.wait, 10), what="start gated recovery"
         )
         # The popup owns the keys at once, but shows loading and holds them.
         assert app.decisions_panel_active and app.overlay_loading
+        before = asyncio.all_tasks()
         _press(app, "1")
+        answers = asyncio.all_tasks() - before
+        gate.set()
+        await await_or_fail(opening, what="popup recovery")
+        # Any answer "1" started can write only after recovery; let it finish.
+        await await_or_fail(
+            asyncio.gather(*answers), what="answer typed during recovery"
+        )
+        staged = await asyncio.to_thread(
+            app._attention_replies(owner.store.session_id).staged
+        )
+        assert not staged, f"1 typed during recovery answered a decision: {staged}"
         assert all(
             AttentionStore(owner.store.session_dir, writer_epoch=5).get(r.id).status == "open"
             for r in records
         )
-        gate.set()
-        if opening is not None:
-            await await_or_fail(opening, what="popup recovery")
-        else:
-            await await_or_fail(
-                asyncio.to_thread(lambda: app.decisions_panel_active),
-                what="popup recovery",
-            )
         assert [item.record.id for item in app._decisions_panel.items] == [
             r.id for r in records
         ]
