@@ -50,6 +50,7 @@ class _UncancellableCloseClient(_LifecycleClient):
         self.close_started.set()
         while not self.gate.is_set():
             try:
+                # test-contract: durability models a close that ignores cancellation
                 await self.gate.wait()
             except asyncio.CancelledError:
                 task = asyncio.current_task()

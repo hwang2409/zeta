@@ -49,6 +49,7 @@ def _wrap_uncancellable_close(
         async def blocked_close() -> None:
             while not close_gate.is_set():
                 try:
+                    # test-contract: durability models a close that ignores cancellation
                     await close_gate.wait()
                 except asyncio.CancelledError:
                     task = asyncio.current_task()
@@ -59,6 +60,7 @@ def _wrap_uncancellable_close(
         client.close = blocked_close
         return client
 
+    # test-contract: seam _build_client is the documented client-factory test seam
     monkeypatch.setattr(mount_module, "_build_client", build)
 
 
