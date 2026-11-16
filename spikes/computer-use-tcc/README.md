@@ -65,7 +65,7 @@ cd spikes/computer-use-tcc
    binary (homebrew `python@3.12`, different path + cdhash). Expect `[FAIL] not granted` even
    though the default python is granted. This is a proxy observation that grants are keyed to the
    exact binary; it does not itself prove an in-place reinstall loses the original grant.
-   `uv` reinstall or python upgrade that swaps the binary loses it. *(Optional, more faithful but
+   The in-place reinstall question remains unmeasured. *(Optional, more faithful but
    disruptive: reinstall zeta's python with `uv tool install --reinstall ...`, then re-run
    `./run.sh check`; you will need to re-grant afterwards.)*
 
@@ -116,7 +116,8 @@ headless/daemon context (no active GUI login) cannot capture. Skip unless asked.
 ## expected conclusions (to confirm or refute)
 - Q1: ad-hoc python under tmux **can** capture + inject after a grant; the entry is owned by the
   responsible process (likely `tmux` or the resolved python binary, not the terminal).
-- Q2: the grant does **not** survive a python/binary change (ad-hoc is path+cdhash keyed).
+- Q2 proxy: a different python binary does not inherit the grant; the in-place reinstall case
+  remains unmeasured (ad-hoc identity includes path + cdhash).
 - Q3: a **self-signed code-signing identity keeps the grant across rebuilds**; ad-hoc does not →
   sign the helper with a stable self-signed identity on the branch.
 - Q3 therefore supports the design's "small signed helper holds the grants" plan without needing a
