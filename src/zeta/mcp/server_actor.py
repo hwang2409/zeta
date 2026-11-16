@@ -1138,18 +1138,20 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._detached_hold = None
         # no client came back: waiting calls and calls still running on an old
         # client end as they would have at the disconnect.
-        for request in [*self._requests.values()]:
-            if isinstance(request, _CallRequest) and (
-                request.task is None or request.client in self._draining
-            ):
-                self._requests.pop(request.identifier)
-                _set_result(
-                    request.result,
-                    _detached_result(self.name, started=request.task is not None),
-                )
-                if request.task is not None:
-                    request.task.cancel()
+        for request in [*self._held_calls(), *self._calls_on_sealed_clients()]:
+            self._requests.pop(request.identifier)
+            started = request.task is not None
+            _set_result(request.result, _detached_result(self.name, started=started))
+            if request.task is not None:
+                request.task.cancel()
         self._close_drained_clients()
+
+    def _calls_on_sealed_clients(self) -> list[_CallRequest]:
+        return [
+            request
+            for request in self._requests.values()
+            if isinstance(request, _CallRequest) and request.client in self._draining
+        ]
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
