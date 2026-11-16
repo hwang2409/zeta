@@ -453,14 +453,15 @@ class ServeControl:
         return task
 
     async def controller_claimed(
-        self, *, reconnect: bool = False, require_host_binding: bool = False
+        self, *, reconnect: bool = False, require_host_binding: bool = False,
+        deadline: float | None = None,
     ) -> bool:
+        if deadline is None:
+            deadline = CONTROLLER_HANDOFF_DEADLINE_SECONDS
         release = self._controller_release_task
         if release is not None:
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
-                )
+                await asyncio.wait_for(asyncio.shield(release), deadline)
             except TimeoutError:
                 return False
             if self._controller_release_task is release:

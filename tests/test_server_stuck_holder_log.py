@@ -99,12 +99,23 @@ async def test_stuck_lost_holder_is_logged_with_dump(
 
     async def gated_status(client, request_id, params):
         entered.set()
-        await asyncio.wait_for(gate.wait(), 10)
-        return {}
+        # Resist cancellation so the lost holder keeps the slot held: this is the
+        # stuck-holder shape under slice 1 (a handler that swallows its cancel).
+        while True:
+            try:
+                await asyncio.wait_for(gate.wait(), 10)
+                return {}
+            except asyncio.CancelledError:
+                pass
 
     monkeypatch.setitem(registry.HANDLERS, MethodDescriptor.STATUS, gated_status)
+    # Hand the slot off at once on contention, then refuse at a short deadline.
+    monkeypatch.setattr(
+        "zeta.server.control.CONTROLLER_HANDOFF_DEADLINE_SECONDS", 0.1, raising=True
+    )
 
     async with _serve(tmp_path, transport) as server:
+        server.lost_request_contended_drain = 0.0
         holder = await connect_replay(server, transport)
         try:
             await negotiate(holder)

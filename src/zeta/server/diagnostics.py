@@ -12,6 +12,9 @@ task is suspended on. This is diagnostic only; it changes no refusal behavior.
 
 The line never carries tokens or secrets: only the User-Agent and remote
 address, the hello client version, and the running method and id.
+
+:func:`log_stuck_holder` reuses the same bounded, escaped dump for the hold
+path, which logs a lost holder whose request did not end after cancel.
 """
 
 from __future__ import annotations
@@ -183,6 +186,16 @@ def _lost_holder_dump(holder: _Client, output: _OutputState | None) -> str:
         f"{_output_summary(output)}; await chain: "
         f"{' <- '.join(chain) if chain else '<empty>'}"
     )
+
+
+def log_stuck_holder(holder: _Client, output: _OutputState | None, *, reason: str) -> None:
+    """Write one bounded record naming a lost holder's stuck request.
+
+    The hold path (``_await_handler_held``) calls this at each cancel-bound
+    interval so a holder whose request swallows its cancel stays visible. It
+    reuses the same bounded, escaped dump the refusal log appends.
+    """
+    logger.warning("serve: %s; %s", reason, _lost_holder_dump(holder, output))
 
 
 def log_controller_refusal(
