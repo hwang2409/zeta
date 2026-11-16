@@ -1169,11 +1169,16 @@ def build_key_bindings(
 
             # A picker whose rows load owns every key: a typed letter or a paste
             # would wait in the composer and an Enter would send it as a prompt.
-            # Keys with their own binding (Esc, ctrl keys) still act.
+            # Esc stops the load (its own eager binding is more specific).
             @bindings.add(Keys.Any, filter=loading, eager=True)
             @bindings.add(Keys.BracketedPaste, filter=loading, eager=True)
             def picker_loading_drop(event: KeyPressEvent) -> None:
                 del event
+
+            # Interrupt and exit still act: eager and more specific than the drop.
+            bindings.add(Keys.SIGINT, filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["interrupt"], filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["exit"], filter=loading, eager=True)(exit_prompt)
 
         picker_actions = (
             ("d", on_picker_default),

@@ -17,6 +17,7 @@ from rich.text import Text
 
 from ...core.slash import context_window
 from .. import theme
+from ..cards.picker_card import SELECTED_MARKER
 
 MAX_VISIBLE_ROWS = 12
 HINT = "↑/↓ move · enter select · esc cancel · or /model <name>"
@@ -81,7 +82,7 @@ class ModelPicker:
             name = self.choices[position]
             highlighted = position == self.index
             line = Text.assemble(
-                ("❯ " if highlighted else "  ", theme.ACCENT),
+                (SELECTED_MARKER if highlighted else "  ", theme.ACCENT),
                 (name.ljust(width), theme.COMMAND if highlighted else theme.BODY),
             )
             window = context_window(self.provider, name)

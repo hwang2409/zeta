@@ -21,7 +21,7 @@ from prompt_toolkit.layout.containers import (
     Window,
     to_container,
 )
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import FormattedTextControl, UIControl
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import Char, Screen, WritePosition
@@ -581,6 +581,7 @@ def full_screen_content(
     queued_messages: Callable[[], Sequence[str]] = tuple,
     decisions_answer_window: AnyContainer | None = None,
     overlay_field_windows: Sequence[AnyContainer] = (),
+    picker_card: UIControl | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -645,7 +646,19 @@ def full_screen_content(
         ),
         Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
     )
-    bottom_rows = [spacer, todo_panel, queued_rows, *padded_composer_rows]
+    bottom_rows = [spacer, todo_panel, queued_rows]
+    if picker_card is not None:
+        # Above the composer, where the picker's keys act.
+        bottom_rows.append(
+            VSplit(
+                [
+                    Window(width=CONTENT_MARGIN, char=" "),
+                    Window(picker_card, dont_extend_height=True),
+                    Window(width=CONTENT_MARGIN, char=" "),
+                ]
+            )
+        )
+    bottom_rows.extend(padded_composer_rows)
     if list_panel is not None:
         bottom_rows.append(list_panel)
     bottom_rows.append(footer)

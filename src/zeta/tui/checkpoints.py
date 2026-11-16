@@ -644,10 +644,14 @@ class CheckpointTranscriptMixin:
             self.loop.store.active_branch_head_id(),
         )
         # A finder search typed during startup may have revealed the place the
-        # user moved to: the first page must not replace it.
+        # user moved to: the first page must not replace it. Only history pages
+        # count; lines printed during startup are live rows, not a place.
         if not (
             self._startup_replay_active
-            and self._agent_navigation.transcript_control.history_pager.descriptors
+            and any(
+                not descriptor.key.startswith("live:")
+                for descriptor in self._agent_navigation.transcript_control.history_pager.descriptors
+            )
         ):
             await self._load_transcript_page(reset=True)
         if self._exit_requested:

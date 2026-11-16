@@ -311,12 +311,9 @@ class TUIApp(
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
         self._model_picker: ModelPicker | None = None
-        self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
         self._picker_loading: asyncio.Future[Any] | None = None
-        # The loading picker's card: (transcript, unit).
-        self._picker_loading_card: tuple[Any, Any] | None = None
-        self._accounts_picker_unit: Any = None
+        self._picker_loading_name = ""
         self._account_switch_task: asyncio.Task[None] | None = None
         self._account_switch_pending = False
         self._account_switch_finished = asyncio.Event()
@@ -687,7 +684,6 @@ class TUIApp(
             if self._loop_state == "approval":
                 self._approval_units.clear()
                 self._present_pending_approvals()
-            self._reprint_picker_cards()
         # The redraw replaced the units an open finder's rows point at.
         transcript = self._viewed_transcript()
         if self._active_finder is transcript and transcript.finder_active:

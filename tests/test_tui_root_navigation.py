@@ -25,6 +25,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.output.vt100 import Vt100_Output
+from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
@@ -611,18 +612,36 @@ def _panel(drawn: Callable[[Driver], bool]) -> dict:
     return {"drawn": drawn, "accepted": kept, "empty_accepted": kept}
 
 
+# One marker per picker card, so a card drawn twice counts twice.
 PICKER_CARDS = (
     "select a model",
     "select an account",
-    "enter select · esc cancel",
     "accounts · loading…",
     "remote · loading…",
+    "lab · alpha",
 )
 
 
+def _picker_cards(driver: Driver) -> int:
+    """Picker cards on the whole screen: the card window and the transcript."""
+
+    return sum(row.count(card) for row in driver.all_rows() for card in PICKER_CARDS)
+
+
 def _picker_card_drawn(driver: Driver) -> bool:
-    screen = driver.screen()
-    return any(card in screen for card in PICKER_CARDS)
+    return _picker_cards(driver) > 0
+
+
+def _picker_cards_in_history(app: TUIApp) -> int:
+    """Picker cards in the transcript's pages, which every redraw draws again."""
+
+    console = Console(file=StringIO(), width=120, record=True)
+    for page in app._agent_navigation.transcript_control.history_pager.pages:
+        for unit in page.units:
+            if not hasattr(unit.value, "type"):
+                console.print(unit.value)
+    text = console.export_text()
+    return sum(text.count(card) for card in PICKER_CARDS)
 
 
 def _model_picker_closed(driver: Driver) -> bool:
@@ -966,10 +985,23 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             f"startup changed the overlay: drawn {drawn} -> {opener.drawn(driver)};"
             f" screen:\n{driver.screen()}"
         )
-        assert app._picker_active == _picker_card_drawn(driver), (
-            f"picker keys active={app._picker_active}, card drawn="
-            f"{_picker_card_drawn(driver)}; screen:\n{driver.screen()}"
+        # A picker's card is drawn once while its keys act, and is never history.
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert cards == (int(app._picker_active), 0), (
+            f"picker keys active={app._picker_active}, cards on screen and in"
+            f" history {cards}; screen:\n{driver.screen()}"
         )
+        if phase == "before-first-page":
+            # The first page was drawn under the overlay, and stays after it closes.
+            assert driver.order(), f"no history after startup; screen:\n{driver.screen()}"
+            for _ in range(opener.escapes):
+                await driver.send(ESCAPE)
+                await driver.settle("settled screen after Esc")
+            if not (opener.key == CTRL_F and burst == "word+enter"):
+                # Every other row ends at the tail; an accepted find moved the view.
+                assert _answer(TURNS - 1) in driver.screen(), (
+                    f"the newest answer is not drawn after Esc; screen:\n{driver.screen()}"
+                )
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1058,99 @@ async def test_esc_while_a_picker_loads_stops_it(
         await driver.settle("settled screen after the load would have ended")
         assert not app.remote_picker_active and driver.session.default_buffer.text == "", (
             f"the picker opened after Esc; screen:\n{driver.screen()}"
+        )
+
+
+def _hold_remote_discovery(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Fake remote hosts whose discovery waits for the returned gate."""
+
+    _fake_remote_hosts(None, monkeypatch)
+    loaded = RemoteSessionClient.discover
+    gate = asyncio.Event()
+
+    async def held_discover(client: object, hosts: object = None) -> tuple:
+        await await_or_fail(gate.wait(), timeout=60, what="remote discovery gate")
+        return await loaded(client, hosts)
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    return gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["\x03", "\x04"], ids=["ctrl+c", "ctrl+d"])
+async def test_interrupt_and_exit_act_while_a_picker_loads(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    # A loading picker drops typed keys, but never the keys that stop zeta.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = _hold_remote_discovery(monkeypatch)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        interrupts: list[None] = []
+        monkeypatch.setattr(app, "abort_active", lambda: interrupts.append(None))
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await driver.until(lambda: app._picker_loading is not None, what="/remote opened nothing")
+            await driver.send(key)
+            await driver.settle("key taken while /remote loads")
+            acted = interrupts == [None] if key == "\x03" else app._exit_requested
+            assert acted, (
+                f"{key!r} was dropped while /remote loaded: interrupts={len(interrupts)},"
+                f" exit requested={app._exit_requested}"
+            )
+        finally:
+            gate.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+async def test_an_open_picker_is_one_card_across_history_redraws(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # PageUp loads older pages and redraws the history: the open picker stays
+    # one card, never a history row, and none is left after Esc.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    _fake_remote_hosts(None, monkeypatch)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        _fake_accounts(app, monkeypatch)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before the picker")
+        redraws = 0
+        draw = app._render_resident_history
+
+        def counted_draw() -> None:
+            nonlocal redraws
+            redraws += 1
+            draw()
+
+        monkeypatch.setattr(app, "_render_resident_history", counted_draw)
+        await driver.send(command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} opened no picker",
+        )
+        for _ in range(60):
+            if redraws >= 3:
+                break
+            await driver.send(PAGE_UP)
+            await driver.settle("PageUp with the picker open")
+        assert redraws >= 3, f"PageUp redrew the history {redraws} times"
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert app._picker_active and cards == (1, 0), (
+            f"after {redraws} redraws: cards on screen and in history {cards};"
+            f" screen:\n{chr(10).join(driver.all_rows())}"
+        )
+        await driver.send(ESCAPE)
+        await driver.settle("settled screen after Esc")
+        cards = (_picker_cards(driver), _picker_cards_in_history(app))
+        assert not app._picker_active and cards == (0, 0), (
+            f"after Esc: cards on screen and in history {cards};"
+            f" screen:\n{chr(10).join(driver.all_rows())}"
         )
 
 
@@ -1201,10 +1326,10 @@ async def test_a_second_picker_command_replaces_the_one_still_loading(
         try:
             await driver.send("/accounts" + ENTER + "/accounts" + ENTER)
             await driver.until(
-                lambda: "accounts · loading…" in driver.screen(), what="/accounts opened nothing"
+                lambda: _picker_card_drawn(driver), what="/accounts opened nothing"
             )
             await driver.settle("both commands taken")
-            assert driver.screen().count("accounts · loading…") == 1, (
+            assert _picker_cards(driver) == 1, (
                 f"two loads for one picker; screen:\n{driver.screen()}"
             )
             await driver.send(ESCAPE)

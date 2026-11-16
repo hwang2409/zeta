@@ -23,6 +23,7 @@ from ...remote.discovery import (
 )
 from ...remote.wire import RemoteWireError
 from .. import theme
+from ..cards.picker_card import SELECTED_MARKER
 from ..checkpoints import render_replayed_message
 from ..transcript import TranscriptPresenter, TranscriptWidget
 from ..user import displayed_user_text, user_message
@@ -43,7 +44,7 @@ class RemotePicker:
     def render(self) -> Panel:
         lines = []
         for index, row in enumerate(self.rows):
-            marker = "› " if index == self.index else "  "
+            marker = SELECTED_MARKER if index == self.index else "  "
             lines.append(Text(f"{marker}{row.host} · {row.name or row.session_id[:8]} · {row.state or 'unknown'}"))
         return Panel(Group(*lines), title="remote", subtitle="↑/↓ move · enter select · esc cancel")
 
@@ -125,8 +126,6 @@ class RemoteViewMixin:
         self._remote_event_task = None
         self._remote_select_task = None
         self._remote_picker = None
-        self._remote_picker_unit = None
-        self._remote_picker_transcript = None
         self._remote_saved_composer = None
         self._remote_attaching = False
 
@@ -152,15 +151,10 @@ class RemoteViewMixin:
     def remote_picker_move(self, delta: int) -> None:
         if self._remote_picker is not None:
             self._remote_picker.move(delta)
-            if self._remote_picker_unit is not None:
-                self._remote_picker_transcript.replace(self._remote_picker_unit, self._remote_picker.render())
             self._invalidate_prompt()
 
     def remote_picker_cancel(self) -> None:
         self._remote_picker = None
-        if self._remote_picker_unit is not None:
-            self._remote_picker_transcript.remove(self._remote_picker_unit)
-        self._remote_picker_unit = self._remote_picker_transcript = None
         self._invalidate_prompt()
 
     def remote_picker_select(self) -> None:
@@ -246,9 +240,6 @@ class RemoteViewMixin:
                 chosen = rows[0]
             else:
                 self._remote_picker = RemotePicker(tuple(rows))
-                presenter = self._screen_presenter()
-                self._remote_picker_unit = presenter.print_unit(self._remote_picker.render())
-                self._remote_picker_transcript = presenter.transcript
                 self._invalidate_prompt()
                 return ""
             await self._open_remote(client, chosen)

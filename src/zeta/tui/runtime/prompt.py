@@ -12,6 +12,7 @@ from rich.text import Text
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import start_tui_stall_watchdog
 from .. import theme
+from ..cards.picker_card import PickerCardControl
 from ..composer import FullScreenPromptSession
 from ..fork_session import RuntimeResult
 from ..layout import detach_completion_menus, full_screen_content
@@ -94,6 +95,7 @@ class PromptRuntimeMixin:
                 queued_messages=lambda: app.queued_messages,
                 decisions_answer_window=app._decisions_answer_field.window,
                 overlay_field_windows=(app._finder_field.window,),
+                picker_card=PickerCardControl(lambda: app._picker_card()),
             )
         ]
         self._agent_navigation.bind_layout(

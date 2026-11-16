@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
+from rich.console import RenderableType
 from rich.text import Text
 
 from ...accounts import (
@@ -194,9 +195,7 @@ class SlashHandlerMixin:
 
         # A second picker command replaces a load still running.
         self._stop_picker_load()
-        presenter = self._screen_presenter()
-        unit = presenter.print_unit(Text(f"{name} · loading…", style=_theme.CHROME))
-        self._picker_loading_card = (presenter.transcript, unit)
+        self._picker_loading_name = name
 
         async def run() -> None:
             try:
@@ -221,35 +220,18 @@ class SlashHandlerMixin:
         self._end_picker_load(task)
 
     def _end_picker_load(self, task: object) -> None:
-        if self._picker_loading is not task or self._picker_loading_card is None:
+        if self._picker_loading is not task:
             return
-        transcript, unit = self._picker_loading_card
-        transcript.remove(unit)
-        self._picker_loading = self._picker_loading_card = None
+        self._picker_loading = None
         self._invalidate_prompt()
 
-    def _reprint_picker_cards(self) -> None:
-        """Draw each open picker's card again after a redraw cleared the root transcript.
+    def _picker_card(self) -> RenderableType | None:
+        """The open picker's card, drawn above the composer on every paint."""
 
-        A picker owns the arrow keys and Enter; its card must stay on screen
-        while it does, or Enter acts on a row nobody can see.
-        """
-
-        root = self._transcript
-
-        def again(unit: Any, transcript: Any = root) -> Any:
-            if unit is None or transcript is not root:
-                return unit
-            return self._presenter.print_unit(unit.value)
-
-        if self._picker_loading_card is not None:
-            transcript, unit = self._picker_loading_card
-            self._picker_loading_card = (transcript, again(unit, transcript))
-        self._accounts_picker_unit = again(self._accounts_picker_unit)
-        self._model_picker_unit = again(self._model_picker_unit)
-        self._remote_picker_unit = again(
-            self._remote_picker_unit, self._remote_picker_transcript
-        )
+        if self._picker_loading is not None:
+            return Text(f"{self._picker_loading_name} · loading…", style=_theme.CHROME)
+        picker = self._accounts_picker or self._model_picker or self._remote_picker
+        return None if picker is None else picker.render()
 
     def _close_picker_for_composer_text(self, buffer: Any) -> None:
         """Text typed or pasted into the composer closes a shown picker.
@@ -311,7 +293,6 @@ class SlashHandlerMixin:
             background_notice=self._accounts_background_notice(),
         )
         self._accounts_picker = picker
-        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
         return ""
 
@@ -421,9 +402,6 @@ class SlashHandlerMixin:
             return
         picker.switching_unavailable = self._accounts_switching_unavailable()
         picker.background_notice = self._accounts_background_notice()
-        unit = self._accounts_picker_unit
-        if unit is not None:
-            self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
         self._invalidate_prompt()
 
     def accounts_picker_refresh(self) -> None:
@@ -639,11 +617,7 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
 
     def _dismiss_accounts_picker(self) -> None:
-        unit = self._accounts_picker_unit
         self._accounts_picker = None
-        self._accounts_picker_unit = None
-        if unit is not None:
-            self._transcript.remove(unit, leading_blank=True)
 
     async def slash_pin(self, args: str) -> str:
         if args.strip():
@@ -727,32 +701,18 @@ class SlashHandlerMixin:
         self._dismiss_model_picker()
         picker = ModelPicker(self.provider, choices, self.model, query)
         self._model_picker = picker
-        self._model_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
         return ""
 
-    def _repaint_model_picker(self) -> None:
-        picker = self._model_picker
-        if picker is None:
-            return
-        unit = self._model_picker_unit
-        if unit is not None:
-            self._model_picker_unit = self._transcript.replace(unit, picker.render())
-        self._invalidate_prompt()
-
     def _dismiss_model_picker(self) -> None:
-        unit = self._model_picker_unit
         self._model_picker = None
-        self._model_picker_unit = None
-        if unit is not None:
-            self._transcript.remove(unit, leading_blank=True)
 
     def model_picker_move(self, delta: int) -> None:
         picker = self._model_picker
         if picker is None:
             return
         picker.move(delta)
-        self._repaint_model_picker()
+        self._invalidate_prompt()
 
     def model_picker_select(self) -> None:
         """Run the highlighted choice through the normal ``/model`` path."""
@@ -782,7 +742,7 @@ class SlashHandlerMixin:
         if not choices or choices == picker.choices:
             return
         self._model_picker = picker.with_choices(choices)
-        self._repaint_model_picker()
+        self._invalidate_prompt()
 
     async def _switch_model(self, model: str) -> str:
         try:
