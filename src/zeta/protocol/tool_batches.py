@@ -78,7 +78,11 @@ def repair_tool_batches[T](
         complete = (
             unique and len(batch_results) == len(call_ids) and set(by_id) == set(call_ids)
         )
-        if complete or index == len(items):
+        if complete:
+            # parallel results are stored as each call ends; the model sees call order
+            result.append(item)
+            result.extend(by_id[call_id] for call_id in call_ids)
+        elif index == len(items):
             result.append(item)
             result.extend(batch_results)
         elif unique and not message.metadata.get(FAILED_TURN_MARKER):

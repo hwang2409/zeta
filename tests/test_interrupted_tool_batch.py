@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 
+from tests.support.branch_reads import branch_messages
 from tests.support.owned import await_or_fail
+from zeta.agent.tool_results import validated_tool_result
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -24,6 +26,7 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
     ToolSchema,
     ToolUseContent,
 )
@@ -32,6 +35,7 @@ from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
 from zeta.providers.ollama import _messages as ollama_messages
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.loop import agent as agent_module
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
@@ -120,12 +124,28 @@ def _registry(
 
 
 async def _die_at_beta_approval(
-    root: Path, dead: Path, ran: list[str], *, parallel: bool
+    root: Path,
+    dead: Path,
+    ran: list[str],
+    *,
+    parallel: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run one batch, approve Alpha, and copy the session at Beta's approval.
 
     The copy is what SIGKILL leaves on disk: the live process never writes again.
+    It is taken once the dispatcher has taken Alpha's result, while Beta waits.
     """
+
+    alpha_taken = asyncio.Event()
+
+    def validated(result: object, call_id: str) -> ToolResult:
+        checked = validated_tool_result(result, call_id)
+        if call_id.endswith("-Alpha"):
+            alpha_taken.set()
+        return checked
+
+    monkeypatch.setattr(agent_module, "_validated_tool_result", validated)
 
     store = ConversationStore(root, session_id="session")
     policy = ApprovalPolicy(default="ask", store=store)
@@ -157,6 +177,7 @@ async def _die_at_beta_approval(
     try:
         await await_or_fail(beta_waiting.wait(), what="Beta's approval request")
         await await_or_fail(alpha_added.wait(), what="Alpha's execution")
+        await await_or_fail(alpha_taken.wait(), what="Alpha's result")
         shutil.copytree(root, dead)
     finally:
         turn.cancel()
@@ -172,16 +193,25 @@ async def _die_at_beta_approval(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
 async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
-    tmp_path: Path, parallel: bool
+    tmp_path: Path, parallel: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ran: list[str] = []
     dead = tmp_path / "dead"
     await await_or_fail(
-        _die_at_beta_approval(tmp_path / "live", dead, ran, parallel=parallel),
+        _die_at_beta_approval(
+            tmp_path / "live", dead, ran, parallel=parallel, monkeypatch=monkeypatch
+        ),
         what="batch reaching Beta's approval",
     )
 
     store = ConversationStore(dead, session_id="session")
+    stored = [
+        (message.tool_result.tool_call_id, message.tool_result.content)
+        for message in branch_messages(store)
+        if message.tool_result is not None
+    ]
+    # Alpha finished before the process died, so its real result is on disk.
+    assert stored == [("dead-0-Alpha", "added Alpha")], stored
     policy = ApprovalPolicy(default="allow", store=store)
     registry = _registry(dead, ran, parallel=parallel, added=asyncio.Event())
     model = AddTaskModel("resumed")
@@ -206,12 +236,11 @@ async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
             for item in request
             if item.get("call_id", "").startswith("dead-")
         ]
-        alpha = MAYBE_RUN if parallel else "added Alpha"
         assert batch == [
             ("function_call", "dead-0-Alpha", None),
             ("function_call", "dead-0-Beta", None),
             ("function_call", "dead-0-Gamma", None),
-            ("function_call_output", "dead-0-Alpha", alpha),
+            ("function_call_output", "dead-0-Alpha", "added Alpha"),
             ("function_call_output", "dead-0-Beta", NOT_RUN),
             ("function_call_output", "dead-0-Gamma", NOT_RUN),
         ]
