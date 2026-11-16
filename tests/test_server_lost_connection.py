@@ -39,12 +39,12 @@ def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[Fake
 
 async def _spin(cond: Callable[[], bool], *, what: str) -> None:
     """Yield to the loop until ``cond`` holds; deterministic, no wall clock."""
-
-    async def loop() -> None:
-        while not cond():
-            await asyncio.sleep(0)
-
-    await await_or_fail(loop(), what=what)
+    try:
+        async with asyncio.timeout(10):
+            while not cond():
+                await asyncio.sleep(0)
+    except TimeoutError:
+        raise AssertionError(f"{what} did not happen within 10 s") from None
 
 
 async def _settle_until(cond: Callable[[], bool], *, turns: int = 2000) -> None:
