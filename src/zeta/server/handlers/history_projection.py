@@ -643,6 +643,18 @@ def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
     return None
 
 
+def forward_next_offset(projection: HistoryProjection, cursor: int) -> int | None:
+    """Return the wire ``next_offset`` once every group before ``cursor`` is served.
+
+    The trailing open group (index ``end``) is a real page while it holds
+    entries, so null means only that nothing is left.
+    """
+    end = len(projection.entry_groups) - 1
+    if cursor < end or (cursor == end and projection.entry_groups[end]):
+        return cursor
+    return None
+
+
 def _history_group(
     projection: HistoryProjection,
     index: int,
@@ -684,7 +696,6 @@ def _history_group_fits(
     body_size: int,
     rows: list[dict[str, object]],
     cursor: int,
-    end: int,
     backward: bool,
     validator: dict[str, object] | None,
     raw_group: tuple[object, ...],
@@ -697,9 +708,7 @@ def _history_group_fits(
     kwargs = (
         {"next_before": cursor or None, "history_validator": validator}
         if backward
-        else {
-            "next_offset": cursor if cursor < end else None,
-        }
+        else {"next_offset": forward_next_offset(projection, cursor)}
     )
     if (
         _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs)

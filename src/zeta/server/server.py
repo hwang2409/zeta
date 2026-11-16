@@ -37,7 +37,7 @@ from .control import (
     NotificationPresentation,
     ServeControl,
 )
-from .diagnostics import log_stuck_holder
+from .diagnostics import capture_peer_identity, log_stuck_holder
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
@@ -554,13 +554,18 @@ class _Client:
         self._transport_failed = False
         self._read_buffer = bytearray()
         # the request this connection runs now (method, id, monotonic start), its
-        # handler task, the one pending socket read, and a once-per-holder flag so
-        # the stuck-holder refusal log fires at most once; used to detect loss
-        # while a handler runs and to dump a stuck holder.
+        # handler task, and the one pending socket read; used to detect loss
+        # while a handler runs and to dump a stuck holder. A contended-slot
+        # refusal log also reads these plus the peer facts captured once at
+        # accept and the connect/last-frame clocks to name and age both the
+        # holder and the refused connection (no behavior change).
         self._request: tuple[str, str | int, float] | None = None
         self._run_task: asyncio.Task[object] | None = None
         self._chunk_read: asyncio.Task[bytes] | None = None
-        self._stuck_holder_reported = False
+        self._peer = capture_peer_identity(reader, writer)
+        self._connected_at = time.monotonic()
+        self._last_frame_at = self._connected_at
+        self._client_version: str | None = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.runtime, codec=self.codec
@@ -575,6 +580,7 @@ class _Client:
                     self._release_dead_connection()
                     graceful = False
                     break
+                self._last_frame_at = time.monotonic()
                 try:
                     request = self.codec.parse_request(line)
                 except ProtocolError as exc:
@@ -970,6 +976,8 @@ class _Client:
             )
         version = params.get("protocol_version")
         client_version = params.get("client_version")
+        if isinstance(client_version, str):
+            self._client_version = client_version
         self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
