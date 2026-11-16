@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from ...core.session_execution import SessionOwnedError
@@ -22,6 +24,7 @@ from . import validation
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
+    from ..control import ServeControl
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -62,6 +65,30 @@ async def _publish_project_registry_notice(self) -> None:
         )
 
 
+@asynccontextmanager
+async def _session_swap(self, park: bool) -> AsyncIterator[ServeControl | None]:
+    """Hold a session swap. Yield None to swap the attached pair in place, as
+    without ``session_park``; or, when ``park`` and the attached pair holds work,
+    yield a new pair to set up beside it. The caller commits that pair with
+    ``server.attach`` right after its setup returns; a setup that fails first is
+    closed here."""
+    server = self.server
+    outgoing = server.control
+    if not park or not outgoing.holds_work():
+        with outgoing.reserve_session_swap():
+            server.connections.replay_session_replaced()
+            yield None
+        return
+    incoming = server.new_pair()
+    with incoming.reserve_session_swap():
+        try:
+            yield incoming
+        except BaseException:
+            if server.control is not incoming:
+                await incoming.runtime.close()
+            raise
+
+
 async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params)
@@ -73,18 +100,20 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 initial_model = validation.required_string(params, "model")
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
-        with self.server.control.reserve_session_swap():
-            self.server.connections.replay_session_replaced()
+        async with _session_swap(self, "session_park" in self.features) as incoming:
             cwd = None
             if "cwd" in params:
                 validation.require_feature(self, "session_cwd", "cwd")
                 cwd = validation.directory(params, "cwd")
-            await self.server.control._terminate_pending_approvals()
-            await self.server.runtime.create_session(
+            if incoming is None:
+                await self.server.control._terminate_pending_approvals()
+            await (incoming or self.server.control).runtime.create_session(
                 provider=validation.optional_string(params, "provider"),
                 model=initial_model,
                 cwd=cwd,
             )
+            if incoming is not None:
+                self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:
                 await model_selection.apply_rpc(
                     self.server.runtime, initial_model, initial_mode
@@ -125,9 +154,13 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
         state = self.server.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
+        park = "session_park" in self.features
         # a wake in setup counts too: resuming the open session attaches, never swaps
-        if "resume_attach" in self.features and self.server.control.state_change_busy():
+        if "resume_attach" in self.features and (
+            park or self.server.control.state_change_busy()
+        ):
             session_id = await _resolve_session_id(self, params)
+            await self.server.wait_closed(session_id)
             state = self.server.runtime.state
             control = self.server.control
             if (
@@ -138,19 +171,25 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 and not control.unhealthy()
             ):
                 return await _attach_live_turn(self, bindings, candidate)
-        with self.server.control.reserve_session_swap():
-            self.server.connections.replay_session_replaced()
+            parked = self.server._parked.get(session_id)
+            if park and parked is not None:
+                return await _attach_live_turn(self, bindings, candidate, parked=parked)
+            # resuming the attached session itself never takes a new pair
+            park = park and (state is None or state.session_id != session_id)
+        async with _session_swap(self, park) as incoming:
             session_id = await _resolve_session_id(self, params)
+            await self.server.wait_closed(session_id)
             unhealthy_same_session = (
-                self.server.control.unhealthy()
+                incoming is None
+                and self.server.control.unhealthy()
                 and self.server.runtime.session_id == session_id
             )
-            await self.server.control._terminate_pending_approvals()
+            if incoming is None:
+                await self.server.control._terminate_pending_approvals()
+            runtime = (incoming or self.server.control).runtime
             if unhealthy_same_session:
                 try:
-                    await self.server.runtime.resume_session(
-                        session_id, force=True
-                    )
+                    await runtime.resume_session(session_id, force=True)
                 except SessionOwnedError as exc:
                     raise session_owned_protocol_error(exc) from exc
                 except SessionNotFoundError as exc:
@@ -166,7 +205,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                     ) from exc
             else:
                 try:
-                    await self.server.runtime.resume_session(session_id)
+                    await runtime.resume_session(session_id)
                 except SessionOwnedError as exc:
                     raise session_owned_protocol_error(exc) from exc
                 except SessionNotFoundError as exc:
@@ -175,6 +214,8 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
+            if incoming is not None:
+                self.server.attach(incoming)
             if bindings is not None:
                 headers, configs = bindings
                 await self.server.runtime.loop.set_mcp_bindings(headers, configs)
@@ -231,10 +272,13 @@ async def _attach_live_turn(
     self,
     bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
     candidate: SessionHostCommands,
+    *,
+    parked: ServeControl | None = None,
 ) -> dict[str, object]:
-    """Attach to the active session's busy turn without a swap: the turn, its
-    approvals and children stay; only this connection's bindings are re-supplied."""
-    control = self.server.control
+    """Attach to the active session's busy turn, or to a ``parked`` pair, without
+    a reopen: the turn, its approvals and children stay; only this connection's
+    bindings are re-supplied."""
+    control = parked or self.server.control
     reattach = None
     if bindings is not None:
         headers, configs = bindings
@@ -254,6 +298,9 @@ async def _attach_live_turn(
                 ErrorDescriptor.OPERATION_BUSY,
                 "mcp_bindings cannot change during a live turn",
             )
+    if parked is not None:
+        # one step after the last await: the pair cannot start closing first
+        self.server.attach(parked)
     # Bind host commands before the await, so a turn that ends meanwhile never
     # sees a half-attached session. The running turn keeps its snapshot.
     previous = (control._active_host_commands, control._host_binding_required)
@@ -265,10 +312,11 @@ async def _attach_live_turn(
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
             raise
-        if not control.state_change_busy():
-            # the turn ended during the rebind: this is a plain resume of an idle session
-            await control.controller_ready()
-            return {"session": session_snapshot(self)}
+    if not control.state_change_busy():
+        # the turn ended during the rebind, or a parked pair only held background
+        # work: this is a plain resume of an idle session
+        await control.controller_ready()
+        return {"session": session_snapshot(self)}
     return {"session": session_snapshot(self), "attached": "live_turn"}
 
 
@@ -422,12 +470,15 @@ def session_snapshot(self) -> dict[str, object] | None:
 
 
 def session_runtime_state(self) -> str:
-    runtime = self.server.runtime
-    control = self.server.control
+    return _pair_state(self.server.control)
+
+
+def _pair_state(control: ServeControl) -> str:
+    state = control.runtime.state
     return (
         "idle"
-        if control.unhealthy() or runtime.state is None
-        else "running" if control.state_change_busy() else runtime.state.status
+        if control.unhealthy() or state is None
+        else "running" if control.state_change_busy() else state.status
     )
 
 
@@ -522,6 +573,15 @@ async def status(
         "store": runtime.opened.store if runtime.opened is not None else None,
     }
     status.update(suffix)
+    if "session_park" in self.features:
+        status["parked_sessions"] = [
+            {
+                "session_id": session_id,
+                "state": _pair_state(control),
+                "pending_approvals": len(control.pending_approvals_now()),
+            }
+            for session_id, control in self.server._parked.items()
+        ]
     slash_command = self.server.control.slash_lock.status()
     if slash_command is not None:
         status["slash_command"] = slash_command
