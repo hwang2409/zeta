@@ -1453,7 +1453,7 @@ async def test_parallel_cancellation_persists_resolved_results(tmp_path: Path) -
     ids=["first-canceled", "second-canceled"],
 )
 @pytest.mark.asyncio
-async def test_parallel_cancellation_keeps_call_order(
+async def test_parallel_cancellation_errors_only_the_canceled_call(
     tmp_path: Path,
     aborted_index: int,
 ) -> None:
@@ -1485,25 +1485,32 @@ async def test_parallel_cancellation_keeps_call_order(
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
     task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(started[0].wait(), 10)
-    await asyncio.wait_for(started[1].wait(), 10)
-    await asyncio.wait_for(completed.wait(), 10)
-    await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(started[0].wait(), 10)
+        await asyncio.wait_for(started[1].wait(), 10)
+        await asyncio.wait_for(completed.wait(), 10)
+        await asyncio.sleep(0)
+        task.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 10)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
 
-    results = [
-        message.tool_result
-        for message in branch_messages(store)
-        if message.tool_result is not None
-    ]
-    assert [result.tool_call_id for result in results] == [call.id for call in calls]
-    assert [result.is_error for result in results] == [
-        aborted_index == 0,
-        aborted_index == 1,
-    ]
+        results = {
+            message.tool_result.tool_call_id: message.tool_result.is_error
+            for message in branch_messages(store)
+            if message.tool_result is not None
+        }
+        # results are stored as calls end, so only the canceled call is an error
+        assert results == {
+            calls[0].id: aborted_index == 0,
+            calls[1].id: aborted_index == 1,
+        }
+    finally:
+        task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        await loop.close()
+        await registry.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -1600,48 +1607,66 @@ def test_finalize_tool_results(
 
 
 @pytest.mark.asyncio
-async def test_parallel_results_persist_in_call_order(tmp_path: Path) -> None:
+async def test_parallel_results_persist_as_each_ends_and_reach_the_model_in_call_order(
+    tmp_path: Path,
+) -> None:
     first_call = ToolCall("call-1", "first", {})
     second_call = ToolCall("call-2", "second", {})
-    backend = FakeBackend([ScriptedTurn([], [first_call, second_call])])
+    backend = FakeBackend(
+        [ScriptedTurn([], [first_call, second_call]), ScriptedTurn([TextContent("done")])]
+    )
     store = ConversationStore(tmp_path)
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
-    first_started = asyncio.Event()
-    second_started = asyncio.Event()
-    first_release = asyncio.Event()
-    second_release = asyncio.Event()
+    second_ended = asyncio.Event()
 
     async def first(arguments: dict[str, object]) -> str:
-        first_started.set()
-        await asyncio.wait_for(first_release.wait(), 10)
+        await asyncio.wait_for(second_ended.wait(), 10)
         return "one"
 
     async def second(arguments: dict[str, object]) -> str:
-        second_started.set()
-        await asyncio.wait_for(second_release.wait(), 10)
         return "two"
+
+    async def run() -> list[StreamEvent]:
+        seen: list[StreamEvent] = []
+        async for event in loop.run_turn("start", origin=MessageOrigin.USER):
+            seen.append(event)
+            if (
+                event.type is StreamEventType.TOOL_EXECUTION_END
+                and event.tool_call is not None
+                and event.tool_call.id == second_call.id
+            ):
+                second_ended.set()
+        return seen
 
     registry.register("first", first, parallel_safe=True)
     registry.register("second", second, parallel_safe=True)
     loop = AgentLoop(backend, store, registry=registry, skill_catalog=SkillCatalog.empty())
+    try:
+        events = await asyncio.wait_for(run(), 10)
+        stored = [
+            message.tool_result.tool_call_id
+            for message in branch_messages(store)
+            if message.tool_result is not None
+        ]
+    finally:
+        await loop.close()
+        await registry.close()
+        store.close()
 
-    task = asyncio.create_task(collect(loop.run_turn("start", origin=MessageOrigin.USER)))
-    await asyncio.wait_for(first_started.wait(), 10)
-    await asyncio.wait_for(second_started.wait(), 10)
-    second_release.set()
-    first_release.set()
-    await asyncio.wait_for(task, 10)
-
-    results = [
-        message.tool_result
-        for message in branch_messages(store)
+    ended = [
+        event.tool_call.id
+        for event in events
+        if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_call is not None
+    ]
+    # each result is written and announced when its call ends
+    assert stored == ended == [second_call.id, first_call.id]
+    request = backend.calls[1][0]
+    sent = [
+        (message.tool_result.tool_call_id, message.tool_result.content)
+        for message in request
         if message.tool_result is not None
     ]
-    assert [result.tool_call_id for result in results] == [
-        first_call.id,
-        second_call.id,
-    ]
-    assert [result.content for result in results] == ["one", "two"]
+    assert sent == [(first_call.id, "one"), (second_call.id, "two")]
 
 
 @pytest.mark.asyncio
@@ -3168,15 +3193,13 @@ async def test_failed_child_returns_error_and_sibling_survives(tmp_path: Path) -
         for message in branch_messages(store)
         if message.tool_result is not None
     ]
-    assert [result.tool_call_id for result in results] == [
-        "child-dies",
-        "child-lives",
-    ]
-    assert results[0].is_error
-    assert "child connection dropped" in results[0].content
-    assert results[1].content.startswith("sibling complete")
+    by_id = {result.tool_call_id: result for result in results}
+    assert len(results) == 2
+    assert by_id["child-dies"].is_error
+    assert "child connection dropped" in by_id["child-dies"].content
+    assert by_id["child-lives"].content.startswith("sibling complete")
     assert branch_messages(store)[-1].content[0].text == "parent survived"
-    child_path = Path(results[0].structured_content["child_session_path"])
+    child_path = Path(by_id["child-dies"].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert branch_messages(child_store)[-1].metadata["turn_failed"] is True
 
