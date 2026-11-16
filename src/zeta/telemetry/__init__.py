@@ -120,20 +120,20 @@ class Telemetry:
     def agent_span(
         self, profile: str, *, agent_name: str, conversation_id: str, model: str, depth: int, background: bool
     ) -> SpanHandle:
-        return self._span(f"invoke_agent {profile}", attributes={
+        return self._span(f"invoke_agent {profile}", operation="agent", attributes={
             "gen_ai.operation.name": "invoke_agent", "zeta.agent.name": agent_name,
             "gen_ai.conversation.id": conversation_id, "gen_ai.request.model": model,
             "zeta.agent.depth": depth, "zeta.background": background,
         })
 
     def turn_span(self, *, conversation_id: str, turn_number: int, notification: bool, tool_count: int) -> SpanHandle:
-        return self._span("zeta.turn", attributes={
+        return self._span("zeta.turn", operation="turn", attributes={
             "gen_ai.conversation.id": conversation_id, "zeta.turn.number": turn_number,
             "zeta.notification": notification, "zeta.tool.count": tool_count,
         })
 
     def inference_span(self, model: str, *, provider: str, stream: bool, conversation_id: str) -> SpanHandle:
-        return self._span("chat " + model, kind="client", attributes={
+        return self._span("chat " + model, kind="client", operation="inference", attributes={
             "gen_ai.operation.name": "chat", "gen_ai.provider.name": provider,
             "gen_ai.request.model": model, "gen_ai.conversation.id": conversation_id,
             "zeta.stream": stream,
@@ -142,25 +142,25 @@ class Telemetry:
     def tool_span(
         self, name: str, *, tool_type: str, call_id: str, agent_name: str, conversation_id: str
     ) -> SpanHandle:
-        return self._span("execute_tool " + name, attributes={
+        return self._span("execute_tool " + name, operation="tool", attributes={
             "gen_ai.operation.name": "execute_tool", "zeta.tool.name": name,
             "zeta.tool.type": tool_type, "zeta.tool.call.id": call_id,
             "zeta.agent.name": agent_name, "gen_ai.conversation.id": conversation_id,
         })
 
     def context_span(self, *, emergency: bool, tokens_before: int, tokens_after: int, marker_count: int) -> SpanHandle:
-        return self._span("zeta.context.compact", attributes={
+        return self._span("zeta.context.compact", operation="context", attributes={
             "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
             "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
         })
 
     def serve_span(self, method: str) -> SpanHandle:
-        return self._span("serve " + method, kind="server", attributes={"rpc.system": "jsonrpc", "rpc.method": method})
+        return self._span("serve " + method, kind="server", operation="serve", attributes={"rpc.system": "jsonrpc", "rpc.method": method})
 
-    def _span(self, name: str, *, kind: str = "internal", attributes: Mapping[str, object] | None = None) -> SpanHandle:
+    def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:
         if self._implementation is None:
             return SpanHandle()
-        return self._implementation._span(name, kind=kind, attributes=attributes)
+        return self._implementation._span(name, kind=kind, operation=operation, attributes=attributes)
 
 
 __all__ = ["SpanHandle", "Telemetry", "TelemetryError", "TelemetryStatus"]

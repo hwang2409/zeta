@@ -213,41 +213,54 @@ def test_facade_table_filters_every_operation_and_handle(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", MemoryExporter)
     instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
-    hostile = "gen_ai.input.messages.secret-value"
+    reserved_names = (
+        "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
+        "gen_ai.tool.call.arguments", "gen_ai.tool.call.result",
+    )
+    leading = tuple(f"{name}.secret-value" for name in reserved_names)
+    embedded = tuple(f"safe.{name}.secret-value" for name in reserved_names)
+    adversarial = ("multi\nline", "madeup-provider", "sk-secret", "ghp_secret", "Bearer secret", "unicode-☃", "x" * 129)
     operations = (
-        lambda: instance.agent_span(hostile, agent_name=hostile, conversation_id=hostile, model=hostile, depth=1, background=True),
-        lambda: instance.turn_span(conversation_id=hostile, turn_number=1, notification=True, tool_count=1),
-        lambda: instance.inference_span(hostile, provider=hostile, stream=True, conversation_id=hostile),
-        lambda: instance.tool_span(hostile, tool_type=hostile, call_id=hostile, agent_name=hostile, conversation_id=hostile),
-        lambda: instance.context_span(emergency=True, tokens_before=1, tokens_after=2, marker_count=3),
-        lambda: instance.serve_span(hostile),
+        lambda value: instance.agent_span(value, agent_name=value, conversation_id=value, model=value, depth=1, background=True),
+        lambda value: instance.turn_span(conversation_id=value, turn_number=1, notification=True, tool_count=1),
+        lambda value: instance.inference_span(value, provider=adversarial[1], stream=True, conversation_id=value),
+        lambda value: instance.tool_span(value, tool_type=value, call_id=value, agent_name=value, conversation_id=value),
+        lambda value: instance.context_span(emergency=True, tokens_before=1, tokens_after=2, marker_count=3),
+        lambda value: instance.serve_span(value),
     )
     try:
-        for operation in operations:
-            with operation() as span:
+        for operation, value in zip(operations, leading):
+            with operation(value) as span:
+                for value in embedded:
+                    span.set_response(model=value, finish_reason=value)
+                    span.retry(attempt=1, reason=value, delay=4, after=True)
+                    span.approval_requested(decision=value, scope=value)
+                    span.approval_resolved(decision=value, scope=value, duration=5)
                 span.set_usage(input_tokens=1, output_tokens=2, total_tokens=3)
-                span.set_response(model=hostile, finish_reason=hostile)
                 span.set_sizes(argument_bytes=4, result_bytes=5)
-                span.retry(attempt=1, reason=hostile, delay=4, after=True)
-                span.approval_requested(decision=hostile, scope=hostile)
-                span.approval_resolved(decision=hostile, scope=hostile, duration=5)
-                span.fail(ValueError(hostile))
+                span.fail(ValueError(embedded[0]))
         try:
-            with instance.tool_span(hostile, tool_type=hostile, call_id=hostile, agent_name=hostile, conversation_id=hostile):
-                raise LookupError(hostile)
+            with instance.tool_span(leading[0], tool_type=embedded[0], call_id=embedded[1], agent_name=embedded[2], conversation_id=embedded[3]) as span:
+                span.fail(LookupError(embedded[4]))
+                raise LookupError(embedded[4])
         except LookupError:
             pass
     finally:
         instance.shutdown()
 
-    assert len(exported) == 7
+    assert len(exported) == 6
+    from zeta.telemetry.runtime import _ALLOWED_ATTRIBUTE_KEYS
+
     for record in exported:
-        assert all(hostile not in str(record.attributes).lower() for _ in [0])
-        assert all(hostile not in str(event.attributes).lower() for event in record.events)
+        assert set(record.attributes) <= _ALLOWED_ATTRIBUTE_KEYS
+        exported_text = (record.name, str(record.attributes), *(event.name for event in record.events), *(str(event.attributes) for event in record.events))
+        for name in reserved_names:
+            assert all(name not in value for value in exported_text)
+        for value in adversarial:
+            assert all(value not in text for text in exported_text)
         assert record.status.description is None
         assert not any(event.name == "exception" or "exception" in event.name for event in record.events)
         assert record.attributes.get("error.type") == "ValueError" or record.attributes.get("error.type") == "LookupError"
-        assert all("gen_ai.input.messages" not in name for name in (record.name, *(event.name for event in record.events)))
 
 def test_batch_queue_and_shared_logger_are_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     from opentelemetry.exporter.otlp.proto.http import trace_exporter

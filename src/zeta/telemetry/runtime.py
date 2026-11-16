@@ -15,31 +15,39 @@ from . import SpanHandle, TelemetryError, TelemetryStatus
 from .attributes import RESERVED_CONTENT_ATTRIBUTES
 
 _RESERVED_PREFIXES = tuple(RESERVED_CONTENT_ATTRIBUTES)
-_ALLOWED_ATTRIBUTE_KEYS = frozenset({
-    "gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model",
-    "gen_ai.response.finish_reasons", "gen_ai.conversation.id", "zeta.agent.depth", "zeta.background",
-    "zeta.turn.number", "zeta.notification", "zeta.tool.count", "zeta.tool.name", "zeta.tool.type",
-    "zeta.tool.call.id", "zeta.agent.name", "zeta.stream", "zeta.emergency", "zeta.tokens.before",
-    "zeta.tokens.after", "zeta.marker.count", "rpc.system", "rpc.method", "error.type",
-    "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "zeta.tool.call.arguments.size",
-    "zeta.tool.call.result.size",
+_OPERATION_ATTRIBUTE_KEYS = {
+    "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background"}),
+    "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification", "zeta.tool.count"}),
+    "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
+    "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
+    "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
+    "serve": frozenset({"rpc.system", "rpc.method"}),
+}
+_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {
+    "error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens",
+    "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size",
 })
 _IDENTIFIER = __import__("re").compile(r"[A-Za-z0-9_.:/-]{1,128}\Z")
+_MODEL = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_PROVIDERS = frozenset({"claude", "codex", "ollama"})
 
 
-def _safe_string(value: str) -> str:
-    if not _IDENTIFIER.fullmatch(value) or any(value == name or value.startswith(name) for name in _RESERVED_PREFIXES):
+def _safe_string(value: str, field: str | None = None) -> str:
+    valid = _MODEL if field in {"gen_ai.request.model", "gen_ai.response.model"} else _IDENTIFIER
+    if field == "gen_ai.provider.name" and value not in _PROVIDERS:
+        return "_invalid"
+    if value.startswith(("sk-", "ghp_", "Bearer ")) or not valid.fullmatch(value) or any(name in value for name in _RESERVED_PREFIXES):
         return "_invalid"
     return value
 
 
-def _safe_attributes(attributes: Mapping[str, object] | None) -> dict[str, object]:
+def _safe_attributes(attributes: Mapping[str, object] | None, allowed_keys: frozenset[str]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in (attributes or {}).items():
-        if key not in _ALLOWED_ATTRIBUTE_KEYS or key in RESERVED_CONTENT_ATTRIBUTES:
+        if key not in allowed_keys or key not in _ALLOWED_ATTRIBUTE_KEYS:
             continue
         if isinstance(value, str):
-            result[key] = _safe_string(value)
+            result[key] = _safe_string(value, key)
         elif isinstance(value, (int, bool)):
             result[key] = value
     return result
@@ -102,7 +110,7 @@ class _SpanHandle(SpanHandle):
 
     def _set(self, name: str, value: object) -> None:
         if isinstance(value, str):
-            value = _safe_string(value)
+            value = _safe_string(value, name)
         self._span.set_attribute(name, value)
 
     def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
@@ -120,7 +128,7 @@ class _SpanHandle(SpanHandle):
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
         self._span.add_event("gen_ai.client.retry", attributes={
-            "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": _safe_string(reason),
+            "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": _safe_string(reason, "gen_ai.retry.reason"),
             "gen_ai.retry.delay": delay, "gen_ai.retry.after": after,
         })
 
@@ -194,14 +202,14 @@ class _Runtime:
                 logger.setLevel(level)
                 logger.handlers[:] = handlers
 
-    def _span(self, name: str, *, kind: str, attributes: Mapping[str, object] | None) -> object:
+    def _span(self, name: str, *, kind: str, attributes: Mapping[str, object] | None, operation: str) -> object:
         from opentelemetry.trace import SpanKind
 
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
         if " " in name:
             prefix, suffix = name.split(" ", 1)
             name = f"{prefix} {_safe_string(suffix)}"
-        safe_attributes = _safe_attributes(attributes)
+        safe_attributes = _safe_attributes(attributes, _OPERATION_ATTRIBUTE_KEYS[operation])
         return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
 
     def current_trace_context(self) -> dict[str, str]:
