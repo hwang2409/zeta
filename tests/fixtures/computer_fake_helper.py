@@ -17,7 +17,6 @@ error mapping without a real desktop. Behavior is driven by the request op:
 import base64
 import json
 import sys
-import time
 
 # a complete 1x1 PNG so MacBackend.screenshot decodes real image bytes.
 _PNG_1x1 = bytes.fromhex(
@@ -63,14 +62,24 @@ def main():
             respond({"id": rid, "ok": False,
                      "error": {"code": req.get("code", "internal"),
                                "message": req.get("message", "boom")}})
-        elif op == "slow":
-            time.sleep(req.get("seconds", 5))
-            respond({"id": rid, "ok": True})
+        elif op == "block":
+            # Wait for another line; the client must terminate this process on deadline.
+            sys.stdin.readline()
         elif op == "crash":
             sys.exit(1)
         elif op == "garbage":
             sys.stdout.write("this is not json\n")
             sys.stdout.flush()
+        elif op == "partial":
+            sys.stdout.write('{"id":' + str(rid))
+            sys.stdout.flush()
+            return
+        elif op == "wrong_id":
+            respond({"id": rid + 1, "ok": True})
+        elif op == "bad_shape":
+            respond({"id": rid, "ok": "yes"})
+        elif op == "bad_error":
+            respond({"id": rid, "ok": False, "error": "bad"})
         elif op == "big":
             respond({"id": rid, "ok": True, "blob": "x" * req.get("size", 500000)})
         else:

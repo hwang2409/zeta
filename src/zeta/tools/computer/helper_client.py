@@ -104,50 +104,80 @@ class HelperClient:
     # requests ------------------------------------------------------------------
 
     def request(self, op: str, *, timeout: float | None = None, **args: object) -> dict:
-        """Send one op and return its response payload (without ``id``/``ok``).
-
-        Raises :class:`HelperError` on an ``ok: false`` response, :class:`HelperTimeout` when the
-        helper is silent past the deadline, and :class:`HelperProtocolError` when it dies or
-        replies with something unparseable.
-        """
+        """Send one operation under one deadline covering lock, write, and read."""
         if self._proc is None or self._sel is None:
             raise RuntimeError("helper not started")
-        deadline = time.monotonic() + (self._timeout if timeout is None else timeout)
-        with self._lock:
+        duration = self._timeout if timeout is None else timeout
+        deadline = time.monotonic() + duration
+        if not self._lock.acquire(timeout=max(0.0, duration)):
+            raise HelperTimeout(f"helper did not respond within {duration}s")
+        try:
             request_id = self._next_id
             self._next_id += 1
-            payload = {"id": request_id, "op": op, **args}
-            self._write(payload)
-            while True:
-                line = self._read_line(deadline)
-                try:
-                    response = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise HelperProtocolError(f"invalid response line: {line!r}") from exc
-                if not isinstance(response, dict):
-                    raise HelperProtocolError(f"response not an object: {line!r}")
-                if response.get("id") != request_id:
-                    # a stale line for an earlier request; skip it and keep reading.
-                    continue
-                if not response.get("ok"):
-                    error = response.get("error") or {}
-                    raise HelperError(
-                        str(error.get("code", "internal")),
-                        str(error.get("message", "")),
-                    )
-                return {k: v for k, v in response.items() if k not in ("id", "ok")}
+            self._write({"id": request_id, "op": op, **args}, deadline)
+            return self._parse_response(self._read_line(deadline), request_id)
+        except HelperTimeout:
+            self._kill()
+            raise
+        finally:
+            self._lock.release()
+
+    @staticmethod
+    def _parse_response(line: bytes, request_id: int) -> dict:
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise HelperProtocolError(f"invalid response line: {line!r}") from exc
+        if not isinstance(response, dict):
+            raise HelperProtocolError(f"response not an object: {line!r}")
+        if type(response.get("id")) is not int or response["id"] != request_id:
+            raise HelperProtocolError(f"response id does not match request: {line!r}")
+        if type(response.get("ok")) is not bool:
+            raise HelperProtocolError(f"response ok is not boolean: {line!r}")
+        if not response["ok"]:
+            error = response.get("error")
+            if (not isinstance(error, dict) or not isinstance(error.get("code"), str)
+                    or not isinstance(error.get("message"), str)):
+                raise HelperProtocolError(f"invalid error response: {line!r}")
+            raise HelperError(error["code"], error["message"])
+        return {k: v for k, v in response.items() if k not in ("id", "ok")}
+
+    def _kill(self) -> None:
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
 
     # framing -------------------------------------------------------------------
 
-    def _write(self, payload: dict) -> None:
+    def _write(self, payload: dict, deadline: float) -> None:
         proc = self._proc
         assert proc is not None and proc.stdin is not None
         data = json.dumps(payload).encode("utf-8") + b"\n"
+        fd = proc.stdin.fileno()
         try:
-            proc.stdin.write(data)
-            proc.stdin.flush()
+            os.set_blocking(fd, False)
+            view = memoryview(data)
+            while view:
+                try:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._wait_for(fd, selectors.EVENT_WRITE, remaining):
+                        raise HelperTimeout("helper request write timed out")
         except (BrokenPipeError, OSError) as exc:
             raise HelperProtocolError("helper stdin closed") from exc
+        finally:
+            os.set_blocking(fd, True)
+
+    @staticmethod
+    def _wait_for(fd: int, event: int, timeout: float) -> bool:
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(fd, event)
+            return bool(selector.select(timeout))
+        finally:
+            selector.close()
 
     def _read_line(self, deadline: float) -> bytes:
         proc = self._proc

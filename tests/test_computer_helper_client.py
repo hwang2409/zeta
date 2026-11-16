@@ -52,7 +52,7 @@ def test_large_payload_spanning_chunks() -> None:
 
 def test_timeout_does_not_hang() -> None:
     with make_client(timeout=0.2) as client, pytest.raises(HelperTimeout):
-        client.request("slow", seconds=5)
+        client.request("block")
 
 
 def test_crash_raises_protocol_error() -> None:
@@ -77,3 +77,19 @@ def test_request_before_start_errors() -> None:
     client = make_client()
     with pytest.raises(RuntimeError):
         client.request("hello")
+
+
+def test_partial_line_at_eof_raises_protocol_error() -> None:
+    with make_client() as client, pytest.raises(HelperProtocolError):
+        client.request("partial")
+
+
+def test_id_mismatch_is_protocol_error() -> None:
+    with make_client() as client, pytest.raises(HelperProtocolError):
+        client.request("wrong_id")
+
+
+@pytest.mark.parametrize("op", ["bad_shape", "bad_error"])
+def test_malformed_response_is_protocol_error(op: str) -> None:
+    with make_client() as client, pytest.raises(HelperProtocolError):
+        client.request(op)

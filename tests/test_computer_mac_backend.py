@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import sys
 from pathlib import Path
 
 import pytest
 
-from zeta.protocol.types import ToolCall
+from zeta.config.settings import load_settings, resolve
+from zeta.core.project_context import ProjectContext
+from zeta.core.session import SessionManager
+from zeta.runtime.cleanup import close_session
+from zeta.runtime.composition import compose_runtime
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.skills import SkillCatalog
+from zeta.tools.computer import mac as mac_module
+from zeta.protocol.types import ToolCall
 from zeta.tools import ToolRegistry
 from zeta.tools.computer.backend import Button, ComputerError, ScreenFrame, ScreenState
 from zeta.tools.computer.mac import MacBackend
@@ -18,6 +27,41 @@ FAKE = Path(__file__).parent / "fixtures" / "computer_fake_helper.py"
 
 def make_backend() -> MacBackend:
     return MacBackend([sys.executable, str(FAKE)])
+
+
+@pytest.mark.asyncio
+async def test_composition_closes_helper_on_session_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = make_backend()
+    monkeypatch.setattr(mac_module, "make_mac_backend", lambda: backend)
+    config = resolve(
+        load_settings(home=tmp_path / "home").settings,
+        cli_provider="codex",
+        cli_model="offline",
+        cli_yolo=None,
+        cli_token_budget=None,
+    )
+    config = dataclasses.replace(config, computer_enabled=True)
+    runtime = await asyncio.to_thread(
+        compose_runtime,
+        home=tmp_path / "home",
+        cwd=tmp_path,
+        manager=SessionManager(tmp_path / "home"),
+        config=config,
+        provider="codex",
+        model="offline",
+        project_context=ProjectContext("system", ()),
+        backend_builder=lambda *_args, **_kwargs: (object(), "offline"),
+        skill_catalog=SkillCatalog.empty(),
+        agent_catalog=AgentCatalog.empty(),
+    )
+    try:
+        await backend.state()
+        assert backend._client._proc is not None
+    finally:
+        await close_session(runtime.loop)
+    assert backend._client._proc is None
 
 
 @pytest.mark.asyncio

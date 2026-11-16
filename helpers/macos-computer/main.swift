@@ -325,6 +325,7 @@ func pointArg(_ req: [String: Any]) throws -> CGPoint {
 func guardInput() throws {
     if screenIsLocked() { throw HelperError.locked }
     if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
+    if !AXIsProcessTrusted() { throw HelperError.notPermitted("Accessibility permission is required") }
 }
 
 func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
@@ -346,6 +347,9 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         return ["x": Int(loc.x), "y": Int(loc.y)]
     case "screenshot":
         if screenIsLocked() { throw HelperError.locked }
+        if !CGPreflightScreenCaptureAccess() {
+            throw HelperError.notPermitted("Screen Recording permission is required")
+        }
         let display = (req["display"] as? Int) ?? 0
         let cap = try captureDisplay(display)
         return [

@@ -300,7 +300,10 @@ def compose_runtime(
             computer_backend = make_mac_backend()
             if computer_backend is not None:
                 registry.computer_backend = computer_backend
-                cleanup.callback(computer_backend.close)
+                async def close_computer_backend() -> None:
+                    await asyncio.to_thread(computer_backend.close)
+
+                registry.add_cleanup(close_computer_backend)
         if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
 
