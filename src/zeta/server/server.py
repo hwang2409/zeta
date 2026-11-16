@@ -31,6 +31,7 @@ from . import (
     accounts,
     login,
 )
+from . import control as control_module
 from .connections import ConnectionRegistry, last_turn_outcome
 from .control import (
     NotificationPresentation,
@@ -977,7 +978,7 @@ class _Client:
             # a controller hello waits up to one shared handoff deadline for a
             # lost holder to release the slot, then passes the time that is left
             # to controller_claimed so the total wait never exceeds one deadline.
-            deadline = self.server.control.handoff_deadline
+            deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
             if params.get("role", "controller") == "controller":
                 start = time.monotonic()
                 await self.connections.wait_for_lost_controller(deadline)

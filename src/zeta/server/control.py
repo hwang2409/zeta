@@ -454,16 +454,8 @@ class ServeControl:
         self._controller_release_task = task
         return task
 
-    @property
-    def handoff_deadline(self) -> float:
-        """The current shared controller-handoff budget (read live for tests)."""
-        return CONTROLLER_HANDOFF_DEADLINE_SECONDS
-
     async def controller_claimed(
-        self,
-        *,
-        reconnect: bool = False,
-        require_host_binding: bool = False,
+        self, *, reconnect: bool = False, require_host_binding: bool = False,
         deadline: float | None = None,
     ) -> bool:
         if deadline is None:
@@ -1331,13 +1323,15 @@ class ServeControl:
                 self._event(event, session_id=session_id, background=True)
             )
 
-    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor | None, fields: dict[str, object]) -> None:
         connections = self.server.connections
         if connections is None:
             return
         def publish() -> None:
             # the sink may run on a worker thread; check idleness on the loop
             self._maybe_idle()
+            if event is None:
+                return
             controller = connections.controller_metadata()
             if not self.closing and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
