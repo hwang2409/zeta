@@ -240,3 +240,56 @@ async def test_output_writer_failure_closes_connection_and_releases_slot(
         await _assert_released_and_reusable(server, transport, output, released)
         assert len(_writer_failures(caplog)) == 1
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+async def test_reply_after_writer_failure_fails_at_once_and_releases_slot(
+    tmp_path: Path,
+    transport: Transport,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A handler still running when the writer dies must not queue its reply into
+    the dead queue: the reply fails at once, so the loop reads EOF and releases."""
+    caplog.set_level(logging.ERROR, logger="zeta.server.connections")
+    server, client, session_id, owner, output, released = await _started_owner(
+        tmp_path, transport, monkeypatch
+    )
+    connections = server.connections
+    assert connections is not None
+    reading, finish_read = asyncio.Event(), asyncio.Event()
+    read_history = connections.read_replay_history
+
+    async def held_read(*args: Any, **kwargs: Any) -> Any:
+        reading.set()
+        await await_or_fail(finish_read.wait(), what="finish the held history read")
+        return await read_history(*args, **kwargs)
+
+    original = connections._end_frame_write
+
+    def broken(target: Any, item: Any) -> None:
+        original(target, item)
+        if HELD_EVENT in item.payload:
+            raise RuntimeError("injected output writer failure")
+
+    # test-contract: seam hold the join handler at its off-loop history read
+    monkeypatch.setattr(connections, "read_replay_history", held_read)
+    # test-contract: seam an unexpected bug inside the output writer task
+    monkeypatch.setattr(connections, "_end_frame_write", broken)
+    async with _closing(server, client, finish_read):
+        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+        await await_or_fail(reading.wait(), what="join handler is reading history")
+        # a live event trips the guard while the join handler is mid-way
+        connections._publish_observer(
+            connections._connections[owner], owner.codec.response(99, {})
+        )
+        writer = output.writer_task
+        assert writer is not None
+        await await_or_fail(writer, what="output writer ended")
+        assert len(_writer_failures(caplog)) == 1
+        # a late send fails at once instead of waiting on a queue nobody drains
+        late = owner.codec.response(98, {})
+        assert await await_or_fail(connections.send(owner, late), what="late send") is False
+        finish_read.set()
+        await _assert_released_and_reusable(server, transport, output, released)
