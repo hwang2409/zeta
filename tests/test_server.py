@@ -12019,6 +12019,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
     reader, writer, session_id = await _ready_extensions(server)
     path = server.runtime.opened.store.path
     await _request(reader, writer, 3, "new_session", {"provider": "codex"})
+    retained = path.read_bytes()
     with path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
     damaged = path.read_bytes()
@@ -12080,7 +12081,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
             path.with_name(
                 f"conversation.quarantine.{quarantine_id}.jsonl"
             ).read_bytes()
-            == damaged
+            == damaged[len(retained) :]
         )
         resumed = (
             await _request(reader, writer, 7, "resume", {"session_id": session_id})
