@@ -1040,7 +1040,7 @@ async def test_a_panel_behind_a_running_slash_command_owns_its_keys(
     gate = asyncio.Event()
 
     async def held_compact(_app: TUIApp) -> str:
-        await await_or_fail(gate.wait(), what="compact gate")
+        await await_or_fail(gate.wait(), timeout=60, what="compact gate")
         return "compact: nothing to compact"
 
     monkeypatch.setattr(TUIApp, "slash_compact", held_compact)
@@ -1055,13 +1055,17 @@ async def test_a_panel_behind_a_running_slash_command_owns_its_keys(
                 lambda: app.slash_lock.holder is not None, what="/compact did not start"
             )
             await driver.send("/tasks" + ENTER + "zz" + ENTER)
-            await driver.until(
-                lambda: _window_drawn(driver, app._tasks_panel_window),
-                what="/tasks waited for /compact",
+            await driver.settle("keys taken while /compact runs")
+            assert _window_drawn(driver, app._tasks_panel_window), (
+                f"/tasks waited for /compact; screen:\n{driver.screen()}"
             )
         finally:
             gate.set()
-        await driver.until(lambda: app.slash_lock.holder is None, what="/compact did not end")
+        await driver.until(
+            lambda: app.slash_lock.holder is None
+            and (app._active_task is None or app._active_task.done()),
+            what="/compact or a queued turn did not end",
+        )
         await driver.settle("settled screen after /compact")
         sent = [str(messages[-1].content) for messages, _tools in backend.calls]
         assert not sent and driver.session.default_buffer.text == "", (
