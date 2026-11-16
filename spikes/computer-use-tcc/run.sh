@@ -23,6 +23,7 @@ BIN="$BUILD_DIR/cuspike"
 IDENT="com.henry.zeta.cuspike"
 CERTNAME="${CUSPIKE_CERT:-Zeta CU Spike}"
 RESULTS="${CUSPIKE_RESULTS:-$HOME/.zeta/scratch/computer-use/slice0-results.md}"
+CAPTURE_DIR="${CUSPIKE_CAPTURE_DIR:-${TMPDIR:-/tmp}/cuspike-${UID}}"
 
 # The python we grant must be the SAME real binary zeta runs as. zeta's uv-tool
 # python is a symlink; resolve it so the grant is representative of real sessions.
@@ -145,8 +146,11 @@ cmd_grant() {
 
 cmd_capture() {
   log ""
-  log "## capture @ $(ts)   (python, harmless: temp file + size only)"
-  pyrun capture 2>&1 | tee -a "$RESULTS"
+  log "## capture @ $(ts)   (python, harmless: private temp file + size only)"
+  umask 077
+  mkdir -p "$CAPTURE_DIR"
+  chmod 700 "$CAPTURE_DIR"
+  CUSPIKE_CAPTURE_DIR="$CAPTURE_DIR" pyrun capture 2>&1 | tee -a "$RESULTS"
 }
 
 cmd_input() {
@@ -161,19 +165,29 @@ cmd_rebuild() {
   log ""
   log "## rebuild @ $(ts)   mode=$mode  (does the grant survive a cdhash change?)"
   local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -n 's/.*CDHash=\(.*\)/\1/p' | head -1)"
-  cmd_build "$mode" >/dev/null
+  if ! cmd_build "$mode" >/dev/null; then
+    log "[INCONCLUSIVE] rebuild failed; grant result is invalid"
+    return 1
+  fi
   local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -n 's/.*CDHash=\(.*\)/\1/p' | head -1)"
   log "cdhash before=$before after=$after"
-  [ "$before" = "$after" ] && log "[warn] cdhash did not change; rebuild may not be a real change"
+  if [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ]; then
+    log "[INCONCLUSIVE] rebuild did not change cdhash, result invalid"
+    return 1
+  fi
   local swout; swout="$("$BIN" preflight 2>&1)"
-  local sr; sr="$(printf '%s' "$swout" | sed -n 's/.*screen_recording=\([a-z]*\).*/\1/p' | head -1)"
-  local ax; ax="$(printf '%s' "$swout" | sed -n 's/.*accessibility=\([a-z]*\).*/\1/p' | head -1)"
-  if [ "$sr" = "true" ] || [ "$ax" = "true" ]; then
+  local sr; sr="$(printf '%s' "$swout" | sed -n 's/.*screen_recording=\(true\|false\).*/\1/p' | head -1)"
+  local ax; ax="$(printf '%s' "$swout" | sed -n 's/.*accessibility=\(true\|false\).*/\1/p' | head -1)"
+  if [ -z "$sr" ] || [ -z "$ax" ]; then
+    log "[INCONCLUSIVE] malformed preflight output: $swout"
+  elif [ "$sr" = "true" ] && [ "$ax" = "true" ]; then
     log "[PASS] grant SURVIVED rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-    log "       -> this signing mode keeps the grant across rebuilds."
-  else
+    log "       -> this signing mode keeps both grants across rebuilds."
+  elif [ "$sr" = "false" ] && [ "$ax" = "false" ]; then
     log "[FAIL] grant LOST after rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
     log "       -> this signing mode re-keys TCC on every rebuild; re-grant needed."
+  else
+    log "[INCONCLUSIVE] split grant after rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
   fi
 }
 
@@ -196,18 +210,7 @@ PRIMARY (GUI, reliable) -- needs your clicks and maybe your login password:
 The first time codesign uses this key it may pop "codesign wants to sign using
 key ... in your keychain" -> click **Always Allow** (may ask your password).
 
-ALTERNATIVE (CLI) -- may still need a keychain-trust click/password:
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/cu.key -out /tmp/cu.crt \\
-    -days 3650 -subj "/CN=$CERTNAME" \\
-    -addext "basicConstraints=critical,CA:false" \\
-    -addext "keyUsage=critical,digitalSignature" \\
-    -addext "extendedKeyUsage=critical,codeSigning"
-  openssl pkcs12 -export -inkey /tmp/cu.key -in /tmp/cu.crt -out /tmp/cu.p12 -passout pass:
-  security import /tmp/cu.p12 -k ~/Library/Keychains/login.keychain-db -P "" -T /usr/bin/codesign
-  # if 'security find-identity -v -p codesigning' does NOT list it, the cert is
-  # untrusted; trust it (admin password + GUI confirm):
-  #   security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db /tmp/cu.crt
-  # if that is awkward, use the GUI path above instead.
+The GUI path is the only supported path. It avoids leaving private-key files on disk.
 
 Then:  ./run.sh build cert   (signs with '$CERTNAME' and identifier $IDENT)
 EOF
@@ -221,30 +224,31 @@ it runs nothing. Review each line, then run the ones that apply to what you did.
 1. Remove the build dir (compiled helper + generated sources):
      rm -rf "$BUILD_DIR"
 
-2. Delete the self-signed code-signing identity (only if you ran './run.sh cert'
+2. If you explicitly added a trust override for this certificate, recover it
+   before deleting the identity. Export the certificate from Keychain Access first,
+   then run this against the exported file (admin trust store):
+     security remove-trusted-cert -d <exported-certificate>
+   Set the certificate to "Use System Defaults" in Keychain Access if removal
+   reports that no matching trust override exists.
+
+3. Delete the self-signed code-signing identity (only if you ran './run.sh cert'
    and created '$CERTNAME'):
      security delete-identity -c "$CERTNAME" ~/Library/Keychains/login.keychain-db
    Or in Keychain Access.app: 'login' keychain -> find '$CERTNAME' (the cert and
    its private key) -> delete both. Verify it is gone:
      security find-identity -v -p codesigning
 
-3. Remove the openssl-fallback trust setting (ONLY if you used the openssl
-   ALTERNATIVE in './run.sh cert' and ran 'security add-trusted-cert ... /tmp/cu.crt'):
-     security remove-trusted-cert /tmp/cu.crt
-   /tmp/cu.crt is likely gone after a reboot. If it is missing, either export the
-   cert first from Keychain Access (select '$CERTNAME' -> File > Export Items ->
-   .cer, then 'security remove-trusted-cert <that file>'), or just remove the
-   trust in Keychain Access: double-click '$CERTNAME' -> Trust -> set 'When using
-   this certificate' to 'Use System Defaults', then delete the cert.
-
 4. Reset the TCC grants for THIS SPIKE's helper only, scoped by its bundle id
    ($IDENT). This touches only cuspike, nothing else:
-     tccutil reset ScreenCapture $IDENT
-     tccutil reset Accessibility $IDENT
-   NEVER run an unscoped 'tccutil reset ScreenCapture' / 'tccutil reset
-   Accessibility' -- that wipes the grants for EVERY app on your mac.
+     tccutil reset ScreenCapture com.henry.zeta.cuspike
+     tccutil reset Accessibility com.henry.zeta.cuspike
+   Never omit the bundle identifier from either command.
 
-5. The python and tmux/terminal grants have no bundle id, so tccutil cannot scope
+5. Remove capture screenshots, including any files from an older run:
+     rm -rf "$CAPTURE_DIR"
+     rm -f "${TMPDIR:-/tmp}"/cuspike-*.png
+
+6. The python and tmux/terminal grants have no bundle id, so remove them by hand
    them. Remove them by hand in System Settings > Privacy & Security:
      - Screen Recording: remove the python entry you enabled in step 4 of the
        procedure (e.g. 'python3.13') and the 'tmux' / terminal entry if you added

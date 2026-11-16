@@ -74,7 +74,11 @@ def cmd_capture():
         return 1
     w = Quartz.CGImageGetWidth(img)
     h = Quartz.CGImageGetHeight(img)
-    fd, path = tempfile.mkstemp(prefix="cuspike-", suffix=".png")
+    capture_dir = os.environ.get("CUSPIKE_CAPTURE_DIR")
+    if capture_dir is not None:
+        os.makedirs(capture_dir, mode=0o700, exist_ok=True)
+        os.chmod(capture_dir, 0o700)
+    fd, path = tempfile.mkstemp(prefix="cuspike-", suffix=".png", dir=capture_dir)
     os.close(fd)
     url = Quartz.CFURLCreateWithFileSystemPath(
         None, path, Quartz.kCFURLPOSIXPathStyle, False

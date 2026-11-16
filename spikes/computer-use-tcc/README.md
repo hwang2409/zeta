@@ -54,7 +54,8 @@ cd spikes/computer-use-tcc
    → **Q1 answer:** write down the **exact name** each list shows (e.g. `python3.13`, `tmux`,
    `cuspike`, or the terminal). This is the key observation; the script cannot read it.
 5. **check after granting** — `./run.sh check`. Expect `[PASS] ... GRANTED` for what you enabled.
-6. **capture** — `./run.sh capture`. Expect `PASS capture: WxH px, N bytes -> /tmp/cuspike-*.png`.
+6. **capture** — `./run.sh capture`. Expect `PASS capture: WxH px, N bytes -> .../cuspike-*.png`.
+   The screenshot is written under a private mode-700 temporary directory.
 7. **input** — `./run.sh input`. Expect `PASS input: moved cursor ...`.
    → Q1 confirmed: the ad-hoc python under tmux can capture + inject after the grant.
 
@@ -62,7 +63,8 @@ cd spikes/computer-use-tcc
 
 8. **different python** — `CUSPIKE_PY=3.12 ./run.sh check`. uv fetches a *different* real python
    binary (homebrew `python@3.12`, different path + cdhash). Expect `[FAIL] not granted` even
-   though the default python is granted. That proves the grant is keyed to the exact binary, so a
+   though the default python is granted. This is a proxy observation that grants are keyed to the
+   exact binary; it does not itself prove an in-place reinstall loses the original grant.
    `uv` reinstall or python upgrade that swaps the binary loses it. *(Optional, more faithful but
    disruptive: reinstall zeta's python with `uv tool install --reinstall ...`, then re-run
    `./run.sh check`; you will need to re-grant afterwards.)*
@@ -92,20 +94,22 @@ headless/daemon context (no active GUI login) cannot capture. Skip unless asked.
 `./run.sh cleanup` prints these steps (it runs nothing). Do whichever you did:
 
 1. Remove the build dir: `rm -rf build`.
-2. If you made the self-signed cert (`./run.sh cert`), delete the identity:
+2. If you explicitly added a trust override, export the certificate from Keychain Access,
+   recover trust in the admin store, then delete the identity:
+   `security remove-trusted-cert -d <exported-certificate>`.
+   Set Trust to "Use System Defaults" in Keychain Access if no override exists.
+3. If you made the self-signed cert (`./run.sh cert`), delete the identity:
    `security delete-identity -c "Zeta CU Spike" ~/Library/Keychains/login.keychain-db`
    (or delete `Zeta CU Spike` and its key in Keychain Access → `login`).
-3. If you used the **openssl** fallback and ran `add-trusted-cert … /tmp/cu.crt`, remove the
-   trust: `security remove-trusted-cert /tmp/cu.crt`. `/tmp/cu.crt` is likely gone after a
-   reboot; if so, export the cert from Keychain Access first, or just set its Trust back to
-   "Use System Defaults" in Keychain Access and delete it.
 4. Reset the TCC grants **for this spike's helper only**, scoped by its bundle id:
    ```
    tccutil reset ScreenCapture com.henry.zeta.cuspike
    tccutil reset Accessibility com.henry.zeta.cuspike
    ```
-   **Never** run an unscoped `tccutil reset ScreenCapture` — that wipes the grants for every app.
-5. The python and `tmux`/terminal grants have no bundle id, so remove them by hand in
+   Never omit the bundle identifier from either command.
+5. Remove screenshots, including files from older runs:
+   `rm -rf "${TMPDIR:-/tmp}/cuspike-${UID}"; rm -f "${TMPDIR:-/tmp}"/cuspike-*.png`.
+6. The python and `tmux`/terminal grants have no bundle id, so remove them by hand in
    **System Settings → Privacy & Security**: delete the python entry (e.g. `python3.13`) and
    the `tmux`/terminal entry you added, under **both** Screen Recording and Accessibility.
 
