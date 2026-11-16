@@ -54,7 +54,7 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.approval_resolved(decision=decision, scope=scope, duration=duration)
 
-    def set_response(self, *, finish_reason: str, model: str | None = None) -> None:
+    def set_response(self, *, finish_reason: str | None = None, model: str | None = None) -> None:
         if self._implementation is not None:
             self._implementation.set_response(finish_reason=finish_reason, model=model)
 

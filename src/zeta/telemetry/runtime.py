@@ -142,10 +142,11 @@ class _SpanHandle(SpanHandle):
         self._set("gen_ai.usage.output_tokens", output_tokens)
         self._set("gen_ai.usage.total_tokens", total_tokens)
 
-    def set_response(self, *, finish_reason: str, model: str | None = None) -> None:
+    def set_response(self, *, finish_reason: str | None = None, model: str | None = None) -> None:
         if model is not None:
             self._set("gen_ai.response.model", model)
-        self._set("gen_ai.response.finish_reasons", finish_reason)
+        if finish_reason is not None:
+            self._set("gen_ai.response.finish_reasons", finish_reason)
 
     def set_tool_count(self, *, tool_count: int) -> None:
         self._set("zeta.tool.count", tool_count)

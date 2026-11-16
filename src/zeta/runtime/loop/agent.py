@@ -81,20 +81,19 @@ from ...providers.completion import (
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
-from ...telemetry import SpanHandle, Telemetry
+from ...telemetry import Telemetry
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
 from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
 from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
+    InferenceObservation,
     _error_info,
     _sanitize_account_message,
     account_generation,
     can_retry_context,
-    end_inference,
     ensure_context_reduced,
-    observe_inference,
     observed_completion,
     provider_prompt_tokens,
     subscription_limit_failure,
@@ -803,7 +802,6 @@ class AgentLoop(
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: CompletionRun | None = None
-            inference: SpanHandle | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
@@ -811,236 +809,229 @@ class AgentLoop(
             provider_retry_usage: dict[str, Any] | None = None
             incomplete_tool_name: str | None = None
             provider_started = False
-            try:
-                account_context = getattr(self, "account_context", None)
-                if (
-                    account_context is not None
-                    and account_context.account_state_unknown
-                ):
-                    yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
-                    await account_context.ensure_account_state(self)
+            # the one owner of this call's inference span: leaving the block ends it once
+            with InferenceObservation() as inference:
                 try:
-                    should_compact = await self.context_assembler.prepare_context(
-                        force=retrying_context,
-                        system_append=host_instruction,
-                    )
-                    if should_compact:
-                        yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
-                    context_messages = await self.context_assembler.assemble(
-                        backend=self.backend,
-                        force=retrying_context,
-                        emergency=retrying_context,
-                        system_append=host_instruction,
-                    )
-                except BudgetExceeded:
-                    if not notification_turn:
-                        raise
-                    context_messages = await self.context_assembler.assemble(
-                        backend=self.backend,
-                        force=True,
-                        emergency=True,
-                        system_append=host_instruction,
-                    )
-                finally:
-                    # cancellation must not retain the prepared message graph.
-                    self.context_assembler.discard_prepared_context()
-                if self._plan_mode:
-                    context_messages = plan_mode_messages(context_messages)
-                context_messages = self._account_safe_context(context_messages)
-                context = self.context_assembler.last_context
-                if retrying_context:
-                    current_tokens = None if context is None else context.token_count
-                    ensure_context_reduced(current_tokens, overflow_context_tokens)
-                if context is not None and context.compacted:
-                    yield StreamEvent(
-                        StreamEventType.COMPACTION_END,
-                        data={
-                            "turn": turn_number,
-                            "token_count": context.token_count,
-                        },
-                    )
-                active_tools = self._active_tool_schemas()
-                steering = self.store.pending_client_steering()
-                notification_context = system_message if notification_turn else None
-                prepared_delivery = await step_delivery.prepare_request(
-                    "after_tools",
-                    context_messages,
-                    steering,
-                    active_tools,
-                    notification_context=notification_context,
-                )
-                system_message, on_persisted = complete_notification_context_staging(
-                    prepared_delivery, system_message, notification_turn, on_persisted
-                )
-                self._delivery_wake_pending = False
-                context_messages = list(prepared_delivery.messages)
-                steering = prepared_delivery.steering
-                self._delivering_prompt_id = prepared_delivery.prompt_id
-                disposition = delivery_disposition(
-                    step_delivery,
-                    prepared_delivery,
-                    notification_turn=notification_turn,
-                    notice_sink=self._mcp_notice_sink,
-                )
-                if disposition == "dispatch":
-                    disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context, waits_for_input=self.agent_instance_id is None or self.explicit_finish)
-                if disposition == "deferred":
-                    yield StreamEvent(StreamEventType.AGENT_END)
-                    return
-                if isinstance(disposition, ErrorInfo):
-                    self._persist_partial_with_cancelled_tools(
-                        [], None, failure=disposition
-                    )
-                    if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
-                        await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
-                    yield StreamEvent(StreamEventType.ERROR, error=disposition)
-                    yield StreamEvent(StreamEventType.AGENT_END)
-                    return
-                if (
-                    provider_retry_budget is None
-                    or prepared_delivery.prompt_id != provider_budget_prompt_id
-                ):
-                    provider_retry_budget = CompletionRetryBudget()
-                    provider_budget_prompt_id = prepared_delivery.prompt_id
-                    self._turn_provider_retry_records = provider_retry_budget.records
-                admitted_request = prepared_delivery.admitted_request
-                assert admitted_request is not None
-                if self._abort_admitted:
-                    return
-                # one span per logical call: provider retries inside the run are events on it
-                inference = self.telemetry.inference_span(
-                    getattr(self.backend, "model", ""),
-                    provider=getattr(self.backend, "provider", ""),
-                    stream=True,
-                    conversation_id=self.store.session_id,
-                )
-                inference.__enter__()
-                completion = self.context_assembler.dispatch_admitted_request(
-                    self.backend,
-                    admitted_request,
-                    control=CompletionControl(
-                        abort=turn_abort_signal,
-                        reset=(
-                            ResetPolicy.ALLOW_ASSISTANT_RESET
-                            if allow_assistant_reset
-                            else ResetPolicy.NO_RESET
-                        ),
-                        budget=provider_retry_budget,
-                        task_deadline=task_deadline,
-                        account_generation=account_generation(self),
-                        account_limit=getattr(getattr(self, "account_context", None), "subscription_limit_event", None),
-                    ),
-                )
-                has_active_delivery = prepared_delivery.has_active_delivery
-                provider_stream = observed_completion(
-                    completion,
-                    self.store,
-                    steering,
-                )
-                async for event in provider_stream:
-                    if event.type in {
-                        StreamEventType.MESSAGE_START,
-                        StreamEventType.MESSAGE_UPDATE,
-                        StreamEventType.MESSAGE_END,
-                    }:
-                        provider_started = True
-                    self.context_assembler.observe_event(event)
-                    observe_inference(inference, event)
-                    if event.type is StreamEventType.ERROR:
-                        provider_error = (
-                            replace(event.error, provider_error=True)
-                            if isinstance(event.error, ErrorInfo)
-                            else ErrorInfo(
-                                "backend_error",
-                                "provider emitted an invalid error event",
-                            )
+                    account_context = getattr(self, "account_context", None)
+                    if (
+                        account_context is not None
+                        and account_context.account_state_unknown
+                    ):
+                        yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
+                        await account_context.ensure_account_state(self)
+                    try:
+                        should_compact = await self.context_assembler.prepare_context(
+                            force=retrying_context,
+                            system_append=host_instruction,
                         )
-                        provider_error_source = event.error or provider_error
-                        provider_error_data = dict(event.data)
-                        break
-                    if (
-                        event.type is StreamEventType.ASSISTANT_RESET
-                        and not completion_succeeded
-                    ):
-                        partial_blocks = []
-                        assistant_message = None
-                    if event.type is StreamEventType.MESSAGE_UPDATE:
-                        if event.content is not None:
-                            partial_blocks.append(event.content)
-                        if event.delta is not None:
-                            partial_blocks.append(TextContent(event.delta))
-                    if (
-                        event.message is not None
-                        and event.type is StreamEventType.MESSAGE_END
-                    ):
-                        assistant_message = event.message
-                    if event.type is StreamEventType.MESSAGE_END:
-                        usage = event.data.get("usage")
-                        if isinstance(usage, Mapping):
-                            provider_retry_usage = dict(usage)
-                        reason, tokens = read_turn_metadata(event.data)
-                        if reason is not None:
-                            self._turn_stop_reason = reason
-                        tool_name = event.data.get("incomplete_tool_name")
-                        if type(tool_name) is str and tool_name:
-                            incomplete_tool_name = tool_name
-                        if tokens is not None:
-                            self._turn_output_tokens = tokens
-                    if event.type is StreamEventType.MESSAGE_END and (
-                        not event.data.get("truncated")
-                        or self._turn_stop_reason == "max_tokens"
-                    ):
-                        completion_succeeded = True
-                    yield event
-                if provider_error is None and not completion_succeeded:
-                    provider_error = ErrorInfo(
-                        "stream_error",
-                        "provider stream ended before completion",
-                        retryable=True,
+                        if should_compact:
+                            yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
+                        context_messages = await self.context_assembler.assemble(
+                            backend=self.backend,
+                            force=retrying_context,
+                            emergency=retrying_context,
+                            system_append=host_instruction,
+                        )
+                    except BudgetExceeded:
+                        if not notification_turn:
+                            raise
+                        context_messages = await self.context_assembler.assemble(
+                            backend=self.backend,
+                            force=True,
+                            emergency=True,
+                            system_append=host_instruction,
+                        )
+                    finally:
+                        # cancellation must not retain the prepared message graph.
+                        self.context_assembler.discard_prepared_context()
+                    if self._plan_mode:
+                        context_messages = plan_mode_messages(context_messages)
+                    context_messages = self._account_safe_context(context_messages)
+                    context = self.context_assembler.last_context
+                    if retrying_context:
+                        current_tokens = None if context is None else context.token_count
+                        ensure_context_reduced(current_tokens, overflow_context_tokens)
+                    if context is not None and context.compacted:
+                        yield StreamEvent(
+                            StreamEventType.COMPACTION_END,
+                            data={
+                                "turn": turn_number,
+                                "token_count": context.token_count,
+                            },
+                        )
+                    active_tools = self._active_tool_schemas()
+                    steering = self.store.pending_client_steering()
+                    notification_context = system_message if notification_turn else None
+                    prepared_delivery = await step_delivery.prepare_request(
+                        "after_tools",
+                        context_messages,
+                        steering,
+                        active_tools,
+                        notification_context=notification_context,
                     )
-            except (asyncio.CancelledError, GeneratorExit) as exc:
-                # end the span first: a failing close must not leave it attached
-                end_inference(inference, exc)
+                    system_message, on_persisted = complete_notification_context_staging(
+                        prepared_delivery, system_message, notification_turn, on_persisted
+                    )
+                    self._delivery_wake_pending = False
+                    context_messages = list(prepared_delivery.messages)
+                    steering = prepared_delivery.steering
+                    self._delivering_prompt_id = prepared_delivery.prompt_id
+                    disposition = delivery_disposition(
+                        step_delivery,
+                        prepared_delivery,
+                        notification_turn=notification_turn,
+                        notice_sink=self._mcp_notice_sink,
+                    )
+                    if disposition == "dispatch":
+                        disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context, waits_for_input=self.agent_instance_id is None or self.explicit_finish)
+                    if disposition == "deferred":
+                        yield StreamEvent(StreamEventType.AGENT_END)
+                        return
+                    if isinstance(disposition, ErrorInfo):
+                        self._persist_partial_with_cancelled_tools(
+                            [], None, failure=disposition
+                        )
+                        if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
+                            await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
+                        yield StreamEvent(StreamEventType.ERROR, error=disposition)
+                        yield StreamEvent(StreamEventType.AGENT_END)
+                        return
+                    if (
+                        provider_retry_budget is None
+                        or prepared_delivery.prompt_id != provider_budget_prompt_id
+                    ):
+                        provider_retry_budget = CompletionRetryBudget()
+                        provider_budget_prompt_id = prepared_delivery.prompt_id
+                        self._turn_provider_retry_records = provider_retry_budget.records
+                    admitted_request = prepared_delivery.admitted_request
+                    assert admitted_request is not None
+                    if self._abort_admitted:
+                        return
+                    # one span per logical call: provider retries inside the run are events on it
+                    inference.start(self.telemetry.inference_span(
+                        getattr(self.backend, "model", ""),
+                        provider=getattr(self.backend, "provider", ""),
+                        stream=True,
+                        conversation_id=self.store.session_id,
+                    ))
+                    completion = self.context_assembler.dispatch_admitted_request(
+                        self.backend,
+                        admitted_request,
+                        control=CompletionControl(
+                            abort=turn_abort_signal,
+                            reset=(
+                                ResetPolicy.ALLOW_ASSISTANT_RESET
+                                if allow_assistant_reset
+                                else ResetPolicy.NO_RESET
+                            ),
+                            budget=provider_retry_budget,
+                            task_deadline=task_deadline,
+                            account_generation=account_generation(self),
+                            account_limit=getattr(getattr(self, "account_context", None), "subscription_limit_event", None),
+                        ),
+                    )
+                    has_active_delivery = prepared_delivery.has_active_delivery
+                    provider_stream = observed_completion(
+                        completion,
+                        self.store,
+                        steering,
+                    )
+                    async for event in provider_stream:
+                        if event.type in {
+                            StreamEventType.MESSAGE_START,
+                            StreamEventType.MESSAGE_UPDATE,
+                            StreamEventType.MESSAGE_END,
+                        }:
+                            provider_started = True
+                        self.context_assembler.observe_event(event)
+                        inference.observe(event)
+                        if event.type is StreamEventType.ERROR:
+                            provider_error = (
+                                replace(event.error, provider_error=True)
+                                if isinstance(event.error, ErrorInfo)
+                                else ErrorInfo(
+                                    "backend_error",
+                                    "provider emitted an invalid error event",
+                                )
+                            )
+                            provider_error_source = event.error or provider_error
+                            provider_error_data = dict(event.data)
+                            break
+                        if (
+                            event.type is StreamEventType.ASSISTANT_RESET
+                            and not completion_succeeded
+                        ):
+                            partial_blocks = []
+                            assistant_message = None
+                        if event.type is StreamEventType.MESSAGE_UPDATE:
+                            if event.content is not None:
+                                partial_blocks.append(event.content)
+                            if event.delta is not None:
+                                partial_blocks.append(TextContent(event.delta))
+                        if (
+                            event.message is not None
+                            and event.type is StreamEventType.MESSAGE_END
+                        ):
+                            assistant_message = event.message
+                        if event.type is StreamEventType.MESSAGE_END:
+                            usage = event.data.get("usage")
+                            if isinstance(usage, Mapping):
+                                provider_retry_usage = dict(usage)
+                            reason, tokens = read_turn_metadata(event.data)
+                            if reason is not None:
+                                self._turn_stop_reason = reason
+                            tool_name = event.data.get("incomplete_tool_name")
+                            if type(tool_name) is str and tool_name:
+                                incomplete_tool_name = tool_name
+                            if tokens is not None:
+                                self._turn_output_tokens = tokens
+                        if event.type is StreamEventType.MESSAGE_END and (
+                            not event.data.get("truncated")
+                            or self._turn_stop_reason == "max_tokens"
+                        ):
+                            completion_succeeded = True
+                        yield event
+                    if provider_error is None and not completion_succeeded:
+                        provider_error = ErrorInfo(
+                            "stream_error",
+                            "provider stream ended before completion",
+                            retryable=True,
+                        )
+                except (asyncio.CancelledError, GeneratorExit):
+                    if completion is not None:
+                        await completion.aclose()
+                    self._persist_partial_for_control(partial_blocks, assistant_message)
+                    raise
+                except ProviderAccountSwitched as exc:  # redispatch through the new account's backend
+                    inference.error = exc
+                    await completion.aclose()  # type: ignore[union-attr]
+                    self._dispatch_progress.reset()
+                    continue
+                except Exception as exc:
+                    if completion is not None:
+                        await completion.aclose()
+                    if task_is_cancelling():
+                        self._persist_partial_for_control(partial_blocks, assistant_message)
+                        raise asyncio.CancelledError() from exc
+                    error = _error_info(
+                        exc, provider_error=getattr(exc, "provider_error", True)
+                    )
+                    provider_error = error
+                    provider_error_source = exc
+                    completion = None
+                cleanup_error: BaseException | None = None
                 if completion is not None:
-                    await completion.aclose()
-                self._persist_partial_for_control(partial_blocks, assistant_message)
-                raise
-            except ProviderAccountSwitched as exc:  # redispatch through the new account's backend
-                end_inference(inference, exc)
-                await completion.aclose()  # type: ignore[union-attr]
-                self._dispatch_progress.reset()
-                continue
-            except Exception as exc:
-                end_inference(inference, asyncio.CancelledError() if task_is_cancelling() else exc)
-                inference = None
-                if completion is not None:
-                    await completion.aclose()
+                    try:
+                        await completion.aclose()
+                    except BaseException as exc:  # noqa: BLE001 - preserve close errors
+                        cleanup_error = exc
                 if task_is_cancelling():
                     self._persist_partial_for_control(partial_blocks, assistant_message)
-                    raise asyncio.CancelledError() from exc
-                error = _error_info(
-                    exc, provider_error=getattr(exc, "provider_error", True)
-                )
-                provider_error = error
-                provider_error_source = exc
-                completion = None
-            cleanup_error: BaseException | None = None
-            if completion is not None:
-                try:
-                    await completion.aclose()
-                except BaseException as exc:  # noqa: BLE001 - preserve close errors
-                    cleanup_error = exc
-            if task_is_cancelling():
-                end_inference(inference, asyncio.CancelledError())
-                self._persist_partial_for_control(partial_blocks, assistant_message)
-                raise asyncio.CancelledError()
-            if cleanup_error is not None and provider_error is None:
-                provider_error = _error_info(cleanup_error, provider_error=True)
-                provider_error_source = cleanup_error
-            end_inference(
-                inference,
-                None if provider_error is None else provider_error_source or provider_error,
-            )
+                    raise asyncio.CancelledError()
+                if cleanup_error is not None and provider_error is None:
+                    provider_error = _error_info(cleanup_error, provider_error=True)
+                    provider_error_source = cleanup_error
+                inference.error = None if provider_error is None else provider_error_source or provider_error
             if provider_error is not None and can_retry_context(
                 provider_error, retrying_context, partial_blocks, assistant_message
             ):

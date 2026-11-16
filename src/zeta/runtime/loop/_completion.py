@@ -12,7 +12,7 @@ import errno
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import httpx
 
@@ -196,46 +196,86 @@ def can_retry_context(
     )
 
 
-def observe_inference(span: SpanHandle, event: StreamEvent) -> None:
-    """Copy retry decisions, normalized usage, and the stop reason onto the call's span."""
+def _usage_tokens(usage: object) -> tuple[int, int] | None:
+    """Normalized (input, output) tokens; input includes cache reads and writes, as GenAI counts them."""
 
-    if event.type is StreamEventType.RETRY and "reason" in event.data:
-        delay = event.data.get("delay")
-        span.retry(
-            attempt=event.data.get("attempt", 0),
-            reason=event.data["reason"],
-            delay=round(delay * 1000) if isinstance(delay, (int, float)) else 0,
-            after="retry_after" in event.data,
-        )
-    elif event.type is StreamEventType.MESSAGE_END:
-        usage = event.data.get("usage")
-        if isinstance(usage, Mapping):
-            # normalized input_tokens exclude cache reads and writes; the GenAI count includes them
-            input_tokens = sum(
-                value
-                for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-                if type(value := usage.get(key)) is int and value >= 0
+    if not isinstance(usage, Mapping):
+        return None
+    counts = [
+        value if type(value := usage.get(key)) is int and value >= 0 else 0
+        for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
+    ]
+    return sum(counts[:3]), counts[3]
+
+
+class InferenceObservation:
+    """The one owner of a logical model call's span.
+
+    ``start`` opens the span; leaving the ``with`` block ends it exactly once on
+    every exit (return, continue, any ``BaseException``). An exception in flight
+    is the span's error; otherwise ``error`` (an exception or an ERROR event's
+    ``ErrorInfo``) is. Usage sums every attempt, because retries are one call.
+    """
+
+    def __init__(self) -> None:
+        self._span: SpanHandle | None = None
+        self.error: BaseException | ErrorInfo | None = None
+        self._finished_usage: tuple[int, int] | None = None
+        self._attempt_usage: tuple[int, int] | None = None
+        self._model: str | None = None
+        self._finish_reason: str | None = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def start(self, span: SpanHandle) -> None:
+        span.__enter__()
+        self._span = span
+
+    def observe(self, event: StreamEvent) -> None:
+        if self._span is None:
+            return
+        if event.type is StreamEventType.MESSAGE_START:
+            model = event.data.get("model")
+            if type(model) is str:
+                self._model = model
+        elif event.type is StreamEventType.MESSAGE_END:
+            self._attempt_usage = _usage_tokens(event.data.get("usage")) or self._attempt_usage
+            reason = event.data.get("stop_reason")
+            if type(reason) is str:
+                self._finish_reason = reason
+        elif event.type is StreamEventType.RETRY and "reason" in event.data:
+            delay = event.data.get("delay")
+            self._span.retry(
+                attempt=event.data.get("attempt", 0),
+                reason=event.data["reason"],
+                delay=round(delay * 1000) if isinstance(delay, (int, float)) else 0,
+                after="retry_after" in event.data,
             )
-            output_tokens = usage.get("output_tokens")
-            output_tokens = output_tokens if type(output_tokens) is int and output_tokens >= 0 else 0
-            span.set_usage(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens,
-            )
-        reason = event.data.get("stop_reason")
-        if type(reason) is str:
-            span.set_response(finish_reason=reason)
+            # the retry notice repeats the failed attempt's usage, so it replaces, never adds to, that attempt's MESSAGE_END
+            failed = _usage_tokens(event.data.get("usage")) or self._attempt_usage
+            if failed is not None:
+                done = self._finished_usage or (0, 0)
+                self._finished_usage = (done[0] + failed[0], done[1] + failed[1])
+            self._attempt_usage = None
+            self._finish_reason = None
 
-
-def end_inference(span: SpanHandle | None, error: BaseException | object | None) -> None:
-    """End the logical call's span; a non-exception error (an ERROR event) is ``_OTHER``."""
-
-    if span is None:
-        return
-    if isinstance(error, BaseException):
-        span.__exit__(type(error), error, None)
-        return
-    if error is not None:
-        span.fail(None)
-    span.__exit__(None, None, None)
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        span, self._span = self._span, None
+        if span is None:
+            return False
+        try:
+            usage = [part for part in (self._finished_usage, self._attempt_usage) if part is not None]
+            if usage:
+                input_tokens = sum(part[0] for part in usage)
+                output_tokens = sum(part[1] for part in usage)
+                span.set_usage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
+            span.set_response(finish_reason=self._finish_reason, model=self._model)
+            if exc is None and isinstance(self.error, ErrorInfo):
+                span.fail(None)
+        finally:
+            if exc is None and isinstance(self.error, BaseException):
+                span.__exit__(type(self.error), self.error, None)
+            else:
+                span.__exit__(exc_type, exc, traceback)
+        return False
