@@ -454,3 +454,84 @@ async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
         close_gate.set()
         backend.open_all()
         await _close(server, client and client.writer)
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_during_incoming_setup_closes_instead_of_parking(
+    tmp_path: Path,
+) -> None:
+    """Forced order: the outgoing turn ends while the new session is set up, so
+    the swap commit finds it idle and closes it instead of parking it."""
+    backend = GatedBackend([([TextContent("held"), HOLD], [TextContent("held")])])
+    server = _server(tmp_path, backend)
+    setup_started = asyncio.Event()
+    setup_gate = asyncio.Event()
+    client = None
+    try:
+        client = await _open(server, FEATURES)
+        a = await client.new()
+        await client.call("send", {"text": "go"})
+        await await_or_fail(backend.held[0].wait(), what="A mid-reply")
+        outgoing = server.control
+        original_new_pair = server.new_pair
+
+        def new_pair():
+            pair = original_new_pair()
+            create = pair.runtime.create_session
+
+            async def held_create(**kwargs):
+                setup_started.set()
+                await await_or_fail(setup_gate.wait(), what="held setup")
+                return await create(**kwargs)
+
+            pair.runtime.create_session = held_create
+            return pair
+
+        server.new_pair = new_pair
+        created = asyncio.create_task(client.new())
+        try:
+            await await_or_fail(setup_started.wait(), what="incoming setup")
+            backend.gates[0].set()
+            await _until(lambda: not outgoing.holds_work(), "A's turn ends during setup")
+            setup_gate.set()
+            b = await await_or_fail(created, what="new_session")
+        finally:
+            setup_gate.set()
+            if not created.done():
+                created.cancel()
+        assert b != a
+        await _closed(server, a)
+        assert (await client.call("status"))["parked_sessions"] == []
+    finally:
+        setup_gate.set()
+        backend.open_all()
+        await _close(server, client and client.writer)
+
+
+@pytest.mark.asyncio
+async def test_stale_idle_check_after_resume_keeps_the_attached_pair(
+    tmp_path: Path,
+) -> None:
+    """Forced order: a parked pair's idle check is scheduled, then `resume`
+    attaches the pair before the check runs; the late check must not close it."""
+    backend = GatedBackend([([TextContent("held"), HOLD], [TextContent("held")])])
+    server = _server(tmp_path, backend)
+    client = None
+    try:
+        client, a, parked = await _parked_turn(server, backend, FEATURES)
+        late_checks = []
+        original_check = server._close_if_idle
+        server._close_if_idle = late_checks.append
+        backend.gates[0].set()
+        await _until(lambda: parked in late_checks, "A's idle check scheduled")
+
+        resumed = await client.call("resume", {"session_id": a})
+        assert "attached" not in resumed
+        for control in late_checks:
+            original_check(control)
+        assert server.control is parked
+        assert a not in server._closing
+        assert (await client.call("status"))["session"]["session_id"] == a
+    finally:
+        backend.open_all()
+        await _close(server, client and client.writer)
