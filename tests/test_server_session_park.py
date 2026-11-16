@@ -85,7 +85,7 @@ async def _until(predicate: Callable[[], bool], what: str) -> None:
 
 async def _closed(server: ZetaServer, session_id: str) -> None:
     await _until(lambda: server.parking.get(session_id) is None, f"{session_id} closing")
-    await await_or_fail(server.parking.wait_closed(session_id), what=f"{session_id} closed")
+    await await_or_fail(server.controllers.wait_closed(session_id), what=f"{session_id} closed")
 
 
 def _stream_text(frames: list[dict[str, Any]], stream_id: str) -> str:
@@ -391,23 +391,23 @@ async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
         parked.runtime.close = held_close
         backend.gates[0].set()
         await await_or_fail(close_started.wait(), what="idle close started")
-        assert a in server.parking._closing
+        assert a in server.controllers.closing_session_ids()
 
         await await_or_fail(client.new(), what="new_session during the close")
 
         waiting = asyncio.Event()
-        original_wait = server.parking.wait_closed
+        original_wait = server.controllers.wait_closed
 
         async def wait_closed(session_id: str) -> None:
-            if session_id in server.parking._closing:
+            if session_id in server.controllers.closing_session_ids():
                 waiting.set()
             await original_wait(session_id)
 
-        server.parking.wait_closed = wait_closed
+        server.controllers.wait_closed = wait_closed  # type: ignore[method-assign]
         resume = asyncio.create_task(client.call("resume", {"session_id": a}))
         try:
             await await_or_fail(waiting.wait(), what="resume waits for the close")
-            assert not resume.done() and a in server.parking._closing
+            assert not resume.done() and a in server.controllers.closing_session_ids()
             close_gate.set()
             result = await await_or_fail(resume, what="resume")
         finally:
