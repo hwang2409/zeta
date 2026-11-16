@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -15,17 +14,23 @@ from pathlib import Path
 
 from ..core.session_files import atomic_publish_file
 from .manifest import MANIFEST_FILENAME, ExtensionManifestError, parse_manifest
+from .paths import ExtensionTrustError, extension_path
 
 TRUST_FILENAME = "extensions-trust.json"
 GIT_FILENAME = ".zeta-extension-git.json"
 _MAX_FILES = 10_000
 _MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _MAX_FILE_BYTES = 16 * 1024 * 1024
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-
-
-class ExtensionTrustError(ValueError):
-    """An extension could not be installed or trusted."""
+def _entry_path(entry: os.DirEntry[str]) -> Path:
+    try:
+        mode = entry.stat(follow_symlinks=False).st_mode
+    except OSError as exc:
+        raise ExtensionTrustError(f"cannot inspect extension file: {entry.path}") from exc
+    if stat.S_ISLNK(mode):
+        raise ExtensionTrustError(f"extension tree contains symlink: {entry.path}")
+    if not stat.S_ISREG(mode):
+        raise ExtensionTrustError(f"extension tree contains non-regular file: {entry.path}")
+    return Path(entry.path)
 
 
 def _regular_files(root: Path):
@@ -42,37 +47,37 @@ def _regular_files(root: Path):
                 mode = entry.stat(follow_symlinks=False).st_mode
             except OSError as exc:
                 raise ExtensionTrustError(f"cannot inspect extension file: {entry.path}") from exc
-            if stat.S_ISLNK(mode):
-                raise ExtensionTrustError(f"extension tree contains symlink: {entry.path}")
             if stat.S_ISDIR(mode):
                 pending.append(Path(entry.path))
                 continue
-            if not stat.S_ISREG(mode):
-                raise ExtensionTrustError(f"extension tree contains non-regular file: {entry.path}")
             count += 1
             if count > _MAX_FILES:
                 raise ExtensionTrustError(f"extension tree exceeds {_MAX_FILES} files")
-            yield Path(entry.path)
+            yield _entry_path(entry)
 
 
-def _hash_file(path: Path, relative: bytes, digest: hashlib._Hash, total: int, max_total_bytes: int) -> int:
-    digest.update(len(relative).to_bytes(8, "big"))
-    digest.update(relative)
+def _hash_file(path: Path, max_total_bytes: int) -> tuple[int, bytes]:
+    digest = hashlib.sha256()
+    total = 0
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
         raise ExtensionTrustError(f"cannot open extension file: {path}") from exc
-    file_total = 0
     try:
         while chunk := os.read(fd, 1024 * 1024):
-            file_total += len(chunk)
             total += len(chunk)
-            if file_total > _MAX_FILE_BYTES or total > max_total_bytes:
-                raise ExtensionTrustError(f"extension tree exceeds {max_total_bytes} byte limit")
+            if total > _MAX_FILE_BYTES:
+                raise ExtensionTrustError(f"extension file exceeds {_MAX_FILE_BYTES} byte limit")
             digest.update(chunk)
     finally:
         os.close(fd)
-    return total
+    if total > max_total_bytes:
+        raise ExtensionTrustError(f"extension tree exceeds {max_total_bytes} byte limit")
+    return total, digest.digest()
+
+
+def _frame_file(relative: bytes, size: int, file_digest: bytes) -> bytes:
+    return b"".join((len(relative).to_bytes(8, "big"), relative, size.to_bytes(8, "big"), file_digest))
 
 
 def fingerprint(directory: str | Path, *, max_total_bytes: int = _MAX_TOTAL_BYTES) -> str:
@@ -86,7 +91,10 @@ def fingerprint(directory: str | Path, *, max_total_bytes: int = _MAX_TOTAL_BYTE
     digest = hashlib.sha256()
     total = 0
     for path in _regular_files(root):
-        total = _hash_file(path, path.relative_to(root).as_posix().encode(), digest, total, max_total_bytes)
+        size, file_digest = _hash_file(path, max_total_bytes - total)
+        relative = path.relative_to(root).as_posix().encode()
+        digest.update(_frame_file(relative, size, file_digest))
+        total += size
     return digest.hexdigest()
 
 
@@ -113,7 +121,7 @@ def _write(path: Path, values: dict[str, str]) -> None:
 
 
 def trust_path(home: str | Path) -> Path:
-    return Path(home).expanduser() / TRUST_FILENAME
+    return Path(home).expanduser().resolve(strict=False) / TRUST_FILENAME
 
 
 def trust_key(scope: str, name: str) -> str:
@@ -134,32 +142,6 @@ def set_trusted(home: str | Path, scope: str, name: str, directory: str | Path, 
     else:
         values.pop(key, None)
     _write(path, values)
-
-
-def _root(home: str | Path, project_dir: str | Path | None, scope: str) -> Path:
-    if scope == "project" and project_dir is None:
-        raise ExtensionTrustError("project scope requires a repository")
-    return (Path(home) / "extensions") if scope == "user" else Path(project_dir) / ".zeta" / "extensions"
-
-
-def _resolve(root: Path, name: str) -> Path:
-    if not _NAME_RE.fullmatch(name) or Path(name).is_absolute() or Path(name).name != name:
-        raise ExtensionTrustError(f"invalid extension name: {name}")
-    candidate = root / name
-    try:
-        try:
-            if stat.S_ISLNK(candidate.lstat().st_mode):
-                raise ExtensionTrustError(f"extension path is a symlink: {name}")
-        except FileNotFoundError:
-            pass
-        root_real = root.resolve(strict=False)
-        target = candidate.resolve(strict=False)
-        target.relative_to(root_real)
-    except ExtensionTrustError:
-        raise
-    except (OSError, ValueError) as exc:
-        raise ExtensionTrustError(f"extension path escapes root: {name}") from exc
-    return candidate
 
 
 def _source_git(source: str) -> tuple[str, str] | None:
@@ -218,14 +200,13 @@ def _review(manifest, staged: Path, *, current: Path | None, action: str, accept
 
 
 def install(source: str, *, home: str | Path, project_dir: str | Path | None, scope: str, accept: bool = False, confirm: Callable[[str], str] = input) -> tuple[str, str]:
-    root = _root(home, project_dir, scope)
-    root.mkdir(parents=True, exist_ok=True)
+    extension_path(home, project_dir, scope, "placeholder", create=True)
     staged, commit, temporary = _stage(source)
     with temporary:
         fingerprint(staged)
         manifest = _manifest(staged)
         _review(manifest, staged, current=None, action="install", accept=accept, confirm=confirm)
-        target = _resolve(root, manifest.name)
+        target = extension_path(home, project_dir, scope, manifest.name, create=True)
         if target.exists():
             shutil.rmtree(target)
         shutil.move(str(staged), target)
@@ -236,8 +217,7 @@ def install(source: str, *, home: str | Path, project_dir: str | Path | None, sc
 
 
 def remove(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str) -> None:
-    root = _root(home, project_dir, scope)
-    target = _resolve(root, name)
+    target = extension_path(home, project_dir, scope, name)
     if not target.is_dir():
         raise ExtensionTrustError(f"extension not installed: {name}")
     shutil.rmtree(target)
@@ -245,15 +225,14 @@ def remove(*, home: str | Path, project_dir: str | Path | None, scope: str, name
 
 
 def untrust(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str) -> None:
-    target = _resolve(_root(home, project_dir, scope), name)
+    target = extension_path(home, project_dir, scope, name)
     if not target.is_dir():
         raise ExtensionTrustError(f"extension not installed: {name}")
     set_trusted(home, scope, name, target, False)
 
 
 def trust(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str, accept: bool = False, confirm: Callable[[str], str] = input) -> None:
-    root = _root(home, project_dir, scope)
-    target = _resolve(root, name)
+    target = extension_path(home, project_dir, scope, name)
     if not target.is_dir():
         raise ExtensionTrustError(f"extension not installed: {name}")
     fingerprint(target)
@@ -263,8 +242,7 @@ def trust(*, home: str | Path, project_dir: str | Path | None, scope: str, name:
 
 
 def update(name: str, *, home: str | Path, project_dir: str | Path | None, scope: str, accept: bool = False, confirm: Callable[[str], str] = input) -> tuple[str, str]:
-    root = _root(home, project_dir, scope)
-    target = _resolve(root, name)
+    target = extension_path(home, project_dir, scope, name)
     try:
         source = json.loads((target / GIT_FILENAME).read_text(encoding="utf-8"))["source"]
     except (OSError, ValueError, KeyError) as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import marshal
 import subprocess
@@ -33,6 +34,30 @@ def _extension(path: Path, name: str = "demo") -> Path:
     )
     (path / "mod.py").write_text("def activate(zx):\n    pass\n", encoding="utf-8")
     return path
+
+
+def test_fingerprint_frames_file_size(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    tail = len(b"b").to_bytes(8, "big") + b"b" + b"b"
+    (first / "a").write_bytes(b"a" + tail)
+    (second / "a").write_bytes(b"a")
+    (second / "b").write_bytes(b"b")
+
+    def legacy(directory: Path) -> str:
+        digest = hashlib.sha256()
+        for path in sorted(directory.iterdir()):
+            relative = path.name.encode()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    assert legacy(first) == legacy(second)
+    assert fingerprint(first) != fingerprint(second)
+    assert trust_module._frame_file(b"a", 1, b"digest") != trust_module._frame_file(b"a", 2, b"digest")
 
 
 def test_fingerprint_match_and_mismatch(tmp_path: Path) -> None:
@@ -81,6 +106,62 @@ async def test_project_scope_fingerprint_mismatch_blocks_load(tmp_path: Path) ->
         assert "untrusted project extensions" in host.warnings[0]
     finally:
         await registry.close()
+
+
+@pytest.mark.parametrize("name", ["..", "/outside"])
+def test_management_public_api_rejects_unsafe_names(tmp_path: Path, name: str) -> None:
+    home = tmp_path / "home"
+    _extension(home / "extensions" / "demo")
+    outside = tmp_path / "outside"
+    _extension(outside)
+    with pytest.raises(ExtensionTrustError):
+        trust(home=home, project_dir=None, scope="user", name=name, accept=True)
+    with pytest.raises(ExtensionTrustError):
+        remove(home=home, project_dir=None, scope="user", name=name)
+    assert outside.exists()
+
+
+@pytest.mark.parametrize("component", [".zeta", "extensions"])
+def test_project_management_rejects_each_symlinked_component(tmp_path: Path, component: str) -> None:
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    _extension(outside / "demo")
+    if component == "extensions":
+        (project / ".zeta").mkdir(parents=True)
+    link = project / component if component == ".zeta" else project / ".zeta" / component
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ExtensionTrustError):
+        remove(home=tmp_path / "home", project_dir=project, scope="project", name="demo")
+    assert (outside / "demo").exists()
+
+
+def test_internal_named_symlink_cannot_delete_sibling(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    root = home / "extensions"
+    _extension(root / "demo")
+    try:
+        (root / "link").symlink_to(root / "demo", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ExtensionTrustError):
+        remove(home=home, project_dir=None, scope="user", name="link")
+    assert (root / "demo").exists()
+
+
+def test_user_home_symlink_is_allowed(tmp_path: Path) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    home = tmp_path / "home"
+    source = _extension(tmp_path / "source")
+    try:
+        home.symlink_to(real_home, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    name, _ = install(str(source), home=home, project_dir=None, scope="user", accept=True)
+    assert name == "demo" and (real_home / "extensions" / name).is_dir()
 
 
 def test_management_name_cannot_escape_root(tmp_path: Path) -> None:
