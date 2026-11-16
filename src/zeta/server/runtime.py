@@ -59,8 +59,7 @@ BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
-# a ``None`` event publishes nothing; it only tells a parked pair to re-check its work
-RunWorkEventSink = Callable[[str, EventDescriptor | None, dict[str, object]], None]
+RunWorkEventSink = Callable[[str, EventDescriptor, dict[str, object]], None]
 ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
@@ -237,6 +236,7 @@ class ServerRuntime:
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._run_work_event_sink: RunWorkEventSink | None = None
+        self._work_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
 
     def backend_for_model(
@@ -434,6 +434,13 @@ class ServerRuntime:
 
     def set_run_work_event_sink(self, sink: RunWorkEventSink | None) -> None:
         self._run_work_event_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    def set_work_changed_sink(self, sink: Callable[[], None] | None) -> None:
+        """Attach the callback for work that ended without an event (a task exit
+        delivery that settled); it may run on any thread."""
+        self._work_changed_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -780,10 +787,6 @@ class ServerRuntime:
             registry.set_notice_sink(task_changed)
 
             def committed_task_changed(notice: BackgroundTaskNotice) -> None:
-                if notice.phase != "stopping":
-                    # a task exit receipt cleared: no row changed, but it held a parked pair
-                    run_work_sink(session_id, None, {})
-                    return
                 task = next((item for item in registry.snapshot() if item.task_id == notice.task_id), None)
                 if task is not None:
                     run_work_sink(
@@ -796,6 +799,7 @@ class ServerRuntime:
             state.opened.store.set_todo_change_sink(
                 lambda todo: run_work_sink(session_id, EventDescriptor.TODO_UPDATED, {"todo": [dict(item) for item in todo]})
             )
+        registry.set_exit_delivery_settled_sink(self._work_changed_sink)
         sink = self._background_event_sink
         wake_sink = self._background_wake_sink
         if sink is None:

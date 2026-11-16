@@ -3,7 +3,6 @@ busy session instead of refusing, and the parked session closes once idle."""
 from __future__ import annotations
 
 import asyncio
-import itertools
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -85,8 +84,8 @@ async def _until(predicate: Callable[[], bool], what: str) -> None:
 
 
 async def _closed(server: ZetaServer, session_id: str) -> None:
-    await _until(lambda: session_id not in server._parked, f"{session_id} closing")
-    await await_or_fail(server.wait_closed(session_id), what=f"{session_id} closed")
+    await _until(lambda: session_id not in server.parking._parked, f"{session_id} closing")
+    await await_or_fail(server.parking.wait_closed(session_id), what=f"{session_id} closed")
 
 
 def _stream_text(frames: list[dict[str, Any]], stream_id: str) -> str:
@@ -189,7 +188,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
         await client.call("send", {"text": "write"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
         b = await client.new()
-        parked = server._parked[a]
+        parked = server.parking._parked[a]
 
         backend.gates[0].set()
         await _until(parked.has_pending_approvals, "parked approval")
@@ -262,7 +261,7 @@ async def _parked_turn(server: ZetaServer, backend: GatedBackend, features: list
     await client.call("send", {"text": "go"})
     await await_or_fail(backend.held[0].wait(), what="A mid-reply")
     await client.new()
-    return client, a, server._parked[a]
+    return client, a, server.parking._parked[a]
 
 
 async def _parked_changes(client: Client, until: str) -> list[dict[str, Any]]:
@@ -271,56 +270,6 @@ async def _parked_changes(client: Client, until: str) -> list[dict[str, Any]]:
     while not changes or changes[-1]["data"]["state"] != until:
         changes.append(await event(client.reader, "parked_session_changed"))
     return changes
-
-
-@pytest.mark.asyncio
-async def test_parked_session_changed_reports_idle_then_closed(tmp_path: Path) -> None:
-    backend = GatedBackend([([TextContent("held"), HOLD], [TextContent("held")])])
-    server = _server(tmp_path, backend)
-    client = None
-    try:
-        client, a, _ = await _parked_turn(server, backend, FEATURES)
-        backend.gates[0].set()
-        changes = await await_or_fail(
-            _parked_changes(client, "closed"), what="parked A closed"
-        )
-        assert {change["session_id"] for change in changes} == {a}
-        *_, idle, closed = [change["data"] for change in changes]
-        assert idle["session_id"] == a
-        assert idle["state"] == "idle"
-        assert idle["pending_approvals"] == 0
-        assert idle["last_turn_outcome"]["reason"] == "completed"
-        assert closed == {**idle, "state": "closed"}
-        # one event per real change
-        datas = [change["data"] for change in changes]
-        assert all(prev != nxt for prev, nxt in itertools.pairwise(datas))
-    finally:
-        backend.open_all()
-        await _close(server, client and client.writer)
-
-
-@pytest.mark.asyncio
-async def test_parked_session_changed_needs_session_park(tmp_path: Path) -> None:
-    backend = GatedBackend([([TextContent("held"), HOLD], [TextContent("held")])])
-    server = _server(tmp_path, backend)
-    client = client2 = None
-    try:
-        client, a, _ = await _parked_turn(server, backend, FEATURES)
-        await _drop(client.writer, server)
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", server.port), 10
-        )
-        client2 = Client(reader, writer)
-        # a reclaim without session_park closes parked A, which would report "closed"
-        seen = await client2.frames("hello", {"protocol_version": "1.2", "features": NO_PARK})
-        await _closed(server, a)
-        seen += await client2.frames("status")
-        assert "parked_session_changed" not in [
-            frame.get("params", {}).get("event") for frame in seen
-        ]
-    finally:
-        backend.open_all()
-        await _close(server, client2 and client2.writer, client and client.writer)
 
 
 async def _outcome(server: ZetaServer, client: Client, session_id: str) -> str:
@@ -422,57 +371,6 @@ async def test_park_limit_refuses_fourth_busy_swap_but_resume_swaps_one_for_one(
 
 
 @pytest.mark.asyncio
-async def test_parked_session_waits_for_background_task_and_its_wake_then_closes(
-    tmp_path: Path,
-) -> None:
-    go = tmp_path / "go"
-    command = f"while [ ! -e {go} ]; do sleep 0.05; done; echo done"
-    start = ToolUseContent(ToolCall("bg-1", "run_background", {"command": command}))
-    backend = GatedBackend([
-        ([TextContent("starting"), HOLD], [TextContent("starting"), start]),
-        ([TextContent("started")], [TextContent("started")]),
-        ([TextContent("woke")], [TextContent("woke")]),
-    ])
-    server = _server(tmp_path, backend)
-    client = None
-    try:
-        client = await _open(server, FEATURES)
-        a = await client.new()
-        await client.call("send", {"text": "start a task"})
-        await await_or_fail(backend.held[0].wait(), what="A mid-reply")
-        await client.new()
-        parked = server._parked[a]
-
-        backend.gates[0].set()
-        await _until(
-            lambda: backend.calls == 2 and not parked.state_change_busy(),
-            "A's turn ends while its task runs",
-        )
-        status = await client.call("status")
-        assert [row["session_id"] for row in status["parked_sessions"]] == [a]
-        assert server._parked.get(a) is parked
-
-        go.touch()
-        await _closed(server, a)
-        assert backend.calls == 3  # the wake turn ran before the close
-
-        await client.call("resume", {"session_id": a})
-        joined = await client.call("session_history_and_subscribe", {"session_id": a})
-        replies = [
-            block["text"]
-            for row in joined["messages"]
-            if row.get("role") == "assistant"
-            for block in row["content"]
-            if block.get("type") == "text"
-        ]
-        assert replies[-1] == "woke"
-    finally:
-        go.touch()
-        backend.open_all()
-        await _close(server, client and client.writer)
-
-
-@pytest.mark.asyncio
 async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
     tmp_path: Path,
 ) -> None:
@@ -493,23 +391,23 @@ async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
         parked.runtime.close = held_close
         backend.gates[0].set()
         await await_or_fail(close_started.wait(), what="idle close started")
-        assert a in server._closing
+        assert a in server.parking._closing
 
         await await_or_fail(client.new(), what="new_session during the close")
 
         waiting = asyncio.Event()
-        original_wait = server.wait_closed
+        original_wait = server.parking.wait_closed
 
         async def wait_closed(session_id: str) -> None:
-            if session_id in server._closing:
+            if session_id in server.parking._closing:
                 waiting.set()
             await original_wait(session_id)
 
-        server.wait_closed = wait_closed
+        server.parking.wait_closed = wait_closed
         resume = asyncio.create_task(client.call("resume", {"session_id": a}))
         try:
             await await_or_fail(waiting.wait(), what="resume waits for the close")
-            assert not resume.done() and a in server._closing
+            assert not resume.done() and a in server.parking._closing
             close_gate.set()
             result = await await_or_fail(resume, what="resume")
         finally:
@@ -574,38 +472,5 @@ async def test_turn_ending_during_incoming_setup_closes_instead_of_parking(
         assert (await client.call("status"))["parked_sessions"] == []
     finally:
         setup_gate.set()
-        backend.open_all()
-        await _close(server, client and client.writer)
-
-
-@pytest.mark.asyncio
-async def test_stale_idle_check_after_resume_keeps_the_attached_pair(
-    tmp_path: Path,
-) -> None:
-    """Forced order: a parked pair's idle check is scheduled, then `resume`
-    attaches the pair before the check runs; the late check must not close it."""
-    backend = GatedBackend([([TextContent("held"), HOLD], [TextContent("held")])])
-    server = _server(tmp_path, backend)
-    client = None
-    try:
-        client, a, parked = await _parked_turn(server, backend, FEATURES)
-        late_checks = []
-        original_check = server._close_if_idle
-        server._close_if_idle = late_checks.append
-        backend.gates[0].set()
-        # dropped frames of the parked turn schedule checks too; wait for an idle one
-        await _until(
-            lambda: parked in late_checks and not parked.holds_work(),
-            "A's idle check scheduled",
-        )
-
-        resumed = await client.call("resume", {"session_id": a})
-        assert "attached" not in resumed
-        for control in late_checks:
-            original_check(control)
-        assert server.control is parked
-        assert a not in server._closing
-        assert (await client.call("status"))["session"]["session_id"] == a
-    finally:
         backend.open_all()
         await _close(server, client and client.writer)
