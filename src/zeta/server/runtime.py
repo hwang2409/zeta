@@ -59,7 +59,8 @@ BackendFactory = Callable[[str, str | None, Path], tuple[CompletionBackend, str]
 SessionEventSink = Callable[[str, StreamEvent], None]
 SessionWakeSink = Callable[[str], None]
 MemoryNoticeSink = Callable[[str, str], None]
-RunWorkEventSink = Callable[[str, EventDescriptor, dict[str, object]], None]
+# a ``None`` event publishes nothing; it only tells a parked pair to re-check its work
+RunWorkEventSink = Callable[[str, EventDescriptor | None, dict[str, object]], None]
 ApprovalControlBinder = Callable[[ApprovalPolicy], None]
 TEST_SCRIPTED_PROVIDER_ENV = "ZETA_TEST_SCRIPTED_PROVIDER"
 _SETUP_SHUTDOWN_WAIT_SECONDS = 1.0
@@ -313,6 +314,23 @@ class ServerRuntime:
             project_dir=project_dir,
             repo_root=repo_root,
         )
+        return runtime
+
+    def sibling(self) -> ServerRuntime:
+        """An empty runtime with this one's settings and manager; no I/O, so the
+        event loop may call it (the provider is already resolved)."""
+        runtime = type(self).__new__(type(self))
+        for name in (
+            "home", "cwd", "_server_provider", "_server_model", "_server_tools",
+            "_server_disallowed_tools", "_require_tools", "_allow_hooks",
+            "_auto_memory", "_cli_yolo", "_max_turns", "_test_scripted_provider",
+            "backend_factory", "manager", "retention_event_sink", "retention_wake",
+        ):
+            if hasattr(self, name):
+                setattr(runtime, name, getattr(self, name))
+        runtime._project_registry_probed = True
+        runtime._state = None
+        runtime._init_sinks()
         return runtime
 
     @property
@@ -763,6 +781,8 @@ class ServerRuntime:
 
             def committed_task_changed(notice: BackgroundTaskNotice) -> None:
                 if notice.phase != "stopping":
+                    # a task exit receipt cleared: no row changed, but it held a parked pair
+                    run_work_sink(session_id, None, {})
                     return
                 task = next((item for item in registry.snapshot() if item.task_id == notice.task_id), None)
                 if task is not None:
