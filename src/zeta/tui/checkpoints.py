@@ -664,16 +664,11 @@ class CheckpointTranscriptMixin:
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
         transcript = self._viewed_transcript()
-        anchor = transcript.durable_scroll_anchor
-        scroll_generation = transcript.scroll_generation
         page = await self._agent_navigation.transcript_control.history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
-        restore_anchor = (
-            anchor
-            if scroll_generation == transcript.scroll_generation
-            else transcript.durable_scroll_anchor
-        )
+        # The place shown now, not at the read's start: a move during the read wins.
+        restore_anchor = transcript.durable_scroll_anchor
         self._render_active_resident_history()
         if restore_anchor is not None:
             transcript.restore_durable_scroll_anchor(restore_anchor)

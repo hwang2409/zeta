@@ -682,7 +682,7 @@ class TUIApp(
         transcript = self._viewed_transcript()
         pager = self._agent_navigation.transcript_control.history_pager
         if direction == "older":
-            if not pager.can_load_older or transcript.scroll_offset > 0:
+            if not pager.can_load_older or not transcript.at_resident_top:
                 return
         elif not pager.can_load_newer or not transcript.follow_tail:
             return
@@ -704,7 +704,7 @@ class TUIApp(
             move()
             return
         move()
-        if pager.can_load_older and transcript.scroll_offset == 0:
+        if pager.can_load_older and transcript.at_resident_top:
             asyncio.create_task(self._load_transcript_page(direction="older"))
 
     def _page_history_up(self) -> None:

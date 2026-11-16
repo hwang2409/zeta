@@ -207,7 +207,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         )
         self._revision = 0
         self._next_key = 0
-        self._scroll_generation = 0
         self._history_entry_id: str | None = None
         self._history_unit_ordinal = 0
         self._follow_tail = True
@@ -602,16 +601,22 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         return self._scroll_offset
 
     @property
+    def at_resident_top(self) -> bool:
+        """Whether the first resident row is the top row the user sees."""
+
+        if self._uses_virtual_history():
+            # Only a frame or a jump places a virtual view; clear() and anchor
+            # restores leave a stale line number behind (CI 43788114830).
+            return self._virtual_start == (0, 0)
+        return self._scroll_offset == 0
+
+    @property
     def scroll_anchor(self) -> tuple[_TranscriptUnit | None, int]:
         """Return the current opaque unit anchor and its text offset."""
 
         if self._anchor is None:
             return None, 0
         return self._anchor
-
-    @property
-    def scroll_generation(self) -> int:
-        return self._scroll_generation
 
     @property
     def durable_scroll_anchor(self) -> tuple[str, int, int] | None:
@@ -676,7 +681,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def _scroll_by(self, amount: int) -> None:
         if self._follow_tail and amount >= 0:
             return
-        self._scroll_generation += 1
         if self._uses_virtual_history():
             self._pending_virtual_scroll += amount
             if amount < 0:
@@ -710,7 +714,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_top(self) -> None:
         """Move to the first transcript line without materializing all history."""
 
-        self._scroll_generation += 1
         self._follow_tail = False
         self._pending_virtual_scroll = 0
         if self._uses_virtual_history():
@@ -723,7 +726,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_bottom(self) -> None:
         """Resume following the live transcript tail."""
 
-        self._scroll_generation += 1
         self._follow_tail = True
         self._anchor = None
         self._pending_virtual_scroll = 0

@@ -301,24 +301,82 @@ async def test_real_tui_child_view_journey(
     failures: list[str] = []
     journey_started = perf_counter()
 
+    # CI 43788114830: prompt_toolkit postpones a redraw while input is ready,
+    # so a PageUp can run before the first frame of the first page. Force that
+    # order: hold the first page until frames are held, hold frames until the
+    # key ran, and hold any older-page read it starts until the PageUp drew.
+    source = app._history_source
+    read_page = source.page
+    first_page_gate = asyncio.Event()
+    older_gate = asyncio.Event()
+    older_reads: list[asyncio.Event] = []
+
+    async def gated_page(cursor=None, *, direction="older"):
+        if cursor is None:
+            await await_or_fail(first_page_gate.wait(), what="held first root page")
+            return await read_page(cursor, direction=direction)
+        if direction != "older":
+            return await read_page(cursor, direction=direction)
+        finished = asyncio.Event()
+        older_reads.append(finished)
+        try:
+            await await_or_fail(older_gate.wait(), what="held older root page")
+            return await read_page(cursor, direction=direction)
+        finally:
+            finished.set()
+
+    source.page = gated_page
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
         session = app._make_session()
         run_task = asyncio.create_task(app.run(session))
         try:
             await _wait_until(lambda: session.app.is_running, what="running TUIApp")
             await _wait_until(
-                lambda: bool(app._transcript.units), what="root first paint"
+                lambda: app._transcript._viewport_height > 1, what="laid-out root"
             )
-
-            initial_anchor = app._transcript.durable_scroll_anchor
-            await _send(pipe, "\x1b[5~")
-            await _wait_until(
-                lambda: (
-                    app._transcript.durable_scroll_anchor is not None
-                    and app._transcript.durable_scroll_anchor != initial_anchor
-                ),
-                what="complex root anchor after PageUp",
-            )
+            assert not app._transcript.units, "the first root page was not held"
+            session.app._redraw = lambda *args, **kwargs: None
+            try:
+                first_page_gate.set()
+                await _wait_until(
+                    lambda: bool(app._transcript.units), what="root first paint"
+                )
+                assert app._transcript.follow_tail
+                await _send(pipe, "\x1b[5~")
+                await _wait_until(
+                    lambda: not app._transcript.follow_tail,
+                    what="root PageUp handled before the first frame",
+                )
+            finally:
+                del session.app._redraw
+                session.app.invalidate()
+            try:
+                await _wait_until(
+                    lambda: app._transcript.durable_scroll_anchor is not None,
+                    what="complex root anchor after PageUp",
+                )
+                root_anchor = app._transcript.durable_scroll_anchor
+                pager = app._agent_navigation.transcript_control.history_pager
+                resident = pager.descriptors
+                older_gate.set()
+                if older_reads:
+                    await await_or_fail(older_reads[0].wait(), what="older root page read")
+                    # The load adopts the page and repaints in one step.
+                    await _wait_until(
+                        lambda: pager.descriptors != resident,
+                        what="older root page adopted",
+                    )
+                await _terminal_text(app)
+                assert app._transcript.durable_scroll_anchor == root_anchor, (
+                    "root-early-pageup: the page load started by a PageUp before "
+                    "the first frame moved the root view; "
+                    f"expected={root_anchor!r} "
+                    f"actual={app._transcript.durable_scroll_anchor!r}"
+                )
+            except AssertionError as exc:
+                failures.append(str(exc))
+            finally:
+                older_gate.set()
             root_anchor = app._transcript.durable_scroll_anchor
             before = Text.from_ansi(app._transcript.render(120)).plain
             assert ROOT_MARKER in before, "root anchor fixture marker was not rendered"
@@ -715,6 +773,9 @@ async def test_real_tui_child_view_journey(
             # A later step cannot run; keep the failures found before it.
             failures.append(f"journey stopped: {exc}")
         finally:
+            first_page_gate.set()
+            older_gate.set()
+            vars(source).pop("page", None)
             app.request_exit()
             await await_or_fail(run_task, what="real child-view TUI shutdown")
 

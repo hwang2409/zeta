@@ -737,7 +737,7 @@ class AgentTranscriptControl(UIControl):
 
     def scroll(self, amount: int) -> None:
         self.transcript.scroll_lines(amount)
-        if amount < 0 and self.transcript.scroll_offset == 0 and self.on_history_edge:
+        if amount < 0 and self.transcript.at_resident_top and self.on_history_edge:
             self.on_history_edge("older")
         elif amount > 0 and self.transcript.follow_tail and self.on_history_edge:
             self.on_history_edge("newer")
