@@ -892,6 +892,31 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             policy.bind_capability_resolver(self.resolve_tool_call_capability)
             policy.bind_label_resolver(self.approval_label)
 
+    async def _effective_tool_call(
+        self, tool_call: ToolCall
+    ) -> tuple[ToolCall, ToolDefinition, ResolvedCapability, dict[str, Any]] | StructuredToolResult:
+        current = self._current_execution(tool_call)
+        if isinstance(current, dict):
+            return current
+        _definition, _capability, arguments = current
+        if self.pre_execute_hook is not None:
+            try:
+                hook_result = self.pre_execute_hook(tool_call.name, arguments)
+                if inspect.isawaitable(hook_result):
+                    hook_result = await hook_result
+            except Exception as exc:  # noqa: BLE001 - report hook failures
+                return _error_result(f"pre-execution hook failed: {exc}", kind="hook_failed")
+            if isinstance(hook_result, str):
+                return _error_result(hook_result, kind="hook_denied")
+            if hook_result is False:
+                return _error_result("tool execution denied by hook", kind="hook_denied")
+        effective_call = replace(tool_call, arguments=dict(arguments))
+        current = self._current_execution(effective_call)
+        if isinstance(current, dict):
+            return current
+        definition, capability, arguments = current
+        return effective_call, definition, capability, arguments
+
     async def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
         if self.approval_policy is None:
             return None
@@ -909,16 +934,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             return None
         if not capability.requires_approval and not self.enforce_approvals:
             return None
-        if definition.validate_arguments:
-            try:
-                _validate_arguments(tool_call.arguments, definition.parameters)
-            except (AttributeError, KeyError, TypeError, ValueError):
-                await self.abort_approval(tool_call)
-                return None
-        return await self.approval_policy.prepare(
-            tool_call,
-            capability=capability,
-        )
+        effective = await self._effective_tool_call(tool_call)
+        if isinstance(effective, dict):
+            await self.abort_approval(tool_call)
+            return None
+        tool_call, definition, capability, _arguments = effective
+        return await self.approval_policy.prepare(tool_call, capability=capability)
 
     def _current_execution(
         self, tool_call: ToolCall
@@ -1028,11 +1049,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         except (KeyError, TypeError, ValueError) as exc:
             await self.abort_approval(tool_call)
             return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        current = self._current_execution(tool_call)
-        if isinstance(current, dict):
+        effective = await self._effective_tool_call(tool_call)
+        if isinstance(effective, dict):
             await self.abort_approval(tool_call)
-            return await finalize(current)
-        definition, capability, arguments = current
+            return await finalize(effective)
+        tool_call, definition, capability, arguments = effective
         if _signal_is_set(signal_state):
             signal_state, abort_result = await self._arbitrate_abort(
                 tool_call, signal_state, _scope_signal
@@ -1065,6 +1086,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 ),
                 persist_request=_persist_approval,
                 capability=capability,
+                run_hook=False,
             )
             approved_execution = None
             if self.approval_policy is not None:
@@ -1081,13 +1103,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
-        # pre_tool hooks may replace arguments; validate and resolve that exact call.
-        effective_call = replace(tool_call, arguments=dict(arguments))
-        current = self._current_execution(effective_call)
-        if isinstance(current, dict):
-            return await finalize(current)
-        tool_call = effective_call
-        definition, capability, arguments = current
         claim_error = self.approval_execution_error(
             tool_call,
             prepared=_pending_execution_claimed,

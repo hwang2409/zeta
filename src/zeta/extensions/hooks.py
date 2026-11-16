@@ -5,11 +5,20 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 HOOK_OUTPUT_LIMIT = 2048
 HOOK_TRUNCATION_MARKER = "...[truncated]"
 DEFAULT_HOOK_TIMEOUT_SECONDS = 5.0
+
+
+class TaskOwner(Protocol):
+    def __call__(self, coroutine: Awaitable[Any]) -> asyncio.Task[Any]: ...
+
+
+def _missing_task_owner(coroutine: Awaitable[Any]) -> asyncio.Task[Any]:
+    coroutine.close()
+    raise RuntimeError("extension hooks require a session task owner")
 
 
 @dataclass(slots=True)
@@ -29,9 +38,10 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
 async def _invoke_with_deadline(
     handler: Callable[..., Awaitable[Any]],
     timeout_seconds: float,
+    task_owner: TaskOwner,
     *payload: Any,
 ) -> Any:
-    task = asyncio.create_task(handler(*payload))
+    task = task_owner(handler(*payload))
     try:
         done, _ = await asyncio.wait(
             (task,), timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
@@ -68,10 +78,38 @@ class CompositeToolHook:
         base: Callable[[str, dict[str, Any]], Awaitable[bool | str]] | None,
         hooks: list[ExtensionHook],
         notice: Callable[[str], None],
+        task_owner: TaskOwner,
     ) -> None:
         self._base = base
         self._hooks = hooks
         self._notice = notice
+        self._task_owner = task_owner
+
+    async def _run_hook(
+        self, hook: ExtensionHook, tool: str, args: dict[str, Any]
+    ) -> tuple[str, dict[str, Any] | None]:
+        if hook.disabled:
+            self._failure(hook, "disabled; call allowed unchecked")
+            return "continue", None
+        try:
+            result = await _invoke_with_deadline(
+                hook.handler, hook.timeout_seconds, self._task_owner, tool, args
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            hook.disabled = True
+            self._failure(hook, "timed out")
+            return "continue", None
+        except Exception as exc:  # noqa: BLE001 - extension code must fail open
+            hook.disabled = True
+            self._failure(hook, f"failed: {_short(exc)}")
+            return "continue", None
+        outcome, replacement = _normalize_pre_tool_result(result)
+        if outcome == "invalid":
+            hook.disabled = True
+            self._failure(hook, "returned invalid tool arguments")
+        return outcome, replacement
 
     async def __call__(self, tool: str, args: dict[str, Any]) -> bool | str:
         if self._base is not None:
@@ -81,33 +119,12 @@ class CompositeToolHook:
         for hook in self._hooks:
             if hook.event != "pre_tool":
                 continue
-            if hook.disabled:
-                self._failure(hook, "disabled; call allowed unchecked")
-                continue
-            try:
-                result = await _invoke_with_deadline(
-                    hook.handler, hook.timeout_seconds, tool, args
-                )
-            except asyncio.CancelledError:
-                raise
-            except TimeoutError:
-                hook.disabled = True
-                self._failure(hook, "timed out")
-                continue
-            except Exception as exc:  # noqa: BLE001 - extension code must fail open
-                hook.disabled = True
-                self._failure(hook, f"failed: {_short(exc)}")
-                continue
-            outcome, replacement = _normalize_pre_tool_result(result)
-            if outcome == "continue":
-                if replacement is not None:
-                    args.clear()
-                    args.update(replacement)
-                continue
-            if outcome != "invalid":
+            outcome, replacement = await self._run_hook(hook, tool, args)
+            if replacement is not None:
+                args.clear()
+                args.update(replacement)
+            if outcome != "continue":
                 return outcome
-            hook.disabled = True
-            self._failure(hook, "returned invalid tool arguments")
         return True
 
     def _failure(self, hook: ExtensionHook, detail: str) -> None:
@@ -122,6 +139,7 @@ async def run_extension_hooks(
     event: str,
     payload: tuple[Any, ...],
     notice: Callable[[str], None],
+    task_owner: TaskOwner,
 ) -> str | None:
     """Run non-blocking hooks and return bounded injected text, if any."""
 
@@ -131,7 +149,7 @@ async def run_extension_hooks(
             continue
         try:
             result = await _invoke_with_deadline(
-                hook.handler, hook.timeout_seconds, *payload
+                hook.handler, hook.timeout_seconds, task_owner, *payload
             )
         except asyncio.CancelledError:
             raise

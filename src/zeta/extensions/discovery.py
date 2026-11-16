@@ -53,6 +53,7 @@ def apply_extensions(
     home: str | Path | None,
     project_dir: str | Path | None,
     builtin_names: frozenset[str],
+    task_owner: object | None = None,
     disabled: tuple[str, ...] = (),
 ) -> ExtensionHost:
     """Load user extensions into ``registry`` and stage project extensions.
@@ -68,6 +69,7 @@ def apply_extensions(
         home=_as_path(home),
         project_dir=_as_path(project_dir),
         builtin_names=builtin_names,
+        task_owner=task_owner,  # type: ignore[arg-type]
     )
     disabled_set = frozenset(disabled)
     user_dir = _scope_dir(home, "")

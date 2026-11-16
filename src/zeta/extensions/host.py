@@ -33,7 +33,13 @@ if TYPE_CHECKING:
     from .manifest import ExtensionManifest
 
 from .api import ExtensionError
-from .hooks import CompositeToolHook, ExtensionHook, run_extension_hooks
+from .hooks import (
+    CompositeToolHook,
+    ExtensionHook,
+    TaskOwner,
+    _missing_task_owner,
+    run_extension_hooks,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +133,14 @@ class ExtensionHost:
         project_dir: Path | None,
         builtin_names: frozenset[str],
         hook_timeout_seconds: float = 5.0,
+        task_owner: TaskOwner | None = None,
     ) -> None:
         self._registry = registry
         self.home = home
         self.project_dir = project_dir
         self._builtin_names = builtin_names
         self.hook_timeout_seconds = hook_timeout_seconds
+        self._task_owner = task_owner or _missing_task_owner
         self.notice_sink: Any = None
         self._hooks: list[ExtensionHook] = []
         self.loaded: list[LoadedExtension] = []
@@ -184,10 +192,12 @@ class ExtensionHost:
             self.notice_sink(message)
 
     def pre_tool_hook(self, base: Any = None) -> CompositeToolHook:
-        return CompositeToolHook(base, self._hooks, self._notice)
+        return CompositeToolHook(base, self._hooks, self._notice, self._task_owner)
 
     async def emit(self, event: str, *payload: Any) -> str | None:
-        return await run_extension_hooks(self._hooks, event, payload, self._notice)
+        return await run_extension_hooks(
+            self._hooks, event, payload, self._notice, self._task_owner
+        )
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
