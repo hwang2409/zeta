@@ -1140,6 +1140,27 @@ async def test_stdio_stderr_lock_timeout_drops_output_and_close_joins_writer(
 
 
 @pytest.mark.asyncio
+async def test_stdio_stderr_log_truncates_marker_payload_to_file_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    cap = 1024
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "overflow.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"x" * cap, 1)
+    finally:
+        await log.close()
+
+    path = tmp_path / "mcp-logs" / "overflow.log"
+    payload = path.read_bytes()
+    assert len(payload) == cap
+    assert payload.startswith(b"[zeta: dropped 1 bytes of stderr]\n")
+
+
+@pytest.mark.asyncio
 async def test_stdio_stderr_queue_overload_writes_one_bounded_loss_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
