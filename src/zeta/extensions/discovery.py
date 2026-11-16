@@ -113,6 +113,7 @@ def _skip(
     disabled: frozenset[str],
 ) -> bool:
     if manifest.name in disabled:
+        host.disabled_inventory.append(PendingExtension(manifest, directory))
         host.notices.append(f"extensions · {manifest.name} disabled by settings")
         return True
     if manifest.api_version > EXTENSION_API_VERSION:

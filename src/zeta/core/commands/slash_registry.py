@@ -445,7 +445,16 @@ class SlashCommandRegistry:
             self._notices.append(notice)
             self._warning_notices.add(notice)
             return
-        if command.name in self._custom_commands and command.source == "home":
+        if command.name in self._custom_commands:
+            existing = self._custom_commands[command.name]
+            if command.source == "home":
+                return
+            notice = (
+                f"ignored custom command {command.path}: /{command.name} "
+                f"already belongs to {existing.source}; keeping the earlier command"
+            )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
             return
         self._custom_commands[command.name] = command
 

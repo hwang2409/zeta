@@ -12,6 +12,7 @@ UI primitives on this same object.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -70,8 +71,10 @@ class ExtensionAPI:
             raise ExtensionError("register_command name must be a nonempty string")
         if (handler is None) == (body is None):
             raise ExtensionError("register_command needs exactly one of handler or body")
-        if handler is not None and not callable(handler):
-            raise ExtensionError("register_command handler must be callable")
+        if handler is not None and not inspect.iscoroutinefunction(handler):
+            raise ExtensionError(
+                "register_command handler must be an async coroutine function"
+            )
         if body is not None and not isinstance(body, str):
             raise ExtensionError("register_command body must be a string")
         if kind not in {"prompt", "exec"}:

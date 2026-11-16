@@ -324,6 +324,48 @@ async def test_invalid_utf8_manifest_fails_open(tmp_path: Path) -> None:
         assert "ext_echo" in registry.registered_names
         assert any("cannot read manifest" in notice for notice in host.notices)
 
+def test_register_command_rejects_sync_handler(tmp_path: Path) -> None:
+    source = """
+def activate(zx):
+    def sync(args):
+        return args
+    try:
+        zx.register_command("sync", handler=sync)
+    except Exception as exc:
+        assert "async coroutine" in str(exc)
+"""
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "sync-ext", source=source)
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
+        assert host.loaded[0].command_names == ()
+    finally:
+        import asyncio
+        asyncio.run(registry.close())
+
+
+@pytest.mark.asyncio
+async def test_extension_command_failure_and_disable_persist(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = """
+def activate(zx):
+    async def fail(args):
+        raise RuntimeError("boom")
+    zx.register_command("fail", handler=fail)
+"""
+    _write_extension(home / "extensions", "commands", source=source)
+    async with _open_registry(tmp_path) as tools:
+        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
+        class Session:
+            slash_lock = SlashLock()
+        assert await registry.dispatch_async(Session(), "/fail") == "extension command failed: boom"
+        assert "extension commands" in (await registry.dispatch_async(Session(), "/ext disable commands"))
+        assert (home / "settings.toml").read_text() == '[extensions]\ndisabled = ["commands"]\n'
+        assert (await registry.dispatch_async(Session(), "/ext info commands")).startswith("commands 0.1.0")
+
+
 @pytest.mark.asyncio
 async def test_extension_commands_run_on_tui_and_serve_registries(tmp_path: Path) -> None:
     home = tmp_path / "home"

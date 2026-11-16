@@ -17,8 +17,11 @@ skipped. One broken extension never breaks the session or stops the rest.
 from __future__ import annotations
 
 import itertools
+import json
+import os
 import re
 import sys
+import tempfile
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,6 +145,7 @@ class ExtensionHost:
         self._packages: dict[str, Path] = {}
         self._command_declarations: dict[str, tuple[_CommandDeclaration, ...]] = {}
         self._disabled: set[str] = set()
+        self.disabled_inventory: list[PendingExtension] = []
         self._closed = False
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
@@ -231,6 +235,48 @@ class ExtensionHost:
             self._disabled.discard(name)
         else:
             self._disabled.add(name)
+
+    def persist_disabled(self) -> None:
+        """Atomically update only the global extensions.disabled setting."""
+        path = self.home / "settings.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            original = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            original = ""
+        value = json.dumps(sorted(self._disabled))
+        lines = original.splitlines(keepends=True)
+        start = next((i for i, line in enumerate(lines) if line.strip() == "[extensions]"), None)
+        if start is None:
+            updated = original + ("\n" if original and not original.endswith("\n") else "")
+            updated += f"[extensions]\ndisabled = {value}\n"
+        else:
+            end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+            disabled = next((i for i in range(start + 1, end) if lines[i].lstrip().startswith("disabled =")), None)
+            replacement = f"disabled = {value}\n"
+            if disabled is None:
+                lines.insert(end, replacement)
+            else:
+                lines[disabled] = replacement
+            updated = "".join(lines)
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                temporary.write(updated)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, path)
+        except BaseException:
+            try:
+                if temporary_name is not None:
+                    os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     def loaded_declarations(self, name: str) -> tuple[_CommandDeclaration, ...]:
         return self._command_declarations.get(name, ())
