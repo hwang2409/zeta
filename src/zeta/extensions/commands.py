@@ -43,7 +43,7 @@ def _register_extension_commands(
                 host.notices.append(_ignored(declaration.name, extension.name, exc))
             continue
         if registry.custom_command_for(declaration.name) is not None:
-            host.notices.append(
+            registry.add_notice(
                 f"extensions · ignored command '{declaration.name}' from {extension.name}: "
                 "shadows an existing custom command"
             )
@@ -62,7 +62,7 @@ def _register_extension_commands(
                 serve=ServeSlash(), reason="runs extension-provided code command",
             ))
         except Exception as exc:  # noqa: BLE001 - one command must not break the session
-            host.notices.append(_ignored(declaration.name, extension.name, exc))
+            registry.add_notice(_ignored(declaration.name, extension.name, exc))
 
 
 def _ignored(name: str, extension: str, exc: Exception) -> str:
@@ -93,7 +93,11 @@ async def _run_ext(host: ExtensionHost, args: str) -> str:
 async def _ext_list(host: ExtensionHost, name: str) -> str:
     if name:
         return "usage: /ext [list|info|enable|disable] [name]"
-    rows = [f"{item.name} {item.version} ({item.scope})" for item in host.loaded]
+    rows = [
+        f"{item.name} {item.version} ({item.scope})"
+        + (" disabled (next session)" if item.name in host.disabled else "")
+        for item in host.loaded
+    ]
     rows.extend(f"{item.manifest.name} (disabled next session)" for item in host.disabled_inventory)
     rows.extend(f"{item.manifest.name} (pending trust)" for item in host.pending_project)
     return "\n".join(rows) or "no extensions loaded"
@@ -102,6 +106,8 @@ async def _ext_list(host: ExtensionHost, name: str) -> str:
 async def _ext_info(host: ExtensionHost, name: str) -> str:
     item = next((item for item in host.loaded if item.name == name), None)
     if item is not None:
+        if item.name in host.disabled:
+            return f"{item.name} {item.version} ({item.scope}) disabled (next session)"
         return (
             f"{item.name} {item.version} ({item.scope})\n"
             f"tools: {', '.join(item.tool_names) or 'none'}\n"
@@ -130,8 +136,9 @@ async def _set_extension(host: ExtensionHost, name: str, enabled: bool) -> str:
     )
     if not name or not known:
         return f"extension not found: {name}"
-    host.set_enabled(name, enabled)
-    await asyncio.to_thread(host.persist_disabled)
+    changed = await asyncio.to_thread(host.persist_disabled, name, enabled)
+    if not changed:
+        return f"extension {name} is disabled in settings.toml; remove it there to enable"
     return f"extension {name} {'enabled' if enabled else 'disabled'} for the next session"
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -68,7 +69,14 @@ def apply_extensions(
         project_dir=_as_path(project_dir),
         builtin_names=builtin_names,
     )
-    disabled_set = frozenset(disabled)
+    host._settings_disabled = set(disabled)
+    try:
+        state = json.loads((host.home / "extensions-state.json").read_text(encoding="utf-8"))
+        state_disabled = set(state.get("disabled", ()))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        state_disabled = set()
+    host._disabled = set(disabled) | state_disabled
+    disabled_set = frozenset(host._disabled)
     user_dir = _scope_dir(home, "")
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):

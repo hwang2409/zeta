@@ -145,6 +145,7 @@ class ExtensionHost:
         self._packages: dict[str, Path] = {}
         self._command_declarations: dict[str, tuple[_CommandDeclaration, ...]] = {}
         self._disabled: set[str] = set()
+        self._settings_disabled: set[str] = set()
         self.disabled_inventory: list[PendingExtension] = []
         self._closed = False
 
@@ -236,47 +237,45 @@ class ExtensionHost:
         else:
             self._disabled.add(name)
 
-    def persist_disabled(self) -> None:
-        """Atomically update only the global extensions.disabled setting."""
-        path = self.home / "settings.toml"
-        path.parent.mkdir(parents=True, exist_ok=True)
+    @property
+    def settings_disabled(self) -> frozenset[str]:
+        return frozenset(self._settings_disabled)
+
+    def persist_disabled(self, name: str, enabled: bool) -> bool:
+        """Read, change, and atomically publish the zeta-owned state file."""
+        path = self.home / "extensions-state.json"
         try:
-            original = path.read_text(encoding="utf-8")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            current = set(data.get("disabled", ()))
         except FileNotFoundError:
-            original = ""
-        value = json.dumps(sorted(self._disabled))
-        lines = original.splitlines(keepends=True)
-        start = next((i for i, line in enumerate(lines) if line.strip() == "[extensions]"), None)
-        if start is None:
-            updated = original + ("\n" if original and not original.endswith("\n") else "")
-            updated += f"[extensions]\ndisabled = {value}\n"
+            current = set()
+        if name in self._settings_disabled and enabled:
+            return False
+        if enabled:
+            current.discard(name)
         else:
-            end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
-            disabled = next((i for i in range(start + 1, end) if lines[i].lstrip().startswith("disabled =")), None)
-            replacement = f"disabled = {value}\n"
-            if disabled is None:
-                lines.insert(end, replacement)
-            else:
-                lines[disabled] = replacement
-            updated = "".join(lines)
+            current.add(name)
+        payload = json.dumps({"disabled": sorted(current)}, separators=(",", ":")) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary_name: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=path.parent,
-                prefix=f".{path.name}.", delete=False,
-            ) as temporary:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                            prefix=f".{path.name}.", delete=False) as temporary:
                 temporary_name = temporary.name
-                temporary.write(updated)
+                os.chmod(temporary.name, 0o600)
+                temporary.write(payload)
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, path)
         except BaseException:
-            try:
-                if temporary_name is not None:
+            if temporary_name is not None:
+                try:
                     os.unlink(temporary_name)
-            except FileNotFoundError:
-                pass
+                except FileNotFoundError:
+                    pass
             raise
+        self._disabled = set(self._settings_disabled) | current
+        return True
 
     def loaded_declarations(self, name: str) -> tuple[_CommandDeclaration, ...]:
         return self._command_declarations.get(name, ())

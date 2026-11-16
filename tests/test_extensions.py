@@ -8,6 +8,8 @@ behavior tests, not fail-first regression tests.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -362,8 +364,31 @@ def activate(zx):
             slash_lock = SlashLock()
         assert await registry.dispatch_async(Session(), "/fail") == "extension command failed: boom"
         assert "extension commands" in (await registry.dispatch_async(Session(), "/ext disable commands"))
-        assert (home / "settings.toml").read_text() == '[extensions]\ndisabled = ["commands"]\n'
+        assert (home / "extensions-state.json").read_text() == '{"disabled":["commands"]}\n'
+        assert (home / "extensions-state.json").stat().st_mode & 0o777 == 0o600
         assert (await registry.dispatch_async(Session(), "/ext info commands")).startswith("commands 0.1.0")
+        await asyncio.to_thread(host.persist_disabled, "commands", True)
+        assert json.loads((home / "extensions-state.json").read_text())["disabled"] == []
+
+
+@pytest.mark.asyncio
+async def test_extension_disabled_sources_and_round_trip(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text('[extensions]\ndisabled = ["settings-off"]\n', encoding="utf-8")
+    _write_extension(home / "extensions", "settings-off")
+    _write_extension(home / "extensions", "active")
+    async with _open_registry(tmp_path) as tools:
+        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names,
+                               disabled=("settings-off",))
+        registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
+        class Session:
+            slash_lock = SlashLock()
+        assert "settings.toml" in await registry.dispatch_async(Session(), "/ext enable settings-off")
+        await registry.dispatch_async(Session(), "/ext disable active")
+        state = json.loads((home / "extensions-state.json").read_text())
+        assert state["disabled"] == ["active"]
+        assert "disabled (next session)" in await registry.dispatch_async(Session(), "/ext info active")
 
 
 @pytest.mark.asyncio
