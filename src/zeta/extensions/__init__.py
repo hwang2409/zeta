@@ -24,9 +24,9 @@ from .manifest import (
 
 __all__ = [
     "EXTENSION_API_VERSION",
+    "CompositeToolHook",
     "ExtensionAPI",
     "ExtensionError",
-    "CompositeToolHook",
     "ExtensionHook",
     "ExtensionHost",
     "ExtensionManifest",
