@@ -16,7 +16,10 @@ skipped. One broken extension never breaks the session or stops the rest.
 
 from __future__ import annotations
 
+import itertools
+import re
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -93,6 +96,10 @@ class PendingExtension:
     directory: Path
 
 
+_NAMESPACE = "_zeta_extensions"
+_LOAD_NUMBER = itertools.count()
+
+
 class ExtensionHost:
     """Mutable per-session record of extension loading."""
 
@@ -115,8 +122,19 @@ class ExtensionHost:
         self._packages: dict[str, Path] = {}
         self._closed = False
 
-    def track_package(self, package: str, directory: Path) -> None:
+    def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
+        safe = re.sub(r"[^0-9A-Za-z_]", "_", extension_name)
+        package = f"{_NAMESPACE}.{safe}_{next(_LOAD_NUMBER):x}"
+        if _NAMESPACE not in sys.modules:
+            namespace = types.ModuleType(_NAMESPACE)
+            namespace.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[_NAMESPACE] = namespace
+        module = types.ModuleType(package)
+        module.__path__ = [str(directory)]  # type: ignore[attr-defined]
+        module.__package__ = package
+        sys.modules[package] = module
         self._packages[package] = directory
+        return package, module
 
     def remove_package_for_directory(self, directory: Path) -> None:
         for package, package_directory in tuple(self._packages.items()):

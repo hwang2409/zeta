@@ -26,10 +26,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import itertools
-import re
 import sys
-import types
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -48,8 +45,6 @@ from .manifest import (
 )
 
 EXTENSIONS_DIRNAME = "extensions"
-_NAMESPACE = "_zeta_extensions"
-_LOAD_NUMBER = itertools.count()
 
 
 def apply_extensions(
@@ -187,14 +182,7 @@ def _import_entry(
     two extensions with a same-named helper module do not collide.
     """
 
-    safe = re.sub(r"[^0-9A-Za-z_]", "_", manifest.name)
-    pkg_name = f"{_NAMESPACE}.{safe}_{next(_LOAD_NUMBER):x}"
-    _ensure_namespace()
-    pkg = types.ModuleType(pkg_name)
-    pkg.__path__ = [str(directory)]  # type: ignore[attr-defined]
-    pkg.__package__ = pkg_name
-    sys.modules[pkg_name] = pkg
-    host.track_package(pkg_name, directory)
+    pkg_name, _pkg = host.new_package(directory, manifest.name)
     entry_full = f"{pkg_name}.{manifest.entry_module}"
     single = directory / f"{manifest.entry_module}.py"
     package_init = directory / manifest.entry_module / "__init__.py"
@@ -226,14 +214,6 @@ def _import_entry(
         host.remove_package(pkg_name)
         raise
     return module
-
-
-def _ensure_namespace() -> None:
-    if _NAMESPACE in sys.modules:
-        return
-    namespace = types.ModuleType(_NAMESPACE)
-    namespace.__path__ = []  # type: ignore[attr-defined]
-    sys.modules[_NAMESPACE] = namespace
 
 
 def _manifest_or_notice(

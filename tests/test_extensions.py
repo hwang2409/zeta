@@ -254,77 +254,56 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
     def package_names() -> set[str]:
         return {name for name in sys.modules if name.startswith("_zeta_extensions.")}
 
-    async with _open_registry(tmp_path) as registry:
-        before = package_names()
+    before = package_names()
+    success_dir = _write_extension(tmp_path / "success" / "extensions", "success")
+    async with load_extension(success_dir) as kit:
+        assert kit.host.loaded
+        assert package_names() != before
+    assert package_names() == before
 
-        _write_extension(tmp_path / "success-home" / "extensions", "success")
-        success = apply_extensions(
-            registry, home=tmp_path / "success-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
-        success_names = package_names() - before
-        assert success_names
-        success.close()
+    broken_dir = _write_extension(
+        tmp_path / "broken" / "extensions", "broken",
+        source="from . import helper\nraise RuntimeError('boom')\n",
+    )
+    (broken_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+    async with load_extension(broken_dir) as kit:
+        assert any("import failed" in notice for notice in kit.host.notices)
         assert package_names() == before
-        success.close()
 
-        broken_dir = _write_extension(
-            tmp_path / "broken-home" / "extensions", "broken",
-            source="from . import helper\nraise RuntimeError('boom')\n",
-        )
-        (broken_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
-        broken = apply_extensions(
-            registry, home=tmp_path / "broken-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
-        assert any("import failed" in notice for notice in broken.notices)
+    crashing_dir = _write_extension(
+        tmp_path / "crashing" / "extensions", "crashing",
+        source="def activate(zx):\n    raise RuntimeError('boom')\n",
+    )
+    async with load_extension(crashing_dir) as kit:
+        assert any("activate raised" in notice for notice in kit.host.notices)
         assert package_names() == before
-        broken.close()
 
-        _write_extension(
-            tmp_path / "crashing-home" / "extensions", "crashing",
-            source="def activate(zx):\n    raise RuntimeError('boom')\n",
-        )
-        crashing = apply_extensions(
-            registry, home=tmp_path / "crashing-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
-        assert any("activate raised" in notice for notice in crashing.notices)
+    async_dir = _write_extension(
+        tmp_path / "async" / "extensions", "async",
+        source="async def activate(zx):\n    return None\n",
+    )
+    async with load_extension(async_dir) as kit:
+        assert any("must be synchronous" in notice for notice in kit.host.notices)
         assert package_names() == before
-        crashing.close()
 
-        _write_extension(
-            tmp_path / "bad-home" / "extensions", "bad",
-            source="VALUE = 1\n",
-        )
-        bad = apply_extensions(
-            registry, home=tmp_path / "bad-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
-        assert any("no callable" in notice for notice in bad.notices)
+    bad_dir = _write_extension(
+        tmp_path / "bad" / "extensions", "bad", source="VALUE = 1\n"
+    )
+    async with load_extension(bad_dir) as kit:
+        assert any("no callable" in notice for notice in kit.host.notices)
         assert package_names() == before
-        bad.close()
 
-        repeated_dir = _write_extension(
-            tmp_path / "repeated-home" / "extensions", "repeated",
-            source="from . import helper\ndef activate(zx):\n    pass\n",
-        )
-        (repeated_dir / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
-        first = apply_extensions(
-            registry, home=tmp_path / "repeated-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
+    repeated_dir = _write_extension(
+        tmp_path / "repeated" / "extensions", "repeated",
+        source="from . import helper\ndef activate(zx):\n    pass\n",
+    )
+    (repeated_dir / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
+    async with load_extension(repeated_dir) as _first:
         first_names = package_names() - before
-        second = apply_extensions(
-            registry, home=tmp_path / "repeated-home", project_dir=None,
-            builtin_names=registry.registered_names,
-        )
-        second_names = package_names() - before - first_names
-        assert first_names and second_names and first_names.isdisjoint(second_names)
-        first.close()
-        assert package_names() == before | second_names
-        second.close()
-        assert package_names() == before
+        async with load_extension(repeated_dir) as _second:
+            second_names = package_names() - before - first_names
+            assert first_names and second_names and first_names.isdisjoint(second_names)
+    assert package_names() == before
 
 
 @pytest.mark.asyncio
