@@ -1158,6 +1158,82 @@ async def test_an_open_picker_is_one_card_across_history_redraws(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+@pytest.mark.parametrize("close", ["j+enter", "esc"])
+async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    close: str,
+) -> None:
+    # The first page draws while the picker is open. Then exactly one card shows,
+    # and once the picker closes none is left: not on screen, not in the history,
+    # not in the finder's preview rows, and never under a sent prompt.
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=True
+    )
+    _fake_remote_hosts(None, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend, painted=False) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        _fake_accounts(app, monkeypatch)
+
+        def cards() -> tuple[int, int]:
+            return _picker_cards(driver), _picker_cards_in_history(app)
+
+        def rows() -> str:
+            return "\n".join(driver.all_rows())
+
+        await driver.send(command + ENTER)
+        await driver.until(lambda: app._picker_active, what=f"{command} opened nothing")
+        startup.set()
+        await driver.until(
+            lambda: not app._startup_replay_active
+            and app._picker_loading is None
+            and _answer(TURNS - 1) in driver.screen(),
+            what="startup did not draw the history under the picker",
+        )
+        await driver.settle("settled screen with the picker open")
+        assert app._picker_active and cards() == (1, 0), (
+            f"open picker: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+        if close == "esc":
+            await driver.send(ESCAPE)
+            await driver.settle("settled screen after Esc")
+        else:
+            await driver.send("j")
+            await driver.settle("settled screen after j")
+            assert driver.session.default_buffer.text == "j" and cards() == (0, 0), (
+                f"after j: composer {driver.session.default_buffer.text!r}, cards"
+                f" {cards()}; screen:\n{rows()}"
+            )
+            # The fake account list cannot run a turn; the real context can.
+            app.loop.account_context = account_context
+            await driver.send(ENTER)
+            await driver.until(
+                lambda: bool(backend.calls)
+                and (app._active_task is None or app._active_task.done()),
+                what="Enter did not send j",
+            )
+            await driver.settle("settled screen after the send")
+        assert not app._picker_active and cards() == (0, 0), (
+            f"after {close}: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f opened no finder")
+        await driver.settle("settled finder")
+        assert _picker_cards(driver) == 0, f"a card in the finder preview; screen:\n{rows()}"
+        for _ in range(2):
+            await driver.send(ESCAPE)
+            await driver.settle("settled screen after Esc")
+        assert not driver.finder_drawn() and cards() == (0, 0), (
+            f"after the finder: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("command", "state"),
     [
