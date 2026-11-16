@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from tests.support.replay_transport import (
 from zeta.server import ZetaServer
 from zeta.server import control as control_module
 from zeta.server.handlers import registry
-from zeta.server.protocol import MethodDescriptor
+from zeta.server.protocol import EventDescriptor, MethodDescriptor
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -461,6 +462,75 @@ async def test_turn_reconnect_through_loss_path(tmp_path: Path, transport: Trans
         for release in backend.release:
             release.set()
         gate.set()
+        await a.close()
+        await b.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_output_drain_on_lost_holder_releases_slot(tmp_path: Path) -> None:
+    """Test 9 (fail-first, unix only): a live-event publish parked in the output
+    writer's ``drain()`` (the holder stopped reading and the kernel send buffer
+    is full) keeps ``callers_settled`` clear, so a request behind it is stuck at
+    ``wait_until_settled`` and never dispatches.
+
+    On the branch the run loop reads the socket concurrently, so a lost holder's
+    EOF is still seen: the slot is released, the stuck handler is cancelled, the
+    connection closes, and the parked publish ends; a contending controller
+    hello wins within one handoff deadline. On base origin/main the run loop is
+    blocked at ``wait_until_settled`` before it can loop back to read, so the EOF
+    is never read, the slot is held, and the hello is refused with -32001.
+
+    Unix only: on TCP a client half-close or RST errors the parked ``drain()``,
+    which resolves the caller and unblocks the base loop, so the bug does not
+    reproduce there. This mirrors the achilles RCA (a unix socket whose peer
+    stopped reading after a resume).
+    """
+    server = await _make_server(tmp_path, "unix")
+    server.lost_request_contended_drain = 0.0
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(control_module, "CONTROLLER_HANDOFF_DEADLINE_SECONDS", 0.5)
+    a = await connect_replay(server, "unix")
+    b = await connect_replay(server, "unix")
+    publishes: list[asyncio.Task[bool]] = []
+    try:
+        await negotiate(a)
+        # shrink the client receive buffer so the kernel buffers fill fast.
+        a.writer.get_extra_info("socket").setsockopt(
+            socket.SOL_SOCKET, socket.SO_RCVBUF, 8192
+        )
+        state = server.connections._controller
+        conn, output = state.connection, state.output
+        # publish big live events the holder never reads; the writer parks in
+        # drain() with its caller still counted, so callers_settled stays clear.
+        publishes = [
+            asyncio.create_task(
+                server.connections.send(
+                    conn,
+                    conn.codec.notification(
+                        EventDescriptor.CONFIG_CHANGED, None, data={"blob": "x" * 900_000}
+                    ),
+                )
+            )
+            for _ in range(4)
+        ]
+        await _settle_until(lambda: output.pending_callers > 0)
+        assert output.pending_callers > 0 and not all(p.done() for p in publishes), (
+            "the publish did not park in the output writer's drain()"
+        )
+        # a request queued behind the parked publish; its handler cannot pass
+        # wait_until_settled. on base the run loop blocks here before reading on.
+        await a.send(2, "session_settings", {})
+        # the holder is gone (FIN); its write side is half-closed.
+        _lose(a)
+        await _settle_until(lambda: _is_lost(server))
+        hello = await b.request(2, "hello", {"protocol_version": "1.1", "features": []})
+        assert "result" in hello, hello
+        await _spin(lambda: all(p.done() for p in publishes), what="parked publish ends")
+    finally:
+        monkeypatch.undo()
+        for publish in publishes:
+            publish.cancel()
         await a.close()
         await b.close()
         await server.close()
