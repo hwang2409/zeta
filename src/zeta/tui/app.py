@@ -39,6 +39,7 @@ from ..core.slash import (
     _format_status,
     create_slash_registry,
 )
+from ..extensions.host import ExtensionHost
 from ..protocol.types import (
     Message,
 )
@@ -196,6 +197,7 @@ class TUIApp(
         startup_warnings: Sequence[str] = (),
         startup_alerts: Sequence[str] = (),
         external_tools: ExternalToolDiscovery | None = None,
+        extensions: ExtensionHost | None = None,
         workspace_snapshot_cap: int | None = None,
         ephemeral_root: Path | None = None,
         session_name: str = "",
@@ -214,6 +216,7 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
+        self.extensions = extensions
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)

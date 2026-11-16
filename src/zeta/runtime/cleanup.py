@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..core.checkpoints.workspace import WorkspaceSnapshotStore
+    from ..extensions.host import ExtensionHost
     from .loop import AgentLoop
 
 
 async def close_session(
     loop: AgentLoop,
     snapshots: WorkspaceSnapshotStore | None = None,
+    extensions: ExtensionHost | None = None,
     *,
     before_store_close: Callable[[], None] | None = None,
 ) -> None:
@@ -35,4 +37,8 @@ async def close_session(
                     if snapshots is not None:
                         await asyncio.to_thread(snapshots.close)
                 finally:
-                    await asyncio.to_thread(loop.store.close)
+                    try:
+                        await asyncio.to_thread(loop.store.close)
+                    finally:
+                        if extensions is not None:
+                            extensions.close()

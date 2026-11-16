@@ -108,6 +108,7 @@ class RuntimeCloseMixin:
                 lambda: close_session(
                     self.loop,
                     self._workspace_snapshot_store,
+                    getattr(self, "extensions", None),
                     before_store_close=(
                         lambda: (
                             surface_shutdown_notifications(self, pending_before)

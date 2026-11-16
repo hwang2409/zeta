@@ -32,6 +32,7 @@ from ..core.slash import (
     effective_budget_for_model,
     resolve_session_budget,
 )
+from ..extensions.host import ExtensionHost
 from ..models.catalog import REMOVED_PROVIDER_ERROR
 from ..project_context.projection import compose_with_stable_projection
 from ..project_registry import ProjectRegistryError
@@ -141,6 +142,7 @@ class SessionState:
     policy: ApprovalPolicy
     project_dir: Path
     repo_root: Path
+    extensions: ExtensionHost | None = None
     project_registry_busy: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
@@ -159,6 +161,7 @@ class SessionState:
             policy=composition.policy,
             project_dir=composition.project_dir,
             repo_root=composition.repo_root,
+            extensions=composition.extensions,
             project_registry_busy=composition.project_registry_busy,
         )
 
@@ -603,7 +606,7 @@ class ServerRuntime:
 
     @staticmethod
     async def _close_state(state: SessionState) -> None:
-        await close_session(state.loop)
+        await close_session(state.loop, extensions=state.extensions)
 
     async def _run_setup(
         self,

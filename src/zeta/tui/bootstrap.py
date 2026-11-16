@@ -628,10 +628,14 @@ def _create_app_with_root(
         + project_context.notices
         + project_registry_notice
         + external_tools.notices
+        + tuple(composition.extensions.notices)
         + theme_notices
     )
     startup_warnings = (
-        tuple(loaded_settings.warnings) + external_tools.warnings + account_warnings
+        tuple(loaded_settings.warnings)
+        + external_tools.warnings
+        + tuple(composition.extensions.warnings)
+        + account_warnings
     )
     if manager.project_registry_unavailable is not None:
         startup_warnings = (
@@ -683,6 +687,7 @@ def _create_app_with_root(
         startup_warnings=startup_warnings,
         startup_alerts=startup_alerts,
         external_tools=external_tools,
+        extensions=composition.extensions,
         workspace_snapshot_cap=config.workspace_snapshot_cap,
         ephemeral_root=ephemeral_root,
         session_name=metadata.name,

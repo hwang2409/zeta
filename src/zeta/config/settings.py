@@ -92,6 +92,7 @@ _TOP_KEYS = frozenset(
         "agents",
         "mcp",
         "retention",
+        "extensions",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -111,6 +112,11 @@ _INBOX_KEYS = frozenset({"enabled"})
 _ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
+# Extensions run arbitrary in-process Python, so their config is trusted and
+# stays global-only: ``extensions`` is deliberately NOT in _PROJECT_SAFE_KEYS,
+# matching allow_external_tools, allow_hooks, and agents. Slice 1 reads only the
+# ``disabled`` list; later slices add more keys here.
+_EXTENSIONS_KEYS = frozenset({"disabled"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
@@ -150,6 +156,7 @@ class Settings:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    extensions_disabled: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +193,7 @@ class ResolvedConfig:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    extensions_disabled: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +364,7 @@ def resolve(
         mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
+        extensions_disabled=settings.extensions_disabled,
     )
 
 
@@ -612,6 +621,7 @@ def _validate(
     tool_deny = _validated_tool_patterns(
         data, "disallowed_tools", notices, optional=False
     )
+    extensions_disabled = _validated_extensions(data, notices)
     allow, deny, ask = _validated_approval(data, notices, warnings)
     keybindings = _validated_keybindings(data, notices)
     return Settings(
@@ -647,7 +657,20 @@ def _validate(
         mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
         mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
+        extensions_disabled=extensions_disabled,
     )
+
+
+def _validated_extensions(
+    data: Mapping[str, Any], notices: list[str]
+) -> tuple[str, ...]:
+    table = data.get("extensions", {})
+    if not isinstance(table, Mapping):
+        notices.append("settings · ignored key 'extensions': expected table")
+        return ()
+    for key in table.keys() - _EXTENSIONS_KEYS:
+        notices.append(f"settings · ignored unknown key 'extensions.{key}'")
+    return _validated_str_list("extensions.disabled", table.get("disabled"), notices)
 
 
 def _validated_inbox(

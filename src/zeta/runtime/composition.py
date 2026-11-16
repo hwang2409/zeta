@@ -23,6 +23,7 @@ from ..core.project_context import (
 )
 from ..core.session import OpenedSession, SessionManager
 from ..core.slash import resolve_session_budget
+from ..extensions import ExtensionHost, apply_extensions
 from ..mcp.envelope import MCPCallLimits
 from ..media.image_policy import image_policy_for_provider
 from ..memory.auto import AutoMemoryConfig, AutoMemoryReconciler
@@ -73,6 +74,7 @@ class RuntimeComposition:
     project_dir: Path
     repo_root: Path
     external_tools: ExternalToolDiscovery
+    extensions: ExtensionHost
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
     project_registry_busy: bool = False
@@ -440,11 +442,22 @@ def compose_runtime(
             else Path(metadata.cwd).resolve()
         )
         loop.set_mcp_scope(home=home, project_dir=repo_root)
+        builtin_tool_names = loop.tool_registry.registered_names
         external_tools = apply_external_tools(
             loop.tool_registry,
             home=home,
             project_dir=repo_root / ".zeta",
             allow_external_tools=config.allow_external_tools,
+        )
+        # Load extensions synchronously at compose time, after built-in and
+        # external tools, exactly like ~/.zeta/tools today. A broken extension
+        # fails open (a notice); project extensions are staged until trusted.
+        extensions = apply_extensions(
+            loop.tool_registry,
+            home=home,
+            project_dir=repo_root,
+            builtin_names=builtin_tool_names,
+            disabled=config.extensions_disabled,
         )
         loop.tool_schemas = tuple(loop.tool_registry.schemas)
         if background_event_sink is not None:
@@ -461,6 +474,7 @@ def compose_runtime(
                 else Path(metadata.cwd).resolve()
             ),
             external_tools=external_tools,
+            extensions=extensions,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
             project_registry_busy=(
