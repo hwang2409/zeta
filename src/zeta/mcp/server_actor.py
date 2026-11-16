@@ -1060,17 +1060,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
         client = self._client
-        # under a hold, a call already sent keeps running on its sealed client
-        # and returns its real result; the client closes when it ends.
-        sent: dict[int, _CallRequest | _PromptRequest] = {}
-        if message.hold is not None:
-            sent = {
-                identifier: request
-                for identifier, request in self._requests.items()
-                if isinstance(request, _CallRequest)
-                and request.task is not None
-                and request.client is not None
-            }
+        sent = self._keep_sent_calls(message.hold)
         for identifier, request in self._requests.items():
             if identifier in sent:
                 continue
@@ -1084,9 +1074,6 @@ class MCPServerActor(MCPDefinitionPublisher):
             else:
                 cancel_prompt_request(request, self.name)
         self._requests = sent
-        for request in sent.values():
-            assert request.client is not None
-            self._seal(request.client)
         self._close_drained_clients()
         cancel_terminated_resources(self)
         await self._tool_refresh.close()
@@ -1131,19 +1118,35 @@ class MCPServerActor(MCPDefinitionPublisher):
             if isinstance(request, _CallRequest) and request.task is None
         ]
 
+    def _keep_sent_calls(
+        self, hold: asyncio.Future[None] | None
+    ) -> dict[int, _CallRequest | _PromptRequest]:
+        """Under a hold, a call already sent keeps running on its sealed client
+        and returns its real result; the client closes when the last one ends."""
+        if hold is None:
+            return {}
+        sent: dict[int, _CallRequest | _PromptRequest] = {}
+        for identifier, request in self._requests.items():
+            if isinstance(request, _CallRequest) and request.task and request.client:
+                sent[identifier] = request
+                self._seal(request.client)
+        return sent
+
     def _handle_hold_ended(self, hold: asyncio.Future[None]) -> None:
         if hold is not self._detached_hold:
             return
         self._detached_hold = None
-        for request in self._held_calls():
-            self._requests.pop(request.identifier)
-            _set_result(request.result, _detached_result(self.name))
-        # no client came back: a call still running on its old client ends as
-        # it would have at the disconnect.
-        for request in list(self._requests.values()):
-            if isinstance(request, _CallRequest) and request.client in self._draining:
+        # no client came back: waiting calls and calls still running on an old
+        # client end as they would have at the disconnect.
+        for request in [*self._requests.values()]:
+            if isinstance(request, _CallRequest) and (
+                request.task is None or request.client in self._draining
+            ):
                 self._requests.pop(request.identifier)
-                _set_result(request.result, _detached_result(self.name, started=True))
+                _set_result(
+                    request.result,
+                    _detached_result(self.name, started=request.task is not None),
+                )
                 if request.task is not None:
                     request.task.cancel()
         self._close_drained_clients()
@@ -1327,9 +1330,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             return
         self._draining.add(client)
         self._detach_failure_sink(client)
-        seal = getattr(client, "seal", None)
-        if seal is not None:
-            seal()
+        client.seal()
 
     def _close_drained_clients(self) -> None:
         busy = {

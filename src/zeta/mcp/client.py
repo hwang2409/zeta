@@ -146,6 +146,9 @@ class MCPClient(Protocol):
     ) -> StructuredToolResult:
         """Call one remote tool."""
 
+    def seal(self) -> None:
+        """Send nothing new; requests already sent keep running until close."""
+
     async def close(self) -> None:
         """Close the transport and release child processes or clients."""
 

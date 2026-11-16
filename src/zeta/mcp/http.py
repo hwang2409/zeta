@@ -29,6 +29,7 @@ from .client import (
     MCPTool,
     MCPTransportError,
     canceled_result,
+    detached_result,
     initialize_params,
     make_error_result,
     parse_rpc_response,
@@ -89,6 +90,13 @@ def _consume_task_exception(task: asyncio.Task[object]) -> None:
 class _ActiveRequest:
     task: asyncio.Task[dict[str, object]] | None = None
     response: httpx.Response | None = None
+
+
+class _Sealed(MCPHTTPError):
+    """A sealed client refused to send a new request with the gone headers."""
+
+    def __init__(self) -> None:
+        super().__init__(0, "the client that provides this server disconnected")
 
 
 class StreamableHTTPMCPClient(MCPClient):
@@ -205,6 +213,8 @@ class StreamableHTTPMCPClient(MCPClient):
             )
         except MCPCanceled:
             return canceled_result()
+        except _Sealed:
+            return detached_result(self.config.name, started=True)
         except MCPWireLimitError:
             return make_error_result(
                 f"MCP tool {self.config.name}__{name} exceeded the "
@@ -315,8 +325,10 @@ class StreamableHTTPMCPClient(MCPClient):
         *,
         recover_session: bool = True,
     ) -> dict[str, object]:
-        if self._closed or self._sealed:
+        if self._closed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
+        if self._sealed:
+            raise _Sealed()
         self._next_id += 1
         request_id = self._next_id
         payload = {
@@ -385,6 +397,8 @@ class StreamableHTTPMCPClient(MCPClient):
         if self.config.auth_type != "oauth":
             return await send(None)
         snapshot = await self._credential_store.load(self.config.name)
+        if self._sealed:
+            raise _Sealed()
         if snapshot.token is None:
             raise self._auth_error(MCPHTTPError(401, "authorization required"))
         try:
@@ -392,6 +406,9 @@ class StreamableHTTPMCPClient(MCPClient):
         except MCPHTTPError as exc:
             if exc.status_code != 401:
                 raise
+            if self._sealed:
+                # a refresh would resend with the gone client's headers.
+                raise _Sealed() from exc
             if not await self._refresh_token_once(exc, snapshot):
                 raise self._auth_error(exc)
             retry = await self._credential_store.load(self.config.name)

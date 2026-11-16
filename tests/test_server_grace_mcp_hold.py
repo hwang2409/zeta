@@ -7,10 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from tests.support.owned import await_or_fail
 from tests.support.server_client import frames_until_event
+from tests.test_mcp_oauth import _monkey_home, _write_token
 from tests.test_server import _connect, _event, _request
 from tests.test_server_mcp_bindings import LocalMCP, allow_local_http
 from tests.test_server_turn_reconnect import (
@@ -23,6 +25,8 @@ from tests.test_server_turn_reconnect import (
     _replies,
     _server,
 )
+from zeta.core.abort import AbortSignal
+from zeta.mcp import MCPServerConfig, StreamableHTTPMCPClient
 from zeta.protocol.types import TextContent, ToolCall, ToolUseContent
 from zeta.server import ZetaServer
 
@@ -369,6 +373,115 @@ async def test_call_in_flight_without_reattach_ends_at_deadline(
     finally:
         gate.set()
         await grace.close()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_call_answered_404_sends_nothing_with_old_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grace = Grace(tmp_path, monkeypatch)
+    gate = asyncio.Event()
+    grace.mcp.call_gate = gate
+    # session gone: an open client would re-initialize and resend the call.
+    grace.mcp.call_error = b"404 Not Found"
+    try:
+        server, _ = await grace.start(IN_FLIGHT_TURN)
+        reader, writer, session_id = await grace.open_session()
+        await _request(reader, writer, 4, "send", {"text": "use page"})
+        await await_or_fail(grace.mcp.tool_called.wait(), what="call in flight")
+        turn = server.control._turn_task
+        assert turn is not None
+        sent_before = len(grace.mcp.headers)
+
+        await _drop(writer, server)
+        reader2, writer2 = await grace.reconnect(5)
+        await _request(reader2, writer2, 6, "resume", {
+            "session_id": session_id, "mcp_bindings": [NEW]
+        })
+        gate.set()
+        await await_or_fail(asyncio.wait({turn}), what="turn end")
+
+        after = grace.mcp.headers[sent_before:]
+        assert "Bearer old-page" not in after, (
+            "a request after the disconnect carried the gone client's header", after
+        )
+        (result,) = await _page_results(reader2, writer2, 7, session_id)
+        assert DETACHED in result["content"] and MAY_HAVE_RUN in result["content"], result
+    finally:
+        gate.set()
+        await grace.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seal_at", ["answer_401", "credential_load"])
+async def test_sealed_oauth_call_sends_nothing_new_with_old_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seal_at: str
+) -> None:
+    home = _monkey_home(monkeypatch, tmp_path)
+    _write_token("page", home, access_token="stale-token")
+    in_flight = asyncio.Event()
+    answer = asyncio.Event()
+    sent: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if str(request.url).endswith("/token"):
+            return httpx.Response(200, request=request, json={
+                "access_token": "fresh-token", "token_type": "Bearer"
+            })
+        if request.method != "POST":
+            return httpx.Response(405, request=request)
+        body = json.loads(request.content)
+        if "id" not in body:
+            return httpx.Response(202, request=request)
+        if body["method"] == "tools/call":
+            in_flight.set()
+            await await_or_fail(answer.wait(), what="test releases the call")
+            return httpx.Response(401, text="expired", request=request)
+        return httpx.Response(200, request=request, json={
+            "jsonrpc": "2.0", "id": body["id"],
+            "result": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        })
+
+    config = MCPServerConfig(
+        "page", "streamable-http", url="https://mcp.test/rpc",
+        auth_type="oauth", headers={"X-Page": "old-page"},
+    )
+    transport = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+    call: asyncio.Task[Any] | None = None
+    try:
+        await client.connect()
+        if seal_at == "credential_load":
+            store = client._credential_store
+            load = store.load
+
+            async def gated_load(name: str):
+                snapshot = await load(name)
+                in_flight.set()
+                await await_or_fail(answer.wait(), what="test releases the load")
+                return snapshot
+
+            monkeypatch.setattr(store, "load", gated_load)
+        call = asyncio.create_task(client.call_tool("echo", {}, AbortSignal()))
+        await await_or_fail(in_flight.wait(), what="call in flight")
+        sent_before = len(sent)
+        client.seal()
+        answer.set()
+        result = await await_or_fail(call, what="sealed call ends")
+
+        assert sent[sent_before:] == [], (
+            "the sealed client sent a new request",
+            [(r.method, str(r.url), r.headers.get("x-page")) for r in sent[sent_before:]],
+        )
+        assert result["isError"] is True
+        assert DETACHED in result["content"][0]["text"], result
+    finally:
+        answer.set()
+        if call is not None:
+            await asyncio.gather(call, return_exceptions=True)
+        await client.close()
+        await transport.aclose()
 
 
 @pytest.mark.asyncio
