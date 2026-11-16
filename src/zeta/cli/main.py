@@ -7,7 +7,6 @@ import asyncio
 import copy
 import json
 import os
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -347,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub = ext_commands.add_parser(action)
         sub.add_argument("name")
         sub.add_argument("--scope", choices=("user", "project"), default="user")
-        if action == "update":
+        if action in {"update", "trust"}:
             sub.add_argument("--yes", action="store_true")
 
     mcp = commands.add_parser("mcp", help="manage MCP servers")
@@ -1091,50 +1090,9 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "accounts":
         return _handle_accounts(args)
     if args.command == "ext":
-        from ..core.project_context import discover_repo_root
-        from ..extensions.trust import (
-            ExtensionTrustError,
-            install,
-            remove,
-            set_trusted,
-            update,
-        )
+        from ..extensions.cli import handle
 
-        home = env_home()
-        project_dir = discover_repo_root(os.getcwd())
-        try:
-            if args.ext_action == "install":
-                name, commit = install(
-                    args.source,
-                    home=home,
-                    project_dir=project_dir,
-                    scope=args.scope,
-                    accept=args.yes,
-                )
-                print(f"installed {name}" + (f" at {commit}" if commit else ""))
-                return 0
-            if args.ext_action == "update":
-                name, commit = update(
-                    args.name,
-                    home=home,
-                    project_dir=project_dir,
-                    scope=args.scope,
-                    accept=args.yes,
-                )
-                print(f"updated {name}" + (f" at {commit}" if commit else ""))
-                return 0
-            if args.scope == "project" and project_dir is None:
-                raise ExtensionTrustError("project scope requires a repository")
-            root = home / "extensions" if args.scope == "user" else project_dir / ".zeta" / "extensions"
-            target = root / args.name
-            if args.ext_action == "remove":
-                remove(home=home, project_dir=project_dir, scope=args.scope, name=args.name)
-            else:
-                set_trusted(home, args.scope, args.name, target, args.ext_action == "trust")
-            return 0
-        except (ExtensionTrustError, OSError, ValueError, subprocess.CalledProcessError) as exc:
-            print(f"extension error: {exc}", file=sys.stderr)
-            return 2
+        return handle(args, home=env_home())
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService

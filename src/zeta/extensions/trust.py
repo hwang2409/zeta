@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -16,6 +18,10 @@ from .manifest import MANIFEST_FILENAME, ExtensionManifestError, parse_manifest
 
 TRUST_FILENAME = "extensions-trust.json"
 GIT_FILENAME = ".zeta-extension-git.json"
+_MAX_FILES = 10_000
+_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_FILE_BYTES = 16 * 1024 * 1024
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 class ExtensionTrustError(ValueError):
@@ -23,13 +29,60 @@ class ExtensionTrustError(ValueError):
 
 
 def fingerprint(directory: str | Path) -> str:
-    root = Path(directory).resolve()
+    root = Path(directory)
+    try:
+        if stat.S_ISLNK(root.lstat().st_mode):
+            raise ExtensionTrustError(f"extension tree is a symlink: {root}")
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ExtensionTrustError(f"cannot inspect extension tree: {root}") from exc
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        relative = path.relative_to(root).as_posix().encode()
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(path.read_bytes())
+    count = 0
+    total = 0
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ExtensionTrustError(f"cannot inspect extension tree: {current}") from exc
+        for entry in entries:
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise ExtensionTrustError(f"cannot inspect extension file: {entry.path}") from exc
+            if stat.S_ISLNK(mode):
+                raise ExtensionTrustError(f"extension tree contains symlink: {entry.path}")
+            if stat.S_ISDIR(mode):
+                pending.append(Path(entry.path))
+                continue
+            if not stat.S_ISREG(mode):
+                raise ExtensionTrustError(f"extension tree contains non-regular file: {entry.path}")
+            count += 1
+            if count > _MAX_FILES:
+                raise ExtensionTrustError(f"extension tree exceeds {_MAX_FILES} files")
+            relative = Path(entry.path).relative_to(root).as_posix().encode()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            try:
+                fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError as exc:
+                raise ExtensionTrustError(f"cannot open extension file: {entry.path}") from exc
+            file_total = 0
+            try:
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    file_total += len(chunk)
+                    total += len(chunk)
+                    if file_total > _MAX_FILE_BYTES or total > _MAX_TOTAL_BYTES:
+                        raise ExtensionTrustError(
+                            f"extension tree exceeds {_MAX_TOTAL_BYTES} byte limit"
+                        )
+                    digest.update(chunk)
+            finally:
+                os.close(fd)
     return digest.hexdigest()
 
 
@@ -79,6 +132,24 @@ def set_trusted(home: str | Path, scope: str, name: str, directory: str | Path, 
     _write(path, values)
 
 
+def _root(home: str | Path, project_dir: str | Path | None, scope: str) -> Path:
+    if scope == "project" and project_dir is None:
+        raise ExtensionTrustError("project scope requires a repository")
+    return (Path(home) / "extensions") if scope == "user" else Path(project_dir) / ".zeta" / "extensions"
+
+
+def _resolve(root: Path, name: str) -> Path:
+    if not _NAME_RE.fullmatch(name) or Path(name).is_absolute() or Path(name).name != name:
+        raise ExtensionTrustError(f"invalid extension name: {name}")
+    try:
+        root_real = root.resolve(strict=False)
+        target = (root / name).resolve(strict=False)
+        target.relative_to(root_real)
+    except (OSError, ValueError) as exc:
+        raise ExtensionTrustError(f"extension path escapes root: {name}") from exc
+    return target
+
+
 def _source_git(source: str) -> tuple[str, str] | None:
     if not source.startswith("git+"):
         return None
@@ -102,38 +173,47 @@ def _files(directory: Path) -> list[str]:
     return [p.relative_to(directory).as_posix() for p in sorted(directory.rglob("*")) if p.is_file()]
 
 
-def install(
-    source: str,
-    *,
-    home: str | Path,
-    project_dir: str | Path | None,
-    scope: str,
-    accept: bool = False,
-    confirm: Callable[[str], str] = input,
-) -> tuple[str, str]:
-    """Review and install a path or git source, returning name and commit pin."""
-    destination_root = Path(home) / "extensions" if scope == "user" else Path(project_dir or "") / ".zeta" / "extensions"
-    if scope == "project" and project_dir is None:
-        raise ExtensionTrustError("project scope requires a repository")
-    destination_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="zeta-extension-stage-") as temporary:
-        staged = Path(temporary) / "extension"
-        git = _source_git(source)
-        commit = ""
-        if git:
-            subprocess.run(["git", "clone", "--quiet", git[0], str(staged)], check=True, capture_output=True, text=True)
-            subprocess.run(["git", "-C", str(staged), "checkout", "--quiet", git[1]], check=True, capture_output=True, text=True)
-            commit = subprocess.run(["git", "-C", str(staged), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-        else:
-            source_path = Path(source).expanduser().resolve(strict=True)
-            shutil.copytree(source_path, staged)
+def _stage(source: str) -> tuple[Path, str, tempfile.TemporaryDirectory[str]]:
+    temporary = tempfile.TemporaryDirectory(prefix="zeta-extension-stage-")
+    staged = Path(temporary.name) / "extension"
+    git = _source_git(source)
+    commit = ""
+    if git:
+        subprocess.run(["git", "clone", "--quiet", git[0], str(staged)], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(staged), "checkout", "--quiet", git[1]], check=True, capture_output=True, text=True)
+        commit = subprocess.run(["git", "-C", str(staged), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    else:
+        shutil.copytree(Path(source).expanduser().resolve(strict=True), staged, symlinks=True)
+    return staged, commit, temporary
+
+
+def _review(manifest, staged: Path, *, current: Path | None, action: str, accept: bool, confirm: Callable[[str], str]) -> None:
+    print(f"name: {manifest.name}\nversion: {manifest.version}\napi_version: {manifest.api_version}\nentry: {manifest.entry_module}:{manifest.entry_function}\ndescription: {manifest.description}")
+    print("warning: this runs arbitrary Python as you, with access to your files, credentials, and session history")
+    files = _files(staged)
+    if current is not None:
+        old = set(_files(current))
+        new = set(files)
+        print("changed files:\n" + "\n".join(sorted(old ^ new | {p for p in old & new if (current / p).read_bytes() != (staged / p).read_bytes()})))
+        print(f"diff summary: {len(new - old)} added, {len(old - new)} removed, {len(old & new) - sum((current / p).read_bytes() == (staged / p).read_bytes() for p in old & new)} changed")
+        changelog = staged / "CHANGELOG.md"
+        if changelog.is_file():
+            print("changelog:\n" + changelog.read_text(encoding="utf-8"))
+    else:
+        print("files:\n" + "\n".join(files))
+    if not accept and confirm(f"{action} this extension? [y/N] ").strip().lower() != "y":
+        raise ExtensionTrustError(f"{action} cancelled")
+
+
+def install(source: str, *, home: str | Path, project_dir: str | Path | None, scope: str, accept: bool = False, confirm: Callable[[str], str] = input) -> tuple[str, str]:
+    root = _root(home, project_dir, scope)
+    root.mkdir(parents=True, exist_ok=True)
+    staged, commit, temporary = _stage(source)
+    with temporary:
+        fingerprint(staged)
         manifest = _manifest(staged)
-        print(f"name: {manifest.name}\nversion: {manifest.version}\napi_version: {manifest.api_version}\nentry: {manifest.entry_module}:{manifest.entry_function}\ndescription: {manifest.description}")
-        print("warning: this runs arbitrary Python as you, with access to your files, credentials, and session history")
-        print("files:\n" + "\n".join(_files(staged)))
-        if not accept and confirm("install this extension? [y/N] ").strip().lower() != "y":
-            raise ExtensionTrustError("installation cancelled")
-        target = destination_root / manifest.name
+        _review(manifest, staged, current=None, action="install", accept=accept, confirm=confirm)
+        target = _resolve(root, manifest.name)
         if target.exists():
             shutil.rmtree(target)
         shutil.move(str(staged), target)
@@ -144,22 +224,50 @@ def install(
 
 
 def remove(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str) -> None:
-    root = Path(home) / "extensions" if scope == "user" else Path(project_dir or "") / ".zeta" / "extensions"
-    target = root / name
+    root = _root(home, project_dir, scope)
+    target = _resolve(root, name)
     if not target.is_dir():
         raise ExtensionTrustError(f"extension not installed: {name}")
     shutil.rmtree(target)
     set_trusted(home, scope, name, target, False)
 
 
+def untrust(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str) -> None:
+    target = _resolve(_root(home, project_dir, scope), name)
+    if not target.is_dir():
+        raise ExtensionTrustError(f"extension not installed: {name}")
+    set_trusted(home, scope, name, target, False)
+
+
+def trust(*, home: str | Path, project_dir: str | Path | None, scope: str, name: str, accept: bool = False, confirm: Callable[[str], str] = input) -> None:
+    root = _root(home, project_dir, scope)
+    target = _resolve(root, name)
+    if not target.is_dir():
+        raise ExtensionTrustError(f"extension not installed: {name}")
+    fingerprint(target)
+    manifest = _manifest(target)
+    _review(manifest, target, current=None, action="trust", accept=accept, confirm=confirm)
+    set_trusted(home, scope, name, target, True)
+
+
 def update(name: str, *, home: str | Path, project_dir: str | Path | None, scope: str, accept: bool = False, confirm: Callable[[str], str] = input) -> tuple[str, str]:
-    root = Path(home) / "extensions" if scope == "user" else Path(project_dir or "") / ".zeta" / "extensions"
-    target = root / name
+    root = _root(home, project_dir, scope)
+    target = _resolve(root, name)
     try:
         source = json.loads((target / GIT_FILENAME).read_text(encoding="utf-8"))["source"]
     except (OSError, ValueError, KeyError) as exc:
         raise ExtensionTrustError(f"extension {name} is not git-installed") from exc
-    return install(source, home=home, project_dir=project_dir, scope=scope, accept=accept, confirm=confirm)
+    staged, commit, temporary = _stage(source)
+    with temporary:
+        fingerprint(staged)
+        fingerprint(target)
+        manifest = _manifest(staged)
+        _review(manifest, staged, current=target, action="update", accept=accept, confirm=confirm)
+        shutil.rmtree(target)
+        shutil.move(str(staged), target)
+        (target / GIT_FILENAME).write_text(json.dumps({"source": source, "commit": commit}, sort_keys=True) + "\n", encoding="utf-8")
+        set_trusted(home, scope, manifest.name, target, True)
+        return manifest.name, commit
 
 
-__all__ = ["ExtensionTrustError", "fingerprint", "install", "is_trusted", "remove", "set_trusted", "trust_path", "update"]
+__all__ = ["ExtensionTrustError", "fingerprint", "install", "is_trusted", "remove", "set_trusted", "trust", "trust_path", "untrust", "update"]

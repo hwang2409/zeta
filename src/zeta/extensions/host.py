@@ -16,6 +16,9 @@ skipped. One broken extension never breaks the session or stops the rest.
 
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import itertools
 import re
 import sys
@@ -120,6 +123,7 @@ class ExtensionHost:
         self.notices: list[str] = []
         self.warnings: list[str] = []
         self._packages: dict[str, Path] = {}
+        self._finders: dict[str, _ExtensionFinder] = {}
         self._closed = False
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
@@ -134,6 +138,9 @@ class ExtensionHost:
         module.__package__ = package
         sys.modules[package] = module
         self._packages[package] = directory
+        finder = _ExtensionFinder(package, directory)
+        self._finders[package] = finder
+        sys.meta_path.insert(0, finder)
         return package, module
 
     def remove_package_for_directory(self, directory: Path) -> None:
@@ -143,6 +150,9 @@ class ExtensionHost:
 
     def remove_package(self, package: str) -> None:
         self._packages.pop(package, None)
+        finder = self._finders.pop(package, None)
+        if finder is not None and finder in sys.meta_path:
+            sys.meta_path.remove(finder)
         for name in tuple(sys.modules):
             if name == package or name.startswith(package + "."):
                 del sys.modules[name]
@@ -198,6 +208,37 @@ class ExtensionHost:
         if name in self._registry.registered_names:
             return "an existing tool"
         return None
+
+
+class _SourceExtensionLoader(importlib.machinery.SourceFileLoader):
+    """Compile extension source directly; never read or write bytecode caches."""
+
+    def get_code(self, fullname: str) -> object:
+        source = self.get_data(self.get_filename(fullname))
+        return compile(source, self.get_filename(fullname), "exec", dont_inherit=True)
+
+
+class _ExtensionFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, package: str, directory: Path) -> None:
+        self.package = package
+        self.directory = directory
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None):
+        prefix = self.package + "."
+        if not fullname.startswith(prefix):
+            return None
+        relative = fullname[len(prefix):].split(".")
+        if any(not part.isidentifier() for part in relative):
+            return None
+        base = self.directory.joinpath(*relative)
+        source = base / "__init__.py" if base.is_dir() else base.with_suffix(".py")
+        if not source.is_file():
+            return None
+        loader = _SourceExtensionLoader(fullname, str(source))
+        locations = [str(base)] if source.name == "__init__.py" else None
+        return importlib.util.spec_from_file_location(
+            fullname, source, loader=loader, submodule_search_locations=locations
+        )
 
 
 def _display(extension: LoadingExtension) -> str:

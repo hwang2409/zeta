@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import zeta.extensions.trust as trust_module
 from zeta.extensions import apply_extensions
 from zeta.extensions.trust import (
     ExtensionTrustError,
@@ -14,6 +15,8 @@ from zeta.extensions.trust import (
     install,
     is_trusted,
     set_trusted,
+    trust,
+    update,
 )
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -50,6 +53,7 @@ async def test_project_scope_trusted_fingerprint_allows_load(tmp_path: Path) -> 
         host = apply_extensions(registry, home=home, project_dir=project, builtin_names=registry.registered_names)
         assert host.loaded and not host.pending_project
         assert host.loaded[0].name == "demo"
+        assert is_trusted(home, "project", "demo", extension)
     finally:
         await registry.close()
 
@@ -71,6 +75,50 @@ async def test_project_scope_fingerprint_mismatch_blocks_load(tmp_path: Path) ->
         await registry.close()
 
 
+def test_management_name_cannot_escape_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    root = home / "extensions"
+    _extension(root / "demo")
+    outside = tmp_path / "outside"
+    _extension(outside)
+    with pytest.raises(ExtensionTrustError):
+        trust(home=home, project_dir=None, scope="user", name="../outside", accept=True)
+    assert outside.exists()
+    with pytest.raises(ExtensionTrustError):
+        trust(home=home, project_dir=None, scope="user", name=str(outside), accept=True)
+    escape = root / "link"
+    try:
+        escape.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ExtensionTrustError):
+        trust(home=home, project_dir=None, scope="user", name="link", accept=True)
+
+
+def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    extension = _extension(tmp_path / "extension")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    try:
+        (extension / "link").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(ExtensionTrustError, match="symlink"):
+        fingerprint(extension)
+    (extension / "link").unlink()
+    monkeypatch.setattr(trust_module, "_MAX_TOTAL_BYTES", 3)
+    with pytest.raises(ExtensionTrustError, match="byte limit"):
+        fingerprint(extension)
+
+
+def test_trust_requires_review(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _extension(home / "extensions" / "demo")
+    with pytest.raises(ExtensionTrustError, match="cancelled"):
+        trust(home=home, project_dir=None, scope="user", name="demo", confirm=lambda _: "n")
+    assert not trust_module.trust_path(home).exists()
+
+
 def test_git_install_requires_review_and_pins_commit(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _extension(source)
@@ -86,3 +134,5 @@ def test_git_install_requires_review_and_pins_commit(tmp_path: Path) -> None:
     assert name == "demo" and len(commit) == 40
     assert is_trusted(home, "user", name, home / "extensions" / name)
     assert (home / "extensions" / name / ".zeta-extension-git.json").exists()
+    with pytest.raises(ExtensionTrustError, match="cancelled"):
+        update(name, home=home, project_dir=None, scope="user", confirm=lambda _: "n")

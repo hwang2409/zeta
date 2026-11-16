@@ -36,6 +36,7 @@ from .host import (
     ExtensionHost,
     LoadingExtension,
     PendingExtension,
+    _SourceExtensionLoader,
 )
 from .manifest import (
     MANIFEST_FILENAME,
@@ -84,11 +85,7 @@ def apply_extensions(
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
             if manifest is None or _skip(host, manifest, directory, disabled_set):
                 continue
-            try:
-                trusted = is_trusted(host.home, PROJECT_SCOPE, manifest.name, directory)
-            except Exception as exc:  # noqa: BLE001 - trust failure fails open
-                host.notices.append(f"extensions · invalid trust store: {_short(exc)}")
-                trusted = False
+            trusted = _project_trusted(host, manifest, directory)
             if trusted:
                 _load_one(host, directory, manifest, PROJECT_SCOPE)
             else:
@@ -114,6 +111,14 @@ def trust_project_extensions(host: ExtensionHost) -> None:
     host.pending_project.clear()
     for item in pending:
         _load_one(host, item.directory, item.manifest, PROJECT_SCOPE)
+
+
+def _project_trusted(host: ExtensionHost, manifest: ExtensionManifest, directory: Path) -> bool:
+    try:
+        return is_trusted(host.home, PROJECT_SCOPE, manifest.name, directory)
+    except Exception as exc:  # noqa: BLE001 - trust failure fails open
+        host.notices.append(f"extensions · invalid trust store: {_short(exc)}")
+        return False
 
 
 def _skip(
@@ -209,7 +214,10 @@ def _import_entry(
             f"entry module '{manifest.entry_module}' not found in {directory}"
         )
     spec = importlib.util.spec_from_file_location(
-        entry_full, entry_path, submodule_search_locations=search
+        entry_full,
+        entry_path,
+        loader=_SourceExtensionLoader(entry_full, str(entry_path)),
+        submodule_search_locations=search,
     )
     if spec is None or spec.loader is None:
         host.remove_package(pkg_name)
