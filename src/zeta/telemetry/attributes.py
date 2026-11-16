@@ -1,11 +1,4 @@
-"""Stable attribute names owned by zeta telemetry."""
-
-GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
-GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
-GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
-GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
-GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
-GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
+"""Content attribute names owned by zeta telemetry."""
 
 # reserved content names: never emit or reuse these in v1.
 RESERVED_CONTENT_ATTRIBUTES = frozenset(

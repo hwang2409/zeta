@@ -26,39 +26,56 @@ _OPERATION_ATTRIBUTE_KEYS = {
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
 _ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size"})
-_PROVIDERS = frozenset({"claude", "codex", "ollama"})
+# Closed sets mirror repository values; tests/telemetry/test_telemetry.py checks each mirror against its source.
+_PROVIDERS = frozenset(PROVIDER_MODELS)
 _OPERATION_NAMES = frozenset({"invoke_agent", "chat", "execute_tool"})
+# zeta-owned tool families; no repository enum exists yet (slice 3a is the first caller).
 _TOOL_TYPES = frozenset({"function", "computer", "mcp", "agent"})
-_FINISH_REASONS = frozenset({"stop", "length", "tool_use", "end_turn", "max_tokens", "content_filter", "error"})
-_RETRY_REASONS = frozenset({"rate_limit", "server_error", "timeout", "connection", "unknown"})
-_APPROVAL_DECISIONS = frozenset({"allow", "deny", "always_allow", "always_deny", "cancel", "reject"})
-_APPROVAL_SCOPES = frozenset({"tool", "session", "turn", "command", "filesystem"})
+# stop_reason literals set in providers/codex.py and providers/ollama.py, plus the Anthropic API's
+# message_delta stop_reason values that providers/anthropic.py passes through unchanged.
+_FINISH_REASONS = frozenset({"end_turn", "max_tokens", "tool_use", "content_filter", "refusal", "stop_sequence", "pause_turn", "model_context_window_exceeded"})
+# RetryPlan.reason values from CompletionRetryBudget.plan() and retry_reason() in providers/completion.py.
+_RETRY_REASONS = frozenset({
+    "subscription_limit", "stream_error", "stream_stall", "stream_inconsistent", "overloaded_error",
+    "rate_limit_error", "server_error", "http_error", "transport_error", "backend_error", "account_lock_timeout",
+})
+# core.approval.ApprovalDecision values plus server.protocol.ApprovalDecision values.
+_APPROVAL_DECISIONS = frozenset({"allow", "deny", "ask", "approve"})
+# server.protocol.APPROVAL_SCOPES.
+_APPROVAL_SCOPES = frozenset({"once", "always_tool"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
 _CALL_ID = re.compile(r"(?=.{1,128}\Z)(?:toolu_[A-Za-z0-9_-]+|call_[A-Za-z0-9_-]+|fc_[A-Za-z0-9_-]+|ollama-[0-9a-f-]+|inline-[0-9a-f-]+)\Z")
-_MODEL = re.compile(r"(?:hf\.co/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?|[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9_.-]+)\Z")
+# catalog ids and ollama names: [host/][namespace/]model[:tag], e.g. locally-created-model, qwen3:4b, hf.co/user/model:Q4_K_M.
+_MODEL = re.compile(r"(?=.{1,128}\Z)(?:[A-Za-z0-9][A-Za-z0-9_.-]*/){0,2}[A-Za-z0-9][A-Za-z0-9_.-]*(?::[A-Za-z0-9_.-]+)?\Z")
 _PYTHON_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
-_MODEL_IDS = frozenset().union(*PROVIDER_MODELS.values())
+_STRING_RULES = {
+    "gen_ai.operation.name": _OPERATION_NAMES, "gen_ai.provider.name": _PROVIDERS, "gen_ai.conversation.id": _SESSION_ID,
+    "gen_ai.request.model": _MODEL, "gen_ai.response.model": _MODEL, "zeta.agent.name": _IDENTIFIER,
+    "zeta.tool.name": _TOOL_NAME, "zeta.tool.type": _TOOL_TYPES, "zeta.tool.call.id": _CALL_ID,
+    "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS,
+    "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
+}
+_INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
+_BOOL_KEYS = frozenset({"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"})
 
-def _valid(value: object, rule: object) -> object:
-    if not isinstance(value, str) or any(name in value for name in RESERVED_CONTENT_ATTRIBUTES): return "_invalid"
-    if isinstance(rule, frozenset): return value if value in rule else "_invalid"
-    return value if rule.fullmatch(value) else "_invalid"
 
 def _field_value(key: str, value: object) -> object:
-    if key in {"gen_ai.request.model", "gen_ai.response.model"}:
-        return value if isinstance(value, str) and not any(name in value for name in RESERVED_CONTENT_ATTRIBUTES) and (value in _MODEL_IDS or _MODEL.fullmatch(value)) else "_invalid"
-    rules = {"gen_ai.operation.name": _OPERATION_NAMES, "gen_ai.provider.name": _PROVIDERS, "gen_ai.conversation.id": _SESSION_ID, "zeta.agent.name": _IDENTIFIER, "zeta.tool.name": _TOOL_NAME, "zeta.tool.type": _TOOL_TYPES, "zeta.tool.call.id": _CALL_ID, "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS, "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME}
-    rule = rules.get(key)
-    if rule is not None: return _valid(value, rule)
-    ints = {"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"}
-    if key in ints: return value if type(value) is int and value >= 0 else 0
-    if key in {"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"}: return value if type(value) is bool else False
-    return value
+    if key in _INT_KEYS:
+        return value if type(value) is int and value >= 0 else 0
+    if key in _BOOL_KEYS:
+        return value if type(value) is bool else False
+    rule = _STRING_RULES[key]
+    if not isinstance(value, str) or any(name in value for name in RESERVED_CONTENT_ATTRIBUTES):
+        return "_invalid"
+    if isinstance(rule, frozenset):
+        return value if value in rule else "_invalid"
+    return value if rule.fullmatch(value) else "_invalid"
+
 
 def _safe_attributes(attributes: Mapping[str, object] | None, allowed_keys: frozenset[str]) -> dict[str, object]:
-    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys and key in _ALLOWED_ATTRIBUTE_KEYS}
+    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys}
 
 
 # This is the single owner of the loopback endpoint policy.
