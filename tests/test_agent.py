@@ -9433,6 +9433,87 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
 
 
 @pytest.mark.asyncio
+async def test_newer_cancel_wins_over_persisted_setup_failure_receipt(
+    tmp_path: Path,
+) -> None:
+    call = _agent_call("cancel-after-setup-failure")
+    child = ConversationStore(tmp_path / "child", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-09-30T00:00:00Z",
+        depth=1,
+        agent_type="agent",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "failed",
+        final_result="stale setup failure receipt",
+        turns_used=0,
+    )
+    child.update_agent_lifecycle_result(
+        "stale setup failure receipt", canonical_receipt=True
+    )
+    cancel = ToolResult(
+        call.id,
+        "cancel wins",
+        is_error=True,
+        is_canceled=True,
+        structured_content={"status": "failed"},
+        lifecycle_projection={"state": "failed"},
+    )
+
+    class Owner:
+        hooks = None
+        agent_instance_id = None
+
+        def __init__(self) -> None:
+            self.store = SimpleNamespace(
+                session_id="parent",
+                finish_agent_child=lambda child_id: None,
+            )
+            self._background_owner = SimpleNamespace(
+                release_unused_stores=lambda: None,
+                mark_store_finished=lambda store: None,
+            )
+            self._agent_child_stores = {call.id: child}
+            self._agent_child_turns = {call.id: 0}
+            self._agent_child_types = {call.id: "agent"}
+
+        def _existing_tool_result(self, tool_call_id: str) -> ToolResult:
+            assert tool_call_id == call.id
+            return cancel
+
+        def _child_result_payload(
+            self, tool_call_id: str, content: str, **kwargs: object
+        ) -> dict[str, object]:
+            del tool_call_id, kwargs
+            return {
+                "content": [{"type": "text", "text": content, "truncated": False}],
+                "isError": True,
+                "isCanceled": True,
+                "structuredContent": {"status": "failed"},
+            }
+
+        def _canceled_agent_result(
+            self, tool_call_id: str, **kwargs: object
+        ) -> ToolResult:
+            del kwargs
+            return ToolResult(
+                tool_call_id,
+                "cancel wins",
+                is_error=True,
+                is_canceled=True,
+            )
+
+    try:
+        result = agent_receipt_module.finalize_agent_results(Owner(), [call], [None])[0]
+        assert result.content == "cancel wins"
+        assert result.is_canceled is True
+    finally:
+        child.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_resolves_dead_child_marker(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path, session_id="parent")
     call = _agent_call()

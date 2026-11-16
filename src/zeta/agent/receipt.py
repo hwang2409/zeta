@@ -737,27 +737,22 @@ def finalize_agent_results(
         stored_result = result
         child_store = owner._agent_child_stores.get(call.id)
         candidate = result if result is not None else slot
-        canonical_result = None
+        reuse_canonical_result = False
         if child_store is not None and candidate is not None:
             lifecycle = child_store.agent_lifecycle() or {}
             projection = candidate.lifecycle_projection or {}
-            # Failed and canceled lifecycles need their persisted receipt;
-            # completed lifecycles may carry a turn-limit projection.
-            if (
+            persisted_result = lifecycle.get("final_result")
+            # Reuse only the exact persisted receipt; newer candidates still win.
+            reuse_canonical_result = (
                 projection.get("state") != "turn_limit"
-                and lifecycle.get("state") in {"failed", "canceled"}
                 and lifecycle.get("final_result_is_receipt") is True
-            ):
-                canonical_result = lifecycle_tool_result(
-                    call, child_store, child_store.session_dir
-                )
-        if canonical_result is not None:
-            result = canonical_result
-            candidate = result
+                and type(persisted_result) is str
+                and candidate.content == persisted_result
+            )
         if (
             call.name.casefold() == "agent"
             and candidate is not None
-            and canonical_result is None
+            and not reuse_canonical_result
             and not (
                 candidate.structured_content is not None
                 and candidate.structured_content.get("status") == "running"
