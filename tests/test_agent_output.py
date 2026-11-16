@@ -1817,3 +1817,65 @@ async def test_damaged_intermediate_is_unknown_and_healthy_sibling_survives(
     hidden.close()
     damaged.close()
     root.close()
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_started_child_with_undecodable_payload_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.checkpoints import ConversationIntegrityError
+    from zeta.tools.agent import subtree
+
+    root = ConversationStore(tmp_path, session_id="root")
+    good = ConversationStore(root.session_dir / "agents", session_id="1")
+    broken = ConversationStore(root.session_dir / "agents", session_id="2")
+    loop = None
+    try:
+        _record_running_child(
+            root,
+            good,
+            call=ToolCall("good", "agent", {"prompt": "good"}),
+            handle="root:1",
+            depth=1,
+        )
+        root.append_child_run_started(
+            "root:1", None, "general", "good", "2026-11-08T00:00:00+00:00"
+        )
+        # A started row whose child marker names no agent call of the root.
+        root.append_child_run_started(
+            "root:2", None, "general", "broken", "2026-11-08T00:00:00+00:00"
+        )
+        broken.mark_agent_parent("not-a-root-call")
+        broken.append_message(Message(MessageRole.ASSISTANT, [TextContent("x")]))
+        broken_dir = broken.session_dir.absolute()
+        broken.close()
+        original = subtree._open_snapshot
+
+        def open_with_undecodable_payload(path: Path) -> ConversationStore:
+            store = original(path)
+            if path.absolute() == broken_dir:
+
+                def undecodable(_ref: object) -> object:
+                    raise ConversationIntegrityError("payload cannot be decoded")
+
+                store.entry = undecodable
+            return store
+
+        # test-contract: seam a payload that fails to decode after a valid open
+        monkeypatch.setattr(subtree, "_open_snapshot", open_with_undecodable_payload)
+        loop = AgentLoop(
+            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        status = await loop.tool_registry.execute(
+            ToolCall("skip-broken-status", "agent_status", {})
+        )
+
+        assert status.get("isError") is not True, status
+        handles = [row["handle"] for row in status["structuredContent"]["children"]]
+        assert handles == ["root:1"]
+    finally:
+        if loop is not None:
+            await loop.close()
+        good.close()
+        broken.close()
+        root.close()
