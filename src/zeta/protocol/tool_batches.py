@@ -3,7 +3,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
-from .types import Message, MessageRole, TextContent, ToolResult, ToolUseContent
+from .types import (
+    FAILED_TURN_MARKER,
+    Message,
+    MessageRole,
+    TextContent,
+    ToolResult,
+    ToolUseContent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +39,8 @@ def complete_tool_batches(messages: Sequence[Message]) -> list[Message]:
     and each missing one gets an interrupted result, so the model sees what
     already ran. A trailing incomplete batch is still in flight and stays as is.
     Context assembly fills these first with approval facts; here none exist, so
-    a missing result may or may not have taken effect.
+    a missing result may or may not have taken effect. A failed provider reply's
+    calls never ran, so that batch is still left out.
     """
 
     result: list[Message] = []
@@ -93,7 +101,9 @@ def complete_tool_batches(messages: Sequence[Message]) -> list[Message]:
         if complete or following == len(messages):
             result.append(message)
             result.extend(batch_results)
-        elif len(set(call_ids)) == len(call_ids):
+        elif len(set(call_ids)) == len(call_ids) and not message.metadata.get(
+            FAILED_TURN_MARKER
+        ):
             by_id: dict[str, Message] = {}
             for candidate in batch_results:
                 if candidate.tool_result is not None:

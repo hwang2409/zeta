@@ -96,7 +96,11 @@ def _with_interrupted_results(
         item = items[index]
         result.append(item)
         index += 1
-        if item.message.role is not MessageRole.ASSISTANT:
+        # A failed provider reply's calls never ran; the payload drops them.
+        if (
+            item.message.role is not MessageRole.ASSISTANT
+            or item.message.metadata.get(FAILED_TURN_MARKER)
+        ):
             continue
         call_ids = [
             block.tool_call.id
