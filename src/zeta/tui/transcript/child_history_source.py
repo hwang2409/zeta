@@ -58,16 +58,13 @@ class ChildLogHistorySource:
         self.pending_prompts: tuple[str, ...] = ()
 
     async def close(self) -> None:
-        # Mark closed first: an operation still running (even one whose caller
-        # was cancelled twice) then closes its store instead of keeping it.
-        with self._store_guard:
-            self._closed = True
         # Shielded, so a cancelled close still closes the kept store.
-        await asyncio.shield(self._close_kept_store())
+        await asyncio.shield(self._close())
 
-    async def _close_kept_store(self) -> None:
+    async def _close(self) -> None:
         async with self._operation_lock:
             with self._store_guard:
+                self._closed = True
                 store, self._store = self._store, None
             if store is not None:
                 await asyncio.to_thread(store.close)
