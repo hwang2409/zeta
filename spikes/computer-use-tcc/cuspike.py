@@ -8,6 +8,7 @@ Read-only checks use CGPreflightScreenCaptureAccess / AXIsProcessTrusted and
 never prompt.
 """
 
+import ctypes
 import os
 import sys
 import tempfile
@@ -40,6 +41,19 @@ def cmd_whoami():
     exe = sys.executable
     print(f"sys.executable = {exe}")
     print(f"realpath       = {os.path.realpath(exe)}")
+    try:
+        libc = ctypes.CDLL(None)
+        fn = libc.responsibility_get_pid_responsible_for_pid
+        fn.argtypes = [ctypes.c_int]
+        fn.restype = ctypes.c_int
+        responsible = fn(os.getpid())
+        path = ctypes.create_string_buffer(4096)
+        libc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        libc.proc_pidpath.restype = ctypes.c_int
+        text = path.value.decode() if libc.proc_pidpath(responsible, path, 4096) else "unknown"
+        print(f"responsible_pid={responsible} executable={text} bundle_id=unknown")
+    except (AttributeError, OSError):
+        print("responsible_process=unknown")
 
 
 def cmd_preflight():

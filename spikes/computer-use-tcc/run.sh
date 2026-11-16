@@ -24,6 +24,21 @@ IDENT="com.henry.zeta.cuspike"
 CERTNAME="${CUSPIKE_CERT:-Zeta CU Spike}"
 RESULTS="${CUSPIKE_RESULTS:-$HOME/.zeta/scratch/computer-use/slice0-results.md}"
 CAPTURE_DIR="${CUSPIKE_CAPTURE_DIR:-${TMPDIR:-/tmp}/cuspike-${UID}}"
+AGENT_LABEL="com.henry.zeta.cuspike.q4"
+AGENT_DIR=""
+AGENT_ACTIVE=0
+
+agent_cleanup() {
+  if [ "$AGENT_ACTIVE" -eq 1 ]; then
+    launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$AGENT_DIR" ]; then
+    rm -rf "$AGENT_DIR"
+  fi
+  AGENT_ACTIVE=0
+  AGENT_DIR=""
+}
+trap agent_cleanup EXIT INT TERM
 
 # The python we grant must be the SAME real binary zeta runs as. zeta's uv-tool
 # python is a symlink; resolve it so the grant is representative of real sessions.
@@ -104,37 +119,76 @@ cmd_build() {
   codesign -dvvv "$BIN" 2>&1 | grep -E 'Identifier|Signature|flags|CDHash|Authority' | sed 's/^/  /' | tee -a "$RESULTS"
 }
 
-cmd_check() {
-  log ""
-  log "## check @ $(ts)   (PASS = GRANTED, FAIL = not granted; read-only, no prompt)"
-  echo "python preflight (identity: $ZETA_PY) ..."
-  local pyout; pyout="$(pyrun preflight 2>&1)"
-  _report_line "python" "$pyout"
-  if need_bin; then
-    local swout; swout="$("$BIN" preflight 2>&1)"
-    _report_line "swift($IDENT)" "$swout"
+python_identity() {
+  local pyinfo resolved
+  pyinfo="$(pyrun whoami 2>&1)"
+  resolved="$(printf '%s\n' "$pyinfo" | sed -nE 's/^realpath[[:space:]]*= //p' | head -1)"
+  log "python resolved path: ${resolved:-unknown}"
+  if [ -n "$resolved" ]; then
+    codesign -dvvv "$resolved" 2>&1 | grep -E 'Identifier|CDHash' | sed 's/^/  /' | tee -a "$RESULTS"
   fi
+  printf '%s\n' "$pyinfo" | tee -a "$RESULTS"
 }
 
-# parse "screen_recording=<bool> accessibility=<bool>" into PASS/FAIL lines
+swift_identity() {
+  codesign -dvvv "$BIN" 2>&1 | grep -E 'Identifier|CDHash' | sed 's/^/  /' | tee -a "$RESULTS"
+}
+
+# parse "screen_recording=<bool> accessibility=<bool>" portably on BSD and GNU sed.
+_preflight_values() {
+  printf '%s\n' "$1" | sed -nE 's/.*screen_recording=(true|false).*accessibility=(true|false).*/\1 \2/p' | head -1
+}
+_classify_preflight() {
+  local values="$1" sr="${1%% *}" ax="${1#* }"
+  [ -z "$values" ] && { echo malformed; return; }
+  if [ "$sr" = true ] && [ "$ax" = true ]; then echo granted
+  elif [ "$sr" = false ] && [ "$ax" = false ]; then echo not-granted
+  else echo split; fi
+}
 _report_line() {
-  local who="$1" out="$2"
-  local sr ax
-  sr="$(printf '%s' "$out" | sed -n 's/.*screen_recording=\([a-z]*\).*/\1/p' | head -1)"
-  ax="$(printf '%s' "$out" | sed -n 's/.*accessibility=\([a-z]*\).*/\1/p' | head -1)"
-  if [ -z "$sr$ax" ]; then
-    log "[FAIL] $who: could not read preflight. raw: $out"
-    return
+  local who="$1" out="$2" values sr ax
+  values="$(_preflight_values "$out")"; sr="${values%% *}"; ax="${values#* }"
+  if [ -z "$values" ]; then
+    log "[FAIL] $who: could not read preflight. raw: $out"; return
   fi
   if [ "$sr" = "true" ]; then log "[PASS] $who screen-recording = GRANTED"; else log "[FAIL] $who screen-recording = not granted"; fi
   if [ "$ax" = "true" ]; then log "[PASS] $who accessibility   = GRANTED"; else log "[FAIL] $who accessibility   = not granted"; fi
+}
+
+cmd_selftest() {
+  local name input expected actual category
+  while IFS='|' read -r name input expected; do
+    actual="$(_preflight_values "$input")"
+    category="$(_classify_preflight "$actual")"
+    printf '%-10s %-10s %s\n' "$name" "$category" "${actual:-empty}"
+    [ "$category" = "$expected" ] || return 1
+  done <<'EOF'
+both-true|screen_recording=true accessibility=true|granted
+both-false|screen_recording=false accessibility=false|not-granted
+split|screen_recording=true accessibility=false|split
+malformed|screen_recording=yes accessibility=false|malformed
+empty||malformed
+EOF
+}
+
+cmd_check() {
+  log ""
+  log "## check @ $(ts)   (PASS = GRANTED, FAIL = not granted; read-only, no prompt)"
+  python_identity
+  local pyout; pyout="$(pyrun preflight 2>&1)"; printf '%s\n' "$pyout" | tee -a "$RESULTS"
+  _report_line "python" "$pyout"
+  if need_bin; then
+    swift_identity
+    local swout; swout="$("$BIN" preflight 2>&1)"; printf '%s\n' "$swout" | tee -a "$RESULTS"
+    _report_line "swift($IDENT)" "$swout"
+  fi
 }
 
 cmd_grant() {
   log ""
   log "## grant @ $(ts)"
   log "python request (will prompt + open System Settings):"
-  pyrun request 2>&1 | tee -a "$RESULTS"
+  python_identity; pyrun request 2>&1 | tee -a "$RESULTS"
   if need_bin; then
     log "swift request (will prompt + open System Settings):"
     "$BIN" request 2>&1 | tee -a "$RESULTS"
@@ -150,13 +204,13 @@ cmd_capture() {
   umask 077
   mkdir -p "$CAPTURE_DIR"
   chmod 700 "$CAPTURE_DIR"
-  CUSPIKE_CAPTURE_DIR="$CAPTURE_DIR" pyrun capture 2>&1 | tee -a "$RESULTS"
+  python_identity; CUSPIKE_CAPTURE_DIR="$CAPTURE_DIR" pyrun capture 2>&1 | tee -a "$RESULTS"
 }
 
 cmd_input() {
   log ""
   log "## input @ $(ts)   (python, harmless: +1px then back)"
-  pyrun input 2>&1 | tee -a "$RESULTS"
+  python_identity; pyrun input 2>&1 | tee -a "$RESULTS"
 }
 
 cmd_rebuild() {
@@ -175,10 +229,10 @@ cmd_rebuild() {
     log "[INCONCLUSIVE] rebuild did not change cdhash, result invalid"
     return 1
   fi
+  swift_identity
   local swout; swout="$("$BIN" preflight 2>&1)"
-  local sr; sr="$(printf '%s' "$swout" | sed -n 's/.*screen_recording=\(true\|false\).*/\1/p' | head -1)"
-  local ax; ax="$(printf '%s' "$swout" | sed -n 's/.*accessibility=\(true\|false\).*/\1/p' | head -1)"
-  if [ -z "$sr" ] || [ -z "$ax" ]; then
+  local values sr ax; values="$(_preflight_values "$swout")"; sr="${values%% *}"; ax="${values#* }"
+  if [ -z "$values" ] || [ "$sr" = "$values" ]; then
     log "[INCONCLUSIVE] malformed preflight output: $swout"
     return 1
   elif [ "$sr" = "true" ] && [ "$ax" = "true" ]; then
@@ -205,7 +259,8 @@ PRIMARY (GUI, reliable) -- needs your clicks and maybe your login password:
      Identity Type:   Self Signed Root
      Certificate Type: Code Signing
   4. Click Create, keep defaults, Done. It is stored in your 'login' keychain
-     with its private key (a self-signed root is trusted in login by default).
+     with its private key. On macOS 26.6, set Trust > Code Signing to Always Trust
+     in Keychain Access; Certificate Assistant does not trust this root by default.
   5. Verify:  security find-identity -v -p codesigning
      '$CERTNAME' must appear as a valid identity.
 
@@ -230,8 +285,7 @@ it runs nothing. Review each line, then run the ones that apply to what you did.
    before deleting the identity. Export the certificate from Keychain Access first,
    then run this against the exported file (admin trust store):
      security remove-trusted-cert -d <exported-certificate>
-   Set the certificate to "Use System Defaults" in Keychain Access if removal
-   reports that no matching trust override exists.
+   Set the certificate to "Use System Defaults" in Keychain Access before deleting it.
 
 3. Delete the self-signed code-signing identity (only if you ran './run.sh cert'
    and created '$CERTNAME'):
@@ -262,6 +316,70 @@ it runs nothing. Review each line, then run the ones that apply to what you did.
 EOF
 }
 
+cmd_agent() {
+  local command="${1:-}"; [ -n "$command" ] || { echo "usage: $0 agent <check|capture|grant>"; return 2; }
+  need_bin || return 1
+  case "$command" in check) command=preflight ;; grant) command=request ;; capture) command=preflight ;; *) echo "unknown agent command: $command"; return 2 ;; esac
+  AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cuspike-agent.XXXXXX")" || return 1
+  chmod 700 "$AGENT_DIR"
+  cat >"$AGENT_DIR/agent.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$AGENT_LABEL</string>
+<key>ProgramArguments</key><array><string>$BIN</string><string>$command</string></array>
+<key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>$AGENT_DIR/stdout</string>
+<key>StandardErrorPath</key><string>$AGENT_DIR/stderr</string>
+</dict></plist>
+EOF
+  launchctl bootstrap "gui/$UID" "$AGENT_DIR/agent.plist" || return 1
+  AGENT_ACTIVE=1
+  local status=1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! launchctl print "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1; then status=0; break; fi
+    sleep 1
+  done
+  launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+  AGENT_ACTIVE=0
+  cat "$AGENT_DIR/stdout" "$AGENT_DIR/stderr" 2>/dev/null | tee -a "$RESULTS"
+  return "$status"
+}
+
+cmd_agent_rebuild() {
+  local mode="${1:-adhoc}"; case "$mode" in adhoc|cert) ;; *) echo "usage: $0 agent-rebuild <adhoc|cert>"; return 2 ;; esac
+  need_bin || return 1
+  local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  cmd_build "$mode" >/dev/null || return 1
+  local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  log "## agent-rebuild @ $(ts) mode=$mode"
+  log "cdhash before=$before after=$after"
+  if [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ]; then
+    log "[INCONCLUSIVE] agent rebuild did not change cdhash"; return 1
+  fi
+  local out values sr ax
+  out="$(cmd_agent check 2>&1)"
+  values="$(_preflight_values "$out")"; sr="${values%% *}"; ax="${values#* }"
+  if [ "$sr" = true ] && [ "$ax" = true ]; then
+    log "[PASS] grant SURVIVED agent rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
+  elif [ "$sr" = false ] && [ "$ax" = false ]; then
+    log "[FAIL] grant LOST after agent rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
+  else
+    log "[INCONCLUSIVE] split or malformed agent preflight (mode=$mode): ${values:-$out}"; return 1
+  fi
+}
+
+cmd_agent_status() {
+  if launchctl print "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1; then
+    echo "loaded: $AGENT_LABEL"; return 1
+  fi
+  echo "not loaded: $AGENT_LABEL"
+  if find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cuspike-agent.*' -print -quit 2>/dev/null | grep -q .; then
+    echo "leftover temp dir found"; return 1
+  fi
+  echo "no leftover temp dir"
+}
+
 cmd_report() {
   if [ -f "$RESULTS" ]; then cat "$RESULTS"; else echo "no results at $RESULTS yet"; fi
 }
@@ -276,6 +394,10 @@ case "${1:-}" in
   rebuild) shift; cmd_rebuild "$@" ;;
   cert) cmd_cert ;;
   cleanup) cmd_cleanup ;;
+  selftest) cmd_selftest ;;
+  agent) shift; cmd_agent "$@" ;;
+  agent-rebuild) shift; cmd_agent_rebuild "$@" ;;
+  agent-status) cmd_agent_status ;;
   report) cmd_report ;;
   *)
     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
