@@ -63,6 +63,7 @@ OLD_WORDS = {3: "quokka", 40: "wombat"}
 CTRL_UP = "\x1b[1;5A"
 CTRL_DOWN = "\x1b[1;5B"
 UP = "\x1b[A"
+DOWN = "\x1b[B"
 PAGE_UP = "\x1b[5~"
 PAGE_DOWN = "\x1b[6~"
 CTRL_F = "\x06"
@@ -70,6 +71,7 @@ CTRL_R = "\x12"
 ENTER = "\r"
 ESCAPE = "\x1b"
 BACKSPACE = "\x7f"
+SCREEN = Size(rows=40, columns=120)
 ROW_ORDER = re.compile(r"(prompt|answer|line one)[- ](\d+)(?:-(\d+))?")
 
 
@@ -322,7 +324,11 @@ class Driver:
 
 @asynccontextmanager
 async def running_tui(
-    home: RootHome, backend: FakeBackend | None = None, *, painted: bool = True
+    home: RootHome,
+    backend: FakeBackend | None = None,
+    *,
+    painted: bool = True,
+    size: Size = SCREEN,
 ) -> AsyncIterator[Driver]:
     store = await asyncio.to_thread(
         ConversationStore, home.root, session_id=home.session_id
@@ -334,7 +340,7 @@ async def running_tui(
         resumed=True,
         zeta_home=home.home,
     )
-    output = Vt100_Output(StringIO(), lambda: Size(rows=40, columns=120), enable_cpr=False)
+    output = Vt100_Output(StringIO(), lambda: size, enable_cpr=False)
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
         session = app._make_session()
         run_task = asyncio.create_task(app.run(session))
@@ -1230,6 +1236,37 @@ async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
             await driver.settle("settled screen after Esc")
         assert not driver.finder_drawn() and cards() == (0, 0), (
             f"after the finder: cards on screen and in history {cards()}; screen:\n{rows()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_long_picker_keeps_its_selected_row_and_the_transcript_on_a_small_screen(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    rows = tuple(RemoteSession("lab", f"s{index}", f"session-{index:02d}", None) for index in range(30))
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return rows, ()
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    async with running_tui(copy, size=Size(rows=24, columns=80)) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        await driver.send("/remote" + ENTER)
+        await driver.until(lambda: app.remote_picker_active, what="/remote opened no picker")
+        await driver.send(DOWN * 25)
+        await driver.settle("settled screen after the moves")
+        screen = driver.all_rows()
+        # The card is cropped around the selected row and says what it hides.
+        assert any("❯ lab · session-25" in row for row in screen) and any(
+            "more above" in row for row in screen
+        ), "the selected row or the crop line is not drawn:\n" + "\n".join(screen)
+        # Half the screen is the card's limit: the transcript keeps its rows.
+        assert len(driver.rows()) >= 6 and "select a remote session" in "\n".join(screen), (
+            "the card squeezed the transcript:\n" + "\n".join(screen)
         )
 
 

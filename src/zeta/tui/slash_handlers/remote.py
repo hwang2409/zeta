@@ -42,11 +42,18 @@ class RemotePicker:
         return self.rows[self.index]
 
     def render(self) -> Panel:
-        lines = []
+        lines = [Text("select a remote session", style=theme.COMMAND)]
         for index, row in enumerate(self.rows):
             marker = SELECTED_MARKER if index == self.index else "  "
             lines.append(Text(f"{marker}{row.host} · {row.name or row.session_id[:8]} · {row.state or 'unknown'}"))
-        return Panel(Group(*lines), title="remote", subtitle="↑/↓ move · enter select · esc cancel")
+        lines.append(Text("↑/↓ move · enter select · esc cancel", style=theme.AFFORDANCE))
+        return Panel(
+            Group(*lines),
+            border_style=theme.ACCENT,
+            style=theme.CARD_BG,
+            padding=(0, 1),
+            expand=True,
+        )
 
 
 @dataclass

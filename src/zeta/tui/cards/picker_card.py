@@ -29,7 +29,8 @@ FragmentLine = list[tuple[str, str]]
 def card_height_cap(terminal_rows: int) -> int:
     """Half the terminal: the transcript above keeps the other half."""
 
-    return max(_EDGE_ROWS * 2 + 1, terminal_rows // 2)
+    # Three body rows at least, so the elision lines never hide the selected one.
+    return max(_EDGE_ROWS * 2 + 3, terminal_rows // 2)
 
 
 def crop_card(lines: list[FragmentLine], cap: int) -> list[FragmentLine]:
@@ -48,7 +49,28 @@ def crop_card(lines: list[FragmentLine], cap: int) -> list[FragmentLine]:
         0,
     )
     start = max(0, min(selected - room // 2, len(body) - room))
-    return [*lines[:_EDGE_ROWS], *body[start : start + room], *lines[-_EDGE_ROWS:]]
+    shown = body[start : start + room]
+    # The first and last shown rows say how many rows the crop hides.
+    if start:
+        shown[0] = _elision(shown[0], f"… {start + 1} more above")
+    if start + room < len(body):
+        shown[-1] = _elision(shown[-1], f"… {len(body) - start - room + 1} more below")
+    return [*lines[:_EDGE_ROWS], *shown, *lines[-_EDGE_ROWS:]]
+
+
+def _elision(line: FragmentLine, text: str) -> FragmentLine:
+    """``line`` with its text between the card borders replaced by ``text``."""
+
+    plain = "".join(part for _style, part in line)
+    if len(plain) < 4:
+        return line
+    border = line[0][0]
+    inside = line[1][0] if len(line) > 1 else border
+    return [
+        (border, plain[0]),
+        (inside, f"   {text}".ljust(len(plain) - 2)[: len(plain) - 2]),
+        (line[-1][0], plain[-1]),
+    ]
 
 
 class PickerCardControl(UIControl):
