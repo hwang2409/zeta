@@ -400,9 +400,6 @@ class ServerRuntime:
         self.manager.project_registry_unavailable = state.unavailable
         self._project_registry_probed = True
 
-    def list_sessions(self) -> list[SessionMetadata]:
-        return self.manager.list_sessions_read_only()
-
     def list_sessions_read_only(self) -> list[SessionMetadata]:
         return self.manager.list_sessions_read_only()
 

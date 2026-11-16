@@ -97,7 +97,7 @@ async def test_stuck_lost_holder_is_logged_with_dump(
     gate = asyncio.Event()
     entered = asyncio.Event()
 
-    async def gated_status(client, request_id, params):
+    async def gated_status(client, request_id, params, controller):
         entered.set()
         # Resist cancellation so the lost holder keeps the slot held: this is the
         # stuck-holder shape under slice 1 (a handler that swallows its cancel).

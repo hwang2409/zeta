@@ -739,7 +739,7 @@ async def test_explicit_refresh_fences_send_before_unread_list_changed_notificat
             },
         }
         assert "page__x" in {
-            schema["name"] for schema in server.runtime.loop._active_tool_schemas()
+            schema["name"] for schema in server._runtime_for_test.loop._active_tool_schemas()
         }
     finally:
         writer.close()
@@ -953,9 +953,9 @@ async def test_socket_http_approved_tool_runs_once(
             timeout=30,
             what="approved MCP approval request",
         )
-        live_turn = server.control._turn_task
+        live_turn = server._control_for_test._turn_task
         assert live_turn is not None
-        server.control._turn_task = None
+        server._control_for_test._turn_task = None
         approved = await await_or_fail(
             _request(reader, writer, 5, "approve", {
                 "request_id": approval["request_id"],
@@ -964,7 +964,7 @@ async def test_socket_http_approved_tool_runs_once(
             what="approved MCP approval response",
         )
         assert "error" not in approved[-1]
-        recovery_turn = server.control._turn_task
+        recovery_turn = server._control_for_test._turn_task
         assert recovery_turn is not None
         await await_or_fail(
             asyncio.gather(live_turn, recovery_turn),
@@ -1086,7 +1086,7 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
     )
     first_agent_end = asyncio.Event()
     release_first_agent_end = asyncio.Event()
-    notify = server.control._notify
+    notify = server._control_for_test._notify
 
     async def hold_first_agent_end(
         event: EventDescriptor, session_id: str | None = None, **fields: object
@@ -1096,7 +1096,7 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
             await asyncio.wait_for(release_first_agent_end.wait(), TIMEOUT)
         return await notify(event, session_id, **fields)
 
-    server.control._notify = hold_first_agent_end
+    server._control_for_test._notify = hold_first_agent_end
     features = ["approval_reconnect", "new_session_settings", "session_mcp_bindings"]
     binding = {"server": "page", "headers": {"Authorization": "Bearer mixed"}}
     reader, writer = await _connect(server)
@@ -1113,7 +1113,7 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         await _request(reader, writer, 3, "send", {"text": "warm"})
         await _event(reader, "turn_end")
         await asyncio.wait_for(first_agent_end.wait(), TIMEOUT)
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         reservation_ready = asyncio.Event()
         recovery_waiting = asyncio.Event()
@@ -1162,8 +1162,8 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
         await _request(reader, writer, 4, "send", {"text": "run bash"})
         approval = await _event(reader, "approval_request")
         # The live turn waits on approval, so it stays busy after the warm-up turn_end.
-        assert server.control.turn_busy()
-        live_turn = server.control._turn_task
+        assert server._control_for_test.turn_busy()
+        live_turn = server._control_for_test._turn_task
         assert live_turn is not None
         live_finished = asyncio.Event()
         live_turn.add_done_callback(lambda _task: live_finished.set())
@@ -1176,12 +1176,12 @@ async def test_socket_approved_tool_after_turn_end_runs_once(
             return await resume_pending_tool(*args, **kwargs)
 
         monkeypatch.setattr(loop, "resume_pending_tool", resume_after_live_turn)
-        server.control._turn_task = None
+        server._control_for_test._turn_task = None
         allowed = await _request(reader, writer, 5, "approve", {
             "request_id": approval["request_id"]
         })
         assert "error" not in allowed[-1]
-        recovery_turn = server.control._turn_task
+        recovery_turn = server._control_for_test._turn_task
         assert recovery_turn is not None
         await asyncio.wait_for(live_claimed.wait(), TIMEOUT)
         await asyncio.wait_for(live_finished.wait(), TIMEOUT)
@@ -1301,8 +1301,8 @@ async def test_reconnect_rebind_runs_only_the_pending_approved_tool(
             marker.write_text(marker.read_text() + "run\n" if marker.exists() else "run\n")
             return "ok"
 
-        assert server.runtime.loop is not None
-        server.runtime.loop.tool_registry.register("page__x", host_tool)
+        assert server._runtime_for_test.loop is not None
+        server._runtime_for_test.loop.tool_registry.register("page__x", host_tool)
         await _request(reader, writer, 4, "send", {"text": "run host tool"})
         host_approval = await _event(reader, "approval_request")
         writer.close()
@@ -1432,14 +1432,14 @@ async def test_session_mcp_binding_disconnect_requires_resume(tmp_path: Path) ->
         session = (await _request(reader, writer, 2, "new_session", {"mcp_bindings": [{"server": "page", "headers": {"Authorization": "Bearer x"}}]}))[-1]["result"]["session"]
         writer.close(); await writer.wait_closed()
         async def wait_for_release() -> None:
-            while server.control._controller_release_task is None:
+            while server._control_for_test._controller_release_task is None:
                 await asyncio.wait_for(asyncio.sleep(0), 10)
             await asyncio.wait_for(
-                asyncio.shield(server.control._controller_release_task), 10
+                asyncio.shield(server._control_for_test._controller_release_task), 10
             )
 
         await asyncio.wait_for(wait_for_release(), 10)
-        assert not server.runtime.loop._mcp_bindings
+        assert not server._runtime_for_test.loop._mcp_bindings
         reader2, writer2 = await asyncio.open_connection("127.0.0.1", server.port)
         try:
             await _request(reader2, writer2, 3, "hello", {"protocol_version": "1.2", "features": ["session_mcp_bindings"]})
@@ -1554,7 +1554,7 @@ async def test_session_mcp_binding_disconnect_closes_authenticated_stream(
         })
         await _request(reader, writer, 3, "send", {"text": "mount"})
         await asyncio.wait_for(model_called.wait(), TIMEOUT)
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         await asyncio.wait_for(mcp.notification_opened.wait(), TIMEOUT)
         mcp.send_tool_change.set()
@@ -1645,7 +1645,7 @@ async def test_session_mcp_binding_disconnect_suspends_all_servers_together(
         })
         await _request(reader, writer, 3, "send", {"text": "mount"})
         await asyncio.wait_for(model_called.wait(), TIMEOUT)
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         await asyncio.wait_for(first.notification_opened.wait(), TIMEOUT)
         await asyncio.wait_for(second.notification_opened.wait(), TIMEOUT)
@@ -1697,7 +1697,7 @@ async def test_session_mcp_binding_disconnect_suspends_all_servers_together(
                 TIMEOUT,
             )
         assert second.notification_closed.is_set()
-        release_task = server.control._controller_release_task
+        release_task = server._control_for_test._controller_release_task
         assert release_task is not None and not release_task.done()
         release_first_close.set()
         await asyncio.wait_for(first_suspended.wait(), TIMEOUT)
@@ -1789,10 +1789,10 @@ async def test_session_mcp_binding_reconnect_uses_only_new_header(
 
 
 async def _wait_for_controller_release(server: ZetaServer) -> None:
-    while server.control._controller_release_task is None:
+    while server._control_for_test._controller_release_task is None:
         await asyncio.wait_for(asyncio.sleep(0), 10)
     await asyncio.wait_for(
-        asyncio.shield(server.control._controller_release_task), 10
+        asyncio.shield(server._control_for_test._controller_release_task), 10
     )
 
 
@@ -1836,12 +1836,12 @@ async def test_bound_mcp_tools_are_not_inherited_by_child_agents(
         })
         await _request(reader, writer, 3, "send", {"text": "warm"})
         await asyncio.wait_for(mcp.request_received.wait(), TIMEOUT)
-        await asyncio.wait_for(server.runtime.loop._ensure_mcp_servers(), TIMEOUT)
-        assert server.runtime.loop._mcp_mount.statuses["page"].state == "mounted", repr(
-            server.runtime.loop._mcp_mount.statuses["page"]
+        await asyncio.wait_for(server._runtime_for_test.loop._ensure_mcp_servers(), TIMEOUT)
+        assert server._runtime_for_test.loop._mcp_mount.statuses["page"].state == "mounted", repr(
+            server._runtime_for_test.loop._mcp_mount.statuses["page"]
         )
-        assert server.control._turn_task is not None
-        await asyncio.wait_for(asyncio.shield(server.control._turn_task), TIMEOUT)
+        assert server._control_for_test._turn_task is not None
+        await asyncio.wait_for(asyncio.shield(server._control_for_test._turn_task), TIMEOUT)
         await _request(reader, writer, 4, "send", {"text": "delegate"})
         async def wait_for_child() -> None:
             async with asyncio.timeout(TIMEOUT):
@@ -1989,15 +1989,15 @@ async def test_unbound_disconnect_preserves_ordinary_mcp_mount(
 
         async def wait_for_mount() -> object:
             async with asyncio.timeout(TIMEOUT):
-                while server.runtime.loop._mcp_mount is None:
+                while server._runtime_for_test.loop._mcp_mount is None:
                     await asyncio.sleep(0)
-            return server.runtime.loop._mcp_mount
+            return server._runtime_for_test.loop._mcp_mount
 
         mount = await asyncio.wait_for(wait_for_mount(), TIMEOUT)
         writer.close()
         await writer.wait_closed()
         await _wait_for_controller_release(server)
-        assert server.runtime.loop._mcp_mount is mount
+        assert server._runtime_for_test.loop._mcp_mount is mount
     finally:
         if not writer.is_closing():
             writer.close()
@@ -2074,11 +2074,11 @@ async def test_bound_http_error_redacts_header_everywhere(
         async def wait_for_statuses() -> object:
             async with asyncio.timeout(TIMEOUT):
                 while (
-                    server.runtime.loop._mcp_mount is None
-                    or server.runtime.loop._mcp_mount.statuses["page"].state == "connecting"
+                    server._runtime_for_test.loop._mcp_mount is None
+                    or server._runtime_for_test.loop._mcp_mount.statuses["page"].state == "connecting"
                 ):
                     await asyncio.sleep(0)
-            return server.runtime.loop._mcp_mount.statuses
+            return server._runtime_for_test.loop._mcp_mount.statuses
 
         statuses = await asyncio.wait_for(wait_for_statuses(), TIMEOUT)
         exposed = json.dumps(frames) + caplog.text + repr(statuses)

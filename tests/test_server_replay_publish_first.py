@@ -121,11 +121,11 @@ class Serve:
 
     @property
     def loop_owner(self) -> Any:
-        return self.server.runtime.loop
+        return self.server._runtime_for_test.loop
 
     @property
     def store(self) -> Any:
-        return self.server.runtime.opened.store
+        return self.server._runtime_for_test.opened.store
 
     async def observer(self) -> ReplayClient:
         client = await connect_replay(self.server, self.transport)
@@ -241,12 +241,12 @@ async def test_config_changed_replay_observers_are_feature_filtered(
             "---\nname: specialist\ndescription: focused specialist\n---\nprofile body\n",
             encoding="utf-8",
         )
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         prepared: list[StreamEvent] = []
-        server.runtime.loop.set_background_event_sink(prepared.append)
-        await server.runtime.loop.refresh_live_config()
+        server._runtime_for_test.loop.set_background_event_sink(prepared.append)
+        await server._runtime_for_test.loop.refresh_live_config()
         assert len(prepared) == 1
-        await server.control._event(prepared[0], background=True)
+        await server._control_for_test._event(prepared[0], background=True)
 
         config = await with_feature.event("config_changed")
         assert with_joined is not None
@@ -258,7 +258,7 @@ async def test_config_changed_replay_observers_are_feature_filtered(
             if frame.get("params", {}).get("event") == "config_changed"
         ]
 
-        await server.control._notify(
+        await server._control_for_test._notify(
             EventDescriptor.TURN_ABORTED, session_id, data={"reason": "test"}
         )
         common_with = await with_feature.event("turn_aborted")
@@ -266,7 +266,7 @@ async def test_config_changed_replay_observers_are_feature_filtered(
         assert common_with["seq"] == 2
         assert common_without["seq"] == 1
 
-        server.control._publish_memory_notice(session_id, "memory-marker")
+        server._control_for_test._publish_memory_notice(session_id, "memory-marker")
         memory = await with_feature.event("memory_updated")
         assert memory["seq"] == 3
         assert memory["message"] == "memory-marker"
@@ -276,7 +276,7 @@ async def test_config_changed_replay_observers_are_feature_filtered(
             if frame.get("params", {}).get("event") == "memory_updated"
         ]
 
-        await server.control.user_message(
+        await server._control_for_test.user_message(
             "user-marker",
             "default",
             frozenset({"user_message_event", "delivery_id", "user_message_delivery_id"}),
@@ -322,7 +322,7 @@ async def test_join_between_assistant_event_and_its_row_sees_it_once(tmp_path: P
         await negotiate(controller)
         session_id = (await controller.request(2, "new_session", {"provider": "codex"}))["result"]["session"]["session_id"]
         await negotiate(observer, observer=True)
-        loop_owner = server.runtime.loop
+        loop_owner = server._runtime_for_test.loop
         original = loop_owner._append_turn_message_with_approvals
 
         async def gated(message: Any, approvals: Any) -> Any:
@@ -419,7 +419,7 @@ async def _send_images(serve: Serve) -> str:
 
 async def _send_skill(serve: Serve) -> str:
     """T7b: a skill expansion's row has origin skill_expansion, not user."""
-    input_id = serve.server.control._model_inputs.register(
+    input_id = serve.server._control_for_test._model_inputs.register(
         serve.session_id,
         ModelInputEnvelope("skill-marker expanded body", "skill-marker", MessageOrigin.SKILL_EXPANSION),
     )
@@ -496,7 +496,7 @@ async def test_turn_canceled_before_its_first_step_closes_its_echo(
     """A turn task canceled before it runs has no pump end; its end closes the echo."""
     gates = Gates()
     serve = await _serve(tmp_path, transport, FakeBackend([ScriptedTurn([TextContent("ok")])]), gates)
-    control = serve.server.control
+    control = serve.server._control_for_test
     start_turn = control.start_turn
     try:
         joins = {"before": await serve.joined()}

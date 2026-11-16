@@ -83,7 +83,7 @@ def _gate_handler(
     event is set, modelling a cancel-resistant handler.
     """
 
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         started.set()
         try:
             await asyncio.wait_for(gate.wait(), 10)
@@ -109,7 +109,7 @@ def _spy_handler(
     *,
     ran: asyncio.Event,
 ) -> None:
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         ran.set()
         return {"ok": True}
 
@@ -343,14 +343,14 @@ async def test_one_shared_handoff_deadline(tmp_path: Path, transport: Transport)
     server.lost_request_contended_drain = 0.0
     deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
     captured: list[float] = []
-    original = server.control.controller_claimed
+    original = server._control_for_test.controller_claimed
 
     async def spy(*args: object, **kwargs: object) -> bool:
         captured.append(float(kwargs["deadline"]))
         return await original(*args, **kwargs)
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(server.control, "controller_claimed", spy)
+    monkeypatch.setattr(server._control_for_test, "controller_claimed", spy)
     started = asyncio.Event()
     gate = asyncio.Event()
     _gate_handler(MethodDescriptor.STATUS, monkeypatch, started=started, gate=gate)
@@ -450,7 +450,7 @@ async def test_turn_reconnect_through_loss_path(tmp_path: Path, transport: Trans
         await _settle_until(lambda: _is_lost(server))
         gate.set()
         await _spin(lambda: _released(server), what="A released via loss path")
-        assert server.runtime.state.status == "running", "the turn was lost on release"
+        assert server._runtime_for_test.state.status == "running", "the turn was lost on release"
 
         await negotiate(b, extra=tuple(RECONNECT), protocol_version="1.2")
         status = (await b.request(5, "status", {}))["result"]

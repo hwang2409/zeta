@@ -28,8 +28,8 @@ def _page(params: dict[str, Any]) -> tuple[int, int]:
     return offset, limit
 
 
-async def list_runs(client: Any, params: dict[str, Any]) -> dict[str, object]:
-    runtime = client.server.runtime
+async def list_runs(client: Any, params: dict[str, Any], controller) -> dict[str, object]:
+    runtime = controller.runtime
     store = validation.active(runtime, params)
     offset, limit = _page(params)
     loop = runtime.loop
@@ -53,8 +53,8 @@ async def list_runs(client: Any, params: dict[str, Any]) -> dict[str, object]:
     return result
 
 
-async def send(client: Any, params: dict[str, Any]) -> dict[str, object]:
-    runtime = client.server.runtime
+async def send(params: dict[str, Any], controller) -> dict[str, object]:
+    runtime = controller.runtime
     store = validation.active(runtime, params)
     run_id = params.get("run_id")
     text = params.get("text")

@@ -263,8 +263,8 @@ async def test_status_represents_foreground_after_restart_and_join_shows_aborted
             await request(reader, writer, 5, "approve", {"request_id": "wire-fg"})
         )[-1]
         assert approved["result"]["accepted"] is True
-        assert server.control._turn_task is not None
-        await asyncio.wait_for(asyncio.shield(server.control._turn_task), 10)
+        assert server._control_for_test._turn_task is not None
+        await asyncio.wait_for(asyncio.shield(server._control_for_test._turn_task), 10)
         assert marker.read_text().splitlines() == ["run"]
 
         after = (

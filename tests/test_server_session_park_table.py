@@ -80,7 +80,7 @@ class Run:
         a = await client.new()
         await client.call("send", {"text": "start a task"})
         await _until(
-            lambda: self.backend.calls == 2 and not server.control.state_change_busy(),
+            lambda: self.backend.calls == 2 and not server._control_for_test.state_change_busy(),
             "A's turn ends while its task runs",
         )
         await client.new()
@@ -105,11 +105,11 @@ def _held_reply() -> list[tuple[list[object], list[Any]]]:
 
 
 def _task_exits(server: ZetaServer) -> int:
-    assert server.runtime.opened is not None
+    assert server._runtime_for_test.opened is not None
     return sum(
         entry.type == "notification"
         and entry.data.get("kind") == TASK_EXITED_NOTIFICATION_KIND
-        for entry in resident_entries(server.runtime.opened.store)
+        for entry in resident_entries(server._runtime_for_test.opened.store)
     )
 
 
@@ -118,7 +118,7 @@ def _parked(server: ZetaServer, session_id: str) -> ServeControl:
     (pair,) = [
         control
         for control in server.controls()
-        if control is not server.control and control.runtime.session_id == session_id
+        if control is not server._control_for_test and control.runtime.session_id == session_id
     ]
     return pair
 
@@ -176,7 +176,7 @@ async def s2_task_and_wake(run: Run) -> None:
     a = await client.new()
     await client.call("send", {"text": "start a task"})
     await _until(
-        lambda: run.backend.calls == 2 and not server.control.state_change_busy(),
+        lambda: run.backend.calls == 2 and not server._control_for_test.state_change_busy(),
         "A's turn ends while its task runs",
     )
     await client.new()
@@ -304,7 +304,7 @@ async def x4_setup_fails_before_commit(run: Run) -> None:
 
     run.monkeypatch.setattr(server, "new_pair", new_pair)
     await client.error("new_session", {"provider": "codex"})
-    assert server.control.runtime.session_id == a
+    assert server._control_for_test.runtime.session_id == a
     assert [pair.runtime.opened for pair in pairs] == [None]
     assert (await client.call("status"))["parked_sessions"] == []
     run.backend.gates[0].set()
@@ -319,7 +319,7 @@ async def c1_cancel_incoming_setup(run: Run) -> None:
     await client.new()
     await client.call("send", {"text": "go"})
     await await_or_fail(run.backend.held[0].wait(), what="A mid-reply")
-    outgoing = server.control
+    outgoing = server._control_for_test
     started = asyncio.Event()
     gate = asyncio.Event()
     pairs: list[ServeControl] = []
@@ -414,15 +414,15 @@ async def r1_stale_receipt_at_load(run: Run) -> None:
     server = run.serve(_task_replies(run.go))
     client = await run.open()
     a = await client.new()
-    session_dir = server.runtime.opened.store.session_dir
+    session_dir = server._runtime_for_test.opened.store.session_dir
     await client.call("send", {"text": "start a task"})
     await _until(
-        lambda: run.backend.calls == 2 and not server.control.state_change_busy(),
+        lambda: run.backend.calls == 2 and not server._control_for_test.state_change_busy(),
         "A's turn ends while its task runs",
     )
     run.go.touch()
     await _until(
-        lambda: run.backend.calls == 3 and not server.control.holds_work(),
+        lambda: run.backend.calls == 3 and not server._control_for_test.holds_work(),
         "the task exit is delivered and its wake turn ends",
     )
     await client.new()
@@ -444,7 +444,7 @@ async def r1_stale_receipt_at_load(run: Run) -> None:
 
 async def _unhealthy(run: Run, client: Client) -> None:
     """Fail the pending approval's durable write through the wire."""
-    control = run.server.control
+    control = run.server._control_for_test
     await _until(control.has_pending_approvals, "A's approval")
     request_id = (await client.call("status"))["pending_approvals"][0]["request_id"]
     with run.monkeypatch.context() as patch:
@@ -469,7 +469,7 @@ async def u1_unhealthy_alone_closes(run: Run) -> None:
     a = await client.new(mode="ask")
     await client.call("send", {"text": "write"})
     await _unhealthy(run, client)
-    assert not server.control.holds_work()
+    assert not server._control_for_test.holds_work()
     await client.new()
     assert (await client.call("status"))["parked_sessions"] == []
     await _closed(server, a)
@@ -488,19 +488,19 @@ async def r3_unhealthy_parked_resume(run: Run) -> None:
     client = await run.open()
     a = await client.new(mode="ask")
     await client.call("send", {"text": "start a task, then write"})
-    await _until(server.control.has_pending_approvals, "the task approval")
+    await _until(server._control_for_test.has_pending_approvals, "the task approval")
     first = (await client.call("status"))["pending_approvals"][0]["request_id"]
     await client.call("approve", {"request_id": first})
     await _unhealthy(run, client)
-    parked = server.control
+    parked = server._control_for_test
     assert parked.holds_work()  # its task still runs
 
     await client.new()
     assert _parked(server, a) is parked
     result = await client.call("resume", {"session_id": a})
     assert "attached" not in result
-    assert server.control is not parked, "resume must reopen an unhealthy parked session"
-    assert not server.control.unhealthy()
+    assert server._control_for_test is not parked, "resume must reopen an unhealthy parked session"
+    assert not server._control_for_test.unhealthy()
     assert parked.runtime.opened is None
 
 
@@ -548,7 +548,7 @@ async def d2_stale_check_after_resume(run: Run) -> None:
     assert "attached" not in resumed
     for control in late_checks:
         original_check(control)
-    assert server.control is parked
+    assert server._control_for_test is parked
     assert a not in server.parking._closing
     assert (await client.call("status"))["session"]["session_id"] == a
 
@@ -564,7 +564,7 @@ async def d3_resume_parked_twice(run: Run) -> None:
     ]
     # the second resume finds A attached: no new pair, no parked_limit, no reset
     assert [_grant_resets(frames, a) for frames in (first, second)] == [1, 0]
-    assert server.control is parked
+    assert server._control_for_test is parked
     assert (await client.call("status"))["parked_sessions"] == []
     run.backend.gates[0].set()
 
@@ -607,7 +607,7 @@ async def test_parked_pair(
             lambda: all(
                 pair.holds_work()
                 for pair in server.controls()
-                if pair is not server.control
+                if pair is not server._control_for_test
             ),
             "every parked pair that holds no work closes",
         )

@@ -191,25 +191,30 @@ class ReplayOutput:
             return self.child_runs.live_store(scope.value)
         for connection in self._connections:
             if self.replay.scope_for(connection) == scope:
-                runtime = connection.server.runtime
+                runtime = self.replay.controller_for(connection).runtime
                 if runtime.opened is not None and runtime.session_id == scope.value:
                     return runtime.opened.store
         return None
 
-    async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        runtime = connection.server.runtime
+    async def begin_replay_join(
+        self, connection: Any, scope: ReplayScopeId, controller: Any
+    ) -> None:
+        """Begin a join on ``controller``, the record the request selected."""
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
-            store = validation.active(runtime, {"session_id": scope.value})
+            store = validation.active(controller.runtime, {"session_id": scope.value})
         self.invalidate_replay_connection(connection, reason="rejoined")
         pending = self.replay.begin_join(
             connection,
             scope,
             None if store is None else store.reset_generation(),
             {},
+            controller,
         )
-        pending.status = await lifecycle.live_status_baseline(connection)
+        pending.status = await lifecycle.live_status_baseline(
+            connection, controller
+        )
 
     def finish_replay_join(
         self,
@@ -564,11 +569,12 @@ class ReplayOutput:
     async def read_replay_history(
         self,
         connection: Any,
+        controller: Any,
         session_id: str,
         history_validator: object | None = None,
     ) -> tuple[dict[str, object], int, str | None]:
         """Read the newest history page and its stable frontier row off-loop."""
-        store = validation.active(connection.server.runtime, {"session_id": session_id})
+        store = validation.active(controller.runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
         features = history_features(self._connections[connection].features)
         def read() -> tuple[dict[str, object], int, str | None]:

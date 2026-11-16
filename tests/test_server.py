@@ -862,7 +862,7 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
         assert hello["protocol_version"] == "1.1"
         assert server._client is not None
         for kind in NOTIFICATION_KINDS:
-            await server.control._event(
+            await server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
@@ -892,7 +892,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
             data = {"kind": kind}
             if kind == "child_question":
                 data["agent_description"] = "nested verifier"
-            await server.control._event(
+            await server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data=data,
@@ -923,7 +923,7 @@ async def test_child_message_delivered_event_maps_from_background_run(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         assert server._client is not None
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
                 data={"child_label": "worker", "preview": "check the retry"},
@@ -1508,7 +1508,7 @@ async def test_server_streams_scripted_turn_over_real_socket(tmp_path: Path) -> 
     server = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
-    assert server.runtime._test_scripted_provider is True
+    assert server._runtime_for_test._test_scripted_provider is True
     reader, writer = await _ready(server)
     try:
         frames = await _request(reader, writer, 3, "send", {"text": "hello"})
@@ -1645,7 +1645,7 @@ async def test_ollama_model_window_error_reaches_serve(tmp_path: Path) -> None:
     )
     reader, writer = await _ready(server)
     try:
-        assembler = server.runtime.loop.context_assembler
+        assembler = server._runtime_for_test.loop.context_assembler
         assembler.update_token_budget(10)
         assembler.system_prompt = Message(
             MessageRole.SYSTEM,
@@ -1758,7 +1758,7 @@ async def test_session_history_and_subscribe_joins_live_sequence_on_unix_socket(
             )
         )[-1]["result"]
         assert result["replay"]["history_seq"] == 0
-        await server.control._notify(
+        await server._control_for_test._notify(
             EventDescriptor.TURN_START, session["session_id"], data={}
         )
         while True:
@@ -1790,7 +1790,7 @@ async def test_session_replay_releases_completed_frames_for_long_stream(
         result = (await _request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))[-1]["result"]
         assert result["replay"]["history_seq"] == 0
         for sequence in range(1, 301):
-            await server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={})
+            await server._control_for_test._notify(EventDescriptor.TURN_START, session["session_id"], data={})
             while True:
                 frame = await _read(reader)
                 if frame.get("method") != "event":
@@ -1833,7 +1833,7 @@ async def test_session_replay_join_admits_response_before_held_events(
         join = asyncio.create_task(_request(reader, writer, 3, "session_history_and_subscribe", {"session_id": session["session_id"]}))
         await await_or_fail(entered.wait(), what="join response write")
         for _ in range(3):
-            await await_or_fail(server.control._notify(EventDescriptor.TURN_START, session["session_id"], data={}), what="publish replay event")
+            await await_or_fail(server._control_for_test._notify(EventDescriptor.TURN_START, session["session_id"], data={}), what="publish replay event")
         release.set()
         assert (await await_or_fail(join, what="join response"))[-1]["result"]["replay"]["history_seq"] == 0
         events = [await await_or_fail(_event(reader, "turn_start"), what="replay event") for _ in range(3)]
@@ -1944,8 +1944,8 @@ async def test_session_history_records_controller_disconnect_approval_abort(
             await asyncio.sleep(0.01)
         else:
             pytest.fail("controller was not released after disconnect")
-        assert server.runtime.policy is not None
-        assert not (await server.runtime.policy.pending_requests())
+        assert server._runtime_for_test.policy is not None
+        assert not (await server._runtime_for_test.policy.pending_requests())
 
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         hello = await _request(
@@ -2049,7 +2049,7 @@ async def test_session_history_keeps_main_durable_entry_cursor_space(
     )
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         for index in range(6):
             store.append_message(
                 with_message_origin(
@@ -2184,7 +2184,7 @@ async def test_session_history_never_splits_approval_anchor_group(
     )
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         for index in range(6):
             store.append_message(
                 with_message_origin(
@@ -2238,7 +2238,7 @@ async def test_session_history_loads_legacy_approval_abort_without_reason(
     reader, writer, session_id = await _ready_extensions(server)
     try:
         call = ToolCall("legacy-call", "read", {"path": "legacy.txt"})
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         store.append_approval_request(call.id, call)
         store.append_approval_resolution(call.id, "abort")
         reopened = (await asyncio.wait_for(_open_session(tmp_path, session_id), 10)).store
@@ -2277,7 +2277,7 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
         durable_at_turn_aborted = False
-        original_notify = server.control._notify
+        original_notify = server._control_for_test._notify
 
         async def record_turn_aborted(event, session_id=None, **fields):
             nonlocal durable_at_turn_aborted
@@ -2289,11 +2289,11 @@ async def test_abort_emits_approval_end_before_turn_aborted(tmp_path: Path) -> N
                     ).tool_result
                     is not None
                     and message.tool_result.tool_call_id == call.id
-                    for entry in branch_entries(server.runtime.opened.store)
+                    for entry in branch_entries(server._runtime_for_test.opened.store)
                 )
             return await original_notify(event, session_id, **fields)
 
-        server.control._notify = record_turn_aborted
+        server._control_for_test._notify = record_turn_aborted
         frames = await _request(reader, writer, 4, "abort")
         frames += await _request(reader, writer, 5, "status")
         frames += await _frames_until_event(reader, "turn_aborted")
@@ -2390,8 +2390,8 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     agent_ended = asyncio.Event()
-    append_history = server.control._approvals._append_delegated_history
-    notify = server.control._notify
+    append_history = server._control_for_test._approvals._append_delegated_history
+    notify = server._control_for_test._notify
 
     async def delay_delegated_approval_end(
         record: object, payload: dict[str, object] | None
@@ -2411,11 +2411,12 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
 
     # test-contract: seam holds the delegated approval-end admission until agent_end
     monkeypatch.setattr(
-        server.control._approvals,
+        server._control_for_test._approvals,
         "_append_delegated_history",
         delay_delegated_approval_end,
     )
-    monkeypatch.setattr(server.control, "_notify", record_agent_end)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server._control_for_test, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
         await _request(reader, writer, 3, "send", {"text": "both"})
@@ -2441,15 +2442,15 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         assert {
             event["request_id"] for event in _named_events(frames, "approval_end")
         } == expected_end_ids
-        assert server.runtime.opened is not None
+        assert server._runtime_for_test.opened is not None
         assert any(
             isinstance(block, TextContent) and block.text == "parent done"
-            for message in branch_messages(server.runtime.opened.store)
+            for message in branch_messages(server._runtime_for_test.opened.store)
             for block in message.content
         )
         child_store = await asyncio.to_thread(
             ConversationStore,
-            server.runtime.opened.store.session_dir / "agents",
+            server._runtime_for_test.opened.store.session_dir / "agents",
             session_id="1",
         )
         try:
@@ -2487,7 +2488,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
     parent_tool_end_release = asyncio.Event()
     parent_tool_end_sent = asyncio.Event()
     approval_end_release = asyncio.Event()
-    notify = server.control._notify
+    notify = server._control_for_test._notify
 
     async def wait_for_gate(gate: asyncio.Event, name: str) -> None:
         try:
@@ -2515,7 +2516,7 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
 
     # test-contract: seam no public hook controls notification publication order
     monkeypatch.setattr(
-        server.control, "_notify", force_parent_tool_end_before_approval_end
+        server._control_for_test, "_notify", force_parent_tool_end_before_approval_end
     )
     reader, writer = await _ready(server)
     background_wait: asyncio.Task[None] | None = None
@@ -2523,13 +2524,13 @@ async def test_child_cancel_while_approval_pending_emits_one_matching_approval_e
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         approval = await _event(reader, "approval_request")
         assert approval["delegated"] is True
-        assert server.runtime.loop is not None
-        assert server.runtime.loop._background_owner.cancel(
+        assert server._runtime_for_test.loop is not None
+        assert server._runtime_for_test.loop._background_owner.cancel(
             approval["agent_instance_id"]
         )
         # test-contract: seam no public completion hook exists for child cancellation
         background_wait = asyncio.create_task(
-            asyncio.wait_for(server.runtime.loop._background_owner.wait(), 10)
+            asyncio.wait_for(server._runtime_for_test.loop._background_owner.wait(), 10)
         )
         frames = await _request(reader, writer, 4, "status")
         parent_tool_end_release.set()
@@ -2599,8 +2600,8 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    assert server.runtime.loop is not None
-    owner = server.runtime.loop._background_owner
+    assert server._runtime_for_test.loop is not None
+    owner = server._runtime_for_test.loop._background_owner
     register_attempted = asyncio.Event()
     original_register = owner.register
     deferred_registration: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -2641,7 +2642,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
             return
         original_register(*args, **kwargs)
 
-    original_notify = server.control._notify
+    original_notify = server._control_for_test._notify
 
     async def cancel_before_grandchild_registration(
         event: str, session_id: str | None = None, **fields: object
@@ -2661,7 +2662,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
     # test-contract: force approval publication before the grandchild is registered
     monkeypatch.setattr(owner, "register", defer_grandchild_registration)
     # test-contract: seam no public hook controls notification publication order
-    monkeypatch.setattr(server.control, "_notify", cancel_before_grandchild_registration)
+    monkeypatch.setattr(server._control_for_test, "_notify", cancel_before_grandchild_registration)
     child_watcher: asyncio.Task[object] | None = None
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
@@ -2684,7 +2685,7 @@ async def test_cancel_child_with_grandchild_approval_starts_no_new_child_turn(
             ]
             pending = [
                 (item.get("request_id"), item.get("agent_instance_id"))
-                for item in server.control.pending_approvals_now()
+                for item in server._control_for_test.pending_approvals_now()
             ]
             run_states = {}
             for instance_id in (child_id, grandchild_id):
@@ -2788,8 +2789,8 @@ async def test_cancel_child_publishes_grandchild_approval_end_when_child_store_c
         approval = await _event(reader, "approval_request")
         grandchild_id = approval["agent_instance_id"]
         child_id = grandchild_id.rsplit(":", 1)[0]
-        assert server.runtime.loop is not None
-        owner = server.runtime.loop._background_owner
+        assert server._runtime_for_test.loop is not None
+        owner = server._runtime_for_test.loop._background_owner
         child_watcher = owner._watchers[child_id]
         # Force the losing race deterministically: close the grandchild store
         # before the cancel, so every settlement write hits a closed store.
@@ -2881,11 +2882,11 @@ async def test_delegated_approval_history_and_live_end_keep_durable_identity(
                     seen_events.add(event_name)
             live_end = _named_events(frames, "approval_end")
         else:
-            assert server.runtime.loop is not None
-            assert server.runtime.loop._background_owner.cancel(
+            assert server._runtime_for_test.loop is not None
+            assert server._runtime_for_test.loop._background_owner.cancel(
                 live_request["agent_instance_id"]
             )
-            await asyncio.wait_for(server.runtime.loop._background_owner.wait(), 10)
+            await asyncio.wait_for(server._runtime_for_test.loop._background_owner.wait(), 10)
             frames = await _request(reader, writer, 4, "status")
             seen_events = {
                 frame.get("params", {}).get("event")
@@ -2937,7 +2938,7 @@ async def test_status_surfaces_transcript_index_failure(
     )
     reader, writer = await _ready(server, "1.1")
     try:
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         requested: list[str] = []
 
@@ -2956,7 +2957,7 @@ async def test_status_surfaces_transcript_index_failure(
             )
         )[-1]["result"]
 
-        assert requested == [server.runtime.session_id]
+        assert requested == [server._runtime_for_test.session_id]
         assert status.get("transcript_index_failure") == (
             "disk full; pending changes will retry"
         )
@@ -3020,13 +3021,13 @@ async def test_status_pending_approvals_does_not_parse_logs(
     try:
         await _request(reader, writer, 3, "send", {"text": "delegate"})
         await _event(reader, "approval_request")
-        assert server.runtime.opened is not None
-        stores = server.runtime.loop._background_owner.conversation_stores()
+        assert server._runtime_for_test.opened is not None
+        stores = server._runtime_for_test.loop._background_owner.conversation_stores()
         child_store = next(
-            store for store in stores if store is not server.runtime.opened.store
+            store for store in stores if store is not server._runtime_for_test.opened.store
         )
         for index in range(100):
-            server.runtime.opened.store.append_message(
+            server._runtime_for_test.opened.store.append_message(
                 Message(MessageRole.ASSISTANT, [TextContent(f"parent {index}")])
             )
             child_store.append_message(
@@ -3112,8 +3113,8 @@ async def test_resolve_approval_writes_through_detached_writer(
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
-        assert server.runtime.opened is not None
-        resident = server.runtime.opened.store
+        assert server._runtime_for_test.opened is not None
+        resident = server._runtime_for_test.opened.store
         calls: list[tuple[ConversationStore, int]] = []
         original = ConversationStore.resolve_approval
 
@@ -3154,7 +3155,7 @@ async def test_status_store_integrity_failure_is_server_error(
     async def fail_read() -> list[dict[str, object]]:
         raise ConversationIntegrityError("store read failed")
 
-    monkeypatch.setattr(server.control, "pending_approvals", fail_read)
+    monkeypatch.setattr(server._control_for_test, "pending_approvals", fail_read)
     try:
         response = (await _request(reader, writer, 3, "status"))[-1]
         assert response["error"] == {
@@ -3282,7 +3283,7 @@ async def test_lifecycle_prunes_ended_approvals(
             await _frames_until_event(reader, "agent_end")
 
         assert server._client is not None
-        assert server.control._approvals.state.records == {}
+        assert server._control_for_test._approvals.state.records == {}
     finally:
         await close_serve(server, writer)
 
@@ -3364,10 +3365,10 @@ async def test_approval_scope_always_tool_records_session_policy_and_skips_next_
         )
         assert allowed[-1]["result"]["scope"] == "always_tool"
         assert allowed[-1]["result"]["decision"] == "approve"
-        assert server.runtime.policy is not None
+        assert server._runtime_for_test.policy is not None
         assert any(
             rule.tool == "read" and rule.pattern is None
-            for rule in server.runtime.policy.always_allow
+            for rule in server._runtime_for_test.policy.always_allow
         )
         # The next turn's read auto-approves (no fresh approval_request for
         # call-2). The bash call in the same turn still asks. Its request can
@@ -3411,8 +3412,8 @@ async def test_approval_without_scope_keeps_legacy_shape(tmp_path: Path) -> None
             "request_id": "call-1",
             "decision": "approve",
         }
-        assert server.runtime.policy is not None
-        assert not server.runtime.policy.always_allow
+        assert server._runtime_for_test.policy is not None
+        assert not server._runtime_for_test.policy.always_allow
         await _event(reader, "turn_end")
     finally:
         await close_serve(server, writer)
@@ -3506,7 +3507,7 @@ async def test_resumed_approval_finishes_idle_after_terminal_event(
         approved = await _request(reader, writer, 3, "approve", {"request_id": call.id})
         assert approved[-1]["result"]["decision"] == "approve"
         await _event(reader, "tool_end")
-        turn_task = server.control._turn_task
+        turn_task = server._control_for_test._turn_task
         assert turn_task is not None
         await asyncio.wait_for(turn_task, 10)
         status = await _request(reader, writer, 4, "status")
@@ -3625,7 +3626,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert canceled_tool_end["tool_call"]["id"] == call.id
         assert canceled_tool_end["tool_result"]["is_canceled"] is True
         assert len(backend.calls) == 1
-        history = branch_messages(server.runtime.opened.store)
+        history = branch_messages(server._runtime_for_test.opened.store)
         assert next_reply not in json.dumps(
             [message.to_dict() for message in history]
         )
@@ -3655,7 +3656,7 @@ async def test_new_run_after_approval_abort_runs_normally(
         assert [
             name for name in next_names if name in {"turn_start", "turn_end"}
         ] == ["turn_start", "turn_end"]
-        history = branch_messages(server.runtime.opened.store)
+        history = branch_messages(server._runtime_for_test.opened.store)
         assert next_reply in json.dumps([message.to_dict() for message in history])
     finally:
         allow_approval_end.set()
@@ -3706,26 +3707,26 @@ async def test_foreground_abort_only_ends_foreground_approval(
             Message(MessageRole.ASSISTANT, [ToolUseContent(delegated_call)]),
             [(delegated_call.id, delegated_call)],
         )
-        assert server.runtime.policy is not None
-        server.runtime.policy.register_delegated(
+        assert server._runtime_for_test.policy is not None
+        server._runtime_for_test.policy.register_delegated(
             delegated_request,
             child_store,
             child_instance_id="background-child",
         )
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         child_task = asyncio.create_task(asyncio.sleep(60))
-        server.runtime.loop._background_owner.register(
+        server._runtime_for_test.loop._background_owner.register(
             "background-child", child_task.cancel, child_task
         )
         assert server._client is not None
-        server.control._approvals.observe(delegated_request)
+        server._control_for_test._approvals.observe(delegated_request)
 
         await _request(reader, writer, 4, "abort", {"scope": "foreground"})
         ended = [await _event(reader, "approval_end")]
         assert [event["request_id"] for event in ended] == [foreground["request_id"]]
-        assert delegated_request.key in server.control._approvals.active_keys()
-        assert delegated_request.key in server.control._approvals.state.records
-        assert server.runtime.policy._delegated == {}
+        assert delegated_request.key in server._control_for_test._approvals.active_keys()
+        assert delegated_request.key in server._control_for_test._approvals.state.records
+        assert server._runtime_for_test.policy._delegated == {}
         assert not child_task.done()
     finally:
         await close_serve(server, writer)
@@ -3761,8 +3762,8 @@ async def test_foreground_abort_mid_stream_keeps_pending_steering(
         frames = await _request(reader, writer, 5, "abort", {"scope": "foreground"})
         assert frames[-1]["result"] == {"aborted": True}
         await _frames_until_event(reader, "turn_aborted")
-        assert server.runtime.loop is not None
-        assert server.runtime.loop.has_pending_steering
+        assert server._runtime_for_test.loop is not None
+        assert server._runtime_for_test.loop.has_pending_steering
 
         await _request(reader, writer, 6, "send", {"text": "continue"})
         await _event(reader, "agent_end")
@@ -3805,8 +3806,8 @@ async def test_clear_steering_returns_cleared_count(tmp_path: Path) -> None:
 
         cleared = await _request(reader, writer, 6, "clear_steering")
         assert cleared[-1]["result"] == {"cleared": 2}
-        assert server.runtime.loop is not None
-        assert not server.runtime.loop.has_pending_steering
+        assert server._runtime_for_test.loop is not None
+        assert not server._runtime_for_test.loop.has_pending_steering
         assert (await _request(reader, writer, 7, "clear_steering"))[-1]["result"] == {
             "cleared": 0
         }
@@ -3877,8 +3878,8 @@ async def test_foreground_abort_does_not_interrupt_tool_cleanup(
             {"protocol_version": "1.1", "features": ["abort_scope"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
-        server.runtime.loop.tool_registry.register(
+        assert server._runtime_for_test.loop is not None
+        server._runtime_for_test.loop.tool_registry.register(
             "controlled",
             controlled_tool,
             parameters={"type": "object", "properties": {}},
@@ -3940,7 +3941,7 @@ async def test_foreground_abort_cancels_tool_but_keeps_background_child(
         await _request(reader, writer, 3, "send", {"text": "start child"})
         await _event(reader, "agent_end")
         await asyncio.wait_for(backend.child_started.wait(), TIMEOUT)
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         owner = loop._background_owner
         assert owner.running
@@ -4104,8 +4105,8 @@ async def test_maximum_legal_frame_gets_bounded_error_response(
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    assert server.runtime.opened is not None
-    server.runtime.opened.metadata.system_prompt = "x" * MAX_FRAME_BYTES
+    assert server._runtime_for_test.opened is not None
+    server._runtime_for_test.opened.metadata.system_prompt = "x" * MAX_FRAME_BYTES
     request_id = "legal-frame"
     padding_length = MAX_FRAME_BYTES
     while True:
@@ -4263,7 +4264,7 @@ async def test_list_sessions_marks_oversized_result_as_truncated(
         compaction_budget=200_000,
         system_prompt="x" * MAX_FRAME_BYTES,
     )
-    server.runtime.list_sessions = lambda: [huge]
+    server.manager.list_sessions_read_only = lambda: [huge]
     reader, writer = await _ready(server)
     try:
         frames = await _request(reader, writer, 3, "list_sessions")
@@ -4306,7 +4307,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
     server = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
-    server.runtime.list_sessions = lambda: [huge]
+    server.manager.list_sessions_read_only = lambda: [huge]
     reader, writer = await _connect(server)
     request_id = "x" * MAX_REQUEST_ID_BYTES
     try:
@@ -4529,7 +4530,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
     # waits for the real completion signal instead of a wall-clock sleep.
     release_started = asyncio.Event()
     release_tasks: list[asyncio.Task[None]] = []
-    begin_controller_release = server.control.begin_controller_release
+    begin_controller_release = server._control_for_test.begin_controller_release
 
     def capture_release(**kwargs: object) -> asyncio.Task[None]:
         task = begin_controller_release(**kwargs)
@@ -4537,7 +4538,7 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
         release_started.set()
         return task
 
-    monkeypatch.setattr(server.control, "begin_controller_release", capture_release)
+    monkeypatch.setattr(server._control_for_test, "begin_controller_release", capture_release)
     reader, writer = await _ready(server)
     await _request(reader, writer, 3, "send", {"text": "read it"})
     await _event(reader, "approval_request")
@@ -4547,8 +4548,8 @@ async def test_disconnect_aborts_pending_approval_without_phantom(
     await await_or_fail(
         asyncio.shield(release_tasks[0]), what="controller release abort"
     )
-    assert server.runtime.policy is not None
-    assert (await server.runtime.policy.pending_requests()) == []
+    assert server._runtime_for_test.policy is not None
+    assert (await server._runtime_for_test.policy.pending_requests()) == []
     await server.close()
 
 
@@ -4620,14 +4621,14 @@ async def test_client_close_persists_streamed_data(tmp_path: Path) -> None:
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    session_id = server.runtime.session_id
+    session_id = server._runtime_for_test.session_id
     await _request(reader, writer, 3, "send", {"text": "stream"})
     await _event(reader, "assistant_delta")
     writer.close()
     await writer.wait_closed()
     # test-contract: latency < the detached turn must commit before reopening
     await asyncio.sleep(0.1)
-    reopened = await asyncio.to_thread(server.runtime.manager.open, session_id)
+    reopened = await asyncio.to_thread(server._runtime_for_test.manager.open, session_id)
     try:
         messages = branch_messages(reopened.store)
     finally:
@@ -5047,10 +5048,10 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
         provider="codex",
     )
     reader, writer = await _ready(server)
-    first_session = server.runtime.session_id
+    first_session = server._runtime_for_test.session_id
     try:
         assert server._client is not None
-        approvals = server.control._approvals
+        approvals = server._control_for_test._approvals
         first_wire = approvals.wire_id(("child-a", "same"))
         await _request(reader, writer, 3, "new_session", {"provider": "codex"})
         assert approvals.core_key(first_wire) == first_wire
@@ -5077,7 +5078,7 @@ async def test_session_swap_resets_usage_for_create_and_resume(tmp_path: Path) -
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server)
-    first_session = server.runtime.session_id
+    first_session = server._runtime_for_test.session_id
     try:
         await _request(reader, writer, 3, "send", {"text": "first"})
         await _event(reader, "usage")
@@ -5192,7 +5193,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
     release_agent_end = asyncio.Event()
     notification_captured = asyncio.Event()
     release_notification = asyncio.Event()
-    original_notify = server.control._notify
+    original_notify = server._control_for_test._notify
     original_notification_turn = server.turn_contexts.run_notification_turn
 
     async def notify(event: str, *args: object, **kwargs: object) -> None:
@@ -5207,7 +5208,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
         return await original_notification_turn(*args, **kwargs)
 
     # test-contract: seam serve has no public agent-end publication gate
-    monkeypatch.setattr(server.control, "_notify", notify)
+    monkeypatch.setattr(server._control_for_test, "_notify", notify)
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
     )  # test-contract: seam serve has no public notification-turn start gate
@@ -5219,7 +5220,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
         await asyncio.wait_for(
             client.request("new", "new_session", {"provider": "codex"}), TIMEOUT
         )
-        old_session_id = server.runtime.session_id
+        old_session_id = server._runtime_for_test.session_id
         await asyncio.wait_for(
             client.request("send", "send", {"text": "start"}), TIMEOUT
         )
@@ -5248,7 +5249,7 @@ async def test_session_swap_rejects_pending_notification_handoff(
             TIMEOUT,
         )
         await asyncio.wait_for(notification_captured.wait(), timeout=TIMEOUT)
-        notification_turn = server.control._turn_task
+        notification_turn = server._control_for_test._turn_task
         assert notification_turn is not None
         release_notification.set()
         await asyncio.wait_for(asyncio.shield(notification_turn), timeout=TIMEOUT)
@@ -5304,15 +5305,15 @@ async def test_session_swap_reserves_child_completion_during_setup(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _ready(server, protocol_version="1.1")
-    old_session_id = server.runtime.session_id
+    old_session_id = server._runtime_for_test.session_id
     setup_entered = asyncio.Event()
     release_setup = asyncio.Event()
     wake_attempted = asyncio.Event()
     notification_captured = asyncio.Event()
     release_notification = asyncio.Event()
-    original_run_setup = server.runtime._run_setup
-    original_terminate_approvals = server.control._terminate_pending_approvals
-    original_schedule_wake = server.control._schedule_background_wake
+    original_run_setup = server._runtime_for_test._run_setup
+    original_terminate_approvals = server._control_for_test._terminate_pending_approvals
+    original_schedule_wake = server._control_for_test._schedule_background_wake
     original_notification_turn = server.turn_contexts.run_notification_turn
     setup_calls = 0
     termination_calls = 0
@@ -5339,7 +5340,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
         nonlocal wake_task
         original_schedule_wake(session_id)
         if setup_entered.is_set():
-            wake_task = server.control._turn_task
+            wake_task = server._control_for_test._turn_task
             wake_attempted.set()
 
     async def gated_notification_turn(*args: object, **kwargs: object):
@@ -5348,14 +5349,14 @@ async def test_session_swap_reserves_child_completion_during_setup(
         return await original_notification_turn(*args, **kwargs)
 
     # test-contract: seam serve has no public session-setup gate
-    monkeypatch.setattr(server.runtime, "_run_setup", gated_run_setup)
+    monkeypatch.setattr(server._runtime_for_test, "_run_setup", gated_run_setup)
     # test-contract: seam serve has no public pre-setup gate
     monkeypatch.setattr(
-        server.control, "_terminate_pending_approvals", gated_terminate_approvals
+        server._control_for_test, "_terminate_pending_approvals", gated_terminate_approvals
     )
     # test-contract: seam serve has no public background-wake observation
     monkeypatch.setattr(
-        server.control, "_schedule_background_wake", observe_schedule_wake
+        server._control_for_test, "_schedule_background_wake", observe_schedule_wake
     )
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
@@ -5369,7 +5370,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
             _request(reader, writer, 4, "new_session", {"provider": "codex"})
         )
         await asyncio.wait_for(setup_entered.wait(), TIMEOUT)
-        loop = server.runtime.loop
+        loop = server._runtime_for_test.loop
         assert loop is not None
         owner = loop._background_owner
         assert len(owner._watchers) == 1
@@ -5378,7 +5379,7 @@ async def test_session_swap_reserves_child_completion_during_setup(
         backend.release_child.set()
         # test-contract: seam serve has no public child-completion join
         await asyncio.wait_for(asyncio.shield(watcher), TIMEOUT)
-        server.control._schedule_background_wake(old_session_id)
+        server._control_for_test._schedule_background_wake(old_session_id)
         await asyncio.wait_for(wake_attempted.wait(), TIMEOUT)
         if wake_task is not None:
             await asyncio.wait_for(notification_captured.wait(), TIMEOUT)
@@ -5596,8 +5597,8 @@ async def test_parent_mode_resolves_live_delegated_approvals_independently(
         # agent_end is published only after the server marks the turn idle.
         if not agent_ended:
             await _event(reader, "agent_end")
-        assert server.runtime.policy is not None
-        assert (await server.runtime.policy.pending_requests()) == []
+        assert server._runtime_for_test.policy is not None
+        assert (await server._runtime_for_test.policy.pending_requests()) == []
         request_id = 6
         async with asyncio.timeout(TIMEOUT):
             while True:
@@ -5680,7 +5681,7 @@ async def test_serve_and_tui_composition_have_matching_runtime_defaults(
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 2, "new_session")
         tui_loop = tui.loop
-        serve_loop = server.runtime.loop
+        serve_loop = server._runtime_for_test.loop
         assert serve_loop is not None
         assert tui_calls == serve_calls
         assert (
@@ -5845,7 +5846,7 @@ async def test_tree_fork_switch_and_history_persist(tmp_path):
         assert restored == history["messages"]
         reopened = await asyncio.wait_for(_open_session(tmp_path, sid), 10)
         assert [m.to_dict() for m in branch_messages(reopened.store)] == [
-            m.to_dict() for m in branch_messages(server.runtime.loop.store)
+            m.to_dict() for m in branch_messages(server._runtime_for_test.loop.store)
         ]
         assert (await rpc("session_history", offset=-1))["error"]["code"] == -32602
     finally:
@@ -5879,8 +5880,8 @@ async def test_inbox_reconcile_uses_receipt_index_not_entry_copy(
         ),
     )
     try:
-        await server.runtime.create_session()
-        assert "inbox" in server.runtime.loop.tool_registry.registered_names
+        await server._runtime_for_test.create_session()
+        assert "inbox" in server._runtime_for_test.loop.tool_registry.registered_names
     finally:
         await server.close()
 
@@ -5909,7 +5910,7 @@ async def test_serve_resume_renders_removed_automation_session_fixture(
             model or "offline",
         ),
     )
-    await server.runtime.resume_session(session_id)
+    await server._runtime_for_test.resume_session(session_id)
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
@@ -5967,7 +5968,7 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(
             model or "offline",
         ),
     )
-    await server.runtime.resume_session(session_id)
+    await server._runtime_for_test.resume_session(session_id)
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
@@ -5999,7 +6000,7 @@ async def test_serve_resume_renders_legacy_browser_tool_messages(
         assert browser_result["tool_call_id"] == "browser-call-1"
         assert browser_result["content"] == "Example Domain"
 
-        provider_context = await server.runtime.loop.context_assembler.assemble()
+        provider_context = await server._runtime_for_test.loop.context_assembler.assemble()
         provider_browser_call = next(
             block.tool_call
             for message in provider_context
@@ -6029,7 +6030,7 @@ async def test_session_history_shows_zeta_notice_as_system_message(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         expected = []
         notice_ids: dict[str, str] = {}
         notices = {
@@ -6109,7 +6110,7 @@ async def test_history_projects_bounded_failed_turn_state(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        server.runtime.opened.store.append_message(
+        server._runtime_for_test.opened.store.append_message(
             Message(
                 MessageRole.ASSISTANT,
                 [ThinkingContent("", "signed")],
@@ -6157,7 +6158,7 @@ async def test_reconnect_streams_pending_notification_turn(tmp_path: Path) -> No
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child-1",
         child_session_path="/tmp/child-1",
@@ -6228,7 +6229,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         return written
 
     monkeypatch.setattr(client.codec, "write", gate_after_receipt_bytes)
-    notification = server.runtime.opened.store.append_agent_notification(
+    notification = server._runtime_for_test.opened.store.append_agent_notification(
         "child-retry",
         child_session_path="/tmp/child-retry",
         description="child",
@@ -6236,18 +6237,18 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         text="child retry done",
     )
     try:
-        server.control._schedule_background_wake(session_id)
+        server._control_for_test._schedule_background_wake(session_id)
         await asyncio.wait_for(published.wait(), TIMEOUT)
-        first_turn = server.control._turn_task
+        first_turn = server._control_for_test._turn_task
         assert first_turn is not None
         first_turn.cancel()
         release_publication.set()
         await asyncio.wait_for(asyncio.gather(first_turn, return_exceptions=True), 10)
         assert [
-            entry.id for entry in server.runtime.opened.store.agent_notifications()
+            entry.id for entry in server._runtime_for_test.opened.store.agent_notifications()
         ] == [notification.id]
 
-        server.control._schedule_background_wake(session_id)
+        server._control_for_test._schedule_background_wake(session_id)
         frames = await _frames_until_event(reader, "turn_end")
         receipts = [
             frame["params"]
@@ -6286,7 +6287,7 @@ async def test_session_history_handles_task_legacy_and_unknown_kinds(
     # notification kinds, preserving each kind on the row.
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     task_cause = "explicit-finish child task safety deadline expired after 3600 seconds"
     store.append_task_notification(
         task_id="task-1",
@@ -6369,7 +6370,7 @@ async def test_close_kill_cause_reaches_live_serve_event(
         hello_frames = await _request(
             reader, writer, 4, "hello", {"protocol_version": "1.2"}
         )
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         store.append_agent_notification(
             "child-1",
             child_session_path="/tmp/child-1",
@@ -6377,14 +6378,14 @@ async def test_close_kill_cause_reaches_live_serve_event(
             status="completed",
             text="child done",
         )
-        registry = server.runtime.loop.tool_registry.background_tasks
+        registry = server._runtime_for_test.loop.tool_registry.background_tasks
         task_id, _pid = await registry.start("sleep 30", tmp_path)
         admission_started = threading.Event()
         admission_held_past_old_deadline = threading.Event()
         release_admission = threading.Event()
         hold_observer: threading.Thread | None = None
         if task_cause == "tool registry closed":
-            flow = await server.runtime.loop._ensure_step_delivery()
+            flow = await server._runtime_for_test.loop._ensure_step_delivery()
             original_produce = flow.produce
 
             async def gated_produce(item):
@@ -6508,7 +6509,7 @@ async def test_history_pages_large_messages_with_bounded_tool_arguments(
     # The default asyncio reader limit is only 64 KiB.
     reader._limit = MAX_FRAME_BYTES
     try:
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         entries = []
         for index in range(17):
             message = Message(
@@ -6574,7 +6575,7 @@ async def test_history_advances_past_single_oversized_persisted_message(tmp_path
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        store = server.runtime.opened.store
+        store = server._runtime_for_test.opened.store
         oversized = store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("x" * 8000)] * 140),
@@ -6657,16 +6658,16 @@ async def test_settings_apply_to_active_session_and_resume(tmp_path):
             reader, writer, "resume-implement", "resume", {"session_id": sid}
         )
         assert (await rpc("session_settings"))["result"]["plan_mode"] is False
-        assert server.runtime.metadata.model_fallback == (
+        assert server._runtime_for_test.metadata.model_fallback == (
             "codex",
             "gpt-5.6-luna",
             1_050_000,
         )
-        assert server.runtime.loop.backend.model == "gpt-5.6-sol"
-        assert server.runtime.policy.default.value == "deny"
+        assert server._runtime_for_test.loop.backend.model == "gpt-5.6-sol"
+        assert server._runtime_for_test.policy.default.value == "deny"
         await _request(reader, writer, "new", "new_session", {"provider": "codex"})
         assert (await rpc("set_settings", **settings))["error"]["code"] == -32003
-        assert server.runtime.policy.default.value == "ask"
+        assert server._runtime_for_test.policy.default.value == "ask"
         await _request(reader, writer, "resume", "resume", {"session_id": sid})
         assert (await rpc("session_settings"))["result"] == {
             **settings,
@@ -6781,17 +6782,17 @@ async def test_images_persist_forward_and_reject_invalid_input(tmp_path):
             {**image, "data": base64.b64encode(png + b"x" * MAX_IMAGE_BYTES).decode()},
         ):
             assert (await send([invalid]))["error"]["code"] == -32602
-        assert not (server.runtime.opened.store.session_dir / "attachments").exists()
+        assert not (server._runtime_for_test.opened.store.session_dir / "attachments").exists()
         assert (await send([image]))["result"]["accepted"]
         await _event(reader, "agent_end")
-        message = branch_messages(server.runtime.loop.store)[0]
+        message = branch_messages(server._runtime_for_test.loop.store)[0]
         attachment = next(
             block for block in message.content if isinstance(block, ImageContent)
         )
         assert attachment.size == len(png)
         assert Path(attachment.path).read_bytes() == png
         assert Path(attachment.path).is_relative_to(
-            server.runtime.opened.store.session_dir
+            server._runtime_for_test.opened.store.session_dir
         )
         assert attachment in backend.calls[0][0][-1].content
         history = (
@@ -6841,7 +6842,7 @@ async def test_serve_model_transition_recomputes_every_budget_and_admission(
     )
     reader, writer, sid = await _ready_extensions(server)
     try:
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         response = (
             await _request(
                 reader,
@@ -6894,7 +6895,7 @@ async def test_settings_retune_budget_atomically(
         (tmp_path / "settings.toml").write_text("token_budget = 123456\n")
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
-    runtime = server.runtime
+    runtime = server._runtime_for_test
     metadata_before = runtime.metadata.to_dict()
     old_budget = 123456 if pinned else 1_050_000
     assert runtime.loop.context_assembler.token_budget == old_budget
@@ -7155,7 +7156,7 @@ async def test_real_catalog_is_complete_for_real_launch(tmp_path, provider):
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        sid = server.runtime.session_id
+        sid = server._runtime_for_test.session_id
         result = (
             await _request(reader, writer, 3, "model_catalog", {"session_id": sid})
         )[-1]["result"]
@@ -7197,7 +7198,7 @@ async def test_cross_provider_settings_preserve_session_and_budget(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         sid = runtime.session_id
         state, loop, opened = runtime.state, runtime.loop, runtime.opened
         backend = loop.backend
@@ -7286,20 +7287,20 @@ async def test_cross_provider_settings_reject_mid_turn_then_apply_when_idle(tmp_
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         params = {
-            "session_id": server.runtime.session_id,
+            "session_id": server._runtime_for_test.session_id,
             "model": "gpt-5.4",
             "approval_mode": "ask",
         }
-        backend = server.runtime.loop.backend
+        backend = server._runtime_for_test.loop.backend
         await _request(reader, writer, 3, "send", {"text": "hello"})
         response = (await _request(reader, writer, 4, "set_settings", params))[-1]
         assert response["error"]["code"] == -32004
-        assert server.runtime.loop.backend is backend
+        assert server._runtime_for_test.loop.backend is backend
         await _request(reader, writer, 5, "abort")
         assert (
             "result" in (await _request(reader, writer, 6, "set_settings", params))[-1]
         )
-        assert server.runtime.provider == "codex"
+        assert server._runtime_for_test.provider == "codex"
     finally:
         await close_serve(server, writer)
 
@@ -7329,7 +7330,7 @@ async def test_cross_provider_missing_credentials_returns_rpc_error(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         before = runtime.metadata.to_dict()
         backend = runtime.loop.backend
         response = (
@@ -7412,7 +7413,7 @@ async def test_removed_provider_resume_is_rejected_without_session_mutation(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         for request_id in (2, 4):
-            state = server.runtime.state
+            state = server._runtime_for_test.state
             before_builds = list(builds)
             response = (
                 await _request(
@@ -7427,7 +7428,7 @@ async def test_removed_provider_resume_is_rejected_without_session_mutation(
                 "code": -32602,
                 "message": "the fake provider was removed; choose claude, codex or ollama",
             }
-            assert server.runtime.state is state
+            assert server._runtime_for_test.state is state
             assert builds == before_builds
             assert {path: path.read_bytes() for path in before_files} == before_files
             if state is None:
@@ -7529,7 +7530,7 @@ def test_plain_serve_resolves_provider_from_settings(
 
     async def check_server(server: ZetaServer) -> None:
         server.socket_path = _socket_path(tmp_path)
-        server.runtime.backend_factory = lambda _provider, model, _home: (
+        server._runtime_for_test.backend_factory = lambda _provider, model, _home: (
             FakeBackend([]),
             model or "claude-sonnet-4-6",
         )
@@ -7560,7 +7561,7 @@ def test_plain_serve_resolves_provider_from_settings(
             assert rejected["error"]["message"] == (
                 "the fake provider was removed; choose claude, codex or ollama"
             )
-            assert server.runtime.session_id == sid
+            assert server._runtime_for_test.session_id == sid
         finally:
             await close_serve(server, writer)
 
@@ -7614,7 +7615,7 @@ async def test_list_sessions_page_touches_only_page_rows(
     monkeypatch.setattr(os, "open", counted_open)
     # test-contract: seam count catalog reconciliation without changing production
     monkeypatch.setattr(
-        server.runtime.manager, "_reconcile_project_link", reconciliations.append
+        server._runtime_for_test.manager, "_reconcile_project_link", reconciliations.append
     )
     reader, writer = await _connect(server)
     try:
@@ -7649,14 +7650,14 @@ async def test_idle_status_resolves_config_off_event_loop_once_per_request(
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     event_loop_thread = threading.get_ident()
     config_threads: list[int] = []
-    original_config = server.runtime._config
+    original_config = server._runtime_for_test._config
 
     def tracked_config(*args, **kwargs):
         config_threads.append(threading.get_ident())
         return original_config(*args, **kwargs)
 
     # test-contract: seam verify the settings resolver leaves the serve event loop
-    monkeypatch.setattr(server.runtime, "_config", tracked_config)
+    monkeypatch.setattr(server._runtime_for_test, "_config", tracked_config)
     reader, writer = await _connect(server)
     observer_reader, observer_writer = await asyncio.open_connection(
         "127.0.0.1", server.port
@@ -7708,7 +7709,7 @@ async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> No
         release.wait(10)
         return []
 
-    server.runtime.list_sessions = blocked_catalog
+    server.manager.list_sessions_read_only = blocked_catalog
     reader, writer = await _connect(server)
     status_reader, status_writer = await asyncio.open_connection(
         "127.0.0.1", server.port
@@ -7836,7 +7837,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         sid = runtime.session_id
         old_budget = runtime.metadata.compaction_budget
         for model in ["gpt-5.4-mini", "gpt-5.4", "gpt-5.4-mini"]:
@@ -7869,7 +7870,7 @@ async def test_unusable_model_reverts_durably_and_next_send_works(
             reader, writer = await _connect(server)
             await _request(reader, writer, 4, "hello", {"protocol_version": "1.1"})
             await _request(reader, writer, 5, "resume", {"session_id": sid})
-            runtime = server.runtime
+            runtime = server._runtime_for_test
         await _request(reader, writer, 6, "send", {"text": "first request"})
         failure = await _event(reader, "error")
         assert failure["error"]["code"] == "model_reverted"
@@ -7944,7 +7945,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         sid = runtime.session_id
         await _request(
             reader,
@@ -7959,7 +7960,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         )
         pending = runtime.metadata.model_fallback
         assert pending
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.ERROR,
                 error=ErrorInfo("auth_error", "child login", provider_error=True),
@@ -7969,7 +7970,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         )
         await _event(reader, "error")
         assert runtime.metadata.model_fallback == pending
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.ERROR,
                 error=ErrorInfo("transport_error", "connection reset"),
@@ -7982,7 +7983,7 @@ async def test_successful_selection_clears_fallback_and_background_errors_do_not
         await _event(reader, "agent_end")
         assert runtime.metadata.model_fallback is None
         assert (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.model_fallback is None
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.ERROR,
                 error=ErrorInfo("auth_error", "expired later", provider_error=True),
@@ -8053,7 +8054,7 @@ async def test_account_lock_timeout_reaches_serve_with_retryable_code(
                     3,
                     "set_settings",
                     {
-                        "session_id": server.runtime.session_id,
+                        "session_id": server._runtime_for_test.session_id,
                         "model": "gpt-5.4",
                         "approval_mode": "ask",
                     },
@@ -8097,7 +8098,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
         await _request(reader, writer, 1, "hello", {"protocol_version": version})
         created = (await _request(reader, writer, 2, "new_session"))[-1]["result"]
         assert "model_fallback" not in created["session"]
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         sid = runtime.session_id
         await model_selection.apply(runtime, "gpt-5.4", "ask")
         assert runtime.metadata.model_fallback is not None
@@ -8117,7 +8118,7 @@ async def test_recovery_storage_and_error_codes_respect_wire_version(tmp_path, v
             StreamEvent(StreamEventType.ERROR, error=info).to_dict()
         )
         assert event.error == info
-        await server.control._event(event, session_id=sid)
+        await server._control_for_test._event(event, session_id=sid)
         failure = (await _event(reader, "error"))["error"]
         assert set(failure) == {"code", "message"}
         if version == "1.0":
@@ -8151,7 +8152,7 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        sid = server.runtime.session_id
+        sid = server._runtime_for_test.session_id
         for model in ["gpt-5.4-mini", "gpt-5.4"]:
             await _request(
                 reader,
@@ -8164,14 +8165,14 @@ async def test_return_to_fallback_does_not_restore_itself(tmp_path):
                     "approval_mode": "ask",
                 },
             )
-        assert server.runtime.metadata.model_fallback is None
+        assert server._runtime_for_test.metadata.model_fallback is None
         assert (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata.model_fallback is None
         await _request(reader, writer, 4, "send", {"text": "try returned selection"})
         failure = (await _event(reader, "error"))["error"]
         assert failure == {"code": "model_access_error", "message": "Access denied"}
         await _event(reader, "agent_end")
-        assert server.runtime.model == "gpt-5.4"
-        assert server.runtime.metadata.model_fallback is None
+        assert server._runtime_for_test.model == "gpt-5.4"
+        assert server._runtime_for_test.metadata.model_fallback is None
     finally:
         await close_serve(server, writer)
 
@@ -8192,7 +8193,7 @@ async def test_mcp_auth_failure_does_not_revert_model(tmp_path, monkeypatch):
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         await model_selection.apply(runtime, "gpt-5.4", "ask")
         fallback = runtime.metadata.model_fallback
 
@@ -8313,7 +8314,7 @@ async def test_stream_access_error_restores_model_over_wire(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        sid = server.runtime.session_id
+        sid = server._runtime_for_test.session_id
         result = (
             await _request(
                 reader,
@@ -8328,12 +8329,12 @@ async def test_stream_access_error_restores_model_over_wire(
             )
         )[-1]
         assert "result" in result
-        assert server.runtime.metadata.model_fallback is not None
+        assert server._runtime_for_test.metadata.model_fallback is not None
         await _request(reader, writer, 4, "send", {"text": "try selection"})
         failure = (await _event(reader, "error"))["error"]
         assert failure["code"] == "model_reverted"
         await _event(reader, "agent_end")
-        assert server.runtime.model == original
+        assert server._runtime_for_test.model == original
         metadata = (await asyncio.wait_for(_open_session(tmp_path, sid), 10)).metadata
         assert (metadata.provider, metadata.model) == (provider, original)
         assert metadata.model_fallback is None
@@ -8454,9 +8455,9 @@ async def test_serve_session_response_includes_account_fields(tmp_path: Path) ->
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
         await persist_metadata_change(
-            server.runtime.manager,
-            server.runtime.metadata,
-            lambda candidate: server.runtime.manager.record_account_selection(
+            server._runtime_for_test.manager,
+            server._runtime_for_test.metadata,
+            lambda candidate: server._runtime_for_test.manager.record_account_selection(
                 candidate,
                 AccountId("codex", "named"),
                 boundary=3,
@@ -8500,7 +8501,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
             )
         )[-1]["result"]["session"]
         assert renamed["name"] == "Project notes"
-        assert server.runtime.metadata.name == "Project notes"
+        assert server._runtime_for_test.metadata.name == "Project notes"
         row = (await _request(reader, writer, 5, "list_sessions"))[-1]["result"][
             "sessions"
         ][0]
@@ -8510,7 +8511,7 @@ async def test_session_management_lifecycle_and_active_delete(tmp_path):
             await _request(reader, writer, 6, "delete_session", {"session_id": sid[:8]})
         )[-1]["error"]
         assert error["data"]["code"] == "active_session"
-        assert server.runtime.session_id == sid
+        assert server._runtime_for_test.session_id == sid
         assert (tmp_path / "sessions" / sid).exists()
         second = (await _request(reader, writer, 7, "new_session"))[-1]["result"][
             "session"
@@ -8604,9 +8605,9 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer = await _ready(server)
     try:
-        sid = server.runtime.session_id
+        sid = server._runtime_for_test.session_id
         await asyncio.to_thread(
-            server.runtime.manager.rename, sid, "private display name"
+            server._runtime_for_test.manager.rename, sid, "private display name"
         )
         for method, params in (
             ("rename_session", {"name": "changed"}),
@@ -8620,7 +8621,7 @@ async def test_session_management_legacy_gate_and_preview(tmp_path):
             "sessions"
         ][0]
         assert "name" not in row
-        expected = server.runtime.metadata.to_dict()
+        expected = server._runtime_for_test.metadata.to_dict()
         expected.pop("name")
         # The only gated field is name; all original metadata and preview remain.
         row.pop("first_message_preview")
@@ -8831,7 +8832,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         ]["session_id"]
         # Also check an inactive target so the streaming guard, not the active guard, decides deletion.
         other = await asyncio.to_thread(
-            server.runtime.manager.create,
+            server._runtime_for_test.manager.create,
             provider="codex",
             model="offline",
             cwd=tmp_path,
@@ -8849,7 +8850,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
             )
         )[-1]
         assert result["result"]["session"]["name"] == "mid-stream"
-        assert server.runtime.state.status == "running"
+        assert server._runtime_for_test.state.status == "running"
         error = (
             await _request(
                 reader,
@@ -8862,7 +8863,7 @@ async def test_rename_succeeds_during_slow_stream_and_delete_declines(tmp_path):
         assert error["code"] == -32004
         release.set()
         await _event(reader, "agent_end")
-        metadata = await asyncio.to_thread(server.runtime.manager.read_metadata, sid)
+        metadata = await asyncio.to_thread(server._runtime_for_test.manager.read_metadata, sid)
         assert metadata.name == "mid-stream"
         assert (
             "result"
@@ -8997,12 +8998,12 @@ async def test_session_swap_project_registry_frames(
     )
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     await asyncio.to_thread(
-        server.runtime.manager.project_registry.create_project, "other", "test"
+        server._runtime_for_test.manager.project_registry.create_project, "other", "test"
     )
     params: dict[str, object] = {"provider": "codex"}
     if method == "resume":
         opened = await asyncio.to_thread(
-            server.runtime.manager.create,
+            server._runtime_for_test.manager.create,
             provider="codex",
             model="test",
             cwd=project,
@@ -9261,9 +9262,9 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        opened = server.runtime.opened
+        opened = server._runtime_for_test.opened
         assert opened is not None
-        registry = server.runtime.manager.project_registry
+        registry = server._runtime_for_test.manager.project_registry
         assert registry is not None
         project_record = await asyncio.to_thread(registry.create_project, "serve attention", "test")
         project_id = project_record.project_id
@@ -9432,7 +9433,7 @@ async def test_serve_request_attention_kind_is_in_tool_end_result(
         await _event(reader, "turn_end")
 
         assert AttentionStore(
-            server.runtime.opened.store.session_dir  # type: ignore[union-attr]
+            server._runtime_for_test.opened.store.session_dir  # type: ignore[union-attr]
         , writer_epoch=5).list()[0].kind == "answer"
     finally:
         await close_serve(server, writer)
@@ -9982,7 +9983,7 @@ async def test_slash_status_uses_live_hooks_usage_and_cost_over_real_transport(
         assert "estimated_cost_usd: unavailable" not in serve_text
 
         tui_lines = _status_card_lines(
-            ServerSlashSession(server.runtime).slash_status()
+            ServerSlashSession(server._runtime_for_test).slash_status()
         )
         tui_text = "\n".join(
             "".join(text for _style, text in line) for line in tui_lines
@@ -10046,8 +10047,8 @@ async def test_slash_status_transcript_work_does_not_block_serve(
                 "features": ["serve_observers", "ping"],
             },
         )
-        assert server.runtime.loop is not None
-        store = server.runtime.loop.store
+        assert server._runtime_for_test.loop is not None
+        store = server._runtime_for_test.loop.store
         sources = store.append_many(
             (
                 "message",
@@ -10060,7 +10061,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
             for _ in range(1_000)
         )
         store.append_compaction_marker("summary", sources[0].seq, sources[-1].seq)
-        original_counter = server.runtime.loop.context_assembler.token_counter
+        original_counter = server._runtime_for_test.loop.context_assembler.token_counter
 
         def blocked_counter(message: Message) -> int:
             entered.set()
@@ -10204,13 +10205,13 @@ async def test_serve_close_settles_slash_status_read(
         assert release.wait(30), "read worker was not released"
         return None
 
-    assert server.runtime.loop is not None
-    store = server.runtime.loop.store
+    assert server._runtime_for_test.loop is not None
+    store = server._runtime_for_test.loop.store
     source = store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("source")])
     )
     store.append_compaction_marker("summary", source.seq, source.seq)
-    original_counter = server.runtime.loop.context_assembler.token_counter
+    original_counter = server._runtime_for_test.loop.context_assembler.token_counter
 
     def blocked_counter(message: Message) -> int:
         if not status_entered.is_set():
@@ -10306,8 +10307,8 @@ async def test_slash_status_maps_compaction_with_or_without_fact_floor(
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
     try:
-        assert server.runtime.loop is not None
-        store = server.runtime.loop.store
+        assert server._runtime_for_test.loop is not None
+        store = server._runtime_for_test.loop.store
         source = store.append_message(
             Message(MessageRole.ASSISTANT, [TextContent("source")])
         )
@@ -10390,7 +10391,7 @@ async def test_serve_project_init_runs_discovery_off_loop(
             )
         )[-1]
 
-        project_id = server.runtime.metadata.project_id
+        project_id = server._runtime_for_test.metadata.project_id
         assert project_id is not None
         assert response["result"] == {
             "kind": "output",
@@ -10442,20 +10443,20 @@ async def test_slash_run_dispatches_scope_floor(tmp_path: Path) -> None:
         result = (await run("/model"))["result"]
         assert result == {
             "kind": "output",
-            "text": f"model: {server.runtime.model} (open Settings to switch)",
+            "text": f"model: {server._runtime_for_test.model} (open Settings to switch)",
         }
 
         # /model switching applies through the shared settings path.
         result = (await run("/model gpt-5.6-sol"))["result"]
         assert result == {"kind": "output", "text": "model: gpt-5.6-sol"}
-        assert server.runtime.model == "gpt-5.6-sol"
+        assert server._runtime_for_test.model == "gpt-5.6-sol"
 
         result = (await run("/vim off"))["result"]
         assert result == {"kind": "output", "text": "vim mode: off"}
-        assert server.runtime.metadata.vim_mode is False
+        assert server._runtime_for_test.metadata.vim_mode is False
         result = (await run("/vim toggle"))["result"]
         assert result == {"kind": "output", "text": "vim mode: on"}
-        assert server.runtime.metadata.vim_mode is True
+        assert server._runtime_for_test.metadata.vim_mode is True
 
         # /compact is safe on an empty conversation; it reports nothing to compact.
         result = (await run("/compact"))["result"]
@@ -10979,14 +10980,14 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         vim_status = (await run("vim-read", "/vim"))["result"]
         assert vim_status == {
             "kind": "output",
-            "text": f"vim mode: {'on' if server.runtime.metadata.vim_mode else 'off'}",
+            "text": f"vim mode: {'on' if server._runtime_for_test.metadata.vim_mode else 'off'}",
         }
         # An unknown `/vim` argument is read-only, even while approval is pending.
         assert (await run("vim-invalid", "/vim bogus"))["result"] == {
             "kind": "output",
             "text": "vim mode unchanged: use /vim on, /vim off, or /vim toggle",
         }
-        assert server.runtime.metadata.vim_mode is True
+        assert server._runtime_for_test.metadata.vim_mode is True
         # `/compact` mutates the context store — must reject.
         assert (await run(4, "/compact"))["error"]["code"] == -32004
         # `/model` with args mutates settings — must reject.
@@ -11000,7 +11001,7 @@ async def test_slash_run_guards_mutations_while_approvals_pending(
         # `/model` with no args is read-only and bypasses the mutation guard.
         assert (await run(6, "/model"))["result"] == {
             "kind": "output",
-            "text": f"model: {server.runtime.model} (open Settings to switch)",
+            "text": f"model: {server._runtime_for_test.model} (open Settings to switch)",
         }
     finally:
         await close_serve(server, writer)
@@ -11365,8 +11366,8 @@ async def test_set_compaction_requires_protocol_1_1(tmp_path):
 @pytest.mark.asyncio
 async def test_same_session_resume_preserves_background_child(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
-    await server.runtime.create_session(provider="codex")
-    loop = server.runtime.loop
+    await server._runtime_for_test.create_session(provider="codex")
+    loop = server._runtime_for_test.loop
     assert loop is not None
     owner = loop._background_owner
     child = asyncio.create_task(asyncio.sleep(60))
@@ -11378,9 +11379,9 @@ async def test_same_session_resume_preserves_background_child(tmp_path: Path) ->
         child.cancel()
 
     owner.register("child", cancel, child)
-    await server.runtime.resume_session(server.runtime.session_id)
+    await server._runtime_for_test.resume_session(server._runtime_for_test.session_id)
     try:
-        assert server.runtime.loop is loop
+        assert server._runtime_for_test.loop is loop
         assert owner.owns_running("child")
         assert not canceled
     finally:
@@ -11390,19 +11391,19 @@ async def test_same_session_resume_preserves_background_child(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_resume_other_session_keeps_existing_semantics(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
-    await server.runtime.create_session(provider="codex")
-    first_session = server.runtime.session_id
-    await server.runtime.create_session(provider="codex")
-    second_session = server.runtime.session_id
-    second_loop = server.runtime.loop
+    await server._runtime_for_test.create_session(provider="codex")
+    first_session = server._runtime_for_test.session_id
+    await server._runtime_for_test.create_session(provider="codex")
+    second_session = server._runtime_for_test.session_id
+    second_loop = server._runtime_for_test.loop
     assert second_loop is not None
     owner = second_loop._background_owner
     child = asyncio.create_task(asyncio.sleep(60))
     owner.register("child", child.cancel, child)
     try:
-        await server.runtime.resume_session(first_session)
+        await server._runtime_for_test.resume_session(first_session)
         assert second_session != first_session
-        assert server.runtime.loop is not second_loop
+        assert server._runtime_for_test.loop is not second_loop
         assert not owner.owns_running("child")
     finally:
         await server.close()
@@ -11415,7 +11416,7 @@ def test_serve_yolo_sets_allow_default(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
 
     async def check_server(server):
-        assert server.runtime._config(None, None).yolo is True
+        assert server._runtime_for_test._config(None, None).yolo is True
 
     monkeypatch.setattr(server_module, "run_server", check_server)
     assert cli_main(["--provider", "codex", "--yolo", "serve"]) == 0
@@ -11429,7 +11430,7 @@ def test_serve_no_yolo_overrides_settings(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
 
     async def check_server(server):
-        assert server.runtime._config(None, None).yolo is False
+        assert server._runtime_for_test._config(None, None).yolo is False
 
     monkeypatch.setattr(server_module, "run_server", check_server)
     assert cli_main(["--provider", "codex", "--no-yolo", "serve"]) == 0
@@ -11447,7 +11448,7 @@ async def test_failed_wake_turn_keeps_durable_notification_input(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11463,7 +11464,7 @@ async def test_failed_wake_turn_keeps_durable_notification_input(
         await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
         await _frames_until_event(reader, "agent_end")
         for _ in range(10000):
-            if server.runtime.loop.notification_turn_state == "idle":
+            if server._runtime_for_test.loop.notification_turn_state == "idle":
                 break
             await asyncio.sleep(0)
         assert backend.calls == 1
@@ -11491,7 +11492,7 @@ async def test_foreground_abort_retries_interrupted_notification_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11553,7 +11554,7 @@ async def test_session_abort_does_not_retry_notification_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11604,7 +11605,7 @@ async def test_repeated_foreground_notification_aborts_schedule_one_retry_each(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11668,7 +11669,7 @@ async def test_foreground_aborts_after_notification_retry_report_idle(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11691,7 +11692,7 @@ async def test_foreground_aborts_after_notification_retry_report_idle(
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
         frames = await _request(reader, writer, 5, "abort", {"scope": "foreground"})
         assert frames[-1]["result"]["aborted"] is True
-        retry_task = server.control._turn_task
+        retry_task = server._control_for_test._turn_task
         assert retry_task is not None
         await asyncio.wait_for(asyncio.shield(retry_task), TIMEOUT)
 
@@ -11706,11 +11707,12 @@ async def test_foreground_aborts_after_notification_retry_report_idle(
             assert frames[-1]["result"]["aborted"] is False
 
         await _frames_until_event(reader, "agent_end")
-        while server.runtime.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
         await asyncio.wait_for(backend.second_started.wait(), TIMEOUT)
         assert len(backend.calls) == 2
-        assert server.runtime.loop.schedule_notification_turn() is False
+        assert server._runtime_for_test.loop.schedule_notification_turn() is False
     finally:
         await close_serve(server, writer)
 
@@ -11727,7 +11729,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11783,7 +11785,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    server.runtime.opened.store.append_agent_notification(
+    server._runtime_for_test.opened.store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
         description="child",
@@ -11800,7 +11802,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
         async with asyncio.timeout(TIMEOUT):
-            while server._client is not None and server.control.turn_busy():
+            while server._client is not None and server._control_for_test.turn_busy():
                 await asyncio.sleep(0)
 
         await _request(reader, writer, 6, "send", {"text": "user now"})
@@ -11826,7 +11828,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
 async def test_disconnected_child_survives_client_reconnect(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
-    loop = server.runtime.loop
+    loop = server._runtime_for_test.loop
     assert loop is not None
     owner = loop._background_owner
     child = asyncio.create_task(asyncio.sleep(60))
@@ -11838,7 +11840,7 @@ async def test_disconnected_child_survives_client_reconnect(tmp_path: Path) -> N
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         await _request(reader, writer, 4, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 5, "resume", {"session_id": session_id})
-        assert server.runtime.loop is loop
+        assert server._runtime_for_test.loop is loop
         assert owner.owns_running("child")
     finally:
         await close_serve(server, writer)
@@ -11854,7 +11856,7 @@ async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> 
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, _session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11874,8 +11876,9 @@ async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> 
             for frame in frames
         )
         assert len(backend.calls) == 1
-        while store.agent_notifications():
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while store.agent_notifications():
+                await asyncio.sleep(0)
         assert store.agent_notifications() == []
     finally:
         await close_serve(server, writer)
@@ -11893,7 +11896,7 @@ async def test_repeated_resume_does_not_duplicate_notification_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, session_id = await _ready_extensions(server)
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
@@ -11932,8 +11935,8 @@ async def test_epoch_two_serve_does_not_offer_or_run_transcript_repair(
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":2}\n')
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
-    assert server.runtime.opened is not None
-    transcript = server.runtime.opened.store.path
+    assert server._runtime_for_test.opened is not None
+    transcript = server._runtime_for_test.opened.store.path
     active_session_id = (
         await _request(reader, writer, 3, "new_session", {"provider": "codex"})
     )[-1]["result"]["session"]["session_id"]
@@ -12017,7 +12020,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
 ) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
-    path = server.runtime.opened.store.path
+    path = server._runtime_for_test.opened.store.path
     await _request(reader, writer, 3, "new_session", {"provider": "codex"})
     with path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
@@ -12140,10 +12143,10 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
         auto_memory=True,
     )
     reader, writer, session_id = await _ready_extensions(server)
-    assert server.runtime.opened is not None
-    assert server.runtime.loop is not None
-    root = server.runtime.opened.store
-    reconciler = server.runtime.loop.memory_reconciler
+    assert server._runtime_for_test.opened is not None
+    assert server._runtime_for_test.loop is not None
+    root = server._runtime_for_test.opened.store
+    reconciler = server._runtime_for_test.loop.memory_reconciler
     assert reconciler is not None
     assert reconciler.session_id == session_id
     root.append_message(
@@ -12228,8 +12231,8 @@ async def test_serve_current_session_repair_updates_live_memory_owner(
 async def test_serve_repairs_child_and_reopens_it_usable(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
-    assert server.runtime.opened is not None
-    root = server.runtime.opened.store
+    assert server._runtime_for_test.opened is not None
+    root = server._runtime_for_test.opened.store
     child = await asyncio.to_thread(
         ConversationStore, root.session_dir / "agents", session_id="1"
     )
@@ -12329,7 +12332,7 @@ async def test_model_selection_respects_unknown_account_fence(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         context = runtime.loop.account_context
         await asyncio.to_thread(
             runtime.manager.record_session_settings,
@@ -12379,7 +12382,7 @@ async def test_serve_model_selection_uses_account_transition(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         persisted_before = await asyncio.to_thread(
             runtime.manager.read_metadata, runtime.session_id
         )
@@ -12434,7 +12437,7 @@ async def test_serve_cross_provider_model_change_updates_account_context(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         await _request(reader, writer, 2, "new_session")
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         await runtime.loop.account_context.switch_active(
             runtime.loop,
             AccountId("codex", "default"),
@@ -12553,7 +12556,7 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
         }
         assert (
             await asyncio.to_thread(
-                server.runtime.loop.account_context.resolve, "codex"
+                server._runtime_for_test.loop.account_context.resolve, "codex"
             )
             == second
         )
@@ -12656,7 +12659,7 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
 
     async def run() -> None:
         reader, writer, sid = await _ready_extensions(server)
-        assert server._client is not None and server.runtime.loop is not None
+        assert server._client is not None and server._runtime_for_test.loop is not None
         first_client = server._client
         second_client = _Client(server, asyncio.StreamReader(), writer)
         original_commit = account_session_module.SessionAccountContext._commit_locked
@@ -12673,6 +12676,7 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
                             second_client,
                             "rename-session",
                             {"session_id": sid, "name": "renamed during switch"},
+                            server.controllers.attached(),
                         )
                     )
                 )
@@ -12694,7 +12698,7 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
             assert response[-1]["result"]["account"] == str(second)
             assert rename_tasks
             await rename_tasks[0]
-            assert server.runtime.metadata.name == "renamed during switch"
+            assert server._runtime_for_test.metadata.name == "renamed during switch"
         finally:
             account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
                 original_commit
@@ -12745,15 +12749,15 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
     )
     server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
     reader, writer, sid = await _ready_extensions(server)
-    assert server.runtime.opened is not None
-    manager = server.runtime.manager
+    assert server._runtime_for_test.opened is not None
+    manager = server._runtime_for_test.manager
     lock_held = threading.Event()
     commit_entered = threading.Event()
     release = threading.Event()
     metadata_lock = manager._metadata_lock
 
     def hold_metadata_lock() -> None:
-        with metadata_lock(server.runtime.opened.metadata.session_id):
+        with metadata_lock(server._runtime_for_test.opened.metadata.session_id):
             lock_held.set()
             assert release.wait(5)
 
@@ -12834,8 +12838,8 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
-        assembler = server.runtime.loop.context_assembler
+        assert server._runtime_for_test.loop is not None
+        assembler = server._runtime_for_test.loop.context_assembler
         assembler.update_token_budget(8_192)
         assembler.system_prompt = Message(
             MessageRole.SYSTEM, [TextContent("short system prompt")]
@@ -12850,11 +12854,11 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             "steer",
             {"text": oversized, "delivery_id": "oversized-steering"},
         )
-        captured = server.runtime.loop.store.pending_client_steering()
+        captured = server._runtime_for_test.loop.store.pending_client_steering()
         assert captured is not None
         steering_tokens = assembler.estimate_messages(captured.messages)
-        assert server.runtime.loop.step_delivery is not None
-        await server.runtime.loop.step_delivery.produce(
+        assert server._runtime_for_test.loop.step_delivery is not None
+        await server._runtime_for_test.loop.step_delivery.produce(
             pending_delivery_module.PromptInput(
                 "agent-send-waits", MessageOrigin.AGENT_SEND, None
             )
@@ -12869,7 +12873,7 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
             "tokens). shorten it and resend it, or switch to a larger model."
         )
         assert error["error"]["message"] == expected
-        assert not server.runtime.loop.has_pending_steering
+        assert not server._runtime_for_test.loop.has_pending_steering
         status = await _request(
             reader,
             writer,
@@ -12879,10 +12883,10 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue_serve(
         )
         assert status[-1]["result"]["status"] == "dropped"
         assert (
-            server.runtime.loop.store.client_delivery("oversized-steering").reason
+            server._runtime_for_test.loop.store.client_delivery("oversized-steering").reason
             == "failed"
         )
-        assert server.runtime.loop.step_delivery.prompt_priority is not None
+        assert server._runtime_for_test.loop.step_delivery.prompt_priority is not None
         assert all(
             not any(
                 isinstance(block, TextContent) and block.text == oversized
@@ -12914,8 +12918,8 @@ async def test_low_capacity_notice_wire_path(tmp_path: Path) -> None:
             {"protocol_version": "1.1", "features": ["memory_updated"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
-        loop = server.runtime.loop
+        assert server._runtime_for_test.loop is not None
+        loop = server._runtime_for_test.loop
         assembler = loop.context_assembler
         assembler.update_token_budget(8_192)
         minimum = assembler.estimator_token_budget
@@ -12988,7 +12992,7 @@ async def test_config_changed_requires_live_config_changed_feature(
             {"protocol_version": "1.1", "features": features},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         profile = tmp_path / "agents" / "specialist.md"
         profile.parent.mkdir(parents=True)
         profile.write_text(
@@ -12998,10 +13002,10 @@ async def test_config_changed_requires_live_config_changed_feature(
         )
 
         prepared_events: list[StreamEvent] = []
-        server.runtime.loop.set_background_event_sink(prepared_events.append)
-        await server.runtime.loop.refresh_live_config()
+        server._runtime_for_test.loop.set_background_event_sink(prepared_events.append)
+        await server._runtime_for_test.loop.refresh_live_config()
         assert len(prepared_events) == 1
-        await server.control._event(prepared_events[0], background=True)
+        await server._control_for_test._event(prepared_events[0], background=True)
 
         # Wire assertion: the one owner of the feature gate is the connection, so
         # a controller that did not negotiate live_config_changed never receives
@@ -13072,7 +13076,7 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
         await asyncio.wait_for(
             raw_request_frames(2, "new_session", {"provider": "codex"}), 30
         )
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         profile = tmp_path / "agents" / "specialist.md"
         profile.parent.mkdir(parents=True)
         profile.write_text(
@@ -13081,13 +13085,13 @@ async def test_unnegotiated_config_change_preserves_complete_frame_stream(
             encoding="utf-8",
         )
         prepared_events: list[StreamEvent] = []
-        server.runtime.loop.set_background_event_sink(prepared_events.append)
-        await asyncio.wait_for(server.runtime.loop.refresh_live_config(), 10)
+        server._runtime_for_test.loop.set_background_event_sink(prepared_events.append)
+        await asyncio.wait_for(server._runtime_for_test.loop.refresh_live_config(), 10)
         assert len(prepared_events) == 1
 
         base_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
         await asyncio.wait_for(
-            server.control._event(prepared_events[0], background=True), 10
+            server._control_for_test._event(prepared_events[0], background=True), 10
         )
         actual_frames = await asyncio.wait_for(raw_request_frames(3, "status", {}), 30)
 
@@ -13119,7 +13123,7 @@ async def test_many_config_changes_reach_negotiated_serve_client_bounded(
             {"protocol_version": "1.1", "features": ["live_config_changed"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         for index in range(132):
             name = f"item-{index}-" + "x" * 8_000
             for kind, body in (("skills", "skill body"), ("agents", "profile body")):
@@ -13130,11 +13134,11 @@ async def test_many_config_changes_reach_negotiated_serve_client_bounded(
                     encoding="utf-8",
                 )
         prepared_events: list[StreamEvent] = []
-        server.runtime.loop.set_background_event_sink(prepared_events.append)
-        await server.runtime.loop.refresh_live_config()
+        server._runtime_for_test.loop.set_background_event_sink(prepared_events.append)
+        await server._runtime_for_test.loop.refresh_live_config()
 
         assert len(prepared_events) == 1
-        await server.control._event(prepared_events[0], background=True)
+        await server._control_for_test._event(prepared_events[0], background=True)
         frame = await _read(reader)
         assert frame["params"]["event"] == "config_changed", (
             "bounded config changes became a serve error frame"
@@ -13174,8 +13178,8 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
             {"protocol_version": "1.1", "features": ["live_config_changed"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.runtime.loop is not None
-        persisted = server.runtime.metadata.agent_catalog
+        assert server._runtime_for_test.loop is not None
+        persisted = server._runtime_for_test.metadata.agent_catalog
         profile = tmp_path / "agents" / "specialist.md"
         profile.parent.mkdir(parents=True)
         profile.write_text(
@@ -13183,7 +13187,7 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
             "---\nprofile body\n",
             encoding="utf-8",
         )
-        await server.runtime.loop.refresh_live_config()
+        await server._runtime_for_test.loop.refresh_live_config()
         from zeta.skills.agent_catalog import AgentCatalog
         from zeta.skills.catalog import SkillCatalog
 
@@ -13207,7 +13211,7 @@ async def test_active_status_overlays_live_config_without_persisting_metadata(
         assert "specialist" in {
             item["name"] for item in status["session"]["agent_catalog"]
         }
-        assert server.runtime.metadata.agent_catalog is persisted
+        assert server._runtime_for_test.metadata.agent_catalog is persisted
         assert "specialist" not in {item["name"] for item in (persisted or [])}
     finally:
         await close_serve(server, writer)
@@ -13570,7 +13574,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     assert server.connections is not None
     parent_tool_ended = asyncio.Event()
     release_parent_turn = asyncio.Event()
-    parent_session_id = server.runtime.session_id
+    parent_session_id = server._runtime_for_test.session_id
     publish_controller = server.connections.publish_controller
 
     async def force_parent_tool_end_first(event, session_id, **fields):
@@ -13624,7 +13628,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             await asyncio.wait_for(history_write_started.wait(), timeout=10)
             owner = None
             if failure == "cancelled":
-                record = server.control._approvals.state.records[
+                record = server._control_for_test._approvals.state.records[
                     (approval["agent_instance_id"], child_call.id)
                 ]
                 owner = record.settlement
@@ -13678,7 +13682,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
                 status_frames = await _request(reader, writer, 5, "status")
                 frames.extend(status_frames)
                 assert status_frames[-1]["result"]["state"] == "idle"
-                health = server.control._approvals.state.health
+                health = server._control_for_test._approvals.state.health
                 assert health is not None
                 assert health.code == "approval_persistence_failed"
             child_tool_owner = (
@@ -13695,7 +13699,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             assert_event_order(frames, parent_tool_owner, approval_owner)
             if any(event_owner(frame) == child_tool_owner for frame in frames):
                 assert_event_order(frames, approval_owner, child_tool_owner)
-            assert key not in server.control._approvals.state.records
+            assert key not in server._control_for_test._approvals.state.records
             release_parent_turn.set()
     finally:
         history_release.set()
@@ -13819,7 +13823,7 @@ async def test_session_history_returns_broken_sent_ledger_activation_notice(
     try:
         activation_error = None
         try:
-            await server.runtime.resume_session(session_id)
+            await server._runtime_for_test.resume_session(session_id)
         except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
             activation_error = exc
         assert activation_error is None

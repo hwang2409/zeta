@@ -80,7 +80,7 @@ async def _start_child(
     parent: ConversationStore | None = None,
 ) -> ConversationStore:
     """Install the durable start row in the immediate parent, then start the lifecycle."""
-    root = server.runtime.opened.store
+    root = server._runtime_for_test.opened.store
     parent = parent or root
     parent_run_id = run_id.rpartition(":")[0]
     parent.append_child_run_started(
@@ -121,7 +121,7 @@ async def _lifecycle_applied(server: ZetaServer) -> None:
 async def _publish_turns(server: ZetaServer, session_id: str, count: int) -> None:
     for index in range(count):
         await await_or_fail(
-            server.control._notify(
+            server._control_for_test._notify(
                 EventDescriptor.TURN_START, session_id, data={"turn_id": f"turn-{index}"}
             ),
             what="publish replay event",
@@ -142,11 +142,11 @@ def _gate_history_read(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> t
     entered, release = asyncio.Event(), asyncio.Event()
     original = server.connections.run_read
 
-    async def gated(connection: Any, read: Any, *, session_id: str | None = None) -> Any:
+    async def gated(connection: Any, read: Any, controller: Any = None) -> Any:
         if not entered.is_set():
             entered.set()
             await await_or_fail(release.wait(), what="release join history read")
-        return await original(connection, read, session_id=session_id)
+        return await original(connection, read, controller)
 
     # test-contract: seam hold the real fixed-worker history read of one join
     monkeypatch.setattr(server.connections, "run_read", gated)
@@ -391,7 +391,7 @@ async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_by
         charged: list[int] = []
         while scope in replay._scopes or not charged:
             await await_or_fail(
-                server.control._notify(
+                server._control_for_test._notify(
                     EventDescriptor.TURN_START, session_id, data={"turn_id": large}
                 ),
                 what="publish large frame",
@@ -522,10 +522,10 @@ async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
         release = asyncio.Event()
         original = server.connections.run_read
 
-        async def gated(connection: Any, read: Any, *, session_id: str | None = None) -> Any:
+        async def gated(connection: Any, read: Any, controller: Any = None) -> Any:
             next(event for event in arrivals if not event.is_set()).set()
             await await_or_fail(release.wait(), what="release child join reads")
-            return await original(connection, read, session_id=session_id)
+            return await original(connection, read, controller)
 
         # test-contract: seam hold both real child join reads while pressure is applied
         monkeypatch.setattr(server.connections, "run_read", gated)
@@ -585,7 +585,7 @@ async def test_snapshot_rows_come_only_from_newest_page_starts_without_scans(
 ) -> None:
     async with _serve(tmp_path, transport) as (server, client, session_id, stores):
         assert server.connections is not None
-        root = server.runtime.opened.store
+        root = server._runtime_for_test.opened.store
         older = [f"{session_id}:{n}" for n in (1, 2, 3)]
         newer = [f"{session_id}:{n}" for n in (4, 5, 6)]
         for run_id in older:
@@ -689,7 +689,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
     async with _serve(tmp_path, transport) as (first, _client, session_id, stores):
         assert first.connections is not None
         first_sink = first.connections.child_runs.sink
-        root = first.runtime.opened.store
+        root = first._runtime_for_test.opened.store
         ended = await _start_child(first, stores, f"{session_id}:1")
         running = await _start_child(first, stores, f"{session_id}:2")
         running.update_agent_lifecycle(current_step="before restart")
@@ -716,7 +716,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
     try:
         assert second.connections is not None
         at_start = (
-            second.runtime.opened is None,
+            second._runtime_for_test.opened is None,
             second.connections.child_runs.sink in agent_progress._sinks,
         )
         client = await connect_replay(second, transport)

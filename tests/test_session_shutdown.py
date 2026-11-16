@@ -128,10 +128,11 @@ def test_entrypoint_shutdown_releases_every_lease(
 
     async def server():
         server = ZetaServer(home=home, cwd=tmp_path, provider="codex", port=0)
-        monkeypatch.setattr(server.runtime, "_bind_background_event_sink", startup)
+        # test-contract: seam patches the attached pair's private hook
+        monkeypatch.setattr(server._runtime_for_test, "_bind_background_event_sink", startup)
         try:
             await server.start()
-            await server.runtime.create_session()
+            await server._runtime_for_test.create_session()
         finally:
             await server.close()
 
@@ -188,8 +189,8 @@ async def test_server_cleanup_continues_after_close_error(
     monkeypatch.setenv("ZETA_HOME", str(home))
     server = ZetaServer(home=home, cwd=tmp_path, provider="codex", port=0)
     await server.start()
-    await server.runtime.create_session()
-    loop = server.runtime.loop
+    await server._runtime_for_test.create_session()
+    loop = server._runtime_for_test.loop
     assert loop is not None
     listener = server._server
     assert listener is not None
@@ -222,7 +223,7 @@ async def test_server_cleanup_continues_after_close_error(
     finally:
         original_close()
         await original_wait_closed()
-        await server.runtime.close()
+        await server._runtime_for_test.close()
 
 
 @pytest.mark.usefixtures("no_gc")

@@ -155,7 +155,7 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
     observer_reader, observer_writer = await _observer(
         server, 3, features=["serve_observers", "list_sessions_paging", "ping"]
     )
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     entered = threading.Event()
     release = threading.Event()
     original_page = store.history_index_page
@@ -245,9 +245,9 @@ async def test_observer_hello_has_no_controller_side_effects(
         "set_memory_notice_sink",
         "set_background_wake_sink",
     ):
-        original = getattr(server.runtime, name)
+        original = getattr(server._runtime_for_test, name)
         monkeypatch.setattr(
-            server.runtime,
+            server._runtime_for_test,
             name,
             lambda *args, _name=name, _original=original, **kwargs: (
                 calls.append(_name) or _original(*args, **kwargs)
@@ -610,10 +610,10 @@ async def test_observer_disconnects_keep_controller_approval(
         released.set()
 
     monkeypatch.setattr(server.connections, "release", release)
-    assert server.runtime.policy is not None
+    assert server._runtime_for_test.policy is not None
     store_calls: list[tuple[str, int]] = []
     for name in ("pending_requests", "abort"):
-        original = getattr(server.runtime.policy, name)
+        original = getattr(server._runtime_for_test.policy, name)
 
         def record(
             *args: Any, _name: str = name, _original: Any = original, **kwargs: Any
@@ -621,7 +621,7 @@ async def test_observer_disconnects_keep_controller_approval(
             store_calls.append((_name, threading.get_ident()))
             return _original(*args, **kwargs)
 
-        monkeypatch.setattr(server.runtime.policy, name, record)
+        monkeypatch.setattr(server._runtime_for_test.policy, name, record)
 
     sockets: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
     try:
@@ -709,7 +709,7 @@ async def test_controller_history_does_not_block_other_clients(
     observer_reader, observer_writer = await _observer(
         server, 3, features=["serve_observers", "ping"]
     )
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     entered = threading.Event()
     release = threading.Event()
     ping_answered = threading.Event()
@@ -781,7 +781,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
             {"provider": "codex"},
         )
     )[-1]["result"]["session"]["session_id"]
-    server.runtime.opened.store.append_message(
+    server._runtime_for_test.opened.store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("from-a")]), MessageOrigin.USER
         )
@@ -819,7 +819,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
                 {"provider": "codex"},
             )
         )[-1]["result"]["session"]["session_id"]
-        server.runtime.opened.store.append_message(
+        server._runtime_for_test.opened.store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("from-b")]), MessageOrigin.USER
             )
@@ -852,18 +852,19 @@ async def test_controller_close_never_writes_after_registry_release(
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     assert server._client is not None and server.connections is not None
     client = server._client
-    runtime_sink = server.runtime._background_event_sink
+    runtime_sink = server._runtime_for_test._background_event_sink
     assert runtime_sink is not None
     close_entered = asyncio.Event()
     close_release = asyncio.Event()
-    original_terminate = server.control._terminate_pending_approvals
+    original_terminate = server._control_for_test._terminate_pending_approvals
 
     async def gated_terminate(*args: Any, **kwargs: Any) -> None:
         close_entered.set()
         await asyncio.wait_for(close_release.wait(), TIMEOUT)
         await original_terminate(*args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_terminate_pending_approvals", gated_terminate)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server._control_for_test, "_terminate_pending_approvals", gated_terminate)
     order: list[str] = []
     original_write = client._write_physical
     original_release = server.connections.release
@@ -881,7 +882,7 @@ async def test_controller_close_never_writes_after_registry_release(
     monkeypatch.setattr(server.connections, "release", registry_release)
     publication_done = asyncio.Event()
     publication_results: list[bool] = []
-    original_notify = server.control._notify
+    original_notify = server._control_for_test._notify
 
     async def record_notification(*args: Any, **kwargs: Any) -> bool:
         result = await original_notify(*args, **kwargs)
@@ -889,14 +890,15 @@ async def test_controller_close_never_writes_after_registry_release(
         publication_done.set()
         return result
 
-    monkeypatch.setattr(server.control, "_notify", record_notification)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server._control_for_test, "_notify", record_notification)
     writer.close()
     await writer.wait_closed()
     try:
         await asyncio.wait_for(close_entered.wait(), TIMEOUT)
-        assert server.runtime._background_event_sink is runtime_sink
+        assert server._runtime_for_test._background_event_sink is runtime_sink
         runtime_sink(
-            server.runtime.session_id,
+            server._runtime_for_test.session_id,
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"kind": "agent_completion", "text": "late"},
@@ -990,8 +992,8 @@ async def _controller_event_stream(
         frames = await read_until(
             reader, is_event("approval_request"), what="approval_request"
         )
-        assert server.runtime.loop is not None
-        server.runtime.loop._publish_background_event(
+        assert server._runtime_for_test.loop is not None
+        server._runtime_for_test.loop._publish_background_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"kind": "agent_completion", "text": "background done"},
@@ -1168,7 +1170,7 @@ async def test_session_tree_uses_one_store_snapshot(
     session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[
         -1
     ]["result"]["session"]
-    store = server.runtime.opened.store
+    store = server._runtime_for_test.opened.store
     first = store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("before")]), MessageOrigin.USER
@@ -1268,7 +1270,7 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
     release = threading.Event()
     ping_done = threading.Event()
     answered_while_held: list[bool] = []
-    original = server.runtime.manager.list_sessions_read_only
+    original = server._runtime_for_test.manager.list_sessions_read_only
 
     def gated_list():
         started.set()
@@ -1278,7 +1280,7 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
         answered_while_held.append(ping_done.is_set())
         return original()
 
-    server.runtime.manager.list_sessions_read_only = gated_list
+    server._runtime_for_test.manager.list_sessions_read_only = gated_list
     try:
         listing = asyncio.create_task(_request(reader, writer, 3, "list_sessions"))
         await _wait_thread(started)
@@ -1395,7 +1397,7 @@ async def test_observer_history_shape_matches_negotiated_backward_feature(
             {"provider": "codex"},
         )
     )[-1]["result"]["session"]["session_id"]
-    server.runtime.opened.store.append_message(
+    server._runtime_for_test.opened.store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER
         )

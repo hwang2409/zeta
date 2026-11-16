@@ -138,7 +138,7 @@ async def test_delegated_tool_end_survives_approval_history_race(
     child_store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy.register_delegated(request, child_store, child_instance_id="child")
@@ -147,7 +147,7 @@ async def test_delegated_tool_end_survives_approval_history_race(
     resolving: asyncio.Task[dict[str, object]] | None = None
     try:
         await await_or_fail(
-            server.control._event(
+            server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -161,8 +161,8 @@ async def test_delegated_tool_end_survives_approval_history_race(
         await await_or_fail(
             _frames_until_event(reader, "approval_request"), what="approval request"
         )
-        wire_id = server.control._approvals.wire_id(request.key)
-        original_append = server.control._approvals._append_delegated_history
+        wire_id = server._control_for_test._approvals.wire_id(request.key)
+        original_append = server._control_for_test._approvals._append_delegated_history
 
         async def hold_history(
             record: object, payload: dict[str, object] | None
@@ -175,14 +175,14 @@ async def test_delegated_tool_end_survives_approval_history_race(
 
         # test-contract: seam gates delegated history to force the stale-record order
         monkeypatch.setattr(
-            server.control._approvals, "_append_delegated_history", hold_history
+            server._control_for_test._approvals, "_append_delegated_history", hold_history
         )
         resolving = asyncio.create_task(
-            server.control.resolve_approval("deny", wire_id)
+            server._control_for_test.resolve_approval("deny", wire_id)
         )
         await await_or_fail(history_started.wait(), what="approval history start")
         await await_or_fail(
-            server.control._event(
+            server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_EXECUTION_END,
                     tool_call=call,
@@ -233,7 +233,7 @@ async def test_approval_lifecycle_transition_rejects_unknown_event(
     server, _reader, writer, _call = await _approval_server(tmp_path)
     try:
         with pytest.raises(AssertionError, match="unhandled approval lifecycle event"):
-            await server.control._approvals.transition(object())  # type: ignore[arg-type]
+            await server._control_for_test._approvals.transition(object())  # type: ignore[arg-type]
     finally:
         await close_serve(server, writer)
 
@@ -296,7 +296,7 @@ def _reservation_gate(
     server: ZetaServer, monkeypatch: pytest.MonkeyPatch
 ) -> asyncio.Event:
     entered = asyncio.Event()
-    reserve = getattr(server.control, "_reserve", None)
+    reserve = getattr(server._control_for_test, "_reserve", None)
     if reserve is not None:
 
         def gated_reserve(*args: object, **kwargs: object) -> bool:
@@ -304,16 +304,18 @@ def _reservation_gate(
             entered.set()
             return result
 
-        monkeypatch.setattr(server.control, "_reserve", gated_reserve)
+        # test-contract: seam patches the attached pair's private hook
+        monkeypatch.setattr(server._control_for_test, "_reserve", gated_reserve)
     else:
-        terminate = server.control._terminate_pending_approvals
+        terminate = server._control_for_test._terminate_pending_approvals
 
         async def gated_terminate(*args: object, **kwargs: object) -> None:
             entered.set()
             await terminate(*args, **kwargs)
 
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(
-            server.control, "_terminate_pending_approvals", gated_terminate
+            server._control_for_test, "_terminate_pending_approvals", gated_terminate
         )
     return entered
 
@@ -322,13 +324,14 @@ def _terminal_gate(
     server: ZetaServer, monkeypatch: pytest.MonkeyPatch
 ) -> asyncio.Event:
     entered = asyncio.Event()
-    original = server.control._end_approval
+    original = server._control_for_test._end_approval
 
     async def finish(*args: object, **kwargs: object) -> None:
         await original(*args, **kwargs)
         entered.set()
 
-    monkeypatch.setattr(server.control, "_end_approval", finish)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server._control_for_test, "_end_approval", finish)
     return entered
 
 
@@ -363,7 +366,7 @@ async def _approval_server(
         ToolCall(f"call-{index}", "read", {"path": f"/tmp/input-{index}"})
         for index in range(1, approval_count + 1)
     ]
-    server.runtime.opened.store.append_message_with_approval_requests(
+    server._runtime_for_test.opened.store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls]),
         [(call.id, call) for call in calls],
     )
@@ -388,15 +391,15 @@ async def test_aborted_approval_without_live_turn_starts_no_recovery_turn(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        server.runtime.opened.store.resolve_approval(
+        await server._control_for_test._event(_start_event(call))
+        server._runtime_for_test.opened.store.resolve_approval(
             call.id, "abort", reason="child_cleanup"
         )
-        result = await server.control.resolve_approval("deny", call.id)
+        result = await server._control_for_test.resolve_approval("deny", call.id)
 
         assert result["decision"] == "abort"
-        assert server.control._turn_task is None
-        assert server.runtime.opened.store.approval_state_now(call.id) == (call, "abort")
+        assert server._control_for_test._turn_task is None
+        assert server._runtime_for_test.opened.store.approval_state_now(call.id) == (call, "abort")
     finally:
         await close_serve(server, writer)
 
@@ -406,10 +409,10 @@ async def test_denied_approval_without_live_turn_resumes_model(tmp_path: Path) -
     backend = FakeBackend([ScriptedTurn([TextContent("done")])])
     server, reader, writer, call = await _approval_server(tmp_path, backend=backend)
     try:
-        await server.control._event(_start_event(call))
-        await server.control.resolve_approval("deny", call.id)
+        await server._control_for_test._event(_start_event(call))
+        await server._control_for_test.resolve_approval("deny", call.id)
 
-        resume = server.control._turn_task
+        resume = server._control_for_test._turn_task
         assert resume is not None
         await await_or_fail(resume, what="denied approval recovery")
         await _request(reader, writer, 3, "send", {"text": "continue"})
@@ -462,11 +465,11 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
     store.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy.register_delegated(request, store, child_instance_id="child")
-    await server.control._event(
+    await server._control_for_test._event(
         StreamEvent(
             StreamEventType.TOOL_APPROVAL_START,
             tool_call=call,
@@ -475,7 +478,7 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
         session_id="parent",
         background=True,
     )
-    wire_id = server.control._approvals.wire_id(request.key)
+    wire_id = server._control_for_test._approvals.wire_id(request.key)
     gate = _StoreGate(store, "resolve_approval")
     gate.install(monkeypatch)
     try:
@@ -484,14 +487,14 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             assert cleanup is not None
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
-                await server.control.resolve_approval("approve", wire_id)
+                await server._control_for_test.resolve_approval("approve", wire_id)
             assert loser.value.code == -32006
             gate.release.set()
             await asyncio.wait_for(cleanup, 10)
             expected = "abort"
         else:
             approve = asyncio.create_task(
-                server.control.resolve_approval("approve", wire_id)
+                server._control_for_test.resolve_approval("approve", wire_id)
             )
             await _wait_thread_gate(gate)
             assert policy.cleanup_delegated("child") is None
@@ -499,11 +502,11 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             result = await asyncio.wait_for(approve, 10)
             assert result["decision"] == "approve"
             expected = "allow"
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
         assert (await store.approval_resolution(call.id))["decision"] == expected
         rows = [entry for entry in resident_entries(store) if entry.type == "approval_resolution"]
         assert len(rows) == 1
-        pending = await server.control.pending_approvals()
+        pending = await server._control_for_test.pending_approvals()
         assert all(item["request_id"] != wire_id for item in pending)
         assert policy._delegated == {}
     finally:
@@ -519,33 +522,33 @@ async def test_same_tick_approval_reservation_winner(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     events: list[str] = []
-    original_admit = server.control._admit_controller
+    original_admit = server._control_for_test._admit_controller
 
     def record(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
         return original_admit(event, *args, **kwargs)
 
     # test-contract: seam observe approval admission through the single publication route
-    monkeypatch.setattr(server.control, "_admit_controller", record)
+    monkeypatch.setattr(server._control_for_test, "_admit_controller", record)
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
         if abort_first:
-            abort = asyncio.create_task(server.control._terminate_pending_approvals())
+            abort = asyncio.create_task(server._control_for_test._terminate_pending_approvals())
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
-                await server.control.resolve_approval("approve", call.id)
+                await server._control_for_test.resolve_approval("approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
             await await_or_fail(abort, what="abort-first terminate_pending_approvals")
         else:
             approve = asyncio.create_task(
-                server.control.resolve_approval("approve", call.id)
+                server._control_for_test.resolve_approval("approve", call.id)
             )
             await _wait_thread_gate(gate)
-            abort = asyncio.create_task(server.control._terminate_pending_approvals())
+            abort = asyncio.create_task(server._control_for_test._terminate_pending_approvals())
             assert not abort.done()
             gate.release.set()
             result = await await_or_fail(approve, what="resolve_approval approve")
@@ -554,7 +557,7 @@ async def test_same_tick_approval_reservation_winner(
         assert gate.thread_ids != [threading.get_ident()]
         rows = [
             entry
-            for entry in resident_entries(server.runtime.opened.store)
+            for entry in resident_entries(server._runtime_for_test.opened.store)
             if entry.type == "approval_resolution"
         ]
         assert len(rows) == 1
@@ -571,8 +574,8 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
     """Handler cancellation does not transfer into the settlement owner."""
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         joined_queue = asyncio.Event()
 
         # test-contract: seam observes queue admission before durable submission
@@ -580,7 +583,7 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
         # Hold the write lock so the settlement parks before it can commit.
         await store._async_write_lock.acquire()
         settlement = asyncio.create_task(
-            server.control.resolve_approval("approve", call.id)
+            server._control_for_test.resolve_approval("approve", call.id)
         )
         try:
             await await_or_fail(joined_queue.wait(), what="approval queue admission")
@@ -589,9 +592,9 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
             store._async_write_lock.release()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement before commit")
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
         assert (await store.approval_resolution(call.id))["decision"] == "allow"
-        assert call.id not in server.control._approvals.state.records
+        assert call.id not in server._control_for_test._approvals.state.records
     finally:
         await close_serve(server, writer)
 
@@ -604,10 +607,10 @@ async def test_cancelled_after_durable_commit_keeps_decision(
     server, _reader, writer, call = await _approval_server(tmp_path)
     gate: _StoreGate | None = None
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         ends: list[object] = []
-        original_admit = server.control._admit_controller
+        original_admit = server._control_for_test._admit_controller
 
         def record_admit(event: object, *args: object, **kwargs: object) -> object:
             if event == EventDescriptor.APPROVAL_END:
@@ -615,21 +618,21 @@ async def test_cancelled_after_durable_commit_keeps_decision(
             return original_admit(event, *args, **kwargs)
 
         # test-contract: seam observe approval admission through the single route
-        monkeypatch.setattr(server.control, "_admit_controller", record_admit)
+        monkeypatch.setattr(server._control_for_test, "_admit_controller", record_admit)
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
         settlement = asyncio.create_task(
-            server.control.resolve_approval("approve", call.id)
+            server._control_for_test.resolve_approval("approve", call.id)
         )
         await _wait_thread_gate(gate)
         settlement.cancel()
         gate.release.set()
         with pytest.raises(asyncio.CancelledError):
             await await_or_fail(settlement, what="cancelled settlement after commit")
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
         resolution = await store.approval_resolution(call.id)
         assert resolution is not None and resolution["decision"] == "allow"
-        assert call.id not in server.control._approvals.state.records
+        assert call.id not in server._control_for_test._approvals.state.records
         assert ends.count(EventDescriptor.APPROVAL_END) == 1
     finally:
         if gate is not None:
@@ -643,8 +646,8 @@ async def test_always_tool_grant_waits_for_durable_approval(
 ) -> None:
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         gate = _StoreGate(store, "resolve_approval")
 
         def fail_after_gate(
@@ -665,12 +668,12 @@ async def test_always_tool_grant_waits_for_durable_approval(
             )
         )
         await _wait_thread_gate(gate)
-        assert server.runtime.policy is not None
-        assert server.runtime.policy.session_allow == frozenset()
+        assert server._runtime_for_test.policy is not None
+        assert server._runtime_for_test.policy.session_allow == frozenset()
         gate.release.set()
         frames = await asyncio.wait_for(approval, 10)
         assert frames[-1]["error"]["code"] == -32000
-        assert server.runtime.policy.session_allow == frozenset()
+        assert server._runtime_for_test.policy.session_allow == frozenset()
     finally:
         gate.release.set()
         await close_serve(server, writer)
@@ -686,22 +689,23 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     events: list[str] = []
-    original_notify = server.control._notify
+    original_notify = server._control_for_test._notify
 
     async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
         events.append(event)
         return await original_notify(event, *args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_notify", record_notify)
-    parent = server.runtime.opened.store
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server._control_for_test, "_notify", record_notify)
+    parent = server._runtime_for_test.opened.store
     try:
         policy.register_delegated(request, child, child_instance_id="child")
         start = asyncio.create_task(
-            server.control._event(
+            server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -714,14 +718,14 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         # the async durable-writer seam does not expose the old registry-thread gate;
         # cleanup may overlap the off-loop history append without publishing a ghost.
         async with asyncio.timeout(10):
-            while ("child", call.id) not in server.control._approvals.state.records:
+            while ("child", call.id) not in server._control_for_test._approvals.state.records:
                 await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
         await asyncio.wait_for(
             asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10
         )
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         history = [
             entry.data for entry in resident_entries(parent) if entry.type == "approval_history"
@@ -735,7 +739,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
             "reason": "child_cleanup",
         }
         assert events == []
-        assert server.control.pending_approvals_now() == []
+        assert server._control_for_test.pending_approvals_now() == []
     finally:
         await close_serve(server, writer)
         child.close()
@@ -749,12 +753,12 @@ async def test_serve_bound_approval_writes_only_through_settlement(
     server, _reader, writer, foreground = await _approval_server(tmp_path)
     child: ConversationStore | None = None
     try:
-        policy = server.runtime.policy
+        policy = server._runtime_for_test.policy
         assert policy is not None
         if path == "foreground":
             call = foreground
-            store = server.runtime.opened.store
-            await server.control._event(_start_event(call))
+            store = server._runtime_for_test.opened.store
+            await server._control_for_test._event(_start_event(call))
             abort = partial(
                 policy.abort_or_winner,
                 call.id,
@@ -770,7 +774,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
             child_policy = ChildApprovalPolicy(policy, child, "child", "child")
             request = ApprovalRequest(call.id, call, child_instance_id="child")
             policy.register_delegated(request, child, child_instance_id="child")
-            await server.control._event(
+            await server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -797,7 +801,7 @@ async def test_serve_bound_approval_writes_only_through_settlement(
         monkeypatch.setattr(store, "resolve_approval_async", record_writer)
         assert await abort() is None
         await asyncio.sleep(0)
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         assert writers
         assert all("persist_durably" in caller for caller in writers)
@@ -815,20 +819,20 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
     server, _reader, writer, foreground = await _approval_server(tmp_path)
     child: ConversationStore | None = None
     notifications: list[str] = []
-    original_admit = server.control._admit_controller
+    original_admit = server._control_for_test._admit_controller
 
     def record_admit(event: str, *args: object, **kwargs: object) -> object:
         notifications.append(event)
         return original_admit(event, *args, **kwargs)
 
     # test-contract: seam observe approval admission through the single publication route
-    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
+    monkeypatch.setattr(server._control_for_test, "_admit_controller", record_admit)
     try:
-        policy = server.runtime.policy
-        assert policy is not None and server.runtime.loop is not None
+        policy = server._runtime_for_test.policy
+        assert policy is not None and server._runtime_for_test.loop is not None
         if path == "foreground":
             call = foreground
-            store = server.runtime.opened.store
+            store = server._runtime_for_test.opened.store
             authorizer = policy
             key: str | tuple[str, str] = call.id
         else:
@@ -838,7 +842,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
             store = child
             key = ("child", call.id)
 
-        capability = server.runtime.loop.tool_registry.resolve_tool_call_capability(
+        capability = server._runtime_for_test.loop.tool_registry.resolve_tool_call_capability(
             call
         )
         if child is not None:
@@ -854,9 +858,9 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         )
         if path == "delegated":
             async with asyncio.timeout(10):
-                while key not in server.control._approvals.state.records:
+                while key not in server._control_for_test._approvals.state.records:
                     await asyncio.sleep(0)
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_START,
                 tool_call=call,
@@ -884,18 +888,18 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         monkeypatch.setattr(
             async_writes_module, "execute_mutation", fail_twice_then_recover
         )
-        monkeypatch.setattr(server.runtime.loop, "abort", signal.set)
-        request_id = server.control._approvals.wire_id(key)
+        monkeypatch.setattr(server._runtime_for_test.loop, "abort", signal.set)
+        request_id = server._control_for_test._approvals.wire_id(key)
         with pytest.raises(ProtocolError) as error:
-            await server.control.resolve_approval("approve", request_id)
+            await server._control_for_test.resolve_approval("approve", request_id)
         assert error.value.code == -32000
-        await server.control.request_approval_abort(
+        await server._control_for_test.request_approval_abort(
             call.id,
             child_instance_id="child" if path == "delegated" else None,
             reason="child_cleanup" if path == "delegated" else "turn_canceled",
         )
         assert await asyncio.wait_for(authorization, TIMEOUT) is None
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         assert writes == 3
         assert await store.approval_resolution(call.id) == {
@@ -908,7 +912,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         if path == "delegated":
             history = [
                 entry.data
-                for entry in resident_entries(server.runtime.opened.store)
+                for entry in resident_entries(server._runtime_for_test.opened.store)
                 if entry.type == "approval_history"
             ]
             assert [row["event"] for row in history] == [
@@ -924,16 +928,16 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
 async def _make_unhealthy(
     server: ZetaServer, call: ToolCall, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await server.control._event(_start_event(call))
+    await server._control_for_test._event(_start_event(call))
     monkeypatch.setattr(
         ConversationStore,
         "resolve_approval",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
     )
     with pytest.raises(ProtocolError) as error:
-        await server.control.resolve_approval("approve", call.id)
+        await server._control_for_test.resolve_approval("approve", call.id)
     assert error.value.code == -32000
-    assert server.control.unhealthy()
+    assert server._control_for_test.unhealthy()
 
 
 @pytest.mark.asyncio
@@ -943,9 +947,9 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         monkeypatch.setattr(
-            server.runtime.loop,
+            server._runtime_for_test.loop,
             "transcript_index_failure",
             lambda _session_id: "disk full; pending changes will retry",
         )
@@ -969,7 +973,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
         }
         assert "health" not in response["result"]
         with pytest.raises(ProtocolError) as error:
-            await server.control.resolve_approval("approve", call.id)
+            await server._control_for_test.resolve_approval("approve", call.id)
         assert error.value.code == -32000
     finally:
         await close_serve(server, writer)
@@ -998,13 +1002,13 @@ async def test_observer_status_surfaces_viewed_session_health_when_degraded(
     )
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         monkeypatch.setattr(
-            server.runtime.loop,
+            server._runtime_for_test.loop,
             "transcript_index_failure",
             lambda _session_id: "disk full; pending changes will retry",
         )
-        server.runtime.loop.project_context_health = SimpleNamespace(
+        server._runtime_for_test.loop.project_context_health = SimpleNamespace(
             summary=(
                 "malformed_memory (p_test/memory/state.md): project memory is malformed"
             )
@@ -1047,8 +1051,8 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
 ) -> None:
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
-        store = server.runtime.opened.store
-        session_id = server.runtime.session_id
+        store = server._runtime_for_test.opened.store
+        session_id = server._runtime_for_test.session_id
         store.append_many(
             [
                 (
@@ -1094,20 +1098,20 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
         )
         await _make_unhealthy(server, call, monkeypatch)
         features = frozenset({"delivery_id"})
-        deliveries = server.control.deliveries
+        deliveries = server._control_for_test.deliveries
         effects: list[str] = []
 
         async def record_message(*args: object, **kwargs: object) -> None:
             del args, kwargs
             effects.append("message")
 
-        monkeypatch.setattr(server.control, "user_message", record_message)
+        monkeypatch.setattr(server._control_for_test, "user_message", record_message)
         monkeypatch.setattr(
-            server.control, "start_turn", lambda *args, **kwargs: effects.append("turn")
+            server._control_for_test, "start_turn", lambda *args, **kwargs: effects.append("turn")
         )
-        assert server.runtime.loop is not None
+        assert server._runtime_for_test.loop is not None
         monkeypatch.setattr(
-            server.runtime.loop,
+            server._runtime_for_test.loop,
             "steer",
             lambda *args, **kwargs: effects.append("steer"),
         )
@@ -1150,7 +1154,7 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             await _request(reader, writer, 90, "resume", {"session_id": session_id})
         )[-1]
         assert "result" in response
-        assert not server.control.unhealthy()
+        assert not server._control_for_test.unhealthy()
         result = await deliveries.send(
             {"text": "recovered", "delivery_id": "recovered-id"}, features
         )
@@ -1170,7 +1174,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
     )
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        session_id = server.runtime.session_id
+        session_id = server._runtime_for_test.session_id
         params_by_method: dict[str, dict[str, object]] = {
             "abort": {},
             "approve": {"request_id": call.id},
@@ -1185,7 +1189,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "set_compaction": {"session_id": session_id, "mode": "eviction"},
             "set_settings": {
                 "session_id": session_id,
-                "model": server.runtime.model,
+                "model": server._runtime_for_test.model,
                 "approval_mode": "ask",
             },
             "set_turn_context": {"text": "blocked"},
@@ -1193,9 +1197,9 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             "steer": {"text": "blocked"},
             "switch_branch": {"session_id": session_id, "head_id": "missing"},
         }
-        old_state = server.runtime.state
-        old_metadata = server.runtime.metadata.to_dict()
-        old_entries = tuple(resident_entries(server.runtime.opened.store))
+        old_state = server._runtime_for_test.state
+        old_metadata = server._runtime_for_test.metadata.to_dict()
+        old_entries = tuple(resident_entries(server._runtime_for_test.opened.store))
         for request_id, method in enumerate(params_by_method, 20):
             response = (
                 await _request(
@@ -1204,9 +1208,9 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             )[-1]
             assert "error" in response, (method, response)
             assert response["error"]["code"] == -32000, method
-            assert server.runtime.state is old_state
-            assert server.runtime.metadata.to_dict() == old_metadata
-            assert tuple(resident_entries(server.runtime.opened.store)) == old_entries
+            assert server._runtime_for_test.state is old_state
+            assert server._runtime_for_test.metadata.to_dict() == old_metadata
+            assert tuple(resident_entries(server._runtime_for_test.opened.store)) == old_entries
 
         read_requests = {
             "delivery_status": {"delivery_id": "unknown"},
@@ -1226,7 +1230,7 @@ async def test_unhealthy_session_rejects_every_loaded_session_mutation(
             await _request(reader, writer, 70, "new_session", {"provider": "codex"})
         )[-1]
         assert "result" in recovered
-        assert not server.control.unhealthy()
+        assert not server._control_for_test.unhealthy()
     finally:
         await close_serve(server, writer)
 
@@ -1239,14 +1243,14 @@ async def test_failed_recovery_keeps_session_unhealthy(
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        old_state = server.runtime.state
+        old_state = server._runtime_for_test.state
         method = "new_session" if recovery == "new_session" else "resume"
         params: dict[str, str] = {"provider": "codex"}
         if recovery == "missing_resume":
             params = {"session_id": "missing-session"}
         elif recovery == "failed_resume":
             opened = await asyncio.to_thread(
-                server.runtime.manager.create,
+                server._runtime_for_test.manager.create,
                 provider="codex",
                 model="offline",
                 cwd=tmp_path,
@@ -1259,12 +1263,13 @@ async def test_failed_recovery_keeps_session_unhealthy(
                 del args, kwargs
                 raise OSError("setup failed")
 
-            monkeypatch.setattr(server.runtime, "_run_setup", fail_setup)
+            # test-contract: seam patches the attached pair's private hook
+            monkeypatch.setattr(server._runtime_for_test, "_run_setup", fail_setup)
 
         response = (await _request(reader, writer, 9, method, params))[-1]
         assert "error" in response
-        assert server.runtime.state is old_state
-        assert server.control.unhealthy()
+        assert server._runtime_for_test.state is old_state
+        assert server._control_for_test.unhealthy()
         mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
         assert mutation["error"]["code"] == -32000
     finally:
@@ -1278,15 +1283,15 @@ async def test_unhealthy_same_session_resume_reopens_and_clears_after_success(
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        session_id = server.runtime.session_id
-        old_store = server.runtime.opened.store
+        session_id = server._runtime_for_test.session_id
+        old_store = server._runtime_for_test.opened.store
         response = (
             await _request(reader, writer, 9, "resume", {"session_id": session_id})
         )[-1]
         assert "result" in response
-        assert server.runtime.session_id == session_id
-        assert server.runtime.opened.store is not old_store
-        assert not server.control.unhealthy()
+        assert server._runtime_for_test.session_id == session_id
+        assert server._runtime_for_test.opened.store is not old_store
+        assert not server._control_for_test.unhealthy()
         assert (await _request(reader, writer, 10, "send", {"text": "recovered"}))[-1][
             "result"
         ]["accepted"] is True
@@ -1301,9 +1306,10 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
     server, reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        session_id = server.runtime.session_id
+        session_id = server._runtime_for_test.session_id
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(
-            server.runtime,
+            server._runtime_for_test,
             "_run_setup",
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replay failed")),
         )
@@ -1311,8 +1317,8 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
             await _request(reader, writer, 9, "resume", {"session_id": session_id})
         )[-1]
         assert response["error"]["code"] == -32000
-        assert server.control.unhealthy()
-        assert server.runtime.opened is None
+        assert server._control_for_test.unhealthy()
+        assert server._runtime_for_test.opened is None
         mutation = (await _request(reader, writer, 10, "send", {"text": "blocked"}))[-1]
         assert mutation["error"]["code"] == -32003
     finally:
@@ -1324,7 +1330,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
-    old_state = server.runtime.state
+    old_state = server._runtime_for_test.state
     assert old_state is not None
     old_store = old_state.opened.store
     session_dir = old_store.session_dir
@@ -1344,17 +1350,17 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
     try:
         await _make_unhealthy(server, call, monkeypatch)
         resume = asyncio.create_task(
-            server.runtime.resume_session(old_state.session_id, force=True)
+            server._runtime_for_test.resume_session(old_state.session_id, force=True)
         )
         await asyncio.wait_for(entered.wait(), TIMEOUT)
         resume.cancel()
         await asyncio.sleep(0)
-        assert server.runtime.state is old_state
+        assert server._runtime_for_test.state is old_state
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(resume, 10)
         assert completed.is_set()
-        assert server.runtime.state is None
+        assert server._runtime_for_test.state is None
         assert old_store._closed
         assert not old_state.loop._background_child_watchers
         assert not [task for task in old_state.loop._tracked_tasks if not task.done()]
@@ -1362,7 +1368,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         mount_task = old_state.loop._mcp_mount_task
         assert mount_task is None or mount_task.done()
         reopened = await asyncio.to_thread(
-            server.runtime.manager.open, old_state.session_id
+            server._runtime_for_test.manager.open, old_state.session_id
         )
         try:
             assert reopened.metadata.session_id == old_state.session_id
@@ -1383,7 +1389,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
     finally:
         release.set()
         if not old_store._closed:
-            await server.runtime._close_state(old_state)
+            await server._runtime_for_test._close_state(old_state)
         await close_serve(server, writer)
 
 
@@ -1395,7 +1401,7 @@ async def test_forced_resume_cancellation_at_each_boundary_is_clean(
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
         await _make_unhealthy(server, call, monkeypatch)
-        runtime = server.runtime
+        runtime = server._runtime_for_test
         session_id = runtime.session_id
         original_close = runtime._close_state
         original_setup = runtime._run_setup
@@ -1422,7 +1428,7 @@ async def test_forced_resume_cancellation_at_each_boundary_is_clean(
             await runtime.resume_session(session_id, force=True)
         assert runtime.opened is None
         assert runtime.state is None
-        assert server.control.unhealthy()
+        assert server._control_for_test.unhealthy()
     finally:
         await close_serve(server, writer)
 
@@ -1433,10 +1439,10 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
+        await server._control_for_test._event(_start_event(call))
         events: list[tuple[str, str | None]] = []
         aborted: list[bool] = []
-        original_admit = server.control._admit_controller
+        original_admit = server._control_for_test._admit_controller
 
         def record_admit(event: str, *args: object, **kwargs: object) -> object:
             error = kwargs.get("error")
@@ -1445,10 +1451,10 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             return original_admit(event, *args, **kwargs)
 
         # test-contract: seam observe approval admission through the single publication route
-        monkeypatch.setattr(server.control, "_admit_controller", record_admit)
-        assert server.runtime.loop is not None
+        monkeypatch.setattr(server._control_for_test, "_admit_controller", record_admit)
+        assert server._runtime_for_test.loop is not None
         monkeypatch.setattr(
-            server.runtime.loop,
+            server._runtime_for_test.loop,
             "abort",
             lambda **kwargs: aborted.append(True),
         )
@@ -1458,25 +1464,25 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
         )
         with pytest.raises(ProtocolError) as error:
-            await server.control.resolve_approval("approve", call.id)
+            await server._control_for_test.resolve_approval("approve", call.id)
         assert error.value.code == -32000
         assert aborted == [True]
 
-        await server.control.request_approval_abort(
+        await server._control_for_test.request_approval_abort(
             call.id,
             reason="turn_canceled",
         )
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         assert events == [
             ("error", "server_error"),
             ("approval_end", None),
         ]
-        assert server.control.pending_approvals_now() == []
-        assert not server.control.has_pending_approvals()
-        assert server.control._approvals.state.records == {}
+        assert server._control_for_test.pending_approvals_now() == []
+        assert not server._control_for_test.has_pending_approvals()
+        assert server._control_for_test._approvals.state.records == {}
         with pytest.raises(ProtocolError) as later:
-            await server.control.resolve_approval("approve", call.id)
+            await server._control_for_test.resolve_approval("approve", call.id)
         assert later.value.code == -32000
 
     finally:
@@ -1490,17 +1496,17 @@ async def test_persistent_failure_removes_many_live_child_approvals(
     server, _reader, writer, _call = await _approval_server(tmp_path)
     stores: list[ConversationStore] = []
     events: list[str] = []
-    original_admit = server.control._admit_controller
+    original_admit = server._control_for_test._admit_controller
 
     def record_admit(event: str, *args: object, **kwargs: object) -> object:
         events.append(event)
         return original_admit(event, *args, **kwargs)
 
     # test-contract: seam observe approval admission through the single publication route
-    monkeypatch.setattr(server.control, "_admit_controller", record_admit)
-    assert server.runtime.loop is not None
-    monkeypatch.setattr(server.runtime.loop, "abort", lambda **kwargs: None)
-    policy = server.runtime.policy
+    monkeypatch.setattr(server._control_for_test, "_admit_controller", record_admit)
+    assert server._runtime_for_test.loop is not None
+    monkeypatch.setattr(server._runtime_for_test.loop, "abort", lambda **kwargs: None)
+    policy = server._runtime_for_test.policy
     assert policy is not None
     try:
         for index in range(4):
@@ -1514,7 +1520,7 @@ async def test_persistent_failure_removes_many_live_child_approvals(
             )
             request = ApprovalRequest(call.id, call, child_instance_id=child_id)
             policy.register_delegated(request, store, child_instance_id=child_id)
-            await server.control._event(
+            await server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -1531,23 +1537,23 @@ async def test_persistent_failure_removes_many_live_child_approvals(
 
         first_key = ("child-0", "child-call-0")
         with pytest.raises(ProtocolError) as error:
-            await server.control.resolve_approval(
-                "approve", server.control._approvals.wire_id(first_key)
+            await server._control_for_test.resolve_approval(
+                "approve", server._control_for_test._approvals.wire_id(first_key)
             )
         assert error.value.code == -32000
 
         for index in range(4):
-            await server.control.request_approval_abort(
+            await server._control_for_test.request_approval_abort(
                 f"child-call-{index}",
                 child_instance_id=f"child-{index}",
                 reason="child_cleanup",
             )
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         assert events.count("error") == 1
         assert events.count("approval_end") == 4
-        assert not server.control.has_pending_approvals()
-        assert server.control._approvals.state.records == {}
+        assert not server._control_for_test.has_pending_approvals()
+        assert server._control_for_test._approvals.state.records == {}
     finally:
         await close_serve(server, writer)
         for store in stores:
@@ -1563,11 +1569,11 @@ async def test_legacy_status_bytes_match_main_from_resident_state(
     monkeypatch.setattr(session_module, "_now", lambda: "2026-01-01T00:00:00+00:00")
     server, reader, writer, call = await _approval_server(tmp_path, approval_count=65)
     try:
-        await server.control._event(_start_event(call))
+        await server._control_for_test._event(_start_event(call))
         await _read_raw(reader)
         assert server._client is not None
         monkeypatch.setattr(
-            lifecycle, "session_snapshot", lambda client: {"session_id": "fixed"}
+            lifecycle, "session_snapshot", lambda client, controller: {"session_id": "fixed"}
         )
         expected = (
             Path(__file__).parent
@@ -1596,11 +1602,11 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
     assert expected.endswith(b"\n")
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
-        released = asyncio.create_task(server.control.controller_released())
+        released = asyncio.create_task(server._control_for_test.controller_released())
         await _wait_thread_gate(gate)
         responsive = asyncio.Event()
         asyncio.get_running_loop().call_soon(responsive.set)
@@ -1608,7 +1614,7 @@ async def test_legacy_disconnect_abort_is_off_loop_and_byte_identical(
         gate.release.set()
         await asyncio.wait_for(released, 10)
         assert gate.thread_ids != [threading.get_ident()]
-        resolution = await server.runtime.opened.store.approval_resolution(call.id)
+        resolution = await server._runtime_for_test.opened.store.approval_resolution(call.id)
         actual = (json.dumps(resolution, separators=(",", ":")) + "\n").encode()
         assert actual == expected
     finally:
@@ -1626,7 +1632,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
     request = ApprovalRequest(call.id, call, child_instance_id="child")
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     late: ConversationStore | None = None
     try:
@@ -1648,7 +1654,7 @@ async def test_serve_bound_delegated_never_touches_policy_registry(
             late_call.id, late_call, child_instance_id="late-child"
         )
         policy.register_delegated(late_request, late, child_instance_id="late-child")
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
         assert late.approval_resolution_now(late_call.id)["decision"] == "abort"
         policy.cleanup_delegated("late-child")
         assert policy._delegated == {}
@@ -1665,16 +1671,16 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        policy = server.runtime.policy
+        await server._control_for_test._event(_start_event(call))
+        policy = server._runtime_for_test.policy
         assert policy is not None and server._client is not None
         monkeypatch.setattr(
             policy,
             "pending_requests",
             lambda: (_ for _ in ()).throw(AssertionError("store read")),
         )
-        session = ServerSlashSession(server.runtime)
-        session._approval_control = server.control
+        session = ServerSlashSession(server._runtime_for_test)
+        session._approval_control = server._control_for_test
         status = session.slash_status()
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
@@ -1682,10 +1688,11 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
                 server._client,
                 "set-settings",
                 {
-                    "session_id": server.runtime.session_id,
-                    "model": server.runtime.metadata.model,
+                    "session_id": server._runtime_for_test.session_id,
+                    "model": server._runtime_for_test.metadata.model,
                     "approval_mode": "ask",
                 },
+                server.controllers.attached(),
             )
         assert error.value.code == -32004
     finally:
@@ -1753,12 +1760,12 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
     child: ConversationStore | None = None
     release = threading.Event()
     try:
-        policy = server.runtime.policy
+        policy = server._runtime_for_test.policy
         assert policy is not None
         if path == "foreground":
             call = foreground_call
-            store = server.runtime.opened.store
-            await server.control._event(_start_event(call))
+            store = server._runtime_for_test.opened.store
+            await server._control_for_test._event(_start_event(call))
             request_id = call.id
         else:
             child = await asyncio.to_thread(ConversationStore, tmp_path / "matrix-child")
@@ -1769,7 +1776,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             )
             request = ApprovalRequest(call.id, call, child_instance_id="child")
             policy.register_delegated(request, child, child_instance_id="child")
-            await server.control._event(
+            await server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -1779,7 +1786,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
                 background=True,
             )
             store = child
-            request_id = server.control._approvals.wire_id(request.key)
+            request_id = server._control_for_test._approvals.wire_id(request.key)
 
         original_resolve = store.resolve_approval
         original_writer_resolve = ConversationStore.resolve_approval
@@ -1819,7 +1826,7 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             original_resolve(call.id, "abort", reason=reasons[competing_event])
         release.set()
         frames = await await_or_fail(rpc, what="test await")
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test.wait_for_approval_settlement()
 
         resolution = await store.approval_resolution(call.id)
         assert resolution is not None
@@ -1834,13 +1841,13 @@ async def test_confirmed_durable_outcome_controls_all_approval_side_effects(
             requested == "always_tool" and resolution["decision"] == "allow"
         )
         key = call.id if path == "foreground" else ("child", call.id)
-        assert key not in server.control._approvals.state.records
+        assert key not in server._control_for_test._approvals.state.records
         assert writer_paths
         assert all("_run_committed_mutation" in caller for caller in writer_paths)
         if path == "delegated":
             history = [
                 entry.data
-                for entry in resident_entries(server.runtime.opened.store)
+                for entry in resident_entries(server._runtime_for_test.opened.store)
                 if entry.type == "approval_history"
             ]
             assert [row["event"] for row in history] == [
@@ -1864,12 +1871,12 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
     policy.register_delegated(request, child, child_instance_id="child")
     try:
-        await server.control._event(
+        await server._control_for_test._event(
             StreamEvent(
                 StreamEventType.TOOL_APPROVAL_START,
                 tool_call=call,
@@ -1878,7 +1885,7 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
             session_id="parent",
             background=True,
         )
-        await server.control.controller_released()
+        await server._control_for_test.controller_released()
         resolution = await child.approval_resolution(call.id)
         assert resolution is not None
         assert resolution["decision"] == "abort"
@@ -1886,8 +1893,8 @@ async def test_persistent_approval_failure_aborts_session_owned_children(
             "child_cleanup",
             "controller_disconnected",
         }
-        assert not server.control._approvals.state.records
-        assert not server.control.has_pending_approvals()
+        assert not server._control_for_test._approvals.state.records
+        assert not server._control_for_test.has_pending_approvals()
     finally:
         await close_serve(server, writer)
         child.close()
@@ -1942,11 +1949,11 @@ async def test_approval_lifecycle_has_no_records_after_release(
 ) -> None:
     server, _reader, writer, call = await _approval_server(tmp_path)
     try:
-        await server.control._event(_start_event(call))
-        await server.control.controller_released()
-        await server.control.wait_for_approval_settlement()
-        assert server.control._approvals.state.records == {}
-        assert server.control._approvals.active_keys() == ()
+        await server._control_for_test._event(_start_event(call))
+        await server._control_for_test.controller_released()
+        await server._control_for_test.wait_for_approval_settlement()
+        assert server._control_for_test._approvals.state.records == {}
+        assert server._control_for_test._approvals.active_keys() == ()
     finally:
         await close_serve(server, writer)
 
@@ -1959,11 +1966,11 @@ async def test_persistence_failure_requests_turn_cancel_without_awaiting_reentra
     try:
         called: list[bool] = []
         monkeypatch.setattr(
-            server.control,
+            server._control_for_test,
             "request_turn_failure",
             lambda: called.append(True),
         )
-        server.control.request_turn_failure()
+        server._control_for_test.request_turn_failure()
         await asyncio.sleep(0)
         assert called == [True]
     finally:
@@ -1979,10 +1986,10 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     child.append_message_with_approval_requests(
         Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
     )
-    policy = server.runtime.policy
+    policy = server._runtime_for_test.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
-    parent = server.runtime.opened.store
+    parent = server._runtime_for_test.opened.store
 
     async def fail_history(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -1992,7 +1999,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
     try:
         policy.register_delegated(request, child, child_instance_id="child")
         start = asyncio.create_task(
-            server.control._event(
+            server._control_for_test._event(
                 StreamEvent(
                     StreamEventType.TOOL_APPROVAL_START,
                     tool_call=call,
@@ -2003,7 +2010,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             )
         )
         async with asyncio.timeout(10):
-            while ("child", call.id) not in server.control._approvals.state.records:
+            while ("child", call.id) not in server._control_for_test._approvals.state.records:
                 await asyncio.sleep(0)
         cleanup = policy.cleanup_delegated("child")
         cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
@@ -2016,7 +2023,7 @@ async def test_failed_delegated_request_write_settles_cleanup_owner(
             "decision": "abort",
             "reason": "child_cleanup",
         }
-        assert ("child", call.id) not in server.control._approvals.state.records
+        assert ("child", call.id) not in server._control_for_test._approvals.state.records
         history = [
             entry.data for entry in resident_entries(parent) if entry.type == "approval_history"
         ]
@@ -2102,7 +2109,7 @@ async def test_approval_reconnect_drop_replay_and_approve_same_id(
         assert approved[-1]["result"]["request_id"] == call.id
         await _frames_until_event(replay_reader, "agent_end")
         assert (
-            (await server.runtime.opened.store.approval_resolution(call.id))["decision"]
+            (await server._runtime_for_test.opened.store.approval_resolution(call.id))["decision"]
             == "allow"
         )
         assert len(backend.calls) == 2
@@ -2121,7 +2128,7 @@ async def test_reconnect_approval_end_waits_for_hello_response(
     hello_held = asyncio.Event()
     release_hello = asyncio.Event()
     try:
-        await server.control._event(_start_event(call))
+        await server._control_for_test._event(_start_event(call))
         writer.close()
         await await_or_fail(writer.wait_closed(), what="old controller close")
         await _wait_controller_release(server)
@@ -2154,7 +2161,7 @@ async def test_reconnect_approval_end_waits_for_hello_response(
         await await_or_fail(hello_held.wait(), what="held hello response")
 
         await await_or_fail(
-            server.control.resolve_approval("deny", call.id),
+            server._control_for_test.resolve_approval("deny", call.id),
             what="approval terminal admission",
         )
         release_hello.set()
@@ -2182,7 +2189,7 @@ async def test_approval_reconnect_legacy_claim_during_grace_gets_hello_first_and
     )
     replacement: asyncio.StreamWriter | None = None
     try:
-        await server.control._event(_start_event(call))
+        await server._control_for_test._event(_start_event(call))
         writer.close()
         await writer.wait_closed()
         await _wait_controller_release(server)
@@ -2223,14 +2230,14 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         tmp_path, protocol_version="1.2", features=["approval_reconnect"]
     )
     replacement: asyncio.StreamWriter | None = None
-    gate = _StoreGate(server.runtime.opened.store, "resolve_approval")
+    gate = _StoreGate(server._runtime_for_test.opened.store, "resolve_approval")
     try:
-        await server.control._event(_start_event(call))
+        await server._control_for_test._event(_start_event(call))
         writer.close()
         await writer.wait_closed()
         await _wait_controller_release(server)
 
-        grace = server.control._grace_task
+        grace = server._control_for_test._grace_task
         assert grace is not None
         grace.cancel()
         await await_or_fail(
@@ -2239,11 +2246,11 @@ async def test_approval_reconnect_negotiated_claim_joining_expiry_gets_hello_fir
         server.approval_reconnect_grace = 0
         gate.install(monkeypatch)
         # restart the grace as a release does: a fresh deadline, then the expiry.
-        server.control._end_grace_deadline()
-        server.control._grace_deadline_task = asyncio.create_task(
-            server.control._grace_deadline()
+        server._control_for_test._end_grace_deadline()
+        server._control_for_test._grace_deadline_task = asyncio.create_task(
+            server._control_for_test._grace_deadline()
         )
-        server.control._grace_task = asyncio.create_task(server.control._expire_grace())
+        server._control_for_test._grace_task = asyncio.create_task(server._control_for_test._expire_grace())
         await _wait_thread_gate(gate)
 
         replacement_reader, replacement = await asyncio.open_unix_connection(
@@ -2277,7 +2284,7 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         tmp_path, protocol_version="1.2", features=["approval_reconnect"]
     )
     events: list[tuple[str, str | None]] = []
-    original_admit = server.control._admit_controller
+    original_admit = server._control_for_test._admit_controller
 
     def record(event: str, session_id: str | None = None, **fields: object) -> object:
         request_id = fields.get("request_id")
@@ -2285,15 +2292,15 @@ async def test_approval_reconnect_starting_claim_before_lookup_completion(
         return original_admit(event, session_id, **fields)
 
     # test-contract: seam observe approval admission through the single publication route
-    monkeypatch.setattr(server.control, "_admit_controller", record)
+    monkeypatch.setattr(server._control_for_test, "_admit_controller", record)
     try:
-        await server.control._event(_start_event(call))
-        await server.control.controller_released(reconnect=True)
-        await server.control.controller_claimed(reconnect=True)
+        await server._control_for_test._event(_start_event(call))
+        await server._control_for_test.controller_released(reconnect=True)
+        await server._control_for_test.controller_claimed(reconnect=True)
         assert events.count(("approval_request", call.id)) == 1
-        await server.control.controller_ready(reconnect=True)
+        await server._control_for_test.controller_ready(reconnect=True)
         assert events.count(("approval_request", call.id)) == 2
-        assert server.control.pending_approvals_now()[0]["request_id"] == call.id
+        assert server._control_for_test.pending_approvals_now()[0]["request_id"] == call.id
     finally:
         await close_serve(server, writer)
 
@@ -2307,18 +2314,18 @@ async def test_approval_reconnect_expiry_aborts_once(tmp_path: Path) -> None:
         approval_reconnect_grace=0,
     )
     try:
-        await server.control._event(_start_event(call))
-        await server.control.controller_released(reconnect=True)
-        await server.control.wait_for_approval_settlement()
+        await server._control_for_test._event(_start_event(call))
+        await server._control_for_test.controller_released(reconnect=True)
+        await server._control_for_test.wait_for_approval_settlement()
         rows = [
             row
-            for row in resident_entries(server.runtime.opened.store)
+            for row in resident_entries(server._runtime_for_test.opened.store)
             if row.type == "approval_resolution" and row.data["request_id"] == call.id
         ]
         assert len(rows) == 1
         assert rows[0].data["reason"] == "grace_expired"
         with pytest.raises(ProtocolError) as late:
-            await server.control.resolve_approval("approve", call.id)
+            await server._control_for_test.resolve_approval("approve", call.id)
         assert late.value.code == -32006
     finally:
         await close_serve(server, writer)
@@ -2332,25 +2339,25 @@ async def test_approval_reconnect_status_during_reserved_write(
         tmp_path, protocol_version="1.2", features=["approval_reconnect"]
     )
     try:
-        await server.control._event(_start_event(call))
-        store = server.runtime.opened.store
+        await server._control_for_test._event(_start_event(call))
+        store = server._runtime_for_test.opened.store
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
         decision = asyncio.create_task(
-            server.control.resolve_approval("approve", call.id)
+            server._control_for_test.resolve_approval("approve", call.id)
         )
         await _wait_thread_gate(gate)
-        status = server.control.pending_approvals_now(reconnect=True)
+        status = server._control_for_test.pending_approvals_now(reconnect=True)
         assert status == [
             {
-                **server.control._approvals.observe(
-                    server.control._approvals.state.records[call.id].request
+                **server._control_for_test._approvals.observe(
+                    server._control_for_test._approvals.state.records[call.id].request
                 ),
                 "resolution_pending": "approve",
             }
         ]
         with pytest.raises(ProtocolError) as competing:
-            await server.control.resolve_approval("deny", call.id)
+            await server._control_for_test.resolve_approval("deny", call.id)
         assert competing.value.code == -32006
         gate.release.set()
         await asyncio.wait_for(decision, 10)
@@ -2370,20 +2377,20 @@ async def test_approval_reconnect_status_bound_is_negotiated(tmp_path: Path) -> 
     try:
         after_seq = 0
         while True:
-            page = await server.runtime.opened.store.pending_approval_page(after_seq)
+            page = await server._runtime_for_test.opened.store.pending_approval_page(after_seq)
             for _request_id, tool_call in page.items:
-                await server.control._event(
+                await server._control_for_test._event(
                     _start_event(ToolCall.from_dict(dict(tool_call)))
                 )
             if page.next_seq is None:
                 break
             after_seq = page.next_seq
-        negotiated, truncated = server.control.pending_approvals_now(
+        negotiated, truncated = server._control_for_test.pending_approvals_now(
             reconnect=True, include_truncated=True
         )
         assert len(negotiated) == 64
         assert truncated is True
-        legacy = await server.control.pending_approvals()
+        legacy = await server._control_for_test.pending_approvals()
         assert len(legacy) == 65
         assert all("resolution_pending" not in item for item in legacy)
         assert first.id == negotiated[0]["request_id"]

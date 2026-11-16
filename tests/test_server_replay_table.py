@@ -134,7 +134,7 @@ async def _join(client: ReplayClient, session_id: str, request_id: int = 3) -> d
 async def _publish(server: ZetaServer, session_id: str, count: int = 1) -> None:
     for index in range(count):
         await await_or_fail(
-            server.control._notify(
+            server._control_for_test._notify(
                 EventDescriptor.TURN_START,
                 session_id,
                 data={"turn_id": f"turn-{index}"},
@@ -232,17 +232,17 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
     entered, release = asyncio.Event(), asyncio.Event()
     original = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release history read")
-        return await original(connection, callable, session_id=session_id)
+        return await original(connection, callable, controller)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(entered.wait(), what="history read entered")
-        assert server.runtime.state is not None
-        server.runtime.state.turn_started()
+        assert server._runtime_for_test.state is not None
+        server._runtime_for_test.state.turn_started()
         await _publish(server, session_id)
         release.set()
         response = await client.response(3)
@@ -260,8 +260,8 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
         assert event["seq"] == 1
     finally:
         release.set()
-        if server.runtime.state is not None:
-            server.runtime.state.turn_finished()
+        if server._runtime_for_test.state is not None:
+            server._runtime_for_test.state.turn_finished()
         await client.close()
         await server.close()
 
@@ -287,14 +287,14 @@ async def test_pending_approval_limit_waits_for_a_free_slot(tmp_path: Path) -> N
         await client.send(3, "send", {"text": "read all files"})
         admitted = [await client.event("approval_request") for _ in range(64)]
         admitted_ids = {request["request_id"] for request in admitted}
-        assert {item["request_id"] for item in server.control.pending_approvals_now()} == admitted_ids
+        assert {item["request_id"] for item in server._control_for_test.pending_approvals_now()} == admitted_ids
 
         first_id = admitted[0]["request_id"]
         denied = await client.request(4, "deny", {"request_id": first_id})
         assert denied["result"]["accepted"] is True
         next_request = await client.event("approval_request")
         assert next_request["request_id"] not in admitted_ids
-        assert len(server.control.pending_approvals_now()) == 64
+        assert len(server._control_for_test.pending_approvals_now()) == 64
 
         joined = await client.request(
             5, "session_history_and_subscribe", {"session_id": session_id}
@@ -692,10 +692,10 @@ async def _replacement(
     entered, release = asyncio.Event(), asyncio.Event()
     original_read = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release replacement history read")
-        return await original_read(connection, callable, session_id=session_id)
+        return await original_read(connection, callable, controller)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
@@ -826,7 +826,7 @@ async def _publication_routes(
     observed: list[dict[str, Any]] = []
     for index, descriptor in enumerate(ordinary, 1):
         await await_or_fail(
-            server.control._notify(descriptor, session_id, data={"route": index}),
+            server._control_for_test._notify(descriptor, session_id, data={"route": index}),
             what=f"publish {descriptor.value}",
         )
         observed.append(await client.event(descriptor.value))
@@ -935,8 +935,8 @@ async def _join_failure(tmp_path: Path, transport: Transport, monkeypatch: pytes
     assert server.connections is not None
     original = server.connections.run_read
 
-    async def fail(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
-        del connection, callable, session_id
+    async def fail(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
+        del connection, callable, controller
         raise RuntimeError("history read failed")
 
     # test-contract: seam make the off-loop history read fail with a non-protocol error
@@ -997,7 +997,7 @@ async def _join_during_swap(
     assert server.connections is not None
     swapped, resume = asyncio.Event(), asyncio.Event()
     read_entered, read_release = asyncio.Event(), asyncio.Event()
-    original_create = server.runtime.create_session
+    original_create = server._runtime_for_test.create_session
     original_read = server.connections.run_read
 
     async def gated_create(**kwargs: Any) -> Any:
@@ -1006,17 +1006,17 @@ async def _join_during_swap(
         await await_or_fail(resume.wait(), what="resume session swap")
         return result
 
-    async def gated_read(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated_read(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
         read_entered.set()
         await await_or_fail(read_release.wait(), what="release swap join read")
-        return await original_read(connection, callable, session_id=session_id)
+        return await original_read(connection, callable, controller)
 
     # test-contract: seam hold the swap after the runtime switched, before it finishes
-    monkeypatch.setattr(server.runtime, "create_session", gated_create)
+    monkeypatch.setattr(server._runtime_for_test, "create_session", gated_create)
     try:
         await controller.send(6, "new_session", {"provider": "codex"})
         await await_or_fail(swapped.wait(), what="runtime switched session")
-        new_session = server.runtime.session_id
+        new_session = server._runtime_for_test.session_id
         assert new_session != old_session
         monkeypatch.setattr(server.connections, "run_read", gated_read)
         await observer.send(3, "session_history_and_subscribe", {"session_id": new_session})
@@ -1183,7 +1183,7 @@ async def _replay_only_backward_page(
     server, client, session_id = await _started(tmp_path, transport)
     try:
         for number in range(60):
-            server.runtime.opened.store.append_message(
+            server._runtime_for_test.opened.store.append_message(
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
                     MessageOrigin.USER,

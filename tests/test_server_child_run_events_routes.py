@@ -97,7 +97,7 @@ class Serve:
 
     @property
     def store(self) -> Any:
-        return self.server.runtime.opened.store
+        return self.server._runtime_for_test.opened.store
 
     async def observer(self) -> ReplayClient:
         client = await connect_replay(self.server, self.transport)

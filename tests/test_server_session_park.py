@@ -84,7 +84,7 @@ async def _until(predicate: Callable[[], bool], what: str) -> None:
 
 
 async def _closed(server: ZetaServer, session_id: str) -> None:
-    await _until(lambda: session_id not in server.parking._parked, f"{session_id} closing")
+    await _until(lambda: server.parking.get(session_id) is None, f"{session_id} closing")
     await await_or_fail(server.parking.wait_closed(session_id), what=f"{session_id} closed")
 
 
@@ -131,14 +131,14 @@ async def test_new_session_parks_busy_turn_and_each_session_keeps_its_reply(
         client = await _open(server, FEATURES)
         await client.new()
         idle_swap_status = await client.call("status")
-        manager = server.runtime.manager
+        manager = server._runtime_for_test.manager
         a = await client.new()
         await client.call("send", {"text": "go"})
         await await_or_fail(backend.held[0].wait(), what="alpha-1 streamed")
 
         b = await client.new()  # without session_park: -32004
         assert b != a
-        assert server.runtime.manager is manager
+        assert server._runtime_for_test.manager is manager
         b_status = await client.call("status")
         assert b_status["project_context_health"] == idle_swap_status["project_context_health"]
         assert [row["session_id"] for row in b_status["parked_sessions"]] == [a]
@@ -188,7 +188,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
         await client.call("send", {"text": "write"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
         b = await client.new()
-        parked = server.parking._parked[a]
+        parked = server.parking.get(a).control
 
         backend.gates[0].set()
         await _until(parked.has_pending_approvals, "parked approval")
@@ -213,7 +213,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
             frame.get("params", {}).get("event") for frame in seen
         ]
         joined = await client.call("session_history_and_subscribe", {"session_id": a})
-        durable = await server.control.pending_approvals()
+        durable = await server._control_for_test.pending_approvals()
         request_id = joined["status"]["pending_approvals"][0]["request_id"]
         assert request_id == durable[0]["request_id"]
 
@@ -261,7 +261,7 @@ async def _parked_turn(server: ZetaServer, backend: GatedBackend, features: list
     await client.call("send", {"text": "go"})
     await await_or_fail(backend.held[0].wait(), what="A mid-reply")
     await client.new()
-    return client, a, server.parking._parked[a]
+    return client, a, server.parking.get(a).control
 
 
 async def _parked_changes(client: Client, until: str) -> list[dict[str, Any]]:
@@ -416,8 +416,8 @@ async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
                 resume.cancel()
         assert result["session"]["session_id"] == a
         assert "attached" not in result
-        assert server.control is not parked
-        assert server.runtime.opened.store.last_turn_end().data["reason"] == "completed"
+        assert server._control_for_test is not parked
+        assert server._runtime_for_test.opened.store.last_turn_end().data["reason"] == "completed"
     finally:
         close_gate.set()
         backend.open_all()
@@ -440,7 +440,7 @@ async def test_turn_ending_during_incoming_setup_closes_instead_of_parking(
         a = await client.new()
         await client.call("send", {"text": "go"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
-        outgoing = server.control
+        outgoing = server._control_for_test
         original_new_pair = server.new_pair
 
         def new_pair():

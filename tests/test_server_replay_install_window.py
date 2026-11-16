@@ -126,20 +126,20 @@ async def test_join_while_send_echo_is_held_sees_message_once(
     try:
         controller = await window.start()
         observer = await window.observer()
-        original = window.server.control.user_message
+        original = window.server._control_for_test.user_message
 
         async def held(*args: Any, **kwargs: Any) -> None:
             await window.held()
             await original(*args, **kwargs)
 
         # test-contract: seam hold the echo after its delivery row installed
-        window.server.control.user_message = held  # type: ignore[method-assign]
+        window.server._control_for_test.user_message = held  # type: ignore[method-assign]
         send = asyncio.create_task(
             controller.request(3, "send", {"text": "marker-text", "delivery_id": "d-1"})
         )
         await await_or_fail(window.entered.wait(), what="delivery row installed")
         if mode == "after_newer_row":
-            window.server.runtime.opened.store.append_task_notification(
+            window.server._runtime_for_test.opened.store.append_task_notification(
                 task_id="newer", command="true", exit_code=0
             )
         if mode == "during_join":
@@ -213,7 +213,7 @@ async def test_background_terminal_card_reaches_each_stream_once(
         controller = await window.start()
         early = await window.observer()
         late = await window.observer()
-        control = window.server.control
+        control = window.server._control_for_test
         original = control._event
         held_ids: list[str] = []
 
@@ -265,7 +265,7 @@ async def test_join_while_delegated_approval_request_is_held_sees_it_once(
     try:
         controller = await window.start()
         observer = await window.observer()
-        store = window.server.runtime.opened.store
+        store = window.server._runtime_for_test.opened.store
         original = store.append_approval_history_async
 
         async def gated(payload: Any) -> Any:
@@ -300,7 +300,7 @@ async def test_join_while_approval_request_is_held_sees_it_once(
     try:
         controller = await window.start()
         observer = await window.observer()
-        control = window.server.control
+        control = window.server._control_for_test
         original = control._start_approval
 
         async def gated(*args: Any, **kwargs: Any) -> None:
@@ -329,10 +329,10 @@ async def test_join_while_receipt_is_held_sees_it_once(tmp_path: Path, transport
     try:
         controller = await window.start()
         observer = await window.observer()
-        notification = window.server.runtime.opened.store.append_agent_notification(
+        notification = window.server._runtime_for_test.opened.store.append_agent_notification(
             "child-done", child_session_path="/tmp/child", description="child", status="completed", text="done"
         )
-        control = window.server.control
+        control = window.server._control_for_test
         original = control._event
 
         async def gated(event: Any, **kwargs: Any) -> None:

@@ -25,7 +25,8 @@ def history_features(features: frozenset[str] | set[str]) -> frozenset[str]:
 
 
 async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> object:
-    """Validate and atomically join a client's session history stream."""
+    """Validate and atomically join a client's session history stream; the
+    request selects its one record here, after the params are valid."""
     connections = client.server.connections
     try:
         if (
@@ -44,7 +45,15 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 "session_history_and_subscribe requires session_id and a complete cursor",
             )
         session_id = params["session_id"]
-        if client.server.runtime.session_id != session_id:
+        selected = client.server.controllers.selected(
+            client,
+            session_id,
+            # the legacy join text while no session is attached
+            unattached_error=ProtocolError(
+                ErrorDescriptor.INTERNAL_ERROR, "server has no active session"
+            ),
+        )
+        if selected.runtime.session_id != session_id:
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION,
                 "session is not active",
@@ -53,9 +62,9 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
         # at server/runtime.py `_replace` ONLY after `_run_setup` -> compose_runtime
         # -> recovery returns, so a join cannot read the store mid-recovery. The
         # session_replay area is owned by lead :1 (#1175); keep edits minimal.
-        await connections.begin_replay_join(client, ReplayScopeId.top(session_id))
+        await connections.begin_replay_join(client, ReplayScopeId.top(session_id), selected)
         read = await connections.read_replay_history(
-            client, session_id, params.get("history_validator")
+            client, selected, session_id, params.get("history_validator")
         )
         return connections.finish_replay_join(client, *read)
     except BaseException:
@@ -127,6 +136,8 @@ class PendingReplayJoin:
     stream_id: str
     reset_generation: int
     status: dict[str, object]
+    # the session record the join selected; its stream reads that record's store
+    controller: Any
     frames: list[HeldFrame] = field(default_factory=list)
     frontier: Frontier | None = None
     stale: bool = False
@@ -137,6 +148,7 @@ class _Subscription:
     scope: ReplayScopeId
     stream_id: str
     frontier: Frontier
+    controller: Any
 
 
 class _Decision:
@@ -205,6 +217,11 @@ class SessionReplay:
     def scope_for(self, connection: Any) -> ReplayScopeId | None:
         state = self._subscriptions.get(connection) or self._pending.get(connection)
         return None if state is None else state.scope
+
+    def controller_for(self, connection: Any) -> Any:
+        """The session record the connection's stream or join selected."""
+        state = self._subscriptions.get(connection) or self._pending.get(connection)
+        return None if state is None else state.controller
 
     def is_pending(self, connection: Any) -> bool:
         return connection in self._pending
@@ -310,6 +327,7 @@ class SessionReplay:
         scope: ReplayScopeId,
         reset_generation: int,
         status: dict[str, object],
+        controller: Any,
     ) -> PendingReplayJoin:
         self.connection_closed(connection)
         pending = PendingReplayJoin(
@@ -318,6 +336,7 @@ class SessionReplay:
             secrets.token_urlsafe(9),
             reset_generation,
             status,
+            controller,
         )
         self._next_sequences[connection] = 1
         self._pending[connection] = pending
@@ -376,7 +395,7 @@ class SessionReplay:
                 "replay continuity was invalidated",
             )
         self._subscriptions[connection] = _Subscription(
-            pending.scope, pending.stream_id, pending.frontier
+            pending.scope, pending.stream_id, pending.frontier, pending.controller
         )
 
     def mark_pending_stale(self, connection: Any) -> None:

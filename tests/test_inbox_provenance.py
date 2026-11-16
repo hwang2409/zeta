@@ -163,7 +163,7 @@ async def _run_rpc_route(
             assert result["untrusted"] is (expected_authority != "trusted_assignment")
         if epoch >= 7 and case in {"delegated", "revoked"}:
             live_inbox = ProjectInbox(
-                server.runtime.manager.project_registry, sessions_root=home / "sessions"
+                server._runtime_for_test.manager.project_registry, sessions_root=home / "sessions"
             )
             claimed = await asyncio.to_thread(
                 live_inbox.claim, recipient_project_id, message_id, session_id
