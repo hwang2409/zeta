@@ -92,10 +92,13 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
             return
 
     class RedirectedHandler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):
+        def _ok(self):
             redirected.set()
             self.send_response(200)
             self.end_headers()
+
+        do_GET = _ok
+        do_POST = _ok
 
         def log_message(self, *_args):
             return
