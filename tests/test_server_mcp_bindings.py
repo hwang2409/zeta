@@ -126,6 +126,8 @@ class LocalMCP:
         self.request_after_detach = asyncio.Event()
         # when set, tools/call answers only after this event.
         self.call_gate: asyncio.Event | None = None
+        # when set, tools/call answers with this HTTP error after the gate.
+        self.call_error: bytes | None = None
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> int:
@@ -209,6 +211,12 @@ class LocalMCP:
                 self.tool_called.set()
                 if self.call_gate is not None:
                     await asyncio.wait_for(self.call_gate.wait(), TIMEOUT)
+                if self.call_error is not None:
+                    writer.write(
+                        b"HTTP/1.1 " + self.call_error + b"\r\ncontent-length: 0\r\n\r\n"
+                    )
+                    await writer.drain()
+                    return
                 result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
             else:
                 result = {}
