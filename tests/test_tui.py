@@ -11825,12 +11825,10 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
     )
 
     app._submit_input("approve the plan")
-
-    async def turn_done() -> None:
-        while not backend.calls or app._active_task is None or not app._active_task.done():
-            await asyncio.sleep(0)
-
-    await await_or_fail(turn_done(), what="prompt turn")
+    # The pipeline consumer starts the turn task on its next loop step.
+    await asyncio.sleep(0)
+    assert app._active_task is not None
+    await await_or_fail(app._active_task, what="prompt turn")
 
     # The words reach the model as a prompt. The new turn closes the open
     # request of the turn that is over, as an abort, never as an approval.
