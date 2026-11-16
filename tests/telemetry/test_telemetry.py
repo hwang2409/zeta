@@ -109,6 +109,10 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
     redirected_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectedHandler)
+    server.daemon_threads = True
+    redirected_server.daemon_threads = True
+    server.block_on_close = False
+    redirected_server.block_on_close = False
     thread = threading.Thread(target=server.serve_forever)
     redirected_thread = threading.Thread(target=redirected_server.serve_forever)
     thread.start()
