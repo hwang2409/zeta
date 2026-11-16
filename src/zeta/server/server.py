@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import stat
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -615,12 +616,19 @@ class _Client:
         self._transport_failed = False
         self._read_buffer = bytearray()
         self.codec = FrameCodec()
+        # Diagnostics for a wedged controller slot (no behavior change):
+        # the request this connection is running, its run task, and a once-per
+        # holder flag so a refusal log fires at most once for this connection.
+        self._request: tuple[str, str | int, float] | None = None
+        self._run_task: asyncio.Task[object] | None = None
+        self._stuck_holder_reported = False
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.runtime, codec=self.codec
         )
 
     async def run(self) -> None:
         graceful = True
+        self._run_task = asyncio.current_task()
         try:
             while True:
                 line = await self._read_frame()
@@ -641,6 +649,7 @@ class _Client:
                         break
                     continue
                 request_id = request["id"]
+                self._request = (request["method"], request_id, time.monotonic())
                 try:
                     result = await self._dispatch(
                         request_id, request["method"], request["params"]
@@ -731,6 +740,7 @@ class _Client:
                     ):
                         for control in self.server.controls():
                             await control.controller_ready(reconnect=True)
+                self._request = None
                 if not self.handshaken:
                     break
         finally:
@@ -768,6 +778,17 @@ class _Client:
         except ConnectionError:
             # A failed write to a gone peer stores its error in the reader; that is EOF.
             return b""
+
+    def peer_closed(self) -> bool:
+        """Best-effort: has this connection's peer gone away (EOF / transport lost)?
+
+        A heuristic for diagnostics; a buffered unread frame can hide EOF on a
+        unix socket, which is acceptable here.
+        """
+        reader_peer_closed = getattr(self.reader, "peer_closed", None)
+        if reader_peer_closed is not None:  # WebSocketConnection adapter
+            return bool(reader_peer_closed())
+        return self.reader.at_eof() or self.writer.is_closing()
 
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""

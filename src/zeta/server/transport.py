@@ -24,6 +24,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.datastructures import MultipleValuesError
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
+from websockets.protocol import State
 
 from .protocol import MAX_FRAME_BYTES
 
@@ -220,6 +221,9 @@ class WebSocketConnection:
             await self._connection.close(1003)
             return b""
         return message.encode("utf-8") + b"\n"
+
+    def peer_closed(self) -> bool:
+        return self._connection.state in (State.CLOSING, State.CLOSED)
 
     def write(self, payload: bytes) -> None:
         if self._pending is not None:
