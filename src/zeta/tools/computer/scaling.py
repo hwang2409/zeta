@@ -12,6 +12,7 @@ The display point space is the global CoreGraphics space the backend acts in:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # Anthropic's XGA/WXGA guidance: keep screenshots at or below WXGA (1280x800).
@@ -59,7 +60,7 @@ def to_backend_point(geometry: ScreenGeometry, x: int, y: int) -> tuple[int, int
     display bounds so edge rounding never lands off-screen.
     """
 
-    if not (0 <= x <= geometry.image_width and 0 <= y <= geometry.image_height):
+    if not (0 <= x < geometry.image_width and 0 <= y < geometry.image_height):
         raise OutOfBounds(
             f"coordinate ({x}, {y}) is outside the "
             f"{geometry.image_width}x{geometry.image_height} screenshot"
@@ -68,9 +69,13 @@ def to_backend_point(geometry: ScreenGeometry, x: int, y: int) -> tuple[int, int
     point_y = geometry.origin_y + (y * geometry.frame_height / geometry.image_height) / geometry.scale
     max_x = geometry.origin_x + geometry.frame_width / geometry.scale
     max_y = geometry.origin_y + geometry.frame_height / geometry.scale
+    # Display bounds are half-open. Clamp after rounding to the largest integer
+    # point strictly below the exclusive edge, including negative origins.
+    last_x = math.ceil(max_x) - 1
+    last_y = math.ceil(max_y) - 1
     return (
-        round(min(max(point_x, geometry.origin_x), max_x)),
-        round(min(max(point_y, geometry.origin_y), max_y)),
+        min(max(round(point_x), geometry.origin_x), last_x),
+        min(max(round(point_y), geometry.origin_y), last_y),
     )
 
 

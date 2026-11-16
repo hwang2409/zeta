@@ -708,6 +708,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        # A child must capture its own desktop view before coordinate actions.
+        clone.computer_geometry = None
         # a child's cwd notice belongs in the child's transcript, not the parent's
         clone._cwd_recovery_notices = []
         clone.web_clients = SessionWebClients()

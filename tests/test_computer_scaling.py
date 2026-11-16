@@ -43,8 +43,12 @@ _BACKEND_CASES = [
     (ScreenGeometry(100, 100, 33, 33, 1.0, 0, 0), (10, 10), (30, 30)),
     # top-left corner maps to the origin
     (ScreenGeometry(2560, 1600, 1280, 800, 2.0, 100, 50), (0, 0), (100, 50)),
-    # bottom-right edge clamps to the display bound
-    (ScreenGeometry(2560, 1600, 1280, 800, 2.0, 100, 50), (1280, 800), (1380, 850)),
+    # last valid pixel stays inside the half-open display bounds
+    (ScreenGeometry(2560, 1600, 1280, 800, 2.0, 100, 50), (1279, 799), (1379, 849)),
+    # negative-origin display keeps its right and bottom edges exclusive
+    (ScreenGeometry(1280, 800, 1280, 800, 1.0, -1280, 0), (1279, 799), (-1, 799)),
+    # non-integer scale rounds, then clamps to the last integer point in bounds
+    (ScreenGeometry(1000, 800, 1000, 800, 1.25, -100, -20), (999, 799), (699, 619)),
 ]
 
 
@@ -55,7 +59,7 @@ def test_to_backend_point(
     assert to_backend_point(geometry, *model) == expected
 
 
-@pytest.mark.parametrize("x, y", [(-1, 0), (0, -1), (1281, 0), (0, 801)])
+@pytest.mark.parametrize("x, y", [(-1, 0), (0, -1), (1280, 0), (0, 800)])
 def test_to_backend_point_rejects_out_of_bounds(x: int, y: int) -> None:
     geometry = ScreenGeometry(2560, 1600, 1280, 800, 2.0, 0, 0)
     with pytest.raises(OutOfBounds):

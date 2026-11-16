@@ -67,7 +67,7 @@ def _point(
     field: str = "coordinate",
 ) -> tuple[int, int]:
     if geometry is None:
-        raise _BadAction("take a screenshot before issuing coordinate actions")
+        raise _BadAction("take a screenshot first")
     value = arguments.get(field)
     if (
         not isinstance(value, list)

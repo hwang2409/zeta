@@ -11,6 +11,7 @@ import pytest
 
 from zeta.agent.tool_results import validated_tool_result
 from zeta.config.settings import SETTINGS_FILENAME, load_settings, resolve
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall
 from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
@@ -124,6 +125,36 @@ async def test_missing_coordinate_is_a_clear_error(tmp_path: Path) -> None:
     assert result["isError"] is True
     assert "coordinate" in result["content"][0]["text"]
     assert backend.actions == [("screenshot", None)]
+
+
+@pytest.mark.asyncio
+async def test_child_registry_does_not_inherit_parent_screenshot(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    (tmp_path / "parent").mkdir()
+    parent = ToolRegistry(
+        tmp_path / "parent", skill_catalog=SkillCatalog.empty(), computer_enabled=True
+    )
+    child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
+    child: ToolRegistry | None = None
+    try:
+        parent.computer_backend = backend
+        await parent.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        child = parent.clone_for_session(child_store)
+        child_backend = FakeBackend()
+        child.computer_backend = child_backend
+        result = await child.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})
+        )
+        assert result["isError"] is True
+        assert result["content"][0]["text"] == "take a screenshot first"
+        assert child_backend.actions == []
+    finally:
+        if child is not None:
+            await child.close()
+        await parent.close()
+        child_store.close()
 
 
 @pytest.mark.asyncio
