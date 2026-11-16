@@ -1083,10 +1083,10 @@ class TUIApp(
                 self._open_model_picker(self.model_choices(), query=""),
             ),
             "/accounts": lambda: self._open_loading_picker(
-                "accounts", lambda: self.slash_accounts("")
+                "accounts", lambda: self._slash_commands.dispatch_async(self, command)
             ),
             "/remote": lambda: self._open_loading_picker(
-                "remote", lambda: self.slash_remote("")
+                "remote", lambda: self._slash_commands.dispatch_async(self, command)
             ),
         }.get(command)
         if (

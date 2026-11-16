@@ -182,14 +182,14 @@ class SlashHandlerMixin:
         )
 
     def _open_loading_picker(
-        self, name: str, load: Callable[[], Awaitable[str]]
+        self, name: str, load: Callable[[], Awaitable[Any]]
     ) -> None:
         """Own the picker keys from the Enter on, while the picker's rows load.
 
         Until the rows show, Esc stops the load and other picker keys do
         nothing: Enter would act on a row nobody has seen (switch an account,
-        attach a session). The load runs under the slash lock, as the command
-        did through the pipeline.
+        attach a session). ``load`` runs the command through the slash registry,
+        under the slash lock, as the pipeline did.
         """
 
         # A second picker command replaces a load still running.
@@ -200,13 +200,13 @@ class SlashHandlerMixin:
 
         async def run() -> None:
             try:
-                async with self.slash_lock.hold(f"/{name}"):
-                    output = await load()
+                output = await load()
             except Exception as exc:  # reported as the pipeline reports a slash failure
                 output = f"submission failed: {exc}"
             finally:
                 self._end_picker_load(asyncio.current_task())
-            self._handle_slash_output(output)
+            if isinstance(output, str):
+                self._handle_slash_output(output)
 
         self._picker_loading = self._open_overlay(lambda: True, run)
 
