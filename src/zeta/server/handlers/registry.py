@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from enum import Enum, auto
 from typing import Any
 
 from ...mcp import MCPManagementError, MCPToolRefreshError
@@ -24,16 +25,84 @@ from .run_work import cancel_background_task, list_run_work
 Handler = Callable[
     [object, str | int, dict[str, Any], SessionController | None], Awaitable[object]
 ]
-# reads of one named session: the handler selects that session's record itself
-_SELECTED_READS = frozenset({
-    MethodDescriptor.SESSION_TREE,
-    MethodDescriptor.SESSION_HISTORY,
-    MethodDescriptor.SESSION_HISTORY_AND_SUBSCRIBE,
-    MethodDescriptor.CHILD_RUN_HISTORY,
-    MethodDescriptor.CHILD_RUN_EVENTS,
-    MethodDescriptor.CHILD_RUN_LIST,
-    MethodDescriptor.PATH_COMPLETE,
-})
+
+
+class Resolve(Enum):
+    """Where a request resolves its one record."""
+
+    # session mutations: base runs the owned control's health check before the
+    # version and feature checks, so this resolve point keeps that error order
+    OWNED_FIRST = auto()
+    OWNED = auto()  # after version and feature checks
+    SELECTED = auto()  # once, at the handler's validated session_id
+    NONE = auto()  # global or sessionless: the handler gets None
+
+
+_O, _S, _N, _F = Resolve.OWNED, Resolve.SELECTED, Resolve.NONE, Resolve.OWNED_FIRST
+_M = MethodDescriptor
+RESOLVE: dict[MethodDescriptor, Resolve] = {
+    _M.LIST_SESSIONS: _N,
+    _M.NEW_SESSION: _O,
+    _M.RESUME: _O,
+    _M.SEND: _O,
+    _M.STEER: _O,
+    _M.APPROVE: _F,
+    _M.DENY: _F,
+    _M.ABORT: _F,
+    _M.STATUS: _O,
+    _M.RENAME_SESSION: _F,
+    _M.DELETE_SESSION: _O,
+    _M.REPAIR_TRANSCRIPT: _F,
+    _M.SESSION_TREE: _S,
+    _M.SESSION_HISTORY: _S,
+    _M.SESSION_HISTORY_AND_SUBSCRIBE: _S,
+    _M.CHILD_RUN_HISTORY: _S,
+    _M.CHILD_RUN_EVENTS: _S,
+    _M.CONTENT_READ: _O,
+    _M.SWITCH_BRANCH: _F,
+    _M.FORK_MESSAGE: _F,
+    _M.MODEL_CATALOG: _O,
+    _M.SESSION_SETTINGS: _O,
+    _M.SET_SETTINGS: _F,
+    _M.SET_COMPACTION: _F,
+    _M.SEND_IMAGES: _O,
+    _M.PATH_COMPLETE: _S,
+    _M.SLASH_LIST: _O,
+    _M.SLASH_RUN: _F,
+    _M.ACCOUNT_LIST: _O,
+    _M.ACCOUNT_LOGOUT: _O,
+    _M.ACCOUNT_REFRESH: _O,
+    _M.ACCOUNT_SWITCH: _O,
+    # controller writes take the owned control's wake hold, as on base
+    _M.LOGIN_START: _O,
+    _M.LOGIN_STATUS: _N,
+    _M.LOGIN_CANCEL: _O,
+    _M.LOGIN_PROVIDERS: _N,
+    _M.PING: _N,
+    _M.SET_TURN_CONTEXT: _F,
+    _M.LIST_PROJECTS: _N,
+    _M.PROJECT_SHOW: _N,
+    _M.PROJECT_MEMORY_LOG: _N,
+    _M.PROJECT_INBOX: _O,
+    _M.CLEAR_STEERING: _F,
+    _M.DELIVERY_STATUS: _O,
+    _M.SESSION_GRANTS: _O,
+    _M.REVOKE_SESSION_GRANTS: _F,
+    _M.RUN_WORK_LIST: _O,
+    _M.BACKGROUND_TASK_CANCEL: _F,
+    _M.CHILD_RUN_LIST: _S,
+    _M.CHILD_RUN_SEND: _O,
+    _M.MCP_REFRESH_TOOLS: _F,
+}
+if RESOLVE.keys() != set(MethodDescriptor) or any(
+    (RESOLVE[item] is Resolve.OWNED_FIRST) != (item.access is Access.SESSION_MUTATION)
+    or (
+        item.access in {Access.DELIVERY, Access.CONTROLLER_WRITE}
+        and RESOLVE[item] is not Resolve.OWNED
+    )
+    for item in MethodDescriptor
+):
+    raise RuntimeError("serve method resolve policies are not exhaustive")
 
 
 async def list_sessions(client, request_id, params, controller):
@@ -44,7 +113,7 @@ async def list_sessions(client, request_id, params, controller):
             {"method": "list_sessions"},
         )
     result, _ = await client.connections.run_read(
-        client, lambda: lifecycle.list_sessions(client, request_id, params, controller)
+        client, lambda: lifecycle.list_sessions(client, request_id, params)
     )
     return result
 
@@ -150,19 +219,7 @@ async def session_history(client, request_id, params, controller):
 
 
 async def session_history_and_subscribe(client, request_id, params, controller):
-    # the join validates params first, then selects through this one resolver
-    return await join_history_and_subscribe(
-        client,
-        params,
-        lambda session_id: client.server.controllers.selected(
-            client,
-            session_id,
-            # the legacy join text while no session is attached
-            unattached_error=ProtocolError(
-                ErrorDescriptor.INTERNAL_ERROR, "server has no active session"
-            ),
-        ),
-    )
+    return await join_history_and_subscribe(client, params)
 
 
 async def content_read(client, request_id, params, controller):
@@ -547,18 +604,17 @@ async def dispatch(
         raise ProtocolError(
             ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
         )
-    # one record per request: resolving raises nothing, so error precedence holds
+    policy = RESOLVE[descriptor]
+    if policy is not Resolve.OWNED_FIRST:
+        _require_negotiated(client, descriptor)
     controller = (
-        None if descriptor in _SELECTED_READS else client.server.controllers.owned(client)
+        client.server.controllers.owned(client)
+        if policy in {Resolve.OWNED_FIRST, Resolve.OWNED}
+        else None
     )
-    if descriptor.access is Access.SESSION_MUTATION:
+    if policy is Resolve.OWNED_FIRST:
         controller.control._reject_if_unhealthy()  # type: ignore[union-attr]
-    if descriptor.since is not None and tuple(
-        int(part) for part in client.protocol_version.split(".")  # type: ignore[attr-defined]
-    ) < tuple(int(part) for part in descriptor.since.split(".")):
-        raise protocol_error(descriptor)
-    if descriptor.feature is not None and descriptor.feature not in client.features:  # type: ignore[attr-defined]
-        raise feature_error(descriptor)
+        _require_negotiated(client, descriptor)
     if descriptor.access is Access.DELIVERY:
         assert controller is not None
         _require_attached_session(controller.runtime, params)
@@ -568,3 +624,12 @@ async def dispatch(
         with controller.control.hold_wake_start():  # type: ignore[attr-defined]
             return await HANDLERS[descriptor](client, request_id, params, controller)
     return await HANDLERS[descriptor](client, request_id, params, controller)
+
+
+def _require_negotiated(client: object, descriptor: MethodDescriptor) -> None:
+    if descriptor.since is not None and tuple(
+        int(part) for part in client.protocol_version.split(".")  # type: ignore[attr-defined]
+    ) < tuple(int(part) for part in descriptor.since.split(".")):
+        raise protocol_error(descriptor)
+    if descriptor.feature is not None and descriptor.feature not in client.features:  # type: ignore[attr-defined]
+        raise feature_error(descriptor)

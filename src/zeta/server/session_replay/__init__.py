@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -25,13 +24,9 @@ def history_features(features: frozenset[str] | set[str]) -> frozenset[str]:
     return frozenset(features)
 
 
-async def join_history_and_subscribe(
-    client: Any, params: dict[str, Any], select: Callable[[str], Any]
-) -> object:
-    """Validate and atomically join a client's session history stream.
-
-    ``select`` is the request's one resolver: it returns the record of the
-    validated session id."""
+async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> object:
+    """Validate and atomically join a client's session history stream; the
+    request selects its one record here, after the params are valid."""
     connections = client.server.connections
     try:
         if (
@@ -50,7 +45,14 @@ async def join_history_and_subscribe(
                 "session_history_and_subscribe requires session_id and a complete cursor",
             )
         session_id = params["session_id"]
-        selected = select(session_id)
+        selected = client.server.controllers.selected(
+            client,
+            session_id,
+            # the legacy join text while no session is attached
+            unattached_error=ProtocolError(
+                ErrorDescriptor.INTERNAL_ERROR, "server has no active session"
+            ),
+        )
         if selected.runtime.session_id != session_id:
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION,

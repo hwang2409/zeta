@@ -87,7 +87,7 @@ async def _session_swap(
             yield incoming
         except BaseException:
             if not incoming.control.attached:
-                await incoming.runtime.close()
+                await server.controllers.retire(incoming).runtime.close()
             raise
 
 
@@ -616,13 +616,13 @@ async def status(
 
 
 def list_sessions(
-    self, request_id: str | int, params: dict[str, Any], controller: SessionController
+    self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
-    return _list_sessions(self, request_id, params, controller)
+    return _list_sessions(self, request_id, params)
 
 
 def _list_sessions(
-    self, request_id: str | int, params: dict[str, Any], controller: SessionController
+    self, request_id: str | int, params: dict[str, Any]
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features
     for name in ("offset", "limit"):
@@ -635,11 +635,11 @@ def _list_sessions(
         assert self.projects is not None
         available = self.projects.project_sessions(params["project_id"])
     else:
-        available = controller.runtime.list_sessions()
+        available = self.server.manager.list_sessions_read_only()
     metadata = available[offset : None if limit is None else offset + limit]
     previews = {
         item.session_id: item
-        for item in controller.runtime.manager.list_session_previews(
+        for item in self.server.manager.list_session_previews(
             limit=len(metadata), sessions=metadata
         )
     }

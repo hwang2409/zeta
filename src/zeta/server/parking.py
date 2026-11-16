@@ -71,7 +71,7 @@ class ParkedPairs:
             self._controllers.park(self._controllers.record_for(outgoing))
             self.changed(outgoing)
         else:
-            self._close_pair(outgoing)
+            self._close_pair(self._controllers.retire(self._controllers.record_for(outgoing)))
 
     def changed(self, control: ServeControl) -> None:
         """Report this parked pair's state and close it once idle; a no-op for a
@@ -121,17 +121,20 @@ class ParkedPairs:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._controllers.parked_controls():
             session_id = control.runtime.session_id
-            self._controllers.remove(self._controllers.record_for(control))
+            record = self._controllers.retire(self._controllers.record_for(control))
             self._publish(
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
             )
             self._sent.pop(session_id, None)
-            self._close_pair(control, settlement_timeout)
+            self._close_pair(record, settlement_timeout)
 
     def _close_pair(
-        self, control: ServeControl, settlement_timeout: float | None = None
+        self, record: SessionController, settlement_timeout: float | None = None
     ) -> None:
+        """Close a record ``SessionControllers.retire`` already took out."""
+        assert record not in self._controllers.records()
+        control = record.control
         session_id = control.runtime.session_id
         control.closing = True  # no wake starts from here on
 
