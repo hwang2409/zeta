@@ -19,11 +19,18 @@ from zeta.tools.computer.helper_client import HelperClient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build-computer-helper.sh"
+HELPER_SOURCE = REPO_ROOT / "helpers" / "macos-computer" / "main.swift"
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("swiftc") is None, reason="swiftc not available"),
     pytest.mark.skipif(sys.platform != "darwin", reason="helper is macOS-only"),
 ]
+
+
+def test_cursor_position_uses_nearest_integer_rule() -> None:
+    source = HELPER_SOURCE.read_text()
+    assert 'Int(loc.x.rounded())' in source
+    assert 'Int(loc.y.rounded())' in source
 
 
 def test_helper_builds_and_answers_hello() -> None:

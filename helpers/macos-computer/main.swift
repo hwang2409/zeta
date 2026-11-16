@@ -344,11 +344,14 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         ]
     case "cursor_position":
         let loc = CGEvent(source: nil)?.location ?? .zero
-        return ["x": Int(loc.x), "y": Int(loc.y)]
+        // Use the same nearest-integer rule as all integer input coordinates.
+        return ["x": Int(loc.x.rounded()), "y": Int(loc.y.rounded())]
     case "screenshot":
         if screenIsLocked() { throw HelperError.locked }
         if !CGPreflightScreenCaptureAccess() {
-            throw HelperError.notPermitted("Screen Recording permission is required")
+            throw HelperError.notPermitted(
+                "Screen Recording permission is required; turn it on in System Settings > " +
+                "Privacy & Security, then retry. macOS can take up to a minute to apply it")
         }
         let display = (req["display"] as? Int) ?? 0
         let cap = try captureDisplay(display)

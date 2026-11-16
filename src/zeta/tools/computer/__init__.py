@@ -59,7 +59,6 @@ _ACTIONS = (
 _REFUSAL_REASON: dict[str, str] = {
     "locked": "the screen is locked",
     "secure_input": "a password field or secure input is active",
-    "not_permitted": "the helper lacks Screen Recording or Accessibility permission",
     "killed": "the kill switch is engaged; restart the helper to re-enable control",
 }
 

@@ -124,7 +124,7 @@ async def test_action_done_is_not_error_when_followup_screenshot_fails(
     text = result["content"][0]["text"]
     assert "left_click done" in text
     assert "screenshot failed" in text
-    assert "Screen Recording or Accessibility permission" in text
+    assert "screen recording denied" in text
     assert ("click", 10, 20, "left", 1) in backend.actions
 
 
