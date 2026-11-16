@@ -697,6 +697,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        # a child's cwd notice belongs in the child's transcript, not the parent's
+        clone._cwd_recovery_notices = []
         clone.web_clients = SessionWebClients()
         clone._agent_output_cache = OrderedDict()
         clone._agent_output_cache_chars = 0
