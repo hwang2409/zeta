@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...core.store import ConversationStore
+from ...core.store._history_index import HistoryIndexError
 from ...protocol.types import ToolCall
 
 if TYPE_CHECKING:
@@ -153,7 +154,7 @@ class _SubtreeDiscovery:
         self.found: dict[str, Path] = {}
         # Extracted data only: an open store pins descriptors, so holding one
         # per child made fds grow with the number of children (EMFILE).
-        self.snapshots: dict[str, _Snapshot | None] = {}
+        self.snapshots: dict[str, _Snapshot | Exception | None] = {}
         self.pending = [self.caller]
 
     def discover(self) -> dict[str, Path]:
@@ -187,23 +188,31 @@ class _SubtreeDiscovery:
         ):
             raise ValueError("unknown child handle")
 
-    def _snapshot(self, handle: str) -> _Snapshot | None:
-        if handle in self.snapshots:
-            return self.snapshots[handle]
-        path = _path_for(self.root_path, self.root_id, handle)
-        snapshot = None
-        if path is not None:
-            try:
-                store = _open_snapshot(path)
-            except (OSError, ValueError):
-                pass
-            else:
-                try:
-                    snapshot = _read_snapshot(store)
-                finally:
-                    store.close()
-        self.snapshots[handle] = snapshot
+    def _snapshot(self, handle: str, *, checking: bool = False) -> _Snapshot | None:
+        """Read one child once; an unreadable child only being checked is skipped."""
+        if handle not in self.snapshots:
+            self.snapshots[handle] = self._read_child(handle)
+        snapshot = self.snapshots[handle]
+        if isinstance(snapshot, Exception):
+            if checking:
+                return None
+            raise snapshot
         return snapshot
+
+    def _read_child(self, handle: str) -> _Snapshot | Exception | None:
+        path = _path_for(self.root_path, self.root_id, handle)
+        if path is None:
+            return None
+        try:
+            store = _open_snapshot(path)
+        except (OSError, ValueError):
+            return None
+        try:
+            return _read_snapshot(store)
+        except (HistoryIndexError, OSError, ValueError) as exc:
+            return exc
+        finally:
+            store.close()
 
     def _visit(self, parent: str, snapshot: _Snapshot) -> None:
         self._add_receipt_edges(parent, snapshot)
@@ -231,7 +240,7 @@ class _SubtreeDiscovery:
             handle = _started_child_handle(entry, parent=parent)
             if handle is None or not self._relevant(handle):
                 continue
-            child_snapshot = self._snapshot(handle)
+            child_snapshot = self._snapshot(handle, checking=True)
             marker = child_snapshot.parent_marker if child_snapshot else None
             if (
                 not isinstance(marker, dict)
@@ -276,7 +285,6 @@ class _SubtreeDiscovery:
             self.found[handle] = path
             if _direct_child(parent, handle):
                 self.pending.append(handle)
-
 
     def _relevant(self, handle: str) -> bool:
         """Checked before any child open, so one handle never reads its siblings."""
