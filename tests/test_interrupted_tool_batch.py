@@ -150,7 +150,9 @@ async def _die_at_beta_approval(
         shutil.copytree(root, dead)
     finally:
         turn.cancel()
-        await asyncio.gather(turn, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(turn, return_exceptions=True), what="dead turn cancel"
+        )
         await loop.close()
         await registry.close()
         store.close()
