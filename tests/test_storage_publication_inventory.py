@@ -40,6 +40,7 @@ _DURABILITY_CALLBACKS = {
     ("remote_sync/project_publish.py", "_publish_payloads", "atomic_publish_file"),
     ("remote_sync/project_publish.py", "_publish_side_files", "atomic_publish_file"),
     ("runtime/loop/persistence.py", "_persist", "write_json_file"),
+    ("extensions/trust.py", "_write", "atomic_publish_file"),
 }
 
 # Raw replace/rename sites are classified so a newly named direct writer cannot

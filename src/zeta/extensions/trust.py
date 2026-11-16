@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from ..core.session_files import atomic_publish_file
 from .manifest import MANIFEST_FILENAME, ExtensionManifestError, parse_manifest
 
 TRUST_FILENAME = "extensions-trust.json"
@@ -46,9 +47,12 @@ def _read(path: Path) -> dict[str, str]:
 
 def _write(path: Path, values: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(values, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    payload = (json.dumps(values, indent=2, sort_keys=True) + "\n").encode()
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        atomic_publish_file(directory_fd, path.name, payload)
+    finally:
+        os.close(directory_fd)
 
 
 def trust_path(home: str | Path) -> Path:
