@@ -914,7 +914,7 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
     try:
         created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         session_id = created[-1]["result"]["session"]["session_id"]
-        _evict_delivery(first.runtime.opened.store, "restart-old")
+        _evict_delivery(first._runtime_for_test.opened.store, "restart-old")
     finally:
         await close_serve(first, writer)
 
@@ -1119,7 +1119,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
             {"delivery_id": "restart-steer"},
         )
         assert status[-1]["result"]["status"] == "dropped"
-        delivery = resumed.runtime.opened.store.client_delivery("restart-steer")
+        delivery = resumed._runtime_for_test.opened.store.client_delivery("restart-steer")
         assert delivery.reason == "restart"
         history = await _request(
             reader,
@@ -1524,14 +1524,14 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             {"delivery_id": "dispatch-steer"},
         )
         assert status[-1]["result"]["status"] == "dropped"
-        delivery = resumed.runtime.opened.store.client_delivery("dispatch-steer")
+        delivery = resumed._runtime_for_test.opened.store.client_delivery("dispatch-steer")
         assert delivery.reason == "restart"
         assert all(
             not any(
                 isinstance(block, TextContent) and block.text == "later"
                 for block in message.content
             )
-            for message in branch_messages(resumed.runtime.opened.store)
+            for message in branch_messages(resumed._runtime_for_test.opened.store)
         )
     finally:
         await close_serve(resumed, writer)

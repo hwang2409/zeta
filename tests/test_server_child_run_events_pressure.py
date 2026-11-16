@@ -689,7 +689,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
     async with _serve(tmp_path, transport) as (first, _client, session_id, stores):
         assert first.connections is not None
         first_sink = first.connections.child_runs.sink
-        root = first.runtime.opened.store
+        root = first._runtime_for_test.opened.store
         ended = await _start_child(first, stores, f"{session_id}:1")
         running = await _start_child(first, stores, f"{session_id}:2")
         running.update_agent_lifecycle(current_step="before restart")
@@ -716,7 +716,7 @@ async def test_restart_registers_the_projection_before_children_and_reads_durabl
     try:
         assert second.connections is not None
         at_start = (
-            second.runtime.opened is None,
+            second._runtime_for_test.opened is None,
             second.connections.child_runs.sink in agent_progress._sinks,
         )
         client = await connect_replay(second, transport)

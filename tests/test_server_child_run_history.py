@@ -346,7 +346,7 @@ async def test_child_history_reads_closed_child_after_serve_restart(tmp_path: Pa
     resumed = ZetaServer(
         provider="codex", home=tmp_path, socket_path=short_socket_path(tmp_path), approval_reconnect_grace=0
     )
-    await resumed.runtime.resume_session(session_id)
+    await resumed._runtime_for_test.resume_session(session_id)
     await resumed.start()
     new_reader, new_writer = await asyncio.open_unix_connection(str(resumed.socket_path))
     try:
@@ -1011,9 +1011,9 @@ async def test_closed_child_history_ends_every_child_started(
         # though the closed store's generation never changes. The child is seeded
         # after resume so the live runtime's crash recovery does not finalize the
         # grandchild.
-        lease = resumed.runtime.opened.store._storage_lease
+        lease = resumed._runtime_for_test.opened.store._storage_lease
         pend_child, pend_gc, pend_child_id, pend_gc_id = await _seed_nested(
-            resumed.runtime.opened.store, session_id, "2", lease=lease
+            resumed._runtime_for_test.opened.store, session_id, "2", lease=lease
         )
         req_id = 4
         if route == "warm":
@@ -1043,7 +1043,7 @@ async def test_closed_child_history_ends_every_child_started(
         req_id += 1
 
         finished = await asyncio.to_thread(ConversationStore,
-            resumed.runtime.opened.store.session_dir / "agents" / "2" / "agents",
+            resumed._runtime_for_test.opened.store.session_dir / "agents" / "2" / "agents",
             session_id="1",
             _storage_lease=lease,
         )
