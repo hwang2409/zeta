@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from zeta.core.commands.slash_registry import SlashLock, SlashSurface
+from zeta.core.slash import create_slash_registry
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
@@ -104,6 +106,8 @@ def test_manifest_parse_good_and_bad() -> None:
         parse_manifest(_manifest("ok") + 'typo_key = true\n')
     with pytest.raises(ExtensionManifestError):
         parse_manifest('[extension]\nname = "ok"\nversion = "1"\nentry = "m"\n')
+    with pytest.raises(ExtensionManifestError):
+        parse_manifest(_manifest("ok") + "load_in_children = true\n")
 
 
 @pytest.mark.asyncio
@@ -319,3 +323,31 @@ async def test_invalid_utf8_manifest_fails_open(tmp_path: Path) -> None:
         )
         assert "ext_echo" in registry.registered_names
         assert any("cannot read manifest" in notice for notice in host.notices)
+
+@pytest.mark.asyncio
+async def test_extension_commands_run_on_tui_and_serve_registries(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = '''
+def activate(zx):
+    async def greet(args):
+        return f"hello {args}"
+    zx.register_command("greet", description="greet", handler=greet)
+    zx.register_command("prompt", description="prompt", body="do $ARGUMENTS")
+'''
+    _write_extension(home / "extensions", "commands", source=source)
+    async with _open_registry(tmp_path) as tools:
+        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        tui = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
+        serve = create_slash_registry(
+            skill_catalog=SkillCatalog.empty(), surface=SlashSurface.SERVE, extensions=host
+        )
+        assert "/greet" in {f"/{name}" for name, _description, _source in tui.completion_entries}
+        assert "/greet" in {f"/{name}" for name, _description, _source in serve.completion_entries}
+        assert "/ext" in {f"/{name}" for name, _description, _source in serve.completion_entries}
+
+        class Session:
+            slash_lock = SlashLock()
+
+        assert await tui.dispatch_async(Session(), "/greet world") == "hello world"
+        assert await serve.dispatch_async(Session(), "/greet serve") == "hello serve"
+        assert "commands" in (await serve.dispatch_async(Session(), "/ext info commands"))

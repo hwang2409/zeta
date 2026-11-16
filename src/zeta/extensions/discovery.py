@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import sys
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -207,7 +206,7 @@ def _import_entry(
         raise ImportError(f"could not build import spec for {entry_path}")
     module = importlib.util.module_from_spec(spec)
     module.__package__ = entry_package
-    sys.modules[entry_full] = module
+    host.register_module(pkg_name, manifest.entry_module, module)
     try:
         spec.loader.exec_module(module)
     except BaseException:

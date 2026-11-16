@@ -39,6 +39,15 @@ class _ToolDeclaration:
     kwargs: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandDeclaration:
+    name: str
+    description: str
+    handler: Any
+    body: str | None
+    kind: str
+
+
 class LoadingExtension:
     """One extension while its ``activate`` runs; collects declarations."""
 
@@ -47,6 +56,7 @@ class LoadingExtension:
         self.scope = scope
         self.directory = directory
         self._tools: list[_ToolDeclaration] = []
+        self._commands: list[_CommandDeclaration] = []
 
     def declare_tool(
         self,
@@ -72,9 +82,18 @@ class LoadingExtension:
             kwargs["actions"] = actions
         self._tools.append(_ToolDeclaration(name, handler, kwargs))
 
+    def declare_command(
+        self, name: str, description: str, handler: Any, body: str | None, kind: str
+    ) -> None:
+        self._commands.append(_CommandDeclaration(name, description, handler, body, kind))
+
     @property
     def declarations(self) -> tuple[_ToolDeclaration, ...]:
         return tuple(self._tools)
+
+    @property
+    def command_declarations(self) -> tuple[_CommandDeclaration, ...]:
+        return tuple(self._commands)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +105,7 @@ class LoadedExtension:
     scope: str
     directory: Path
     tool_names: tuple[str, ...]
+    command_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +140,8 @@ class ExtensionHost:
         self.notices: list[str] = []
         self.warnings: list[str] = []
         self._packages: dict[str, Path] = {}
+        self._command_declarations: dict[str, tuple[_CommandDeclaration, ...]] = {}
+        self._disabled: set[str] = set()
         self._closed = False
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
@@ -135,6 +157,12 @@ class ExtensionHost:
         sys.modules[package] = module
         self._packages[package] = directory
         return package, module
+
+    def register_module(self, package: str, name: str, module: types.ModuleType) -> None:
+        """Register an imported entry module under a host-owned namespace."""
+        if package not in self._packages:
+            raise ValueError(f"unknown extension package: {package}")
+        sys.modules[f"{package}.{name}"] = module
 
     def remove_package_for_directory(self, directory: Path) -> None:
         for package, package_directory in tuple(self._packages.items()):
@@ -182,6 +210,7 @@ class ExtensionHost:
                     f"extensions · {extension.scope} extension tool '{name}' from "
                     f"{display} shadows {shadow}"
                 )
+        self._command_declarations[extension.manifest.name] = extension.command_declarations
         self.loaded.append(
             LoadedExtension(
                 name=extension.manifest.name,
@@ -189,8 +218,28 @@ class ExtensionHost:
                 scope=extension.scope,
                 directory=extension.directory,
                 tool_names=tuple(added),
+                command_names=tuple(item.name for item in extension.command_declarations),
             )
         )
+
+    @property
+    def disabled(self) -> frozenset[str]:
+        return frozenset(self._disabled)
+
+    def set_enabled(self, name: str, enabled: bool) -> None:
+        if enabled:
+            self._disabled.discard(name)
+        else:
+            self._disabled.add(name)
+
+    def loaded_declarations(self, name: str) -> tuple[_CommandDeclaration, ...]:
+        return self._command_declarations.get(name, ())
+
+    def register_commands(self, registry: Any) -> None:
+        """Add activated extension commands to a shared slash registry."""
+        from .commands import register_commands
+
+        register_commands(registry, self)
 
     def _shadow_phrase(self, name: str) -> str | None:
         if name in self._builtin_names:
