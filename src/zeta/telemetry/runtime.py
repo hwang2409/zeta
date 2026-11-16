@@ -9,9 +9,11 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
+from typing import Self
 from urllib.parse import urlsplit
 
 from . import TelemetryError, TelemetryStatus
+from .attributes import RESERVED_CONTENT_ATTRIBUTES
 
 
 # This is the single owner of the loopback endpoint policy.
@@ -20,6 +22,9 @@ def validate_loopback_endpoint(endpoint: str) -> str:
         parsed = urlsplit(endpoint)
         host = parsed.hostname
         address = ipaddress.ip_address(host) if host else None
+        port = parsed.port
+        if port is not None and not 0 <= port <= 65535:
+            raise ValueError
         if (
             parsed.scheme not in {"http", "https"}
             or address is None
@@ -49,6 +54,34 @@ class StatusCell:
     def read(self) -> str | None:
         with self._lock:
             return self._values.pop() if self._values else None
+
+
+class _SpanHandle:
+    def __init__(self, scope: object) -> None:
+        self._scope = scope
+        self._span: object | None = None
+
+    def __enter__(self) -> Self:
+        self._span = self._scope.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self._scope.__exit__(*args)
+
+    def set_attribute(self, name: str, value: object) -> None:
+        if name not in RESERVED_CONTENT_ATTRIBUTES:
+            self._span.set_attribute(name, value)
+
+    def add_event(self, name: str, attributes: Mapping[str, object] | None = None) -> None:
+        safe = {key: value for key, value in (attributes or {}).items() if key not in RESERVED_CONTENT_ATTRIBUTES}
+        self._span.add_event(name, attributes=safe)
+
+    def record_exception(self, exception: BaseException) -> None:
+        self.set_attribute("error.type", type(exception).__name__)
+
+    def set_error(self, error_type: str | None = None) -> None:
+        if error_type is not None:
+            self.set_attribute("error.type", error_type)
 
 
 class _Exporter:
@@ -114,7 +147,8 @@ class _Runtime:
         from opentelemetry.trace import SpanKind
 
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
-        return self._tracer.start_as_current_span(name, kind=span_kind, attributes=dict(attributes or {}))
+        safe_attributes = {key: value for key, value in (attributes or {}).items() if key not in RESERVED_CONTENT_ATTRIBUTES}
+        return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes))
 
     def current_trace_context(self) -> dict[str, str]:
         carrier: dict[str, str] = {}
@@ -185,8 +219,10 @@ def configure(endpoint: str) -> _Runtime:
         max_attribute_length=4096,
         max_span_attribute_length=4096,
     )
+    from importlib.metadata import version
+
     provider = TracerProvider(
-        resource=Resource({"service.name": "zeta", "service.version": "0.1.0"}),
+        resource=Resource({"service.name": "zeta", "service.version": version("zeta")}),
         sampler=ParentBased(ALWAYS_ON),
         span_limits=limits,
     )
