@@ -309,6 +309,7 @@ class TUIApp(
         self._model_picker: ModelPicker | None = None
         self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
+        self._picker_loading: asyncio.Future[Any] | None = None
         self._accounts_picker_unit: Any = None
         self._account_switch_task: asyncio.Task[None] | None = None
         self._account_switch_pending = False
@@ -1064,11 +1065,18 @@ class TUIApp(
                 self._start_model_catalog_load(),
                 self._open_model_picker(self.model_choices(), query=""),
             ),
+            "/accounts": lambda: self._open_loading_picker(
+                "accounts", lambda: self.slash_accounts("")
+            ),
+            "/remote": lambda: self._open_loading_picker(
+                "remote", lambda: self.slash_remote("")
+            ),
         }.get(command)
         if (
             open_panel is None
             or not self._full_screen_active()
-            or self._remote_view is not None
+            # A remote view is read only; /remote still picks another session.
+            or (self._remote_view is not None and command != "/remote")
             # Behind a running slash command it waits its turn, as before.
             or self.slash_lock.holder is not None
             # /model answers that it cannot change the model now.

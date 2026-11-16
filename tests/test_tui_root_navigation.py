@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from io import StringIO
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application import create_app_session
@@ -27,6 +28,9 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
+from zeta.accounts.availability import AccountDisplay
+from zeta.accounts.registry import AccountId
+from zeta.accounts.session import AccountListSnapshot
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -38,6 +42,8 @@ from zeta.protocol.types import (
     ToolResult,
     ToolUseContent,
 )
+from zeta.remote.client import RemoteSessionClient
+from zeta.remote.discovery import RemoteSession
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -574,6 +580,8 @@ class Opener:
     escapes: int
     # The state once Enter on an empty query is taken.
     empty_accepted: Callable[[Driver], bool]
+    # Fakes the overlay's slow source before the keys (remote hosts, accounts).
+    setup: Callable[[TUIApp, pytest.MonkeyPatch], None] = lambda _app, _patch: None
 
 
 def _window_drawn(driver: Driver, window: object) -> bool:
@@ -596,6 +604,50 @@ def _panel(drawn: Callable[[Driver], bool]) -> dict:
 
 def _model_picker_closed(driver: Driver) -> bool:
     return not driver.app.model_picker_active and driver.session.default_buffer.text == ""
+
+
+def _fake_remote_hosts(_app: TUIApp, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = (
+        RemoteSession("lab", "a1", "alpha", None),
+        RemoteSession("lab", "b2", "beta", None),
+    )
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return rows, ()
+
+    async def attach(_client: object, _host: str, _session: object) -> None:
+        raise ValueError("test: attach is not available")
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+
+
+def _fake_accounts(app: TUIApp, monkeypatch: pytest.MonkeyPatch) -> None:
+    accounts = (AccountId("codex", "work"), AccountId("codex", "home"))
+
+    async def list_snapshot() -> AccountListSnapshot:
+        return AccountListSnapshot(
+            tuple(AccountDisplay(account, account.name) for account in accounts),
+            {"codex": accounts[0]},
+            {"codex": accounts[0]},
+        )
+
+    context = SimpleNamespace(list_snapshot=list_snapshot, switching_unavailable=None)
+    monkeypatch.setattr(app.loop, "account_context", context, raising=False)
+
+
+def _loading_picker(active: Callable[[TUIApp], bool], setup: Callable) -> dict:
+    """A picker whose rows load first: Enter before they show must not pick one."""
+
+    def shown(driver: Driver) -> bool:
+        return active(driver.app) and driver.session.default_buffer.text == ""
+
+    return {
+        "drawn": lambda driver: driver.app._picker_active,
+        "accepted": shown,
+        "empty_accepted": shown,
+        "setup": setup,
+    }
 
 
 OPENERS = [
@@ -680,8 +732,7 @@ OPENERS = [
         Opener("/decisions" + ENTER, "zz", field=None, escapes=1, **_panel(_decisions_drawn)),
         id="/decisions",
     ),
-    # The model picker's keys are the arrows, Enter, and Esc; typed letters are
-    # the composer's by design, so it has no miss+enter case.
+    # The pickers' keys are the arrows, Enter, and Esc.
     pytest.param(
         Opener(
             "/model" + ENTER,
@@ -694,7 +745,29 @@ OPENERS = [
         ),
         id="/model",
     ),
+    pytest.param(
+        Opener(
+            "/accounts" + ENTER,
+            UP,
+            field=None,
+            escapes=1,
+            **_loading_picker(lambda app: app.accounts_picker_active, _fake_accounts),
+        ),
+        id="/accounts",
+    ),
+    pytest.param(
+        Opener(
+            "/remote" + ENTER,
+            UP,
+            field=None,
+            escapes=1,
+            **_loading_picker(lambda app: app.remote_picker_active, _fake_remote_hosts),
+        ),
+        id="/remote",
+    ),
 ]
+# Pickers leave typed letters to the composer by design: no miss+enter case.
+LETTERS_TO_COMPOSER = {"/model", "/accounts", "/remote"}
 MISS = "zzsettled"
 
 
@@ -723,7 +796,7 @@ OPENER_CASES = [
     for opener in OPENERS
     for phase in ("startup", "settled")
     for burst in ("word+enter", "miss+enter", "word+esc", "enter")
-    if not (opener.id == "/model" and burst == "miss+enter")
+    if not (opener.id in LETTERS_TO_COMPOSER and burst == "miss+enter")
 ]
 
 
@@ -745,6 +818,7 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
     backend = FakeBackend([])
     async with running_tui(copy, backend) as driver:
         app = driver.app
+        opener.setup(app, monkeypatch)
         if phase == "startup":
             assert app._startup_replay_active, "startup finished before the keys"
         else:
@@ -851,6 +925,38 @@ async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
         sent = [str(messages[-1].content) for messages, _tools in backend.calls]
         assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
         assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
+
+
+@pytest.mark.asyncio
+async def test_esc_while_a_picker_loads_stops_it(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    _fake_remote_hosts(None, monkeypatch)
+    loaded = RemoteSessionClient.discover
+    gate = asyncio.Event()
+
+    async def held_discover(client: object, hosts: object = None) -> tuple:
+        await await_or_fail(gate.wait(), what="remote discovery gate")
+        return await loaded(client, hosts)
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", held_discover)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await driver.until(lambda: app._picker_active, what="/remote opened nothing")
+            await driver.send(ESCAPE)
+            await driver.until(lambda: not app._picker_active, what="Esc did not stop the load")
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the load would have ended")
+        assert not app.remote_picker_active and driver.session.default_buffer.text == "", (
+            f"the picker opened after Esc; screen:\n{driver.screen()}"
+        )
 
 
 def _assert_pages_adjacent(driver: Driver, what: str) -> None:

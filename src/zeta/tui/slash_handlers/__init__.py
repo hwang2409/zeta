@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from prompt_toolkit.enums import EditingMode
+from rich.text import Text
 
 from ...accounts import (
     AccountError,
@@ -172,9 +174,42 @@ class SlashHandlerMixin:
 
     @property
     def _picker_active(self) -> bool:
-        return self.accounts_picker_active or self.model_picker_active or self.remote_picker_active
+        return (
+            self._picker_loading is not None
+            or self.accounts_picker_active
+            or self.model_picker_active
+            or self.remote_picker_active
+        )
+
+    def _open_loading_picker(
+        self, name: str, load: Callable[[], Awaitable[str]]
+    ) -> None:
+        """Own the picker keys from the Enter on, while the picker's rows load.
+
+        Until the rows show, Esc stops the load and other picker keys do
+        nothing: Enter would act on a row nobody has seen (switch an account,
+        attach a session).
+        """
+
+        presenter = self._screen_presenter()
+        unit = presenter.print_unit(Text(f"{name} · loading…", style=_theme.CHROME))
+
+        async def run() -> None:
+            try:
+                output = await load()
+            except Exception as exc:  # reported as the pipeline reports a slash failure
+                output = f"submission failed: {exc}"
+            finally:
+                presenter.transcript.remove(unit)
+                self._picker_loading = None
+                self._invalidate_prompt()
+            self._handle_slash_output(output)
+
+        self._picker_loading = self._open_overlay(lambda: True, run)
 
     def _picker_move(self, delta: int) -> None:
+        if self._picker_loading is not None:
+            return
         if self.accounts_picker_active:
             self.accounts_picker_move(delta)
         elif self.model_picker_active:
@@ -183,6 +218,8 @@ class SlashHandlerMixin:
             self.remote_picker_move(delta)
 
     def _picker_select(self) -> None:
+        if self._picker_loading is not None:
+            return
         if self.accounts_picker_active:
             self.accounts_picker_select()
         elif self.model_picker_active:
@@ -191,6 +228,9 @@ class SlashHandlerMixin:
             self.remote_picker_select()
 
     def _picker_cancel(self) -> None:
+        if self._picker_loading is not None:
+            self._picker_loading.cancel()
+            return
         if self.accounts_picker_active:
             self.accounts_picker_cancel()
         elif self.model_picker_active:
