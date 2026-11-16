@@ -1573,7 +1573,7 @@ async def test_legacy_status_bytes_match_main_from_resident_state(
         await _read_raw(reader)
         assert server._client is not None
         monkeypatch.setattr(
-            lifecycle, "session_snapshot", lambda client: {"session_id": "fixed"}
+            lifecycle, "session_snapshot", lambda client, controller: {"session_id": "fixed"}
         )
         expected = (
             Path(__file__).parent
@@ -1692,6 +1692,7 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
                     "model": server._runtime_for_test.metadata.model,
                     "approval_mode": "ask",
                 },
+                server.controllers.attached(),
             )
         assert error.value.code == -32004
     finally:
