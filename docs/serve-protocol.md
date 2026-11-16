@@ -1203,11 +1203,15 @@ grace with nobody back, cancels the turn as an immediate disconnect does:
 `served_turn_end` reason `disconnect`, and queued steers `dropped` with reason
 `disconnect`. When the turn ends inside the grace, the grace ends with it, so a
 later background wake is not cancelled. Tools of transient MCP bindings are
-detached at the disconnect as before, and the server never uses the gone
-client's headers again; a call already running at the disconnect returns an
-error result that says the client that provides the tool disconnected and may
-reconnect, and that the call was already sent, so it may or may not have taken
-effect. A call made during the grace waits instead: when a controller
+detached at the disconnect as before, and the server sends no new request with
+the gone client's headers. A call already sent to the MCP server at the
+disconnect keeps running on its old connection through the grace, also when a
+controller re-supplies the bindings, and returns the server's real result. If
+the grace deadline ends first, the call ends with an error result that says the
+client that provides the tool disconnected and may reconnect, and that the call
+was already sent, so it may or may not have taken effect; when the grace ends
+the turn, the call is cancelled with it. A call made during the grace waits
+instead: when a controller
 re-supplies the bindings with `hello` or `resume` (`resume_attach`), the call
 runs once with the new headers. The wait keeps the grace deadline that started
 at the disconnect, also after a `hello` takes the turn over without bindings.

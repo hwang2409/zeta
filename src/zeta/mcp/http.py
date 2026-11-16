@@ -110,6 +110,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self.capabilities: dict[str, object] | None = None
         self._next_id = 0
         self._closed = False
+        # sealed: requests already sent finish; nothing new is sent.
+        self._sealed = False
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
@@ -232,6 +234,14 @@ class StreamableHTTPMCPClient(MCPClient):
             return make_error_result(str(exc))
         return translate_call_result(result)
 
+    def seal(self) -> None:
+        """Send nothing new with these headers: stop the notification stream and
+        session recovery. Requests already sent keep running until ``close``."""
+        self._sealed = True
+        for task in (self._notification_task, self._session_recovery_task):
+            if task is not None:
+                task.cancel()
+
     async def close(self) -> None:
         if self._closed:
             return
@@ -305,7 +315,7 @@ class StreamableHTTPMCPClient(MCPClient):
         *,
         recover_session: bool = True,
     ) -> dict[str, object]:
-        if self._closed:
+        if self._closed or self._sealed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
         self._next_id += 1
         request_id = self._next_id
@@ -615,7 +625,7 @@ class StreamableHTTPMCPClient(MCPClient):
 
     async def _listen_notifications(self) -> None:
         delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-        while not self._closed:
+        while not (self._closed or self._sealed):
             session_id = None
             generation = self._session_generation
             try:
@@ -647,7 +657,7 @@ class StreamableHTTPMCPClient(MCPClient):
             else:
                 if healthy:
                     delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-            if self._closed:
+            if self._closed or self._sealed:
                 return
             await asyncio.sleep(delay)
             delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)

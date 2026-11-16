@@ -192,6 +192,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._binding_detached = False
         # calls made while detached wait in _requests (no task) until this ends.
         self._detached_hold: asyncio.Future[None] | None = None
+        # sealed clients of a detached binding whose sent calls still run.
+        self._draining: set[MCPClient] = set()
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
@@ -990,6 +992,16 @@ class MCPServerActor(MCPDefinitionPublisher):
     def _handle_call_finished(self, message: _CallFinished) -> None:
         self._children.discard(message.task)
         request = self._requests.pop(message.request.identifier, message.request)
+        if request.client in self._draining:
+            # sent before the binding left: the model gets the server's real answer.
+            _set_result(
+                request.result,
+                message.result
+                if message.result is not None
+                else _detached_result(self.name, started=True),
+            )
+            self._close_drained_clients()
+            return
         if isinstance(message.error, asyncio.CancelledError):
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -1035,6 +1047,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             request.task.cancel()
         self._requests.pop(message.identifier, None)
         self._resource_requests.pop(message.identifier, None)
+        self._close_drained_clients()
         _set_result(message.acknowledged, None)
 
     async def _handle_suspend(self, message: _Suspend) -> None:
@@ -1046,7 +1059,21 @@ class MCPServerActor(MCPDefinitionPublisher):
             self._finish_cancelled(operation)
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
-        for request in self._requests.values():
+        client = self._client
+        # under a hold, a call already sent keeps running on its sealed client
+        # and returns its real result; the client closes when it ends.
+        sent: dict[int, _CallRequest | _PromptRequest] = {}
+        if message.hold is not None:
+            sent = {
+                identifier: request
+                for identifier, request in self._requests.items()
+                if isinstance(request, _CallRequest)
+                and request.task is not None
+                and request.client is not None
+            }
+        for identifier, request in self._requests.items():
+            if identifier in sent:
+                continue
             if request.task is not None:
                 request.task.cancel()
             if isinstance(request, _CallRequest):
@@ -1056,10 +1083,13 @@ class MCPServerActor(MCPDefinitionPublisher):
                 )
             else:
                 cancel_prompt_request(request, self.name)
-        self._requests.clear()
+        self._requests = sent
+        for request in sent.values():
+            assert request.client is not None
+            self._seal(request.client)
+        self._close_drained_clients()
         cancel_terminated_resources(self)
         await self._tool_refresh.close()
-        client = self._client
         self._client = None
         self._tools = ()
         self._prompts = ()
@@ -1067,7 +1097,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         # hidden, not removed: a call the model already chose gets the detached
         # result rather than "unknown tool" until the client re-attaches.
         self._unregister_tools(keep_primary=True)
-        if client is not None:
+        if client is not None and client not in self._draining:
             await self._schedule_close(client)
         if self._scheduled_closes:
             await asyncio.gather(
@@ -1108,6 +1138,15 @@ class MCPServerActor(MCPDefinitionPublisher):
         for request in self._held_calls():
             self._requests.pop(request.identifier)
             _set_result(request.result, _detached_result(self.name))
+        # no client came back: a call still running on its old client ends as
+        # it would have at the disconnect.
+        for request in list(self._requests.values()):
+            if isinstance(request, _CallRequest) and request.client in self._draining:
+                self._requests.pop(request.identifier)
+                _set_result(request.result, _detached_result(self.name, started=True))
+                if request.task is not None:
+                    request.task.cancel()
+        self._close_drained_clients()
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
@@ -1164,6 +1203,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()
+        self._close_drained_clients()
         cancel_terminated_resources(self)
         self._prompts = ()
         self._unregister_tools()
@@ -1281,6 +1321,25 @@ class MCPServerActor(MCPDefinitionPublisher):
             return
         if outcome.client is not None:
             self._schedule_close(outcome.client)
+
+    def _seal(self, client: MCPClient) -> None:
+        if client in self._draining:
+            return
+        self._draining.add(client)
+        self._detach_failure_sink(client)
+        seal = getattr(client, "seal", None)
+        if seal is not None:
+            seal()
+
+    def _close_drained_clients(self) -> None:
+        busy = {
+            request.client
+            for request in self._requests.values()
+            if isinstance(request, _CallRequest)
+        }
+        for client in self._draining - busy:
+            self._draining.discard(client)
+            self._schedule_close(client)
 
     def _queue_child_finished(self, task: asyncio.Task[object]) -> None:
         self._queue.put_nowait(_ChildFinished(task))
