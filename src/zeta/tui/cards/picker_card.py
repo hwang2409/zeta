@@ -39,7 +39,8 @@ def crop_card(lines: list[FragmentLine], cap: int) -> list[FragmentLine]:
     if len(lines) <= cap:
         return lines
     body = lines[_EDGE_ROWS:-_EDGE_ROWS]
-    room = cap - _EDGE_ROWS * 2
+    # A screen too short for the elision lines keeps the selected row instead.
+    room = max(1, cap - _EDGE_ROWS * 2)
     selected = next(
         (
             index
@@ -50,6 +51,8 @@ def crop_card(lines: list[FragmentLine], cap: int) -> list[FragmentLine]:
     )
     start = max(0, min(selected - room // 2, len(body) - room))
     shown = body[start : start + room]
+    if room < 3:
+        return [*lines[:_EDGE_ROWS], *shown, *lines[-_EDGE_ROWS:]]
     # The first and last shown rows say how many rows the crop hides.
     if start:
         shown[0] = _elision(shown[0], f"… {start + 1} more above")
@@ -79,7 +82,9 @@ class PickerCardControl(UIControl):
     def __init__(self, card: Callable[[], RenderableType | None]) -> None:
         self._card = card
 
-    def lines(self, width: int) -> list[FragmentLine]:
+    def lines(self, width: int, height: int) -> list[FragmentLine]:
+        """The card cropped to half the terminal and to ``height``, the window's room."""
+
         renderable = self._card()
         if renderable is None:
             return []
@@ -92,7 +97,8 @@ class PickerCardControl(UIControl):
             theme=RICH_THEME,
         ).print(renderable)
         lines = list(split_lines(to_formatted_text(ANSI(output.getvalue().rstrip("\n")))))
-        return crop_card(lines, card_height_cap(get_app().output.get_size().rows))
+        cap = min(card_height_cap(get_app().output.get_size().rows), height)
+        return crop_card(lines, cap)
 
     def preferred_height(
         self,
@@ -101,10 +107,10 @@ class PickerCardControl(UIControl):
         wrap_lines: bool,
         get_line_prefix: object,
     ) -> int:
-        return len(self.lines(width))
+        return len(self.lines(width, max_available_height))
 
     def create_content(self, width: int, height: int) -> UIContent:
-        lines = self.lines(width)
+        lines = self.lines(width, height)
         return UIContent(get_line=lambda index: lines[index], line_count=len(lines))
 
     def is_focusable(self) -> bool:

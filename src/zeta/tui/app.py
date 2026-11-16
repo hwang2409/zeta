@@ -1055,6 +1055,11 @@ class TUIApp(
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
+        # A prompt is never sent with a picker on screen. Typed text closes a
+        # picker first; this catches a prompt queued before the picker opened.
+        if not internal and not value.lstrip().startswith(("/", "!")) and value.strip():
+            if self._picker_active:
+                self._picker_cancel()
         if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
             return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()

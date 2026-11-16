@@ -165,6 +165,10 @@ class RemoteViewMixin:
         self._invalidate_prompt()
 
     def remote_picker_select(self) -> None:
+        # The attach replaces the view that startup still draws into: Enter
+        # acts once startup ends, and the picker stays open until then.
+        if self._startup_replay_active:
+            return
         picker = self._remote_picker
         self.remote_picker_cancel()
         if picker is not None:

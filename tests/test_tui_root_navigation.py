@@ -1038,6 +1038,56 @@ async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/model", "/accounts", "/remote"])
+async def test_a_prompt_queued_before_a_picker_command_closes_the_picker_when_sent(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # The picker opens from its Enter during startup, over the prompt typed
+    # before it. When startup ends the prompt is sent, and never with a picker
+    # on screen.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    _fake_remote_hosts(None, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        account_context = getattr(app.loop, "account_context", None)
+        _fake_accounts(app, monkeypatch)
+        assert app._startup_replay_active, "startup finished before the keys"
+        await driver.send("hello" + ENTER + command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} did not show its picker during startup",
+        )
+        await driver.settle("settled screen with the picker")
+        assert _picker_cards(driver) == 1 and not backend.calls, (
+            f"before startup ends: cards={_picker_cards(driver)}, sent={len(backend.calls)}"
+        )
+        sent_under: list[bool] = []
+        complete = backend.complete
+
+        def recording_complete(*args: object, **kwargs: object) -> object:
+            sent_under.append(app._picker_active)
+            return complete(*args, **kwargs)
+
+        monkeypatch.setattr(backend, "complete", recording_complete)
+        # The turn needs the real account context back; the picker has its rows.
+        app.loop.account_context = account_context
+        startup.set()
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="the queued prompt was not sent after startup",
+        )
+        await driver.settle("settled screen after startup")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
+        assert sent_under == [False] and _picker_cards(driver) == 0, (
+            f"'hello' was sent with the {command} picker on screen: picker at send"
+            f" {sent_under}, cards now {_picker_cards(driver)}; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_esc_while_a_picker_loads_stops_it(
     root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1239,8 +1289,9 @@ async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("screen_rows", [24, 12])
 async def test_a_long_picker_keeps_its_selected_row_and_the_transcript_on_a_small_screen(
-    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, screen_rows: int
 ) -> None:
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
     startup.set()
@@ -1250,7 +1301,7 @@ async def test_a_long_picker_keeps_its_selected_row_and_the_transcript_on_a_smal
         return rows, ()
 
     monkeypatch.setattr(RemoteSessionClient, "discover", discover)
-    async with running_tui(copy, size=Size(rows=24, columns=80)) as driver:
+    async with running_tui(copy, size=Size(rows=screen_rows, columns=80)) as driver:
         app = driver.app
         await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
         await driver.settle("settled screen before /remote")
@@ -1259,14 +1310,21 @@ async def test_a_long_picker_keeps_its_selected_row_and_the_transcript_on_a_smal
         await driver.send(DOWN * 25)
         await driver.settle("settled screen after the moves")
         screen = driver.all_rows()
-        # The card is cropped around the selected row and says what it hides.
-        assert any("❯ lab · session-25" in row for row in screen) and any(
-            "more above" in row for row in screen
-        ), "the selected row or the crop line is not drawn:\n" + "\n".join(screen)
-        # Half the screen is the card's limit: the transcript keeps its rows.
-        assert len(driver.rows()) >= 6 and "select a remote session" in "\n".join(screen), (
-            "the card squeezed the transcript:\n" + "\n".join(screen)
-        )
+        drawn = "\n".join(screen)
+        # The card fits the room it gets: the selected row, the hint, and the
+        # bottom border all show, also when the screen leaves it few rows.
+        hint = next((index for index, row in enumerate(screen) if "esc cancel" in row), None)
+        assert (
+            any("❯ lab · session-25" in row for row in screen)
+            and hint is not None
+            and "╰" in screen[hint + 1]
+        ), "the selected row, the hint, or the bottom border is not drawn:\n" + drawn
+        if screen_rows == 24:
+            # The card is cropped around the selected row and says what it hides,
+            # and half the screen is its limit: the transcript keeps its rows.
+            assert "more above" in drawn and len(driver.rows()) >= 6, (
+                "the crop line is missing or the card squeezed the transcript:\n" + drawn
+            )
 
 
 @pytest.mark.asyncio
@@ -1499,6 +1557,44 @@ async def test_esc_while_remote_attaches_lets_the_attach_finish(
         assert attached == ["a1"] and app._remote_view is not None, (
             f"Esc cut the attach: attached={attached}, view={app._remote_view}"
         )
+        await app.slash_detach("")
+
+
+@pytest.mark.asyncio
+async def test_a_remote_row_chosen_during_startup_attaches_after_it(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The attach would replace the view that startup still draws: Enter on a
+    # row waits for startup to end, with the picker still open.
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=True
+    )
+    _fake_remote_hosts(None, monkeypatch)
+    attached: list[str] = []
+
+    async def attach(_client: object, _host: str, session: RemoteSession) -> None:
+        attached.append(session.session_id)
+
+    async def next_event(_client: object) -> str:
+        return ""  # the link ended: the view stays, marked disconnected
+
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+    monkeypatch.setattr(RemoteSessionClient, "next_event", next_event)
+    async with running_tui(copy, painted=False) as driver:
+        app = driver.app
+        await driver.send("/remote" + ENTER)
+        await driver.until(lambda: app.remote_picker_active, what="/remote opened no picker")
+        await driver.send(ENTER)
+        await driver.settle("Enter taken during startup")
+        assert attached == [] and app._remote_view is None and app.remote_picker_active, (
+            f"a row chosen during startup attached at once: attached={attached},"
+            f" view={app._remote_view}, picker open={app.remote_picker_active}"
+        )
+        startup.set()
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.send(ENTER)
+        await driver.until(lambda: app._remote_view is not None, what="Enter after startup did not attach")
+        assert attached == ["a1"], f"attached {attached}, expected the chosen row once"
         await app.slash_detach("")
 
 
