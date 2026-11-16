@@ -1252,10 +1252,7 @@ class ServeControl:
             await self._start_approval(event, session_id, wire_event)
             return
         if kind is StreamEventType.AGENT_NOTIFICATION and event.data.get("kind") == "extension":
-            await self._notify(
-                wire_event, session_id, data=dict(event.data)
-            )
-            return
+            await self._notify(wire_event, session_id, data=dict(event.data)); return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
                 session_id,
