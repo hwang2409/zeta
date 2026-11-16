@@ -56,8 +56,12 @@ def _seed(store: AccountStore, *accounts: AccountId) -> None:
 
 
 def _save_account_token(
-    home: str, account: AccountId, result: multiprocessing.queues.Queue
+    home: str,
+    account: AccountId,
+    result: multiprocessing.queues.Queue,
+    ready: multiprocessing.synchronize.Event,
 ) -> None:
+    ready.set()
     try:
         named_account_credentials(home, account.provider, account.name).save(
             _tokens(), lock_timeout=0.1
@@ -280,16 +284,21 @@ async def test_usage_request_does_not_hold_lifecycle_lock(
     refresh_task = asyncio.create_task(usage.refresh_stale())
     context = multiprocessing.get_context("spawn")
     result = context.Queue()
+    saver_ready = context.Event()
     saver = context.Process(
         target=_save_account_token,
-        args=(str(tmp_path), account, result),
+        args=(str(tmp_path), account, result, saver_ready),
     )
     try:
         await await_or_fail(request_started.wait(), what="usage request to start")
         saver.start()
+        assert await await_or_fail(
+            asyncio.to_thread(saver_ready.wait, 10),
+            what="token saver process to start",
+        ), "token saver process did not start"
         saved = await await_or_fail(
             asyncio.to_thread(result.get, True, 5),
-            what="token save during usage request",
+            what="token save after saver process started",
         )
         assert saved == "saved"
     finally:
