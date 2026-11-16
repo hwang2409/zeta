@@ -775,6 +775,7 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
 
     # test-contract: hold the first create, then advance the injected clock while
     # the second create waits. the old one-second deadline expires; ten seconds does not.
+    # test-contract: seam force the concurrent publication ordering
     monkeypatch.setattr(registry, "_publish", blocked_publish)
     monkeypatch.setattr(locking_module.time, "monotonic", forced_monotonic)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -782,6 +783,7 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
         assert publish_started.wait(10), "first project create did not reach publish"
         second = pool.submit(registry.create_project, "project-1", "scope")
         assert second_lock_attempted.wait(10), "second project create did not contend"
+        # test-contract: seam assert the finite identity wait stays pending
         assert not second.done(), "project create raised ProjectRegistryBusyError before the finite holder released"
         release_publish.set()
         first_project = first.result()
