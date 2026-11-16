@@ -34,7 +34,9 @@ class _TrackingOwner:
     async def close(self) -> None:
         for task in tuple(self.tasks):
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(*self.tasks, return_exceptions=True), 10
+        )
 
 
 def _task_owner(coroutine: object) -> asyncio.Task[object]:
@@ -113,7 +115,7 @@ async def test_hook_tasks_are_owned_and_drained_on_close() -> None:
 
     async def post_tool(_name: str, _result: str) -> None:
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
 
     hook_task = asyncio.create_task(
         run_extension_hooks(
