@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...core.store import ConversationStore
+from ...core.store._history_index import HistoryIndexError
 from ...protocol.types import ToolCall
 
 if TYPE_CHECKING:
@@ -208,7 +209,7 @@ class _SubtreeDiscovery:
             return None
         try:
             return _read_snapshot(store)
-        except (OSError, ValueError) as exc:
+        except (HistoryIndexError, OSError, ValueError) as exc:
             return exc
         finally:
             store.close()
