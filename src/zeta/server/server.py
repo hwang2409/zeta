@@ -8,6 +8,7 @@ import logging
 import os
 import socket
 import stat
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,12 @@ from . import (
     login,
 )
 from .connections import ConnectionRegistry
-from .control import NotificationPresentation, ServeControl
+from .control import (
+    CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+    NotificationPresentation,
+    ServeControl,
+)
+from .diagnostics import log_stuck_holder
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
@@ -229,6 +235,14 @@ class ZetaServer:
         )
         self.port = port
         self.approval_reconnect_grace = approval_reconnect_grace
+        # deadlines for a controller connection lost mid-request (tests override).
+        # drain this long once another controller contends, then cancel the holder.
+        self.lost_request_contended_drain = 5.0
+        # after the cancel, log the stuck-holder task dump at this interval.
+        self.lost_request_cancel_bound = 1.0
+        # one shared deadline for a waiting controller hello (lost-holder wait +
+        # the controller_claimed handoff), kept under achilles' 15 s hello timeout.
+        self.controller_handoff_deadline = CONTROLLER_HANDOFF_DEADLINE_SECONDS
         self._borrowed = runtime is not None
         runtime = runtime or ServerRuntime(
             self.home,
@@ -614,6 +628,12 @@ class _Client:
         self._controller_release: asyncio.Future[object] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
+        # the request this connection runs now (method, id, monotonic start), its
+        # task, and the one pending socket read; used to detect loss while a
+        # handler runs and to dump a stuck holder.
+        self._request: tuple[str, str | int, float] | None = None
+        self._run_task: asyncio.Task[object] | None = None
+        self._chunk_read: asyncio.Task[bytes] | None = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.runtime, codec=self.codec
@@ -628,7 +648,6 @@ class _Client:
                     self._release_dead_connection()
                     graceful = False
                     break
-                await self.connections.wait_until_settled(self)
                 try:
                     request = self.codec.parse_request(line)
                 except ProtocolError as exc:
@@ -640,101 +659,190 @@ class _Client:
                     if not self.handshaken:
                         break
                     continue
-                request_id = request["id"]
-                try:
-                    result = await self._dispatch(
-                        request_id, request["method"], request["params"]
-                    )
-                except ProtocolError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            exc.request_id
-                            if exc.request_id is not None
-                            else request_id,
-                            exc.descriptor,
-                            exc.message,
-                            exc.data,
-                        )
-                    )
-                    if not self.handshaken:
-                        self.connections.release(self)
-                except PROJECT_REQUEST_EXCEPTIONS as exc:
-                    descriptor, message, data = project_request_error(exc)
-                    await self._write(
-                        self.codec.error_response(request_id, descriptor, message, data)
-                    )
-                except ProjectRegistryBusyError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.PROJECT_REGISTRY_BUSY,
-                            str(exc),
-                            {"retryable": exc.retryable},
-                        )
-                    )
-                except TranscriptRepairRequiresUpgrade as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
-                            str(exc),
-                            {
-                                "home_epoch": exc.home_epoch,
-                                "required_epoch": exc.required_epoch,
-                            },
-                        )
-                    )
-                except TranscriptLoadError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.CORRUPT_TRANSCRIPT,
-                            str(exc),
-                            exc.protocol_data(),
-                        )
-                    )
-                except ConversationIntegrityError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
-                        )
-                    )
-                except (SessionError, ValueError) as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 - keep the socket alive
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
-                        )
-                    )
-                else:
-                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
-                        baseline_builder = (
-                            self.connections.child_runs.with_baseline
-                            if request["method"] in {"session_history_and_subscribe", "child_run_events"}
-                            else None
-                        )
-                        written = await self.connections.admit_join_response(
-                            self, request_id, result, baseline_builder
-                        )
-                    else:
-                        written = await self._write(self.codec.response(request_id, result))
-                    if (
-                        written
-                        and request["method"] == "hello"
-                        and self.role == "controller"
-                        and "approval_reconnect" in self.features
-                    ):
-                        for control in self.server.controls():
-                            await control.controller_ready(reconnect=True)
+                handling = asyncio.create_task(self._handle(request))
+                self._run_task = handling
+                if await self._run_request(handling):
+                    await self._handle_loss(handling)
+                    graceful = False
+                    break
+                self._run_task = None
                 if not self.handshaken:
                     break
         finally:
+            self._cancel_pending_read()
             await self.close(graceful=graceful and not self._transport_failed)
+
+    async def _run_request(self, handling: asyncio.Task[None]) -> bool:
+        """Run one request to completion while reading the socket ahead.
+
+        Dispatch stays serial: the next request is not parsed until this one
+        ends. Only the socket read runs concurrently so a peer that closes mid
+        request is seen at once. Return ``True`` if the peer closed (EOF).
+        """
+        while not handling.done():
+            if len(self._read_buffer) > MAX_FRAME_BYTES:
+                # read-ahead bound reached (one max frame); wait for the handler.
+                await asyncio.wait({handling})
+                break
+            chunk = self._ensure_chunk_read()
+            await asyncio.wait({handling, chunk}, return_when=asyncio.FIRST_COMPLETED)
+            if chunk.done():
+                self._chunk_read = None
+                data = chunk.result()
+                if not data:
+                    return True
+                self._read_buffer.extend(data)
+        await handling
+        return False
+
+    async def _handle_loss(self, handling: asyncio.Task[None]) -> None:
+        """Peer EOF while a request runs: start no new request, hold the slot
+        until the handler ends, and cancel it only once another controller
+        contends for the slot."""
+        if self._local_close:
+            # a local server close cancels the handler at once and releases via
+            # close(); no remote hello waits on it.
+            handling.cancel()
+            with contextlib.suppress(BaseException):
+                await handling
+            return
+        contended = self.connections.mark_lost(self)
+        if contended is None:
+            with contextlib.suppress(BaseException):
+                await handling
+            return
+        contended_wait = asyncio.create_task(contended.wait())
+        try:
+            await asyncio.wait(
+                {handling, contended_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not handling.done():
+                # a controller hello is waiting: drain briefly so a handler that
+                # is about to finish keeps its side effects, then cancel.
+                await asyncio.wait(
+                    {handling}, timeout=self.server.lost_request_contended_drain
+                )
+                if not handling.done():
+                    handling.cancel()
+                    await self._await_handler_held(handling)
+        finally:
+            contended_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await contended_wait
+        with contextlib.suppress(BaseException):
+            await handling
+        self._release_dead_connection()
+
+    async def _await_handler_held(self, handling: asyncio.Task[None]) -> None:
+        """Hold the slot until the cancelled handler ends; dump the stuck holder
+        at each cancel-bound interval so a swallowed cancel stays visible."""
+        while True:
+            done, _ = await asyncio.wait(
+                {handling}, timeout=self.server.lost_request_cancel_bound
+            )
+            if done:
+                return
+            log_stuck_holder(
+                self,
+                self.connections.output_state(self),
+                reason="controller slot held; lost holder's request did not end after cancel",
+            )
+
+    async def _handle(self, request: dict[str, Any]) -> None:
+        request_id = request["id"]
+        self._request = (request["method"], request_id, time.monotonic())
+        await self.connections.wait_until_settled(self)
+        try:
+            result = await self._dispatch(
+                request_id, request["method"], request["params"]
+            )
+        except ProtocolError as exc:
+            await self._write(
+                self.codec.error_response(
+                    exc.request_id
+                    if exc.request_id is not None
+                    else request_id,
+                    exc.descriptor,
+                    exc.message,
+                    exc.data,
+                )
+            )
+            if not self.handshaken:
+                self.connections.release(self)
+        except PROJECT_REQUEST_EXCEPTIONS as exc:
+            descriptor, message, data = project_request_error(exc)
+            await self._write(
+                self.codec.error_response(request_id, descriptor, message, data)
+            )
+        except ProjectRegistryBusyError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.PROJECT_REGISTRY_BUSY,
+                    str(exc),
+                    {"retryable": exc.retryable},
+                )
+            )
+        except TranscriptRepairRequiresUpgrade as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                    str(exc),
+                    {
+                        "home_epoch": exc.home_epoch,
+                        "required_epoch": exc.required_epoch,
+                    },
+                )
+            )
+        except TranscriptLoadError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.CORRUPT_TRANSCRIPT,
+                    str(exc),
+                    exc.protocol_data(),
+                )
+            )
+        except ConversationIntegrityError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                )
+            )
+        except (SessionError, ValueError) as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the socket alive
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                )
+            )
+        else:
+            if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
+                baseline_builder = (
+                    self.connections.child_runs.with_baseline
+                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}
+                    else None
+                )
+                written = await self.connections.admit_join_response(
+                    self, request_id, result, baseline_builder
+                )
+            else:
+                written = await self._write(self.codec.response(request_id, result))
+            if (
+                written
+                and request["method"] == "hello"
+                and self.role == "controller"
+                and "approval_reconnect" in self.features
+            ):
+                for control in self.server.controls():
+                    await control.controller_ready(reconnect=True)
+        self._request = None
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -762,12 +870,31 @@ class _Client:
                 return line
             self._read_buffer.extend(chunk)
 
-    async def _read_chunk(self) -> bytes:
+    def _ensure_chunk_read(self) -> asyncio.Task[bytes]:
+        """One pending socket read, shared by the run loop and read-ahead so a
+        single reader never has two concurrent reads."""
+        if self._chunk_read is None:
+            self._chunk_read = asyncio.create_task(self._read_raw())
+        return self._chunk_read
+
+    async def _read_raw(self) -> bytes:
         try:
             return await self.reader.read(65_536)
         except ConnectionError:
             # A failed write to a gone peer stores its error in the reader; that is EOF.
             return b""
+
+    async def _read_chunk(self) -> bytes:
+        chunk = self._ensure_chunk_read()
+        data = await chunk
+        if self._chunk_read is chunk:
+            self._chunk_read = None
+        return data
+
+    def _cancel_pending_read(self) -> None:
+        if self._chunk_read is not None:
+            self._chunk_read.cancel()
+            self._chunk_read = None
 
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
@@ -822,6 +949,14 @@ class _Client:
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
         if method == "hello":
+            # a controller hello waits up to one shared handoff deadline for a
+            # lost holder to release the slot, then passes the time that is left
+            # to controller_claimed so the total wait never exceeds one deadline.
+            deadline = self.server.controller_handoff_deadline
+            if params.get("role", "controller") == "controller":
+                start = time.monotonic()
+                await self.connections.wait_for_lost_controller(deadline)
+                deadline = max(0.0, deadline - (time.monotonic() - start))
             result = self._hello(params)
             reconnect_bindings = None
             if "mcp_bindings" in params:
@@ -836,21 +971,36 @@ class _Client:
             if self.role == "controller":
                 reconnect = "approval_reconnect" in self.features
                 require_host_binding = "session_host_commands" in self.features
-                claimed = await self.server.control.controller_claimed(
-                    reconnect=reconnect,
-                    require_host_binding=require_host_binding,
-                )
+
+                async def claim() -> bool:
+                    if not await self.server.control.controller_claimed(
+                        reconnect=reconnect,
+                        require_host_binding=require_host_binding,
+                        deadline=deadline,
+                    ):
+                        return False
+                    await self.server.claim_parked(
+                        "session_park" in self.features,
+                        reconnect=reconnect,
+                        require_host_binding=require_host_binding,
+                    )
+                    return True
+
+                # shield the claim so a cancel of the hello does not leave the
+                # approvals lifecycle half-moved; it waits for the bounded claim.
+                claim_task = asyncio.ensure_future(claim())
+                try:
+                    claimed = await asyncio.shield(claim_task)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await claim_task
+                    raise
                 if not claimed:
                     self.handshaken = False
                     raise ProtocolError(
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
-                await self.server.claim_parked(
-                    "session_park" in self.features,
-                    reconnect=reconnect,
-                    require_host_binding=require_host_binding,
-                )
                 if reconnect_bindings is not None:
                     await self.server.control.reattach_mcp_bindings(
                         *reconnect_bindings
