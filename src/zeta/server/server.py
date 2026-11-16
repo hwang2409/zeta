@@ -47,6 +47,7 @@ from .handlers.registry import dispatch as _dispatch_request
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
+    DORMANT_FEATURES,
     FEATURES,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
@@ -212,6 +213,7 @@ class ZetaServer:
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
+        _supported_features_for_test: frozenset[str] | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -239,6 +241,11 @@ class ZetaServer:
         # after the cancel, log the stuck-holder task dump at this interval.
         self.lost_request_cancel_bound = 1.0
         self._borrowed = runtime is not None
+        if self._borrowed and _supported_features_for_test is not None:
+            raise ValueError("borrowed observer hosts cannot override supported features")
+        self._supported_features = frozenset(
+            FEATURES if _supported_features_for_test is None else _supported_features_for_test
+        )
         runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
@@ -989,7 +996,13 @@ class _Client:
             )
         extended = self.protocol_version != "1.0"
         accepted = (
-            [item for item in FEATURES if item in (requested or ())] if extended else []
+            [
+                item
+                for item in (*FEATURES, *DORMANT_FEATURES)
+                if item in self.server._supported_features and item in (requested or ())
+            ]
+            if extended
+            else []
         )
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:

@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tests.support.replay_transport import (
+    Transport,
+    connect_replay,
+    negotiate,
+    replay_server,
+)
+from tests.test_server_replay_table import _backend_factory
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_dormant_multi_controller_test_capability_keeps_legacy_admission(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    first = await connect_replay(server, transport)
+    second = await connect_replay(server, transport)
+    try:
+        hello = await negotiate(first, replay=False, extra=("multi_controller",))
+        assert "multi_controller" in hello["result"]["capabilities"]["features"]
+
+        refused = await negotiate(second, replay=False, extra=("multi_controller",))
+        assert refused["error"]["code"] == -32001
+        assert await second.closed(2) == []
+    finally:
+        await first.close()
+        await second.close()
+        await server.close()
