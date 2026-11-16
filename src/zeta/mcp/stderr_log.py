@@ -152,7 +152,9 @@ class RotatingStderrLog:
                         fd = -1
                         self._rotate()
                         fd = self._open_log(0, create=True)
-                    write_all(fd, payload)
+                    available = MCP_STDERR_LOG_FILE_BYTES - os.fstat(fd).st_size
+                    if available > 0:
+                        write_all(fd, payload[:available])
                 finally:
                     if fd >= 0:
                         os.close(fd)
