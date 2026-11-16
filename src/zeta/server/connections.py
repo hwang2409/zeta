@@ -632,7 +632,11 @@ class ConnectionRegistry(ReplayOutput):
             return
         except Exception:
             # a dead writer strands every caller and the controller slot: fail closed
-            logger.exception("serve output writer failed; closing the connection")
+            logger.exception(
+                "serve output writer failed; closing the connection (role=%s phase=%s)",
+                state.role,
+                output.phase,
+            )
             self._fail_dead_writer(state, output, item)
 
     def _fail_dead_writer(
@@ -643,7 +647,9 @@ class ConnectionRegistry(ReplayOutput):
         if item is not None:
             self._finish_future(item.future, False)
         self._finish_future(output.ready, False)
-        output.current_frame = None
+        if output.current_frame is not None:
+            # the writer failed before this frame left it: it is still charged
+            self._end_frame_write(output, output.current_frame)
         output.current_write = None
         # queued frames still hold their replay budget; release it with them
         self._clear_output(output, result=False)

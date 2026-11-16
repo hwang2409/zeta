@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -99,6 +100,13 @@ def _hold_join_reply(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, as
     return entered, resume
 
 
+WRITER_FAILED = "serve output writer failed"
+
+
+def _writer_failures(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(WRITER_FAILED)]
+
+
 async def _assert_released_and_reusable(
     server: ZetaServer, transport: Transport, output: Any, released: asyncio.Event
 ) -> None:
@@ -109,17 +117,26 @@ async def _assert_released_and_reusable(
     await _assert_new_controller(server, transport)
 
 
-@pytest.mark.asyncio
-async def test_page_close_during_join_reply_releases_controller_slot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A browser reload: the socket closes while the join reply is written, so the
-    write raises (websockets' ConnectionClosed), the writer's exception branch."""
-    server, client, session_id = await _started(tmp_path, "websocket")
+async def _started_owner(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ZetaServer, ReplayClient, str, Any, Any, asyncio.Event]:
+    server, client, session_id = await _started(tmp_path, transport)
     assert server.connections is not None
     owner = server._client
     output = server.connections._connections[owner].output
-    released = _watch_release(server, monkeypatch)
+    return server, client, session_id, owner, output, _watch_release(server, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_page_close_during_join_reply_releases_controller_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A browser reload: the socket closes while the join reply is written, so the
+    write raises (websockets' ConnectionClosed), the writer's exception branch."""
+    caplog.set_level(logging.ERROR, logger="zeta.server.connections")
+    server, client, session_id, owner, output, released = await _started_owner(
+        tmp_path, "websocket", monkeypatch
+    )
     entered, resume = _hold_join_reply(monkeypatch)
     async with _closing(server, client, resume):
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
@@ -129,19 +146,23 @@ async def test_page_close_during_join_reply_releases_controller_slot(
         await await_or_fail(owner.writer._connection.wait_closed(), what="serve saw the close")
         resume.set()
         await _assert_released_and_reusable(server, "websocket", output, released)
+        # the write failure path itself must hold, not the dead-writer guard
+        assert _writer_failures(caplog) == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 async def test_cancelled_join_reply_write_releases_controller_slot(
-    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    transport: Transport,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The join reply's write task is cancelled (the writer's cancel branch)."""
-    server, client, session_id = await _started(tmp_path, transport)
-    assert server.connections is not None
-    owner = server._client
-    output = server.connections._connections[owner].output
-    released = _watch_release(server, monkeypatch)
+    caplog.set_level(logging.ERROR, logger="zeta.server.connections")
+    server, client, session_id, _, output, released = await _started_owner(
+        tmp_path, transport, monkeypatch
+    )
     entered, resume = _hold_join_reply(monkeypatch)
     async with _closing(server, client, resume):
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
@@ -150,26 +171,55 @@ async def test_cancelled_join_reply_write_releases_controller_slot(
         # test-contract: seam cancel the in-flight frame write, as a write owner close does
         output.current_write.cancel()
         await _assert_released_and_reusable(server, transport, output, released)
+        # the cancel path itself must hold, not the dead-writer guard
+        assert _writer_failures(caplog) == []
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("charged", (False, True), ids=("after_uncharge", "before_uncharge"))
 async def test_output_writer_failure_closes_connection_and_releases_slot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    transport: Transport,
+    charged: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Any unexpected exception in the output writer closes the connection."""
-    server, client, session_id = await _started(tmp_path, "unix")
-    assert server.connections is not None
-    released = _watch_release(server, monkeypatch)
-    original = server.connections._finish_frame_accounting
+    """An unexpected exception in the output writer closes the connection; a frame
+    still in flight is uncharged and a caller waiting on a queued frame gets False."""
+    caplog.set_level(logging.ERROR, logger="zeta.server.connections")
+    server, client, session_id, owner, output, released = await _started_owner(
+        tmp_path, transport, monkeypatch
+    )
+    connections = server.connections
+    assert connections is not None
+    entered, resume = _hold_join_reply(monkeypatch)
+    original = connections._end_frame_write
+    failed = False
 
-    def broken(output: Any, item: Any) -> None:
-        original(output, item)
-        if JOIN_REPLY in item.payload:
+    def broken(target: Any, item: Any) -> None:
+        nonlocal failed
+        failing = not failed and JOIN_REPLY in item.payload
+        if failing and charged:
+            failed = True
+            raise RuntimeError("injected output writer failure")
+        original(target, item)
+        if failing:
+            failed = True
             raise RuntimeError("injected output writer failure")
 
     # test-contract: seam an unexpected bug inside the output writer task
-    monkeypatch.setattr(server.connections, "_finish_frame_accounting", broken)
-    async with _closing(server, client):
+    monkeypatch.setattr(connections, "_end_frame_write", broken)
+    async with _closing(server, client, resume):
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
-        await await_or_fail(released.wait(), what="failed writer released its connection")
-        await _assert_new_controller(server, "unix")
+        await await_or_fail(entered.wait(), what="join reply write started")
+        queued = asyncio.create_task(connections.send(owner, owner.codec.response(99, {})))
+        try:
+            await asyncio.sleep(0)
+            assert output.queue, "the second frame must wait behind the held join reply"
+            resume.set()
+            assert await await_or_fail(queued, what="queued frame settled") is False
+        finally:
+            queued.cancel()
+        await _assert_released_and_reusable(server, transport, output, released)
+        assert len(_writer_failures(caplog)) == 1
