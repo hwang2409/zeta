@@ -226,6 +226,22 @@ class ServeControl:
         """This pair is the client's session; a parked pair sends no frame."""
         return self.server.control is self
 
+    def pair_state(self) -> str:
+        state = self.runtime.state
+        return (
+            "idle"
+            if self.unhealthy() or state is None
+            else "running" if self.state_change_busy() else state.status
+        )
+
+    def parked_row(self) -> dict[str, object]:
+        """This pair's row in ``status.parked_sessions``."""
+        return {
+            "session_id": self.runtime.session_id,
+            "state": self.pair_state(),
+            "pending_approvals": len(self.pending_approvals_now()),
+        }
+
     def holds_work(self) -> bool:
         """Closing this pair now would cut work: a turn, a wake, an approval, a
         background child or task, or a task exit not yet delivered."""
@@ -250,7 +266,8 @@ class ServeControl:
         self._maybe_idle()
 
     def _maybe_idle(self) -> None:
-        """Ask the server to close this pair once it is parked and idle; loop thread only."""
+        """Ask the server to report this parked pair's state and close it once
+        idle; loop thread only."""
         if self in self.server._parked.values():
             asyncio.get_running_loop().call_soon(self.server._close_if_idle, self)
 
@@ -1345,6 +1362,7 @@ class ServeControl:
     ) -> object:
         connections = getattr(self.server, "connections", None)
         if connections is None or not self.attached:
+            self._maybe_idle()  # a dropped frame of a parked pair may change its row
             from .connections import Admission
 
             return Admission("no_controller")
@@ -1359,6 +1377,7 @@ class ServeControl:
             session_id = self.runtime.session_id
         connections = self.server.connections
         if connections is None or not self.attached:
+            self._maybe_idle()  # a dropped frame of a parked pair may change its row
             return False
         return await connections.publish_controller(event, session_id, **fields)
 
