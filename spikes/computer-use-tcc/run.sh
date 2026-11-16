@@ -333,8 +333,8 @@ cmd_agent() {
 <key>StandardErrorPath</key><string>$AGENT_DIR/stderr</string>
 </dict></plist>
 EOF
-  launchctl bootstrap "gui/$UID" "$AGENT_DIR/agent.plist" || return 1
   AGENT_ACTIVE=1
+  launchctl bootstrap "gui/$UID" "$AGENT_DIR/agent.plist" || return 1
   local status=1
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if ! launchctl print "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1; then status=0; break; fi
