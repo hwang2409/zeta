@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
+from .abandoned_closes import AbandonedCloses, live_abandoned_closes
 from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
     MCPClient,
@@ -89,19 +90,6 @@ AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
 
 NoticeSink = Callable[[str], None]
-
-# Client closes that ignored their bounded wait and were abandoned (cancelled
-# but still running). We hold a strong reference to one such task per server so
-# it is not garbage-collected while pending, and count the live set here for
-# diagnostics. An uncancellable close against a dead peer may never return;
-# without a per-server cap every re-bind would add one more leaked task.
-_ABANDONED_CLOSES: set[asyncio.Task[object]] = set()
-
-
-def live_abandoned_closes() -> int:
-    """Number of abandoned client closes still running process-wide."""
-    return len(_ABANDONED_CLOSES)
-
 
 @dataclass(frozen=True, slots=True)
 class _SetupOutcome:
@@ -195,7 +183,7 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
         # at most one abandoned (timed-out) close per server stays referenced
         # here; later ones are dropped so re-binds cannot stack leaked tasks.
-        self._abandoned_closes: set[asyncio.Task[object]] = set()
+        self._abandoned_closes = AbandonedCloses()
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
@@ -1333,25 +1321,15 @@ class MCPServerActor(MCPDefinitionPublisher):
         )
 
     def _abandon_close(self, task: asyncio.Task[object]) -> None:
-        """Drop a timed-out close from the owned sets so repeated re-binds do
-        not accumulate references, and keep at most one abandoned close per
-        server: an uncancellable close may never end, so a later one would only
-        stack another leaked task. The event loop keeps a dropped task alive
-        while it is pending, and it is collected once it finally finishes."""
+        """Drop a timed-out close from the actor's owned sets and hand it to the
+        abandoned-close owner, which keeps at most one live per server so
+        repeated re-binds cannot accumulate references."""
         for client_id, (_, scheduled) in list(self._scheduled_closes.items()):
             if scheduled is task:
                 del self._scheduled_closes[client_id]
                 break
         self._children.discard(task)
-        if any(not pending.done() for pending in self._abandoned_closes):
-            return
-        self._abandoned_closes.add(task)
-        _ABANDONED_CLOSES.add(task)
-        task.add_done_callback(self._abandoned_close_finished)
-
-    def _abandoned_close_finished(self, task: asyncio.Task[object]) -> None:
-        self._abandoned_closes.discard(task)
-        _ABANDONED_CLOSES.discard(task)
+        self._abandoned_closes.abandon(task)
 
     def _schedule_close(
         self,
