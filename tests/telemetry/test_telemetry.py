@@ -249,10 +249,14 @@ def test_facade_table_filters_every_operation_and_handle(monkeypatch: pytest.Mon
         instance.shutdown()
 
     assert len(exported) == 26
-    from zeta.telemetry.runtime import _ALLOWED_ATTRIBUTE_KEYS
+    from zeta.telemetry.runtime import _ALLOWED_ATTRIBUTE_KEYS, _EVENT_ATTRIBUTE_KEYS, _field_value
 
+    assert {name for name in dir(telemetry.Telemetry) if name.endswith("_span")} == {"agent_span", "turn_span", "inference_span", "tool_span", "context_span"}
+    assert _field_value("zeta.tool.call.id", "madeup") == "_invalid"
     for record in exported:
         assert set(record.attributes) <= _ALLOWED_ATTRIBUTE_KEYS
+        for event in record.events:
+            assert set(event.attributes) <= _EVENT_ATTRIBUTE_KEYS[event.name]
         exported_text = (record.name, str(record.attributes), *(event.name for event in record.events), *(str(event.attributes) for event in record.events))
         for name in reserved_names:
             assert all(name not in value for value in exported_text)
