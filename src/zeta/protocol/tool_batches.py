@@ -1,15 +1,39 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
-from .types import Message, MessageRole, ToolUseContent
+from .types import Message, MessageRole, TextContent, ToolResult, ToolUseContent
 
 logger = logging.getLogger(__name__)
 
+NOT_RUN_TEXT = "not run: the turn was interrupted"
+MAYBE_RUN_TEXT = (
+    "interrupted: may or may not have taken effect; check before retrying"
+)
 
-def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message]:
-    """Remove incomplete tool batches before later conversation messages."""
+
+def interrupted_tool_result(call_id: str, *, not_run: bool) -> Message:
+    """Stand in for the result a dead process never wrote."""
+
+    text = NOT_RUN_TEXT if not_run else MAYBE_RUN_TEXT
+    return Message(
+        MessageRole.TOOL_RESULT,
+        [TextContent(text)],
+        tool_result=ToolResult(call_id, text, is_error=True),
+    )
+
+
+def complete_tool_batches(
+    messages: Sequence[Message], not_run_call_ids: Collection[str] = ()
+) -> list[Message]:
+    """Pair every tool call of an interrupted batch with exactly one result.
+
+    A batch is interrupted when a later message follows before all its results
+    exist (the process died mid-batch). Its real results stay, in call order,
+    and each missing one gets an interrupted result, so the model sees what
+    already ran. A trailing incomplete batch is still in flight and stays as is.
+    """
 
     result: list[Message] = []
     orphan_results = 0
@@ -69,6 +93,19 @@ def without_incomplete_tool_batches(messages: Sequence[Message]) -> list[Message
         if complete or following == len(messages):
             result.append(message)
             result.extend(batch_results)
+        elif len(set(call_ids)) == len(call_ids):
+            by_id: dict[str, Message] = {}
+            for candidate in batch_results:
+                if candidate.tool_result is not None:
+                    by_id.setdefault(candidate.tool_result.tool_call_id, candidate)
+            result.append(message)
+            result.extend(
+                by_id.get(call_id)
+                or interrupted_tool_result(
+                    call_id, not_run=call_id in not_run_call_ids
+                )
+                for call_id in call_ids
+            )
         index = following
     if orphan_results:
         logger.warning(

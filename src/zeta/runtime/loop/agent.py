@@ -84,6 +84,7 @@ from ...skills.agent_catalog import AgentCatalog
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
 from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
+from ..approval_recovery import abort_stale_turn_approvals
 from ..backend_state import effective_backend_budget
 from ..prompt import RuntimePrompt
 from ._completion import (
@@ -683,6 +684,7 @@ class AgentLoop(
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._await_project_inbox_turn_start()
+        await abort_stale_turn_approvals(self.store)
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
         if system_message is not None and not notification_turn:

@@ -1,0 +1,219 @@
+"""A process that dies mid tool batch must not make the next turn repeat writes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+from collections.abc import AsyncIterator, Sequence
+from contextlib import aclosing
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.support.owned import await_or_fail
+from zeta.core.approval import ApprovalPolicy
+from zeta.core.store import ConversationStore
+from zeta.protocol.types import (
+    CompletionBackend,
+    Message,
+    MessageOrigin,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolSchema,
+    ToolUseContent,
+)
+from zeta.providers.codex_payload import build_responses_payload
+from zeta.providers.completion import owned_completion
+from zeta.runtime.loop import AgentLoop
+from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+
+TITLES = ("Alpha", "Beta", "Gamma")
+NOT_RUN = "not run: the turn was interrupted"
+MAYBE_RUN = "interrupted: may or may not have taken effect; check before retrying"
+
+
+class AddTaskModel(CompletionBackend):
+    """Scripted model that adds only titles it cannot see as added.
+
+    It reads the real provider request (the Codex Responses payload). A
+    title with no result, or with a "not run" result, is added again; a title
+    with a real result or a "may or may not" result is not.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.requests: list[list[dict[str, Any]]] = []
+        self.turn = 0
+
+    @owned_completion
+    async def complete(
+        self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+    ) -> AsyncIterator[StreamEvent]:
+        items = build_responses_payload(messages, tool_schemas, model="gpt-5")["input"]
+        self.requests.append(items)
+        titles = {
+            item["call_id"]: json.loads(item["arguments"])["title"]
+            for item in items
+            if item.get("type") == "function_call"
+        }
+        seen = {
+            titles[item["call_id"]]
+            for item in items
+            if item.get("type") == "function_call_output" and item["output"] != NOT_RUN
+        }
+        last_user = max(
+            index for index, item in enumerate(items) if item.get("role") == "user"
+        )
+        first_request = not any(
+            item.get("type") == "function_call" for item in items[last_user:]
+        )
+        missing = [title for title in TITLES if title not in seen]
+        if first_request and missing:
+            content = [
+                ToolUseContent(
+                    ToolCall(f"{self.name}-{self.turn}-{title}", "add_task", {"title": title})
+                )
+                for title in missing
+            ]
+        else:
+            content = [TextContent("done")]
+        self.turn += 1
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        for block in content:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, content),
+        )
+
+
+def _registry(
+    root: Path, ran: list[str], *, parallel: bool, added: asyncio.Event
+) -> ToolRegistry:
+    registry = ToolRegistry(
+        root, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+
+    def add_task(arguments: dict[str, str]) -> str:
+        ran.append(arguments["title"])
+        added.set()
+        return f"added {arguments['title']}"
+
+    registry.register("add_task", add_task, parallel_safe=parallel)
+    return registry
+
+
+async def _die_at_beta_approval(
+    root: Path, dead: Path, ran: list[str], *, parallel: bool
+) -> None:
+    """Run one batch, approve Alpha, and copy the session at Beta's approval.
+
+    The copy is what SIGKILL leaves on disk: the live process never writes again.
+    """
+
+    store = ConversationStore(root, session_id="session")
+    policy = ApprovalPolicy(default="ask", store=store)
+    alpha_added = asyncio.Event()
+    registry = _registry(root, ran, parallel=parallel, added=alpha_added)
+    loop = AgentLoop(
+        AddTaskModel("dead"),
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    beta_waiting = asyncio.Event()
+
+    async def drive() -> None:
+        async with aclosing(
+            loop.run_turn("add Alpha, Beta, Gamma", origin=MessageOrigin.USER)
+        ) as events:
+            async for event in events:
+                if event.type is not StreamEventType.TOOL_APPROVAL_START:
+                    continue
+                assert event.tool_call is not None
+                if event.tool_call.arguments["title"] == "Alpha":
+                    assert policy.approve(event.tool_call.id)
+                elif event.tool_call.arguments["title"] == "Beta":
+                    beta_waiting.set()
+
+    turn = asyncio.create_task(drive())
+    try:
+        await await_or_fail(beta_waiting.wait(), what="Beta's approval request")
+        await await_or_fail(alpha_added.wait(), what="Alpha's execution")
+        shutil.copytree(root, dead)
+    finally:
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+        await loop.close()
+        await registry.close()
+        store.close()
+    assert ran == ["Alpha"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
+    tmp_path: Path, parallel: bool
+) -> None:
+    ran: list[str] = []
+    dead = tmp_path / "dead"
+    await await_or_fail(
+        _die_at_beta_approval(tmp_path / "live", dead, ran, parallel=parallel),
+        what="batch reaching Beta's approval",
+    )
+
+    store = ConversationStore(dead, session_id="session")
+    policy = ApprovalPolicy(default="allow", store=store)
+    registry = _registry(dead, ran, parallel=parallel, added=asyncio.Event())
+    model = AddTaskModel("resumed")
+    loop = AgentLoop(
+        model,
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        async with aclosing(loop.run_turn("continue", origin=MessageOrigin.USER)) as events:
+            await await_or_fail(
+                _drain(events), what="resumed turn after continue"
+            )
+
+        assert ran == ["Alpha", "Beta", "Gamma"], "a completed call ran again"
+        request = model.requests[0]
+        batch = [
+            (item["type"], item["call_id"], item.get("output"))
+            for item in request
+            if item.get("call_id", "").startswith("dead-")
+        ]
+        alpha = MAYBE_RUN if parallel else "added Alpha"
+        assert batch == [
+            ("function_call", "dead-0-Alpha", None),
+            ("function_call", "dead-0-Beta", None),
+            ("function_call", "dead-0-Gamma", None),
+            ("function_call_output", "dead-0-Alpha", alpha),
+            ("function_call_output", "dead-0-Beta", NOT_RUN),
+            ("function_call_output", "dead-0-Gamma", NOT_RUN),
+        ]
+
+        # "continue" closed the dead turn's requests: approving Beta now cannot
+        # run it a second time.
+        assert await policy.pending_requests() == []
+        assert not policy.approve("dead-0-Beta")
+        assert ran == ["Alpha", "Beta", "Gamma"]
+    finally:
+        await loop.close()
+        await registry.close()
+        store.close()
+
+
+async def _drain(events: AsyncIterator[StreamEvent]) -> None:
+    async for _event in events:
+        pass

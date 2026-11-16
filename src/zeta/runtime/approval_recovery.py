@@ -45,6 +45,24 @@ def recover_store_approvals(store: ConversationStore, home_epoch: int) -> None:
         after_seq = page.next_seq
 
 
+async def abort_stale_turn_approvals(store: ConversationStore) -> None:
+    """Close the open approvals of a turn that is over before a new turn starts.
+
+    Only one turn runs at a time, so an approval still open here belongs to a
+    turn that ended without settling it (the process died). The model is told
+    that call did not run; closing the request keeps that true, because no one
+    can approve and run it later.
+    """
+    after_seq = 0
+    while True:
+        page = await store.pending_approval_page(after_seq)
+        for request_id, _tool_call in page.items:
+            await store.resolve_approval_async(request_id, "abort", reason="turn_canceled")
+        if page.next_seq is None:
+            return
+        after_seq = page.next_seq
+
+
 def repair_delegated_child(
     history_store: ConversationStore,
     child_store: ConversationStore,
@@ -93,4 +111,8 @@ def _end_payload(
     return payload
 
 
-__all__ = ["recover_store_approvals", "repair_delegated_child"]
+__all__ = [
+    "abort_stale_turn_approvals",
+    "recover_store_approvals",
+    "repair_delegated_child",
+]

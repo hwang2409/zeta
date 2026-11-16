@@ -45,6 +45,7 @@ from ..compaction import (
     SummaryCompletionError as _SummaryCompletionError,
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
+from ..protocol.tool_batches import interrupted_tool_result
 from ..protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_STATE,
@@ -67,6 +68,59 @@ EMERGENCY_TARGET_RATIO = 0.5
 
 
 BudgetExceeded = RequestBudgetExceeded
+
+
+def _with_interrupted_results(
+    items: list[_ContextItem], entries: Sequence[ConversationEntry]
+) -> list[_ContextItem]:
+    """Give each call of a batch that a dead process left open a stand-in result.
+
+    A batch is open when a later item follows before all its results exist.
+    A call whose durable approval request never got ``allow`` did not run;
+    any other call may have run.
+    """
+    allowed = {
+        entry.data.get("request_id")
+        for entry in entries
+        if entry.type == "approval_resolution" and entry.data.get("decision") == "allow"
+    }
+    requested = {
+        request["request_id"]
+        for entry in entries
+        if entry.type == "message"
+        for request in entry.data.get("approval_requests", ())
+    }
+    result: list[_ContextItem] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        result.append(item)
+        index += 1
+        if item.message.role is not MessageRole.ASSISTANT:
+            continue
+        call_ids = [
+            block.tool_call.id
+            for block in item.message.content
+            if isinstance(block, ToolUseContent)
+        ]
+        answered: set[str] = set()
+        while index < len(items) and items[index].message.tool_result is not None:
+            answered.add(items[index].message.tool_result.tool_call_id)
+            result.append(items[index])
+            index += 1
+        if index == len(items) or len(set(call_ids)) != len(call_ids):
+            continue
+        result.extend(
+            _ContextItem(
+                None,
+                interrupted_tool_result(
+                    call_id, not_run=call_id in requested and call_id not in allowed
+                ),
+            )
+            for call_id in call_ids
+            if call_id not in answered
+        )
+    return result
 
 
 class StaleBranchError(RuntimeError):
@@ -1267,7 +1321,7 @@ class ContextAssembler(ContextMarkerMixin):
                         ),
                     )
                 )
-        return items
+        return _with_interrupted_results(items, entries)
 
     @staticmethod
     def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:
