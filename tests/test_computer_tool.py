@@ -114,6 +114,29 @@ async def test_cursor_position_returns_text_without_capture(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_cursor_position_edge_can_be_reused_for_click(tmp_path: Path) -> None:
+    backend = FakeBackend(width=1280, height=800, cursor=(1280, 800))
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        position = await registry.execute(
+            ToolCall("p", "computer", {"action": "cursor_position"})
+        )
+        point = position["structuredContent"]
+        result = await registry.execute(
+            ToolCall(
+                "c",
+                "computer",
+                {"action": "left_click", "coordinate": [point["x"], point["y"]]},
+            )
+        )
+
+    assert position["isError"] is False
+    assert point == {"x": 1279, "y": 799}
+    assert result["isError"] is False
+    assert ("click", 1279, 799, "left", 1) in backend.actions
+
+
+@pytest.mark.asyncio
 async def test_missing_coordinate_is_a_clear_error(tmp_path: Path) -> None:
     backend = FakeBackend()
     async with _computer_registry(tmp_path, backend=backend) as registry:

@@ -82,12 +82,12 @@ def to_backend_point(geometry: ScreenGeometry, x: int, y: int) -> tuple[int, int
 def to_model_point(geometry: ScreenGeometry, x: int, y: int) -> tuple[int, int]:
     """Map a global display point back to a model image coordinate.
 
-    Used for ``cursor_position``. Clamps to the image bounds.
+    Used for ``cursor_position``. Clamps to the valid image coordinates.
     """
 
     model_x = (x - geometry.origin_x) * geometry.scale * geometry.image_width / geometry.frame_width
     model_y = (y - geometry.origin_y) * geometry.scale * geometry.image_height / geometry.frame_height
     return (
-        round(min(max(model_x, 0), geometry.image_width)),
-        round(min(max(model_y, 0), geometry.image_height)),
+        round(min(max(model_x, 0), geometry.image_width - 1)),
+        round(min(max(model_y, 0), geometry.image_height - 1)),
     )

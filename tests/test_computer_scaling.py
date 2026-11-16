@@ -74,8 +74,8 @@ def test_to_model_point_inverts_origin_and_scale() -> None:
 
 def test_to_model_point_clamps_to_image_bounds() -> None:
     geometry = ScreenGeometry(2560, 1600, 1280, 800, 2.0, 100, 50)
-    # a point past the bottom-right of the display clamps to the image size
-    assert to_model_point(geometry, 9999, 9999) == (1280, 800)
+    # a point past the bottom-right of the display clamps to the last pixel
+    assert to_model_point(geometry, 9999, 9999) == (1279, 799)
     assert to_model_point(geometry, 0, 0) == (0, 0)  # above-left clamps to zero
 
 
