@@ -21,6 +21,7 @@ from zeta.tools import ToolRegistry
 from zeta.tools.computer import mac as mac_module
 from zeta.tools.computer.backend import Button, ComputerError, ScreenFrame, ScreenState
 from zeta.tools.computer.mac import MacBackend
+from zeta.tools.computer.scaling import ScreenGeometry
 
 FAKE = Path(__file__).parent / "fixtures" / "computer_fake_helper.py"
 
@@ -116,6 +117,7 @@ async def test_tool_reports_action_specific_refusal(tmp_path: Path) -> None:
         tmp_path, skill_catalog=SkillCatalog.empty(), computer_enabled=True
     )
     registry.computer_backend = _RefusingBackend()  # type: ignore[assignment]
+    registry.computer_geometry = ScreenGeometry(100, 100, 100, 100, 1.0, 0, 0)
     try:
         result = await registry.execute(
             ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})

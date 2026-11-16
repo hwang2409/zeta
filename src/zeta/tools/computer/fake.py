@@ -1,36 +1,48 @@
-"""In-memory ``ComputerBackend`` for tests: a fixed frame and an action log."""
+"""In-memory ``ComputerBackend`` for tests: a real frame and an action log."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from io import BytesIO
 
 from .backend import Button, ScreenFrame, ScreenState
 
-# A complete 1x1 PNG, so screenshot results pass real image validation and the
-# in-process normalization fast path (no worker subprocess).
-_PNG_1x1 = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-    "0000000d49444154789c6360f8cf00000004000101a2e0c4b00000000049454e44ae426082"
-)
+
+def _solid_png(width: int, height: int) -> bytes:
+    """A real PNG of the given size, so normalization sees the true dimensions."""
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (width, height), (32, 96, 160)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @dataclass
 class FakeBackend:
-    """Records every op and returns a fixed frame. Tests inspect ``actions``."""
+    """Records every op and returns a fixed frame. Tests inspect ``actions``.
 
-    image: bytes = _PNG_1x1
-    media_type: str = "image/png"
-    width: int = 1
-    height: int = 1
+    The frame image is a real PNG matching ``width``/``height`` so the tool's
+    downscaling and coordinate mapping run against true pixel dimensions.
+    """
+
+    width: int = 100
+    height: int = 100
     scale: float = 1.0
     origin_x: int = 0
     origin_y: int = 0
+    media_type: str = "image/png"
+    image: bytes | None = None
     cursor: tuple[int, int] = (0, 0)
     locked: bool = False
     secure_input: bool = False
     frontmost_bundle_id: str | None = "com.example.app"
     actions: list[tuple] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.image is None:
+            self.image = _solid_png(self.width, self.height)
 
     async def screenshot(self, display: int | None = None) -> ScreenFrame:
         self.actions.append(("screenshot", display))
