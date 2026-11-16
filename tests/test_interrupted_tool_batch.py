@@ -339,3 +339,104 @@ async def test_live_batch_with_a_late_approval_anchor_stays_one_paired_batch(
         await loop.close()
         await registry.close()
         store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+async def test_harness_notice_written_mid_batch_follows_its_results(
+    tmp_path: Path, parallel: bool
+) -> None:
+    """A shell cwd notice written after Alpha's result must not split the batch.
+
+    Every provider payload pairs each call with exactly one result right after
+    the calls, and the notice comes after the results.
+    """
+
+    store = ConversationStore(tmp_path, session_id="session")
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    alpha_written = asyncio.Event()
+
+    async def add_task(arguments: dict[str, str]) -> str:
+        if arguments["title"] == "Alpha":
+            registry.commit_cwd_recovery("/gone", "/fallback")
+        else:
+            # Beta ends after Alpha's result and notice are stored
+            await await_or_fail(alpha_written.wait(), what="Alpha's result")
+        return f"added {arguments['title']}"
+
+    registry.register("add_task", add_task, parallel_safe=parallel)
+    model = AddTaskModel("live")
+    loop = AgentLoop(model, store, registry=registry, skill_catalog=SkillCatalog.empty())
+    try:
+        async with aclosing(
+            loop.run_turn("add Alpha, Beta, Gamma", origin=MessageOrigin.USER)
+        ) as events:
+
+            async def drain() -> None:
+                async for event in events:
+                    if (
+                        event.type is StreamEventType.TOOL_EXECUTION_END
+                        and event.tool_call is not None
+                        and event.tool_call.id == "live-0-Alpha"
+                    ):
+                        alpha_written.set()
+
+            await await_or_fail(drain(), what="live turn")
+
+        ids = [f"live-0-{title}" for title in TITLES]
+        added = [f"added {title}" for title in TITLES]
+
+        codex = model.requests[1]
+        first = next(i for i, item in enumerate(codex) if item.get("call_id") == ids[0])
+        assert [
+            (item.get("type"), item.get("call_id"), item.get("output"))
+            for item in codex[first : first + 6]
+        ] == [
+            *(("function_call", call_id, None) for call_id in ids),
+            *(
+                ("function_call_output", call_id, text)
+                for call_id, text in zip(ids, added, strict=True)
+            ),
+        ]
+        assert sum(item.get("type") == "function_call_output" for item in codex) == 3
+        assert "/fallback" in str(codex[first + 6 :])
+
+        anthropic = model.anthropic[1]
+        uses = next(
+            index
+            for index, message in enumerate(anthropic)
+            if any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in message["content"]
+            )
+        )
+        results = [
+            (block["tool_use_id"], block["content"])
+            for message in anthropic
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        following: list[str] = []
+        for message in anthropic[uses + 1 :]:
+            blocks = message["content"]
+            if not all(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in blocks
+            ):
+                break
+            following.extend(block["tool_use_id"] for block in blocks)
+        assert [call_id for call_id, _ in results] == ids == following, anthropic
+
+        ollama = model.ollama[1]
+        calls_at = next(
+            index for index, message in enumerate(ollama) if message.get("tool_calls")
+        )
+        tools = [message for message in ollama if message["role"] == "tool"]
+        assert [message["content"] for message in ollama[calls_at + 1 : calls_at + 4]] == added
+        assert len(tools) == 3
+    finally:
+        await loop.close()
+        await registry.close()
+        store.close()

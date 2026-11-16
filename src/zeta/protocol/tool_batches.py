@@ -12,6 +12,7 @@ from .types import (
     TextContent,
     ToolResult,
     ToolUseContent,
+    is_passive_harness_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ def repair_tool_batches[T](
     A call that asks for approval only at execute time stores a synthetic
     assistant anchor holding that call between the batch and its result; the
     anchor repeats a call of the open batch, so it is skipped, not sent.
+    A harness notice written between a batch's results moves after them.
     """
 
     result: list[T] = []
@@ -62,10 +64,14 @@ def repair_tool_batches[T](
             result.append(item)
             continue
         batch_results: list[T] = []
+        notices: list[T] = []
         while index < len(items):
             candidate = message_of(items[index])
             if candidate.role is MessageRole.TOOL_RESULT:
                 batch_results.append(items[index])
+            elif is_passive_harness_message(candidate):
+                # written mid-batch (shell cwd recovery); it follows the results
+                notices.append(items[index])
             elif not _is_anchor(candidate, call_ids):
                 break
             index += 1
@@ -88,6 +94,7 @@ def repair_tool_batches[T](
         elif unique and not message.metadata.get(FAILED_TURN_MARKER):
             result.append(item)
             result.extend(by_id.get(call_id) or stand_in(call_id) for call_id in call_ids)
+        result.extend(notices)
     return result
 
 
