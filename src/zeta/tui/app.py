@@ -1143,11 +1143,6 @@ class TUIApp(
             except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
             return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
         return run()
-    def show_extensions(self) -> None:
-        from .render import render_extensions_list
-
-        self._print(render_extensions_list(self.extensions.status_rows() if self.extensions else []))
-
     def _print_system(self, output: str) -> None:
         self._print_unit(
             Text(

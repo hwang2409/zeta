@@ -538,17 +538,6 @@ STREAM_EVENTS_HANDLED_ELSEWHERE = frozenset({
 STREAM_EVENTS_HIDDEN = frozenset()
 
 
-def render_extensions_list(rows: list[dict[str, object]]) -> RenderableType:
-    from rich.table import Table
-
-    table = Table(title="extensions")
-    for heading in ("name", "scope", "version", "enabled", "trusted", "loaded", "error"):
-        table.add_column(heading)
-    for row in rows:
-        table.add_row(*(str(row.get(key, "")) for key in ("name", "scope", "version", "enabled", "trusted", "loaded", "error")))
-    return table
-
-
 def render_extension_notice(event: StreamEvent) -> RenderableType:
     text = event.data.get("text")
     extension = event.data.get("extension", "extension")
