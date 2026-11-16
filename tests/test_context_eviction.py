@@ -26,7 +26,7 @@ from zeta.core.context_parts.tool_results import truncate_tool_results
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.tool_batches import without_incomplete_tool_batches
+from zeta.protocol.tool_batches import complete_tool_batches
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -585,7 +585,7 @@ def test_provider_payload_drops_stored_eviction_orphan_result(caplog: pytest.Log
 
     assert not any(item.get("type") == "function_call_output" for item in payload["input"])
     assert "orphan tool result" in caplog.text
-    assert len(without_incomplete_tool_batches(messages)) == 1
+    assert len(complete_tool_batches(messages)) == 1
 
 
 def test_tool_result_accounting_counts_every_provider_bound_field() -> None:

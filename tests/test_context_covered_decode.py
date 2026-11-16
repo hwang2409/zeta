@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from zeta.context_eviction import valid_eviction_view
-from zeta.core.context import ContextAssembler
+from zeta.core.context import ContextAssembler, _with_interrupted_results
 from zeta.core.context_parts.types import _ContextItem
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.protocol.types import (
@@ -89,7 +89,8 @@ def reference_items(assembler: ContextAssembler, entries: list[ConversationEntry
     for marker in markers:
         if marker.id not in emitted:
             items.extend(assembler._marker_items(marker, active, entries))
-    return items
+    # The shared batch repair runs last; here it leaves out the failed reply.
+    return _with_interrupted_results(items, entries)
 
 
 def _seed_pending(store: ConversationStore) -> None:

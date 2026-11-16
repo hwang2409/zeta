@@ -354,7 +354,12 @@ def test_reused_fork_with_dangling_parallel_calls_is_safe_on_reopen(
     reopened = SessionManager(tmp_path).open(fork_id, _read_only=True)
     try:
         messages = branch_messages(reopened.store)
-        assert _anthropic_tool_ids(messages) == (set(), set())
+        ids = {call.id for call in calls}
+        assert _anthropic_tool_ids(messages) == (ids, ids)
+        # No approval facts reach a bare payload build, so it cannot say "not run".
+        assert json.dumps(_anthropic_payload(messages)).count(
+            "interrupted: may or may not have taken effect"
+        ) == 3
         payload = build_messages_payload(
             messages,
             [],

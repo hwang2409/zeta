@@ -1042,7 +1042,11 @@ wins on overlap, keeping its `resolution_pending`), limited to 64 entries. The
 durable projection covers a session resumed after a serve restart, when the loop
 holds no live approval records yet, and any approval that is only durable while
 another is settling live, so an approval persisted before the restart stays
-visible (still bounded to 64). The result also contains
+visible (still bounded to 64). Such a recovered approval stays answerable
+until the next turn starts: starting a turn closes every approval still open
+with `approval_end` (decision `abort`, reason `turn_canceled`), because its
+turn is over and the model is told that call did not run. An automatic turn
+right after a restart (a notification wake) also closes them. The result also contains
 `pending_approvals_truncated`. An approval whose durable resolution is being
 written stays visible with `resolution_pending`: `approve`, `deny`, `expire`,
 or `abort`. Read-only observers receive the same live baseline as the controller,
