@@ -52,6 +52,12 @@ from zeta.tools.agent.approval import ChildApprovalPolicy
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 
+async def _decide(server: ZetaServer, method: str, request_id: str, scope: str = "once") -> dict[str, object]:
+    """Decide through the attached record's use, as the serve request does."""
+    with server.controllers.owned(None) as use:
+        return await use.control.resolve_approval(use, method, request_id, scope)
+
+
 def test_approval_lifecycle_state_has_one_writer_in_all_production_modules() -> None:
     root = Path(__file__).parents[1] / "src"
     lifecycle_path = root / "zeta" / "server" / "approval_lifecycle.py"
@@ -178,7 +184,7 @@ async def test_delegated_tool_end_survives_approval_history_race(
             server.controllers.attached().control._approvals, "_append_delegated_history", hold_history
         )
         resolving = asyncio.create_task(
-            server.controllers.attached().control.resolve_approval("deny", wire_id)
+            _decide(server, "deny", wire_id)
         )
         await await_or_fail(history_started.wait(), what="approval history start")
         await await_or_fail(
@@ -395,7 +401,7 @@ async def test_aborted_approval_without_live_turn_starts_no_recovery_turn(
         server.controllers.attached().runtime.opened.store.resolve_approval(
             call.id, "abort", reason="child_cleanup"
         )
-        result = await server.controllers.attached().control.resolve_approval("deny", call.id)
+        result = await _decide(server, "deny", call.id)
 
         assert result["decision"] == "abort"
         assert server.controllers.attached().control._turn_task is None
@@ -410,7 +416,7 @@ async def test_denied_approval_without_live_turn_resumes_model(tmp_path: Path) -
     server, reader, writer, call = await _approval_server(tmp_path, backend=backend)
     try:
         await server.controllers.attached().control._event(_start_event(call))
-        await server.controllers.attached().control.resolve_approval("deny", call.id)
+        await _decide(server, "deny", call.id)
 
         resume = server.controllers.attached().control._turn_task
         assert resume is not None
@@ -487,14 +493,14 @@ async def test_delegated_cleanup_overlaps_worker_resolve_exact_target(
             assert cleanup is not None
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
-                await server.controllers.attached().control.resolve_approval("approve", wire_id)
+                await _decide(server, "approve", wire_id)
             assert loser.value.code == -32006
             gate.release.set()
             await asyncio.wait_for(cleanup, 10)
             expected = "abort"
         else:
             approve = asyncio.create_task(
-                server.controllers.attached().control.resolve_approval("approve", wire_id)
+                _decide(server, "approve", wire_id)
             )
             await _wait_thread_gate(gate)
             assert policy.cleanup_delegated("child") is None
@@ -539,13 +545,13 @@ async def test_same_tick_approval_reservation_winner(
             abort = asyncio.create_task(server.controllers.attached().control._terminate_pending_approvals())
             await _wait_thread_gate(gate)
             with pytest.raises(ProtocolError) as loser:
-                await server.controllers.attached().control.resolve_approval("approve", call.id)
+                await _decide(server, "approve", call.id)
             assert loser.value.code == -32006
             gate.release.set()
             await await_or_fail(abort, what="abort-first terminate_pending_approvals")
         else:
             approve = asyncio.create_task(
-                server.controllers.attached().control.resolve_approval("approve", call.id)
+                _decide(server, "approve", call.id)
             )
             await _wait_thread_gate(gate)
             abort = asyncio.create_task(server.controllers.attached().control._terminate_pending_approvals())
@@ -583,7 +589,7 @@ async def test_cancelled_handler_before_durable_commit_does_not_cancel_owner(
         # Hold the write lock so the settlement parks before it can commit.
         await store._async_write_lock.acquire()
         settlement = asyncio.create_task(
-            server.controllers.attached().control.resolve_approval("approve", call.id)
+            _decide(server, "approve", call.id)
         )
         try:
             await await_or_fail(joined_queue.wait(), what="approval queue admission")
@@ -622,7 +628,7 @@ async def test_cancelled_after_durable_commit_keeps_decision(
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
         settlement = asyncio.create_task(
-            server.controllers.attached().control.resolve_approval("approve", call.id)
+            _decide(server, "approve", call.id)
         )
         await _wait_thread_gate(gate)
         settlement.cancel()
@@ -891,7 +897,7 @@ async def test_failed_settlement_cancellation_recovery_balances_publication(
         monkeypatch.setattr(server.controllers.attached().runtime.loop, "abort", signal.set)
         request_id = server.controllers.attached().control._approvals.wire_id(key)
         with pytest.raises(ProtocolError) as error:
-            await server.controllers.attached().control.resolve_approval("approve", request_id)
+            await _decide(server, "approve", request_id)
         assert error.value.code == -32000
         await server.controllers.attached().control.request_approval_abort(
             call.id,
@@ -935,7 +941,7 @@ async def _make_unhealthy(
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
     )
     with pytest.raises(ProtocolError) as error:
-        await server.controllers.attached().control.resolve_approval("approve", call.id)
+        await _decide(server, "approve", call.id)
     assert error.value.code == -32000
     assert server.controllers.attached().control.unhealthy()
 
@@ -973,7 +979,7 @@ async def test_protocol_1_0_persistent_approval_failure_keeps_legacy_status_shap
         }
         assert "health" not in response["result"]
         with pytest.raises(ProtocolError) as error:
-            await server.controllers.attached().control.resolve_approval("approve", call.id)
+            await _decide(server, "approve", call.id)
         assert error.value.code == -32000
     finally:
         await close_serve(server, writer)
@@ -1464,7 +1470,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk failed")),
         )
         with pytest.raises(ProtocolError) as error:
-            await server.controllers.attached().control.resolve_approval("approve", call.id)
+            await _decide(server, "approve", call.id)
         assert error.value.code == -32000
         assert aborted == [True]
 
@@ -1482,7 +1488,7 @@ async def test_approval_durable_failure_is_fail_closed_and_documented(
         assert not server.controllers.attached().control.has_pending_approvals()
         assert server.controllers.attached().control._approvals.state.records == {}
         with pytest.raises(ProtocolError) as later:
-            await server.controllers.attached().control.resolve_approval("approve", call.id)
+            await _decide(server, "approve", call.id)
         assert later.value.code == -32000
 
     finally:
@@ -1537,7 +1543,8 @@ async def test_persistent_failure_removes_many_live_child_approvals(
 
         first_key = ("child-0", "child-call-0")
         with pytest.raises(ProtocolError) as error:
-            await server.controllers.attached().control.resolve_approval(
+            await _decide(
+                server,
                 "approve", server.controllers.attached().control._approvals.wire_id(first_key)
             )
         assert error.value.code == -32000
@@ -2161,7 +2168,7 @@ async def test_reconnect_approval_end_waits_for_hello_response(
         await await_or_fail(hello_held.wait(), what="held hello response")
 
         await await_or_fail(
-            server.controllers.attached().control.resolve_approval("deny", call.id),
+            _decide(server, "deny", call.id),
             what="approval terminal admission",
         )
         release_hello.set()
@@ -2325,7 +2332,7 @@ async def test_approval_reconnect_expiry_aborts_once(tmp_path: Path) -> None:
         assert len(rows) == 1
         assert rows[0].data["reason"] == "grace_expired"
         with pytest.raises(ProtocolError) as late:
-            await server.controllers.attached().control.resolve_approval("approve", call.id)
+            await _decide(server, "approve", call.id)
         assert late.value.code == -32006
     finally:
         await close_serve(server, writer)
@@ -2344,7 +2351,7 @@ async def test_approval_reconnect_status_during_reserved_write(
         gate = _StoreGate(store, "resolve_approval")
         gate.install(monkeypatch)
         decision = asyncio.create_task(
-            server.controllers.attached().control.resolve_approval("approve", call.id)
+            _decide(server, "approve", call.id)
         )
         await _wait_thread_gate(gate)
         status = server.controllers.attached().control.pending_approvals_now(reconnect=True)
@@ -2357,7 +2364,7 @@ async def test_approval_reconnect_status_during_reserved_write(
             }
         ]
         with pytest.raises(ProtocolError) as competing:
-            await server.controllers.attached().control.resolve_approval("deny", call.id)
+            await _decide(server, "deny", call.id)
         assert competing.value.code == -32006
         gate.release.set()
         await asyncio.wait_for(decision, 10)

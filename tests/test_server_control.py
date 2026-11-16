@@ -144,8 +144,9 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
         connection, "controller", "1.2", frozenset({"memory_updated"})
     )
     control = object.__new__(ServeControl)
-    control.closing = False
-    control.server = SimpleNamespace(connections=registry)
+    control.server = SimpleNamespace(
+        connections=registry, controllers=SimpleNamespace(is_closing=lambda _control: False)
+    )
     control._notify = lambda event, session_id=None, **fields: (
         registry.publish_controller(event, session_id, **fields)
     )

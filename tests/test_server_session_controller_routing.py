@@ -49,9 +49,9 @@ async def test_send_delivers_only_to_the_owned_record(
             deliveries = record.control.deliveries
             session_id = record.runtime.session_id
 
-            async def send(params: Any, features: Any, original=deliveries.send, session_id=session_id):
+            async def send(use: Any, params: Any, features: Any, original=deliveries.send, session_id=session_id):
                 delivered.append(session_id)
-                return await original(params, features)
+                return await original(use, params, features)
 
             monkeypatch.setattr(deliveries, "send", send)
         assert {record.runtime.session_id for record in server.controllers.records()} == {a, b}
@@ -88,7 +88,7 @@ async def test_session_history_reads_the_selected_record_not_the_owned_one(
 
 
 @pytest.mark.asyncio
-async def test_idle_record_replaced_by_reattach_leaves_records_before_its_close(
+async def test_idle_record_replaced_by_reattach_stays_resident_until_its_close_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = GatedBackend([([HOLD], [TextContent("a")])])
@@ -110,6 +110,12 @@ async def test_idle_record_replaced_by_reattach_leaves_records_before_its_close(
         monkeypatch.setattr(record_b.control, "close", held_close)
         await client.call("resume", {"session_id": a})
         await await_or_fail(entered.wait(), what="B's close starts")
+        # closing: not selectable, but still resident (and counted) until closed
+        assert record_b in server.controllers.records()
+        assert server.controllers.is_closing(record_b.control)
+        assert server.controllers.closing_session_ids() == [b]
+        release.set()
+        await await_or_fail(server.controllers.wait_closed(b), what="B's close")
         assert record_b not in server.controllers.records()
     finally:
         release.set()
@@ -118,7 +124,7 @@ async def test_idle_record_replaced_by_reattach_leaves_records_before_its_close(
 
 
 @pytest.mark.asyncio
-async def test_failed_new_session_setup_leaves_records_before_its_close(
+async def test_failed_new_session_setup_answers_only_after_its_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = GatedBackend([([HOLD], [TextContent("a")])])
@@ -135,7 +141,8 @@ async def test_failed_new_session_setup_leaves_records_before_its_close(
         new_pair = server.new_pair
 
         def failing_pair():
-            record = new_pair()
+            reservation = new_pair()
+            record = reservation.record
             incoming.append(record)
             runtime = record.runtime
             original = runtime.close
@@ -150,14 +157,18 @@ async def test_failed_new_session_setup_leaves_records_before_its_close(
 
             monkeypatch.setattr(runtime, "create_session", create_session)
             monkeypatch.setattr(runtime, "close", held_close)
-            return record
+            return reservation
 
         monkeypatch.setattr(server, "new_pair", failing_pair)
         request = asyncio.create_task(client.frames("new_session", {}))
         await await_or_fail(entered.wait(), what="the failed pair's close starts")
-        assert incoming and incoming[0] not in server.controllers.records()
+        # the failed generation stays reserved until its close ends; the error
+        # answers only after that
+        assert incoming and incoming[0] in server.controllers.records()
+        assert incoming[0].closing and not request.done()
         release.set()
         assert "error" in (await await_or_fail(request, what="new_session"))[-1]
+        assert incoming[0] not in server.controllers.records()
     finally:
         release.set()
         backend.open_all()

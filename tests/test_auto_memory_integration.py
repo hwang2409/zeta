@@ -363,10 +363,10 @@ async def test_login_required_notice_is_delivered_to_serve_client(
 ) -> None:
     composition, memory_backend = await _login_required_composition(tmp_path)
     control = object.__new__(ServeControl)
-    control.closing = False
     controller = SimpleNamespace(features=frozenset({"memory_updated"}))
     control.server = SimpleNamespace(
-        connections=SimpleNamespace(controller_metadata=lambda: controller)
+        connections=SimpleNamespace(controller_metadata=lambda: controller),
+        controllers=SimpleNamespace(is_closing=lambda _control: False),
     )
     events: list[tuple[str, str | None, dict[str, object]]] = []
 
@@ -430,8 +430,9 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
         registry.register(connection)
         registry.negotiate_role(connection, "controller", "1.2", features)
         control = object.__new__(ServeControl)
-        control.closing = False
-        control.server = SimpleNamespace(connections=registry)
+        control.server = SimpleNamespace(
+            connections=registry, controllers=SimpleNamespace(is_closing=lambda _control: False)
+        )
         control._notify = lambda event, session_id=None, **fields: (
             registry.publish_controller(event, session_id, **fields)
         )

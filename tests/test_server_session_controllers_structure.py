@@ -28,22 +28,24 @@ RESOLVER_ENTRIES = {
 }
 # `.owned`/`.selected` attributes that are not the resolvers
 OTHER_ATTRIBUTES = {("accounts.py", "snapshot.selected")}
-# the functions that may close a resident control or runtime, each only after
-# `SessionControllers.retire` took the record out of every index
-CLOSE_ENTRIES = {
-    "parking.py:ParkedPairs._close_pair.close",
-    "handlers/lifecycle.py:_session_swap",
-    "server.py:ZetaServer.close",
-}
-RETIRE_BEFORE_CLOSE = {
+# `SessionControllers` is the one close coordinator: outside it, the only
+# control/runtime close is the attached runtime teardown shutdown hands to it
+RUNTIME_TEARDOWN = {"server.py:ZetaServer._close_attached_runtime"}
+# the only callers of `retire`, each through the owner
+RETIRE_CALLERS = {
     "parking.py:ParkedPairs.leave",
     "parking.py:ParkedPairs.close",
     "handlers/lifecycle.py:_session_swap",
-    "server.py:ZetaServer.close",
 }
+# close state that only `SessionControllers` holds
+CLOSE_STATE = {"closing", "close_task", "closing_session_id", "_closing", "_close_pair", "closing_tasks"}
 RESOLVERS = {"owned", "selected"}
-# the only places a request use is handed to a completion (2a: worker reads)
-TRANSFER_ENTRIES = {"connections.py:ConnectionRegistry.run_read"}
+# the only places a request use is handed to an existing completion: the worker
+# read and the approval settlement; delivery and setup tasks use `SessionUse.run`
+TRANSFER_ENTRIES = {
+    "connections.py:ConnectionRegistry.run_read",
+    "control.py:ServeControl.resolve_approval",
+}
 # use and completion state, each written only by its owner module
 USE_OWNER = "session_controllers.py"
 COMPLETION_OWNER = "thread_call.py"
@@ -219,122 +221,135 @@ def test_use_and_completion_state_have_one_owner() -> None:
 
 
 def test_every_resident_close_goes_through_retire() -> None:
-    """A control or runtime close, or a ``_close_pair``, happens only in the close
-    entries, and each closing path retires the record before its first await or
-    task."""
+    """No control or runtime closes outside ``SessionControllers`` except the
+    attached runtime teardown shutdown hands to it; every ``retire`` call goes
+    through the owner from a named caller; and no module outside the owner
+    holds close state (closing flags, close tasks, closing maps)."""
     problems: list[str] = []
-    functions = {name: function for name, function, _file in _functions()}
-    for name, function in functions.items():
+    for name, function, _file in _functions():
         for node in _own_nodes(function):
+            if isinstance(node, ast.Attribute) and node.attr in CLOSE_STATE:
+                problems.append(f"{name}:{node.lineno}: close state {ast.unparse(node)}")
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                 continue
             text = ast.unparse(node.func)
-            closes = node.func.attr == "_close_pair" or (
-                node.func.attr == "close"
-                and (text.endswith(("control.close", "runtime.close")))
-            )
-            if not closes:
-                continue
-            if node.func.attr == "_close_pair":
-                if name not in {"parking.py:ParkedPairs.leave", "parking.py:ParkedPairs.close"}:
-                    problems.append(f"{name}:{node.lineno}: {text}")
-            elif name not in CLOSE_ENTRIES:
+            if text.endswith(("control.close", "runtime.close")) and name not in RUNTIME_TEARDOWN:
+                problems.append(f"{name}:{node.lineno}: {text} outside the close coordinator")
+            if node.func.attr == "retire" and (
+                name not in RETIRE_CALLERS or not text.endswith("controllers.retire")
+            ):
                 problems.append(f"{name}:{node.lineno}: {text}")
-    for name in RETIRE_BEFORE_CLOSE:
-        nodes = _own_nodes(functions[name])
-        retire = min(
-            (n.lineno for n in nodes if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "retire"),
-            default=None,
-        )
-        first_close = min(
-            n.lineno
-            for n in nodes
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and (
-                n.func.attr in {"_close_pair", "create_task"}
-                or ast.unparse(n.func).endswith(("control.close", "runtime.close"))
-            )
-        )
-        if retire is None or retire > first_close:
-            problems.append(f"{name}: closes at line {first_close} before retire")
-    for name in CLOSE_ENTRIES:
-        nodes = _own_nodes(functions[name])
-        drained = min(
-            (n.lineno for n in nodes if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "drained"),
-            default=None,
-        )
-        first_close = min(
-            n.lineno
-            for n in nodes
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and ast.unparse(n.func).endswith(("control.close", "runtime.close"))
-        )
-        if drained is None or drained > first_close:
-            problems.append(f"{name}: closes at line {first_close} before its uses drain")
+    for file in SCANNED:
+        if file.name in {"parking.py", "registry.py"} or file.name == "server.py":
+            for node in ast.walk(ast.parse(file.read_text())):
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Attribute) and target.attr == "closing"
+                    for target in node.targets
+                ):
+                    problems.append(f"{_rel(file)}:{node.lineno}: writes a closing flag")
     assert problems == []
 
 
-def test_record_identity_survives_transitions() -> None:
+def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
+    """Identity and generation survive transitions; ``retire`` stops resolution
+    at once, keeps the record resident while a held use delays the close, closes
+    control then runtime once, and only then drops the record."""
+    events: list[str] = []
+
     class Runtime:
         session_id = "s"
         opened = object()
 
-    class Control:
-        runtime = Runtime()
+        async def close(self) -> None:
+            events.append("runtime")
 
-    control = Control()
-    owner = SessionControllers(control)
-    record = owner.attached()
-    generation = record.generation
-    assert owner.attach(record) is record
-    assert owner.park(record) is record
-    assert owner.unpark(record) is record
-    assert owner.attach(record) is record
-    assert owner.register(Control()).generation > generation  # type: ignore[arg-type]
-    with owner.owned(None) as use:
-        assert (use.record, use.generation, record.uses) == (record, generation, {use})
-    assert record.uses == set()
-    owner.park(record)
-    assert owner.retire(record) is record
-    assert record.generation == generation
-    assert record not in owner.records()
-    with pytest.raises(ProtocolError):
-        owner.selected(None, "s")
+    class Control:
+        def __init__(self) -> None:
+            self.runtime = Runtime()
+
+        async def close(self) -> None:
+            events.append("control")
+
+        async def wait_for_approval_settlement(self, timeout: float | None) -> None:
+            events.append("settled")
+
+    async def main() -> None:
+        control = Control()
+        owner = SessionControllers(control)  # type: ignore[arg-type]
+        record = owner.attached()
+        generation = record.generation
+        assert owner.attach(record) is record
+        assert owner.park(record) is record
+        assert owner.unpark(record) is record
+        assert owner.attach(record) is record
+        assert owner.register(Control()).generation > generation  # type: ignore[arg-type]
+        with owner.owned(None) as use:
+            assert (use.record, use.generation, record.uses) == (record, generation, {use})
+        assert record.uses == set()
+        owner.park(record)
+        held = owner.selected(None, "s")
+        close = owner.retire(record)
+        assert owner.retire(record) is close
+        assert (record.closing, record.generation) == (True, generation)
+        with pytest.raises(ProtocolError):
+            owner.selected(None, "s")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert (events, record in owner.records()) == ([], True)
+        held.release()
+        await await_or_fail(owner.wait_closed("s"), what="close after the use settles")
+        assert events == ["control", "runtime", "settled"]
+        assert record not in owner.records()
+
+    asyncio.run(main())
 
 
 def test_a_transferred_use_settles_only_with_its_completion() -> None:
     """Release after transfer is a no-op; the completion's settle (result, error,
-    or cancel) releases the use once, and only then does a close drain end."""
+    or cancel) releases the use once, and only then does the record's close
+    start."""
+
+    closed: list[str] = []
+
+    class Runtime:
+        opened = None
+
+        async def close(self) -> None:
+            closed.append("runtime")
 
     class Control:
-        runtime = None
+        def __init__(self) -> None:
+            self.runtime = Runtime()
+
+        async def close(self) -> None:
+            closed.append("control")
+
+        async def wait_for_approval_settlement(self, timeout: float | None) -> None:
+            pass
 
     async def main() -> None:
         owner = SessionControllers(Control())  # type: ignore[arg-type]
-        record = owner.attached()
-        with owner.owned(None):
-            # a request's own use does not delay a close: it may wait on that close
-            await await_or_fail(owner.drained(record), what="drain beside a held use")
         for settle in ("result", "exception", "cancel"):
+            closed.clear()
+            use = owner.register(Control())  # type: ignore[arg-type]
+            record = use.record
             completion = asyncio.get_running_loop().create_future()
-            use = owner.owned(None)
             use.transfer_to(completion)
             with pytest.raises(RuntimeError):
                 use.transfer_to(completion)
             use.release()
-            drain = asyncio.ensure_future(owner.drained(record))
-            await asyncio.sleep(0)
-            assert (record.uses, drain.done()) == ({use}, False), settle
+            close = owner.retire(record)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert (record.uses, closed, close.done()) == ({use}, [], False), settle
             if settle == "result":
                 completion.set_result(None)
             elif settle == "exception":
                 completion.set_exception(ValueError())
             else:
                 completion.cancel()
-            await await_or_fail(drain, what=f"drain after {settle}")
-            assert record.uses == set()
+            await await_or_fail(close, what=f"close after {settle}")
+            assert (record.uses, closed) == (set(), ["control", "runtime"])
             if settle == "exception":
                 completion.exception()
 

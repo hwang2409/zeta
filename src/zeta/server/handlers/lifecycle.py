@@ -81,19 +81,42 @@ async def _session_swap(
             server.connections.replay_session_replaced()
             yield None
         return
-    incoming = server.new_pair()
-    with incoming.control.reserve_session_swap():
-        try:
-            yield incoming
-        except BaseException:
-            if not incoming.control.attached:
-                server.controllers.retire(incoming)
-                await server.controllers.drained(incoming)
-                await incoming.runtime.close()
-            raise
+    # this setup holds the new generation's reservation until it ends
+    with server.new_pair() as reservation:
+        incoming = reservation.record
+        with incoming.control.reserve_session_swap():
+            try:
+                yield incoming
+            except BaseException:
+                if not incoming.control.attached:
+                    closed = server.controllers.retire(incoming)
+                    reservation.release()
+                    await asyncio.shield(closed)
+                raise
 
 
-async def new_session(
+async def new_session(self, params: dict[str, Any], controller: SessionUse) -> dict[str, object]:
+    return await _setup(self, _new_session, params, controller)
+
+
+async def resume(self, params: dict[str, Any], controller: SessionUse) -> dict[str, object]:
+    return await _setup(self, _resume, params, controller)
+
+
+async def _setup(self, body: Any, params: dict[str, Any], controller: SessionUse) -> dict[str, object]:
+    """Run a create or resume as the one setup completion that owns the
+    request's use (and, inside it, the new pair's reservation): a cancel of the
+    request reaches the setup once and its cleanup still holds both records."""
+
+    async def setup() -> dict[str, object]:
+        # a queued wake may not start its setup while this state change runs
+        with controller.control.hold_wake_start():
+            return await body(self, params, controller)
+
+    return await controller.run(setup())
+
+
+async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     try:
@@ -156,7 +179,7 @@ async def new_session(
         raise
 
 
-async def resume(
+async def _resume(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     try:
@@ -171,7 +194,7 @@ async def resume(
             return attached
         async with _session_swap(self, park, controller) as incoming:
             session_id = await _resolve_session_id(self, params, controller)
-            await self.server.parking.wait_closed(session_id)
+            await self.server.controllers.wait_closed(session_id)
             unhealthy_same_session = (
                 incoming is None
                 and controller.control.unhealthy()
@@ -258,7 +281,7 @@ async def _resume_live_or_parked(
         return None, park
     session_id = await _resolve_session_id(self, params, controller)
     parking = self.server.parking
-    await parking.wait_closed(session_id)
+    await self.server.controllers.wait_closed(session_id)
     state = controller.runtime.state
     control = controller.control
     if (
@@ -275,7 +298,7 @@ async def _resume_live_or_parked(
             return await _attach_live_turn(self, bindings, candidate, parked=parked, controller=controller), park
         # as for the open session: close it (its turn ends disconnect), reopen from disk
         parking.close(parked.control)
-        await parking.wait_closed(session_id)
+        await self.server.controllers.wait_closed(session_id)
     # resuming the attached session itself never takes a new pair
     return None, park and (state is None or state.session_id != session_id)
 

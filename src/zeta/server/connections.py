@@ -1227,6 +1227,10 @@ class ConnectionRegistry(ReplayOutput):
             controller,
         )
 
+    def stop_admission(self) -> None:
+        """Refuse every later connection; server shutdown calls this first."""
+        self._closed = True
+
     async def aclose(self) -> None:
         self._closed = True
         self._unregister_child_run_sink()

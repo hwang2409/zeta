@@ -58,6 +58,12 @@ PNG = bytes.fromhex(
 )
 
 
+async def _send_images(server: ZetaServer, params: dict[str, object], features: frozenset[str]) -> dict[str, object]:
+    """``send_images`` through the attached record's use, as the serve request does."""
+    with server.controllers.owned(None) as use:
+        return await use.control.deliveries.send_images(use, params, features)
+
+
 def _server(
     tmp_path: Path,
     backend: FakeBackend | None,
@@ -948,7 +954,8 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
             "result"
         ]["session"]["session_id"]
         request = asyncio.create_task(
-            server.controllers.attached().control.deliveries.send_images(
+            _send_images(
+                server,
                 {
                     "session_id": session_id,
                     "text": "look",
@@ -1001,7 +1008,8 @@ async def test_cancelled_send_images_publishes_nothing(
             "result"
         ]["session"]["session_id"]
         request = asyncio.create_task(
-            server.controllers.attached().control.deliveries.send_images(
+            _send_images(
+                server,
                 {
                     "session_id": session_id,
                     "text": "look",
