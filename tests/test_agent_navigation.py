@@ -2657,3 +2657,65 @@ async def test_child_approval_exits_navigation_in_full_screen(
     assert not app.pending_approvals
     await app.close()
     child_store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_views_hold_only_the_viewed_childs_descriptors(tmp_path: Path) -> None:
+    """#1351: per-child stores ran the orchestrator out of descriptors. Across
+    ten children (more than the eight parked views), a nested child, and three
+    rounds of enter and leave, the viewed child alone holds descriptors: the
+    count is the same for every child and every round, and leaving to main or
+    closing the navigation gives them all back."""
+
+    def open_fds() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    store = ConversationStore(tmp_path / "sessions", session_id="root")
+    children = [_child(store, number, description=f"child {number}") for number in range(1, 11)]
+    parent = ConversationStore(children[0].parent, session_id=children[0].name)
+    nested = _child(parent, 11, description="nested")
+    parent.close()
+    for path in (*children, nested):
+        writer = ConversationStore(path.parent, session_id=path.name)
+        writer.append_message(Message(MessageRole.ASSISTANT, [TextContent(f"from {path.name}")]))
+        writer.close()
+
+    before_navigation = open_fds()
+    navigation = AgentNavigation(store)
+    try:
+        await navigation.wait_for_publication()
+        at_main = open_fds()
+
+        async def go(path: Path) -> int:
+            if path in navigation._path_stack:
+                navigation.back_to_parent()
+            else:
+                navigation.selected_index = next(
+                    index for index, entry in enumerate(navigation.entries) if entry.path == path
+                )
+                navigation.open_selected()
+            await navigation.wait_for_publication()
+            assert navigation.current_path == path
+            return open_fds()
+
+        viewing: dict[str, int] = {}
+        for round_number in range(3):
+            for child in children:
+                viewing[f"round {round_number} {child.name}"] = await go(child)
+                if child == children[0]:
+                    viewing[f"round {round_number} nested"] = await go(nested)
+                    viewing[f"round {round_number} back to {child.name}"] = await go(child)
+                after_leave = await go(store.session_dir)
+                assert after_leave == at_main, (
+                    f"leaving {child.name} in round {round_number} kept "
+                    f"{after_leave - at_main} descriptors open"
+                )
+        assert len(set(viewing.values())) == 1, f"descriptors differ per view: {viewing}"
+        held = next(iter(viewing.values())) - at_main
+        assert 0 < held <= 4, f"one child view holds {held} descriptors"
+        await go(children[-1])
+    finally:
+        await navigation.close()
+        after_close = open_fds()
+        store.close()
+    assert after_close == before_navigation, "closing navigation left a child's descriptors open"

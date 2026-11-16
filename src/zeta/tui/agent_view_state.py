@@ -141,12 +141,16 @@ def _text_lines(text: str, tail: int | None = None) -> Iterator[str]:
         yield from text.splitlines()[-tail:]
         return
     start = 0
+    # Each search runs again only once start passes its hit: one pass, not a
+    # scan to the end of the text for every line.
+    newline = text.find("\n")
+    carriage = text.find("\r")
     while start < len(text):
-        ends = [
-            index
-            for index in (text.find("\n", start), text.find("\r", start))
-            if index >= 0
-        ]
+        if 0 <= newline < start:
+            newline = text.find("\n", start)
+        if 0 <= carriage < start:
+            carriage = text.find("\r", start)
+        ends = [index for index in (newline, carriage) if index >= 0]
         end = min(ends) if ends else -1
         if end < 0:
             yield text[start:]
