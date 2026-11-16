@@ -314,6 +314,9 @@ def test_a_transferred_use_settles_only_with_its_completion() -> None:
     async def main() -> None:
         owner = SessionControllers(Control())  # type: ignore[arg-type]
         record = owner.attached()
+        with owner.owned(None):
+            # a request's own use does not delay a close: it may wait on that close
+            await await_or_fail(owner.drained(record), what="drain beside a held use")
         for settle in ("result", "exception", "cancel"):
             completion = asyncio.get_running_loop().create_future()
             use = owner.owned(None)
