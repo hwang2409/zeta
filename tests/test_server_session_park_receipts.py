@@ -85,7 +85,7 @@ async def test_parked_session_closes_when_its_exit_receipt_clears_without_a_wake
             "A's turn ends while its task runs",
         )
         await client.new()
-        parked = server._parked[a]
+        parked = server.parking._parked[a]
         # m-b: the client requires host commands but none are bound, so no wake can start
         parked._host_binding_required = True
         parked._active_host_commands = None

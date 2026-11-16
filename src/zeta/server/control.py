@@ -268,8 +268,7 @@ class ServeControl:
     def _maybe_idle(self) -> None:
         """Ask the server to report this parked pair's state and close it once
         idle; loop thread only."""
-        if self in self.server._parked.values():
-            asyncio.get_running_loop().call_soon(self.server._close_if_idle, self)
+        self.server.parking.changed(self)
 
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()

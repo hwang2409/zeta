@@ -160,7 +160,7 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
             park or self.server.control.state_change_busy()
         ):
             session_id = await _resolve_session_id(self, params)
-            await self.server.wait_closed(session_id)
+            await self.server.parking.wait_closed(session_id)
             state = self.server.runtime.state
             control = self.server.control
             if (
@@ -171,14 +171,14 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 and not control.unhealthy()
             ):
                 return await _attach_live_turn(self, bindings, candidate)
-            parked = self.server._parked.get(session_id)
+            parked = self.server.parking.get(session_id)
             if park and parked is not None:
                 return await _attach_live_turn(self, bindings, candidate, parked=parked)
             # resuming the attached session itself never takes a new pair
             park = park and (state is None or state.session_id != session_id)
         async with _session_swap(self, park) as incoming:
             session_id = await _resolve_session_id(self, params)
-            await self.server.wait_closed(session_id)
+            await self.server.parking.wait_closed(session_id)
             unhealthy_same_session = (
                 incoming is None
                 and self.server.control.unhealthy()
@@ -565,9 +565,7 @@ async def status(
     }
     status.update(suffix)
     if "session_park" in self.features:
-        status["parked_sessions"] = [
-            control.parked_row() for control in self.server._parked.values()
-        ]
+        status["parked_sessions"] = self.server.parking.rows()
     slash_command = self.server.control.slash_lock.status()
     if slash_command is not None:
         status["slash_command"] = slash_command
