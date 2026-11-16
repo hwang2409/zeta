@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 
 from .types import Message, MessageRole, TextContent, ToolResult, ToolUseContent
 
@@ -24,15 +24,15 @@ def interrupted_tool_result(call_id: str, *, not_run: bool) -> Message:
     )
 
 
-def complete_tool_batches(
-    messages: Sequence[Message], not_run_call_ids: Collection[str] = ()
-) -> list[Message]:
+def complete_tool_batches(messages: Sequence[Message]) -> list[Message]:
     """Pair every tool call of an interrupted batch with exactly one result.
 
     A batch is interrupted when a later message follows before all its results
     exist (the process died mid-batch). Its real results stay, in call order,
     and each missing one gets an interrupted result, so the model sees what
     already ran. A trailing incomplete batch is still in flight and stays as is.
+    Context assembly fills these first with approval facts; here none exist, so
+    a missing result may or may not have taken effect.
     """
 
     result: list[Message] = []
@@ -100,10 +100,7 @@ def complete_tool_batches(
                     by_id.setdefault(candidate.tool_result.tool_call_id, candidate)
             result.append(message)
             result.extend(
-                by_id.get(call_id)
-                or interrupted_tool_result(
-                    call_id, not_run=call_id in not_run_call_ids
-                )
+                by_id.get(call_id) or interrupted_tool_result(call_id, not_run=False)
                 for call_id in call_ids
             )
         index = following
