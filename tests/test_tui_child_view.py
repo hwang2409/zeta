@@ -961,6 +961,70 @@ async def test_child_source_validates_its_log_once_across_reads(
     assert all(store.closed for store in opened), "child source left its store open"
 
 
+@pytest.mark.asyncio
+async def test_child_source_closes_a_store_from_a_read_whose_caller_left(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second cancel lets a read's caller leave while its worker thread still
+    holds a store. A later read keeps its own store; when the late thread ends it
+    must close its store, not replace the kept one (2 leaked descriptors each)."""
+
+    import threading
+
+    from zeta.protocol.types import Message, MessageRole, TextContent
+    from zeta.tui.transcript import child_history_source
+
+    writer = ConversationStore(tmp_path / "agents", session_id="1")
+    writer.append_message(Message(MessageRole.ASSISTANT, [TextContent("child reply")]))
+    path = writer.session_dir
+    writer.close()
+
+    opened: list[ConversationStore] = []
+
+    class CountingStore(ConversationStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    # test-contract: seam count store opens behind the source's reads
+    monkeypatch.setattr(child_history_source, "ConversationStore", CountingStore)
+    source = child_history_source.ChildLogHistorySource(path)
+    started, release, late_done = threading.Event(), threading.Event(), threading.Event()
+    run_sync = source._run_sync
+
+    def tracked_run_sync(operation, *args):
+        try:
+            return run_sync(operation, *args)
+        finally:
+            if operation is held_read:
+                late_done.set()
+
+    def held_read(store: ConversationStore) -> None:
+        started.set()
+        release.wait(10)
+
+    # test-contract: seam mark when the held read's worker thread returns
+    monkeypatch.setattr(source, "_run_sync", tracked_run_sync)
+    late = asyncio.create_task(source._run(held_read))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 10), 10)
+        late.cancel()
+        # test-contract: one loop turn so the first cancel reaches the drain
+        await asyncio.sleep(0)
+        late.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(late, 10)
+        await asyncio.wait_for(source.page(), 10)
+        release.set()
+        assert await asyncio.wait_for(asyncio.to_thread(late_done.wait, 10), 10)
+    finally:
+        release.set()
+        await source.close()
+    assert len(opened) == 2, f"expected the late read and the next read to open stores: {opened}"
+    leaked = [store for store in opened if not store.closed]
+    assert not leaked, f"{len(leaked)} of 2 child stores left open after close"
+
+
 def test_bounded_text_scans_each_character_a_bounded_number_of_times() -> None:
     """A many-line tool result is split in one pass, not one scan per line."""
 

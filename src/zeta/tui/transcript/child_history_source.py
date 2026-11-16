@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
-from ...core.store import ConversationStore
+from ...core.store import ConversationStore, ObserverSnapshotChanged
 from ...core.store._history_index import StaleHistorySnapshot
 from ...core.store._row_history import searchable_units
 from ...core.store._rows import MessageFacts
@@ -54,39 +54,62 @@ class ChildLogHistorySource:
         # One read-only store for the source's life: opening validates the whole
         # log, while each operation's refresh() rereads only what changed.
         self._store: ConversationStore | None = None
+        self._store_guard = threading.Lock()
         self.pending_prompts: tuple[str, ...] = ()
 
     async def close(self) -> None:
-        async with self._operation_lock:
+        # Mark closed first: an operation still running (even one whose caller
+        # was cancelled twice) then closes its store instead of keeping it.
+        with self._store_guard:
             self._closed = True
-            store, self._store = self._store, None
+        # Shielded, so a cancelled close still closes the kept store.
+        await asyncio.shield(self._close_kept_store())
+
+    async def _close_kept_store(self) -> None:
+        async with self._operation_lock:
+            with self._store_guard:
+                store, self._store = self._store, None
             if store is not None:
                 await asyncio.to_thread(store.close)
 
+    def _open_store(self) -> ConversationStore:
+        return ConversationStore(
+            self.path.parent,
+            session_id=self.path.name,
+            _read_only=True,
+            _observer_snapshot=True,
+            _must_exist=True,
+        )
+
     def _run_sync(self, operation: Any, *args: Any) -> Any:
-        store, self._store = self._store, None
-        if store is None:
-            store = ConversationStore(
-                self.path.parent,
-                session_id=self.path.name,
-                _read_only=True,
-                _observer_snapshot=True,
-                _must_exist=True,
-            )
+        with self._store_guard:
+            store, self._store = self._store, None
         try:
+            if store is None:
+                store = self._open_store()
             if not self._replay_provider_loaded:
                 from ..checkpoints import session_replay_provider
 
                 self.replay_provider = session_replay_provider(self.path)
                 self._replay_provider_loaded = True
-            result = operation(store, *args)
+            try:
+                result = operation(store, *args)
+            except ObserverSnapshotChanged:
+                # The log was replaced during the read: reopen it once and retry.
+                store.close()
+                store = None
+                store = self._open_store()
+                result = operation(store, *args)
         except BaseException:
-            store.close()
+            if store is not None:
+                store.close()
             raise
-        if self._closed:
+        with self._store_guard:
+            keep = not self._closed and self._store is None
+            if keep:
+                self._store = store
+        if not keep:
             store.close()
-        else:
-            self._store = store
         return result
 
     async def _run(self, operation: Any, *args: Any) -> Any:
