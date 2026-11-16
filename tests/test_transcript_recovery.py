@@ -439,6 +439,7 @@ def _sequenced_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     import zeta.core.store._log as log_module
 
     ticks = iter(range(1, 10_000))
+    # test-contract: seam strictly increasing diagnosis times make the newest-3 order exact
     monkeypatch.setattr(
         log_module, "_now", lambda: f"2026-01-01T00:00:00.{next(ticks):06d}+00:00"
     )
@@ -490,6 +491,7 @@ def test_prune_keeps_unresolved_and_newest_resolved_sets(
     monkeypatch.setattr(recovery, "_after_recovery_step", abandon_at_pending)
     with pytest.raises(_PruneCrash):
         _bad_row_repair(root, "pruned", home_lease)
+    # test-contract: seam disarm the fault boundary for the following repairs
     monkeypatch.setattr(recovery, "_after_recovery_step", lambda _step: None)
     (abandoned,) = _quarantine_ids(session_dir) - {review}
     with session_directory(root, "pruned") as (_, directory_fd):
@@ -539,6 +541,7 @@ def test_prune_crash_points_reopen_and_converge_on_next_repair(
     monkeypatch.setattr(recovery, "_after_recovery_step", crash_at)
     with pytest.raises(_PruneCrash):
         _bad_row_repair(root, step, home_lease)
+    # test-contract: seam disarm the fault boundary for the following repairs
     monkeypatch.setattr(recovery, "_after_recovery_step", lambda _step: None)
 
     reopened = ConversationStore(root, session_id=step)
