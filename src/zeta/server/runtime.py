@@ -315,6 +315,23 @@ class ServerRuntime:
         )
         return runtime
 
+    def sibling(self) -> ServerRuntime:
+        """An empty runtime with this one's settings and manager; no I/O, so the
+        event loop may call it (the provider is already resolved)."""
+        runtime = type(self).__new__(type(self))
+        for name in (
+            "home", "cwd", "_server_provider", "_server_model", "_server_tools",
+            "_server_disallowed_tools", "_require_tools", "_allow_hooks",
+            "_auto_memory", "_cli_yolo", "_max_turns", "_test_scripted_provider",
+            "backend_factory", "manager", "retention_event_sink", "retention_wake",
+        ):
+            if hasattr(self, name):
+                setattr(runtime, name, getattr(self, name))
+        runtime._project_registry_probed = True
+        runtime._state = None
+        runtime._init_sinks()
+        return runtime
+
     @property
     def opened(self) -> OpenedSession | None:
         return self._state.opened if self._state is not None else None

@@ -510,8 +510,61 @@ state with `status` or `session_history_and_subscribe`; pending approvals are
 in that result and can be answered. With `in_flight_replay`, the join also
 starts with the reply streamed so far (see "joining during a reply").
 `resume` of a different session during a
-busy turn still returns `-32004`, and `resume` of an idle session is unchanged.
-serve-only: no TUI surface.
+busy turn still returns `-32004` unless the connection negotiated
+`session_park` (see "parking a busy session"), and `resume` of an idle session
+is unchanged. serve-only: no TUI surface.
+
+#### parking a busy session (`session_park` feature)
+
+`session_park` requires `resume_attach`; the server drops it from `hello`
+without that feature. Without `session_park`, nothing below changes.
+
+With the feature, `new_session`, and `resume` of another session, do not
+return `-32004` while the attached session holds work. Work is a turn, a
+pending or scheduled notification turn, a pending approval, a running
+background child or background task, or a background task exit that is not yet
+delivered. The server keeps that session running in the background ("parked")
+and attaches the requested session. When the attached session holds no work,
+the swap is the same as without the feature.
+
+- A parked session sends no event to the controller while it is parked. Its
+  turn, approvals, children, and background tasks keep running, and its rows
+  are written to its own history. Two kinds of frames can still carry a
+  `session_id` that is not the attached session: child-run events of a parked
+  session's children, and events of the outgoing session while the incoming
+  session is still being set up. Clients must ignore events whose
+  `session_id` is not the attached session.
+- `resume` of a parked session attaches it again, with the rules of "attaching
+  to a live turn" (no reopen). The result has `attached: "live_turn"` when its
+  turn is still busy, and no `attached` field when it only held background work
+  or its turn ended. The client reads its pending approvals from `status` or
+  the `session_history_and_subscribe` result (with their original
+  `request_id`, answerable with `approve`/`deny`); they are not sent again as
+  `approval_request` events. With `in_flight_replay`, the join starts with the
+  reply that streamed while the session was parked. The session that was
+  attached is parked when it holds work, else closed.
+- A parked session closes when it no longer holds work. A parked approval has
+  no deadline while the controller stays connected. `resume` of a session that
+  is closing waits for the close to end, then opens the session from disk.
+- At most 3 sessions can be parked or closing at a time. A swap that would park
+  one more returns `-32004` with
+  `data: {"reason": "parked_limit", "parked": [session ids]}`, listing the
+  parked and closing sessions. `resume` of a parked session never returns this
+  error, because it swaps one session for one.
+- `status.parked_sessions` lists the parked sessions (see `status`).
+- On a controller disconnect, each parked session follows the same rules as
+  the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
+  with `session_park` takes over every parked session. A reclaiming `hello`
+  without `session_park` closes every parked session: its turn ends with
+  reason `disconnect` and its approvals end. After a reclaim, parked sessions
+  have no `mcp_bindings` or `host_commands` until each one is resumed with
+  them: a held bound MCP call gets the detached result when the grace deadline
+  ends, and a notification turn that needs host commands waits for that
+  `resume`. Nothing is lost; the pending work is durable.
+- `account_switch`, `account_logout`, and `account_refresh` return `-32004`
+  while any parked session has a busy turn, even when `status.state` is
+  `idle`. Another process (and `delete_session`) cannot open a parked session,
+  as for a session that another serve process holds.
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"resume","params":{"session_id":"abc123","mcp_bindings":[{"server":"page","headers":{"Authorization":"Bearer ..."}}]}}
@@ -967,7 +1020,17 @@ display-only string naming the call's target; it is absent when there is none.
 
 `state` is `"running"` whenever a state-changing request would refuse with
 `-32004` (`a turn is already running`): during a turn, and while a queued
-notification turn runs its setup before its `turn_start`. In that setup window
+notification turn runs its setup before its `turn_start`. With `session_park`,
+`state` describes the attached session only: `new_session` and `resume` of
+another session park it instead of refusing, `account_switch`,
+`account_logout`, and `account_refresh` can refuse for a busy parked session, and a full park limit returns `-32004` with
+`data.reason: "parked_limit"`.
+
+With `session_park`, the result also has `parked_sessions`: one
+`{session_id, state, pending_approvals}` object per parked session, oldest
+first. `state` uses the same values as the top-level `state`, and
+`pending_approvals` is the number of its pending approvals. A closing session
+is not listed. Without the feature, the key is omitted. In that setup window
 `send` is still accepted and replaces the queued turn. If the server is
 unhealthy because approval persistence failed, `state` remains `"idle"` and
 `send` refuses with `-32000` (`approval_persistence_failed`) instead; this is a
@@ -1347,7 +1410,8 @@ Error descriptors are:
 | `mcp_tool_refresh_failed` | `-32005` | `mcp_tool_refresh_failed` | an MCP tools/list refresh failed |
 
 Error objects have `code` and `message`, and may have a method-specific
-`data` object. A new `send` or `send_images` turn on a detached session that
+`data` object. With `session_park`, a swap over the park limit returns
+`-32004` with `data: {"reason": "parked_limit", "parked": [session ids]}`. A new `send` or `send_images` turn on a detached session that
 requires host commands returns `-32003` with
 `data.code: "host_binding_required"`; the controller must `resume` with a new
 binding first. Durable store read failures use `-32000`, not the invalid-params
@@ -1582,7 +1646,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    controller-write request is running. When the turn left a steer unread, the
    server starts the next turn after `agent_end`; a `send` that arrives after
    that start gets `-32004` and should be retried as `steer`. Clients must wait
-   for `agent_end` before idle-only requests such as `new_session`; the server
+   for `agent_end` before idle-only requests such as `new_session` (with
+   `session_park`, `new_session` and `resume` of another session park the busy
+   session instead; see "parking a busy session"); the server
    commits `served_turn_end` before cleanup. Error and abort paths still end
    with `error` or `turn_aborted`.
 4. `approval_request` precedes `approval_end`. The server emits exactly one
@@ -1863,6 +1929,8 @@ error code and message. Provider status and origin remain internal.
   child, an unknown account, or unsafe account files return `-32005`. The disk
   operation runs off the server event loop; after cancellation, `account_list`
   reports its final persisted result.
+- With `session_park`, the idle requirement of `account_logout`,
+  `account_refresh`, and `account_switch` also covers every parked session.
 - `account_refresh`: takes `session_id`, requires an idle session, and performs
   the same explicit refresh as `r` in `/accounts`: all stale accounts,
   sequentially, with the persisted 60-second per-account cooldown. Provider
@@ -2108,6 +2176,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
+| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), and `status` adds `parked_sessions` (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
