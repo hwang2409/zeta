@@ -16,6 +16,7 @@ skipped. One broken extension never breaks the session or stops the rest.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import re
 import sys
@@ -30,6 +31,9 @@ if TYPE_CHECKING:
     from ..runtime.execution import ToolHandler
     from ..tools.registry import ToolRegistry
     from .manifest import ExtensionManifest
+
+from .api import ExtensionError
+from .hooks import CompositeToolHook, ExtensionHook, run_extension_hooks
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +51,7 @@ class LoadingExtension:
         self.scope = scope
         self.directory = directory
         self._tools: list[_ToolDeclaration] = []
+        self._hooks: list[ExtensionHook] = []
 
     def declare_tool(
         self,
@@ -72,9 +77,20 @@ class LoadingExtension:
             kwargs["actions"] = actions
         self._tools.append(_ToolDeclaration(name, handler, kwargs))
 
+    def declare_hook(self, event: str, handler: Any) -> None:
+        if not inspect.iscoroutinefunction(handler):
+            raise ExtensionError(
+                f"extension hook '{event}' must be an async function"
+            )
+        self._hooks.append(ExtensionHook(self.manifest.name, event, handler))
+
     @property
     def declarations(self) -> tuple[_ToolDeclaration, ...]:
         return tuple(self._tools)
+
+    @property
+    def hooks(self) -> tuple[ExtensionHook, ...]:
+        return tuple(self._hooks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,11 +126,15 @@ class ExtensionHost:
         home: Path,
         project_dir: Path | None,
         builtin_names: frozenset[str],
+        hook_timeout_seconds: float = 5.0,
     ) -> None:
         self._registry = registry
         self.home = home
         self.project_dir = project_dir
         self._builtin_names = builtin_names
+        self.hook_timeout_seconds = hook_timeout_seconds
+        self.notice_sink: Any = None
+        self._hooks: list[ExtensionHook] = []
         self.loaded: list[LoadedExtension] = []
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
@@ -155,6 +175,20 @@ class ExtensionHost:
         for package in tuple(self._packages):
             self.remove_package(package)
 
+    def set_notice_sink(self, sink: Any) -> None:
+        self.notice_sink = sink
+
+    def _notice(self, message: str) -> None:
+        self.notices.append(message)
+        if self.notice_sink is not None:
+            self.notice_sink(message)
+
+    def pre_tool_hook(self, base: Any = None) -> CompositeToolHook:
+        return CompositeToolHook(base, self._hooks, self._notice)
+
+    async def emit(self, event: str, *payload: Any) -> str | None:
+        return await run_extension_hooks(self._hooks, event, payload, self._notice)
+
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
 
@@ -182,6 +216,9 @@ class ExtensionHost:
                     f"extensions · {extension.scope} extension tool '{name}' from "
                     f"{display} shadows {shadow}"
                 )
+        for hook in extension.hooks:
+            hook.timeout_seconds = self.hook_timeout_seconds
+            self._hooks.append(hook)
         self.loaded.append(
             LoadedExtension(
                 name=extension.manifest.name,

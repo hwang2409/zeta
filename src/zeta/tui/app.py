@@ -227,6 +227,11 @@ class TUIApp(
                 app._defer_startup_notice(message, hook=True)
                 or app._print_hook_notice(message)
             )
+        if self.extensions is not None:
+            self.extensions.set_notice_sink(
+                lambda message: app._defer_startup_notice(message, hook=True)
+                or app._print_hook_notice(message)
+            )
         self.provider = provider
         self.model = model
         self.verbose = verbose

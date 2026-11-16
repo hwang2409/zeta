@@ -811,11 +811,14 @@ class ServerRuntime:
             session_id = state.session_id
             state.loop.set_background_event_sink(lambda event: sink(session_id, event))
         memory_sink = self._memory_notice_sink
-        state.loop.set_mcp_notice_sink(
+        extension_notice = (
             None
             if memory_sink is None
             else lambda message: memory_sink(state.session_id, message)
         )
+        state.loop.set_mcp_notice_sink(extension_notice)
+        if state.loop.extensions is not None:
+            state.loop.extensions.set_notice_sink(extension_notice)
         reconciler = state.loop.memory_reconciler
         if reconciler is not None:
             reconciler.notice = (

@@ -56,6 +56,25 @@ class ExtensionAPI:
     def project_dir(self) -> Path | None:
         return self._host.project_dir
 
+    def on(self, event: str, handler: Any) -> None:
+        """Register an async lifecycle hook for this session."""
+        if not isinstance(event, str) or event not in {
+            "session_start",
+            "user_prompt_submit",
+            "pre_tool",
+            "post_tool",
+            "stop",
+            "tool_result",
+        }:
+            raise ExtensionError(f"unknown extension hook event: {event!r}")
+        self._extension.declare_hook(event, handler)
+
+    def run_blocking(self, fn: Any, *args: Any) -> Any:
+        """Return an awaitable that runs synchronous work off the event loop."""
+        import asyncio
+
+        return asyncio.to_thread(fn, *args)
+
     def register_tool(
         self,
         name: str,
