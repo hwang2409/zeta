@@ -35,11 +35,12 @@ BINDING = {"server": "page", "headers": {"Authorization": "Bearer page"}}
 
 
 def _wrap_uncancellable_close(
-    monkeypatch: pytest.MonkeyPatch, close_gate: asyncio.Event
+    monkeypatch: pytest.MonkeyPatch, armed: asyncio.Event, close_gate: asyncio.Event
 ) -> None:
-    """Every bound client gets a close() that blocks on close_gate and ignores
-    cancellation until it is set -- the anyio/httpx aclose against a restarting
-    peer that the RCA names."""
+    """Once ``armed`` is set, a bound client's close() blocks on close_gate and
+    ignores cancellation until it is set -- the anyio/httpx aclose against a
+    restarting peer that the RCA names. Before arming, closes run normally so
+    session setup is unaffected."""
     real_build = mount_module._build_client
 
     def build(config):
@@ -47,7 +48,7 @@ def _wrap_uncancellable_close(
         original_close = client.close
 
         async def blocked_close() -> None:
-            while not close_gate.is_set():
+            while armed.is_set() and not close_gate.is_set():
                 try:
                     # test-contract: durability models a close that ignores cancellation
                     await close_gate.wait()
@@ -73,7 +74,8 @@ async def test_resume_rebind_replies_though_bound_close_wedges(
     # safe_close wait_for cannot, because the client close ignores cancellation.
     monkeypatch.setattr(server_actor_module, "CLIENT_CLOSE_TIMEOUT_SECONDS", 0.2)
     close_gate = asyncio.Event()
-    _wrap_uncancellable_close(monkeypatch, close_gate)
+    armed = asyncio.Event()
+    _wrap_uncancellable_close(monkeypatch, armed, close_gate)
 
     mcp = LocalMCP()
     port = await mcp.start()
@@ -118,6 +120,7 @@ async def test_resume_rebind_replies_though_bound_close_wedges(
         # the second resume re-binds page: it suspends and closes the old bound
         # client. on base, _handle_suspend awaits that close inline, the actor
         # loop wedges, and this resume never replies (fails at the wait below).
+        armed.set()
         resume = await await_or_fail(
             _request(
                 reader,
