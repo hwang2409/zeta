@@ -122,9 +122,9 @@ def activate(zx):
         host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
         events = []
         host.set_event_sink(events.append, asyncio.get_running_loop())
-        # activation happens before the frontend binds its sink; a later call is transient.
-        host.notify("notify-ext", "hello", "warning")
+        # the public zx.ui.notify call during activation waits for the frontend sink.
         await asyncio.sleep(0)
+        assert len(events) == 1
         assert events[0].type is StreamEventType.AGENT_NOTIFICATION
         assert events[0].data == {"kind": "extension", "extension": "notify-ext", "text": "hello", "level": "warning"}
         rendered = render_event(events[0])

@@ -380,6 +380,28 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_extensions_list_returns_loaded_rows(tmp_path: Path) -> None:
+    extension_dir = tmp_path / "home" / "extensions" / "listed"
+    extension_dir.mkdir(parents=True)
+    (extension_dir / "zeta-extension.toml").write_text(
+        '[extension]\nname = "listed"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
+    )
+    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        session = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]["session"]
+        rows = (await _request(reader, writer, 3, "extensions_list", {"session_id": session["session_id"]}))[-1]["result"]
+        assert rows == [{
+            "name": "listed", "scope": "user", "version": "1", "enabled": True,
+            "trusted": True, "loaded": True, "error": None,
+        }]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_hello_echoes_requested_supported_features_only(tmp_path: Path) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
