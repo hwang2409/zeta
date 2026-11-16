@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -1055,7 +1055,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         if operation is not None:
             self._cancel_current_operation()
             if operation.task is not None:
-                await asyncio.gather(operation.task, return_exceptions=True)
+                await self._drain_closes(
+                    (operation.task,), "setup cancellation during suspend"
+                )
             self._finish_cancelled(operation)
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
@@ -1085,12 +1087,11 @@ class MCPServerActor(MCPDefinitionPublisher):
         # result rather than "unknown tool" until the client re-attaches.
         self._unregister_tools(keep_primary=True)
         if client is not None and client not in self._draining:
-            await self._schedule_close(client)
-        if self._scheduled_closes:
-            await asyncio.gather(
-                *(task for _, task in self._scheduled_closes.values()),
-                return_exceptions=True,
-            )
+            self._schedule_close(client)
+        await self._drain_closes(
+            tuple(task for _, task in self._scheduled_closes.values()),
+            "server close during suspend",
+        )
         self.config = message.config
         self.source = message.source
         self._set_status(
@@ -1284,6 +1285,36 @@ class MCPServerActor(MCPDefinitionPublisher):
             if message.waiter is not None:
                 _set_result(message.waiter.result, _unavailable_result(self.name))
 
+    async def _drain_closes(
+        self, tasks: Iterable[asyncio.Task[object]], what: str
+    ) -> None:
+        """Wait a bounded time for close/cancel tasks, then abandon the rest.
+
+        The actor's single loop runs this inline. An MCP client close() can
+        ignore cancellation (anyio/httpx against a restarting peer), so even
+        safe_close's inner wait_for may never return; waiting for it here would
+        wedge the loop and pin the controller slot on resume (RCA resume-stuck).
+        Wait at most CLIENT_CLOSE_TIMEOUT_SECONDS, then cancel the stragglers
+        and stop waiting. They stay owned in self._children (and self.
+        _scheduled_closes) and are retrieved by their done callbacks, so an
+        abandoned close is never reused and never logs as never-retrieved.
+        """
+        pending = {task for task in tasks if not task.done()}
+        if not pending:
+            return
+        _, still = await asyncio.wait(pending, timeout=CLIENT_CLOSE_TIMEOUT_SECONDS)
+        if not still:
+            return
+        for task in still:
+            task.cancel()
+        logger.warning(
+            "MCP server %s: %d %s did not finish in %.1fs; abandoning them",
+            self.name,
+            len(still),
+            what,
+            CLIENT_CLOSE_TIMEOUT_SECONDS,
+        )
+
     def _schedule_close(
         self,
         client: MCPClient,
@@ -1359,16 +1390,30 @@ class MCPServerActor(MCPDefinitionPublisher):
         # a setup that ignores its cancel (httpcore can lose it) still queues a
         # connected client while we wait; drain again so that client gets closed.
         # wait, not gather: gather returns at once for done tasks, before their
-        # queued done callback has put _SetupFinished in the queue
-        while tasks := tuple(
-            task for task in self._children if task is not asyncio.current_task()
-        ):
-            await asyncio.wait(tasks)
-            for task in tasks:
+        # queued done callback has put _SetupFinished in the queue.
+        # in-flight calls and setup are waited for in full (a cancellation-
+        # resistant call returns its real result; #1336/#1353); only client
+        # closes are bounded, so an uncancellable aclose against a dead peer
+        # cannot hang process or session exit.
+        while True:
+            close_tasks = {task for _, task in self._scheduled_closes.values()}
+            others = tuple(
+                task
+                for task in self._children
+                if task is not asyncio.current_task() and task not in close_tasks
+            )
+            if not others:
+                break
+            await asyncio.wait(others)
+            for task in others:
                 if not task.cancelled():
                     task.exception()  # mark retrieved, as gather did
-            self._children.difference_update(tasks)
+            self._children.difference_update(others)
             self._drain_queue()
+        await self._drain_closes(
+            tuple(task for _, task in self._scheduled_closes.values()),
+            "server close at shutdown",
+        )
         self._children.clear()
 
     def _drain_queue(self) -> None:
