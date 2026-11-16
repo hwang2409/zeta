@@ -745,15 +745,48 @@ def test_project_record_publish_closes_descriptor_when_fdopen_fails(
 
 
 def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "projects"
     registry = ProjectRegistry(root)
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    real_publish = registry._publish
+    real_acquire_lock = registry._acquire_lock
+    publish_calls = 0
+    lock_calls = 0
+    second_lock_attempted = threading.Event()
+
+    def blocked_publish(*args: object, **kwargs: object) -> None:
+        nonlocal publish_calls
+        publish_calls += 1
+        if publish_calls == 1:
+            publish_started.set()
+            assert release_publish.wait(10), "timed out waiting to release project create"
+        real_publish(*args, **kwargs)
+
+    def observe_lock(lock_fd: int, mode: int, **kwargs: object) -> None:
+        nonlocal lock_calls
+        lock_calls += 1
+        if lock_calls == 2:
+            second_lock_attempted.set()
+        real_acquire_lock(lock_fd, mode, **kwargs)
+
+    monkeypatch.setattr(registry, "_publish", blocked_publish)
+    monkeypatch.setattr(registry, "_acquire_lock", observe_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(registry.create_project, "project-0", "scope")
+        assert publish_started.wait(10), "first project create did not reach publish"
+        second = pool.submit(registry.create_project, "project-1", "scope")
+        assert second_lock_attempted.wait(10), "second project create did not contend"
+        assert not release_publish.wait(1.1), "project create released too early"
+        release_publish.set()
+        projects = [first.result(), second.result()]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        projects = list(
+        projects.extend(
             pool.map(
                 lambda index: registry.create_project(f"project-{index}", "scope"),
-                range(12),
+                range(2, 12),
             )
         )
     assert len({project.project_id for project in projects}) == 12
