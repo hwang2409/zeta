@@ -597,7 +597,7 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
     width: int,
 ) -> None:
     from zeta.tui.cards.agent_sync import (
-        AgentTranscriptSnapshot,
+        AgentTailSnapshot,
         AgentTranscriptTreeSnapshot,
     )
 
@@ -633,7 +633,7 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
         (
             (
                 root,
-                AgentTranscriptSnapshot(
+                AgentTailSnapshot(
                     (
                         "read",
                         "read-result",
@@ -717,7 +717,7 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
             ),
             (
                 worker_path,
-                AgentTranscriptSnapshot((), ()),
+                AgentTailSnapshot((), ()),
             ),
         ),
     )
@@ -833,7 +833,7 @@ def test_recursive_agent_send_is_bounded_after_wrapping(
 ) -> None:
     from zeta.tui.cards.agent import MAX_TAIL_LINES, AgentCard
     from zeta.tui.cards.agent_sync import (
-        AgentTranscriptSnapshot,
+        AgentTailSnapshot,
         AgentTranscriptTreeSnapshot,
     )
 
@@ -854,7 +854,7 @@ def test_recursive_agent_send_is_bounded_after_wrapping(
         (
             (
                 root,
-                AgentTranscriptSnapshot(
+                AgentTailSnapshot(
                     ("send", "send-result", "latest", "latest-result"),
                     (
                         (

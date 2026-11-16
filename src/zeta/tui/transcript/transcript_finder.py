@@ -21,7 +21,7 @@ from typing import Any
 from rich.text import Text
 
 from .finder_overlay import FinderState
-from .fuzzy import highlight_literal
+from .fuzzy import _smart_case, highlight_literal
 from .message_finder import Candidate, MessageFinder, RankingResult, Role
 from .streaming_text import StreamingText
 from .transcript_search import find_matches
@@ -30,6 +30,17 @@ _FINDER_TEXT_LIMIT = 2_000
 _FINDER_PREVIEW_LINES = 60
 _FINDER_PREVIEW_TEXT_LIMIT = 12_000
 _FINDER_PREPARE_BATCH_SIZE = 16
+
+
+def finder_row_contains(text: str, query: str) -> bool:
+    """Return whether a finder row built from ``text`` holds ``query`` literally.
+
+    Durable history search uses this so every hit it reveals has a finder row:
+    the row keeps only the first characters, and matching is smart-case.
+    """
+
+    row = text[:_FINDER_TEXT_LIMIT]
+    return query in row if _smart_case(query) else query.lower() in row.lower()
 
 
 @dataclass(frozen=True, slots=True)

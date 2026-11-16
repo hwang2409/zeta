@@ -934,9 +934,12 @@ def build_key_bindings(
         navigating = (
             history_navigation_active is not None and history_navigation_active()
         )
-        if not navigating and buffer.text:
-            if buffer.document.cursor_position_row > 0:
-                buffer.auto_up()
+        if (
+            not navigating
+            and buffer.text
+            and buffer.document.cursor_position_row > 0
+        ):
+            buffer.auto_up()
             return
         on_history_previous(buffer)
 

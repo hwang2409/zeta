@@ -619,10 +619,10 @@ class CheckpointTranscriptMixin:
         """Reset root paging after a branch or repair change."""
 
         branch_id = self.loop.store.active_branch_head_id()
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(), self._history_source, branch_id
         )
-        self._history_pager.reset(endpoint_id=branch_id)
+        self._agent_navigation.transcript_control.history_pager.reset(endpoint_id=branch_id)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -638,7 +638,7 @@ class CheckpointTranscriptMixin:
         await asyncio.sleep(0)
         if self._exit_requested:
             return False
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(),
             self._history_source,
             self.loop.store.active_branch_head_id(),
@@ -660,22 +660,18 @@ class CheckpointTranscriptMixin:
         """Read one page off-loop, then repaint the bounded resident window."""
 
         if reset:
-            self._history_pager.reset(
+            self._agent_navigation.transcript_control.history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
-        anchor = self._transcript.durable_scroll_anchor
-        scroll_generation = self._transcript.scroll_generation
-        page = await self._history_pager.load(direction)
+        transcript = self._viewed_transcript()
+        page = await self._agent_navigation.transcript_control.history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
-        restore_anchor = (
-            anchor
-            if scroll_generation == self._transcript.scroll_generation
-            else self._transcript.durable_scroll_anchor
-        )
-        self._render_resident_history()
+        # The place shown now, not at the read's start: a move during the read wins.
+        restore_anchor = transcript.durable_scroll_anchor
+        self._render_active_resident_history()
         if restore_anchor is not None:
-            self._transcript.restore_durable_scroll_anchor(restore_anchor)
+            transcript.restore_durable_scroll_anchor(restore_anchor)
         if then is not None:
             then()
         if self._history_marker_tasks:
@@ -687,7 +683,7 @@ class CheckpointTranscriptMixin:
         self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
-        pages = self._history_pager.pages
+        pages = self._agent_navigation.transcript_control.history_pager.pages
         entries = tuple(
             unit.value
             for page in pages

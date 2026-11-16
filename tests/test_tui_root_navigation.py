@@ -289,7 +289,7 @@ class Driver:
     def idle(self) -> bool:
         return (
             not self.session.app.invalidated
-            and not self.app._history_pager._loads
+            and not self.app._agent_navigation.transcript_control.history_pager._loads
             and self.app._finder_prepare_task is None
             and self.app._finder_rank_task is None
             and (
@@ -297,8 +297,8 @@ class Driver:
                 or self.app._user_nav_task.done()
             )
             and (
-                self.app._history_search_task is None
-                or self.app._history_search_task.done()
+                self.app._agent_navigation.transcript_control.search_task is None
+                or self.app._agent_navigation.transcript_control.search_task.done()
             )
         )
 
@@ -354,11 +354,11 @@ async def _page_up_to(driver: Driver, turn: int) -> None:
         if _prompt(turn) in driver.screen():
             return
         await driver.until(driver.idle, what="settled screen before PageUp")
-        rows, pages = driver.rows(), driver.app._history_pager.descriptors
+        rows, pages = driver.rows(), driver.app._agent_navigation.transcript_control.history_pager.descriptors
         await driver.send(PAGE_UP)
         await driver.until(
             lambda rows=rows, pages=pages: driver.rows() != rows
-            or driver.app._history_pager.descriptors != pages,
+            or driver.app._agent_navigation.transcript_control.history_pager.descriptors != pages,
             what="PageUp neither moved the view nor loaded an older page",
         )
     raise AssertionError(f"PageUp never reached {_prompt(turn)}")
@@ -511,7 +511,7 @@ async def test_finder_match_in_unloaded_history_opens_on_enter(
         await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         await driver.send(OLD_WORDS[3])
         await driver.until(
-            lambda: app._history_search_task is not None and app._history_search_task.done(),
+            lambda: app._agent_navigation.transcript_control.search_task is not None and app._agent_navigation.transcript_control.search_task.done(),
             what="durable search for the old match",
         )
         await driver.until(driver.idle, what="settled screen before Enter")
@@ -559,7 +559,7 @@ def _assert_pages_adjacent(driver: Driver, what: str) -> None:
 
     durable = [
         descriptor
-        for descriptor in driver.app._history_pager.descriptors
+        for descriptor in driver.app._agent_navigation.transcript_control.history_pager.descriptors
         if not descriptor.key.startswith("live:")
     ]
     keys = [descriptor.key for descriptor in durable]
@@ -725,7 +725,7 @@ async def test_finder_escape_before_the_old_match_lands_keeps_the_view(
     async with running_tui(root_home) as driver:
         await driver.settle("settled tail before the finder")
         tail = driver.rows()
-        source = driver.app._history_pager.source
+        source = driver.app._agent_navigation.transcript_control.history_pager.source
         real_reveal, entered, gate = source.reveal, asyncio.Event(), asyncio.Event()
 
         async def gated_reveal(entry_id: str) -> TUIHistoryPage:
@@ -751,12 +751,51 @@ async def test_finder_escape_before_the_old_match_lands_keeps_the_view(
 
 
 @pytest.mark.asyncio
+async def test_clearing_the_query_before_the_old_match_lands_keeps_the_view(
+    root_home: RootHome,
+) -> None:
+    async with running_tui(root_home) as driver:
+        await driver.settle("settled tail before the finder")
+        pager = driver.app._agent_navigation.transcript_control.history_pager
+        tail_pages = _resident(pager)
+        source = pager.source
+        real_search, entered, gate = source.search, asyncio.Event(), asyncio.Event()
+
+        async def gated_search(query: str, **kwargs: object) -> object:
+            entered.set()
+            await asyncio.wait_for(gate.wait(), 10)
+            return await real_search(query, **kwargs)
+
+        source.search = gated_search
+        try:
+            await driver.send(CTRL_F)
+            await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+            await driver.send(OLD_WORDS[3])
+            await await_or_fail(
+                asyncio.ensure_future(entered.wait()), what="the old-history search started"
+            )
+            await driver.send(BACKSPACE * len(OLD_WORDS[3]))
+            await driver.until(
+                lambda: not driver.session.app.invalidated, what="the cleared query was drawn"
+            )
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the old search ended")
+        assert _resident(pager) == tail_pages, (
+            "the search of a cleared query replaced the resident pages"
+        )
+        assert _prompt(3) not in driver.screen(), (
+            f"the search of a cleared query drew its old match:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_finder_shows_searching_until_old_history_answers(
     root_home: RootHome,
 ) -> None:
     async with running_tui(root_home) as driver:
         app = driver.app
-        source = app._history_pager.source
+        source = app._agent_navigation.transcript_control.history_pager.source
         real_search, entered, gate = source.search, asyncio.Event(), asyncio.Event()
 
         async def gated_search(query: str, **kwargs: object) -> object:
@@ -804,8 +843,8 @@ async def test_finder_shows_no_matches_once_old_history_finds_nothing(
         await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         await driver.send("zzqqxx")
         await driver.until(
-            lambda: driver.app._history_search_task is not None
-            and driver.app._history_search_task.done(),
+            lambda: driver.app._agent_navigation.transcript_control.search_task is not None
+            and driver.app._agent_navigation.transcript_control.search_task.done(),
             what="durable search for a query with no hit",
         )
         await driver.settle("screen after the empty search")
@@ -844,7 +883,7 @@ async def test_page_up_while_a_reveal_loads_newer_pages_keeps_paging(
         app = driver.app
         await _ctrl_up_past(driver, TURNS - 30)
         await driver.settle("settled old history")
-        source = app._history_pager.source
+        source = app._agent_navigation.transcript_control.history_pager.source
         real_page, entered, gate = source.page, asyncio.Event(), asyncio.Event()
 
         async def gated_page(cursor=None, *, direction="older"):
@@ -868,17 +907,17 @@ async def test_page_up_while_a_reveal_loads_newer_pages_keeps_paging(
                 if entered.is_set():
                     break
             assert entered.is_set(), "ctrl+down never revealed a prompt from the store"
-            held = app._history_pager.scalar_tokens[1]
+            held = app._agent_navigation.transcript_control.history_pager.scalar_tokens[1]
             for press in range(400):
                 await driver.send(PAGE_UP)
                 await driver.until(
                     lambda: not driver.session.app.invalidated
-                    and not any(key[2] == "older" for key in app._history_pager._loads),
+                    and not any(key[2] == "older" for key in app._agent_navigation.transcript_control.history_pager._loads),
                     what=f"PageUp {press + 1} during the held reveal",
                 )
-                if app._history_pager.scalar_tokens[1] != held:
+                if app._agent_navigation.transcript_control.history_pager.scalar_tokens[1] != held:
                     break
-            assert app._history_pager.scalar_tokens[1] != held, (
+            assert app._agent_navigation.transcript_control.history_pager.scalar_tokens[1] != held, (
                 "PageUp never evicted the page the held newer read extends"
             )
         finally:

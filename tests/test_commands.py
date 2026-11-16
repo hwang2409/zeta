@@ -878,11 +878,11 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         await _drain_submission_consumer(app)
 
         assert not app.pending_approvals
-        assert app._prompt_history.snapshot(store.session_dir) == ()
+        assert app._agent_navigation.transcript_control.prompt_history.snapshot(store.session_dir) == ()
 
         await app._handle_prompt_value("/approve missing")
 
-        history = app._prompt_history.snapshot(store.session_dir)
+        history = app._agent_navigation.transcript_control.prompt_history.snapshot(store.session_dir)
         assert "/approve missing" in history
         assert "shortcut-approval" not in history
 
