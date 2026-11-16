@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from zeta.config.settings import load_settings, resolve
+from zeta.config.settings import ComputerUseConfig, load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
 from zeta.protocol.types import ToolCall
@@ -35,7 +35,7 @@ async def test_composition_closes_helper_on_session_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = make_backend()
-    monkeypatch.setattr(mac_module, "make_mac_backend", lambda: backend)
+    monkeypatch.setattr(mac_module, "make_mac_backend", lambda _config=None: backend)
     config = resolve(
         load_settings(home=tmp_path / "home").settings,
         cli_provider="codex",
@@ -43,7 +43,7 @@ async def test_composition_closes_helper_on_session_shutdown(
         cli_yolo=None,
         cli_token_budget=None,
     )
-    config = dataclasses.replace(config, computer_enabled=True)
+    config = dataclasses.replace(config, computer=ComputerUseConfig(enabled=True, default_app_access="allow"))
     runtime = await asyncio.to_thread(
         compose_runtime,
         home=tmp_path / "home",
@@ -109,6 +109,9 @@ class _RefusingBackend:
 
     async def click(self, x: int, y: int, button: Button, count: int) -> None:
         raise ComputerError("locked", "screen is locked")
+
+    async def state(self) -> ScreenState:
+        return ScreenState(False, False, "com.example.app")
 
 
 @pytest.mark.asyncio
