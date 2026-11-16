@@ -117,7 +117,7 @@ def _parked(server: ZetaServer, session_id: str) -> ServeControl:
     """A's parked pair, read through ``controls()`` (also on the pre-4b base)."""
     (pair,) = [
         control
-        for control in server._control_for_tests()
+        for control in server.controls()
         if control is not server._control_for_test and control.runtime.session_id == session_id
     ]
     return pair
@@ -348,7 +348,7 @@ async def c1_cancel_incoming_setup(run: Run) -> None:
         created.cancel()
         await asyncio.wait([created], timeout=10)
     assert [pair.runtime.opened for pair in pairs] == [None]
-    assert list(server._control_for_tests()) == [outgoing]
+    assert list(server.controls()) == [outgoing]
     assert outgoing.state_change_busy()
     run.backend.gates[0].set()
 
@@ -606,7 +606,7 @@ async def test_parked_pair(
         await _until(
             lambda: all(
                 pair.holds_work()
-                for pair in server._control_for_tests()
+                for pair in server.controls()
                 if pair is not server._control_for_test
             ),
             "every parked pair that holds no work closes",
