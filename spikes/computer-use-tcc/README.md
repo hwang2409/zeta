@@ -88,10 +88,26 @@ headless/daemon context (no active GUI login) cannot capture. Skip unless asked.
 13. **report** — `./run.sh report`. Send the printed results file to the lead, plus the entry
     names you noted in step 4.
 
-## cleanup (optional)
-- `rm -rf build` removes the compiled helper.
-- In System Settings you can toggle off / remove the `cuspike` and python entries you added.
-  (Do not bother with `tccutil` unless you want to.)
+## cleanup
+`./run.sh cleanup` prints these steps (it runs nothing). Do whichever you did:
+
+1. Remove the build dir: `rm -rf build`.
+2. If you made the self-signed cert (`./run.sh cert`), delete the identity:
+   `security delete-identity -c "Zeta CU Spike" ~/Library/Keychains/login.keychain-db`
+   (or delete `Zeta CU Spike` and its key in Keychain Access → `login`).
+3. If you used the **openssl** fallback and ran `add-trusted-cert … /tmp/cu.crt`, remove the
+   trust: `security remove-trusted-cert /tmp/cu.crt`. `/tmp/cu.crt` is likely gone after a
+   reboot; if so, export the cert from Keychain Access first, or just set its Trust back to
+   "Use System Defaults" in Keychain Access and delete it.
+4. Reset the TCC grants **for this spike's helper only**, scoped by its bundle id:
+   ```
+   tccutil reset ScreenCapture com.henry.zeta.cuspike
+   tccutil reset Accessibility com.henry.zeta.cuspike
+   ```
+   **Never** run an unscoped `tccutil reset ScreenCapture` — that wipes the grants for every app.
+5. The python and `tmux`/terminal grants have no bundle id, so remove them by hand in
+   **System Settings → Privacy & Security**: delete the python entry (e.g. `python3.13`) and
+   the `tmux`/terminal entry you added, under **both** Screen Recording and Accessibility.
 
 ## expected conclusions (to confirm or refute)
 - Q1: ad-hoc python under tmux **can** capture + inject after a grant; the entry is owned by the

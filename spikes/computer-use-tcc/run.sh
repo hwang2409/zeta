@@ -9,6 +9,7 @@
 #   ./run.sh input             python: nudge the cursor 1 point and back
 #   ./run.sh rebuild [adhoc|cert]  rebuild (new cdhash) then re-check the swift grant
 #   ./run.sh cert              print how to make a local self-signed code-signing cert
+#   ./run.sh cleanup           print how to undo everything this spike set up (prints only)
 #   ./run.sh report            print the collected results
 #
 # Results append to ~/.zeta/scratch/computer-use/slice0-results.md.
@@ -212,6 +213,47 @@ Then:  ./run.sh build cert   (signs with '$CERTNAME' and identifier $IDENT)
 EOF
 }
 
+cmd_cleanup() {
+  cat <<EOF
+How to UNDO everything this spike set up. This command only PRINTS the commands;
+it runs nothing. Review each line, then run the ones that apply to what you did.
+
+1. Remove the build dir (compiled helper + generated sources):
+     rm -rf "$BUILD_DIR"
+
+2. Delete the self-signed code-signing identity (only if you ran './run.sh cert'
+   and created '$CERTNAME'):
+     security delete-identity -c "$CERTNAME" ~/Library/Keychains/login.keychain-db
+   Or in Keychain Access.app: 'login' keychain -> find '$CERTNAME' (the cert and
+   its private key) -> delete both. Verify it is gone:
+     security find-identity -v -p codesigning
+
+3. Remove the openssl-fallback trust setting (ONLY if you used the openssl
+   ALTERNATIVE in './run.sh cert' and ran 'security add-trusted-cert ... /tmp/cu.crt'):
+     security remove-trusted-cert /tmp/cu.crt
+   /tmp/cu.crt is likely gone after a reboot. If it is missing, either export the
+   cert first from Keychain Access (select '$CERTNAME' -> File > Export Items ->
+   .cer, then 'security remove-trusted-cert <that file>'), or just remove the
+   trust in Keychain Access: double-click '$CERTNAME' -> Trust -> set 'When using
+   this certificate' to 'Use System Defaults', then delete the cert.
+
+4. Reset the TCC grants for THIS SPIKE's helper only, scoped by its bundle id
+   ($IDENT). This touches only cuspike, nothing else:
+     tccutil reset ScreenCapture $IDENT
+     tccutil reset Accessibility $IDENT
+   NEVER run an unscoped 'tccutil reset ScreenCapture' / 'tccutil reset
+   Accessibility' -- that wipes the grants for EVERY app on your mac.
+
+5. The python and tmux/terminal grants have no bundle id, so tccutil cannot scope
+   them. Remove them by hand in System Settings > Privacy & Security:
+     - Screen Recording: remove the python entry you enabled in step 4 of the
+       procedure (e.g. 'python3.13') and the 'tmux' / terminal entry if you added
+       one. Select the row and click the '-' button.
+     - Accessibility: remove the same python and tmux/terminal entries.
+   Leave entries you rely on for other apps.
+EOF
+}
+
 cmd_report() {
   if [ -f "$RESULTS" ]; then cat "$RESULTS"; else echo "no results at $RESULTS yet"; fi
 }
@@ -225,6 +267,7 @@ case "${1:-}" in
   input) cmd_input ;;
   rebuild) shift; cmd_rebuild "$@" ;;
   cert) cmd_cert ;;
+  cleanup) cmd_cleanup ;;
   report) cmd_report ;;
   *)
     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
