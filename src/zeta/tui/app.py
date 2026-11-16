@@ -855,7 +855,8 @@ class TUIApp(
             ),
             lambda: self._return_finder_to_its_view(transcript, query),
         )
-        owner.search_task.add_done_callback(self._history_search_ended)
+        if owner.search_task is not None:
+            owner.search_task.add_done_callback(self._history_search_ended)
 
     async def _return_finder_to_its_view(
         self, transcript: TranscriptWidget, query: str
