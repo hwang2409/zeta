@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import queue
 import re
 import shlex
 import signal
@@ -12659,31 +12660,53 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
         assert server._client is not None and server.runtime.loop is not None
         first_client = server._client
         second_client = _Client(server, asyncio.StreamReader(), writer)
+        # an observer-free second connection past hello, as a real one would be
+        second_client.handshaken = True
+        second_client.protocol_version = first_client.protocol_version
+        manager = server.runtime.manager
         original_commit = account_session_module.SessionAccountContext._commit_locked
+        metadata_lock = manager._metadata_lock
         event_loop = asyncio.get_running_loop()
         rename_tasks: list[asyncio.Task[object]] = []
+        switch_thread: list[int] = []
+        rename_waits_for_lock = threading.Event()
 
-        def commit_then_queue_rename(self: object, state: object, directory_fd: int):
+        @contextmanager
+        def observed_metadata_lock(*args: object, **kwargs: object):
+            if switch_thread and threading.get_ident() != switch_thread[0]:
+                rename_waits_for_lock.set()
+            with metadata_lock(*args, **kwargs) as directory_fd:
+                yield directory_fd
+
+        def commit_then_wait_for_rename(self: object, state: object, directory_fd: int):
             metadata = original_commit(self, state, directory_fd)
+            switch_thread.append(threading.get_ident())
 
             def start_rename() -> None:
                 rename_tasks.append(
                     asyncio.create_task(
-                        registry.rename_session(
+                        registry.dispatch(
                             second_client,
                             "rename-session",
+                            "rename_session",
                             {"session_id": sid, "name": "renamed during switch"},
                         )
                     )
                 )
 
             event_loop.call_soon_threadsafe(start_rename)
+            # worst order: the rename waits for the metadata lock this thread
+            # holds before the switch asks the loop to apply its result.
+            assert rename_waits_for_lock.wait(10), "rename never reached the lock"
             return metadata
 
+        # test-contract: seam force the rename to wait on the switch's metadata lock
+        manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
         account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
-            commit_then_queue_rename
+            commit_then_wait_for_rename
         )
         try:
+            results.put("racing")  # type: ignore[attr-defined]
             response = await _request(
                 reader,
                 writer,
@@ -12692,25 +12715,32 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
                 {"session_id": sid, "account": str(second)},
             )
             assert response[-1]["result"]["account"] == str(second)
-            assert rename_tasks
-            await rename_tasks[0]
+            assert rename_waits_for_lock.is_set() and rename_tasks
+            await await_or_fail(
+                rename_tasks[0],
+                timeout=10,
+                what="second-client rename during account switch",
+            )
             assert server.runtime.metadata.name == "renamed during switch"
         finally:
             account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
                 original_commit
             )
+            manager._metadata_lock = metadata_lock  # type: ignore[method-assign]
             await first_client.close()
             await server.close()
 
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.put(repr(exc))
+        results.put(repr(exc))  # type: ignore[attr-defined]
     else:
-        results.put(None)
+        results.put(None)  # type: ignore[attr-defined]
 
 
 def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -> None:
+    # a deadlock blocks the child's event loop, so only a process boundary can
+    # bound it; the limit starts once the child is set up, not at spawn.
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     process = context.Process(
@@ -12718,13 +12748,26 @@ def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -
         args=(str(tmp_path / "race-home"), results),
     )
     process.start()
-    process.join(timeout=5)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=1)
-        pytest.fail("serve switch and second-client rename deadlocked")
+    outcome: object = "serve child did not report an outcome"
+    try:
+        try:
+            ready = results.get(timeout=120)
+        except queue.Empty:
+            pytest.fail("serve child never reached the switch")
+        assert ready == "racing", ready
+        try:
+            outcome = results.get(timeout=30)
+        except queue.Empty:
+            pytest.fail("serve switch and second-client rename deadlocked")
+    finally:
+        if process.is_alive():
+            process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        results.close()
+    assert outcome is None
     assert process.exitcode == 0
-    assert results.get(timeout=1) is None
 
 
 @pytest.mark.asyncio
