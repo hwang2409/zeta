@@ -10,7 +10,12 @@ from textwrap import dedent
 import pytest
 
 from zeta.agent.tool_results import validated_tool_result
-from zeta.config.settings import ComputerUseConfig, SETTINGS_FILENAME, load_settings, resolve
+from zeta.config.settings import (
+    SETTINGS_FILENAME,
+    ComputerUseConfig,
+    load_settings,
+    resolve,
+)
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall
 from zeta.providers.anthropic import build_messages_payload
