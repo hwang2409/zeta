@@ -818,9 +818,7 @@ class TUIApp(
             self._show_history_search_target(target, query)
 
         self._history_search_task = asyncio.create_task(reveal_match())
-        self._history_search_task.add_done_callback(
-            lambda _task: self._finder_accept_when_ready()
-        )
+        self._history_search_task.add_done_callback(self._history_search_ended)
 
     def _navigate_history_search(self, delta: int) -> bool:
         if not self._history_search_results:
@@ -844,7 +842,13 @@ class TUIApp(
             self._show_history_search_target(target, self._transcript.search_query)
 
         self._history_search_task = asyncio.create_task(reveal())
+        self._history_search_task.add_done_callback(self._history_search_ended)
         return True
+
+    def _history_search_ended(self, _task: asyncio.Task[None]) -> None:
+        # The finder reads "searching…" until this task ends; redraw without a key.
+        self._invalidate_prompt()
+        self._finder_accept_when_ready()
 
     def _show_history_search_target(self, target: Any, query: str) -> None:
         """Paint the revealed match and rebuild the open finder's rows from it."""
