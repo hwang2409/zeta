@@ -1362,7 +1362,8 @@ class ServeControl:
     ) -> object:
         connections = getattr(self.server, "connections", None)
         if connections is None or not self.attached:
-            self._maybe_idle()  # a dropped frame of a parked pair may change its row
+            if connections is not None:
+                self._maybe_idle()  # a dropped frame of a parked pair may change its row
             from .connections import Admission
 
             return Admission("no_controller")
@@ -1377,7 +1378,8 @@ class ServeControl:
             session_id = self.runtime.session_id
         connections = self.server.connections
         if connections is None or not self.attached:
-            self._maybe_idle()  # a dropped frame of a parked pair may change its row
+            if connections is not None:
+                self._maybe_idle()  # a dropped frame of a parked pair may change its row
             return False
         return await connections.publish_controller(event, session_id, **fields)
 
