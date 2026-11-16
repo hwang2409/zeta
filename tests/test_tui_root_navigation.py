@@ -610,8 +610,12 @@ async def test_finder_keys_typed_during_startup_never_become_a_prompt(
             what="Enter typed in the finder during startup did not accept its match",
         )
         startup.set()
+        # Startup sends its queued prompts in the same step that ends it; wait
+        # for any turn they started, so a sent prompt reaches the backend.
         await driver.until(
-            lambda: not driver.app._startup_replay_active, what="startup did not finish"
+            lambda: not driver.app._startup_replay_active
+            and (driver.app._active_task is None or driver.app._active_task.done()),
+            what="startup or its queued turn did not finish",
         )
         await driver.settle("settled screen after startup")
         assert not backend.calls, (
