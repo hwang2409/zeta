@@ -454,9 +454,17 @@ class SlashCommandRegistry:
             existing = self._custom_commands[command.name]
             if command.source == "home":
                 notice = (
-                    f"custom command {existing.path}: /{command.name} is shadowed by home; "
-                    "keeping the home command"
+                    f"custom command {command.path}: /{command.name} is shadowed by "
+                    f"{existing.source}; keeping the existing command"
                 )
+                self.add_notice(notice)
+                return
+            if existing.source == "home" and command.source == "project":
+                notice = (
+                    f"custom command {existing.path}: /{command.name} is shadowed by "
+                    "project; keeping the project command"
+                )
+                self._custom_commands[command.name] = command
                 self.add_notice(notice)
                 return
             notice = (
