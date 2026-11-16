@@ -176,6 +176,12 @@ class _Connection:
     protocol_version: str = "1.0"
     features: frozenset[str] = frozenset()
     output: _OutputState | None = None
+    # set when the run loop sees the peer gone while a request still runs
+    lost: bool = False
+    # set when a controller hello starts waiting for this lost holder to release
+    contended: asyncio.Event = field(default_factory=asyncio.Event)
+    # set when the slot is released, so a waiting controller hello can proceed
+    released: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class ConnectionRegistry(ReplayOutput):
@@ -304,6 +310,32 @@ class ConnectionRegistry(ReplayOutput):
     def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
         return state is not None and state is self._controller
+
+    def output_state(self, connection: Any) -> _OutputState | None:
+        state = self._connections.get(connection)
+        return state.output if state is not None else None
+
+    def mark_lost(self, connection: Any) -> asyncio.Event | None:
+        """Mark a connection lost while its request still runs.
+
+        Return the event the run loop waits on to learn a controller hello is
+        now contending for the slot, or ``None`` if the connection is gone.
+        """
+        state = self._connections.get(connection)
+        if state is None:
+            return None
+        state.lost = True
+        return state.contended
+
+    async def wait_for_lost_controller(self, deadline: float) -> None:
+        """If the controller slot is held by a lost holder, signal contention
+        and wait up to ``deadline`` seconds for the slot to be released."""
+        state = self._controller
+        if state is None or not state.lost:
+            return
+        state.contended.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(state.released.wait(), deadline)
 
     def activate_controller(self, connection: Any) -> None:
         if self.is_controller(connection):
@@ -524,6 +556,7 @@ class ConnectionRegistry(ReplayOutput):
         state = self._connections.pop(connection, None)
         if state is None:
             return
+        state.released.set()
         if state is self._controller:
             self._controller = None
             self._controller_output_paused = True
