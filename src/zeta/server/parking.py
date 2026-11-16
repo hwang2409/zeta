@@ -76,6 +76,17 @@ class ParkedPairs:
         if control in self._parked.values():
             asyncio.get_running_loop().call_soon(self._check, control)
 
+    def changed_from_any_thread(self, control: ServeControl) -> None:
+        """``changed`` for a sink that may run off the loop thread."""
+        connections = self._connections()
+        if connections is None:
+            return
+        try:
+            connections.loop.call_soon_threadsafe(self.changed, control)
+        except RuntimeError:
+            if not connections.loop.is_closed():
+                raise
+
     def _check(self, control: ServeControl) -> None:
         # a resume may have attached the pair since this check was scheduled
         if control not in self._parked.values():

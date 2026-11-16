@@ -269,17 +269,6 @@ class ServeControl:
         idle; loop thread only."""
         self.server.parking.changed(self)
 
-    def work_changed(self) -> None:
-        """``_maybe_idle`` from any thread."""
-        connections = self.server.connections
-        if connections is None:
-            return
-        try:
-            connections.loop.call_soon_threadsafe(self._maybe_idle)
-        except RuntimeError:
-            if not connections.loop.is_closed():
-                raise
-
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
 

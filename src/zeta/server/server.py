@@ -348,7 +348,9 @@ class ZetaServer:
             runtime.set_memory_notice_sink(control._publish_memory_notice)
             runtime.set_run_work_event_sink(control._publish_run_work_event)
             runtime.set_background_wake_sink(control._schedule_background_wake)
-            runtime.set_work_changed_sink(control.work_changed)
+            runtime.set_work_changed_sink(
+                lambda: self.parking.changed_from_any_thread(control)
+            )
 
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None
