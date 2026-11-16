@@ -180,6 +180,7 @@ cmd_rebuild() {
   local ax; ax="$(printf '%s' "$swout" | sed -n 's/.*accessibility=\(true\|false\).*/\1/p' | head -1)"
   if [ -z "$sr" ] || [ -z "$ax" ]; then
     log "[INCONCLUSIVE] malformed preflight output: $swout"
+    return 1
   elif [ "$sr" = "true" ] && [ "$ax" = "true" ]; then
     log "[PASS] grant SURVIVED rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
     log "       -> this signing mode keeps both grants across rebuilds."
@@ -188,6 +189,7 @@ cmd_rebuild() {
     log "       -> this signing mode re-keys TCC on every rebuild; re-grant needed."
   else
     log "[INCONCLUSIVE] split grant after rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
+    return 1
   fi
 }
 
@@ -248,7 +250,9 @@ it runs nothing. Review each line, then run the ones that apply to what you did.
      rm -rf "$CAPTURE_DIR"
      rm -f "${TMPDIR:-/tmp}"/cuspike-*.png
 
-6. The python and tmux/terminal grants have no bundle id, so remove them by hand
+6. Keep $RESULTS. It is the spike result; henry may delete it by hand after sending or archiving it.
+
+7. The python and tmux/terminal grants have no bundle id, so remove them by hand
    them. Remove them by hand in System Settings > Privacy & Security:
      - Screen Recording: remove the python entry you enabled in step 4 of the
        procedure (e.g. 'python3.13') and the 'tmux' / terminal entry if you added
