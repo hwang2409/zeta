@@ -1231,10 +1231,9 @@ async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
         await driver.until(driver.finder_drawn, what="ctrl+f opened no finder")
         await driver.settle("settled finder")
         assert _picker_cards(driver) == 0, f"a card in the finder preview; screen:\n{rows()}"
-        for _ in range(2):
-            await driver.send(ESCAPE)
-            await driver.settle("settled screen after Esc")
-        assert not driver.finder_drawn() and cards() == (0, 0), (
+        await _close_finder_with_escape(driver)
+        await driver.settle("settled screen after the finder")
+        assert cards() == (0, 0), (
             f"after the finder: cards on screen and in history {cards()}; screen:\n{rows()}"
         )
 
