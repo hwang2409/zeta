@@ -98,8 +98,9 @@ class ProjectLockingMixin:
                     raise ProjectRegistryBusyError() from exc
                 time.sleep(_PROJECT_REGISTRY_LOCK_POLL_SECONDS)
 
-    def _acquire_identity_lock(self, lock_fd: int) -> None:
-        self._acquire_lock_with_timeout(
+    @staticmethod
+    def _acquire_identity_lock(lock_fd: int) -> None:
+        ProjectLockingMixin._acquire_lock_with_timeout(
             lock_fd, fcntl.LOCK_EX, timeout_seconds=_IDENTITY_WRITE_LOCK_TIMEOUT_SECONDS
         )
 
