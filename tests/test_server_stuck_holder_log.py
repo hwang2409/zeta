@@ -55,11 +55,14 @@ async def _serve(tmp_path: Path, transport: Transport) -> AsyncIterator[ZetaServ
 
 
 async def _poll(predicate: Callable[[], bool], what: str) -> None:
-    async def loop() -> None:
-        while not predicate():
-            await asyncio.sleep(0.01)
-
-    await await_or_fail(loop(), what=what)
+    # Transport-level states (EOF seen, slot released) have no producer event;
+    # yield to the loop until they hold, bounded by an explicit deadline.
+    try:
+        async with asyncio.timeout(10):
+            while not predicate():
+                await asyncio.sleep(0)
+    except TimeoutError as exc:
+        raise AssertionError(f"timed out waiting for {what}") from exc
 
 
 async def _controller_hello(client: ReplayClient, request_id: int) -> dict[str, object]:
@@ -79,8 +82,10 @@ async def test_stuck_lost_holder_is_logged_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     gate = asyncio.Event()
+    entered = asyncio.Event()
 
     async def gated_status(client, request_id, params):
+        entered.set()
         await asyncio.wait_for(gate.wait(), 10)
         return {}
 
@@ -94,16 +99,7 @@ async def test_stuck_lost_holder_is_logged_once(
             await holder.send(2, "status", {})
             registry_connections = server.connections
             assert registry_connections is not None
-            await _poll(
-                lambda: (
-                    registry_connections._controller is not None
-                    and getattr(
-                        registry_connections._controller.connection, "_request", None
-                    )
-                    is not None
-                ),
-                what="holder enters its request",
-            )
+            await await_or_fail(entered.wait(), what="holder enters its request")
             await holder.close()
             await _poll(
                 lambda: registry_connections._controller is not None
