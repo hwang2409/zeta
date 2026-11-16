@@ -407,12 +407,9 @@ class DeliveryRequests:
     ) -> None:
         async with self._turn_guard:
             dropped = await state.opened.store.drop_client_steering_async(reason)
-        connections = self._control.server.connections
-        if connections is None:
-            return
         for entry, accepted_message in dropped:
             row = event_contract.delivery_status_row(entry, accepted_message)
-            await connections.publish_controller(
+            await self._control._notify(
                 event_contract.AUXILIARY_WIRE_EVENTS[
                     event_contract.AuxiliaryEvent.DELIVERY_STATUS
                 ],

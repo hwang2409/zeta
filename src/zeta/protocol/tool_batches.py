@@ -12,6 +12,7 @@ from .types import (
     TextContent,
     ToolResult,
     ToolUseContent,
+    is_passive_harness_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ def repair_tool_batches[T](
     A call that asks for approval only at execute time stores a synthetic
     assistant anchor holding that call between the batch and its result; the
     anchor repeats a call of the open batch, so it is skipped, not sent.
+    A harness notice written between a batch's results moves after them.
     """
 
     result: list[T] = []
@@ -62,13 +64,25 @@ def repair_tool_batches[T](
             result.append(item)
             continue
         batch_results: list[T] = []
+        notices: list[T] = []
+        # notices not yet followed by a result or anchor of this batch
+        pending: list[T] = []
         while index < len(items):
             candidate = message_of(items[index])
             if candidate.role is MessageRole.TOOL_RESULT:
                 batch_results.append(items[index])
+            elif is_passive_harness_message(candidate):
+                # written mid-batch (shell cwd recovery); it follows the results
+                pending.append(items[index])
+                index += 1
+                continue
             elif not _is_anchor(candidate, call_ids):
                 break
+            notices.extend(pending)
+            pending.clear()
             index += 1
+        # trailing notices are not part of the batch; they stay after it
+        index -= len(pending)
         by_id: dict[str, T] = {}
         for candidate in batch_results:
             tool_result = message_of(candidate).tool_result
@@ -78,12 +92,17 @@ def repair_tool_batches[T](
         complete = (
             unique and len(batch_results) == len(call_ids) and set(by_id) == set(call_ids)
         )
-        if complete or index == len(items):
+        if complete:
+            # parallel results are stored as each call ends; the model sees call order
+            result.append(item)
+            result.extend(by_id[call_id] for call_id in call_ids)
+        elif index == len(items):
             result.append(item)
             result.extend(batch_results)
         elif unique and not message.metadata.get(FAILED_TURN_MARKER):
             result.append(item)
             result.extend(by_id.get(call_id) or stand_in(call_id) for call_id in call_ids)
+        result.extend(notices)
     return result
 
 
