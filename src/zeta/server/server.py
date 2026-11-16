@@ -655,11 +655,13 @@ class _Client:
         self._transport_failed = False
         self._read_buffer = bytearray()
         # the request this connection runs now (method, id, monotonic start), its
-        # task, and the one pending socket read; used to detect loss while a
-        # handler runs and to dump a stuck holder.
+        # handler task, the one pending socket read, and a once-per-holder flag so
+        # the stuck-holder refusal log fires at most once; used to detect loss
+        # while a handler runs and to dump a stuck holder.
         self._request: tuple[str, str | int, float] | None = None
         self._run_task: asyncio.Task[object] | None = None
         self._chunk_read: asyncio.Task[bytes] | None = None
+        self._stuck_holder_reported = False
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.runtime, codec=self.codec
@@ -921,6 +923,17 @@ class _Client:
         if self._chunk_read is not None:
             self._chunk_read.cancel()
             self._chunk_read = None
+
+    def peer_closed(self) -> bool:
+        """Best-effort: has this connection's peer gone away (EOF / transport lost)?
+
+        A heuristic for diagnostics; a buffered unread frame can hide EOF on a
+        unix socket, which is acceptable here.
+        """
+        reader_peer_closed = getattr(self.reader, "peer_closed", None)
+        if reader_peer_closed is not None:  # WebSocketConnection adapter
+            return bool(reader_peer_closed())
+        return self.reader.at_eof() or self.writer.is_closing()
 
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""

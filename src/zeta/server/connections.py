@@ -20,6 +20,7 @@ from ..core.store._child_runs import (
 )
 from ..core.thread_call import ThreadCallWorkers
 from . import content, event_contract
+from .diagnostics import log_stuck_holder
 from .handlers import history, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
@@ -249,12 +250,34 @@ class ConnectionRegistry(ReplayOutput):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached"
                 ) from exc
+            self._log_lost_holder_refusal()
             raise ProtocolError(
                 ErrorDescriptor.CONNECTION_CAPACITY,
                 "another client is already connected",
             ) from exc
         connection.role = role
         return role
+
+    def _log_lost_holder_refusal(self) -> None:
+        """On a controller refusal, if the holder's connection is already gone
+        while its request still runs, log it once (diagnostic only)."""
+        holder = self._controller
+        if holder is None:
+            return
+        client = holder.connection
+        if getattr(client, "_stuck_holder_reported", True):
+            return
+        peer_closed = getattr(client, "peer_closed", None)
+        if peer_closed is None or getattr(client, "_request", None) is None:
+            return
+        if not peer_closed():
+            return
+        client._stuck_holder_reported = True
+        log_stuck_holder(
+            client,
+            holder.output,
+            reason="hello refused -32001; holder connection closed while a request runs",
+        )
 
     def _claim(
         self,
