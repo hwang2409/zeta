@@ -1305,13 +1305,15 @@ class ServeControl:
                 self._event(event, session_id=session_id, background=True)
             )
 
-    def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
+    def _publish_run_work_event(self, session_id: str, event: EventDescriptor | None, fields: dict[str, object]) -> None:
         connections = self.server.connections
         if connections is None:
             return
         def publish() -> None:
             # the sink may run on a worker thread; check idleness on the loop
             self._maybe_idle()
+            if event is None:
+                return
             controller = connections.controller_metadata()
             if not self.closing and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
