@@ -51,7 +51,25 @@ enum HelperError: Error {
 final class Flag {
     private let lock = NSLock()
     private var value = false
-    func set() { lock.lock(); value = true; lock.unlock() }
+    private var observers: [() -> Void] = []
+
+    func observe(_ observer: @escaping () -> Void) {
+        lock.lock()
+        observers.append(observer)
+        let alreadySet = value
+        lock.unlock()
+        if alreadySet { observer() }
+    }
+
+    func set() {
+        lock.lock()
+        guard !value else { lock.unlock(); return }
+        value = true
+        let callbacks = observers
+        lock.unlock()
+        callbacks.forEach { $0() }
+    }
+
     var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
@@ -222,10 +240,15 @@ func moveMouse(_ point: CGPoint) {
     postMouse(.mouseMoved, point, .left)
 }
 
+func checkKilled() throws {
+    if killed.isSet { throw HelperError.killed }
+}
+
 func click(_ point: CGPoint, button name: String, count: Int) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
     for i in 1...n {
+        try checkKilled()
         postMouse(b.down, point, b.button, clickState: i)
         postMouse(b.up, point, b.button, clickState: i)
     }
@@ -233,10 +256,13 @@ func click(_ point: CGPoint, button name: String, count: Int) throws {
 
 func drag(_ path: [CGPoint]) throws {
     guard let start = path.first else { throw HelperError.badRequest("drag path is empty") }
+    try checkKilled()
     postMouse(.leftMouseDown, start, .left)
     for point in path.dropFirst() {
+        try checkKilled()
         postMouse(.leftMouseDragged, point, .left)
     }
+    try checkKilled()
     postMouse(.leftMouseUp, path.last ?? start, .left)
 }
 
@@ -250,8 +276,9 @@ func scroll(at point: CGPoint, dx: Int, dy: Int) {
     event.post(tap: .cghidEventTap)
 }
 
-func typeText(_ text: String) {
+func typeText(_ text: String) throws {
     for ch in text {
+        try checkKilled()
         var utf16 = Array(String(ch).utf16)
         guard
             let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
@@ -281,6 +308,7 @@ let keyCodes: [String: CGKeyCode] = [
 ]
 
 func keyCombo(_ combo: String) throws {
+    try checkKilled()
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     guard !parts.isEmpty else { throw HelperError.badRequest("empty key combo") }
     var flags: CGEventFlags = []
@@ -400,7 +428,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         guard let text = req["text"] as? String else {
             throw HelperError.badRequest("type needs text")
         }
-        typeText(text)
+        try typeText(text)
         return [:]
     case "key":
         try guardInput()
@@ -418,14 +446,67 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
     }
 }
 
+// MARK: - indicator and application lifecycle
+
+final class Indicator {
+    private var windows: [NSWindow] = []
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    init() {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Zeta controls the desktop", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "kill: ctrl+opt+cmd+esc", action: nil, keyEquivalent: "")
+        statusItem.menu = menu
+        statusItem.button?.title = "Zeta controls the desktop"
+        killed.observe { [weak self] in
+            DispatchQueue.main.async { self?.showKilled() }
+        }
+    }
+
+    func showActive() {
+        guard !killed.isSet else { return }
+        windows = NSScreen.screens.map { screen in
+            let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.ignoresMouseEvents = true
+            window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            let view = NSView(frame: window.contentView?.bounds ?? screen.frame)
+            view.wantsLayer = true
+            view.layer?.borderColor = NSColor.systemRed.cgColor
+            view.layer?.borderWidth = 4
+            view.autoresizingMask = [.width, .height]
+            window.contentView = view
+            window.orderFrontRegardless()
+            return window
+        }
+    }
+
+    func hide() {
+        windows.forEach { $0.orderOut(nil) }
+        windows.removeAll()
+    }
+
+    private func showKilled() {
+        hide()
+        statusItem.button?.title = "Zeta desktop control killed"
+        statusItem.menu?.items.forEach { $0.isEnabled = false }
+    }
+}
+
 // MARK: - stdio loop
 
 let stdout = FileHandle.standardOutput
+let responseLock = NSLock()
+let actionQueue = DispatchQueue(label: "zeta-computer-helper.actions")
 
 func writeResponse(_ dict: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
+    responseLock.lock()
     stdout.write(data)
     stdout.write(Data([0x0a]))
+    responseLock.unlock()
 }
 
 func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
@@ -433,34 +514,50 @@ func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
     return ["id": id, "ok": false, "error": ["code": he.code, "message": he.message]]
 }
 
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let indicator = Indicator()
+killed.observe { DispatchQueue.main.async { indicator.hide() } }
 installKillSwitch()
 
-while let line = readLine(strippingNewline: true) {
-    if line.isEmpty { continue }
-    guard let data = line.data(using: .utf8),
-        let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else {
-        writeResponse([
-            "id": 0, "ok": false,
-            "error": ["code": "bad_request", "message": "malformed request line"],
-        ])
-        continue
+Thread {
+    while let line = readLine(strippingNewline: true) {
+        if line.isEmpty { continue }
+        guard let data = line.data(using: .utf8),
+            let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            writeResponse([
+                "id": 0, "ok": false,
+                "error": ["code": "bad_request", "message": "malformed request line"],
+            ])
+            continue
+        }
+        let id = (req["id"] as? Int) ?? 0
+        guard let op = req["op"] as? String else {
+            writeResponse(errorResponse(id, HelperError.badRequest("missing op")))
+            continue
+        }
+        actionQueue.async {
+            if killed.isSet {
+                writeResponse(errorResponse(id, HelperError.killed))
+                return
+            }
+            DispatchQueue.main.async { indicator.showActive() }
+            do {
+                var payload = try handle(op, req)
+                payload["id"] = id
+                payload["ok"] = true
+                writeResponse(payload)
+            } catch {
+                writeResponse(errorResponse(id, error))
+            }
+            DispatchQueue.main.async { if !killed.isSet { indicator.hide() } }
+        }
     }
-    let id = (req["id"] as? Int) ?? 0
-    guard let op = req["op"] as? String else {
-        writeResponse(errorResponse(id, HelperError.badRequest("missing op")))
-        continue
+    DispatchQueue.main.async {
+        indicator.hide()
+        app.terminate(nil)
     }
-    if killed.isSet {
-        writeResponse(errorResponse(id, HelperError.killed))
-        continue
-    }
-    do {
-        var payload = try handle(op, req)
-        payload["id"] = id
-        payload["ok"] = true
-        writeResponse(payload)
-    } catch {
-        writeResponse(errorResponse(id, error))
-    }
-}
+}.start()
+
+app.run()

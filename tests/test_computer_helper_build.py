@@ -33,6 +33,17 @@ def test_cursor_position_uses_nearest_integer_rule() -> None:
     assert 'Int(loc.y.rounded())' in source
 
 
+def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
+    source = HELPER_SOURCE.read_text()
+    assert 'NSStatusBar.system.statusItem' in source
+    assert 'window.ignoresMouseEvents = true' in source
+    assert 'Thread {' in source
+    assert 'app.run()' in source
+    assert 'for point in path.dropFirst()' in source
+    assert 'try checkKilled()' in source
+    assert 'for ch in text' in source
+
+
 def test_helper_builds_and_answers_hello() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
@@ -46,3 +57,15 @@ def test_helper_builds_and_answers_hello() -> None:
     assert reply["version"] == "0.1.0"
     assert isinstance(reply["screen_recording"], bool)
     assert isinstance(reply["accessibility"], bool)
+
+
+def test_helper_exits_when_stdin_reaches_eof() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        binary = Path(tmp) / "zeta-computer-helper"
+        process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=15) == 0
