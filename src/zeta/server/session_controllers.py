@@ -44,9 +44,6 @@ class SessionControllers:
         self._records[control] = record
         return record
 
-    def attached_controls(self) -> tuple[ServeControl, ...]:
-        return (self._attached.control,)
-
     def attached(self) -> SessionController:
         return self._attached
 
@@ -55,21 +52,31 @@ class SessionControllers:
         del connection
         return self._attached
 
-    def selected(self, connection: Any, session_id: str) -> SessionController:
-        """Return the persistent resident record selected by ``session_id``."""
+    def selected(
+        self,
+        connection: Any,
+        session_id: str,
+        *,
+        unattached_error: ProtocolError | None = None,
+    ) -> SessionController:
+        """Return the persistent resident record selected by ``session_id``.
+
+        ``unattached_error`` replaces the absence error while no session is
+        attached, for an operation whose legacy wire text differs."""
         del connection
-        record = self._attached
-        try:
-            if record in self._records.values() and record.runtime.session_id == session_id:
-                return record
-        except RuntimeError:
-            pass
-        try:
-            return self._parked[session_id]
-        except KeyError as exc:
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            ) from exc
+        attached = self._attached.runtime
+        if (
+            self._attached in self._records.values()
+            and attached.opened is not None
+            and attached.session_id == session_id
+        ):
+            return self._attached
+        record = self._parked.get(session_id)
+        if record is not None:
+            return record
+        if attached.opened is None and unattached_error is not None:
+            raise unattached_error
+        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def attach(self, record: SessionController) -> SessionController:
         self._parked.pop(record.runtime.session_id, None)
@@ -90,21 +97,24 @@ class SessionControllers:
     def parked_controls(self) -> tuple[ServeControl, ...]:
         return tuple(record.control for record in self._parked.values())
 
-    def parked_records(self) -> tuple[SessionController, ...]:
-        return tuple(self._parked.values())
-
-    def parked_control(self, session_id: str) -> ServeControl | None:
-        record = self._parked.get(session_id)
-        return record.control if record is not None else None
+    def parked_record(self, session_id: str) -> SessionController | None:
+        return self._parked.get(session_id)
 
     def remove(self, record: SessionController) -> None:
         control = record.control
         self._parked.pop(record.runtime.session_id, None)
         self._records.pop(control, None)
 
-    def require_current(self, connection: Any, record: SessionController) -> None:
+    def require_current(
+        self, connection: Any, record: SessionController, session_id: str | None
+    ) -> None:
+        """Fail unless ``record`` is still resident and still holds ``session_id``."""
         del connection
-        if record not in self._records.values():
+        runtime = record.runtime
+        if record not in self._records.values() or (
+            session_id is not None
+            and (runtime.opened is None or runtime.session_id != session_id)
+        ):
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def is_attached(self, control: ServeControl) -> bool:

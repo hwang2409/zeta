@@ -13,7 +13,7 @@ from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
 if TYPE_CHECKING:
     from .connections import ConnectionRegistry
     from .control import ServeControl
-    from .session_controllers import SessionControllers
+    from .session_controllers import SessionController, SessionControllers
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +48,8 @@ class ParkedPairs:
     def pairs(self) -> tuple[ServeControl, ...]:
         return self._controllers.parked_controls()
 
-    def get(self, session_id: str) -> ServeControl | None:
-        return self._controllers.parked_control(session_id)
+    def get(self, session_id: str) -> SessionController | None:
+        return self._controllers.parked_record(session_id)
 
     def rows(self) -> list[dict[str, object]]:
         """``status.parked_sessions``."""
@@ -58,9 +58,10 @@ class ParkedPairs:
     def unpark(self, incoming: ServeControl) -> bool:
         """Take ``incoming`` out of the parked set when it is parked."""
         session_id = incoming.runtime.session_id
-        if self._controllers.parked_control(session_id) is not incoming:
+        record = self._controllers.parked_record(session_id)
+        if record is None or record.control is not incoming:
             return False
-        assert self._controllers.unpark(self._controllers.record_for(incoming)) is not None
+        assert self._controllers.unpark(record) is not None
         self._sent.pop(session_id, None)
         return True
 

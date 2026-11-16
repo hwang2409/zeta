@@ -128,6 +128,7 @@ def test_entrypoint_shutdown_releases_every_lease(
 
     async def server():
         server = ZetaServer(home=home, cwd=tmp_path, provider="codex", port=0)
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(server._runtime_for_test, "_bind_background_event_sink", startup)
         try:
             await server.start()

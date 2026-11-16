@@ -2415,6 +2415,7 @@ async def test_foreground_and_delegated_same_raw_id_distinct_request_ids_and_mat
         "_append_delegated_history",
         delay_delegated_approval_end,
     )
+    # test-contract: seam patches the attached pair's private hook
     monkeypatch.setattr(server._control_for_test, "_notify", record_agent_end)
     reader, writer = await _ready(server)
     try:
@@ -11706,8 +11707,9 @@ async def test_foreground_aborts_after_notification_retry_report_idle(
             assert frames[-1]["result"]["aborted"] is False
 
         await _frames_until_event(reader, "agent_end")
-        while server._runtime_for_test.loop.notification_turn_state != "idle":
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while server._runtime_for_test.loop.notification_turn_state != "idle":
+                await asyncio.sleep(0)
         await asyncio.wait_for(backend.second_started.wait(), TIMEOUT)
         assert len(backend.calls) == 2
         assert server._runtime_for_test.loop.schedule_notification_turn() is False
@@ -11874,8 +11876,9 @@ async def test_reconnect_runs_pending_notification_turn_once(tmp_path: Path) -> 
             for frame in frames
         )
         assert len(backend.calls) == 1
-        while store.agent_notifications():
-            await asyncio.sleep(0)
+        async with asyncio.timeout(TIMEOUT):
+            while store.agent_notifications():
+                await asyncio.sleep(0)
         assert store.agent_notifications() == []
     finally:
         await close_serve(server, writer)

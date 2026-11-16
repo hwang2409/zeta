@@ -188,7 +188,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
         await client.call("send", {"text": "write"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
         b = await client.new()
-        parked = server.parking.get(a)
+        parked = server.parking.get(a).control
 
         backend.gates[0].set()
         await _until(parked.has_pending_approvals, "parked approval")
@@ -261,7 +261,7 @@ async def _parked_turn(server: ZetaServer, backend: GatedBackend, features: list
     await client.call("send", {"text": "go"})
     await await_or_fail(backend.held[0].wait(), what="A mid-reply")
     await client.new()
-    return client, a, server.parking.get(a)
+    return client, a, server.parking.get(a).control
 
 
 async def _parked_changes(client: Client, until: str) -> list[dict[str, Any]]:

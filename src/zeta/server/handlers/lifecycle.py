@@ -24,7 +24,7 @@ from . import validation
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
-    from ..control import ServeControl
+    from ..session_controllers import SessionController
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -46,7 +46,7 @@ _RESERVED_HEADERS = frozenset({
 _RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-", "x-forwarded-")
 
 
-async def _publish_project_registry_notice(self, controller) -> None:
+async def _publish_project_registry_notice(self, controller: SessionController) -> None:
     runtime = controller.runtime
     if runtime.project_registry_busy:
         await controller.control._event(
@@ -66,7 +66,9 @@ async def _publish_project_registry_notice(self, controller) -> None:
 
 
 @asynccontextmanager
-async def _session_swap(self, park: bool, controller) -> AsyncIterator[ServeControl | None]:
+async def _session_swap(
+    self, park: bool, controller: SessionController
+) -> AsyncIterator[SessionController | None]:
     """Hold a session swap. Yield None to swap the attached pair in place, as
     without ``session_park``; or, when ``park`` and the attached pair holds work,
     yield a new pair to set up beside it. The caller commits that pair with
@@ -84,14 +86,16 @@ async def _session_swap(self, park: bool, controller) -> AsyncIterator[ServeCont
         try:
             yield incoming
         except BaseException:
-            if controller.control is not incoming:
+            if not incoming.control.attached:
                 await incoming.runtime.close()
             raise
 
 
-async def new_session(self, params: dict[str, Any], controller) -> dict[str, object]:
+async def new_session(
+    self, params: dict[str, Any], controller: SessionController
+) -> dict[str, object]:
     try:
-        bindings = await mcp_bindings(self, params)
+        bindings = await mcp_bindings(self, params, controller)
         initial_model = validation.optional_string(params, "model")
         initial_mode = validation.optional_string(params, "approval_mode")
         if initial_mode is not None:
@@ -150,9 +154,11 @@ async def new_session(self, params: dict[str, Any], controller) -> dict[str, obj
         raise
 
 
-async def resume(self, params: dict[str, Any], controller) -> dict[str, object]:
+async def resume(
+    self, params: dict[str, Any], controller: SessionController
+) -> dict[str, object]:
     try:
-        bindings = await mcp_bindings(self, params)
+        bindings = await mcp_bindings(self, params, controller)
         state = controller.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
@@ -239,7 +245,7 @@ async def _resume_live_or_parked(
     bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
     candidate: SessionHostCommands,
     park: bool,
-    controller,
+    controller: SessionController,
 ) -> tuple[dict[str, object] | None, bool]:
     """Attach to the open session's busy turn or to a parked pair and return the
     result; else return None and whether the reopen takes a new pair."""
@@ -263,16 +269,18 @@ async def _resume_live_or_parked(
         return await _attach_live_turn(self, bindings, candidate, controller=controller), park
     parked = parking.get(session_id)
     if park and parked is not None:
-        if not parked.unhealthy():
+        if not parked.control.unhealthy():
             return await _attach_live_turn(self, bindings, candidate, parked=parked, controller=controller), park
         # as for the open session: close it (its turn ends disconnect), reopen from disk
-        parking.close(parked)
+        parking.close(parked.control)
         await parking.wait_closed(session_id)
     # resuming the attached session itself never takes a new pair
     return None, park and (state is None or state.session_id != session_id)
 
 
-async def _resolve_session_id(self, params: dict[str, Any], controller) -> str:
+async def _resolve_session_id(
+    self, params: dict[str, Any], controller: SessionController
+) -> str:
     session_id = validation.required_string(params, "session_id")
     try:
         return await asyncio.to_thread(
@@ -299,13 +307,13 @@ async def _attach_live_turn(
     bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
     candidate: SessionHostCommands,
     *,
-    parked: ServeControl | None = None,
-    controller=None,
+    parked: SessionController | None = None,
+    controller: SessionController,
 ) -> dict[str, object]:
     """Attach to the active session's busy turn, or to a ``parked`` pair, without
     a reopen: the turn, its approvals and children stay; only this connection's
     bindings are re-supplied."""
-    control = parked or controller.control
+    control = (parked or controller).control
     reattach = None
     if bindings is not None:
         headers, configs = bindings
@@ -327,7 +335,7 @@ async def _attach_live_turn(
             )
     if parked is not None:
         # one step after the last await: the pair cannot start closing first
-        controller = self.server.attach(self.server.controllers.record_for(parked))
+        controller = self.server.attach(parked)
     # Bind host commands before the await, so a turn that ends meanwhile never
     # sees a half-attached session. The running turn keeps its snapshot.
     previous = (control._active_host_commands, control._host_binding_required)
@@ -351,27 +359,27 @@ async def _attach_live_turn(
 
 
 async def mcp_bindings(
-    self, params: dict[str, Any]
+    self, params: dict[str, Any], controller: SessionController
 ) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
     if "mcp_bindings" not in params:
         return None
     validation.require_feature(self, "session_mcp_bindings", "mcp_bindings")
     parsed = parse_mcp_bindings(params["mcp_bindings"])
-    configs = await resolve_mcp_bindings(self, parsed, params.get("cwd"))
+    configs = await resolve_mcp_bindings(self, parsed, params.get("cwd"), controller)
     return parsed, configs
 
 
 async def reconnect_mcp_bindings(
-    self, params: dict[str, Any]
+    self, params: dict[str, Any], controller: SessionController
 ) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
     if "mcp_bindings" not in params:
         return None
     validation.require_feature(self, "approval_reconnect", "mcp_bindings")
-    bindings = await mcp_bindings(self, params)
+    bindings = await mcp_bindings(self, params, controller)
     assert bindings is not None
     session_id = validation.required_string(params, "session_id")
-    state = self.server.controllers.owned(self).runtime.state
-    control = self.server.controllers.owned(self).control
+    state = controller.runtime.state
+    control = controller.control
     if (
         state is None
         or state.session_id != session_id
@@ -421,20 +429,24 @@ def parse_mcp_bindings(raw: object) -> dict[str, dict[str, str]]:
 
 
 async def resolve_mcp_bindings(
-    self, bindings: dict[str, dict[str, str]], project_dir: object = None
+    self,
+    bindings: dict[str, dict[str, str]],
+    project_dir: object,
+    controller: SessionController,
 ) -> dict[str, MCPServerConfig]:
-    home_path = home_config_path(self.server.controllers.owned(self).runtime.home)
-    loop = self.server.controllers.owned(self).runtime.loop
+    runtime = controller.runtime
+    home_path = home_config_path(runtime.home)
+    loop = runtime.loop
     project_dir = (
         loop.tool_registry.cwd
         if loop is not None and project_dir is None
-        else project_dir if project_dir is not None else self.server.controllers.owned(self).runtime.cwd
+        else project_dir if project_dir is not None else runtime.cwd
     )
     config, effective = await asyncio.gather(
         asyncio.to_thread(load_mcp_config, home_path),
         asyncio.to_thread(
             load_mcp_config_overlay,
-            home=self.server.controllers.owned(self).runtime.home,
+            home=runtime.home,
             project_dir=project_dir,
         ),
     )
@@ -489,7 +501,7 @@ def _active_runtime_snapshot(
     return snapshot
 
 
-def session_snapshot(self, controller) -> dict[str, object] | None:
+def session_snapshot(self, controller: SessionController) -> dict[str, object] | None:
     runtime = controller.runtime
     if runtime.opened is None:
         return None
@@ -499,11 +511,11 @@ def session_snapshot(self, controller) -> dict[str, object] | None:
     return snapshot
 
 
-def session_runtime_state(self, controller) -> str:
+def session_runtime_state(self, controller: SessionController) -> str:
     return controller.control.pair_state()
 
 
-async def live_status_baseline(self, controller) -> dict[str, object]:
+async def live_status_baseline(self, controller: SessionController) -> dict[str, object]:
     pending, truncated = await controller.control.reconnect_baseline()
     return {
         "state": session_runtime_state(self, controller),
@@ -517,7 +529,7 @@ async def status(
     *,
     include_connection_setup_counts: bool = False,
     fallback_config: object | None = None,
-    controller,
+    controller: SessionController,
 ) -> dict[str, object]:
     runtime = controller.runtime
     session = session_snapshot(self, controller)
@@ -604,13 +616,13 @@ async def status(
 
 
 def list_sessions(
-    self, request_id: str | int, params: dict[str, Any]
+    self, request_id: str | int, params: dict[str, Any], controller: SessionController
 ) -> tuple[dict[str, object], list[str]]:
-    return _list_sessions(self, request_id, params)
+    return _list_sessions(self, request_id, params, controller)
 
 
 def _list_sessions(
-    self, request_id: str | int, params: dict[str, Any]
+    self, request_id: str | int, params: dict[str, Any], controller: SessionController
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features
     for name in ("offset", "limit"):
@@ -623,11 +635,11 @@ def _list_sessions(
         assert self.projects is not None
         available = self.projects.project_sessions(params["project_id"])
     else:
-        available = self.server.controllers.owned(self).runtime.list_sessions()
+        available = controller.runtime.list_sessions()
     metadata = available[offset : None if limit is None else offset + limit]
     previews = {
         item.session_id: item
-        for item in self.server.controllers.owned(self).runtime.manager.list_session_previews(
+        for item in controller.runtime.manager.list_session_previews(
             limit=len(metadata), sessions=metadata
         )
     }

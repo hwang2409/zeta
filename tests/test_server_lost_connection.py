@@ -83,7 +83,7 @@ def _gate_handler(
     event is set, modelling a cancel-resistant handler.
     """
 
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         started.set()
         try:
             await asyncio.wait_for(gate.wait(), 10)
@@ -109,7 +109,7 @@ def _spy_handler(
     *,
     ran: asyncio.Event,
 ) -> None:
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         ran.set()
         return {"ok": True}
 

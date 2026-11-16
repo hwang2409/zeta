@@ -304,6 +304,7 @@ def _reservation_gate(
             entered.set()
             return result
 
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(server._control_for_test, "_reserve", gated_reserve)
     else:
         terminate = server._control_for_test._terminate_pending_approvals
@@ -312,6 +313,7 @@ def _reservation_gate(
             entered.set()
             await terminate(*args, **kwargs)
 
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(
             server._control_for_test, "_terminate_pending_approvals", gated_terminate
         )
@@ -328,6 +330,7 @@ def _terminal_gate(
         await original(*args, **kwargs)
         entered.set()
 
+    # test-contract: seam patches the attached pair's private hook
     monkeypatch.setattr(server._control_for_test, "_end_approval", finish)
     return entered
 
@@ -696,6 +699,7 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         events.append(event)
         return await original_notify(event, *args, **kwargs)
 
+    # test-contract: seam patches the attached pair's private hook
     monkeypatch.setattr(server._control_for_test, "_notify", record_notify)
     parent = server._runtime_for_test.opened.store
     try:
@@ -1259,6 +1263,7 @@ async def test_failed_recovery_keeps_session_unhealthy(
                 del args, kwargs
                 raise OSError("setup failed")
 
+            # test-contract: seam patches the attached pair's private hook
             monkeypatch.setattr(server._runtime_for_test, "_run_setup", fail_setup)
 
         response = (await _request(reader, writer, 9, method, params))[-1]
@@ -1302,6 +1307,7 @@ async def test_unhealthy_same_session_resume_failure_does_not_clear_health(
     try:
         await _make_unhealthy(server, call, monkeypatch)
         session_id = server._runtime_for_test.session_id
+        # test-contract: seam patches the attached pair's private hook
         monkeypatch.setattr(
             server._runtime_for_test,
             "_run_setup",

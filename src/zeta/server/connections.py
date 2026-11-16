@@ -32,6 +32,7 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
+from .session_controllers import SessionController
 from .session_replay import (
     DeferredFrame,
     ReplayScopeId,
@@ -1012,42 +1013,37 @@ class ConnectionRegistry(ReplayOutput):
         self,
         connection: Any,
         callable: Callable[[], Any],
-        *,
-        controller=None,
-        session_id: str | None = None,
+        controller: SessionController | None = None,
     ) -> Any:
+        """Run one read off-loop; with ``controller``, fail if that record no
+        longer holds the session it held before the read."""
         if connection not in self._connections:
             raise RuntimeError("connection is not connected")
+        runtime = None if controller is None else controller.runtime
+        session_id = None if runtime is None or runtime.opened is None else runtime.session_id
         result = await self.run_blocking(callable)
         if controller is not None:
-            connection.server.controllers.require_current(connection, controller)
-        elif session_id is not None:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+            connection.server.controllers.require_current(connection, controller, session_id)
         return result
 
-    async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
-        if type(params.get("session_id")) is not str or not params["session_id"]:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
+    async def read_tree(
+        self, connection: Any, params: dict[str, Any], controller: SessionController | None = None
+    ) -> object:
+        """``controller`` is the request's owned record after a mutation; else select."""
+        if controller is None:
+            controller = connection.server.controllers.selected(
+                connection, validation.required_string(params, "session_id")
             )
-        owned = connection.server.controllers.owned(connection)
-        selected = connection.server.controllers.selected(connection, params.get("session_id", owned.runtime.session_id))
-        runtime = selected.runtime
-        store = validation.active(runtime, params)
+        store = validation.active(controller.runtime, params)
         return await self.run_read(
-            connection,
-            lambda: session.tree(_observer_runtime(store)),
-            controller=selected,
+            connection, lambda: session.tree(_observer_runtime(store)), controller
         )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
-        if type(params.get("session_id")) is not str or not params["session_id"]:
-            raise ProtocolError(
-                ErrorDescriptor.INVALID_PARAMS, "session_id must be a nonempty string"
-            )
-        selected = connection.server.controllers.selected(connection, params["session_id"])
-        runtime = selected.runtime
-        store = validation.active(runtime, params)
+        selected = connection.server.controllers.selected(
+            connection, validation.required_string(params, "session_id")
+        )
+        store = validation.active(selected.runtime, params)
         features = history_features(self._connections[connection].features)
         result = await self.run_read(
             connection,
@@ -1060,16 +1056,16 @@ class ConnectionRegistry(ReplayOutput):
                 content_read="content_read" in features,
                 served_turn_end="served_turn_end" in features,
             ),
-            controller=selected,
+            selected,
         )
         return self._strip_restart_reason(connection, result)
 
-    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+    async def read_content(
+        self, connection: Any, params: dict[str, Any], controller: SessionController
+    ) -> object:
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
-        owned = connection.server.controllers.owned(connection)
-        selected = (connection.server.controllers.selected(connection, params["session_id"]) if "session_id" in params else owned)
-        runtime = selected.runtime
+        runtime = controller.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return await self.run_read(
@@ -1080,14 +1076,15 @@ class ConnectionRegistry(ReplayOutput):
                 offset=params.get("offset", 0),
                 limit=params.get("limit", content.MAX_CONTENT_READ),
             ),
-            controller=selected,
+            controller,
         )
 
-    async def read_catalog(self, connection: Any) -> object:
-        return await self.run_read(connection, lambda: settings.catalog(connection.server.controllers.owned(connection).runtime))
+    async def read_catalog(self, connection: Any, controller: SessionController) -> object:
+        runtime = controller.runtime
+        return await self.run_read(connection, lambda: settings.catalog(runtime))
 
-    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.controllers.owned(connection).runtime
+    async def read_settings(self, connection: Any, controller: SessionController) -> object:
+        runtime = controller.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
         return await self.run_read(connection, lambda: settings.settings(runtime))
@@ -1104,7 +1101,8 @@ class ConnectionRegistry(ReplayOutput):
                 ErrorDescriptor.INVALID_PARAMS,
                 "session_id and run_id are required child history parameters",
             )
-        runtime = connection.server.controllers.selected(connection, params["session_id"]).runtime
+        selected = connection.server.controllers.selected(connection, params["session_id"])
+        runtime = selected.runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
@@ -1117,13 +1115,15 @@ class ConnectionRegistry(ReplayOutput):
                 registry=self,
                 fidelity="session_history_fidelity" in features,
             ),
-            controller=connection.server.controllers.selected(connection, params["session_id"]),
+            selected,
         )
         return self._strip_restart_reason(connection, result)
 
-    async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
+    async def read_child_run_events(
+        self, connection: Any, params: dict[str, Any], controller: SessionController
+    ):
         # params are validated by the child_run_events handler before begin_replay_join
-        runtime = connection.server.controllers.selected(connection, params["session_id"]).runtime
+        runtime = controller.runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
@@ -1144,7 +1144,7 @@ class ConnectionRegistry(ReplayOutput):
             if row is None:
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result, row
-        result = await self.run_read(connection, read, session_id=runtime.session_id)
+        result = await self.run_read(connection, read, controller)
         return result[0], 0, result[1]
 
     def _child_reader_for(
@@ -1205,13 +1205,13 @@ class ConnectionRegistry(ReplayOutput):
 
     # merge-resolution: src/zeta/server/connections.py pr-lines ConnectionRegistry.read_status@9bb4d2bb8ef9 -> keep the shared status method after adding child history reads
     async def read_status(
-        self, connection: Any, status: dict[str, Any], session_id: str | None, controller=None
+        self, connection: Any, status: dict[str, Any], controller: SessionController
     ) -> object:
         features = self._connections[connection].features
         return await self.run_read(
             connection,
             lambda: project_status(status, served_turn_end="served_turn_end" in features),
-            controller=controller,
+            controller,
         )
 
     async def aclose(self) -> None:

@@ -916,6 +916,8 @@ class _Client:
                 await self.connections.wait_for_lost_controller(deadline)
                 deadline = max(0.0, deadline - (time.monotonic() - start))
             result = self._hello(params)
+            # one record for the whole hello: bindings, claim, and rebind
+            controller = self.server.controllers.owned(self)
             reconnect_bindings = None
             if "mcp_bindings" in params:
                 if self.role != "controller":
@@ -925,13 +927,13 @@ class _Client:
                     )
                 from .handlers.lifecycle import reconnect_mcp_bindings
 
-                reconnect_bindings = await reconnect_mcp_bindings(self, params)
+                reconnect_bindings = await reconnect_mcp_bindings(self, params, controller)
             if self.role == "controller":
                 reconnect = "approval_reconnect" in self.features
                 require_host_binding = "session_host_commands" in self.features
 
                 async def claim() -> bool:
-                    return await self.server.controllers.attached().control.controller_claimed(
+                    return await controller.control.controller_claimed(
                         reconnect=reconnect,
                         require_host_binding=require_host_binding,
                         deadline=deadline,
@@ -958,7 +960,7 @@ class _Client:
                     require_host_binding=require_host_binding,
                 )
                 if reconnect_bindings is not None:
-                    await self.server.controllers.attached().control.reattach_mcp_bindings(
+                    await controller.control.reattach_mcp_bindings(
                         *reconnect_bindings
                     )
                 self.server._client_active = True

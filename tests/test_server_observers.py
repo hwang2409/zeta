@@ -863,6 +863,7 @@ async def test_controller_close_never_writes_after_registry_release(
         await asyncio.wait_for(close_release.wait(), TIMEOUT)
         await original_terminate(*args, **kwargs)
 
+    # test-contract: seam patches the attached pair's private hook
     monkeypatch.setattr(server._control_for_test, "_terminate_pending_approvals", gated_terminate)
     order: list[str] = []
     original_write = client._write_physical
@@ -889,6 +890,7 @@ async def test_controller_close_never_writes_after_registry_release(
         publication_done.set()
         return result
 
+    # test-contract: seam patches the attached pair's private hook
     monkeypatch.setattr(server._control_for_test, "_notify", record_notification)
     writer.close()
     await writer.wait_closed()
