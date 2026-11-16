@@ -297,7 +297,10 @@ def compose_runtime(
         if config.computer_enabled:
             from ..tools.computer.mac import make_mac_backend
 
-            registry.computer_backend = make_mac_backend()
+            computer_backend = make_mac_backend()
+            if computer_backend is not None:
+                registry.computer_backend = computer_backend
+                cleanup.callback(computer_backend.close)
         if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
 

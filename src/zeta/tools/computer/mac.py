@@ -17,7 +17,6 @@ import asyncio
 import base64
 import os
 import sys
-import weakref
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -58,8 +57,6 @@ class MacBackend:
         self._client = HelperClient(argv)
         self._started = False
         self._start_lock = asyncio.Lock()
-        # close the helper subprocess when the backend is dropped (e.g. registry GC).
-        weakref.finalize(self, self._client.close)
 
     async def _call(self, op: str, **args: object) -> dict:
         if not self._started:
