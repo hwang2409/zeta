@@ -113,6 +113,47 @@ async def test_refusal_names_both_identities(
 
 @pytest.mark.parametrize("transport", TRANSPORTS)
 @pytest.mark.asyncio
+async def test_refused_client_version_control_chars_are_escaped(
+    tmp_path: Path,
+    transport: Transport,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused hello cannot forge a second stderr line via client_version.
+
+    The client controls client_version; newlines/CR in it must be escaped so
+    the refusal record stays one line.
+    """
+    async with _serve(tmp_path, transport) as server:
+        holder = await connect_replay(server, transport)
+        try:
+            await negotiate(holder)  # live holder
+            with caplog.at_level(logging.WARNING, logger=_DIAG_LOGGER):
+                refused_client = await connect_replay(server, transport)
+                try:
+                    refused = await refused_client.request(
+                        1,
+                        "hello",
+                        {
+                            "protocol_version": "1.1",
+                            "features": ["session_replay_seq"],
+                            "client_version": "x\ny\rz",
+                        },
+                    )
+                finally:
+                    await refused_client.close()
+                assert refused["error"]["code"] == -32001
+
+                records = _refusal_records(caplog)
+                assert len(records) == 1, [r.getMessage() for r in records]
+                message = records[0].getMessage()
+                assert "\n" not in message and "\r" not in message, repr(message)
+                assert r"client=x\ny\rz" in message, message
+        finally:
+            await holder.close()
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.asyncio
 async def test_refusal_is_rate_limited_per_holder_with_suppressed_count(
     tmp_path: Path,
     transport: Transport,

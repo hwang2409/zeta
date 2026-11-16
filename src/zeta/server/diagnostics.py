@@ -82,7 +82,18 @@ def capture_peer_identity(reader: object, writer: object) -> PeerIdentity:
 
 
 def _clip(value: str, limit: int) -> str:
-    return value if len(value) <= limit else value[: limit - 1] + "\u2026"
+    """Escape control characters, then bound to ``limit`` chars.
+
+    Client-controlled text (User-Agent, client version, request method) must not
+    forge log lines, so escape every non-printable character -- newlines, CR,
+    tab, other C0/C1 controls, and the unicode line separators U+2028/U+2029 --
+    before formatting. Clip after escaping so the bound holds on the output.
+    """
+    escaped = "".join(
+        c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
+        for c in value
+    )
+    return escaped if len(escaped) <= limit else escaped[: limit - 1] + "\u2026"
 
 
 def _await_chain(task: asyncio.Task[object] | None) -> list[str]:
@@ -141,7 +152,7 @@ def _identity(client: _Client, now: float) -> str:
     if peer.pid is not None:
         parts.append(f"pid={peer.pid}")
     if peer.remote is not None:
-        parts.append(f"remote={peer.remote}")
+        parts.append(f"remote={_clip(peer.remote, _MAX_UA_CHARS)}")
     if peer.user_agent:
         parts.append(f'ua="{_clip(peer.user_agent, _MAX_UA_CHARS)}"')
     client_version = client._client_version
@@ -149,7 +160,11 @@ def _identity(client: _Client, now: float) -> str:
     parts.append(f"age={now - client._connected_at:.1f}s")
     parts.append(f"last_frame={now - client._last_frame_at:.1f}s")
     request = client._request
-    parts.append(f"req={request[0]}/{request[1]!r}" if request is not None else "req=idle")
+    parts.append(
+        f"req={_clip(request[0], _MAX_CLIENT_CHARS)}/{request[1]!r}"
+        if request is not None
+        else "req=idle"
+    )
     parts.append(f"peer_closed={'yes' if client.peer_closed() else 'no'}")
     return " ".join(parts)
 
