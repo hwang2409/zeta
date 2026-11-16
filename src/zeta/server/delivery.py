@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ from . import event_contract
 from .handlers import validation
 from .protocol import ErrorDescriptor, ProtocolError
 from .session_replay.rows import RowFacts
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -321,7 +324,6 @@ class DeliveryRequests:
         *,
         owner_task: asyncio.Task[Any] | None,
     ) -> None:
-        control = self._control
         # a completed turn keeps its unconsumed steering: continue_after_turn
         # starts the next turn with it once turn_end is published.
         reason = {
@@ -339,6 +341,25 @@ class DeliveryRequests:
             TurnOutcome.DISCONNECTED: "disconnect",
         }[outcome]
         await state.opened.store.append_turn_end_async(turn_id, turn_reason)
+        self._release_turn(state, owner_task)
+
+    async def fail_finalize(self, session_id: str, state: SessionState) -> None:
+        """End a turn whose finalization raised: drop its steering as failed
+        and release the turn, so no steer stays queued and the next send runs."""
+        try:
+            await self._drop_steering(session_id, state, "failed")
+        except Exception:  # the turn must still be released
+            logger.exception(
+                "dropping steering after failed finalization failed: session=%s",
+                session_id,
+            )
+        finally:
+            self._release_turn(state, asyncio.current_task())
+
+    def _release_turn(
+        self, state: SessionState, owner_task: asyncio.Task[Any] | None
+    ) -> None:
+        control = self._control
         control._approvals.prune_ended()
         if control.runtime.state is state:
             state.turn_finished()

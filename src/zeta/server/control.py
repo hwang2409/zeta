@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import aclosing, contextmanager
@@ -62,13 +63,16 @@ from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
-    from .runtime import ServerRuntime
+    from .runtime import ServerRuntime, SessionState
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
+
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationPresentation:
@@ -261,7 +265,9 @@ class ServeControl:
             or loop.tool_registry.background_tasks.exit_delivery_pending
         )
 
-    def _turn_done(self, _task: asyncio.Task[None]) -> None:
+    def _turn_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("serve turn task failed", exc_info=exc)
         self._maybe_idle()
 
     def _maybe_idle(self) -> None:
@@ -903,12 +909,7 @@ class ServeControl:
                 terminal_error = None
                 agent_end = None
             self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-            )
+            outcome = await self._finalize_turn(session_id, state, turn_id, outcome)
         if terminal_error is not None:
             await self._notify(
                 event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
@@ -924,6 +925,33 @@ class ServeControl:
             await self.deliveries.continue_after_turn(
                 session_id, state, allow_assistant_reset=allow_assistant_reset
             )
+
+    async def _finalize_turn(
+        self,
+        session_id: str,
+        state: SessionState,
+        turn_id: str,
+        outcome: TurnOutcome,
+    ) -> TurnOutcome:
+        """Finalize the turn; if that raises, end it as failed so the client
+        still gets an error, turn_end, and agent_end, and no steer stays queued."""
+        try:
+            await self.deliveries.finalize_turn(session_id, state, turn_id, outcome)
+        except Exception as exc:  # a raise here would wedge the session
+            logger.exception(
+                "serve turn finalization failed: session=%s turn=%s",
+                session_id,
+                turn_id,
+            )
+            await self.deliveries.fail_finalize(session_id, state)
+            await self._notify(
+                event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+                session_id,
+                error={"code": "server_error", "message": str(exc)},
+                data={},
+            )
+            return TurnOutcome.FAILED
+        return outcome
 
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
@@ -1025,12 +1053,7 @@ class ServeControl:
             self._wake_admitted = False
             if started:
                 self._close_deferred_replay(session_id)
-                await self.deliveries.finalize_turn(
-                    session_id,
-                    state,
-                    turn_id,
-                    outcome,
-                )
+                outcome = await self._finalize_turn(session_id, state, turn_id, outcome)
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
         if agent_end is not None:
@@ -1092,12 +1115,7 @@ class ServeControl:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
             self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
-            )
+            outcome = await self._finalize_turn(session_id, state, turn_id, outcome)
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
