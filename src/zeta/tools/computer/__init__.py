@@ -19,7 +19,7 @@ from ...media.image_normalization import normalize_image_bytes
 from ...protocol.types import StructuredToolResult
 from .._results import _error_result, text_block
 from ..registry import ToolRegistry
-from .backend import ComputerBackend
+from .backend import ComputerBackend, ComputerError
 from .scaling import (
     OutOfBounds,
     ScreenGeometry,
@@ -55,6 +55,12 @@ _ACTIONS = (
     "scroll",
     "cursor_position",
 )
+# backend error code -> human reason for the per-action failure message.
+_REFUSAL_REASON: dict[str, str] = {
+    "locked": "the screen is locked",
+    "secure_input": "a password field or secure input is active",
+    "killed": "the kill switch is engaged; restart the helper to re-enable control",
+}
 
 
 class _BadAction(ValueError):
@@ -188,7 +194,17 @@ async def _dispatch(
         await backend.scroll(x, y, unit_x * amount, unit_y * amount)
     else:  # defensive: the schema enum already rejects unknown actions
         raise _BadAction(f"unknown action {action!r}")
-    return await _screenshot(registry, backend, None)
+    try:
+        return await _screenshot(registry, backend, None)
+    except ComputerError as exc:
+        reason = _REFUSAL_REASON.get(exc.code, f"{exc.code}: {exc.message}")
+    except ValueError as exc:
+        reason = str(exc)
+    return {
+        "content": [text_block(f"{action} done; screenshot failed: {reason}")],
+        "isError": False,
+        "structuredContent": {},
+    }
 
 
 async def _computer(
@@ -199,12 +215,16 @@ async def _computer(
         return _error_result(
             "no computer backend is available on this machine", kind="error"
         )
+    action = arguments.get("action", "action")
     try:
         return await _dispatch(registry, backend, arguments["action"], arguments)
     except _BadAction as exc:
         return _error_result(str(exc), kind="invalid_arguments")
+    except ComputerError as exc:
+        reason = _REFUSAL_REASON.get(exc.code, exc.message)
+        return _error_result(f"{action} failed: {reason}", kind="error")
     except ValueError as exc:
-        return _error_result(f"screenshot failed: {exc}", kind="error")
+        return _error_result(f"{action} failed: {exc}", kind="error")
 
 
 def register(registry: ToolRegistry) -> None:

@@ -17,6 +17,7 @@ from zeta.providers.anthropic import build_messages_payload
 from zeta.providers.codex import build_responses_payload
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools.computer.backend import ComputerError
 from zeta.tools.computer.fake import FakeBackend
 
 
@@ -96,6 +97,35 @@ async def test_screen_changing_actions_record_op_and_return_screenshot(
         assert result["content"][-1]["type"] == "image", arguments
         assert expected in backend.actions, arguments
         assert backend.actions[-1] == ("screenshot", None), arguments
+
+
+@pytest.mark.asyncio
+async def test_action_done_is_not_error_when_followup_screenshot_fails(
+    tmp_path: Path,
+) -> None:
+    class ScreenshotFailureBackend(FakeBackend):
+        async def screenshot(self, display: int | None = None):
+            if self.actions and self.actions[-1][0] == "click":
+                raise ComputerError("not_permitted", "screen recording denied")
+            return await super().screenshot(display)
+
+    backend = ScreenshotFailureBackend()
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        result = await registry.execute(
+            ToolCall(
+                "c",
+                "computer",
+                {"action": "left_click", "coordinate": [10, 20]},
+            )
+        )
+
+    assert result["isError"] is False
+    text = result["content"][0]["text"]
+    assert "left_click done" in text
+    assert "screenshot failed" in text
+    assert "screen recording denied" in text
+    assert ("click", 10, 20, "left", 1) in backend.actions
 
 
 @pytest.mark.asyncio

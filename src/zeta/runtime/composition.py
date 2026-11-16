@@ -294,6 +294,16 @@ def compose_runtime(
         if project_registry is None:
             registry.unregister("project")
             registry.unregister("inbox")
+        if config.computer_enabled:
+            from ..tools.computer.mac import make_mac_backend
+
+            computer_backend = make_mac_backend()
+            if computer_backend is not None:
+                registry.computer_backend = computer_backend
+                async def close_computer_backend() -> None:
+                    await asyncio.to_thread(computer_backend.close)
+
+                registry.add_cleanup(close_computer_backend)
         if attention_fork is not None:
             from ..tools.resolve_attention import register_fork
 
