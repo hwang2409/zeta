@@ -643,7 +643,13 @@ class CheckpointTranscriptMixin:
             self._history_source,
             self.loop.store.active_branch_head_id(),
         )
-        await self._load_transcript_page(reset=True)
+        # A finder search typed during startup may have revealed the place the
+        # user moved to: the first page must not replace it.
+        if not (
+            self._startup_replay_active
+            and self._agent_navigation.transcript_control.history_pager.descriptors
+        ):
+            await self._load_transcript_page(reset=True)
         if self._exit_requested:
             return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:

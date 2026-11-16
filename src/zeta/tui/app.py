@@ -795,14 +795,15 @@ class TUIApp(
         return tuple(descriptor.key for descriptor in pager.descriptors)
 
     def _finder_open(self) -> None:
-        transcript = self._transcript
+        transcript = self._viewed_transcript()
         if transcript.search_active:
             # A new search replaces the accepted one and its match keys.
             self._end_history_search()
+        # The view the finder opened on, root or child: Esc and a query whose
+        # search finds nothing return to it.
         self._finder_return = (
             None
             if getattr(self, "_agent_navigation", None) is None
-            or self._agent_navigation.child_view_active
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -824,15 +825,16 @@ class TUIApp(
             asyncio.create_task(self._return_to_view(saved[0], saved[1]))
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
+        transcript = self._viewed_transcript()
         if follow_tail or anchor is None:
             await self._load_transcript_page(reset=True)
-            self._transcript.scroll_to_bottom()
+            transcript.scroll_to_bottom()
         else:
             pager = self._agent_navigation.transcript_control.history_pager
             if not (await pager.reveal(anchor[0])).segments:
                 return
             self._render_active_resident_history()
-            self._transcript.restore_durable_scroll_anchor(anchor)
+            transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
 
     def _publish_history_search_target(

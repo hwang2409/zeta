@@ -202,16 +202,22 @@ class Driver:
     pipe: object
 
     def rows(self) -> list[str]:
-        """Rows the renderer last drew for the root transcript window."""
+        """Rows the renderer last drew for the viewed transcript window."""
 
         screen = self.session.app.renderer._last_screen
         if screen is None:
             return []
+        navigation = self.app._agent_navigation
+        control = (
+            navigation.transcript_control
+            if navigation.child_view_active
+            else self.app._transcript
+        )
         position = next(
             (
                 position
                 for window, position in screen.visible_windows_to_write_positions.items()
-                if window.content is self.app._transcript
+                if window.content is control
             ),
             None,
         )
@@ -1023,6 +1029,132 @@ async def test_esc_while_a_picker_loads_stops_it(
         )
 
 
+@pytest.mark.asyncio
+async def test_a_panel_behind_a_running_slash_command_owns_its_keys(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /compact holds the slash lock; /tasks only shows information, so it opens
+    # from its Enter and the keys after it never wait in the composer as a prompt.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+
+    async def held_compact(_app: TUIApp) -> str:
+        await await_or_fail(gate.wait(), what="compact gate")
+        return "compact: nothing to compact"
+
+    monkeypatch.setattr(TUIApp, "slash_compact", held_compact)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /compact")
+        try:
+            await driver.send("/compact" + ENTER)
+            await driver.until(
+                lambda: app.slash_lock.holder is not None, what="/compact did not start"
+            )
+            await driver.send("/tasks" + ENTER + "zz" + ENTER)
+            await driver.until(
+                lambda: _window_drawn(driver, app._tasks_panel_window),
+                what="/tasks waited for /compact",
+            )
+        finally:
+            gate.set()
+        await driver.until(lambda: app.slash_lock.holder is None, what="/compact did not end")
+        await driver.settle("settled screen after /compact")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert not sent and driver.session.default_buffer.text == "", (
+            f"keys typed for the panel were sent {sent} or left in the composer"
+            f" {driver.session.default_buffer.text!r}"
+        )
+        assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
+
+
+@pytest.mark.asyncio
+async def test_a_second_picker_command_replaces_the_one_still_loading(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    gate = asyncio.Event()
+    async with running_tui(copy) as driver:
+        app = driver.app
+        _fake_accounts(app, monkeypatch)
+        listed = app.loop.account_context.list_snapshot
+
+        async def held_list() -> AccountListSnapshot:
+            await await_or_fail(gate.wait(), what="accounts gate")
+            return await listed()
+
+        monkeypatch.setattr(app.loop.account_context, "list_snapshot", held_list)
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /accounts")
+        try:
+            await driver.send("/accounts" + ENTER + "/accounts" + ENTER)
+            await driver.until(
+                lambda: "accounts · loading…" in driver.screen(), what="/accounts opened nothing"
+            )
+            await driver.settle("both commands taken")
+            assert driver.screen().count("accounts · loading…") == 1, (
+                f"two loads for one picker; screen:\n{driver.screen()}"
+            )
+            await driver.send(ESCAPE)
+            await driver.until(lambda: not app._picker_active, what="Esc did not stop the load")
+        finally:
+            gate.set()
+        await driver.settle("settled screen after the loads would have ended")
+        assert not app._picker_active and not _picker_card_drawn(driver), (
+            f"a picker opened after Esc; screen:\n{driver.screen()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_esc_while_remote_attaches_lets_the_attach_finish(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One remote session: /remote attaches without a picker. Esc then must not
+    # cancel the attach halfway and leave the client attached with no view.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    row = RemoteSession("lab", "a1", "alpha", None)
+    started, gate = asyncio.Event(), asyncio.Event()
+    attached: list[str] = []
+
+    async def discover(_client: object, _hosts: object = None) -> tuple:
+        return (row,), ()
+
+    async def attach(_client: object, _host: str, session: RemoteSession) -> None:
+        started.set()
+        await await_or_fail(gate.wait(), what="attach gate")
+        attached.append(session.session_id)
+
+    async def next_event(_client: object) -> str:
+        await asyncio.Event().wait()
+        return ""
+
+    monkeypatch.setattr(RemoteSessionClient, "discover", discover)
+    monkeypatch.setattr(RemoteSessionClient, "attach", attach)
+    monkeypatch.setattr(RemoteSessionClient, "next_event", next_event)
+    async with running_tui(copy) as driver:
+        app = driver.app
+        await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.settle("settled screen before /remote")
+        try:
+            await driver.send("/remote" + ENTER)
+            await await_or_fail(started.wait(), what="/remote did not attach")
+            await driver.send(ESCAPE)
+            await driver.settle("Esc taken during the attach")
+        finally:
+            gate.set()
+        await driver.until(lambda: not app._picker_active, what="the attach did not end")
+        await driver.settle("settled screen after the attach")
+        assert attached == ["a1"] and app._remote_view is not None, (
+            f"Esc cut the attach: attached={attached}, view={app._remote_view}"
+        )
+        await app.slash_detach("")
+
+
 def _assert_pages_adjacent(driver: Driver, what: str) -> None:
     """Resident pages touch, come in seq order, and no page or row shows twice."""
 
@@ -1444,16 +1576,57 @@ async def test_ctrl_f_after_an_accepted_match_opens_a_new_search(
         )
 
 
+async def _home_with_a_child(root_home: RootHome, tmp_path: Path) -> RootHome:
+    """A copy of the home whose root session has one running child: the same history."""
+
+    home = tmp_path / "home"
+    await asyncio.to_thread(shutil.copytree, root_home.home, home)
+    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
+    child = copy.root / copy.session_id / "agents" / "1"
+    child.mkdir(parents=True)
+    log = (copy.root / copy.session_id / "conversation.jsonl").read_text().splitlines()
+    header = json.loads(log[0])
+    header["data"]["session_id"] = "1"
+    (child / "conversation.jsonl").write_text("\n".join([json.dumps(header), *log[1:]]) + "\n")
+    (child / "agent_lifecycle.json").write_text(
+        json.dumps({"agent_type": "worker", "description": "child", "depth": 1, "state": "running"})
+    )
+    return copy
+
+
+async def _enter_the_child(driver: Driver) -> None:
+    navigation = driver.app._agent_navigation
+    await driver.until(lambda: bool(navigation.entries), what="no child in the agent list")
+    await driver.until(driver.app.composer_can_focus_agent_list, what="agent list not reachable")
+    await driver.send("\x1b[B")
+    await driver.until(navigation.list_focused, what="Down did not focus the agent list")
+    while navigation.entries[navigation.selected_index].path.name != "1":
+        before = navigation.selected_index
+        await driver.send("\x1b[B")
+        await driver.until(lambda: navigation.selected_index != before, what="no next row")
+    await driver.send(ENTER)
+    await driver.until(
+        lambda: navigation.child_view_active and _answer(TURNS - 1) in driver.screen(),
+        what="the child view did not show its newest answer",
+        seconds=90,
+    )
+    await navigation.wait_for_publication()
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["root", "child"])
 @pytest.mark.parametrize("last_key", ["a", BACKSPACE], ids=["miss", "cleared"])
 async def test_finder_typed_one_key_per_frame_searches_the_view_it_opened_on(
-    root_home: RootHome, last_key: str
+    root_home: RootHome, tmp_path: Path, last_key: str, view: str
 ) -> None:
     # "q" alone matches only turn 3's quokka, far behind the tail, so its search
     # replaces the pages. The next key must not leave the finder ranking those
     # pages: "qa" fuzzy-matches quokka but no text holds "qa", and a burst of the
     # same keys finds nothing.
-    async with running_tui(root_home) as driver:
+    home = root_home if view == "root" else await _home_with_a_child(root_home, tmp_path)
+    async with running_tui(home) as driver:
+        if view == "child":
+            await _enter_the_child(driver)
         await driver.settle("settled tail before the finder")
         pager = driver.app._agent_navigation.transcript_control.history_pager
         tail_pages, tail = _resident(pager), driver.rows()
