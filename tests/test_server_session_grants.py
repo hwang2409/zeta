@@ -337,13 +337,13 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
 
         if transport == "unix":
             output = StringIO()
-            assert server._runtime_for_test.loop is not None
+            assert server.controllers.attached().runtime.loop is not None
             app = TUIApp(
-                server._runtime_for_test.loop,
+                server.controllers.attached().runtime.loop,
                 provider="codex",
                 model="offline",
                 zeta_home=tmp_path,
-                approval_policy=server._runtime_for_test.policy,
+                approval_policy=server.controllers.attached().runtime.policy,
                 console=Console(file=output, width=160, force_terminal=False),
             )
             await app._handle_prompt_value("/permissions")
@@ -446,7 +446,7 @@ async def test_session_grant_flow_over_authenticated_websocket(
 
     setup_started = asyncio.Event()
     release_setup = asyncio.Event()
-    original_run_setup = server._runtime_for_test._run_setup
+    original_run_setup = server.controllers.attached().runtime._run_setup
 
     async def gated_run_setup(*args: Any, **kwargs: Any):
         setup_started.set()
@@ -456,7 +456,7 @@ async def test_session_grant_flow_over_authenticated_websocket(
         return await original_run_setup(*args, **kwargs)
 
     # test-contract: seam no public setup gate exposes request/setup ordering
-    monkeypatch.setattr(server._runtime_for_test, "_run_setup", gated_run_setup)
+    monkeypatch.setattr(server.controllers.attached().runtime, "_run_setup", gated_run_setup)
     create_task: asyncio.Task[list[dict[str, Any]]] | None = None
     try:
         hello = (
@@ -576,7 +576,7 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
 
     try:
         await asyncio.wait_for(_hello_and_create(reader, writer), TIMEOUT)
-        server._runtime_for_test.policy.always_ask = ("bash",)
+        server.controllers.attached().runtime.policy.always_ask = ("bash",)
         observer_reader, observer_writer, status, _headers = await asyncio.wait_for(
             _connect_websocket(
                 server, token=None, protocol_token=server._websocket.token
@@ -634,7 +634,7 @@ async def test_revoking_grant_leaves_matching_pending_approval_unchanged(
         assert [item["request_id"] for item in status_result["pending_approvals"]] == [
             "call-2"
         ]
-        assert server._runtime_for_test.opened.store.approval_resolution_now("call-2") is None
+        assert server.controllers.attached().runtime.opened.store.approval_resolution_now("call-2") is None
 
         observer_denied = await observer_request(
             11,
@@ -1026,9 +1026,9 @@ async def test_session_grant_exactness_noops_feature_gate_and_fifo_sentinels(
     reader, writer = await _connect(server)
     try:
         await _hello_and_create(reader, writer)
-        assert server._runtime_for_test.policy is not None
-        rule = server._runtime_for_test.policy.remember_allow(
-            server._runtime_for_test.policy.request_from_store(
+        assert server.controllers.attached().runtime.policy is not None
+        rule = server.controllers.attached().runtime.policy.remember_allow(
+            server.controllers.attached().runtime.policy.request_from_store(
                 "manual", ToolCall("manual", "bash", {"command": "printf exact"})
             )
         )
@@ -1351,7 +1351,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
         await _wait_idle(reader, writer, 30)
 
         publication_attempted = asyncio.Event()
-        original_admit = server._control_for_test._approvals._admit
+        original_admit = server.controllers.attached().control._approvals._admit
 
         def observe_publication(event, session_id, **fields):
             result = original_admit(event, session_id, **fields)
@@ -1363,7 +1363,7 @@ async def test_parent_grant_and_revoke_control_future_delegated_child_calls(
                 publication_attempted.set()
             return result
 
-        server._control_for_test._approvals._admit = observe_publication
+        server.controllers.attached().control._approvals._admit = observe_publication
         await await_or_fail(
             backend.child_one_ready.wait(), what="child 1 post-revoke ordering gate"
         )
@@ -1483,8 +1483,8 @@ async def test_duplicate_grant_emits_no_event_before_positive_fifo_sentinel(
             reader, writer, 4, first["request_id"], "always_tool", ["bash"]
         )
         await _frames_until_event(reader, "turn_end")
-        assert server._runtime_for_test.opened is not None
-        server._runtime_for_test.opened.store.append_approval_request("call-2", calls[1])
+        assert server.controllers.attached().runtime.opened is not None
+        server.controllers.attached().runtime.opened.store.append_approval_request("call-2", calls[1])
         await _request(
             reader,
             writer,
@@ -1633,7 +1633,7 @@ async def test_abort_canceled_settlement_keeps_controller_connected(
         gate_enabled = True
         abort = asyncio.create_task(_request(reader, writer, 4, "abort"))
         await await_or_fail(entered.wait(), what="abort settlement gate")
-        record = server._control_for_test._approvals.state.records[approval["request_id"]]
+        record = server.controllers.attached().control._approvals.state.records[approval["request_id"]]
         assert record.settlement is not None
         record.settlement.cancel()
         release.set()
@@ -1720,7 +1720,7 @@ async def test_turn_end_send_ready_orders(
     release_notification_start = asyncio.Event()
     notification_run_started = asyncio.Event()
     release_notification_run = asyncio.Event()
-    original_event = server._control_for_test._event
+    original_event = server.controllers.attached().control._event
     original_run_notification_turn = server.turn_contexts.run_notification_turn
 
     async def gated_notification_turn(
@@ -1756,7 +1756,7 @@ async def test_turn_end_send_ready_orders(
             await await_or_fail(release_turn_end.wait(), what="turn_end owner")
 
     # test-contract: seam gate the real notification wake before turn_start publication
-    monkeypatch.setattr(server._control_for_test, "_event", gated_event)
+    monkeypatch.setattr(server.controllers.attached().control, "_event", gated_event)
     monkeypatch.setattr(
         server.turn_contexts, "run_notification_turn", gated_notification_turn
     )
@@ -1769,8 +1769,8 @@ async def test_turn_end_send_ready_orders(
         await request(3, "send", {"text": "first"})
         await event("turn_start")
         await await_or_fail(turn_end_published.wait(), what="turn_end publication")
-        assert server._runtime_for_test.loop.step_delivery is not None
-        await server._runtime_for_test.loop.step_delivery.produce(
+        assert server.controllers.attached().runtime.loop.step_delivery is not None
+        await server.controllers.attached().runtime.loop.step_delivery.produce(
             pending_delivery_module.NotificationInput(
                 "child_completion",
                 {
@@ -1784,7 +1784,7 @@ async def test_turn_end_send_ready_orders(
             )
         )
         if order == "send_first":
-            owner_task = server._control_for_test._turn_handoff_task
+            owner_task = server.controllers.attached().control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
             await await_or_fail(
@@ -1808,7 +1808,7 @@ async def test_turn_end_send_ready_orders(
             )
             status_frames = await request(4, "status", {})
             assert status_frames[-1]["result"]["state"] == "running"
-            owner_task = server._control_for_test._turn_handoff_task
+            owner_task = server.controllers.attached().control._turn_handoff_task
             assert owner_task is not None
             release_turn_end.set()
             release_notification_run.set()
@@ -1827,7 +1827,7 @@ async def test_turn_end_send_ready_orders(
             await await_or_fail(owner_task, what="notification turn return")
         await event("turn_end")
         assert turn_starts == turn_ends
-        assert session_id == server._runtime_for_test.session_id
+        assert session_id == server.controllers.attached().runtime.session_id
     finally:
         release_turn_end.set()
         release_notification_run.set()
@@ -2051,7 +2051,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
     try:
         _, session_id = await hello_create()
         runtime_end_entered = asyncio.Event()
-        original_end_approval = server._control_for_test._approvals._end_approval
+        original_end_approval = server.controllers.attached().control._approvals._end_approval
 
         async def end_approval_recording(key: object, *args: object, **kwargs: object):
             if key == "call-1":
@@ -2060,7 +2060,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
 
         # test-contract: seam mark the runtime TOOL_APPROVAL_END reaching serve
         monkeypatch.setattr(
-            server._control_for_test._approvals, "_end_approval", end_approval_recording
+            server.controllers.attached().control._approvals, "_end_approval", end_approval_recording
         )
 
         original_persist_durably = approval_settlement.persist_durably
@@ -2094,8 +2094,8 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             # Another writer decides the request; the bare runtime route (no serve
             # settlement) must still publish exactly one approval_end through the
             # one owner and leave no record.
-            assert server._runtime_for_test.opened is not None
-            await server._runtime_for_test.opened.store.resolve_approval_async("call-1", "allow")
+            assert server.controllers.attached().runtime.opened is not None
+            await server.controllers.attached().runtime.opened.store.resolve_approval_async("call-1", "allow")
             await frames_until("turn_end")
             approval_ends = [
                 frame
@@ -2113,17 +2113,17 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert duplicate["error"]["code"] == -32006, duplicate
             snapshot = (await request(5, "session_grants", {}))[-1]
             assert snapshot["result"]["session_grants"] == []
-            assert not server._control_for_test._approvals.state.records
+            assert not server.controllers.attached().control._approvals.state.records
             return
         if case == "store_decision_duplicate":
             # Another writer decides call-1; while the bare runtime publication is
             # mid-flight (record reserved to settling), a duplicate approve must
             # not start a second settlement. Deleting the pending->settling reserve
             # in _settlement_for_end lets the approve re-reserve the pending record.
-            assert server._runtime_for_test.opened is not None
+            assert server.controllers.attached().runtime.opened is not None
             entered = asyncio.Event()
             release = asyncio.Event()
-            original_finish_record = server._control_for_test._approvals._finish_record
+            original_finish_record = server.controllers.attached().control._approvals._finish_record
 
             async def gated_bare_finish(
                 record: Any, resolution: dict[str, str], row: Any = None
@@ -2136,9 +2136,9 @@ async def test_session_grant_lifecycle_table_over_real_transports(
 
             # test-contract: seam gate the bare one-owner publication mid-flight
             monkeypatch.setattr(
-                server._control_for_test._approvals, "_finish_record", gated_bare_finish
+                server.controllers.attached().control._approvals, "_finish_record", gated_bare_finish
             )
-            await server._runtime_for_test.opened.store.resolve_approval_async("call-1", "allow")
+            await server.controllers.attached().runtime.opened.store.resolve_approval_async("call-1", "allow")
             await await_or_fail(entered.wait(), what="bare publication gate")
             duplicate = (
                 await request(4, "approve", {"request_id": "call-1"})
@@ -2155,12 +2155,12 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert len(approval_ends) == 1, approval_ends
             durable_ends = [
                 entry
-                for entry in branch_entries(server._runtime_for_test.opened.store)
+                for entry in branch_entries(server.controllers.attached().runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]
             assert len(durable_ends) == 1, durable_ends
-            assert not server._control_for_test._approvals.state.records
+            assert not server.controllers.attached().control._approvals.state.records
             return
         if case == "abort_during_finish":
             # Cancel the pump at its new wait on the settlement: the one owner must
@@ -2228,7 +2228,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 and frame.get("params", {}).get("data", {}).get("change") == "grant"
             ]
             assert len(grant_events) == 1, grant_events
-            assert not server._control_for_test._approvals.state.records
+            assert not server.controllers.attached().control._approvals.state.records
             status = (await request(6, "status", {}))[-1]
             assert status["result"]["state"] == "idle"
             return
@@ -2265,7 +2265,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     await writer.drain()
                 else:
                     await _send_json(writer, replacement_request)
-            record = server._control_for_test._approvals.state.records["call-1"]
+            record = server.controllers.attached().control._approvals.state.records["call-1"]
             assert record.settlement is not None
             record.settlement.cancel()
             release.set()
@@ -2292,7 +2292,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             assert approval_ends[0]["reason"] == "turn_canceled"
             status = (await request(6, "status", {}))[-1]
             assert status["result"]["state"] in {"idle", "running"}
-            assert not server._control_for_test._approvals.state.records
+            assert not server.controllers.attached().control._approvals.state.records
             return
         cancel = case.startswith("cancel_")
         if case == "deny":
@@ -2351,7 +2351,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         # test-contract: capture the settlement owner here, assert it
                         # on the test task (raising in a server task would hang)
                         gate_owner = asyncio.current_task()
-                        gate_settlement = server._control_for_test._approvals.state.records[
+                        gate_settlement = server.controllers.attached().control._approvals.state.records[
                             "call-1"
                         ].settlement
                         # test-contract: cancel before the real durable operation begins
@@ -2371,7 +2371,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 ) -> tuple[bool, bool, bool]:
                     nonlocal gate_owner, gate_settlement
                     gate_owner = asyncio.current_task()
-                    gate_settlement = server._control_for_test._approvals.state.records[
+                    gate_settlement = server.controllers.attached().control._approvals.state.records[
                         "call-1"
                     ].settlement
                     entered.set()
@@ -2413,7 +2413,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         publish_entered.wait(), what="grant publish entered"
                     )
                     gate_owner = asyncio.current_task()
-                    gate_settlement = server._control_for_test._approvals.state.records[
+                    gate_settlement = server.controllers.attached().control._approvals.state.records[
                         "call-1"
                     ].settlement
                     entered.set()
@@ -2442,7 +2442,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 ) -> object:
                     nonlocal gate_owner, gate_settlement
                     gate_owner = asyncio.current_task()
-                    gate_settlement = server._control_for_test._approvals.state.records[
+                    gate_settlement = server.controllers.attached().control._approvals.state.records[
                         "call-1"
                     ].settlement
                     entered.set()
@@ -2510,8 +2510,8 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 )
 
             if case == "cancel_history":
-                record = server._control_for_test._approvals.state.records["call-1"]
-                server._control_for_test._approvals._change(
+                record = server.controllers.attached().control._approvals.state.records["call-1"]
+                server.controllers.attached().control._approvals._change(
                     record,
                     target=replace(record.target, history_store=record.target.store),
                     history_published=True,
@@ -2545,10 +2545,10 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         runtime_end_entered.wait(),
                         what="runtime approval_end during finish",
                     )
-                record = server._control_for_test._approvals.state.records.get("call-1")
+                record = server.controllers.attached().control._approvals.state.records.get("call-1")
                 if record is not None:
                     settlement = record.settlement
-                original_turn = server._control_for_test._turn_task
+                original_turn = server.controllers.attached().control._turn_task
                 assert original_turn is not None
                 assert gate_owner is not None
                 assert not gate_owner.done()
@@ -2568,7 +2568,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         asyncio.gather(original_turn, return_exceptions=True),
                         what=f"{case} original turn task",
                     )
-                    assert not server._control_for_test._approvals.state.records
+                    assert not server.controllers.attached().control._approvals.state.records
                     if transport == "unix":
                         reader, writer = await asyncio.open_unix_connection(
                             str(server.socket_path)
@@ -2614,7 +2614,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                         "cancel_write must publish no grant-change event to a dead "
                         f"peer; observed {changed!r}"
                     )
-                    assert not server._control_for_test._approvals.state.records
+                    assert not server.controllers.attached().control._approvals.state.records
                     assert_end_before_tool_start()
                     return
                 assert approve is not None
@@ -2643,8 +2643,8 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 snapshot_frames = await request(11, "session_grants", {})
                 all_frames.extend(snapshot_frames)
                 assert snapshot_frames[-1]["result"]["session_grants"] == ["bash"]
-                assert server._runtime_for_test.opened is not None
-                resolution = server._runtime_for_test.opened.store.approval_resolution_now(
+                assert server.controllers.attached().runtime.opened is not None
+                resolution = server.controllers.attached().runtime.opened.store.approval_resolution_now(
                     "call-1"
                 )
                 assert resolution is not None
@@ -2679,7 +2679,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                     )
                 elif case == "fail_approval_end_publish":
                     assert responses[0]["result"]["decision"] == "approve"
-                assert not server._control_for_test._approvals.state.records
+                assert not server.controllers.attached().control._approvals.state.records
                 assert_end_before_tool_start()
                 return
             else:
@@ -2690,10 +2690,10 @@ async def test_session_grant_lifecycle_table_over_real_transports(
 
             if cancel:
                 if case == "cancel_history":
-                    assert server._runtime_for_test.opened is not None
+                    assert server.controllers.attached().runtime.opened is not None
                     history = [
                         entry.data
-                        for entry in branch_entries(server._runtime_for_test.opened.store)
+                        for entry in branch_entries(server.controllers.attached().runtime.opened.store)
                         if entry.type == "approval_history"
                     ]
                     assert [row["event"] for row in history] == ["approval_end"]
@@ -2748,7 +2748,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 assert len(changed) == 1, (
                     f"{case} must publish exactly one grant-change event; observed {changed!r}"
                 )
-                assert not server._control_for_test._approvals.state.records, (
+                assert not server.controllers.attached().control._approvals.state.records, (
                     f"{case} left an approval record after grant settlement"
                 )
                 assert_end_before_tool_start()
@@ -2761,11 +2761,11 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 assert len(grant_events) == (0 if case == "deny" else 1)
                 if case == "duplicate":
                     buffered().clear()
-                    assert server._runtime_for_test.opened is not None
+                    assert server.controllers.attached().runtime.opened is not None
                     duplicate_call = ToolCall(
                         "call-2", "bash", {"command": "true"}
                     )
-                    server._runtime_for_test.opened.store.append_approval_request(
+                    server.controllers.attached().runtime.opened.store.append_approval_request(
                         "call-2", duplicate_call
                     )
                     before = (await request(5, "session_grants", {}))[-1]
@@ -2853,7 +2853,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 await frames_until("turn_end")
             else:
                 await frames_until("turn_end")
-            assert not server._control_for_test._approvals.state.records
+            assert not server.controllers.attached().control._approvals.state.records
             if case == "deny":
                 # A denied call still runs to a tool_end; its approval_end must
                 # precede both tool_end and turn_end on the wire (moved here from
@@ -2870,10 +2870,10 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             # before_finish seam forced it ahead of publication, the scenario the
             # deleted external_end row covered): the one owner must write exactly
             # one durable end and emit exactly one approval_end on the wire.
-            assert server._runtime_for_test.opened is not None
+            assert server.controllers.attached().runtime.opened is not None
             durable_ends = [
                 entry
-                for entry in branch_entries(server._runtime_for_test.opened.store)
+                for entry in branch_entries(server.controllers.attached().runtime.opened.store)
                 if entry.type == "approval_resolution"
                 and entry.data.get("request_id") == "call-1"
             ]
@@ -2899,4 +2899,4 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             writer,
             *([replacement_writer] if replacement_writer is not None else []),
         )
-        assert not server._control_for_test._approvals._settlement_tasks
+        assert not server.controllers.attached().control._approvals._settlement_tasks

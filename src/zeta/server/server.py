@@ -326,14 +326,6 @@ class ZetaServer:
         self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections, self.controllers)
 
-    @property
-    def _control_for_test(self) -> ServeControl:
-        return self.controllers.attached().control
-
-    @property
-    def _runtime_for_test(self) -> ServerRuntime:
-        return self.controllers.attached().runtime
-
     def controls(self) -> Iterator[ServeControl]:
         """The attached pair, then every parked pair."""
         yield self.controllers.attached().control

@@ -66,9 +66,9 @@ async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) 
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        opened = server._runtime_for_test.opened
+        opened = server.controllers.attached().runtime.opened
         assert opened is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project_id = await asyncio.to_thread(registry.create_project, "broken", "test")
         record = await _seed_attention_record(
@@ -104,9 +104,9 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
-        opened = server._runtime_for_test.opened
+        opened = server.controllers.attached().runtime.opened
         assert opened is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project_id = (
             await asyncio.to_thread(registry.create_project, "serve attention", "test")
@@ -265,7 +265,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
                     sealer.reply(sealed.id, "yes", session_id)
             return real_dismiss(replies, attention_id)
 
-        loop = server._runtime_for_test.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
         loop.tool_registry.project_id = project_id
         seeded = await asyncio.to_thread(
@@ -337,9 +337,9 @@ async def test_serve_batch_sends_good_items_and_refuses_broken_one(
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     reader, writer, session_id = await _ready_extensions(server)
     try:
-        opened = server._runtime_for_test.opened
+        opened = server.controllers.attached().runtime.opened
         assert opened is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project_id = (
             await asyncio.to_thread(registry.create_project, "serve attention", "test")
@@ -396,9 +396,9 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
-        opened = server._runtime_for_test.opened
+        opened = server.controllers.attached().runtime.opened
         assert opened is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project_id = (
             await asyncio.to_thread(registry.create_project, "invalid batch", "test")
@@ -408,7 +408,7 @@ async def test_serve_invalid_batch_does_not_recover_older_sealed_journal(
         invalid = await _seed_attention_record(store, session_id, project_id, "invalid")
         _leave_sealed_reply(tmp_path / "home", session_id, sealed.id, monkeypatch)
 
-        loop = server._runtime_for_test.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
         payload = json.dumps([{"id": invalid.id, "reply": "   "}])
         error = (
@@ -438,9 +438,9 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
-        opened = server._runtime_for_test.opened
+        opened = server.controllers.attached().runtime.opened
         assert opened is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project_id = (
             await asyncio.to_thread(registry.create_project, "operation error", "test")
@@ -457,7 +457,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
                 raise RuntimeError("unexpected operation failure")
             return real_record(replies, attention_id)
 
-        loop = server._runtime_for_test.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
         loop.tool_registry.project_id = project_id
         seeded = await asyncio.to_thread(
@@ -505,10 +505,10 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
     worker_done = threading.Event()
     watcher = None
     try:
-        opened = server._runtime_for_test.opened
-        loop = server._runtime_for_test.loop
+        opened = server.controllers.attached().runtime.opened
+        loop = server.controllers.attached().runtime.loop
         assert opened is not None and loop is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         project_id = (
             await asyncio.to_thread(registry.create_project, "cancel serve", "test")
         ).project_id
@@ -533,7 +533,7 @@ async def test_cancelled_serve_adapter_still_checks_late_publication(
         # test-contract: seam hold the real serve worker before durable publication
         monkeypatch.setattr(ProjectInbox, "send", blocked_send)
         watcher = _start_publication_watcher(loop, turn_active=True)
-        adapter = ServerSlashSession(server._runtime_for_test)
+        adapter = ServerSlashSession(server.controllers.attached().runtime)
         replies = adapter._attention_replies(session_id)
         task = asyncio.create_task(
             adapter._run_attention_operation(
@@ -574,9 +574,9 @@ async def test_cross_process_style_send_uses_existing_two_second_poll(
     _reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
-        loop = server._runtime_for_test.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         project_id = (
             await asyncio.to_thread(registry.create_project, "poll send", "test")
         ).project_id

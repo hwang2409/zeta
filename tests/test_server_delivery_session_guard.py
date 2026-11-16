@@ -124,7 +124,7 @@ async def test_mismatched_session_id_delivers_nothing_before_delivery_id_lookup(
         if method == "steer":
             await _call(reader, writer, 3, "send", {"text": "start"})
             await await_or_fail(backend.started.wait(), what="turn start")
-        store = server._runtime_for_test.opened.store
+        store = server.controllers.attached().runtime.opened.store
         rows_before = [entry.id for entry in resident_entries(store)]
         mismatch = {
             "code": -32003,

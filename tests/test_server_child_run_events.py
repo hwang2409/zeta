@@ -104,9 +104,9 @@ async def test_child_run_events_returns_real_join_over_both_transports(
         session_id = created["result"]["session"]["session_id"]
         child = await asyncio.to_thread(
             ConversationStore,
-            server._runtime_for_test.opened.store.session_dir / "agents",
+            server.controllers.attached().runtime.opened.store.session_dir / "agents",
             session_id="1",
-            _storage_lease=server._runtime_for_test.opened.store._storage_lease,
+            _storage_lease=server.controllers.attached().runtime.opened.store._storage_lease,
         )
         child.start_agent_lifecycle(
             handle=f"{session_id}:1", started_at="2026-01-01T00:00:00+00:00",
@@ -168,9 +168,9 @@ async def test_late_unknown_child_join_activates_no_stream(
 
         child = await asyncio.to_thread(
             ConversationStore,
-            server._runtime_for_test.opened.store.session_dir / "agents",
+            server.controllers.attached().runtime.opened.store.session_dir / "agents",
             session_id="1",
-            _storage_lease=server._runtime_for_test.opened.store._storage_lease,
+            _storage_lease=server.controllers.attached().runtime.opened.store._storage_lease,
         )
         child.start_agent_lifecycle(
             handle=run_id,

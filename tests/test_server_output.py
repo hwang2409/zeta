@@ -355,7 +355,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     old_output_gate = asyncio.Event()
     rejected_released = asyncio.Event()
     old_frames_after_fence: list[dict[str, Any]] = []
-    original_release = server._control_for_test._controller_release
+    original_release = server.controllers.attached().control._controller_release
     original_registry_release = server.connections.release
     original_write = _Client._write_physical
     old_state: Any = None
@@ -394,7 +394,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
             rejected_released.set()
 
     # test-contract: seam hold the real semantic handoff past its production bound
-    monkeypatch.setattr(server._control_for_test, "_controller_release", gated_release)
+    monkeypatch.setattr(server.controllers.attached().control, "_controller_release", gated_release)
     # test-contract: seam observe the rejected controller slot release without polling
     monkeypatch.setattr(server.connections, "release", tracked_release)
     # test-contract: seam observe raw old-controller writes after the output fence
@@ -436,7 +436,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         old_publish = asyncio.create_task(
             server.connections.publish_controller(
                 EventDescriptor.ASSISTANT_DELTA,
-                server._runtime_for_test.session_id,
+                server.controllers.attached().runtime.session_id,
                 delta="old-controller",
             )
         )
@@ -485,7 +485,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         assert old_frames_after_fence == []
 
         release_gate.set()
-        release = server._control_for_test._controller_release_task
+        release = server.controllers.attached().control._controller_release_task
         assert release is not None
         await asyncio.wait_for(asyncio.shield(release), 10)
 
@@ -756,7 +756,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     original_write = _Client._write_physical
     original_release = server.connections.release
     original_enqueue = server.connections._enqueue
-    original_finalize = server._control_for_test.deliveries.finalize_turn
+    original_finalize = server.controllers.attached().control.deliveries.finalize_turn
 
     async def gated_write(client: _Client, payload: bytes) -> bool:
         frame = json.loads(payload)
@@ -792,7 +792,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     monkeypatch.setattr(server.connections, "release", release)
     # test-contract: seam identifies when the active turn publication is queued
     monkeypatch.setattr(server.connections, "_enqueue", observe_enqueue)
-    monkeypatch.setattr(server._control_for_test.deliveries, "finalize_turn", record_finalize)
+    monkeypatch.setattr(server.controllers.attached().control.deliveries, "finalize_turn", record_finalize)
     try:
         await _send_json(
             writer,
@@ -828,7 +828,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
             )
         )
         await asyncio.wait_for(head_started.wait(), TIMEOUT)
-        server._control_for_test.start_turn("finish despite output overload")
+        server.controllers.attached().control.start_turn("finish despite output overload")
         await asyncio.wait_for(turn_event_queued.wait(), TIMEOUT)
         trigger_started = asyncio.Event()
 
@@ -1381,8 +1381,8 @@ async def test_status_projects_foreign_turn_end_after_resident_append(
             {"provider": "codex"},
         )
         session_id = created["result"]["session"]["session_id"]
-        assert server._runtime_for_test.opened is not None
-        resident = server._runtime_for_test.opened.store
+        assert server.controllers.attached().runtime.opened is not None
+        resident = server.controllers.attached().runtime.opened.store
         foreign = await asyncio.to_thread(
             ConversationStore, resident.root_dir, session_id=session_id
         )

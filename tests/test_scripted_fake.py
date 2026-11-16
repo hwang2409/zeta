@@ -308,8 +308,8 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         ),
     )
     tool_ended = asyncio.Event()
-    notify = server._control_for_test._notify
-    resolve_approval = server._control_for_test.resolve_approval
+    notify = server.controllers.attached().control._notify
+    resolve_approval = server.controllers.attached().control.resolve_approval
 
     async def record_tool_end(
         event: str, session_id: str | None = None, **fields: object
@@ -326,8 +326,8 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         await asyncio.wait_for(tool_ended.wait(), 10)
         return result
 
-    server._control_for_test._notify = record_tool_end
-    server._control_for_test.resolve_approval = delay_decision_response_until_tool_end
+    server.controllers.attached().control._notify = record_tool_end
+    server.controllers.attached().control.resolve_approval = delay_decision_response_until_tool_end
     await asyncio.wait_for(server.start(), TIMEOUT)
     reader, writer = await asyncio.wait_for(
         asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT

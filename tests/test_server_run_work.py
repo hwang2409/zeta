@@ -141,14 +141,14 @@ async def test_run_work_lists_and_cancels_real_task_and_publishes_todo(
             )
         )[-1]["result"]["session"]
         session_id = session["session_id"]
-        registry = server._runtime_for_test.loop.tool_registry.background_tasks
+        registry = server.controllers.attached().runtime.loop.tool_registry.background_tasks
         command = (
             f"{shlex.quote(sys.executable)} -c "
             + shlex.quote("import sys; sys.stdin.buffer.read()")
         )
         task_id, _pid = await registry.start(command, tmp_path)
         todo = [{"content": "finish transport proof", "status": "in_progress"}]
-        server._runtime_for_test.opened.store.set_todo_items(todo)
+        server.controllers.attached().runtime.opened.store.set_todo_items(todo)
 
         list_response = (
             await request(
@@ -215,7 +215,7 @@ async def test_todo_write_after_closed_server_loop_is_ignored(
         {"protocol_version": "1.2", "features": ["run_work"]},
     )
     await request(reader, writer, "new", "new_session", {"provider": "codex"})
-    store = server._runtime_for_test.opened.store
+    store = server.controllers.attached().runtime.opened.store
     # test-contract: seam this is the post-commit edge that can race server teardown
     todo_committed = store._todo_change_sink
     assert todo_committed is not None
@@ -227,7 +227,7 @@ async def test_todo_write_after_closed_server_loop_is_ignored(
         notifications.append((args, kwargs))
 
     # test-contract: seam the test runner loop stays open, so inject the closed serve loop
-    monkeypatch.setattr(server._control_for_test, "_notify", record_notification)
+    monkeypatch.setattr(server.controllers.attached().control, "_notify", record_notification)
     closed_loop = asyncio.new_event_loop()
     exception_contexts: list[dict[str, object]] = []
     closed_loop.set_exception_handler(
@@ -262,7 +262,7 @@ async def test_run_work_real_transports_and_all_task_statuses(
             reader, writer, transport, "new", "new_session", {"provider": "codex"}
         )
         session_id = created["result"]["session"]["session_id"]  # type: ignore[index]
-        registry = server._runtime_for_test.loop.tool_registry.background_tasks
+        registry = server.controllers.attached().runtime.loop.tool_registry.background_tasks
         command = f"{shlex.quote(sys.executable)} -c " + shlex.quote("import sys; sys.stdin.buffer.read()")
         task_id, _ = await registry.start(command, tmp_path)
         started = await _event_transport(reader, transport, "background_task_updated")
@@ -332,8 +332,8 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
     try:
         await _rpc_transport(controller_reader, controller_writer, transport, "hello", "hello", {"protocol_version": "1.2", "features": []})
         await _rpc_transport(controller_reader, controller_writer, transport, "new", "new_session", {"provider": "codex"})
-        await server._runtime_for_test.loop.tool_registry.background_tasks.start("true", tmp_path)
-        server._runtime_for_test.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
+        await server.controllers.attached().runtime.loop.tool_registry.background_tasks.start("true", tmp_path)
+        server.controllers.attached().runtime.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
         sentinel, frames = await _rpc_transport_with_frames(
             controller_reader, controller_writer, transport, "sentinel", "status", {}
         )
@@ -373,8 +373,8 @@ async def test_run_work_events_are_suppressed_without_negotiation_or_for_observe
                 {"session_id": session_id},
             )
             assert "error" not in joined
-            await server._runtime_for_test.loop.tool_registry.background_tasks.start("true", tmp_path)
-            server._runtime_for_test.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
+            await server.controllers.attached().runtime.loop.tool_registry.background_tasks.start("true", tmp_path)
+            server.controllers.attached().runtime.opened.store.set_todo_items([{"content": "hidden", "status": "pending"}])
             sentinel, frames = await _rpc_transport_with_frames(
                 observer_reader, observer_writer, transport, "observer-status", "status", {}
             )
