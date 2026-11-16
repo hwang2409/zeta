@@ -30,6 +30,8 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.config.settings", "_validated_inbox", "settings"),
     ("zeta.config.settings", "_validated_anthropic", "settings"),
     ("zeta.config.settings", "_validated_approval", "settings"),
+    ("zeta.config.settings", "_validated_extensions", "settings"),
+    ("zeta.extensions.manifest", "parse_manifest", "settings"),
     ("zeta.core.session_files", "copy_session_tree", "in-memory value"),
     ("zeta.core.transcript_recovery.__init__", "reconcile_pending", "in-memory value"),
     ("zeta.memory.entry_history", "set_memory_profile", "in-memory value"),
