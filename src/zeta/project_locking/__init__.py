@@ -27,6 +27,9 @@ _T = TypeVar("_T")
 _ACTIVE_WRITER_LEASE: ContextVar[WriterLease | None] = ContextVar(
     "project_writer_lease", default=None
 )
+_WAIT_FOR_REGISTRY_LOCK: ContextVar[bool] = ContextVar(
+    "wait_for_registry_lock", default=False
+)
 
 
 class ProjectLockingMixin:
@@ -78,8 +81,8 @@ class ProjectLockingMixin:
         return lock_fd
 
     @staticmethod
-    def _acquire_lock(lock_fd: int, mode: int, *, wait: bool = False) -> None:
-        if wait:
+    def _acquire_lock(lock_fd: int, mode: int) -> None:
+        if _WAIT_FOR_REGISTRY_LOCK.get():
             fcntl.flock(lock_fd, mode)
             return
         deadline = time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
@@ -319,7 +322,11 @@ class ProjectLockingMixin:
                     assert lock_fd is not None
                     try:
                         os.fchmod(lock_fd, 0o600)
-                        self._acquire_lock(lock_fd, fcntl.LOCK_EX, wait=True)
+                        token = _WAIT_FOR_REGISTRY_LOCK.set(True)
+                        try:
+                            self._acquire_lock(lock_fd, fcntl.LOCK_EX)
+                        finally:
+                            _WAIT_FOR_REGISTRY_LOCK.reset(token)
                         yield root_fd
                         return
                     finally:
