@@ -336,7 +336,8 @@ async def test_tui_popup_waits_for_recovery_before_input(
         await await_or_fail(
             asyncio.to_thread(started.wait, 10), what="start gated recovery"
         )
-        assert not app.decisions_panel_active
+        # The popup owns the keys at once, but shows loading and holds them.
+        assert app.decisions_panel_active and app.overlay_loading
         _press(app, "1")
         assert all(
             AttentionStore(owner.store.session_dir, writer_epoch=5).get(r.id).status == "open"

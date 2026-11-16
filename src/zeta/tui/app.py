@@ -75,6 +75,7 @@ from .layout import (
 from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
+from .overlay_opener import OverlayOpenerMixin
 from .paste_runtime import PasteRuntime
 from .runtime.prompt import PromptRuntimeMixin
 from .runtime.stream import StreamEventMixin
@@ -167,6 +168,7 @@ class TUIApp(
     RuntimeCloseMixin,
     AgentRunCommandMixin,
     FinderRuntimeMixin,
+    OverlayOpenerMixin,
     StreamEventMixin,
     PromptRuntimeMixin,
 ):
@@ -837,8 +839,8 @@ class TUIApp(
             prompt_history is not None
             and self._active_finder is getattr(self, "_history_finder", None)
         ):
-            prompt_history.start_finder_scan(
-                query, self._publish_prompt_history_snapshot
+            self._hold_overlay_keys(
+                self._scan_prompt_history(query), self._finder_accept_when_ready
             )
         transcript = self._viewed_transcript()
         if not query or self._active_finder is not transcript:
@@ -919,19 +921,22 @@ class TUIApp(
             transcript.adopt_units(units)
         self._closed_history_snapshot = None
 
-    def _publish_prompt_history_snapshot(
-        self, snapshot: tuple[str, ...], buffer: Any | None = None
-    ) -> None:
+    def _publish_prompt_history_snapshot(self, snapshot: tuple[str, ...]) -> None:
         request = self._history_finder.set_snapshot(snapshot)
         if request is None:
-            if buffer is not None:
-                FinderRuntimeMixin._history_finder_open(self, buffer)
             return
         if self._finder_prepare_task is not None:
             self._finder_prepare_task.cancel()
         if self._finder_rank_task is not None:
             self._finder_rank_task.cancel()
         self._start_finder_preparation(request)
+
+    def _scan_prompt_history(self, query: str) -> asyncio.Task[None]:
+        """Read prompt history for ``query``; Enter waits for it."""
+
+        prompt_history = self._agent_navigation.transcript_control.prompt_history
+        prompt_history.start_finder_scan(query, self._publish_prompt_history_snapshot)
+        return prompt_history.finder_task
 
     def _history_finder_open(self, buffer: Any) -> None:
         prompt_history = self._agent_navigation.transcript_control.prompt_history
@@ -941,11 +946,9 @@ class TUIApp(
         prompt_history.bind(
             self._viewed_session_path(), self._agent_navigation.transcript_control.history_pager.source
         )
-
-        def publish(snapshot: tuple[str, ...]) -> None:
-            self._publish_prompt_history_snapshot(snapshot, buffer)
-
-        prompt_history.start_finder_scan(buffer.text, publish)
+        FinderRuntimeMixin._history_finder_open(
+            self, buffer, lambda: self._scan_prompt_history(buffer.text)
+        )
 
     def _history_previous(self, buffer: Any) -> None:
         path = self._viewed_session_path()

@@ -302,6 +302,7 @@ class Driver:
                 self.app._agent_navigation.transcript_control.search_task is None
                 or self.app._agent_navigation.transcript_control.search_task.done()
             )
+            and not self.app._agent_navigation.transcript_control.prompt_history.busy
         )
 
 
@@ -558,40 +559,88 @@ async def test_finder_typing_after_a_queued_enter_does_not_accept(
         )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("opener", "query", "accepted"),
-    [
-        pytest.param(
+@dataclass(frozen=True)
+class Opener:
+    """A key that opens an overlay, and what each typed burst must do in it."""
+
+    key: str
+    # A word that matches one entry, and the state once Enter accepts it.
+    word: str
+    accepted: Callable[[Driver], bool]
+    drawn: Callable[[Driver], bool]
+    # The overlay's own text field; None for an overlay that takes no text.
+    field: Callable[[Driver], str] | None
+    escapes: int
+
+
+def _decisions_drawn(driver: Driver) -> bool:
+    screen = driver.session.app.renderer._last_screen
+    return screen is not None and driver.app._decisions_panel_window in (
+        screen.visible_windows_to_write_positions
+    )
+
+
+OPENERS = [
+    pytest.param(
+        Opener(
             CTRL_F,
             OLD_WORDS[40],
-            lambda driver: _prompt(40) in driver.screen(),
-            id="message-finder",
+            lambda driver: not driver.finder_drawn() and _prompt(40) in driver.screen(),
+            Driver.finder_drawn,
+            lambda driver: driver.app._finder_field.text,
+            escapes=2,
         ),
-        pytest.param(
+        id="ctrl+f",
+    ),
+    pytest.param(
+        Opener(
             CTRL_R,
             _prompt(TURNS - 2),
-            lambda driver: driver.session.default_buffer.text.startswith(
-                _prompt(TURNS - 2)
-            ),
-            id="history-finder",
+            lambda driver: not driver.finder_drawn()
+            and driver.session.default_buffer.text.startswith(_prompt(TURNS - 2)),
+            Driver.finder_drawn,
+            lambda driver: driver.app._finder_field.text,
+            escapes=2,
         ),
-    ],
-)
-async def test_finder_keys_typed_during_startup_never_become_a_prompt(
+        id="ctrl+r",
+    ),
+    pytest.param(
+        Opener(
+            "\x14",
+            "zz",
+            lambda driver: _decisions_drawn(driver)
+            and driver.session.default_buffer.text == "",
+            _decisions_drawn,
+            None,
+            escapes=1,
+        ),
+        id="ctrl+t",
+    ),
+]
+MISS = "zzsettled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("burst", ["word+enter", "miss+enter", "word+esc"])
+@pytest.mark.parametrize("phase", ["startup", "settled"])
+@pytest.mark.parametrize("opener", OPENERS)
+async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
     root_home: RootHome,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    opener: str,
-    query: str,
-    accepted: Callable[[Driver], bool],
+    opener: Opener,
+    phase: str,
+    burst: str,
 ) -> None:
-    # Own copy: on a failure the typed query lands in the session as a prompt.
+    # The opener and the keys after it arrive in one write, before the overlay's
+    # first paint: they must reach the overlay, never composer submit.
     home = tmp_path / "home"
+    # Own copy: on a failure the typed keys land in the session as a prompt.
     await asyncio.to_thread(shutil.copytree, root_home.home, home)
     copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
-    # Hold startup after the first paint, so the keys arrive while it still runs.
     startup = asyncio.Event()
+    if phase == "settled":
+        startup.set()
     ensure_mcp_servers = AgentLoop.ensure_mcp_servers
 
     async def held_startup(loop: AgentLoop) -> None:
@@ -601,25 +650,84 @@ async def test_finder_keys_typed_during_startup_never_become_a_prompt(
     monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
     backend = FakeBackend([])
     async with running_tui(copy, backend) as driver:
-        assert driver.app._startup_replay_active, "startup finished before the keys"
-        await driver.send(opener)
-        await driver.until(driver.finder_drawn, what="the finder did not open")
-        await driver.send(query + ENTER)
-        await driver.until(
-            lambda: not driver.finder_drawn() and accepted(driver),
-            what="Enter typed in the finder during startup did not accept its match",
-        )
+        app = driver.app
+        if phase == "startup":
+            assert app._startup_replay_active, "startup finished before the keys"
+        else:
+            await driver.until(
+                lambda: not app._startup_replay_active, what="startup did not finish"
+            )
+            await driver.settle("settled screen before the opener")
+
+        def submitted() -> list[str]:
+            return [value for value, _internal in app._startup_submissions] + [
+                str(messages[-1].content) for messages, _tools in backend.calls
+            ]
+
+        def composer() -> str:
+            return driver.session.default_buffer.text
+
+        typed = MISS if burst == "miss+enter" else opener.word
+        if burst == "word+esc":
+            await driver.send(opener.key + typed)
+            for _ in range(opener.escapes):
+                await driver.until(lambda: opener.drawn(driver), what="the overlay did not open")
+                await driver.settle("overlay holds the typed keys")
+                await driver.send(ESCAPE)
+                await driver.until(
+                    lambda: not opener.drawn(driver)
+                    or driver.session.app.vi_state.input_mode is InputMode.NAVIGATION,
+                    what="Esc did nothing",
+                )
+            await driver.until(lambda: not opener.drawn(driver), what="Esc did not close it")
+            await driver.settle("settled screen after Esc")
+            assert not submitted(), f"keys typed for the overlay were sent: {submitted()}"
+            assert not opener.drawn(driver) and composer() == "", (
+                f"after Esc: overlay drawn={opener.drawn(driver)}, stray composer"
+                f" text {composer()!r}; screen:\n{driver.screen()}"
+            )
+        else:
+            await driver.send(opener.key + typed + ENTER)
+            expected = (
+                (lambda: opener.accepted(driver))
+                if burst == "word+enter"
+                else (
+                    lambda: opener.drawn(driver)
+                    and (opener.field is None or opener.field(driver) == MISS)
+                )
+            )
+            await driver.until(
+                lambda: bool(submitted()) or expected(),
+                what=f"the overlay did not take {typed!r} + Enter",
+            )
+            await driver.settle("settled screen after Enter")
+            assert not submitted(), f"keys typed for the overlay were sent: {submitted()}"
+            if burst == "word+enter":
+                assert opener.accepted(driver), (
+                    f"Enter did not accept {typed!r}: composer {composer()!r};"
+                    f" screen:\n{driver.screen()}"
+                )
+            else:
+                # Enter waits for rows that match the query; none match, so it stays.
+                assert opener.drawn(driver) and composer() == "", (
+                    f"Enter on a query with no match: overlay drawn={opener.drawn(driver)},"
+                    f" composer {composer()!r}; screen:\n{driver.screen()}"
+                )
+                if opener.field is not None:
+                    assert opener.field(driver) == MISS, (
+                        f"the overlay query is {opener.field(driver)!r}, typed {MISS!r}"
+                    )
         startup.set()
         # Startup sends its queued prompts in the same step that ends it; wait
         # for any turn they started, so a sent prompt reaches the backend.
         await driver.until(
-            lambda: not driver.app._startup_replay_active
-            and (driver.app._active_task is None or driver.app._active_task.done()),
+            lambda: not app._startup_replay_active
+            and (app._active_task is None or app._active_task.done()),
             what="startup or its queued turn did not finish",
         )
         await driver.settle("settled screen after startup")
         assert not backend.calls, (
-            f"keys typed in the finder were sent to the model: {backend.calls[0][0][-1]}"
+            f"keys typed for the overlay were sent to the model: {submitted()}"
         )
 
 

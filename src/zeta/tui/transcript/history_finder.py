@@ -80,7 +80,6 @@ class HistoryFinder:
         self._buffer: Buffer | None = None
         self._draft: Document | None = None
         self._entries: dict[int, str] = {}
-        self._snapshot_override: tuple[str, ...] | None = None
         self._preview = True
 
     @property
@@ -102,23 +101,17 @@ class HistoryFinder:
     ) -> AsyncIterator[tuple[HistorySnapshot, bool]]:
         snapshot = await asyncio.to_thread(
             build_history_candidates,
-            self._load_snapshot() if request.snapshot is None else request.snapshot,
+            self._history_snapshot() if request.snapshot is None else request.snapshot,
         )
         yield snapshot, True
 
     def set_snapshot(
         self, history: tuple[str, ...]
     ) -> HistoryCandidateRequest | None:
-        self._snapshot_override = history
         if self._finder is None:
             return None
         self._generation += 1
         return HistoryCandidateRequest(self._generation, history)
-
-    def _load_snapshot(self) -> tuple[str, ...]:
-        history = self._snapshot_override
-        self._snapshot_override = None
-        return self._history_snapshot() if history is None else history
 
     def finder_publish_candidate_batch(
         self,
