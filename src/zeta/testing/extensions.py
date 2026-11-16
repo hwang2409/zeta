@@ -63,6 +63,7 @@ class ExtensionKit:
         return await self.registry.execute(call)
 
     async def aclose(self) -> None:
+        self.host.close()
         await self.registry.close()
         await asyncio.to_thread(shutil.rmtree, self._root, ignore_errors=True)
 

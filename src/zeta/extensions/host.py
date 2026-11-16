@@ -16,6 +16,7 @@ skipped. One broken extension never breaks the session or stops the rest.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -111,6 +112,30 @@ class ExtensionHost:
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
         self.warnings: list[str] = []
+        self._packages: dict[str, Path] = {}
+        self._closed = False
+
+    def track_package(self, package: str, directory: Path) -> None:
+        self._packages[package] = directory
+
+    def remove_package_for_directory(self, directory: Path) -> None:
+        for package, package_directory in tuple(self._packages.items()):
+            if package_directory == directory:
+                self.remove_package(package)
+
+    def remove_package(self, package: str) -> None:
+        self._packages.pop(package, None)
+        for name in tuple(sys.modules):
+            if name == package or name.startswith(package + "."):
+                del sys.modules[name]
+
+    def close(self) -> None:
+        """Release imported extension namespaces; safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        for package in tuple(self._packages):
+            self.remove_package(package)
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""

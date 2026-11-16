@@ -139,7 +139,7 @@ def _load_one(
 ) -> None:
     display = _display(directory)
     try:
-        module = _import_entry(directory, manifest)
+        module = _import_entry(directory, manifest, host=host)
     except Exception as exc:  # noqa: BLE001 - loading must fail open
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): "
@@ -148,6 +148,7 @@ def _load_one(
         return
     entry = getattr(module, manifest.entry_function, None)
     if not callable(entry):
+        host.remove_package_for_directory(directory)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): "
             f"no callable {manifest.entry_function}(zx)"
@@ -158,6 +159,7 @@ def _load_one(
     try:
         result = entry(api)
     except Exception as exc:  # noqa: BLE001 - a broken activate must not break the session
+        host.remove_package_for_directory(directory)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): "
             f"activate raised: {_short(exc)}"
@@ -166,6 +168,7 @@ def _load_one(
     if inspect.isawaitable(result):
         if inspect.iscoroutine(result):
             result.close()
+        host.remove_package_for_directory(directory)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): "
             "activate must be synchronous"
@@ -174,7 +177,9 @@ def _load_one(
     host.commit(loading)
 
 
-def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
+def _import_entry(
+    directory: Path, manifest: ExtensionManifest, *, host: ExtensionHost
+) -> object:
     """Import the entry module as a package rooted at the extension dir.
 
     The extension dir is made importable only as this synthetic package's
@@ -189,6 +194,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
     pkg.__path__ = [str(directory)]  # type: ignore[attr-defined]
     pkg.__package__ = pkg_name
     sys.modules[pkg_name] = pkg
+    host.track_package(pkg_name, directory)
     entry_full = f"{pkg_name}.{manifest.entry_module}"
     single = directory / f"{manifest.entry_module}.py"
     package_init = directory / manifest.entry_module / "__init__.py"
@@ -201,7 +207,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
         search = [str(directory / manifest.entry_module)]
         entry_package = entry_full
     else:
-        _remove_package_modules(pkg_name)
+        host.remove_package(pkg_name)
         raise ImportError(
             f"entry module '{manifest.entry_module}' not found in {directory}"
         )
@@ -209,7 +215,7 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
         entry_full, entry_path, submodule_search_locations=search
     )
     if spec is None or spec.loader is None:
-        _remove_package_modules(pkg_name)
+        host.remove_package(pkg_name)
         raise ImportError(f"could not build import spec for {entry_path}")
     module = importlib.util.module_from_spec(spec)
     module.__package__ = entry_package
@@ -217,15 +223,9 @@ def _import_entry(directory: Path, manifest: ExtensionManifest) -> object:
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        _remove_package_modules(pkg_name)
+        host.remove_package(pkg_name)
         raise
     return module
-
-
-def _remove_package_modules(pkg_name: str) -> None:
-    for name in list(sys.modules):
-        if name == pkg_name or name.startswith(pkg_name + "."):
-            del sys.modules[name]
 
 
 def _ensure_namespace() -> None:

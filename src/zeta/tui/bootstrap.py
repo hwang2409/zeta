@@ -687,6 +687,7 @@ def _create_app_with_root(
         startup_warnings=startup_warnings,
         startup_alerts=startup_alerts,
         external_tools=external_tools,
+        extensions=composition.extensions,
         workspace_snapshot_cap=config.workspace_snapshot_cap,
         ephemeral_root=ephemeral_root,
         session_name=metadata.name,

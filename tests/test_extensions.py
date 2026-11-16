@@ -22,7 +22,6 @@ from zeta.extensions import (
     parse_manifest,
     trust_project_extensions,
 )
-from zeta.extensions.discovery import _import_entry
 from zeta.extensions.host import USER_SCOPE
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
@@ -251,44 +250,81 @@ def activate(zx):
 
 
 @pytest.mark.asyncio
-async def test_import_failure_removes_entry_and_sibling_modules(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    source = "from . import helper\nraise RuntimeError('boom')\n"
-    directory = _write_extension(home / "extensions", "broken", source=source)
-    (directory / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None:
+    def package_names() -> set[str]:
+        return {name for name in sys.modules if name.startswith("_zeta_extensions.")}
+
     async with _open_registry(tmp_path) as registry:
-        before = {name for name in sys.modules if name.startswith("_zeta_extensions.")}
-        host = apply_extensions(
-            registry, home=home, project_dir=None,
+        before = package_names()
+
+        _write_extension(tmp_path / "success-home" / "extensions", "success")
+        success = apply_extensions(
+            registry, home=tmp_path / "success-home", project_dir=None,
             builtin_names=registry.registered_names,
         )
-        after = {
-            name for name in sys.modules
-            if name.startswith("_zeta_extensions.")
-        }
-        assert any("import failed" in notice for notice in host.notices)
-        assert after == before
+        success_names = package_names() - before
+        assert success_names
+        success.close()
+        assert package_names() == before
+        success.close()
 
+        broken_dir = _write_extension(
+            tmp_path / "broken-home" / "extensions", "broken",
+            source="from . import helper\nraise RuntimeError('boom')\n",
+        )
+        (broken_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+        broken = apply_extensions(
+            registry, home=tmp_path / "broken-home", project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        assert any("import failed" in notice for notice in broken.notices)
+        assert package_names() == before
+        broken.close()
 
-@pytest.mark.asyncio
-async def test_loads_of_one_extension_do_not_share_sibling_state(tmp_path: Path) -> None:
-    directory = _write_extension(
-        tmp_path / "home" / "extensions", "stateful",
-        source="from . import helper\n\ndef activate(zx):\n    pass\n",
-    )
-    (directory / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
-    manifest = parse_manifest((directory / "zeta-extension.toml").read_text())
-    before = {name for name in sys.modules if name.startswith("_zeta_extensions.")}
-    try:
-        first = _import_entry(directory, manifest)
-        second = _import_entry(directory, manifest)
-        assert first.helper.COUNT == 1
-        assert second.helper.COUNT == 1
-        assert first.helper is not second.helper
-    finally:
-        for name in list(sys.modules):
-            if name.startswith("_zeta_extensions.") and name not in before:
-                del sys.modules[name]
+        _write_extension(
+            tmp_path / "crashing-home" / "extensions", "crashing",
+            source="def activate(zx):\n    raise RuntimeError('boom')\n",
+        )
+        crashing = apply_extensions(
+            registry, home=tmp_path / "crashing-home", project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        assert any("activate raised" in notice for notice in crashing.notices)
+        assert package_names() == before
+        crashing.close()
+
+        _write_extension(
+            tmp_path / "bad-home" / "extensions", "bad",
+            source="VALUE = 1\n",
+        )
+        bad = apply_extensions(
+            registry, home=tmp_path / "bad-home", project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        assert any("no callable" in notice for notice in bad.notices)
+        assert package_names() == before
+        bad.close()
+
+        repeated_dir = _write_extension(
+            tmp_path / "repeated-home" / "extensions", "repeated",
+            source="from . import helper\ndef activate(zx):\n    pass\n",
+        )
+        (repeated_dir / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
+        first = apply_extensions(
+            registry, home=tmp_path / "repeated-home", project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        first_names = package_names() - before
+        second = apply_extensions(
+            registry, home=tmp_path / "repeated-home", project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        second_names = package_names() - before - first_names
+        assert first_names and second_names and first_names.isdisjoint(second_names)
+        first.close()
+        assert package_names() == before | second_names
+        second.close()
+        assert package_names() == before
 
 
 @pytest.mark.asyncio
