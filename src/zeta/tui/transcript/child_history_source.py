@@ -51,29 +51,43 @@ class ChildLogHistorySource:
         self._replay_provider_loaded = False
         self._closed = False
         self._operation_lock = asyncio.Lock()
+        # One read-only store for the source's life: opening validates the whole
+        # log, while each operation's refresh() rereads only what changed.
+        self._store: ConversationStore | None = None
         self.pending_prompts: tuple[str, ...] = ()
 
     async def close(self) -> None:
         async with self._operation_lock:
             self._closed = True
+            store, self._store = self._store, None
+            if store is not None:
+                await asyncio.to_thread(store.close)
 
     def _run_sync(self, operation: Any, *args: Any) -> Any:
-        store = ConversationStore(
-            self.path.parent,
-            session_id=self.path.name,
-            _read_only=True,
-            _observer_snapshot=True,
-            _must_exist=True,
-        )
+        store, self._store = self._store, None
+        if store is None:
+            store = ConversationStore(
+                self.path.parent,
+                session_id=self.path.name,
+                _read_only=True,
+                _observer_snapshot=True,
+                _must_exist=True,
+            )
         try:
             if not self._replay_provider_loaded:
                 from ..checkpoints import session_replay_provider
 
                 self.replay_provider = session_replay_provider(self.path)
                 self._replay_provider_loaded = True
-            return operation(store, *args)
-        finally:
+            result = operation(store, *args)
+        except BaseException:
             store.close()
+            raise
+        if self._closed:
+            store.close()
+        else:
+            self._store = store
+        return result
 
     async def _run(self, operation: Any, *args: Any) -> Any:
         async with self._operation_lock:
