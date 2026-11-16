@@ -49,6 +49,7 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import NotificationPresentation
 from zeta.server.event_contract import notification_wire_event
 from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.inbox import _inbox
@@ -3106,7 +3107,7 @@ async def test_p03a_runtime_health_event_reaches_tui_and_serve(tmp_path, monkeyp
         async def close(self) -> None:
             pass
 
-    connections = ConnectionRegistry(asyncio.get_running_loop())
+    connections = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _HealthController()
     connections.register(connection)
     connections.negotiate_role(connection, "controller", "1.2", frozenset())

@@ -67,7 +67,7 @@ class DeliveryRequests:
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         control = self._control
-        runtime = control.server.runtime
+        runtime = control.runtime
         if runtime.loop is None or runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(params, features)
@@ -145,7 +145,7 @@ class DeliveryRequests:
         from .handlers import send_images
 
         control = self._control
-        runtime = control.server.runtime
+        runtime = control.runtime
         if runtime.loop is None or runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         delivery_id = self._delivery_id(
@@ -241,7 +241,7 @@ class DeliveryRequests:
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         control = self._control
-        runtime = control.server.runtime
+        runtime = control.runtime
         loop = runtime.loop
         if loop is None or runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
@@ -340,7 +340,7 @@ class DeliveryRequests:
         }[outcome]
         await state.opened.store.append_turn_end_async(turn_id, turn_reason)
         control._approvals.prune_ended()
-        if control.server.runtime.state is state:
+        if control.runtime.state is state:
             state.turn_finished()
         if control._turn_task is owner_task:
             control._turn_handoff_task = owner_task
@@ -383,7 +383,7 @@ class DeliveryRequests:
                 not control.closing
                 and control.controller_present()
                 and not control.client_turn_detached()
-                and control.server.runtime.state is state
+                and control.runtime.state is state
             ):
                 # the next turn's first provider request drains the queue,
                 # so each steer becomes delivered exactly as a mid-turn steer.
@@ -427,7 +427,7 @@ class DeliveryRequests:
         control = self._control
         _require_feature(features, "delivery_id", "delivery_status")
         delivery_id = _required_delivery_id(params)
-        runtime = control.server.runtime
+        runtime = control.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         store = runtime.opened.store
@@ -459,7 +459,7 @@ class DeliveryRequests:
     def _duplicate(
         self, delivery_id: str | None, *, payload_digest: str | None = None
     ) -> dict[str, object] | None:
-        runtime = self._control.server.runtime
+        runtime = self._control.runtime
         if delivery_id is None or runtime.opened is None:
             return None
         store = runtime.opened.store

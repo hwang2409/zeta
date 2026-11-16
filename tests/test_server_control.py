@@ -49,6 +49,7 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -136,7 +137,7 @@ def _frame(connection: _ControllerConnection, label: str) -> bytes:
 
 @pytest.mark.asyncio
 async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -158,7 +159,7 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -180,7 +181,7 @@ def test_no_server_caller_branches_on_ready_controller() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_event_emitted_before_hello_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -197,7 +198,7 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_events_keep_emission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -218,7 +219,7 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -260,7 +261,7 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -299,7 +300,7 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_claim_failure_drops_pre_hello_events() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     first = _ControllerConnection()
     registry.register(first)
     registry.negotiate_role(first, "controller", "1.2", frozenset())
@@ -319,7 +320,7 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -345,7 +346,7 @@ async def _send_hello_and_flush(
 
 @pytest.mark.asyncio
 async def test_cancel_after_physical_write_reports_delivered_once() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -378,7 +379,7 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
 @pytest.mark.asyncio
 async def test_release_after_physical_write_reports_delivered() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -400,7 +401,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_release_fences_queued_frames() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -427,7 +428,7 @@ async def test_controller_release_fences_queued_frames() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_release_matches_base() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -463,7 +464,7 @@ async def test_observer_release_matches_base() -> None:
 
 @pytest.mark.asyncio
 async def test_aclose_settles_queued_frames_false() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
