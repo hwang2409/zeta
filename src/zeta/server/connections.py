@@ -175,7 +175,11 @@ class _Connection:
 class ConnectionRegistry(ReplayOutput):
     """Owns connection claims, output, and bounded observer reads."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        in_flight: Callable[[], InFlightReply],
+    ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
         self._controller: _Connection | None = None
@@ -183,7 +187,8 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
-        self.in_flight = InFlightReply()
+        # the attached control's unfinished reply, read by a join and the live skip
+        self.in_flight = in_flight
         self.child_runs = ChildRunProjection(loop, self)
         self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
