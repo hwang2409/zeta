@@ -974,13 +974,14 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     writer.close()
     await writer.wait_closed()
     await asyncio.wait_for(cleanup_finished.wait(), TIMEOUT)
+    runtime = server.controllers.attached().runtime
     await server.close()
     del client
     gc.collect()
 
-    assert server.controllers.attached().runtime._background_event_sink is not None
-    assert server.controllers.attached().runtime._memory_notice_sink is not None
-    assert server.controllers.attached().runtime._background_wake_sink is not None
+    assert runtime._background_event_sink is not None
+    assert runtime._memory_notice_sink is not None
+    assert runtime._background_wake_sink is not None
     assert reference() is None
 
 

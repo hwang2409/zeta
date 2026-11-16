@@ -45,28 +45,28 @@ async def join_history_and_subscribe(client: Any, params: dict[str, Any]) -> obj
                 "session_history_and_subscribe requires session_id and a complete cursor",
             )
         session_id = params["session_id"]
-        selected = client.server.controllers.selected(
+        with client.server.controllers.selected(
             client,
             session_id,
             # the legacy join text while no session is attached
             unattached_error=ProtocolError(
                 ErrorDescriptor.INTERNAL_ERROR, "server has no active session"
             ),
-        )
-        if selected.runtime.session_id != session_id:
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION,
-                "session is not active",
+        ) as selected:
+            if selected.runtime.session_id != session_id:
+                raise ProtocolError(
+                    ErrorDescriptor.NO_ACTIVE_SESSION,
+                    "session is not active",
+                )
+            # No swap guard here: serve installs the resumed runtime (`self._state`)
+            # at server/runtime.py `_replace` ONLY after `_run_setup` -> compose_runtime
+            # -> recovery returns, so a join cannot read the store mid-recovery. The
+            # session_replay area is owned by lead :1 (#1175); keep edits minimal.
+            await connections.begin_replay_join(client, ReplayScopeId.top(session_id), selected)
+            read = await connections.read_replay_history(
+                client, selected, session_id, params.get("history_validator")
             )
-        # No swap guard here: serve installs the resumed runtime (`self._state`)
-        # at server/runtime.py `_replace` ONLY after `_run_setup` -> compose_runtime
-        # -> recovery returns, so a join cannot read the store mid-recovery. The
-        # session_replay area is owned by lead :1 (#1175); keep edits minimal.
-        await connections.begin_replay_join(client, ReplayScopeId.top(session_id), selected)
-        read = await connections.read_replay_history(
-            client, selected, session_id, params.get("history_validator")
-        )
-        return connections.finish_replay_join(client, *read)
+            return connections.finish_replay_join(client, *read)
     except BaseException:
         connections.invalidate_replay_connection(client, reason="rejoined")
         raise

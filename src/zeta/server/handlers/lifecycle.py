@@ -24,7 +24,7 @@ from . import validation
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
-    from ..session_controllers import SessionController
+    from ..session_controllers import SessionController, SessionUse
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -46,7 +46,7 @@ _RESERVED_HEADERS = frozenset({
 _RESERVED_HEADER_PREFIXES = ("proxy-", "sec-websocket-", "x-forwarded-")
 
 
-async def _publish_project_registry_notice(self, controller: SessionController) -> None:
+async def _publish_project_registry_notice(self, controller: SessionUse | SessionController) -> None:
     runtime = controller.runtime
     if runtime.project_registry_busy:
         await controller.control._event(
@@ -67,7 +67,7 @@ async def _publish_project_registry_notice(self, controller: SessionController) 
 
 @asynccontextmanager
 async def _session_swap(
-    self, park: bool, controller: SessionController
+    self, park: bool, controller: SessionUse | SessionController
 ) -> AsyncIterator[SessionController | None]:
     """Hold a session swap. Yield None to swap the attached pair in place, as
     without ``session_park``; or, when ``park`` and the attached pair holds work,
@@ -87,12 +87,14 @@ async def _session_swap(
             yield incoming
         except BaseException:
             if not incoming.control.attached:
-                await server.controllers.retire(incoming).runtime.close()
+                server.controllers.retire(incoming)
+                await server.controllers.drained(incoming)
+                await incoming.runtime.close()
             raise
 
 
 async def new_session(
-    self, params: dict[str, Any], controller: SessionController
+    self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params, controller)
@@ -155,7 +157,7 @@ async def new_session(
 
 
 async def resume(
-    self, params: dict[str, Any], controller: SessionController
+    self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     try:
         bindings = await mcp_bindings(self, params, controller)
@@ -245,7 +247,7 @@ async def _resume_live_or_parked(
     bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
     candidate: SessionHostCommands,
     park: bool,
-    controller: SessionController,
+    controller: SessionUse | SessionController,
 ) -> tuple[dict[str, object] | None, bool]:
     """Attach to the open session's busy turn or to a parked pair and return the
     result; else return None and whether the reopen takes a new pair."""
@@ -279,7 +281,7 @@ async def _resume_live_or_parked(
 
 
 async def _resolve_session_id(
-    self, params: dict[str, Any], controller: SessionController
+    self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> str:
     session_id = validation.required_string(params, "session_id")
     try:
@@ -308,7 +310,7 @@ async def _attach_live_turn(
     candidate: SessionHostCommands,
     *,
     parked: SessionController | None = None,
-    controller: SessionController,
+    controller: SessionUse | SessionController,
 ) -> dict[str, object]:
     """Attach to the active session's busy turn, or to a ``parked`` pair, without
     a reopen: the turn, its approvals and children stay; only this connection's
@@ -359,7 +361,7 @@ async def _attach_live_turn(
 
 
 async def mcp_bindings(
-    self, params: dict[str, Any], controller: SessionController
+    self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
     if "mcp_bindings" not in params:
         return None
@@ -370,7 +372,7 @@ async def mcp_bindings(
 
 
 async def reconnect_mcp_bindings(
-    self, params: dict[str, Any], controller: SessionController
+    self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None:
     if "mcp_bindings" not in params:
         return None
@@ -432,7 +434,7 @@ async def resolve_mcp_bindings(
     self,
     bindings: dict[str, dict[str, str]],
     project_dir: object,
-    controller: SessionController,
+    controller: SessionUse | SessionController,
 ) -> dict[str, MCPServerConfig]:
     runtime = controller.runtime
     home_path = home_config_path(runtime.home)
@@ -501,7 +503,7 @@ def _active_runtime_snapshot(
     return snapshot
 
 
-def session_snapshot(self, controller: SessionController) -> dict[str, object] | None:
+def session_snapshot(self, controller: SessionUse | SessionController) -> dict[str, object] | None:
     runtime = controller.runtime
     if runtime.opened is None:
         return None
@@ -511,11 +513,11 @@ def session_snapshot(self, controller: SessionController) -> dict[str, object] |
     return snapshot
 
 
-def session_runtime_state(self, controller: SessionController) -> str:
+def session_runtime_state(self, controller: SessionUse | SessionController) -> str:
     return controller.control.pair_state()
 
 
-async def live_status_baseline(self, controller: SessionController) -> dict[str, object]:
+async def live_status_baseline(self, controller: SessionUse | SessionController) -> dict[str, object]:
     pending, truncated = await controller.control.reconnect_baseline()
     return {
         "state": session_runtime_state(self, controller),
@@ -529,7 +531,7 @@ async def status(
     *,
     include_connection_setup_counts: bool = False,
     fallback_config: object | None = None,
-    controller: SessionController,
+    controller: SessionUse | SessionController,
 ) -> dict[str, object]:
     runtime = controller.runtime
     session = session_snapshot(self, controller)
