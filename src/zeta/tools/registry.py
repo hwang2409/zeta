@@ -1081,6 +1081,13 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
+        # pre_tool hooks may replace arguments; validate and resolve that exact call.
+        effective_call = replace(tool_call, arguments=dict(arguments))
+        current = self._current_execution(effective_call)
+        if isinstance(current, dict):
+            return await finalize(current)
+        tool_call = effective_call
+        definition, capability, arguments = current
         claim_error = self.approval_execution_error(
             tool_call,
             prepared=_pending_execution_claimed,

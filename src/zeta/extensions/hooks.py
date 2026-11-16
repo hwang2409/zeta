@@ -21,6 +21,45 @@ class ExtensionHook:
     disabled: bool = False
 
 
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _invoke_with_deadline(
+    handler: Callable[..., Awaitable[Any]],
+    timeout_seconds: float,
+    *payload: Any,
+) -> Any:
+    task = asyncio.create_task(handler(*payload))
+    try:
+        done, _ = await asyncio.wait(
+            (task,), timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
+        )
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_task_result)
+        raise
+    if task not in done:
+        task.cancel()
+        task.add_done_callback(_consume_task_result)
+        raise TimeoutError
+    return task.result()
+
+
+def _normalize_pre_tool_result(result: Any) -> tuple[str, dict[str, Any] | None]:
+    if result is None:
+        return "continue", None
+    if isinstance(result, str):
+        return result, None
+    if isinstance(result, Mapping):
+        replacement = result.get("arguments")
+        if type(replacement) is dict:
+            return "continue", replacement
+        return "invalid", None
+    return "invalid", None
+
+
 class CompositeToolHook:
     """Run the configured hook manager and in-process extension pre-tool hooks."""
 
@@ -40,11 +79,14 @@ class CompositeToolHook:
             if result is not True:
                 return result
         for hook in self._hooks:
-            if hook.event != "pre_tool" or hook.disabled:
+            if hook.event != "pre_tool":
+                continue
+            if hook.disabled:
+                self._failure(hook, "disabled; call allowed unchecked")
                 continue
             try:
-                result = await asyncio.wait_for(
-                    hook.handler(tool, args), timeout=hook.timeout_seconds
+                result = await _invoke_with_deadline(
+                    hook.handler, hook.timeout_seconds, tool, args
                 )
             except asyncio.CancelledError:
                 raise
@@ -56,21 +98,16 @@ class CompositeToolHook:
                 hook.disabled = True
                 self._failure(hook, f"failed: {_short(exc)}")
                 continue
-            if result is None:
+            outcome, replacement = _normalize_pre_tool_result(result)
+            if outcome == "continue":
+                if replacement is not None:
+                    args.clear()
+                    args.update(replacement)
                 continue
-            if isinstance(result, str):
-                return result
-            if isinstance(result, Mapping):
-                replacement = result.get("arguments")
-                if type(replacement) is not dict:
-                    hook.disabled = True
-                    self._failure(hook, "returned invalid tool arguments")
-                    continue
-                args.clear()
-                args.update(replacement)
-                continue
+            if outcome != "invalid":
+                return outcome
             hook.disabled = True
-            self._failure(hook, "returned an invalid result")
+            self._failure(hook, "returned invalid tool arguments")
         return True
 
     def _failure(self, hook: ExtensionHook, detail: str) -> None:
@@ -93,8 +130,8 @@ async def run_extension_hooks(
         if hook.event != event or hook.disabled:
             continue
         try:
-            result = await asyncio.wait_for(
-                hook.handler(*payload), timeout=hook.timeout_seconds
+            result = await _invoke_with_deadline(
+                hook.handler, hook.timeout_seconds, *payload
             )
         except asyncio.CancelledError:
             raise
