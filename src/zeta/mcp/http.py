@@ -29,6 +29,7 @@ from .client import (
     MCPTool,
     MCPTransportError,
     canceled_result,
+    detached_result,
     initialize_params,
     make_error_result,
     parse_rpc_response,
@@ -91,6 +92,13 @@ class _ActiveRequest:
     response: httpx.Response | None = None
 
 
+class _Sealed(MCPHTTPError):
+    """A sealed client refused to send a new request with the gone headers."""
+
+    def __init__(self) -> None:
+        super().__init__(0, "the client that provides this server disconnected")
+
+
 class StreamableHTTPMCPClient(MCPClient):
     def __init__(
         self,
@@ -110,6 +118,8 @@ class StreamableHTTPMCPClient(MCPClient):
         self.capabilities: dict[str, object] | None = None
         self._next_id = 0
         self._closed = False
+        # sealed: requests already sent finish; nothing new is sent.
+        self._sealed = False
         self._failure_sink: Callable[[str], None] | None = None
         self._notification_sink: Callable[[str], None] | None = None
         self._notification_task: asyncio.Task[None] | None = None
@@ -203,6 +213,8 @@ class StreamableHTTPMCPClient(MCPClient):
             )
         except MCPCanceled:
             return canceled_result()
+        except _Sealed:
+            return detached_result(self.config.name, started=True)
         except MCPWireLimitError:
             return make_error_result(
                 f"MCP tool {self.config.name}__{name} exceeded the "
@@ -231,6 +243,14 @@ class StreamableHTTPMCPClient(MCPClient):
                 self._failure_sink(str(exc))
             return make_error_result(str(exc))
         return translate_call_result(result)
+
+    def seal(self) -> None:
+        """Send nothing new with these headers: stop the notification stream and
+        session recovery. Requests already sent keep running until ``close``."""
+        self._sealed = True
+        for task in (self._notification_task, self._session_recovery_task):
+            if task is not None:
+                task.cancel()
 
     async def close(self) -> None:
         if self._closed:
@@ -307,6 +327,8 @@ class StreamableHTTPMCPClient(MCPClient):
     ) -> dict[str, object]:
         if self._closed:
             raise MCPHTTPError(0, "MCP HTTP client is closed")
+        if self._sealed:
+            raise _Sealed()
         self._next_id += 1
         request_id = self._next_id
         payload = {
@@ -375,6 +397,8 @@ class StreamableHTTPMCPClient(MCPClient):
         if self.config.auth_type != "oauth":
             return await send(None)
         snapshot = await self._credential_store.load(self.config.name)
+        if self._sealed:
+            raise _Sealed()
         if snapshot.token is None:
             raise self._auth_error(MCPHTTPError(401, "authorization required"))
         try:
@@ -382,6 +406,9 @@ class StreamableHTTPMCPClient(MCPClient):
         except MCPHTTPError as exc:
             if exc.status_code != 401:
                 raise
+            if self._sealed:
+                # a refresh would resend with the gone client's headers.
+                raise _Sealed() from exc
             if not await self._refresh_token_once(exc, snapshot):
                 raise self._auth_error(exc)
             retry = await self._credential_store.load(self.config.name)
@@ -615,7 +642,7 @@ class StreamableHTTPMCPClient(MCPClient):
 
     async def _listen_notifications(self) -> None:
         delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-        while not self._closed:
+        while not (self._closed or self._sealed):
             session_id = None
             generation = self._session_generation
             try:
@@ -647,7 +674,7 @@ class StreamableHTTPMCPClient(MCPClient):
             else:
                 if healthy:
                     delay = NOTIFICATION_RECONNECT_INITIAL_SECONDS
-            if self._closed:
+            if self._closed or self._sealed:
                 return
             await asyncio.sleep(delay)
             delay = min(delay * 2, NOTIFICATION_RECONNECT_MAX_SECONDS)
