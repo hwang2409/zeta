@@ -27,18 +27,32 @@ CAPTURE_DIR="${CUSPIKE_CAPTURE_DIR:-${TMPDIR:-/tmp}/cuspike-${UID}}"
 AGENT_LABEL="com.henry.zeta.cuspike.q4"
 AGENT_DIR=""
 AGENT_ACTIVE=0
+AGENT_DRY_RUN=0
 
 agent_cleanup() {
   if [ "$AGENT_ACTIVE" -eq 1 ]; then
-    launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+    if [ "$AGENT_DRY_RUN" -eq 1 ]; then
+      printf 'dry-run: launchctl bootout gui/%s/%s\n' "$UID" "$AGENT_LABEL"
+    else
+      launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+    fi
   fi
   if [ -n "$AGENT_DIR" ]; then
-    rm -rf "$AGENT_DIR"
+    if [ "$AGENT_DRY_RUN" -eq 1 ]; then printf 'dry-run: rm -rf %s\n' "$AGENT_DIR"; else rm -rf "$AGENT_DIR"; fi
   fi
   AGENT_ACTIVE=0
   AGENT_DIR=""
 }
-trap agent_cleanup EXIT INT TERM
+
+agent_signal() {
+  local rc="$1"
+  trap - EXIT INT TERM
+  agent_cleanup
+  exit "$rc"
+}
+trap agent_cleanup EXIT
+trap 'agent_signal 130' INT
+trap 'agent_signal 143' TERM
 
 # The python we grant must be the SAME real binary zeta runs as. zeta's uv-tool
 # python is a symlink; resolve it so the grant is representative of real sessions.
@@ -138,12 +152,15 @@ swift_identity() {
 _preflight_values() {
   printf '%s\n' "$1" | sed -nE 's/.*screen_recording=(true|false).*accessibility=(true|false).*/\1 \2/p' | head -1
 }
-_classify_preflight() {
-  local values="$1" sr="${1%% *}" ax="${1#* }"
-  [ -z "$values" ] && { echo malformed; return; }
-  if [ "$sr" = true ] && [ "$ax" = true ]; then echo granted
-  elif [ "$sr" = false ] && [ "$ax" = false ]; then echo not-granted
-  else echo split; fi
+classify_rebuild_result() {
+  local values="$1" before="$2" after="$3" build_rc="$4" sr ax
+  if [ "$build_rc" -ne 0 ] || [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ] || [ -z "$values" ]; then
+    echo INCONCLUSIVE; return 2
+  fi
+  sr="${values%% *}"; ax="${values#* }"
+  if [ "$sr" = true ] && [ "$ax" = true ]; then echo SURVIVED; return 0; fi
+  if [ "$sr" = false ] && [ "$ax" = false ]; then echo LOST; return 1; fi
+  echo INCONCLUSIVE; return 2
 }
 _report_line() {
   local who="$1" out="$2" values sr ax
@@ -156,19 +173,29 @@ _report_line() {
 }
 
 cmd_selftest() {
-  local name input expected actual category
-  while IFS='|' read -r name input expected; do
-    actual="$(_preflight_values "$input")"
-    category="$(_classify_preflight "$actual")"
-    printf '%-10s %-10s %s\n' "$name" "$category" "${actual:-empty}"
-    [ "$category" = "$expected" ] || return 1
+  local name input expected expected_status values actual status
+  while IFS='|' read -r name input expected expected_status; do
+    values="$(_preflight_values "$input")"
+    if actual="$(classify_rebuild_result "$values" old new 0)"; then status=0; else status=$?; fi
+    printf '%-18s %-12s status=%s\n' "$name" "$actual" "$status"
+    [ "$actual" = "$expected" ] && [ "$status" -eq "$expected_status" ] || return 1
   done <<'EOF'
-both-true|screen_recording=true accessibility=true|granted
-both-false|screen_recording=false accessibility=false|not-granted
-split|screen_recording=true accessibility=false|split
-malformed|screen_recording=yes accessibility=false|malformed
-empty||malformed
+both-true|screen_recording=true accessibility=true|SURVIVED|0
+both-false|screen_recording=false accessibility=false|LOST|1
+split|screen_recording=true accessibility=false|INCONCLUSIVE|2
+malformed|screen_recording=yes accessibility=false|INCONCLUSIVE|2
+empty||INCONCLUSIVE|2
 EOF
+  # The last two cases exercise the same failure gates used by rebuild commands.
+  if actual="$(classify_rebuild_result "true true" same same 0)"; then status=0; else status=$?; fi
+  printf '%-18s %-12s status=%s\n' unchanged-cdhash "$actual" "$status"
+  [ "$actual" = INCONCLUSIVE ] && [ "$status" -eq 2 ] || return 1
+  if actual="$(classify_rebuild_result "true true" old new 1)"; then status=0; else status=$?; fi
+  printf '%-18s %-12s status=%s\n' build-failure "$actual" "$status"
+  [ "$actual" = INCONCLUSIVE ] && [ "$status" -eq 2 ] || return 1
+  AGENT_DIR="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-selftest"
+  AGENT_ACTIVE=1; AGENT_DRY_RUN=1
+  agent_cleanup
 }
 
 cmd_check() {
@@ -218,33 +245,17 @@ cmd_rebuild() {
   need_bin || return 1
   log ""
   log "## rebuild @ $(ts)   mode=$mode  (does the grant survive a cdhash change?)"
-  local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -n 's/.*CDHash=\(.*\)/\1/p' | head -1)"
-  if ! cmd_build "$mode" >/dev/null; then
-    log "[INCONCLUSIVE] rebuild failed; grant result is invalid"
-    return 1
-  fi
-  local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -n 's/.*CDHash=\(.*\)/\1/p' | head -1)"
+  local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  local build_rc=0; cmd_build "$mode" >/dev/null || build_rc=$?
+  local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
   log "cdhash before=$before after=$after"
-  if [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ]; then
-    log "[INCONCLUSIVE] rebuild did not change cdhash, result invalid"
-    return 1
-  fi
   swift_identity
-  local swout; swout="$("$BIN" preflight 2>&1)"
-  local values sr ax; values="$(_preflight_values "$swout")"; sr="${values%% *}"; ax="${values#* }"
-  if [ -z "$values" ] || [ "$sr" = "$values" ]; then
-    log "[INCONCLUSIVE] malformed preflight output: $swout"
-    return 1
-  elif [ "$sr" = "true" ] && [ "$ax" = "true" ]; then
-    log "[PASS] grant SURVIVED rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-    log "       -> this signing mode keeps both grants across rebuilds."
-  elif [ "$sr" = "false" ] && [ "$ax" = "false" ]; then
-    log "[FAIL] grant LOST after rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-    log "       -> this signing mode re-keys TCC on every rebuild; re-grant needed."
-  else
-    log "[INCONCLUSIVE] split grant after rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-    return 1
-  fi
+  local swout values outcome outcome_rc
+  swout="$([ -x "$BIN" ] && "$BIN" preflight 2>&1 || true)"
+  values="$(_preflight_values "$swout")"
+  if outcome="$(classify_rebuild_result "$values" "$before" "$after" "$build_rc")"; then outcome_rc=0; else outcome_rc=$?; fi
+  log "[$([ "$outcome" = SURVIVED ] && echo PASS || echo "$outcome")] grant $outcome after rebuild (mode=$mode): ${values:-malformed}"
+  return "$outcome_rc"
 }
 
 cmd_cert() {
@@ -320,26 +331,38 @@ cmd_agent() {
   local command="${1:-}"; [ -n "$command" ] || { echo "usage: $0 agent <check|capture|grant>"; return 2; }
   need_bin || return 1
   case "$command" in check) command=preflight ;; grant) command=request ;; capture) command=preflight ;; *) echo "unknown agent command: $command"; return 2 ;; esac
-  AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cuspike-agent.XXXXXX")" || return 1
+  AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/com.henry.zeta.cuspike.XXXXXX")" || return 1
   chmod 700 "$AGENT_DIR"
-  cat >"$AGENT_DIR/agent.plist" <<EOF
+  local plist="$AGENT_DIR/com.henry.zeta.cuspike.q4.plist"
+  local wrapper="$AGENT_DIR/com.henry.zeta.cuspike.q4-wrapper.sh"
+  cat >"$wrapper" <<'EOF'
+#!/usr/bin/env bash
+"$1" "$2" >"$3" 2>"$4"
+printf '%s\n' "$?" >"$5"
+EOF
+  chmod 700 "$wrapper"
+  cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$AGENT_LABEL</string>
-<key>ProgramArguments</key><array><string>$BIN</string><string>$command</string></array>
+<key>ProgramArguments</key><array><string>$wrapper</string><string>$BIN</string><string>$command</string><string>$AGENT_DIR/stdout</string><string>$AGENT_DIR/stderr</string><string>$AGENT_DIR/done</string></array>
 <key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>$AGENT_DIR/stdout</string>
 <key>StandardErrorPath</key><string>$AGENT_DIR/stderr</string>
 </dict></plist>
 EOF
   AGENT_ACTIVE=1
-  launchctl bootstrap "gui/$UID" "$AGENT_DIR/agent.plist" || return 1
-  local status=1
+  launchctl bootstrap "gui/$UID" "$plist" || return 1
+  local status=124 done_code
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! launchctl print "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1; then status=0; break; fi
+    if [ -s "$AGENT_DIR/done" ]; then status=0; break; fi
     sleep 1
   done
+  if [ "$status" -eq 0 ]; then
+    done_code="$(cat "$AGENT_DIR/done")"
+    case "$done_code" in 0|[1-9]|[1-9][0-9]) status="$done_code" ;; *) status=125 ;; esac
+  fi
   launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
   AGENT_ACTIVE=0
   cat "$AGENT_DIR/stdout" "$AGENT_DIR/stderr" 2>/dev/null | tee -a "$RESULTS"
@@ -350,23 +373,16 @@ cmd_agent_rebuild() {
   local mode="${1:-adhoc}"; case "$mode" in adhoc|cert) ;; *) echo "usage: $0 agent-rebuild <adhoc|cert>"; return 2 ;; esac
   need_bin || return 1
   local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
-  cmd_build "$mode" >/dev/null || return 1
+  local build_rc=0; cmd_build "$mode" >/dev/null || build_rc=$?
   local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
   log "## agent-rebuild @ $(ts) mode=$mode"
   log "cdhash before=$before after=$after"
-  if [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ]; then
-    log "[INCONCLUSIVE] agent rebuild did not change cdhash"; return 1
-  fi
-  local out values sr ax
+  local out values outcome outcome_rc
   out="$(cmd_agent check 2>&1)"
-  values="$(_preflight_values "$out")"; sr="${values%% *}"; ax="${values#* }"
-  if [ "$sr" = true ] && [ "$ax" = true ]; then
-    log "[PASS] grant SURVIVED agent rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-  elif [ "$sr" = false ] && [ "$ax" = false ]; then
-    log "[FAIL] grant LOST after agent rebuild (mode=$mode): screen_recording=$sr accessibility=$ax"
-  else
-    log "[INCONCLUSIVE] split or malformed agent preflight (mode=$mode): ${values:-$out}"; return 1
-  fi
+  values="$(_preflight_values "$out")"
+  if outcome="$(classify_rebuild_result "$values" "$before" "$after" "$build_rc")"; then outcome_rc=0; else outcome_rc=$?; fi
+  log "[$([ "$outcome" = SURVIVED ] && echo PASS || echo "$outcome")] grant $outcome after agent rebuild (mode=$mode): ${values:-malformed}"
+  return "$outcome_rc"
 }
 
 cmd_agent_status() {
@@ -374,7 +390,7 @@ cmd_agent_status() {
     echo "loaded: $AGENT_LABEL"; return 1
   fi
   echo "not loaded: $AGENT_LABEL"
-  if find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'cuspike-agent.*' -print -quit 2>/dev/null | grep -q .; then
+  if find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'com.henry.zeta.cuspike.*' -print -quit 2>/dev/null | grep -q .; then
     echo "leftover temp dir found"; return 1
   fi
   echo "no leftover temp dir"
