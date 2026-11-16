@@ -224,7 +224,7 @@ class ServeControl:
     @property
     def attached(self) -> bool:
         """This pair is the client's session; a parked pair sends no frame."""
-        return self.server.control is self
+        return self.server.controllers.is_attached(self)
 
     def pair_state(self) -> str:
         state = self.runtime.state

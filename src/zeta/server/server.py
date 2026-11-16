@@ -290,7 +290,7 @@ class ZetaServer:
                 runtime.manager._storage_lease,
                 lambda: (
                     0
-                    if self.runtime.opened is None
+                    if self.controllers.attached().runtime.opened is None
                     else load_settings(home=self.home).settings.retention_days
                 ),
                 session_available=False,
@@ -312,25 +312,31 @@ class ZetaServer:
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
-        self.control = ServeControl(self, runtime, self.foreground_event_publisher)
-        self._bind_pair(self.control)
+        control = ServeControl(self, runtime, self.foreground_event_publisher)
+        self.controllers = SessionControllers(control)
+        self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections)
-        self.controllers = SessionControllers(self)
+
+    @property
+    def control(self) -> ServeControl:
+        """The attached record's control, retained for embedded callers."""
+        return self.controllers.attached().control
 
     @property
     def runtime(self) -> ServerRuntime:
-        return self.control.runtime
+        """The attached record's runtime, retained for embedded callers."""
+        return self.controllers.attached().runtime
 
     def controls(self) -> Iterator[ServeControl]:
         """The attached pair, then every parked pair."""
-        yield self.control
+        yield self.controllers.attached().control
         yield from self.parking.pairs()
 
     def new_pair(self) -> ServeControl:
         """An empty pair beside the attached one; it shares the session manager."""
         self.parking.require_room()
         control = ServeControl(
-            self, self.runtime.sibling(), self.foreground_event_publisher
+            self, self.controllers.attached().runtime.sibling(), self.foreground_event_publisher
         )
         self._bind_pair(control)
         return control
@@ -338,15 +344,19 @@ class ZetaServer:
     def attach(self, incoming: ServeControl) -> None:
         """Make ``incoming`` the attached pair in one step (no await): park the
         outgoing pair while it holds work, else start its close."""
-        outgoing = self.control
-        if not self.parking.unpark(incoming):
+        outgoing = self.controllers.attached().control
+        if self.parking.unpark(incoming):
+            self.controllers.unregister_parked(incoming.runtime.session_id)
+        else:
             # a new pair takes over the controller slot state of the pair it replaces
             incoming._controller_attached = outgoing._controller_attached
-        self.control = incoming
+        self.controllers.attach(incoming)
         assert self.connections is not None
         self.connections.replay_session_replaced()
         if outgoing.runtime.opened is not None:
             self.parking.leave(outgoing)
+            if self.parking.get(outgoing.runtime.session_id) is outgoing:
+                self.controllers.register_parked(outgoing)
 
     async def require_all_idle(self) -> None:
         for control in self.controls():
@@ -368,8 +378,8 @@ class ZetaServer:
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None
         async for event in self._foreground_subscription:
-            await self.control._event(
-                event, session_id=self.runtime.session_id, turn_id=None
+            await self.controllers.attached().control._event(
+                event, session_id=self.controllers.attached().runtime.session_id, turn_id=None
             )
 
     async def _close_foreground_events(self) -> None:
@@ -390,7 +400,7 @@ class ZetaServer:
             await self.connections.publish_feature_event(
                 "zeta_updated",
                 EventDescriptor.ZETA_UPDATED,
-                self.runtime.session_id if self.runtime.opened is not None else None,
+                self.controllers.attached().runtime.session_id if self.controllers.attached().runtime.opened is not None else None,
                 data={"old_revision": old_revision, "new_revision": new_revision},
             )
 
@@ -402,10 +412,10 @@ class ZetaServer:
 
     async def start(self) -> None:
         if not self._borrowed:
-            await self.runtime.initialize_project_registry()
+            await self.controllers.attached().runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(
-            asyncio.get_running_loop(), lambda: self.control.in_flight
+            asyncio.get_running_loop(), lambda: self.controllers.attached().control.in_flight
         )
         if self.port is None:
             if self._prebound_socket is not None:
@@ -438,15 +448,15 @@ class ZetaServer:
             async def publish_retention(projection: dict[str, object]) -> None:
                 if projection.get("mode") == "none" and not projection.get("errors"):
                     return
-                if self.connections is None or self.runtime.opened is None:
+                if self.connections is None or self.controllers.attached().runtime.opened is None:
                     return
                 await self.connections.publish_feature_event(
                     "session_retention", EventDescriptor.SESSION_RETENTION,
-                    self.runtime.opened.metadata.session_id, data=projection,
+                    self.controllers.attached().runtime.opened.metadata.session_id, data=projection,
                 )
 
-            self.runtime.retention_event_sink = publish_retention
-            self.runtime.retention_wake = self._retention_owner.wake
+            self.controllers.attached().runtime.retention_event_sink = publish_retention
+            self.controllers.attached().runtime.retention_wake = self._retention_owner.wake
             self._retention_owner.set_publish(publish_retention)
 
     async def serve_forever(self) -> None:
@@ -472,15 +482,15 @@ class ZetaServer:
             self.parking.close_all(approval_settlement_timeout)
             try:
                 try:
-                    await self.control.close()
+                    await self.controllers.attached().control.close()
                 finally:
                     await self._close_foreground_events()
                 try:
                     if not self._borrowed:
-                        await self.runtime.close()
+                        await self.controllers.attached().runtime.close()
                 finally:
                     try:
-                        await self.control.wait_for_approval_settlement(
+                        await self.controllers.attached().control.wait_for_approval_settlement(
                             approval_settlement_timeout
                         )
                     finally:
@@ -538,7 +548,7 @@ class _Client:
         self.writer = writer
         if server.connections is None:
             server.connections = ConnectionRegistry(
-                asyncio.get_running_loop(), lambda: server.control.in_flight
+                asyncio.get_running_loop(), lambda: server.controllers.attached().control.in_flight
             )
             server.connections.register(self)
         self.connections = server.connections
@@ -570,7 +580,7 @@ class _Client:
         self._client_version: str | None = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
-            home=server.home, runtime=server.runtime, codec=self.codec
+            home=server.home, runtime=server.controllers.attached().runtime, codec=self.codec
         )
 
     async def run(self) -> None:
@@ -926,7 +936,7 @@ class _Client:
                 require_host_binding = "session_host_commands" in self.features
 
                 async def claim() -> bool:
-                    return await self.server.control.controller_claimed(
+                    return await self.server.controllers.attached().control.controller_claimed(
                         reconnect=reconnect,
                         require_host_binding=require_host_binding,
                         deadline=deadline,
@@ -953,7 +963,7 @@ class _Client:
                     require_host_binding=require_host_binding,
                 )
                 if reconnect_bindings is not None:
-                    await self.server.control.reattach_mcp_bindings(
+                    await self.server.controllers.attached().control.reattach_mcp_bindings(
                         *reconnect_bindings
                     )
                 self.server._client_active = True
@@ -993,7 +1003,7 @@ class _Client:
         accepted = (
             [item for item in FEATURES if item in (requested or ())] if extended else []
         )
-        accepted = self.server.runtime.available_project_features(accepted)
+        accepted = self.server.controllers.attached().runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         if "turn_reconnect" in accepted and "approval_reconnect" not in accepted:
@@ -1034,7 +1044,7 @@ class _Client:
         result = hello_result(
             self.protocol_version,
             capabilities,
-            self.server.runtime.project_registry_warning,
+            self.server.controllers.attached().runtime.project_registry_warning,
         )
         if self.server._account_warnings:
             notices = result.setdefault("notices", [])

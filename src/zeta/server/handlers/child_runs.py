@@ -29,7 +29,8 @@ def _page(params: dict[str, Any]) -> tuple[int, int]:
 
 
 async def list_runs(client: Any, params: dict[str, Any]) -> dict[str, object]:
-    runtime = client.server.controllers.owned(client).runtime
+    controller = client.server.controllers.selected(client, params["session_id"])
+    runtime = controller.runtime
     store = validation.active(runtime, params)
     offset, limit = _page(params)
     loop = runtime.loop

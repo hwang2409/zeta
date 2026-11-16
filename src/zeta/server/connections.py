@@ -1039,8 +1039,7 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
-        owned = connection.server.controllers.owned(connection)
-        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        selected = connection.server.controllers.selected(connection, params["session_id"])
         runtime = selected.runtime
         store = validation.active(runtime, params)
         features = history_features(self._connections[connection].features)
@@ -1099,7 +1098,7 @@ class ConnectionRegistry(ReplayOutput):
                 ErrorDescriptor.INVALID_PARAMS,
                 "session_id and run_id are required child history parameters",
             )
-        runtime = connection.server.controllers.owned(connection).runtime
+        runtime = connection.server.controllers.selected(connection, params["session_id"]).runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
@@ -1118,7 +1117,7 @@ class ConnectionRegistry(ReplayOutput):
 
     async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
         # params are validated by the child_run_events handler before begin_replay_join
-        runtime = connection.server.controllers.owned(connection).runtime
+        runtime = connection.server.controllers.selected(connection, params["session_id"]).runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features

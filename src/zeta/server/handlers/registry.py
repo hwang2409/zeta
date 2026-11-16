@@ -102,6 +102,9 @@ async def status(client, request_id, params):
             include_connection_setup_counts=(
                 params.get("include_connection_setup_counts") is True
             ),
+            controller=client.server.controllers.selected(client, session_id)
+            if session_id is not None
+            else client.server.controllers.owned(client),
         )
     return await client.connections.read_status(client, snapshot, session_id)
 
@@ -226,11 +229,12 @@ async def send_images(client, request_id, params):
 
 
 async def path_complete(client, request_id, params):
-    store = validation.active(client.server.controllers.owned(client).runtime, params)
+    controller = client.server.controllers.selected(client, params["session_id"])
+    store = validation.active(controller.runtime, params)
     return await path_completion.complete(
         params,
         base_dir=store.cwd,
-        run_blocking=client.server.controllers.owned(client).control._run_blocking,
+        run_blocking=controller.control._run_blocking,
     )
 
 

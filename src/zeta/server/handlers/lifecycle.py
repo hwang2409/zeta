@@ -487,8 +487,8 @@ def _active_runtime_snapshot(
     return snapshot
 
 
-def session_snapshot(self) -> dict[str, object] | None:
-    runtime = self.server.controllers.owned(self).runtime
+def session_snapshot(self, controller=None) -> dict[str, object] | None:
+    runtime = (controller or self.server.controllers.owned(self)).runtime
     if runtime.opened is None:
         return None
     snapshot = _active_runtime_snapshot(runtime.metadata.to_dict(), runtime.loop)
@@ -497,14 +497,15 @@ def session_snapshot(self) -> dict[str, object] | None:
     return snapshot
 
 
-def session_runtime_state(self) -> str:
-    return self.server.controllers.owned(self).control.pair_state()
+def session_runtime_state(self, controller=None) -> str:
+    return (controller or self.server.controllers.owned(self)).control.pair_state()
 
 
-async def live_status_baseline(self) -> dict[str, object]:
-    pending, truncated = await self.server.controllers.owned(self).control.reconnect_baseline()
+async def live_status_baseline(self, controller=None) -> dict[str, object]:
+    controller = controller or self.server.controllers.owned(self)
+    pending, truncated = await controller.control.reconnect_baseline()
     return {
-        "state": session_runtime_state(self),
+        "state": session_runtime_state(self, controller),
         "pending_approvals": pending,
         "pending_approvals_truncated": truncated,
     }
@@ -515,18 +516,20 @@ async def status(
     *,
     include_connection_setup_counts: bool = False,
     fallback_config: object | None = None,
+    controller=None,
 ) -> dict[str, object]:
-    runtime = self.server.controllers.owned(self).runtime
-    session = session_snapshot(self)
+    controller = controller or self.server.controllers.owned(self)
+    runtime = controller.runtime
+    session = session_snapshot(self, controller)
     reconnect = "approval_reconnect" in self.features
     if reconnect:
-        baseline = await live_status_baseline(self)
+        baseline = await live_status_baseline(self, controller)
         state = baseline["state"]
         pending_approvals = baseline["pending_approvals"]
         pending_approvals_truncated = baseline["pending_approvals_truncated"]
     else:
-        state = session_runtime_state(self)
-        pending_approvals = await self.server.controllers.owned(self).control.pending_approvals()
+        state = session_runtime_state(self, controller)
+        pending_approvals = await controller.control.pending_approvals()
         pending_approvals_truncated = None
     loop = runtime.loop
     if loop is None and fallback_config is None:

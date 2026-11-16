@@ -191,13 +191,13 @@ class ReplayOutput:
             return self.child_runs.live_store(scope.value)
         for connection in self._connections:
             if self.replay.scope_for(connection) == scope:
-                runtime = connection.server.runtime
+                runtime = connection.server.controllers.selected(connection, scope.value).runtime
                 if runtime.opened is not None and runtime.session_id == scope.value:
                     return runtime.opened.store
         return None
 
     async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        runtime = connection.server.runtime
+        runtime = connection.server.controllers.selected(connection, scope.value).runtime
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
@@ -568,7 +568,7 @@ class ReplayOutput:
         history_validator: object | None = None,
     ) -> tuple[dict[str, object], int, str | None]:
         """Read the newest history page and its stable frontier row off-loop."""
-        store = validation.active(connection.server.runtime, {"session_id": session_id})
+        store = validation.active(connection.server.controllers.selected(connection, session_id).runtime, {"session_id": session_id})
         pinned = SimpleNamespace(opened=SimpleNamespace(store=store))
         features = history_features(self._connections[connection].features)
         def read() -> tuple[dict[str, object], int, str | None]:
