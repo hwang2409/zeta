@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import threading
-import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -478,8 +477,8 @@ def _real_values() -> list:
     cases += [("tool_span", "name", name, "zeta.tool.name") for name in ("bash", "web_search", "filesystem__read_file")]
     cases += [("tool_span", "tool_type", kind, "zeta.tool.type") for kind in ("function", "computer", "mcp", "agent")]
     cases += [("agent_span", "agent_name", name, "zeta.agent.name") for name in ("worker", "ux-tester")]
-    cases += [("turn_span", "conversation_id", uuid.uuid4().hex, "gen_ai.conversation.id")]
-    call_ids = ("toolu_01A09q90qw90lq917835lq9", "call_abc123XYZ", "fc_68a1b2c3d4e5", f"ollama-{uuid.uuid4()}", f"inline-{uuid.uuid4().hex}")
+    cases += [("turn_span", "conversation_id", "0123456789abcdef0123456789abcdef", "gen_ai.conversation.id")]
+    call_ids = ("toolu_01A09q90qw90lq917835lq9", "call_abc123XYZ", "fc_68a1b2c3d4e5", "ollama-01234567-89ab-cdef-0123-456789abcdef", "inline-0123456789abcdef0123456789abcdef")
     cases += [("tool_span", "call_id", call_id, "zeta.tool.call.id") for call_id in call_ids]
     return [pytest.param(*case, id=f"{case[0]}-{case[1]}-{case[2]}") for case in cases]
 
