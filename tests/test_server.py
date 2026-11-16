@@ -4857,7 +4857,8 @@ async def test_serve_client_without_reset_optin_keeps_post_stream_retry_off(
 @pytest.mark.asyncio
 async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
     client = object.__new__(ServeControl)
-    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    client.server = SimpleNamespace()
+    client.runtime = SimpleNamespace(state=None)
     notifications: list[tuple[str, dict[str, object]]] = []
 
     async def notify(event: str, session_id: str | None, **fields: object) -> None:
@@ -4897,7 +4898,8 @@ async def test_serve_emits_assistant_reset_before_retry_deltas() -> None:
 @pytest.mark.asyncio
 async def test_serve_maps_tool_output_limit_recovery_and_error() -> None:
     client = object.__new__(ServeControl)
-    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    client.server = SimpleNamespace()
+    client.runtime = SimpleNamespace(state=None)
     notifications: list[tuple[str, dict[str, object]]] = []
 
     async def notify(event: str, session_id: str | None, **fields: object) -> None:
@@ -4976,7 +4978,8 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        SimpleNamespace(),
+        SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )
 
@@ -12516,7 +12519,8 @@ async def test_serve_limit_event_and_switch_action(tmp_path: Path) -> None:
         )
     await asyncio.to_thread(AccountStore(home).set_default, first)
     client = object.__new__(ServeControl)
-    client.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    client.server = SimpleNamespace()
+    client.runtime = SimpleNamespace(state=None)
     notifications: list[tuple[str, dict[str, object]]] = []
 
     async def notify(event: str, session_id: str | None, **fields: object) -> None:
@@ -13226,7 +13230,8 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     policy_store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        SimpleNamespace(),
+        SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []
@@ -13300,7 +13305,8 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     policy_store = ConversationStore(tmp_path / "serve")
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(runtime=SimpleNamespace(policy=policy, state=None)),
+        SimpleNamespace(),
+        SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )
     notifications: list[tuple[str, dict[str, object]]] = []

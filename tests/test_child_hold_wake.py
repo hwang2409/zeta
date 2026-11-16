@@ -180,9 +180,9 @@ class HeldTree:
 async def _serve_frames(event: StreamEvent) -> list[tuple[str, dict[str, object]]]:
     control = object.__new__(ServeControl)
     control.server = SimpleNamespace(
-        runtime=SimpleNamespace(state=None),
         notification_presentations=NotificationPresentation(),
     )
+    control.runtime = SimpleNamespace(state=None)
     control._protocol_version = lambda: "1.2"
     frames: list[tuple[str, dict[str, object]]] = []
 

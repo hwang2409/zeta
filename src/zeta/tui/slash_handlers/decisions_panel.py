@@ -374,7 +374,7 @@ class DecisionsMixin:
         if self._decisions_panel_open:
             self._decisions_panel.set_items(items, staged)
             self._decisions_panel_control.set_lines(
-                self._decisions_panel.render_lines(),
+                self._decisions_panel.render_lines(loading=self.overlay_loading),
                 keep_offset=True,
                 overflow_hint=True,
             )
@@ -412,27 +412,36 @@ class DecisionsMixin:
         async with self._decisions_ops_lock:
             return await asyncio.to_thread(operation, *args, **kwargs)
 
-    def open_decisions_panel(self) -> asyncio.Task[None]:
-        return asyncio.create_task(self._open_decisions_panel())
+    def open_decisions_panel(self) -> asyncio.Future[None] | None:
+        return self._open_overlay(
+            self._show_decisions_panel,
+            self._load_decisions_panel,
+            on_loaded=self._refresh_decisions_panel,
+        )
 
     async def _open_decisions_panel(self) -> None:
+        load = self.open_decisions_panel()
+        if load is not None:
+            await load
+
+    def _show_decisions_panel(self) -> bool:
         session = self._active_session
-        if not isinstance(session, FullScreenPromptSession):
-            return
-        await self._recover_decisions(self._decisions_session_id)
-        await self._decisions_tick()
-        if self._decisions_panel_open:
-            return
+        if not isinstance(session, FullScreenPromptSession) or self._decisions_panel_open:
+            return False
         buffer = session.default_buffer
         self._decisions_restore_text = buffer.text
         self._decisions_restore_cursor = buffer.cursor_position
         self._decisions_panel_open = True
         self._decisions_panel_control.set_lines(
-            self._decisions_panel.render_lines(), overflow_hint=True
+            self._decisions_panel.render_lines(loading=True), overflow_hint=True
         )
         session.layout.focus(self._decisions_panel_window)
+        return True
+
+    async def _load_decisions_panel(self) -> None:
+        await self._recover_decisions(self._decisions_session_id)
+        await self._decisions_tick()
         self.request_decisions_refresh()
-        self._invalidate_prompt()
 
     def close_decisions_panel(self) -> None:
         if not self._decisions_panel_open:
@@ -473,6 +482,9 @@ class DecisionsMixin:
 
     def _decisions_key(self, key: str) -> None:
         panel = self._decisions_panel
+        if self.overlay_loading and key != "escape":
+            # No answer or dismiss on decisions that are still being recovered.
+            return
         if key == "pageup":
             self._decisions_panel_control.page(-1)
         elif key == "pagedown":
@@ -537,7 +549,7 @@ class DecisionsMixin:
         if not self._decisions_panel_open:
             return
         self._decisions_panel_control.set_lines(
-            self._decisions_panel.render_lines(),
+            self._decisions_panel.render_lines(loading=self.overlay_loading),
             keep_offset=keep_offset,
             overflow_hint=True,
         )
@@ -596,7 +608,11 @@ class DecisionsMixin:
 
     def _discuss_selected(self) -> None:
         item = self._decisions_panel.selected
-        if item is None or self._decisions_switching:
+        if (
+            item is None
+            or self._decisions_switching
+            or self._reject_during_startup_replay("discussion")
+        ):
             return
         self._decisions_switching = True
         source_id, attention_id = item.session_id, item.record.id
