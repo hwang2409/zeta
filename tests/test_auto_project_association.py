@@ -142,7 +142,9 @@ def test_tui_startup_retries_busy_registry_and_links_project(
         original(fd)
 
     # test-contract: seam patch the real identity lock for deterministic contention
-    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
+    monkeypatch.setattr(
+        ProjectRegistry, "_acquire_identity_lock", staticmethod(acquire)
+    )
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     try:
         metadata = SessionManager(tmp_path / "zeta-home").read_metadata(
@@ -165,7 +167,9 @@ def test_tui_busy_registry_notice_renders(
         raise ProjectRegistryBusyError()
 
     # test-contract: seam patch the real identity lock for deterministic contention
-    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
+    monkeypatch.setattr(
+        ProjectRegistry, "_acquire_identity_lock", staticmethod(acquire)
+    )
     app = create_app(build_parser().parse_args(["--provider", "codex"]))
     app.console = Console(file=StringIO())
     try:
@@ -191,7 +195,9 @@ def test_busy_registry_retries_project_discovery(
         original(fd)
 
     # test-contract: seam force a bounded busy-lock interleaving
-    monkeypatch.setattr(ProjectRegistry, "_acquire_identity_lock", acquire)
+    monkeypatch.setattr(
+        ProjectRegistry, "_acquire_identity_lock", staticmethod(acquire)
+    )
     opened = m.create(provider="codex", model="test", cwd=root)
     try:
         assert opened.metadata.project_id is not None
