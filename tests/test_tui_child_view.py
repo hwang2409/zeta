@@ -928,3 +928,73 @@ async def test_child_keeps_every_top_row_across_park_and_reentry(
         f"child-sweep: {len(misses)} of {rows_checked} top rows moved:\n- "
         + "\n- ".join(misses[:8])
     )
+
+
+@pytest.mark.asyncio
+async def test_child_source_validates_its_log_once_across_reads(
+    child_view_fixture: ChildViewHome, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a child store validates the whole log; each read only refreshes it."""
+
+    from zeta.tui.transcript import child_history_source
+
+    opened: list[ConversationStore] = []
+
+    class CountingStore(ConversationStore):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    # test-contract: seam count store opens behind the source's page reads
+    monkeypatch.setattr(child_history_source, "ConversationStore", CountingStore)
+    source = child_history_source.ChildLogHistorySource(child_view_fixture.child_path)
+    try:
+        newest = await source.page()
+        older = await source.page(newest.older)
+        await source.reveal(older.segments[0].units[0].entry_id)
+        await source.search("child", limit=1)
+        assert len(opened) == 1, (
+            f"child source opened {len(opened)} stores for 4 reads of an unchanged log"
+        )
+    finally:
+        await source.close()
+    assert all(store.closed for store in opened), "child source left its store open"
+
+
+def test_bounded_text_scans_each_character_a_bounded_number_of_times() -> None:
+    """A many-line tool result is split in one pass, not one scan per line."""
+
+    from zeta.tui.agent_view_state import _bounded_text
+
+    scanned = 0
+
+    class CountingText(str):
+        def find(self, sub: str, start: int = 0, *rest: int) -> int:  # type: ignore[override]
+            nonlocal scanned
+            hit = str.find(self, sub, start, *rest)
+            scanned += (hit + 1 if hit >= 0 else len(self)) - start
+            return hit
+
+    text = CountingText(("\n" + "h" * 99) * 2_000)
+    assert _bounded_text(text) == _bounded_text(str(text))
+    assert scanned <= 3 * len(text), (
+        f"split scanned {scanned} characters of a {len(text)}-character text"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "lines"),
+    [
+        ("", [""]),
+        ("a\r\nb", ["a", "b"]),
+        ("a\rb\nc", ["a", "b", "c"]),
+        ("a\n\rb", ["a", "", "b"]),
+        ("a\r", ["a"]),
+        ("\r\n\r\n", ["", ""]),
+        ("a\n\nb\n", ["a", "", "b"]),
+    ],
+)
+def test_text_lines_splits_on_cr_lf_and_crlf(text: str, lines: list[str]) -> None:
+    from zeta.tui.agent_view_state import _text_lines
+
+    assert list(_text_lines(text)) == lines
