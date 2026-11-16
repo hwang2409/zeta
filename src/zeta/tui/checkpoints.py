@@ -644,21 +644,23 @@ class CheckpointTranscriptMixin:
             self.loop.store.active_branch_head_id(),
         )
         # A finder search typed during startup may have revealed the place the
-        # user moved to: the first page must not replace it. Only history pages
-        # count; lines printed during startup are live rows, not a place.
-        if not (
-            self._startup_replay_active
-            and any(
-                not descriptor.key.startswith("live:")
-                for descriptor in self._agent_navigation.transcript_control.history_pager.descriptors
-            )
-        ):
+        # user moved to: the first page must not replace it. Lines printed
+        # during startup are live rows, not a place.
+        if not (self._startup_replay_active and self._history_pages_resident()):
             await self._load_transcript_page(reset=True)
         if self._exit_requested:
             return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
+
+    def _history_pages_resident(self) -> bool:
+        """True once a page of stored history is resident; live rows do not count."""
+
+        return any(
+            not descriptor.key.startswith("live:")
+            for descriptor in self._agent_navigation.transcript_control.history_pager.descriptors
+        )
 
     async def _load_transcript_page(
         self,

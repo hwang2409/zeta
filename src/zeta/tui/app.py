@@ -915,7 +915,7 @@ class TUIApp(
             FinderRuntimeMixin._finder_loading(self)
             or (task is not None and not task.done())
             # Startup has not drawn the first history page: its rows are coming.
-            or (self._startup_replay_active and not control.history_pager.descriptors)
+            or (self._startup_replay_active and not self._history_pages_resident())
         )
 
     def _end_history_search(self) -> None:
