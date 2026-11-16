@@ -123,7 +123,7 @@ def test_runtime_guard_rejects_finder_attribute_probes() -> None:
         _assert_runtime_finder_contract(mutated)
 
 
-def _finder(history: SessionPromptHistory, path: str, *, on_accept=None) -> HistoryFinder:
+def _finder(history: SessionPromptHistory, path: Path, *, on_accept=None) -> HistoryFinder:
     return HistoryFinder(lambda: history.snapshot(path), on_accept=on_accept)
 
 
@@ -150,20 +150,21 @@ def test_candidates_are_newest_first_deduplicated_and_multiline() -> None:
 
 def test_session_history_is_scoped_and_navigation_restores_draft() -> None:
     history = SessionPromptHistory()
-    history.replace("a", ("a one", "a two"))
-    assert history.older("a", Document("draft")).text == "a two"
-    assert history.older("a", Document("a two")).text == "a one"
-    history.replace("b", ("b one",))
-    assert history.older("b", Document("draft")).text == "b one"
-    assert history.newer("b").text == "draft"
+    history.append(Path("a"), "a one")
+    history.append(Path("a"), "a two")
+    assert history.older(Path("a"), Document("draft")).text == "a two"
+    assert history.older(Path("a"), Document("a two")).text == "a one"
+    history.append(Path("b"), "b one")
+    assert history.older(Path("b"), Document("draft")).text == "b one"
+    assert history.newer(Path("b")).text == "draft"
 
 
 @pytest.mark.asyncio
 async def test_finder_uses_viewed_session_snapshot() -> None:
     history = SessionPromptHistory()
-    history.replace("a", ("a prompt",))
-    history.replace("b", ("b prompt",))
-    finder = _finder(history, "b")
+    history.append(Path("a"), "a prompt")
+    history.append(Path("b"), "b prompt")
+    finder = _finder(history, Path("b"))
     await _open(finder, Buffer())
     state = finder.finder_state()
     assert state is not None
@@ -173,10 +174,10 @@ async def test_finder_uses_viewed_session_snapshot() -> None:
 @pytest.mark.asyncio
 async def test_accept_and_cancel_preserve_draft() -> None:
     history = SessionPromptHistory()
-    history.replace("a", ("selected prompt",))
+    history.append(Path("a"), "selected prompt")
     buffer = Buffer()
     buffer.text = ""
-    finder = _finder(history, "a")
+    finder = _finder(history, Path("a"))
     await _open(finder, buffer)
     assert finder.finder_accept()
     assert buffer.text == "selected prompt"
@@ -184,7 +185,7 @@ async def test_accept_and_cancel_preserve_draft() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_history_renders_empty_state() -> None:
-    finder = _finder(SessionPromptHistory(), "missing")
+    finder = _finder(SessionPromptHistory(), Path("missing"))
     await _open(finder, Buffer())
     content = FinderControl(finder.finder_state, OverlayTextField("TEST_FINDER")).create_content(80, 20)
     rendered = "".join(

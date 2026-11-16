@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any, Literal, Protocol
 
+from ...core.store._history_index import StaleHistorySnapshot
+
 logger = logging.getLogger(__name__)
 
 
@@ -173,6 +175,16 @@ class PagedTranscriptHistory:
     def set_anchor(self, entry_id: str, unit_ordinal: int, text_offset: int) -> None:
         self._anchor = (entry_id, unit_ordinal, text_offset)
 
+    def cancel_pending(self) -> tuple[asyncio.Task[TUIHistoryPage], ...]:
+        """Cancel reads without dropping the active resident pages."""
+
+        self.generation += 1
+        tasks = tuple(self._loads.values())
+        for task in tasks:
+            task.cancel()
+        self._loads.clear()
+        return tasks
+
     async def close(self) -> None:
         """Invalidate publication without waiting for executor-backed reads."""
 
@@ -300,9 +312,23 @@ class PagedTranscriptHistory:
             task = asyncio.create_task(source.page(cursor, direction=direction))
             self._loads[key] = task
             try:
-                page = await task
-            finally:
-                self._loads.pop(key, None)
+                try:
+                    page = await task
+                finally:
+                    self._loads.pop(key, None)
+            except StaleHistorySnapshot:
+                if generation != self.generation or source is not self.source:
+                    return TUIHistoryPage(())
+                anchor = self._anchor
+                self.reset()
+                self._anchor = anchor
+                page = (
+                    await source.reveal(anchor[0])
+                    if anchor is not None
+                    else await source.page()
+                )
+                self.adopt(page)
+                return page
             if generation != self.generation:
                 return TUIHistoryPage(())
             if cursor != (self._older if direction == "older" else self._newer):

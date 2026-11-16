@@ -207,7 +207,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         )
         self._revision = 0
         self._next_key = 0
-        self._scroll_generation = 0
         self._history_entry_id: str | None = None
         self._history_unit_ordinal = 0
         self._follow_tail = True
@@ -409,6 +408,8 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._line_locations.clear()
         self._locations_cache.clear()
         self._anchor = None
+        self._virtual_start = None
+        self._pending_virtual_scroll = 0
         self._user_units.clear()
         self._user_unit_set.clear()
         self._search_cache.clear()
@@ -600,6 +601,16 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         return self._scroll_offset
 
     @property
+    def at_resident_top(self) -> bool:
+        """Whether the first resident row is the top row the user sees."""
+
+        if self._uses_virtual_history():
+            # Only a frame or a jump places a virtual view; clear() and anchor
+            # restores leave a stale line number behind (CI 43788114830).
+            return self._virtual_start == (0, 0)
+        return self._scroll_offset == 0
+
+    @property
     def scroll_anchor(self) -> tuple[_TranscriptUnit | None, int]:
         """Return the current opaque unit anchor and its text offset."""
 
@@ -608,30 +619,24 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         return self._anchor
 
     @property
-    def scroll_generation(self) -> int:
-        return self._scroll_generation
-
-    @property
     def durable_scroll_anchor(self) -> tuple[str, int, int] | None:
         if self._anchor is None or self._anchor[0] is None:
             return None
         unit, text_offset = self._anchor
-        if unit.history_identity is None and unit in self._unit_set:
-            # A spacer line has no durable identity: anchor on the row after it.
-            index = self._units.index(unit)
-            unit = next(
-                (
-                    later
-                    for later in self._units[index + 1 :]
-                    if later is not None and later.history_identity is not None
-                ),
-                unit,
-            )
-            text_offset = 0
-        identity = unit.history_identity
-        if identity is None:
+        if unit.history_identity is not None:
+            return (*unit.history_identity, text_offset)
+        if unit not in self._unit_set:
             return None
-        return identity[0], identity[1], text_offset
+        # Separators and other rows without identity are named by the nearest
+        # identified unit: -n means n units before the next one (ux r5 M7).
+        index = self._units.index(unit)
+        for distance, later in enumerate(self._units[index + 1 :], start=1):
+            if later is not None and later.history_identity is not None:
+                return (*later.history_identity, -distance)
+        for earlier in reversed(self._units[:index]):
+            if earlier is not None and earlier.history_identity is not None:
+                return (*earlier.history_identity, 0)
+        return None
 
     def restore_scroll_anchor(self, unit: _TranscriptUnit, text_offset: int) -> None:
         """Restore a non-tail viewport anchor after transcript reconstruction."""
@@ -651,8 +656,15 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         """Restore a viewport anchor after durable rows are reconstructed."""
 
         entry_id, unit_ordinal, text_offset = anchor
-        for unit in self._units:
+        for index, unit in enumerate(self._units):
             if unit is not None and unit.history_identity == (entry_id, unit_ordinal):
+                # Step back over the rows without identity that -n names.
+                while text_offset < 0 and index:
+                    previous = self._units[index - 1]
+                    if previous is None or previous.history_identity is not None:
+                        break
+                    index, unit, text_offset = index - 1, previous, text_offset + 1
+                text_offset = max(0, text_offset)
                 self.restore_scroll_anchor(unit, text_offset)
                 return True
         return False
@@ -669,7 +681,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def _scroll_by(self, amount: int) -> None:
         if self._follow_tail and amount >= 0:
             return
-        self._scroll_generation += 1
         if self._uses_virtual_history():
             self._pending_virtual_scroll += amount
             if amount < 0:
@@ -703,7 +714,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_top(self) -> None:
         """Move to the first transcript line without materializing all history."""
 
-        self._scroll_generation += 1
         self._follow_tail = False
         self._pending_virtual_scroll = 0
         if self._uses_virtual_history():
@@ -716,7 +726,6 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def scroll_to_bottom(self) -> None:
         """Resume following the live transcript tail."""
 
-        self._scroll_generation += 1
         self._follow_tail = True
         self._anchor = None
         self._pending_virtual_scroll = 0
