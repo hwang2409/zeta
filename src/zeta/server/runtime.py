@@ -341,6 +341,10 @@ class ServerRuntime:
         return self._state.opened if self._state is not None else None
 
     @property
+    def extensions(self) -> ExtensionHost | None:
+        return self._state.extensions if self._state is not None else None
+
+    @property
     def loop(self) -> AgentLoop | None:
         return self._state.loop if self._state is not None else None
 
