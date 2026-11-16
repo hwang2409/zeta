@@ -211,6 +211,16 @@ class WebSocketConnection:
         self._close_task: asyncio.Task[None] | None = None
         self.transport = connection.transport
         self.max_role = getattr(connection, "max_role", "controller")
+        # Diagnostics captured once at accept (no behavior change): the remote
+        # address and the request User-Agent, so a refusal log can name the page.
+        request = getattr(connection, "request", None)
+        headers = getattr(request, "headers", None)
+        try:
+            self.user_agent = headers.get("User-Agent") if headers is not None else None
+        except MultipleValuesError:
+            self.user_agent = None
+        remote = getattr(connection, "remote_address", None)
+        self.remote_address = f"{remote[0]}:{remote[1]}" if remote else None
 
     async def read(self, _size: int) -> bytes:
         try:
