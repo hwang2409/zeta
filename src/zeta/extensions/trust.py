@@ -28,18 +28,9 @@ class ExtensionTrustError(ValueError):
     """An extension could not be installed or trusted."""
 
 
-def fingerprint(directory: str | Path) -> str:
-    root = Path(directory)
-    try:
-        if stat.S_ISLNK(root.lstat().st_mode):
-            raise ExtensionTrustError(f"extension tree is a symlink: {root}")
-        root = root.resolve(strict=True)
-    except OSError as exc:
-        raise ExtensionTrustError(f"cannot inspect extension tree: {root}") from exc
-    digest = hashlib.sha256()
-    count = 0
-    total = 0
+def _regular_files(root: Path):
     pending = [root]
+    count = 0
     while pending:
         current = pending.pop()
         try:
@@ -61,28 +52,41 @@ def fingerprint(directory: str | Path) -> str:
             count += 1
             if count > _MAX_FILES:
                 raise ExtensionTrustError(f"extension tree exceeds {_MAX_FILES} files")
-            relative = Path(entry.path).relative_to(root).as_posix().encode()
-            digest.update(len(relative).to_bytes(8, "big"))
-            digest.update(relative)
-            try:
-                fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW)
-            except OSError as exc:
-                raise ExtensionTrustError(f"cannot open extension file: {entry.path}") from exc
-            file_total = 0
-            try:
-                while True:
-                    chunk = os.read(fd, 1024 * 1024)
-                    if not chunk:
-                        break
-                    file_total += len(chunk)
-                    total += len(chunk)
-                    if file_total > _MAX_FILE_BYTES or total > _MAX_TOTAL_BYTES:
-                        raise ExtensionTrustError(
-                            f"extension tree exceeds {_MAX_TOTAL_BYTES} byte limit"
-                        )
-                    digest.update(chunk)
-            finally:
-                os.close(fd)
+            yield Path(entry.path)
+
+
+def _hash_file(path: Path, relative: bytes, digest: hashlib._Hash, total: int, max_total_bytes: int) -> int:
+    digest.update(len(relative).to_bytes(8, "big"))
+    digest.update(relative)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ExtensionTrustError(f"cannot open extension file: {path}") from exc
+    file_total = 0
+    try:
+        while chunk := os.read(fd, 1024 * 1024):
+            file_total += len(chunk)
+            total += len(chunk)
+            if file_total > _MAX_FILE_BYTES or total > max_total_bytes:
+                raise ExtensionTrustError(f"extension tree exceeds {max_total_bytes} byte limit")
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+    return total
+
+
+def fingerprint(directory: str | Path, *, max_total_bytes: int = _MAX_TOTAL_BYTES) -> str:
+    root = Path(directory)
+    try:
+        if stat.S_ISLNK(root.lstat().st_mode):
+            raise ExtensionTrustError(f"extension tree is a symlink: {root}")
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ExtensionTrustError(f"cannot inspect extension tree: {root}") from exc
+    digest = hashlib.sha256()
+    total = 0
+    for path in _regular_files(root):
+        total = _hash_file(path, path.relative_to(root).as_posix().encode(), digest, total, max_total_bytes)
     return digest.hexdigest()
 
 
@@ -141,13 +145,21 @@ def _root(home: str | Path, project_dir: str | Path | None, scope: str) -> Path:
 def _resolve(root: Path, name: str) -> Path:
     if not _NAME_RE.fullmatch(name) or Path(name).is_absolute() or Path(name).name != name:
         raise ExtensionTrustError(f"invalid extension name: {name}")
+    candidate = root / name
     try:
+        try:
+            if stat.S_ISLNK(candidate.lstat().st_mode):
+                raise ExtensionTrustError(f"extension path is a symlink: {name}")
+        except FileNotFoundError:
+            pass
         root_real = root.resolve(strict=False)
-        target = (root / name).resolve(strict=False)
+        target = candidate.resolve(strict=False)
         target.relative_to(root_real)
+    except ExtensionTrustError:
+        raise
     except (OSError, ValueError) as exc:
         raise ExtensionTrustError(f"extension path escapes root: {name}") from exc
-    return target
+    return candidate
 
 
 def _source_git(source: str) -> tuple[str, str] | None:
@@ -262,6 +274,10 @@ def update(name: str, *, home: str | Path, project_dir: str | Path | None, scope
         fingerprint(staged)
         fingerprint(target)
         manifest = _manifest(staged)
+        if manifest.name != name:
+            raise ExtensionTrustError(
+                f"update manifest name {manifest.name!r} does not match installed name {name!r}"
+            )
         _review(manifest, staged, current=target, action="update", accept=accept, confirm=confirm)
         shutil.rmtree(target)
         shutil.move(str(staged), target)

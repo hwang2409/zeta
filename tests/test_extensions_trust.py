@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import marshal
 import subprocess
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from zeta.extensions.trust import (
     fingerprint,
     install,
     is_trusted,
+    remove,
     set_trusted,
     trust,
     update,
@@ -46,6 +49,11 @@ async def test_project_scope_trusted_fingerprint_allows_load(tmp_path: Path) -> 
     home = tmp_path / "home"
     project = tmp_path / "project"
     extension = _extension(project / ".zeta" / "extensions" / "demo")
+    set_trusted(home, "project", "demo", extension, True)
+    pyc = extension / "__pycache__" / "mod.cpython-313.pyc"
+    pyc.parent.mkdir()
+    bad_code = compile("raise AssertionError('pyc executed')", str(pyc), "exec")
+    pyc.write_bytes(importlib.util.MAGIC_NUMBER + b"\0" * 12 + marshal.dumps(bad_code))
     set_trusted(home, "project", "demo", extension, True)
     (tmp_path / "cwd").mkdir()
     registry = ToolRegistry(tmp_path / "cwd", skill_catalog=SkillCatalog.empty())
@@ -93,6 +101,9 @@ def test_management_name_cannot_escape_root(tmp_path: Path) -> None:
         pytest.skip("symlinks unavailable")
     with pytest.raises(ExtensionTrustError):
         trust(home=home, project_dir=None, scope="user", name="link", accept=True)
+    with pytest.raises(ExtensionTrustError):
+        remove(home=home, project_dir=None, scope="user", name="link")
+    assert (root / "demo").is_dir()
 
 
 def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path) -> None:
@@ -136,3 +147,12 @@ def test_git_install_requires_review_and_pins_commit(tmp_path: Path) -> None:
     assert (home / "extensions" / name / ".zeta-extension-git.json").exists()
     with pytest.raises(ExtensionTrustError, match="cancelled"):
         update(name, home=home, project_dir=None, scope="user", confirm=lambda _: "n")
+    (source / "zeta-extension.toml").write_text(
+        '[extension]\nname = "other"\nversion = "1"\napi_version = 1\nentry = "mod:activate"\n', encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "rename"], check=True)
+    subprocess.run(["git", "-C", str(source), "push", "--quiet", str(bare), "HEAD:master"], check=True)
+    with pytest.raises(ExtensionTrustError, match="does not match"):
+        update(name, home=home, project_dir=None, scope="user", accept=True)
+    assert (home / "extensions" / name).is_dir()
