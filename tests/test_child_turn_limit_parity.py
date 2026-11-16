@@ -110,6 +110,7 @@ async def _unset_child_snapshot(
         release_nested.set()
         return await orig_wait_for_finish(*args, **kwargs)
 
+    # test-contract: seam release the nested child after the finish-gate notice turn
     monkeypatch.setattr(finish_gate_module, "_wait_for_finish", wait_for_finish)
     catalog = AgentCatalog(
         (
