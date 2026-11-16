@@ -1,0 +1,175 @@
+"""A page that closes its socket during a join reply must free the controller slot."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
+from tests.support.replay_transport import (
+    ReplayClient,
+    Transport,
+    connect_replay,
+    negotiate,
+    replay_server,
+)
+from zeta.server import ZetaServer
+from zeta.server.server import _Client
+
+pytest_plugins = ("tests.support.socket_fixtures",)
+
+JOIN_REPLY = b'"id":3'
+
+
+def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[FakeBackend, str]:
+    del provider, home
+    return FakeBackend([]), model or "offline"
+
+
+async def _started(tmp_path: Path, transport: Transport) -> tuple[ZetaServer, ReplayClient, str]:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    client = await connect_replay(server, transport)
+    await negotiate(client)
+    created = await client.request(2, "new_session", {"provider": "codex"})
+    return server, client, created["result"]["session"]["session_id"]
+
+
+@contextlib.asynccontextmanager
+async def _closing(
+    server: ZetaServer, client: ReplayClient, resume: asyncio.Event | None = None
+) -> AsyncIterator[None]:
+    try:
+        yield
+    except BaseException:
+        if resume is not None:
+            resume.set()
+        await client.close()
+        # the bug also wedges server close: keep the first failure as the report
+        with contextlib.suppress(Exception, pytest.fail.Exception):
+            await await_or_fail(server.close(), what="server close after a failure")
+        raise
+    await client.close()
+    await await_or_fail(server.close(), what="server close")
+
+
+def _watch_release(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    assert server.connections is not None
+    connection, released = server._client, asyncio.Event()
+    original = server.connections.release
+
+    def release(target: Any) -> None:
+        original(target)
+        if target is connection:
+            released.set()
+
+    # test-contract: seam observe the real connection release after its transport closes
+    monkeypatch.setattr(server.connections, "release", release)
+    return released
+
+
+async def _assert_new_controller(server: ZetaServer, transport: Transport) -> None:
+    replacement = await connect_replay(server, transport)
+    try:
+        hello = await negotiate(replacement)
+        assert "error" not in hello, f"the old connection kept the controller slot: {hello}"
+    finally:
+        await replacement.close()
+
+
+def _hold_join_reply(monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the join reply's physical write until the test resumes it."""
+    entered, resume = asyncio.Event(), asyncio.Event()
+    original = _Client._write_physical
+
+    async def gated(target: _Client, payload: bytes) -> bool:
+        if JOIN_REPLY in payload and not entered.is_set():
+            entered.set()
+            await await_or_fail(resume.wait(), what="resume the join reply write")
+        return await original(target, payload)
+
+    # test-contract: seam hold the join reply write at the frame write
+    monkeypatch.setattr(_Client, "_write_physical", gated)
+    return entered, resume
+
+
+async def _assert_released_and_reusable(
+    server: ZetaServer, transport: Transport, output: Any, released: asyncio.Event
+) -> None:
+    await await_or_fail(released.wait(), what="old connection released its controller slot")
+    assert (output.retained_bytes, output.retained_frames) == (0, 0)
+    assert server.connections is not None
+    assert (server.connections.replay._bytes, server.connections.replay._records) == (0, 0)
+    await _assert_new_controller(server, transport)
+
+
+@pytest.mark.asyncio
+async def test_page_close_during_join_reply_releases_controller_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A browser reload: the socket closes while the join reply is written, so the
+    write raises (websockets' ConnectionClosed), the writer's exception branch."""
+    server, client, session_id = await _started(tmp_path, "websocket")
+    assert server.connections is not None
+    owner = server._client
+    output = server.connections._connections[owner].output
+    released = _watch_release(server, monkeypatch)
+    entered, resume = _hold_join_reply(monkeypatch)
+    async with _closing(server, client, resume):
+        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+        await await_or_fail(entered.wait(), what="join reply write started")
+        await client.close()
+        # test-contract: seam wait until serve's websocket saw the close, so the held write fails
+        await await_or_fail(owner.writer._connection.wait_closed(), what="serve saw the close")
+        resume.set()
+        await _assert_released_and_reusable(server, "websocket", output, released)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+async def test_cancelled_join_reply_write_releases_controller_slot(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The join reply's write task is cancelled (the writer's cancel branch)."""
+    server, client, session_id = await _started(tmp_path, transport)
+    assert server.connections is not None
+    owner = server._client
+    output = server.connections._connections[owner].output
+    released = _watch_release(server, monkeypatch)
+    entered, resume = _hold_join_reply(monkeypatch)
+    async with _closing(server, client, resume):
+        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+        await await_or_fail(entered.wait(), what="join reply write started")
+        assert output.current_write is not None
+        # test-contract: seam cancel the in-flight frame write, as a write owner close does
+        output.current_write.cancel()
+        await _assert_released_and_reusable(server, transport, output, released)
+
+
+@pytest.mark.asyncio
+async def test_output_writer_failure_closes_connection_and_releases_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any unexpected exception in the output writer closes the connection."""
+    server, client, session_id = await _started(tmp_path, "unix")
+    assert server.connections is not None
+    released = _watch_release(server, monkeypatch)
+    original = server.connections._finish_frame_accounting
+
+    def broken(output: Any, item: Any) -> None:
+        original(output, item)
+        if JOIN_REPLY in item.payload:
+            raise RuntimeError("injected output writer failure")
+
+    # test-contract: seam an unexpected bug inside the output writer task
+    monkeypatch.setattr(server.connections, "_finish_frame_accounting", broken)
+    async with _closing(server, client):
+        await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
+        await await_or_fail(released.wait(), what="failed writer released its connection")
+        await _assert_new_controller(server, "unix")
