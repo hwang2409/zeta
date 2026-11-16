@@ -454,13 +454,20 @@ class ServeControl:
         self._controller_release_task = task
         return task
 
+    @property
+    def handoff_deadline(self) -> float:
+        """The current shared controller-handoff budget (read live for tests)."""
+        return CONTROLLER_HANDOFF_DEADLINE_SECONDS
+
     async def controller_claimed(
         self,
         *,
         reconnect: bool = False,
         require_host_binding: bool = False,
-        deadline: float = CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+        deadline: float | None = None,
     ) -> bool:
+        if deadline is None:
+            deadline = CONTROLLER_HANDOFF_DEADLINE_SECONDS
         release = self._controller_release_task
         if release is not None:
             try:

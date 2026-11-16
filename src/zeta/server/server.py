@@ -33,7 +33,6 @@ from . import (
 )
 from .connections import ConnectionRegistry, last_turn_outcome
 from .control import (
-    CONTROLLER_HANDOFF_DEADLINE_SECONDS,
     NotificationPresentation,
     ServeControl,
 )
@@ -240,9 +239,6 @@ class ZetaServer:
         self.lost_request_contended_drain = 5.0
         # after the cancel, log the stuck-holder task dump at this interval.
         self.lost_request_cancel_bound = 1.0
-        # one shared deadline for a waiting controller hello (lost-holder wait +
-        # the controller_claimed handoff), kept under achilles' 15 s hello timeout.
-        self.controller_handoff_deadline = CONTROLLER_HANDOFF_DEADLINE_SECONDS
         self._borrowed = runtime is not None
         runtime = runtime or ServerRuntime(
             self.home,
@@ -981,7 +977,7 @@ class _Client:
             # a controller hello waits up to one shared handoff deadline for a
             # lost holder to release the slot, then passes the time that is left
             # to controller_claimed so the total wait never exceeds one deadline.
-            deadline = self.server.controller_handoff_deadline
+            deadline = self.server.control.handoff_deadline
             if params.get("role", "controller") == "controller":
                 start = time.monotonic()
                 await self.connections.wait_for_lost_controller(deadline)

@@ -26,6 +26,7 @@ from tests.support.replay_transport import (
     replay_server,
 )
 from zeta.server import ZetaServer
+from zeta.server import control as control_module
 from zeta.server.handlers import registry
 from zeta.server.protocol import MethodDescriptor
 
@@ -282,7 +283,6 @@ async def test_cancel_resistant_handler_holds_slot(
     server = await _make_server(tmp_path, transport)
     server.lost_request_contended_drain = 0.0
     server.lost_request_cancel_bound = 0.01
-    server.controller_handoff_deadline = 10.0
     started = asyncio.Event()
     gate = asyncio.Event()
     cancelled = asyncio.Event()
@@ -311,7 +311,7 @@ async def test_cancel_resistant_handler_holds_slot(
             _lose(a)
             await _settle_until(lambda: _is_lost(server))
             # the hello contends; the handler swallows the cancel and holds the slot.
-            server.controller_handoff_deadline = 0.5
+            monkeypatch.setattr(control_module, "CONTROLLER_HANDOFF_DEADLINE_SECONDS", 0.5)
             hello = await b.request(2, "hello", {"protocol_version": "1.1", "features": []})
             assert hello["error"]["code"] == -32001, hello
             await await_or_fail(cancelled.wait(), what="holder saw the cancel")
@@ -340,7 +340,7 @@ async def test_one_shared_handoff_deadline(tmp_path: Path, transport: Transport)
     controller_claimed, not a fresh full deadline."""
     server = await _make_server(tmp_path, transport)
     server.lost_request_contended_drain = 0.0
-    deadline = server.controller_handoff_deadline
+    deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
     captured: list[float] = []
     original = server.control.controller_claimed
 
