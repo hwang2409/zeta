@@ -71,7 +71,7 @@ async def test_session_history_reads_the_selected_record_not_the_owned_one(
     server = _server(tmp_path, backend)
     client = None
     try:
-        client, a, b = await _park_a_then_attach_b(server, backend, "A-only")
+        client, a, _b = await _park_a_then_attach_b(server, backend, "A-only")
         await client.call("send", {"text": "B-only"})
         await frames_until_event(client.reader, "agent_end")
 
